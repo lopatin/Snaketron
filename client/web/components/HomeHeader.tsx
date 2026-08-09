@@ -42,7 +42,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onOpenAccount,
   onLogout,
 }) => {
-  const { isCrazyGamesBuild, portalUser, userAccountAvailable } = useCrazyGames();
+  const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
   const fullscreen = useFullscreen();
   const inputSurface = useInputSurface();
   // The CrazyGames portal owns fullscreen chrome, and desktop users have F11;
@@ -212,18 +212,21 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
             </button>
           )}
           {isCrazyGamesBuild ? (
-            portalUser ? (
+            currentUser?.authSource === 'crazygames' ? (
               <div
                 className="home-account-action flex items-center gap-2"
-                aria-label={`Playing as ${portalUser.username} through CrazyGames`}
+                aria-label={`Playing as ${currentUser.username} through CrazyGames; progress saves automatically`}
+                title="CrazyGames account linked · progress saves automatically"
               >
-                <img
-                  src={portalUser.profilePictureUrl}
-                  alt=""
-                  className="h-7 w-7 rounded-full border border-black/20 object-cover"
-                  referrerPolicy="no-referrer"
-                />
-                <span className="home-account-username">{portalUser.username}</span>
+                {currentUser.avatarUrl && (
+                  <img
+                    src={currentUser.avatarUrl}
+                    alt=""
+                    className="h-7 w-7 rounded-full border border-black/20 object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                )}
+                <span className="home-account-username">{currentUser.username}</span>
               </div>
             ) : (
               <button

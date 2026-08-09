@@ -1,9 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { useCrazyGames } from '../contexts/CrazyGamesContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
-import { crazyGamesGuestNickname } from '../services/crazyGames';
 import { User } from '../types';
 
 const generateGuestNickname = (lobbyCode: string) => {
@@ -16,8 +14,7 @@ const LobbyInvitePage: React.FC = () => {
   const { lobbyCode: rawCode } = useParams<{ lobbyCode: string }>();
   const lobbyCode = (rawCode ?? '').toUpperCase();
   const navigate = useNavigate();
-  const { isCrazyGamesBuild, portalUser } = useCrazyGames();
-  const { user, createGuest, loading: authLoading, getToken } = useAuth();
+  const { user, ensurePlayableSession, loading: authLoading, getToken } = useAuth();
   const { isConnected, joinLobby, waitForSessionReady } = useWebSocket();
 
   const inFlightRef = useRef(false);
@@ -33,19 +30,11 @@ const LobbyInvitePage: React.FC = () => {
   }, [user]);
 
   const ensureAuthenticatedSession = useCallback(async () => {
-    let activeUser = latestUserRef.current;
-    let resolvedToken: string | null = getToken();
-
-    if (!activeUser) {
-      setStatusMessage('Creating guest profile…');
-      const guestNickname = isCrazyGamesBuild
-        ? crazyGamesGuestNickname(portalUser?.username)
-        : generateGuestNickname(lobbyCode);
-      const { user: guestUser, token } = await createGuest(guestNickname);
-      latestUserRef.current = guestUser;
-      activeUser = guestUser;
-      resolvedToken = token;
-    }
+    setStatusMessage(latestUserRef.current ? 'Verifying player session…' : 'Creating player profile…');
+    const { user: activeUser, token: resolvedToken } = await ensurePlayableSession(
+      generateGuestNickname(lobbyCode),
+    );
+    latestUserRef.current = activeUser;
 
     setStatusMessage('Authenticating session…');
     const token = resolvedToken ?? getToken();
@@ -55,11 +44,9 @@ const LobbyInvitePage: React.FC = () => {
 
     await waitForSessionReady();
   }, [
-    createGuest,
+    ensurePlayableSession,
     getToken,
-    isCrazyGamesBuild,
     lobbyCode,
-    portalUser?.username,
     waitForSessionReady,
   ]);
 

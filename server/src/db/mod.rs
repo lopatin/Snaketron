@@ -74,6 +74,29 @@ pub trait Database: Send + Sync {
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP
 
+    /// Resolve one verified CrazyGames identity into a durable Snaketron
+    /// account. Implementations own the uniqueness/claim transaction; callers
+    /// must never construct an account from unverified portal profile data.
+    /// Initial browser preferences may be imported only when an eligible
+    /// authenticated guest is actually claimed with explicit permission; a
+    /// newly created provider identity must not inherit unscoped state from a
+    /// shared browser. A consent check is read-only and returns a typed outcome
+    /// when an eligible guest could be claimed.
+    async fn resolve_crazygames_account(
+        &self,
+        profile: &CrazyGamesProfile,
+        guest_candidate_user_id: Option<i32>,
+        guest_promotion: CrazyGamesGuestPromotion,
+        initial_preferences: Option<&CrazyGamesPreferences>,
+    ) -> Result<CrazyGamesAccountOutcome>;
+    /// Save the CrazyGames-linked user's preference snapshot. Implementations
+    /// must reject users which are not linked to CrazyGames.
+    async fn save_crazygames_preferences(
+        &self,
+        user_id: i32,
+        preferences: &CrazyGamesPreferences,
+    ) -> Result<CrazyGamesPreferences>;
+
     // MMR operations for ranked/casual queues
     async fn update_user_mmr_by_mode(
         &self,

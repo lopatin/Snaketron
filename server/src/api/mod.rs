@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod crazygames;
 pub mod jwt;
 pub mod leaderboard;
 pub mod middleware;

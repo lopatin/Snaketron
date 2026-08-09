@@ -63,7 +63,16 @@ export interface User {
   mmr?: number;
   token?: string;
   isGuest?: boolean;
+  authSource?: 'crazygames' | string;
+  avatarUrl?: string | null;
 }
+
+export type CrazyGamesSessionStatus =
+  | 'not-applicable'
+  | 'resolving'
+  | 'linked'
+  | 'guest'
+  | 'error';
 
 export interface AuthContextType {
   user: User | null;
@@ -71,9 +80,15 @@ export interface AuthContextType {
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string | null) => Promise<void>;
   createGuest: (nickname: string) => Promise<{ user: User; token: string }>;
+  ensurePlayableSession: (nickname?: string) => Promise<{ user: User; token: string }>;
   updateGuestNickname: (nickname: string) => void;
   logout: () => void;
   getToken: () => string | null;
+  crazyGamesSessionStatus: CrazyGamesSessionStatus;
+  crazyGamesSessionError: string | null;
+  retryCrazyGamesSession: () => Promise<void>;
+  beginCrazyGamesAccountTransition: () => void;
+  crazyGamesAccountTransitionSequence: number;
 }
 
 // Lobby Types
@@ -145,6 +160,7 @@ export interface WebSocketContextType {
   createLobby: () => Promise<void>;
   joinLobby: (lobbyCode: string) => Promise<void>;
   leaveLobby: () => Promise<void>;
+  clearSessionForAccountChange: () => void;
   sendChatMessage: (scope: ChatScope, message: string) => void;
   updateLobbyPreferences: (preferences: LobbyPreferences) => void;
 }

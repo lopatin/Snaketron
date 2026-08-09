@@ -11,6 +11,11 @@ const isProduction = process.env.NODE_ENV === 'production';
 // href "./" in index.html) and routing must not rely on the History API.
 const isItchBuild = process.env.ITCH_BUILD === 'true';
 const isCrazyGamesBuild = process.env.CRAZYGAMES_BUILD === 'true';
+
+if (isItchBuild && isCrazyGamesBuild) {
+  throw new Error('ITCH_BUILD and CRAZYGAMES_BUILD are mutually exclusive release targets');
+}
+
 const isEmbeddedBuild = isItchBuild || isCrazyGamesBuild;
 
 module.exports = {

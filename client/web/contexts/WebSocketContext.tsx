@@ -54,6 +54,7 @@ import {
   replacementFailureAction,
   replacementReadyForPromotion,
 } from '../services/websocketLifecycle';
+import { subscribeGameStorage } from '../services/gameStorage';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -108,6 +109,17 @@ declare global {
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
 const LOBBY_STORAGE_KEY = 'snaketron:lastLobby';
+const NO_LOBBY_STORAGE_KEY = '__snaketron:no-lobby-storage__';
+
+export const lobbyStorageKeyForIdentity = (
+  isCrazyGamesBuild: boolean,
+  userId: number | null,
+): string | null => {
+  if (!isCrazyGamesBuild) {
+    return LOBBY_STORAGE_KEY;
+  }
+  return userId === null ? null : `${LOBBY_STORAGE_KEY}:user:${userId}`;
+};
 const MAX_CHAT_HISTORY = 200;
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
@@ -247,6 +259,16 @@ const normalizeLobbyPreferences = (payload: any): LobbyPreferences => {
   };
 };
 
+const sameLobbyPreferences = (
+  current: LobbyPreferences | null,
+  next: LobbyPreferences,
+): boolean => Boolean(
+  current &&
+  current.competitive === next.competitive &&
+  current.selectedModes.length === next.selectedModes.length &&
+  current.selectedModes.every((mode, index) => mode === next.selectedModes[index]),
+);
+
 interface StoredLobbyInfo {
   code: string;
   id?: number | null;
@@ -270,6 +292,7 @@ export const useWebSocket = (): WebSocketContextType => {
 
 export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
   const {
+    isCrazyGamesBuild,
     inviteParams,
     isInstantMultiplayer,
     settings: { disableChat },
@@ -316,7 +339,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
   const isInitializingRef = useRef(false);
   const storedLobbyRef = useRef<StoredLobbyInfo | null>(null);
-  const hasLoadedStoredLobbyRef = useRef(false);
+  const loadedLobbyStorageKeyRef = useRef<string | null>(null);
+  const persistedLobbyStorageKeyRef = useRef<string | null>(null);
   const restoreInProgressRef = useRef(false);
   // QueueForMatch is safe to replay because Redis admission preserves the
   // first physical queue identity. Keep only the one unacknowledged intent
@@ -326,7 +350,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
   const latencySettingsRef = useRef(latencySettings);
-  const { user, getToken } = useAuth();
+  const {
+    user,
+    getToken,
+    loading: authLoading,
+    crazyGamesSessionStatus,
+  } = useAuth();
+  const activeLobbyStorageKey = useMemo(
+    () => lobbyStorageKeyForIdentity(isCrazyGamesBuild, user?.id ?? null),
+    [isCrazyGamesBuild, user?.id],
+  );
   const hasEverConnectedRef = useRef(false);
   const authHandshakeRef = useRef(false);
   const lastAuthTokenRef = useRef<string | null>(null);
@@ -356,6 +389,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       desiredLobbyPreferencesRef.current = lobbyPreferences;
     }
   }, [lobbyPreferences]);
+
+  // Account exchange can replace the local snapshot after this provider has
+  // mounted. Adopt that canonical backend value before any lobby/gameplay UI
+  // becomes available instead of writing the stale pre-exchange value back.
+  useEffect(() => subscribeGameStorage((key) => {
+    if (key !== 'lastLobbyPreferences') {
+      return;
+    }
+    const restored = loadStoredLobbyPreferences();
+    if (!restored) {
+      desiredLobbyPreferencesRef.current = null;
+      setLobbyPreferences(null);
+      return;
+    }
+    desiredLobbyPreferencesRef.current = restored;
+    setLobbyPreferences((current) => (
+      sameLobbyPreferences(current, restored) ? current : restored
+    ));
+  }), []);
 
   useEffect(() => {
     if (lobbyPreferences) {
@@ -428,12 +480,30 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, []);
 
   useEffect(() => {
-    if (hasLoadedStoredLobbyRef.current) {
+    if (
+      isCrazyGamesBuild &&
+      (authLoading || crazyGamesSessionStatus === 'resolving' || crazyGamesSessionStatus === 'error')
+    ) {
       return;
     }
 
+    const storageMarker = activeLobbyStorageKey ?? NO_LOBBY_STORAGE_KEY;
+    if (loadedLobbyStorageKeyRef.current === storageMarker) {
+      return;
+    }
+
+    storedLobbyRef.current = null;
+    persistedLobbyStorageKeyRef.current = activeLobbyStorageKey;
+    setLobbyRestorationComplete(false);
+
     if (typeof window === 'undefined') {
-      hasLoadedStoredLobbyRef.current = true;
+      loadedLobbyStorageKeyRef.current = storageMarker;
+      setLobbyRestorationComplete(true);
+      return;
+    }
+
+    if (!activeLobbyStorageKey) {
+      loadedLobbyStorageKeyRef.current = storageMarker;
       setLobbyRestorationComplete(true);
       return;
     }
@@ -442,11 +512,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       if (isInstantMultiplayer || inviteParams?.lobbyCode || inviteParams?.roomCode) {
         // Platform-directed multiplayer launches always supersede an
         // unrelated lobby persisted from a prior visit.
-        window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+        window.localStorage.removeItem(activeLobbyStorageKey);
         storedLobbyRef.current = null;
         return;
       }
-      const raw = window.localStorage.getItem(LOBBY_STORAGE_KEY);
+      const raw = window.localStorage.getItem(activeLobbyStorageKey);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.code === 'string' && parsed.code.trim()) {
@@ -459,17 +529,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     } catch (error) {
       console.warn('Failed to load stored lobby info, clearing persisted data', error);
       try {
-        window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+        window.localStorage.removeItem(activeLobbyStorageKey);
       } catch {
         // Ignore removal errors
       }
     } finally {
-      hasLoadedStoredLobbyRef.current = true;
+      loadedLobbyStorageKeyRef.current = storageMarker;
       if (!storedLobbyRef.current) {
         setLobbyRestorationComplete(true);
       }
     }
-  }, [inviteParams?.lobbyCode, inviteParams?.roomCode, isInstantMultiplayer]);
+  }, [
+    activeLobbyStorageKey,
+    authLoading,
+    crazyGamesSessionStatus,
+    inviteParams?.lobbyCode,
+    inviteParams?.roomCode,
+    isCrazyGamesBuild,
+    isInstantMultiplayer,
+  ]);
 
   const persistLobby = useCallback((lobby: { id: number | null; code: string }) => {
     storedLobbyRef.current = { id: lobby.id, code: lobby.code.toUpperCase() };
@@ -478,15 +556,20 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
+    if (!activeLobbyStorageKey) {
+      return;
+    }
+
     try {
+      persistedLobbyStorageKeyRef.current = activeLobbyStorageKey;
       window.localStorage.setItem(
-        LOBBY_STORAGE_KEY,
+        activeLobbyStorageKey,
         JSON.stringify({ id: lobby.id, code: lobby.code.toUpperCase() })
       );
     } catch (error) {
       console.warn('Failed to persist lobby info', error);
     }
-  }, []);
+  }, [activeLobbyStorageKey]);
 
   const clearPersistedLobby = useCallback(() => {
     storedLobbyRef.current = null;
@@ -496,11 +579,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     try {
-      window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+      const keys = new Set([
+        activeLobbyStorageKey,
+        persistedLobbyStorageKeyRef.current,
+      ]);
+      for (const key of keys) {
+        if (key) window.localStorage.removeItem(key);
+      }
+      persistedLobbyStorageKeyRef.current = activeLobbyStorageKey;
     } catch (error) {
       console.warn('Failed to clear stored lobby info', error);
     }
-  }, []);
+  }, [activeLobbyStorageKey]);
 
   const resetLobbyState = useCallback(() => {
     clearPendingMatchmakingIntent();
@@ -1787,6 +1877,32 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     const previous = previousUserRef.current;
     const token = getToken();
     if (
+      isCrazyGamesBuild &&
+      (crazyGamesSessionStatus === 'resolving' || crazyGamesSessionStatus === 'error')
+    ) {
+      const active = activeSlotRef.current;
+      if (
+        currentLobbyRef.current &&
+        active?.role === 'active' &&
+        active.authenticated &&
+        active.socket.readyState === WebSocket.OPEN
+      ) {
+        try {
+          active.socket.send(JSON.stringify('LeaveLobby'));
+        } catch (error) {
+          console.warn('Failed to leave lobby while CrazyGames identity was gated', error);
+        }
+      }
+      clearPendingMatchmakingIntent();
+      resetLobbyState();
+      setAuthHandshakeState(false);
+      lastAuthTokenRef.current = null;
+      disconnect();
+      // Retain previousUserRef so a retry resolving a different portal account
+      // is compared with the identity that actually owned the retired socket.
+      return;
+    }
+    if (
       pendingMatchmakingIntentRef.current &&
       pendingMatchmakingIntentRef.current.authToken !== token
     ) {
@@ -1837,6 +1953,26 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     const tokenChanged = lastAuthTokenRef.current && token !== lastAuthTokenRef.current;
+    const crazyGamesIdentityChanged = Boolean(
+      isCrazyGamesBuild &&
+      previous &&
+      user &&
+      previous.id !== user.id,
+    );
+
+    if (crazyGamesIdentityChanged) {
+      console.log('CrazyGames identity changed, clearing lobby state before reconnecting');
+      previousUserRef.current = user;
+      resetLobbyState();
+      setAuthHandshakeState(false);
+      const url = activeSlotRef.current?.url ?? currentRegionUrl;
+      disconnect();
+      if (url) {
+        reconnectEnabledRef.current = true;
+        connect(url, onConnectCallback.current || undefined);
+      }
+      return;
+    }
 
     // If the auth token changes (guest -> real account, logout, etc.), force a reconnect
     // because the server only accepts authentication during the initial handshake.
@@ -1889,10 +2025,19 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clearPendingMatchmakingIntent,
     resetLobbyState,
     setAuthHandshakeState,
+    isCrazyGamesBuild,
+    crazyGamesSessionStatus,
   ]);
 
   // Auto-connect to the preferred or closest region on mount
   useEffect(() => {
+    if (
+      isCrazyGamesBuild &&
+      (authLoading || crazyGamesSessionStatus === 'resolving' || crazyGamesSessionStatus === 'error')
+    ) {
+      return;
+    }
+
     let cancelled = false;
     let detectionAttempt = 0;
     let retryTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -1981,7 +2126,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         clearTimeout(retryTimeout);
       }
     };
-  }, [connectToRegion]);
+  }, [
+    authLoading,
+    connectToRegion,
+    crazyGamesSessionStatus,
+    isCrazyGamesBuild,
+  ]);
 
   // Lobby methods
   const createLobby = useCallback(async () => {
@@ -2314,6 +2464,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }, 5000);
     });
   }, [beginResponseTrackedRequest, onMessage, sendMessage, resetLobbyState]);
+
+  const clearSessionForAccountChange = useCallback(() => {
+    resetLobbyState();
+    setLobbyRestorationComplete(true);
+    setAuthHandshakeState(false);
+    disconnect();
+  }, [disconnect, resetLobbyState, setAuthHandshakeState]);
 
   const updateLobbyPreferences = useCallback(
     (preferences: LobbyPreferences) => {
@@ -2790,7 +2947,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [disconnect]);
 
   useEffect(() => {
-    if (!hasLoadedStoredLobbyRef.current) {
+    const expectedStorageMarker = activeLobbyStorageKey ?? NO_LOBBY_STORAGE_KEY;
+    if (loadedLobbyStorageKeyRef.current !== expectedStorageMarker) {
       return;
     }
 
@@ -2853,7 +3011,14 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     return () => {
       cancelled = true;
     };
-  }, [isConnected, isSessionAuthenticated, currentLobby, joinLobby, resetLobbyState]);
+  }, [
+    activeLobbyStorageKey,
+    currentLobby,
+    isConnected,
+    isSessionAuthenticated,
+    joinLobby,
+    resetLobbyState,
+  ]);
 
   const value: WebSocketContextType = {
     isConnected,
@@ -2878,6 +3043,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     createLobby,
     joinLobby,
     leaveLobby,
+    clearSessionForAccountChange,
     sendChatMessage,
     updateLobbyPreferences,
   };

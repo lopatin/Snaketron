@@ -21,6 +21,7 @@ pub struct AuthState {
     pub db: Arc<dyn Database>,
     pub jwt_manager: Arc<JwtManager>,
     pub user_cache: Option<UserCache>,
+    pub crazygames_verifier: Option<Arc<super::crazygames::CrazyGamesJwtVerifier>>,
 }
 
 #[derive(Debug, Deserialize)]

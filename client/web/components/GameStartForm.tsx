@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
@@ -10,7 +10,6 @@ import {
   persistStoredLobbyPreferences,
 } from '../utils/lobbyPreferencesStorage';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
-import { crazyGamesGuestNickname } from '../services/crazyGames';
 import { useInputSurface } from '../hooks/useInputSurface';
 
 const areModeSetsEqual = (a: Set<LobbyGameMode> | null, b: Set<LobbyGameMode> | null) => {
@@ -59,24 +58,18 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   errorMessage = null,
   playersOnline = null,
 }) => {
-  const { isCrazyGamesBuild, portalUser, userAccountAvailable } = useCrazyGames();
-  const portalNickname = useMemo(
-    () => portalUser ? crazyGamesGuestNickname(portalUser.username) : '',
-    [portalUser?.username],
-  );
-  // A signed-in CrazyGames profile is the recognizable multiplayer identity.
-  // If an existing backend guest was restored, the debounced update below
-  // renames that guest to the latest portal display name.
-  const effectiveUsername = portalNickname || currentUsername || '';
-  const hasPlatformIdentity = Boolean(isCrazyGamesBuild && portalUser);
-  const locksNickname = isAuthenticated || hasPlatformIdentity;
+  const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
+  const effectiveUsername = currentUsername || '';
   const [nickname, setNickname] = useState(effectiveUsername);
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
   const [selectedModes, setSelectedModes] = useState<Set<LobbyGameMode> | null>(null);
   const [isCompetitive, setIsCompetitive] = useState<boolean | null>(null);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
   const lastSubmittedNicknameRef = useRef<string | null>(null);
-  const { user, updateGuestNickname } = useAuth();
+  const { user, updateGuestNickname, crazyGamesSessionStatus } = useAuth();
+  const locksNickname = isAuthenticated || (
+    isCrazyGamesBuild && crazyGamesSessionStatus === 'linked'
+  );
   const { sendMessage } = useWebSocket();
   const prevUsernameRef = useRef<string | null>(null);
   const canEdit = !isLobbyQueued;
@@ -152,14 +145,12 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
     if (prevUsernameRef.current !== effectiveUsername) {
       setNickname(effectiveUsername);
-      // CrazyGamesBridge owns the server rename for portal identities so it
-      // works on invite/game routes too; do not duplicate that WS command here.
-      lastSubmittedNicknameRef.current = hasPlatformIdentity || effectiveUsername === currentUsername
+      lastSubmittedNicknameRef.current = effectiveUsername === currentUsername
         ? effectiveUsername
         : null;
       prevUsernameRef.current = effectiveUsername;
     }
-  }, [currentUsername, effectiveUsername, hasAutoSetNickname, hasPlatformIdentity]);
+  }, [currentUsername, effectiveUsername, hasAutoSetNickname]);
 
   useEffect(() => {
     if (!user || !user.isGuest) {
@@ -301,6 +292,12 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                   {isCrazyGamesBuild ? 'Sign in with CrazyGames' : 'Sign in or create account'}
                 </button>
               )}
+            </div>
+          )}
+
+          {locksNickname && isCrazyGamesBuild && crazyGamesSessionStatus === 'linked' && (
+            <div className="mt-2 px-1 text-[13px] font-semibold text-green-700">
+              CrazyGames account linked · progress saves automatically
             </div>
           )}
 

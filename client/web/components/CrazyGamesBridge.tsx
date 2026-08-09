@@ -23,11 +23,18 @@ export const CrazyGamesBridge: React.FC = () => {
     isInstantMultiplayer,
     inviteParams,
     inviteSequence,
+    authChangeSequence,
     portalUser,
     settings: { muteAudio },
     adState,
   } = useCrazyGames();
-  const { user, loading: authLoading, createGuest, updateGuestNickname } = useAuth();
+  const {
+    user,
+    loading: authLoading,
+    ensurePlayableSession,
+    beginCrazyGamesAccountTransition,
+    crazyGamesAccountTransitionSequence,
+  } = useAuth();
   const {
     isConnected,
     isSessionAuthenticated,
@@ -36,13 +43,19 @@ export const CrazyGamesBridge: React.FC = () => {
     lobbyMembers,
     createLobby,
     leaveLobby,
-    sendMessage,
     waitForSessionReady,
+    clearSessionForAccountChange,
   } = useWebSocket();
   const reportedRoomRef = useRef<string | null>(null);
   const handledInviteSequenceRef = useRef(0);
   const instantMultiplayerCompleteRef = useRef(false);
   const instantMultiplayerInFlightRef = useRef(false);
+  const observedAuthChangeSequenceRef = useRef(authChangeSequence);
+  // Provider-owned transitions start at zero and remain observable even when
+  // one was recorded on the render boundary immediately before this bridge
+  // mounted. SDK sequence itself may legitimately predate AuthProvider.
+  const observedAccountTransitionSequenceRef = useRef(0);
+  const accountReloadInFlightRef = useRef(false);
   const [instantRetry, setInstantRetry] = useState(0);
 
   useEffect(() => {
@@ -84,32 +97,48 @@ export const CrazyGamesBridge: React.FC = () => {
   }, [adState, isCrazyGamesBuild, muteAudio]);
 
   useEffect(() => {
-    if (
-      !isCrazyGamesBuild ||
-      !portalUser ||
-      !user?.isGuest ||
-      !isSessionAuthenticated
-    ) {
+    if (!isCrazyGamesBuild) {
       return;
     }
-
-    const portalNickname = crazyGamesGuestNickname(portalUser.username);
-    if (portalNickname === user.username) {
+    const sdkIdentityChanged = authChangeSequence > observedAuthChangeSequenceRef.current;
+    const backendIdentityChanged = crazyGamesAccountTransitionSequence >
+      observedAccountTransitionSequenceRef.current;
+    if (!sdkIdentityChanged && !backendIdentityChanged) {
       return;
     }
-
-    if (sendMessage({ UpdateNickname: { nickname: portalNickname } })) {
-      // Keep every same-page roster/chat action aligned while the server
-      // durably updates the guest and refreshes this socket's metadata.
-      updateGuestNickname(portalNickname);
+    observedAuthChangeSequenceRef.current = authChangeSequence;
+    observedAccountTransitionSequenceRef.current = crazyGamesAccountTransitionSequence;
+    if (accountReloadInFlightRef.current) {
+      return;
     }
+    accountReloadInFlightRef.current = true;
+    beginCrazyGamesAccountTransition();
+
+    const completeAccountChange = async () => {
+      if (currentLobby && isSessionAuthenticated) {
+        try {
+          await Promise.race([
+            leaveLobby(),
+            new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+          ]);
+        } catch (error) {
+          console.warn('Could not leave the current lobby before switching accounts', error);
+        }
+      }
+      crazyGames.leftRoom();
+      clearSessionForAccountChange();
+      window.location.reload();
+    };
+    void completeAccountChange();
   }, [
+    authChangeSequence,
+    beginCrazyGamesAccountTransition,
+    clearSessionForAccountChange,
+    crazyGamesAccountTransitionSequence,
+    currentLobby,
     isCrazyGamesBuild,
     isSessionAuthenticated,
-    portalUser,
-    sendMessage,
-    updateGuestNickname,
-    user,
+    leaveLobby,
   ]);
 
   useEffect(() => {
@@ -208,7 +237,9 @@ export const CrazyGamesBridge: React.FC = () => {
     const createInstantRoom = async () => {
       try {
         if (!user) {
-          await createGuest(crazyGamesGuestNickname(portalUser?.username));
+          await ensurePlayableSession(crazyGamesGuestNickname(portalUser?.username));
+        } else {
+          await ensurePlayableSession();
         }
         await waitForSessionReady();
         await createLobby();
@@ -230,7 +261,7 @@ export const CrazyGamesBridge: React.FC = () => {
   }, [
     authLoading,
     available,
-    createGuest,
+    ensurePlayableSession,
     createLobby,
     currentLobby,
     instantRetry,

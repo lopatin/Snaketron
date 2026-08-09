@@ -21,14 +21,21 @@ import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
 import { CrazyGamesAdOverlay, CrazyGamesBridge } from './components/CrazyGamesBridge';
+import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
 
 function AppContent() {
   const location = useLocation();
-  const { user } = useAuth();
+  const {
+    user,
+    crazyGamesSessionStatus,
+    crazyGamesSessionError,
+    retryCrazyGamesSession,
+  } = useAuth();
   const { isCrazyGamesBuild, showAuthPrompt } = useCrazyGames();
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
+  const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
 
   const handleOpenAuth = useCallback(() => {
@@ -50,6 +57,51 @@ function AppContent() {
       setAccountModalView(null);
     }
   }, [user]);
+
+  if (
+    isCrazyGamesBuild &&
+    !isCrazyGamesPrivacyPage &&
+    crazyGamesSessionStatus === 'resolving'
+  ) {
+    return (
+      <main className="min-h-screen flex items-center justify-center px-6" aria-busy="true">
+        <div className="max-w-md border-2 border-black bg-white p-8 text-center shadow-[8px_8px_0_#000]">
+          <div
+            className="mx-auto mb-4 h-7 w-7 animate-spin rounded-full border-4 border-black/20 border-t-black"
+            aria-hidden="true"
+          />
+          <h1 className="text-xl font-black uppercase tracking-1">Connecting your account</h1>
+          <p className="mt-3 text-sm text-gray-600">
+            Restoring your Snaketron progress from CrazyGames…
+          </p>
+        </div>
+      </main>
+    );
+  }
+
+  if (
+    isCrazyGamesBuild &&
+    !isCrazyGamesPrivacyPage &&
+    crazyGamesSessionStatus === 'error'
+  ) {
+    return (
+      <main className="min-h-screen flex items-center justify-center px-6">
+        <div className="max-w-md border-2 border-black bg-white p-8 text-center shadow-[8px_8px_0_#000]" role="alert">
+          <h1 className="text-xl font-black uppercase tracking-1">Progress connection failed</h1>
+          <p className="mt-3 text-sm text-gray-600">
+            {crazyGamesSessionError ?? 'Your CrazyGames account could not be connected safely.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => void retryCrazyGamesSession()}
+            className="mt-6 border-2 border-black bg-yellow-300 px-5 py-3 text-sm font-black uppercase tracking-1 hover:bg-yellow-200"
+          >
+            Retry account sync
+          </button>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -77,6 +129,10 @@ function AppContent() {
         />
         <Route path="/profile" element={<Navigate to="/" replace />} />
         <Route path="/history" element={<Navigate to="/" replace />} />
+        <Route
+          path="/privacy"
+          element={isCrazyGamesBuild ? <CrazyGamesPrivacy /> : <Navigate to="/" replace />}
+        />
         <Route
           path="/game-modes/:category"
           element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <GameModeSelector />}
