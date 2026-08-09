@@ -5,7 +5,7 @@
 | Status | Direct-only implementation acceptance draft |
 | Product | Snaketron regional game service |
 | Owners | Engineering / Product |
-| Last updated | 2026-07-29 |
+| Last updated | 2026-08-09 |
 | Scope | Executor ownership, task lifecycle, WebSocket continuity, matchmaking safety, readiness, and autoscaling |
 
 ## 1. Executive summary
