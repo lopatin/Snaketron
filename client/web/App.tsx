@@ -22,6 +22,12 @@ import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
 import { CrazyGamesAdOverlay, CrazyGamesBridge } from './components/CrazyGamesBridge';
 
+// Design-review harness for the post-match rating reveal. Only reachable —
+// and only bundled — outside production builds.
+const RatingRevealQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/RatingRevealQA'))
+  : null;
+
 function AppContent() {
   const location = useLocation();
   const { user } = useAuth();
@@ -102,6 +108,16 @@ function AppContent() {
             </ProtectedRoute>
           }
         />
+        {RatingRevealQA && (
+          <Route
+            path="/qa/rating-reveal"
+            element={
+              <React.Suspense fallback={null}>
+                <RatingRevealQA />
+              </React.Suspense>
+            }
+          />
+        )}
       </AnimatedRoutes>
       <AuthModal
         isOpen={isAuthModalOpen && !isCrazyGamesBuild}

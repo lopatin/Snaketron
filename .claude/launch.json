@@ -4,8 +4,9 @@
     {
       "name": "web-client",
       "runtimeExecutable": "bash",
-      "runtimeArgs": ["-lc", "cd client/web && npx webpack-dev-server --port 3100"],
-      "port": 3100
+      "runtimeArgs": ["-lc", "cd client/web && npx webpack-dev-server --port ${PORT:-3100}"],
+      "port": 3100,
+      "autoPort": true
     }
   ]
 }

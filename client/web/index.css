@@ -1107,6 +1107,389 @@ button.game-scoreboard-brand {
   text-shadow: 2px 2px 0 rgb(20 24 31 / 50%), 4px 4px 0 rgb(20 24 31 / 20%);
 }
 
+/* ── Post-match rating reveal ─────────────────────────────────────────
+   One accent variable (--rating-accent, set from the player's tier) tints
+   the meter, rank caption, and promotion ribbon so the band re-colors
+   itself live as the odometer sweeps across a division boundary. */
+.rating-reveal {
+  position: relative;
+  display: flex;
+  overflow: hidden;
+  align-items: center;
+  gap: 15px;
+  padding: 11px 18px 12px;
+  border-bottom: 1px solid #d8dbe0;
+  background:
+    linear-gradient(104deg, rgb(23 32 51 / 4.5%), rgb(23 32 51 / 0%) 34%),
+    #fff;
+}
+
+.rating-reveal-medallion {
+  display: flex;
+  width: 46px;
+  height: 46px;
+  flex: 0 0 46px;
+  align-items: center;
+  justify-content: center;
+}
+
+.rating-reveal-medallion img {
+  width: 100%;
+  height: 100%;
+  animation: rating-medallion-stamp 360ms cubic-bezier(0.2, 1.4, 0.3, 1) both;
+  filter: drop-shadow(0 2px 0 rgb(20 24 31 / 14%));
+  object-fit: contain;
+}
+
+@keyframes rating-medallion-stamp {
+  0% {
+    opacity: 0;
+    transform: scale(1.8) rotate(-8deg);
+  }
+
+  62% {
+    opacity: 1;
+    transform: scale(0.93) rotate(1.5deg);
+  }
+
+  100% {
+    transform: scale(1) rotate(0deg);
+  }
+}
+
+.rating-reveal-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rating-reveal-label {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.rating-reveal-placed {
+  padding: 1px 5px;
+  background: var(--game-graphite);
+  color: #fff;
+  font-size: 8px;
+  font-style: italic;
+  letter-spacing: 0.12em;
+  transform: skewX(-8deg);
+}
+
+.rating-reveal-valueline {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.rating-reveal-value {
+  color: var(--game-graphite);
+  font-size: 29px;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+  font-weight: 950;
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+
+.rating-reveal-value.is-placeholder {
+  color: #c9d3df;
+  letter-spacing: 0.08em;
+}
+
+.rating-reveal-delta {
+  font-size: 16px;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+  font-weight: 950;
+  opacity: 0;
+  transform: translateX(-7px);
+  transition: opacity 240ms ease-out, transform 240ms cubic-bezier(0.2, 0.9, 0.2, 1.3);
+}
+
+.rating-reveal-delta.is-shown {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.rating-reveal-delta.is-up {
+  color: #16a34a;
+}
+
+.rating-reveal-delta.is-down {
+  color: #e0433f;
+}
+
+.rating-reveal-delta.is-zero {
+  color: rgb(63 63 65 / 56%);
+}
+
+.rating-reveal-position {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  margin-left: auto;
+  animation: rating-position-in 260ms ease-out both;
+  color: rgb(63 63 65 / 56%);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+}
+
+.rating-reveal-position em {
+  font-size: 9px;
+  font-style: normal;
+}
+
+.rating-reveal-position em.is-up {
+  color: #16a34a;
+}
+
+.rating-reveal-position em.is-down {
+  color: #e0433f;
+}
+
+@keyframes rating-position-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The division meter leans with the card's chevron motif: the whole track
+   is a sharp parallelogram, quarter notches mark the climb to promotion. */
+.rating-reveal-meter {
+  position: relative;
+  overflow: hidden;
+  height: 6px;
+  margin-top: 2px;
+  background: #e9ecf0;
+  transform: skewX(-14deg);
+}
+
+.rating-reveal-meter::after {
+  position: absolute;
+  background:
+    repeating-linear-gradient(
+      90deg,
+      transparent 0,
+      transparent calc(25% - 1px),
+      #fff calc(25% - 1px),
+      #fff 25%
+    );
+  content: "";
+  inset: 0;
+  pointer-events: none;
+}
+
+.rating-reveal-meter-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--rating-accent, #3c8dde);
+  transition: width 90ms linear;
+}
+
+.rating-reveal-meter.is-indeterminate {
+  transform: skewX(-14deg);
+}
+
+.rating-reveal-meter.is-indeterminate .rating-reveal-meter-fill {
+  width: 30%;
+  animation: rating-meter-scan 1100ms ease-in-out infinite;
+  background: #c9d3df;
+}
+
+@keyframes rating-meter-scan {
+  0% {
+    transform: translateX(-110%);
+  }
+
+  100% {
+    transform: translateX(440%);
+  }
+}
+
+.rating-reveal-caption {
+  display: flex;
+  min-height: 15px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 1px;
+}
+
+.rating-reveal-rank {
+  color: var(--rating-accent, var(--game-graphite));
+  font-size: 9.5px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.rating-reveal-bounds {
+  color: rgb(63 63 65 / 40%);
+  font-size: 8.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+}
+
+.rating-reveal-tallying {
+  animation: rating-tallying-pulse 1400ms ease-in-out infinite;
+  color: rgb(63 63 65 / 44%);
+  font-size: 8.5px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+@keyframes rating-tallying-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.rating-reveal-ribbon {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  animation: rating-ribbon-stamp 320ms cubic-bezier(0.2, 1.3, 0.3, 1) both;
+  animation-delay: 120ms;
+  background: var(--rating-accent, var(--game-graphite));
+  color: #fff;
+  font-size: 9.5px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  transform: skewX(-8deg);
+}
+
+.rating-reveal-ribbon.is-demoted {
+  background: var(--game-graphite);
+}
+
+@keyframes rating-ribbon-stamp {
+  0% {
+    opacity: 0;
+    transform: skewX(-8deg) scale(1.45);
+  }
+
+  65% {
+    opacity: 1;
+    transform: skewX(-8deg) scale(0.96);
+  }
+
+  100% {
+    opacity: 1;
+    transform: skewX(-8deg) scale(1);
+  }
+}
+
+.rating-reveal-chevrons {
+  width: 8px;
+  height: 8px;
+  fill: currentcolor;
+}
+
+.rating-reveal-chevrons.is-down {
+  transform: rotate(180deg);
+}
+
+/* Celebration sweep for promotions only: a light blade crossing the band. */
+.rating-reveal-beam {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -45%;
+  width: 38%;
+  animation: rating-beam-sweep 750ms cubic-bezier(0.3, 0, 0.2, 1) 180ms both;
+  background: linear-gradient(
+    100deg,
+    rgb(255 255 255 / 0%),
+    rgb(248 200 74 / 34%) 45%,
+    rgb(255 255 255 / 0%)
+  );
+  pointer-events: none;
+  transform: skewX(-20deg);
+}
+
+@keyframes rating-beam-sweep {
+  from {
+    transform: translateX(0) skewX(-20deg);
+  }
+
+  to {
+    transform: translateX(400%) skewX(-20deg);
+  }
+}
+
+@media (max-width: 480px) {
+  .rating-reveal {
+    gap: 11px;
+    padding: 9px 13px 10px;
+  }
+
+  .rating-reveal-medallion {
+    width: 38px;
+    height: 38px;
+    flex-basis: 38px;
+  }
+
+  .rating-reveal-value {
+    font-size: 25px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rating-reveal-medallion img,
+  .rating-reveal-ribbon,
+  .rating-reveal-position,
+  .rating-reveal-tallying,
+  .rating-reveal-beam {
+    animation: none;
+  }
+
+  .rating-reveal-beam {
+    display: none;
+  }
+
+  .rating-reveal-delta {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+
+  .rating-reveal-meter-fill {
+    transition: none;
+  }
+}
+
 .game-over-statline {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));

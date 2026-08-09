@@ -67,6 +67,7 @@ import TouchControls, {
 } from './TouchControls';
 import { useInputSurface } from '../hooks/useInputSurface';
 import { useFullscreen } from '../hooks/useFullscreen';
+import { useMatchRating } from '../hooks/useMatchRating';
 import './GameArena.css';
 
 /**
@@ -267,6 +268,12 @@ export default function GameArena() {
 
   const [gameOver, setGameOver] = useState(false);
   const inputSurface = useInputSurface();
+  const matchRating = useMatchRating(
+    gameId,
+    committedState ?? gameState,
+    isGameComplete,
+    user?.id,
+  );
   const isTouchSurface = inputSurface === 'touch';
   const fullscreen = useFullscreen();
   // The touch d-pad reads its gates through this ref so a tap consults the
@@ -1619,6 +1626,7 @@ export default function GameArena() {
           arenaWidth={panelSize.width}
           currentUserId={user?.id}
           queueMode={queueMode}
+          rating={matchRating}
           onMenu={handleBackToMenu}
           onPlayAgain={handlePlayAgain}
           playAgainDisabled={isLobbyQueued}
