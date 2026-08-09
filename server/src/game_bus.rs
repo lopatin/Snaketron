@@ -126,7 +126,7 @@ impl PartitionSubscription {
 }
 
 /// Approximate trim bounds (`MAXLEN ~`). At game rates (a handful of events
-/// per 100 ms tick, 1/10 of games per partition) the events bound keeps
+/// per 100 ms tick, 1/50 of games per partition) the events bound keeps
 /// several minutes of backlog — ample for any reconnect window — while
 /// keeping memory strictly bounded (the old implementation never trimmed).
 const EVENTS_MAXLEN: usize = 8192;
