@@ -697,8 +697,8 @@
 
   .game-controls-hint {
     position: fixed;
-    bottom: 10px;
-    left: 12px;
+    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
     min-height: 32px;
     gap: 17px;
     margin-top: 0;
@@ -1595,6 +1595,350 @@
   .tutorial-auto-start-fill,
   .tutorial-step-button,
   .tutorial-ready-button {
+    transition: none;
+  }
+}
+
+/* --- Touch controls: mobile d-pads + NOS Boost button ----------------------
+   Rendered only on touch surfaces (see useInputSurface). Portrait shows one
+   d-pad at the bottom right with the Boost button adjacent on its left;
+   landscape shows a d-pad at each top corner with Boost under the left pad.
+   The stage padding below MUST stay in lockstep with the reserve constants
+   in TouchControls.tsx, which GameArena's calculateSizes subtracts so the
+   canvas never slides beneath a cluster. */
+
+/* Size tokens live on the arena root, not the controls themselves, so the
+   controls hint and chat dock can position around the same cluster geometry. */
+.game-arena-screen.is-touch-surface {
+  --touch-dpad-size: 158px;
+  --touch-boost-size: 72px;
+}
+
+.touch-controls {
+  position: fixed;
+  inset: 0;
+  z-index: 42;
+  pointer-events: none;
+}
+
+/* An open chat must sit above the touch clusters: reading and typing is a
+   deliberate pause, and a d-pad floating over the transcript would steer the
+   snake on taps meant for the conversation. */
+.game-arena-screen.is-touch-surface .home-lobby-chat.is-expanded {
+  z-index: 65;
+}
+
+.touch-controls__cluster,
+.touch-controls__aux {
+  position: fixed;
+  display: flex;
+  pointer-events: none;
+}
+
+.touch-dpad {
+  display: grid;
+  width: var(--touch-dpad-size);
+  height: var(--touch-dpad-size);
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 4px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.touch-dpad__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 2px solid rgb(0 0 0 / 78%);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 84%);
+  color: rgb(0 0 0 / 78%);
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  backdrop-filter: blur(2px);
+}
+
+.touch-dpad__btn svg {
+  width: 26px;
+  height: 26px;
+}
+
+.touch-dpad__btn:active {
+  border-color: #000;
+  background: rgb(0 0 0 / 85%);
+  color: #fff;
+}
+
+.touch-dpad__btn--up { grid-area: 1 / 2; }
+.touch-dpad__btn--left { grid-area: 2 / 1; }
+.touch-dpad__btn--right { grid-area: 2 / 3; }
+.touch-dpad__btn--down { grid-area: 3 / 2; }
+
+.touch-dpad__btn--left svg { transform: rotate(-90deg); }
+.touch-dpad__btn--right svg { transform: rotate(90deg); }
+.touch-dpad__btn--down svg { transform: rotate(180deg); }
+
+.touch-dpad__hub {
+  grid-area: 2 / 2;
+  align-self: center;
+  justify-self: center;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 22%);
+}
+
+.touch-controls__aux {
+  align-items: center;
+  gap: 14px;
+  pointer-events: none;
+}
+
+.touch-boost {
+  position: relative;
+  display: flex;
+  width: var(--touch-boost-size);
+  height: var(--touch-boost-size);
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 2px solid rgb(0 0 0 / 78%);
+  border-radius: 50%;
+  background: rgb(255 255 255 / 90%);
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  transition: border-color 130ms ease, box-shadow 130ms ease, opacity 130ms ease;
+}
+
+/* Stored-charge ring around the button, driven by --touch-boost-charge. */
+.touch-boost::before {
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
+  background: conic-gradient(
+    var(--game-blue, #3b82f6) var(--touch-boost-charge, 0deg),
+    rgb(0 0 0 / 12%) 0
+  );
+  content: "";
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4.5px));
+}
+
+.touch-boost.is-ready::before {
+  background: conic-gradient(var(--game-blue, #3b82f6) 360deg, rgb(0 0 0 / 12%) 0);
+}
+
+.touch-boost.is-active {
+  border-color: var(--game-blue, #3b82f6);
+  box-shadow: 0 0 0 5px rgb(59 130 246 / 30%);
+}
+
+.touch-boost:disabled {
+  opacity: 0.45;
+}
+
+.touch-boost__canister {
+  width: 46px;
+  height: 33px;
+}
+
+.touch-fullscreen {
+  display: flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 2px solid rgb(0 0 0 / 45%);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 85%);
+  color: rgb(0 0 0 / 70%);
+  pointer-events: auto;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.touch-fullscreen svg {
+  width: 20px;
+  height: 20px;
+}
+
+.touch-fullscreen:active {
+  background: rgb(0 0 0 / 85%);
+  color: #fff;
+}
+
+@media (max-width: 360px), (orientation: portrait) and (max-height: 620px) {
+  .game-arena-screen.is-touch-surface {
+    --touch-dpad-size: 134px;
+    --touch-boost-size: 62px;
+  }
+}
+
+/* Short landscape (phones): smaller clusters so the Boost button still fits
+   in the gutter below the left pad. */
+@media (orientation: landscape) and (max-height: 430px) {
+  .game-arena-screen.is-touch-surface {
+    --touch-dpad-size: 128px;
+    --touch-boost-size: 62px;
+  }
+}
+
+@media (orientation: portrait) {
+  .touch-controls__cluster--left {
+    display: none;
+  }
+
+  .touch-controls__cluster--right {
+    right: max(14px, env(safe-area-inset-right, 0px));
+    bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Boost sits adjacent to the d-pad, centered on its vertical middle, with
+     the fullscreen toggle floating above it. */
+  .touch-controls__aux {
+    right: calc(max(14px, env(safe-area-inset-right, 0px)) + var(--touch-dpad-size) + 18px);
+    bottom: calc(
+      18px + env(safe-area-inset-bottom, 0px) +
+      (var(--touch-dpad-size) - var(--touch-boost-size)) / 2
+    );
+    flex-direction: column-reverse;
+  }
+
+  .game-arena-screen.is-touch-surface .game-arena-stage {
+    padding-bottom: calc(var(--touch-portrait-reserve, 196px) + env(safe-area-inset-bottom, 0px));
+
+    /* Anchor to the HUD instead of dead-centering: when the 5px cell floor
+       makes the arena taller than the reserved space, the overflow goes
+       downward only, so the scoreboard is never covered. */
+    justify-content: flex-start;
+  }
+
+  /* The touch clusters own the bottom-right corner; the chat dock moves to
+     the left edge above the controls hint. */
+  .game-arena-screen.is-touch-surface .home-lobby-chat {
+    right: auto;
+    left: max(12px, env(safe-area-inset-left, 0px));
+    bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* The small-screen hint normally stretches to the chat trigger's old spot
+     on the right; on touch that ground belongs to the d-pad, so the (much
+     smaller) touch legend hugs the left edge instead. */
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch {
+    right: auto;
+  }
+}
+
+@media (orientation: landscape) {
+  .touch-controls__cluster--left {
+    left: max(14px, env(safe-area-inset-left, 0px));
+    top: calc(var(--game-hud-top-footprint, 132px) + 10px);
+  }
+
+  .touch-controls__cluster--right {
+    right: max(14px, env(safe-area-inset-right, 0px));
+    top: calc(var(--game-hud-top-footprint, 132px) + 10px);
+  }
+
+  /* Boost centered under the left d-pad, fullscreen toggle beside it. The
+     min() keeps the cluster on-screen when the viewport is too short for
+     "below the pad" to exist. */
+  .touch-controls__aux {
+    left: calc(
+      max(14px, env(safe-area-inset-left, 0px)) +
+      (var(--touch-dpad-size) - var(--touch-boost-size)) / 2
+    );
+    top: min(
+      calc(var(--game-hud-top-footprint, 132px) + 10px + var(--touch-dpad-size) + 12px),
+      calc(100dvh - var(--touch-boost-size) - 10px - env(safe-area-inset-bottom, 0px))
+    );
+    flex-direction: row;
+  }
+
+  .game-arena-screen.is-touch-surface .game-arena-stage {
+    padding-right: calc(var(--touch-side-reserve, 188px) + env(safe-area-inset-right, 0px));
+    padding-left: calc(var(--touch-side-reserve, 188px) + env(safe-area-inset-left, 0px));
+  }
+
+}
+
+/* On short touch landscape the bottom-left rail and bottom-center are both
+   taken (Boost cluster, arena charge strip). The much smaller touch legend
+   tucks into the right gutter under the right d-pad, and the chat trigger
+   drops to the corner beneath it. */
+@media (orientation: landscape) and (max-height: 560px) {
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch {
+    position: fixed;
+    left: auto;
+    right: max(14px, env(safe-area-inset-right, 0px));
+    top: calc(var(--game-hud-top-footprint, 132px) + 10px + var(--touch-dpad-size, 158px) + 10px);
+    bottom: auto;
+    width: auto;
+    min-height: 0;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch .game-controls-hint__group.is-boost {
+    display: flex;
+    align-items: center;
+  }
+
+  .game-arena-screen.is-touch-surface .home-lobby-chat {
+    right: max(8px, env(safe-area-inset-right, 0px));
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Same icon-only treatment the narrow-portrait rule gives the trigger, so
+     the corner row (help button + chat) fits inside the right gutter. */
+  .game-arena-screen.is-touch-surface .home-chat-trigger {
+    width: 48px;
+    min-width: 48px;
+    height: 48px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .game-arena-screen.is-touch-surface .home-chat-label {
+    display: none;
+  }
+}
+
+/* Ultra-short landscape leaves no gutter row for both the legend and the
+   chat trigger below the right d-pad. Keep only the help button, seated in
+   the corner row beside the chat trigger; the Boost input preference stays
+   reachable on every taller layout. */
+@media (orientation: landscape) and (max-height: 400px) {
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch {
+    top: auto;
+    right: calc(max(8px, env(safe-area-inset-right, 0px)) + 56px);
+    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch .game-controls-hint__group.is-boost {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .touch-boost {
     transition: none;
   }
 }

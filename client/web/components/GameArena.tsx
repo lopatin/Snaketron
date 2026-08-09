@@ -59,79 +59,85 @@ import type {
   PredictedCrashVisualState,
 } from '../utils/crashExplosion';
 import type { PredictedScoreVisualState } from '../utils/scoreEffects';
+import BoostCanisterMark from './BoostCanisterMark';
+import TouchControls, {
+  TOUCH_LANDSCAPE_SIDE_RESERVE_PX,
+  TOUCH_PORTRAIT_BOTTOM_RESERVE_PX,
+  type ScreenDirection,
+} from './TouchControls';
+import { useInputSurface } from '../hooks/useInputSurface';
+import { useFullscreen } from '../hooks/useFullscreen';
 import './GameArena.css';
 
-function BoostCanisterMark() {
-  return (
-    <svg
-      className="game-boost-meter__canister"
-      data-testid="boost-nos-bottle"
-      viewBox="0 0 34 24"
-      preserveAspectRatio="xMidYMid meet"
-      shapeRendering="geometricPrecision"
-      aria-hidden="true"
-      focusable="false"
-    >
-      <g className="game-boost-meter__canister-tilt" transform="rotate(-24 17 12)">
-        <path
-          className="game-boost-meter__canister-base"
-          fill="#3b82f6"
-          d="M2.8 4.8h18.4l3.2 2.8h2V6.1h4.3v2H33v7.8h-2.3v2h-4.3v-1.5h-2l-3.2 2.8H2.8L.6 17V7l2.2-2.2Z"
-        />
-        <path
-          className="game-boost-meter__canister-body"
-          fill="#3b82f6"
-          d="M3.2 6.3h17.4l2.2 2v7.4l-2.2 2H3.2L2 16.5v-9l1.2-1.2Z"
-        />
-        <path
-          className="game-boost-meter__canister-highlight"
-          fill="#93c5fd"
-          d="M2.8 4.8h18.4l3.2 2.8h2v1.1h-2.3l-3.2-2.4H3.2L2 7.5v3H.6V7l2.2-2.2Z"
-        />
-        <path
-          className="game-boost-meter__canister-shade"
-          fill="#2563eb"
-          d="M.6 13.5H2v3l1.2 1.2h17.4l2.2-2v-2.2h1.6v2.9h2v1.5h-2l-3.2 1.3H2.8L.6 17v-3.5Z"
-        />
-        <rect
-          className="game-boost-meter__pressure-plate-separator"
-          x="5"
-          y="6.3"
-          width="15.8"
-          height="11.4"
-          fill="#f8fafc"
-        />
-        <rect
-          className="game-boost-meter__pressure-plate"
-          x="6.7"
-          y="8"
-          width="12.4"
-          height="8"
-          fill="#ff641e"
-        />
-        <text
-          className="game-boost-meter__nos-wordmark"
-          x="12.9"
-          y="12.25"
-          fill="#fff"
-          fontFamily="Arial, sans-serif"
-          fontSize="5.5"
-          fontStyle="normal"
-          fontWeight="900"
-          letterSpacing="0"
-          textAnchor="middle"
-          dominantBaseline="middle"
-        >
-          NOS
-        </text>
-        <path fill="#f8fafc" d="M24.2 9.2h2.4v5.6h-2.4Z" />
-        <path fill="#93c5fd" d="M26.2 7.5h3.1v9h-3.1Z" />
-        <path fill="#f8fafc" d="M27 7.5h2.3v4.3H27Z" />
-        <path fill="#ff641e" d="M29.3 8.6h2v2.6h-2Z" />
-        <path fill="#2563eb" d="M29.3 13h2v2.4h-2Z" />
-      </g>
-    </svg>
-  );
+/**
+ * Pointer edges for one physical Boost button, isolated per button so the
+ * arena meter and the mobile touch button cannot claim each other's pointer.
+ * The shared controller still collapses simultaneous holds into one level.
+ */
+function useBoostPointerBinding(
+  controllerRef: React.MutableRefObject<BoostInputController | null>,
+  contextRef: React.MutableRefObject<BoostInputContext>,
+  sendBoostDecision: (decision: BoostInputDecision) => void,
+) {
+  const pointerIdRef = useRef<number | null>(null);
+
+  const onPointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const controller = controllerRef.current;
+    if (!controller || controller.getMode() !== 'hold' || event.button !== 0) {
+      return;
+    }
+
+    // One hold per button: a second finger landing on the same button must
+    // not claim the capture (its release would then be unmatchable) or
+    // inflate the controller's hold count past what this button can release.
+    if (pointerIdRef.current !== null) {
+      event.preventDefault();
+      return;
+    }
+
+    const decision = controller.handlePointerDown(contextRef.current);
+    if (decision.preventDefault) {
+      event.preventDefault();
+    }
+
+    // Always claim the pointer, even while commands cannot be sent. The press
+    // is a physical fact the controller has already recorded, and skipping this
+    // would drop the matching release and leave the hold latched on forever.
+    pointerIdRef.current = event.pointerId;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic and older embedded browsers may not expose pointer capture;
+      // pointerup/cancel still delivers the matching release in the common path.
+    }
+    sendBoostDecision(decision);
+  }, [contextRef, controllerRef, sendBoostDecision]);
+
+  const onPointerRelease = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    if (pointerIdRef.current !== event.pointerId) {
+      return;
+    }
+    pointerIdRef.current = null;
+
+    const controller = controllerRef.current;
+    if (!controller) {
+      return;
+    }
+    const decision = controller.handlePointerUp(contextRef.current);
+    if (decision.preventDefault) {
+      event.preventDefault();
+    }
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // The browser may already have released capture during cancellation.
+    }
+    sendBoostDecision(decision);
+  }, [contextRef, controllerRef, sendBoostDecision]);
+
+  return { onPointerDown, onPointerRelease };
 }
 
 const commandIdKey = (commandId: CommandId): string => (
@@ -260,6 +266,16 @@ export default function GameArena() {
   });
 
   const [gameOver, setGameOver] = useState(false);
+  const inputSurface = useInputSurface();
+  const isTouchSurface = inputSurface === 'touch';
+  const fullscreen = useFullscreen();
+  // The touch d-pad reads its gates through this ref so a tap consults the
+  // freshest game state at event time, exactly like the keydown listener's
+  // ref reads, without re-subscribing anything per simulation tick.
+  const steerContextRef = useRef<{ canSteer: boolean; rotation: ArenaRotation }>({
+    canSteer: false,
+    rotation: 0,
+  });
   const [boostInputMode, setBoostInputMode] = useState<BoostInputMode>(loadBoostInputMode);
   const boostInputControllerRef = useRef<BoostInputController | null>(null);
   if (boostInputControllerRef.current === null) {
@@ -273,17 +289,17 @@ export default function GameArena() {
   });
   const sendBoostCommandRef = useRef<(command: BoostInputCommand) => void>(() => {});
   const boostInputGameIdRef = useRef(gameId);
-  const boostPointerIdRef = useRef<number | null>(null);
   const releaseBoostBeforeLeave = useCallback(() => {
     const controller = boostInputControllerRef.current;
     if (!controller) {
       return;
     }
+    // Per-button pointer ids need no reset here: a release arriving after
+    // teardown finds physicalPointerDown already false and is ignored.
     const decision = controller.teardown(boostInputContextRef.current);
     if (decision.command) {
       sendBoostCommandRef.current(decision.command);
     }
-    boostPointerIdRef.current = null;
   }, []);
   const gameSessionClosedRef = useRef(false);
   const leaveGameRef = useRef(leaveGame);
@@ -529,8 +545,26 @@ export default function GameArena() {
               .getPropertyValue('--game-boost-indicator-height'),
           ) || 40
         : 0;
-      const availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10;
-      const availableWidth = vw - 32 - 10;
+      // On touch surfaces the on-screen controls own part of the viewport:
+      // the portrait d-pad sits under the arena, the landscape d-pads flank
+      // it. These reserves mirror the stage padding in GameArena.css —
+      // including the safe-area insets, which are only ever non-zero on
+      // notched phones in fullscreen — so the canvas can never end up
+      // underneath a control cluster.
+      const rootStyle = getComputedStyle(document.documentElement);
+      const safeAreaInset = (side: 'bottom' | 'left' | 'right'): number =>
+        Number.parseFloat(rootStyle.getPropertyValue(`--safe-area-inset-${side}`)) || 0;
+      // Strict comparison to match CSS: `orientation: portrait` matches when
+      // height >= width, so an exactly-square viewport is portrait there too.
+      const isLandscapeViewport = vw > vh;
+      const touchBottomReserve = isTouchSurface && !isLandscapeViewport
+        ? TOUCH_PORTRAIT_BOTTOM_RESERVE_PX + safeAreaInset('bottom')
+        : 0;
+      const touchSideReserve = isTouchSurface && isLandscapeViewport
+        ? TOUCH_LANDSCAPE_SIDE_RESERVE_PX * 2 + safeAreaInset('left') + safeAreaInset('right')
+        : 0;
+      const availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10 - touchBottomReserve;
+      const availableWidth = vw - 32 - 10 - touchSideReserve;
       
       // For vertical orientations (90° and 270°), we need to swap dimensions
       const isVertical = rotation === 90 || rotation === 270;
@@ -560,9 +594,9 @@ export default function GameArena() {
 
     calculateSizes();
     window.addEventListener('resize', calculateSizes);
-    
+
     return () => window.removeEventListener('resize', calculateSizes);
-  }, [gameState, committedState, rotation]);
+  }, [gameState, committedState, rotation, isTouchSurface]);
 
   // Check for game completion
   useEffect(() => {
@@ -932,9 +966,12 @@ export default function GameArena() {
   // state here rather than off anything chosen at queue time.
   const readinessState = committedState ?? gameState;
   const tutorial = useMemo(
-    () => (readinessState ? tutorialContentForGame(readinessState, boostInputMode) : null),
+    () => (readinessState
+      ? tutorialContentForGame(readinessState, boostInputMode, inputSurface)
+      : null),
     [
       boostInputMode,
+      inputSurface,
       readinessState?.game_type,
       readinessState?.properties.score_limit,
       readinessState?.queue_mode,
@@ -1155,6 +1192,13 @@ export default function GameArena() {
   // A modal owns the screen: Space belongs to its Ready button, not to Boost.
   const isModalOwningInput = showBriefing || showHelp;
   isModalOwningInputRef.current = isModalOwningInput;
+  // The touch d-pad shares the keyboard steering gates. Modal ownership is
+  // deliberately left out and read at event time instead, exactly like the
+  // keydown path, so a briefing opening mid-game swallows taps immediately.
+  steerContextRef.current = {
+    canSteer: Boolean(gameState) && isGameInteractionActive && !isBoostGameTerminal,
+    rotation,
+  };
   const boostInputContext: BoostInputContext = {
     active: Boolean(localSnake?.boost.active),
     // The engine's latched copy of what this player asked for. Reconciliation
@@ -1183,6 +1227,22 @@ export default function GameArena() {
     }
     sendCommand('PlayerActivity');
   }, [gameOver, isGameInteractionActive, localWasIdleKicked, sendCommand]);
+
+  // Touch steering funnels into the exact same command path as the arrow
+  // keys, including the Rust screen->game rotation mapping, so the d-pad can
+  // never disagree with what the rotated renderer shows.
+  const handleTouchSteer = useCallback((screenDirection: ScreenDirection) => {
+    const wasm = getWasm();
+    const { canSteer, rotation: steerRotation } = steerContextRef.current;
+    if (!wasm || !canSteer || isModalOwningInputRef.current) {
+      return;
+    }
+    const transformedDirection = wasm.screenDirectionToGame(
+      screenDirection,
+      steerRotation,
+    ) as ScreenDirection;
+    sendCommand({ Turn: { direction: transformedDirection } });
+  }, [sendCommand]);
 
   const sendBoostDecision = useCallback((decision: BoostInputDecision) => {
     if (decision.command) {
@@ -1218,53 +1278,16 @@ export default function GameArena() {
     sendBoostDecision(decision);
   }, [sendBoostDecision]);
 
-  const handleBoostPointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    const controller = boostInputControllerRef.current;
-    if (!controller || controller.getMode() !== 'hold' || event.button !== 0) {
-      return;
-    }
-
-    const decision = controller.handlePointerDown(boostInputContextRef.current);
-    if (decision.preventDefault) {
-      event.preventDefault();
-    }
-
-    // Always claim the pointer, even while commands cannot be sent. The press
-    // is a physical fact the controller has already recorded, and skipping this
-    // would drop the matching release and leave the hold latched on forever.
-    boostPointerIdRef.current = event.pointerId;
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Synthetic and older embedded browsers may not expose pointer capture;
-      // pointerup/cancel still delivers the matching release in the common path.
-    }
-    sendBoostDecision(decision);
-  }, [sendBoostDecision]);
-
-  const handleBoostPointerRelease = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    if (boostPointerIdRef.current !== event.pointerId) {
-      return;
-    }
-    boostPointerIdRef.current = null;
-
-    const controller = boostInputControllerRef.current;
-    if (!controller) {
-      return;
-    }
-    const decision = controller.handlePointerUp(boostInputContextRef.current);
-    if (decision.preventDefault) {
-      event.preventDefault();
-    }
-    try {
-      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
-    } catch {
-      // The browser may already have released capture during cancellation.
-    }
-    sendBoostDecision(decision);
-  }, [sendBoostDecision]);
+  const hudBoostPointer = useBoostPointerBinding(
+    boostInputControllerRef,
+    boostInputContextRef,
+    sendBoostDecision,
+  );
+  const touchBoostPointer = useBoostPointerBinding(
+    boostInputControllerRef,
+    boostInputContextRef,
+    sendBoostDecision,
+  );
 
   const handleBoostInputModeChange = useCallback((mode: BoostInputMode) => {
     const controller = boostInputControllerRef.current;
@@ -1336,6 +1359,23 @@ export default function GameArena() {
       }
     };
   }, []);
+
+  // Retiring the touch surface mid-hold (a tablet docking to a keyboard)
+  // unmounts the NOS button together with its pointer-release edge, which
+  // would otherwise leave the hold latched on forever. Drop held edges the
+  // same way the blur safety net does; with nothing held this is a no-op.
+  useEffect(() => {
+    if (isTouchSurface) {
+      return;
+    }
+    const controller = boostInputControllerRef.current;
+    if (controller) {
+      const decision = controller.releaseHeld(boostInputContextRef.current);
+      if (decision.command) {
+        sendBoostCommandRef.current(decision.command);
+      }
+    }
+  }, [isTouchSurface]);
 
   // Republish Boost intent whenever the engine's latched copy disagrees with
   // what the player is doing. Losing interaction is deliberately NOT treated as
@@ -1456,6 +1496,28 @@ export default function GameArena() {
 
   const showAuthLoading = authLoading || !user;
 
+  // CrazyGames supplies its own fullscreen chrome and their QA rejects a
+  // second in-game prompt; iPhones have no Fullscreen API at all. Everyone
+  // else on a touch surface gets the toggle next to the touch controls.
+  const showFullscreenControl =
+    fullscreen.supported && !crazyGames.getSnapshot().isCrazyGamesBuild;
+
+  const touchControls = isTouchSurface && !gameOver && isLocalUserPlaying ? (
+    <TouchControls
+      onSteer={handleTouchSteer}
+      boost={boostConfig && localSnake && boostHud ? {
+        hud: boostHud,
+        inputMode: boostInputMode,
+        onTap: handleBoostButtonPress,
+        onPointerDown: touchBoostPointer.onPointerDown,
+        onPointerRelease: touchBoostPointer.onPointerRelease,
+      } : null}
+      fullscreen={showFullscreenControl
+        ? { active: fullscreen.active, onToggle: fullscreen.toggle }
+        : null}
+    />
+  ) : null;
+
   const boostControl = boostConfig && localSnake && boostHud && !gameOver ? (
     <div
       className={`game-boost-hud${isArenaVisible ? ' is-visible' : ''}${boostHud.active ? ' is-active' : ''}${boostHud.ready ? ' is-ready' : ''}`}
@@ -1485,10 +1547,10 @@ export default function GameArena() {
         type="button"
         onClick={handleBoostButtonPress}
         onKeyDown={handleBoostControlKeyDown}
-        onPointerDown={handleBoostPointerDown}
-        onPointerUp={handleBoostPointerRelease}
-        onPointerCancel={handleBoostPointerRelease}
-        onLostPointerCapture={handleBoostPointerRelease}
+        onPointerDown={hudBoostPointer.onPointerDown}
+        onPointerUp={hudBoostPointer.onPointerRelease}
+        onPointerCancel={hudBoostPointer.onPointerRelease}
+        onLostPointerCapture={hudBoostPointer.onPointerRelease}
         disabled={boostButtonDisabled}
         aria-label={boostInputMode === 'hold'
           ? (boostHud.active
@@ -1517,7 +1579,15 @@ export default function GameArena() {
   }
   
   return (
-    <div className="game-arena-screen fixed inset-0 flex flex-col overflow-hidden">
+    <div
+      className={`game-arena-screen fixed inset-0 flex flex-col overflow-hidden${
+        isTouchSurface ? ' is-touch-surface' : ''
+      }`}
+      style={isTouchSurface ? {
+        '--touch-portrait-reserve': `${TOUCH_PORTRAIT_BOTTOM_RESERVE_PX}px`,
+        '--touch-side-reserve': `${TOUCH_LANDSCAPE_SIDE_RESERVE_PX}px`,
+      } as React.CSSProperties : undefined}
+    >
 
       <>
         <GameHudShell
@@ -1662,6 +1732,7 @@ export default function GameArena() {
           <GameControlsHint
             showBoost={Boolean(boostConfig)}
             boostInputMode={boostInputMode}
+            inputSurface={inputSurface}
             onBoostInputModeChange={handleBoostInputModeChange}
             // Withheld while inactivity owns the screen: the help modal would
             // be closed again on the next commit, so offering it reads as a
@@ -1673,6 +1744,7 @@ export default function GameArena() {
         </div>
 
       </>
+      {touchControls}
       {tutorial && (
         <TutorialModal
           open={showBriefing || showHelp}

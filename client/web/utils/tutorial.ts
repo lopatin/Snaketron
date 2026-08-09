@@ -1,6 +1,7 @@
 import type { GameState, GameType, QueueMode } from '../types';
 import { gameStorage } from '../services/gameStorage.ts';
 import type { BoostInputMode } from './boostInput';
+import type { InputSurface } from './inputSurface';
 
 /**
  * One tutorial exists per (game mode x ranked/unranked) combination. There are
@@ -90,13 +91,20 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
  *   queue context is already named by the tutorial kicker, so step copy stays
  *   focused on what the player needs to do.
  */
-const collectibleBoostStep = (inputMode: BoostInputMode): TutorialStep => ({
+const collectibleBoostStep = (
+  inputMode: BoostInputMode,
+  inputSurface: InputSurface,
+): TutorialStep => ({
   scene: 'team-boost',
   title: 'BOOST',
   body:
-    inputMode === 'toggle'
-      ? 'Collect NOS, then press Space to toggle boost.'
-      : 'Collect NOS, then hold Space to boost.',
+    inputSurface === 'touch'
+      ? (inputMode === 'toggle'
+          ? 'Collect NOS, then tap the NOS button to toggle boost.'
+          : 'Collect NOS, then hold the NOS button to boost.')
+      : (inputMode === 'toggle'
+          ? 'Collect NOS, then press Space to toggle boost.'
+          : 'Collect NOS, then hold Space to boost.'),
   visualLabel: 'A snake collects NOS; its fuel fills and it accelerates.',
 });
 
@@ -104,6 +112,7 @@ const teamSteps = (
   mode: 'duel' | '2v2',
   scoreLimit: number | null,
   inputMode: BoostInputMode,
+  inputSurface: InputSurface,
 ): [TutorialStep, TutorialStep, TutorialStep] => {
   // There is no clock to fall back on, so a match whose state somehow carries
   // no target gets the shape of the rule without inventing a number.
@@ -122,7 +131,7 @@ const teamSteps = (
           ? 'A snake returns through the gate labeled YOU; the team score increases.'
           : 'A teammate returns through the gate labeled YOU; the shared team score increases.',
     },
-    collectibleBoostStep(inputMode),
+    collectibleBoostStep(inputMode, inputSurface),
     {
       scene: 'team-danger',
       title: 'STAY OUT',
@@ -134,6 +143,7 @@ const teamSteps = (
 
 const ffaSteps = (
   inputMode: BoostInputMode,
+  inputSurface: InputSurface,
 ): [TutorialStep, TutorialStep, TutorialStep] => [
   {
     scene: 'ffa-food',
@@ -141,7 +151,7 @@ const ffaSteps = (
     body: 'Eat food to grow and score.',
     visualLabel: 'A snake eats food, grows two segments, and gains two points.',
   },
-  { ...collectibleBoostStep(inputMode), scene: 'ffa-boost' },
+  { ...collectibleBoostStep(inputMode, inputSurface), scene: 'ffa-boost' },
   {
     scene: 'ffa-crash',
     title: 'ONE LIFE',
@@ -150,20 +160,30 @@ const ffaSteps = (
   },
 ];
 
-const soloSteps = (inputMode: BoostInputMode): [TutorialStep, TutorialStep, TutorialStep] => [
+const soloSteps = (
+  inputMode: BoostInputMode,
+  inputSurface: InputSurface,
+): [TutorialStep, TutorialStep, TutorialStep] => [
   {
     scene: 'solo-food',
     title: 'MOVE & GROW',
-    body: 'Use arrow keys to eat, grow, and score.',
+    body:
+      inputSurface === 'touch'
+        ? 'Steer with the d-pad to eat, grow, and score.'
+        : 'Use arrow keys to eat, grow, and score.',
     visualLabel: 'The solo snake turns toward food and grows.',
   },
   {
     scene: 'solo-boost',
     title: 'UNLIMITED BOOST',
     body:
-      inputMode === 'toggle'
-        ? 'Press Space to toggle unlimited boost.'
-        : 'Hold Space for unlimited boost.',
+      inputSurface === 'touch'
+        ? (inputMode === 'toggle'
+            ? 'Tap the NOS button to toggle unlimited boost.'
+            : 'Hold the NOS button for unlimited boost.')
+        : (inputMode === 'toggle'
+            ? 'Press Space to toggle unlimited boost.'
+            : 'Hold Space for unlimited boost.'),
     visualLabel: 'The solo snake boosts while its full fuel meter stays full.',
   },
   {
@@ -188,15 +208,16 @@ export const tutorialContent = (
   queueMode: QueueMode,
   facts: TutorialFacts = { scoreLimit: null },
   inputMode: BoostInputMode = 'hold',
+  inputSurface: InputSurface = 'keyboard',
 ): TutorialContent => {
   const ranked = queueMode === 'Competitive';
   const key = tutorialKey(mode, queueMode);
   const steps =
     mode === 'solo'
-      ? soloSteps(inputMode)
+      ? soloSteps(inputMode, inputSurface)
       : mode === 'ffa'
-        ? ffaSteps(inputMode)
-        : teamSteps(mode, facts.scoreLimit, inputMode);
+        ? ffaSteps(inputMode, inputSurface)
+        : teamSteps(mode, facts.scoreLimit, inputMode, inputSurface);
 
   return {
     key,
@@ -211,6 +232,7 @@ export const tutorialContent = (
 export const tutorialContentForGame = (
   gameState: Pick<GameState, 'game_type' | 'queue_mode' | 'properties'>,
   inputMode: BoostInputMode = 'hold',
+  inputSurface: InputSurface = 'keyboard',
 ): TutorialContent | null => {
   const mode = tutorialModeForGameType(gameState.game_type);
   return mode === null
@@ -220,6 +242,7 @@ export const tutorialContentForGame = (
         gameState.queue_mode,
         { scoreLimit: gameState.properties.score_limit },
         inputMode,
+        inputSurface,
       );
 };
 

@@ -141,3 +141,35 @@ export const NetworkIcon = ({ className = '', style = {} }: { className?: string
     />
   </svg>
 );
+
+export const FullscreenEnterIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={2.2}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"
+    />
+  </svg>
+);
+
+export const FullscreenExitIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={2.2}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6"
+    />
+  </svg>
+);

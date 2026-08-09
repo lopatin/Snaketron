@@ -347,8 +347,31 @@ test('Hold pointer edges start and stop Boost while its synthesized click is ine
     preventDefault: true,
     command: 'ActivateBoost',
   });
-  assert.equal(controller.handlePointerDown(context({ intent: true })).command, null);
   assert.equal(controller.handleButtonPress(context({ intent: true, active: true })).command, null);
+  assert.deepEqual(controller.handlePointerUp(context({ intent: true, active: true })), {
+    preventDefault: true,
+    command: 'DeactivateBoost',
+  });
+  assert.equal(controller.handlePointerUp(context()).command, null);
+});
+
+// Touch surfaces render two physical Boost buttons (the arena meter and the
+// mobile NOS button). Holds are counted: the level a player is expressing
+// ends when the LAST finger lifts, never when the first one does.
+test('a second button joining a Hold keeps Boost until the last release', () => {
+  const controller = new BoostInputController('hold');
+
+  assert.equal(controller.handlePointerDown(context()).command, 'ActivateBoost');
+  assert.equal(
+    controller.handlePointerDown(context({ intent: true, active: true })).command,
+    null,
+    'a second button joining the hold publishes nothing new',
+  );
+  assert.equal(
+    controller.handlePointerUp(context({ intent: true, active: true })).command,
+    null,
+    'the first release must not end a hold another button still expresses',
+  );
   assert.deepEqual(controller.handlePointerUp(context({ intent: true, active: true })), {
     preventDefault: true,
     command: 'DeactivateBoost',

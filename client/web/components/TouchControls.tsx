@@ -1,0 +1,198 @@
+import React, { useRef } from 'react';
+import BoostCanisterMark from './BoostCanisterMark';
+import { FullscreenEnterIcon, FullscreenExitIcon } from './Icons';
+import type { BoostHudView } from '../utils/boostHud';
+import type { BoostInputMode } from '../utils/boostInput';
+
+/** A direction as the player sees it on screen, before arena-rotation mapping. */
+export type ScreenDirection = 'Up' | 'Down' | 'Left' | 'Right';
+
+/**
+ * Viewport room the arena sizing must leave free for the touch clusters.
+ * GameArena's `calculateSizes` subtracts these and GameArena.css pads the
+ * stage by the same values (via --touch-portrait-reserve/--touch-side-reserve
+ * set on the arena root), so the canvas never slides under a d-pad. The
+ * numbers cover the largest cluster footprint: 158px d-pad + edge margins.
+ */
+export const TOUCH_PORTRAIT_BOTTOM_RESERVE_PX = 196;
+export const TOUCH_LANDSCAPE_SIDE_RESERVE_PX = 188;
+
+export interface TouchBoostBinding {
+  hud: BoostHudView;
+  inputMode: BoostInputMode;
+  /** Toggle-mode activation; the controller ignores it in hold mode. */
+  onTap: () => void;
+  /** Hold-mode pointer edges; the controller ignores them in toggle mode. */
+  onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
+  onPointerRelease: (event: React.PointerEvent<HTMLButtonElement>) => void;
+}
+
+interface TouchControlsProps {
+  onSteer: (direction: ScreenDirection) => void;
+  /** Absent when the match has no Boost or the local snake is gone. */
+  boost: TouchBoostBinding | null;
+  /** Absent in CrazyGames builds (the portal owns fullscreen) and on iPhones. */
+  fullscreen: { active: boolean; onToggle: () => void } | null;
+}
+
+const DIRECTION_LABELS: Record<ScreenDirection, string> = {
+  Up: 'Steer up',
+  Down: 'Steer down',
+  Left: 'Steer left',
+  Right: 'Steer right',
+};
+
+/** Chevron pointing up; each button rotates it via CSS. */
+function ChevronGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path
+        d="M4.5 14.6 12 7.4l7.5 7.2"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="3.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+interface DPadProps {
+  onSteer: (direction: ScreenDirection) => void;
+  /** Distinguishes the two landscape pads for tests and ARIA. */
+  side: 'left' | 'right';
+}
+
+function DPad({ onSteer, side }: DPadProps) {
+  // Steering fires on pointerdown for zero-latency response. Assistive
+  // technologies drive buttons with click instead, so click is honored too —
+  // but a click that immediately follows our own pointerdown on the same
+  // direction is the browser's synthesized follow-up, not a second command.
+  const recentPointerSteerRef = useRef<{
+    direction: ScreenDirection;
+    at: number;
+  } | null>(null);
+
+  const steerFromPointer =
+    (direction: ScreenDirection) => (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0 && event.pointerType === 'mouse') {
+        return;
+      }
+      recentPointerSteerRef.current = { direction, at: event.timeStamp };
+      onSteer(direction);
+    };
+
+  const steerFromClick =
+    (direction: ScreenDirection) => (event: React.MouseEvent<HTMLButtonElement>) => {
+      const recent = recentPointerSteerRef.current;
+      if (
+        recent &&
+        recent.direction === direction &&
+        event.timeStamp - recent.at < 600
+      ) {
+        return;
+      }
+      onSteer(direction);
+    };
+
+  return (
+    <div
+      className="touch-dpad"
+      role="group"
+      aria-label={side === 'left' ? 'Steering pad (left)' : 'Steering pad'}
+      data-testid={`touch-dpad-${side}`}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      {(['Up', 'Left', 'Right', 'Down'] as const).map((direction) => (
+        <button
+          key={direction}
+          type="button"
+          className={`touch-dpad__btn touch-dpad__btn--${direction.toLowerCase()}`}
+          aria-label={DIRECTION_LABELS[direction]}
+          data-testid={`touch-steer-${direction.toLowerCase()}`}
+          tabIndex={-1}
+          onPointerDown={steerFromPointer(direction)}
+          onClick={steerFromClick(direction)}
+        >
+          <ChevronGlyph />
+        </button>
+      ))}
+      <span className="touch-dpad__hub" aria-hidden="true" />
+    </div>
+  );
+}
+
+/**
+ * On-screen gameplay controls for touch surfaces.
+ *
+ * Portrait shows one d-pad near the bottom-right (right-thumb steering) with
+ * the NOS Boost button adjacent on its left. Landscape shows a d-pad at each
+ * top corner so either thumb can steer, with the Boost button under the left
+ * pad. Which clusters are visible is pure CSS (orientation media queries), so
+ * rotating the device never remounts a control mid-hold.
+ */
+export function TouchControls({ onSteer, boost, fullscreen }: TouchControlsProps) {
+  const boostHud = boost?.hud ?? null;
+  const chargeDegrees = boostHud ? Math.round(boostHud.fillRatio * 360) : 0;
+
+  const boostButton = boost && boostHud ? (
+    <button
+      type="button"
+      className={
+        'touch-boost' +
+        (boostHud.active ? ' is-active' : '') +
+        (boostHud.ready ? ' is-ready' : '')
+      }
+      style={{ '--touch-boost-charge': `${chargeDegrees}deg` } as React.CSSProperties}
+      disabled={boostHud.buttonDisabled}
+      aria-label={boost.inputMode === 'hold'
+        ? (boostHud.active
+            ? `Release Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
+            : `Hold to Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)
+        : (boostHud.active
+            ? `Stop Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
+            : `Activate Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)}
+      data-testid="touch-boost-button"
+      onClick={boost.onTap}
+      onPointerDown={boost.onPointerDown}
+      onPointerUp={boost.onPointerRelease}
+      onPointerCancel={boost.onPointerRelease}
+      onLostPointerCapture={boost.onPointerRelease}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <BoostCanisterMark className="touch-boost__canister" />
+    </button>
+  ) : null;
+
+  const fullscreenButton = fullscreen ? (
+    <button
+      type="button"
+      className="touch-fullscreen"
+      aria-label={fullscreen.active ? 'Exit full screen' : 'Enter full screen'}
+      data-testid="touch-fullscreen-button"
+      onClick={fullscreen.onToggle}
+    >
+      {fullscreen.active
+        ? <FullscreenExitIcon className="touch-fullscreen__icon" />
+        : <FullscreenEnterIcon className="touch-fullscreen__icon" />}
+    </button>
+  ) : null;
+
+  return (
+    <div className="touch-controls" data-testid="touch-controls">
+      <div className="touch-controls__cluster touch-controls__cluster--left">
+        <DPad onSteer={onSteer} side="left" />
+      </div>
+      <div className="touch-controls__cluster touch-controls__cluster--right">
+        <DPad onSteer={onSteer} side="right" />
+      </div>
+      <div className="touch-controls__aux">
+        {boostButton}
+        {fullscreenButton}
+      </div>
+    </div>
+  );
+}
+
+export default TouchControls;

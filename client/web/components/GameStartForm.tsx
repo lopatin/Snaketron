@@ -11,6 +11,7 @@ import {
 } from '../utils/lobbyPreferencesStorage';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
 import { crazyGamesGuestNickname } from '../services/crazyGames';
+import { useInputSurface } from '../hooks/useInputSurface';
 
 const areModeSetsEqual = (a: Set<LobbyGameMode> | null, b: Set<LobbyGameMode> | null) => {
   if (a === b) {
@@ -84,12 +85,15 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   const debouncedNickname = useDebouncedValue(nickname, 500);
   const showNicknameError = debouncedNickname.length > 0 && debouncedNickname.length < 3;
 
-  // Auto-focus on nickname field when component mounts
+  // Auto-focus on nickname field when component mounts. Touch surfaces skip
+  // it: focusing a text input there pops the software keyboard over the home
+  // screen before the player has asked to type anything.
+  const inputSurface = useInputSurface();
   useEffect(() => {
-    if (!locksNickname) {
+    if (!locksNickname && inputSurface !== 'touch') {
       nicknameInputRef.current?.focus();
     }
-  }, [locksNickname]);
+  }, [locksNickname, inputSurface]);
 
   // Keep local selection state in sync with lobby-wide preferences
   useEffect(() => {
