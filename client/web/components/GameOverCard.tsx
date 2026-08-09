@@ -1,4 +1,5 @@
 import React, { useEffect, useId, useRef } from 'react';
+import { useInputSurface } from '../hooks/useInputSurface';
 import type { MatchPresentation } from '../utils/gamePresentation';
 import {
   formatPerMinuteRate,
@@ -63,6 +64,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
   onPlayAgain,
   playAgainDisabled = false,
 }) => {
+  const inputSurface = useInputSurface();
   const dialogRef = useRef<HTMLDivElement>(null);
   const playAgainRef = useRef<HTMLButtonElement>(null);
   const onDismissRef = useRef(onDismiss);
@@ -284,10 +286,12 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
             Main menu
           </button>
           <div className="game-over-replay-actions">
-            <span className="game-over-shortcut" aria-hidden="true">
-              <kbd><span>Space</span></kbd>
-              <span>to</span>
-            </span>
+            {inputSurface !== 'touch' && (
+              <span className="game-over-shortcut" aria-hidden="true">
+                <kbd><span>Space</span></kbd>
+                <span>to</span>
+              </span>
+            )}
             <button
               ref={playAgainRef}
               type="button"

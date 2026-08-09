@@ -247,7 +247,15 @@ export function getBoostKeyAction(event: BoostKeyboardEventLike): BoostKeyAction
 export class BoostInputController {
   private mode: BoostInputMode;
   private physicalSpaceDown = false;
-  private physicalPointerDown = false;
+  /**
+   * Count, not boolean: the arena meter button and the mobile NOS button are
+   * both live on touch surfaces, and a level derived from "any pointer is
+   * down" must end on the LAST release, not the first. Each button's binding
+   * guarantees exactly one down/release pair per gesture (pointer capture +
+   * per-button pointer-id guard), so the count cannot drift under normal
+   * delivery; the blur/visibility/unmount safety nets zero it outright.
+   */
+  private physicalPointerHolds = 0;
   /** Toggle mode's durable latch. Hold mode derives its level from the edges. */
   private toggleLatched = false;
   /** The level already published and not yet echoed back by the engine. */
@@ -272,7 +280,7 @@ export class BoostInputController {
   /** The one definition of what the player is currently asking for. */
   private desiredLevel(): boolean {
     return this.mode === 'hold'
-      ? this.physicalSpaceDown || this.physicalPointerDown
+      ? this.physicalSpaceDown || this.physicalPointerHolds > 0
       : this.toggleLatched;
   }
 
@@ -416,22 +424,21 @@ export class BoostInputController {
       return IGNORE_DECISION;
     }
 
-    if (this.physicalPointerDown) {
-      return SUPPRESS_DECISION;
-    }
-
     this.reconciliationSuppressed = false;
-    this.physicalPointerDown = true;
+    // A second button's press while another is held records a real physical
+    // fact; sync() publishes nothing because the level is already true, and
+    // the hold now ends only when the LAST button is released.
+    this.physicalPointerHolds += 1;
     return this.decide(context, true);
   }
 
   handlePointerUp(context: BoostInputContext): BoostInputDecision {
-    if (this.mode !== 'hold' || !this.physicalPointerDown) {
+    if (this.mode !== 'hold' || this.physicalPointerHolds === 0) {
       return IGNORE_DECISION;
     }
 
     this.reconciliationSuppressed = false;
-    this.physicalPointerDown = false;
+    this.physicalPointerHolds -= 1;
     return this.decide(context, true);
   }
 
@@ -444,7 +451,7 @@ export class BoostInputController {
   releaseHeld(context: BoostInputContext): BoostInputDecision {
     this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
-    this.physicalPointerDown = false;
+    this.physicalPointerHolds = 0;
     return this.decide(context, false);
   }
 
@@ -452,7 +459,7 @@ export class BoostInputController {
   cleanup(context: BoostInputContext): BoostInputDecision {
     this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
-    this.physicalPointerDown = false;
+    this.physicalPointerHolds = 0;
     this.toggleLatched = false;
     return this.decide(context, false);
   }
@@ -467,7 +474,7 @@ export class BoostInputController {
   teardown(context: BoostInputContext): BoostInputDecision {
     this.reconciliationSuppressed = false;
     this.physicalSpaceDown = false;
-    this.physicalPointerDown = false;
+    this.physicalPointerHolds = 0;
     this.toggleLatched = false;
     return this.decide(context, false, true);
   }
@@ -491,7 +498,7 @@ export class BoostInputController {
    */
   handleRejectedCommand(command: BoostInputCommand): void {
     this.physicalSpaceDown = false;
-    this.physicalPointerDown = false;
+    this.physicalPointerHolds = 0;
     this.toggleLatched = command === 'DeactivateBoost';
     this.pendingLevel = null;
     this.reconciliationSuppressed = true;
@@ -510,7 +517,7 @@ export class BoostInputController {
   /** Drop all local state, e.g. when the arena switches to a different game. */
   reset(): void {
     this.physicalSpaceDown = false;
-    this.physicalPointerDown = false;
+    this.physicalPointerHolds = 0;
     this.toggleLatched = false;
     this.pendingLevel = null;
     this.interactionWasActive = false;

@@ -252,3 +252,37 @@ test('the persistence key distinguishes ranked from casual for the same mode', (
   assert.equal(tutorialKey('duel', 'Competitive'), 'duel:ranked');
   assert.equal(tutorialKey('duel', 'Quickmatch'), 'duel:casual');
 });
+
+test('touch surfaces teach the d-pad and NOS button instead of keyboard keys', () => {
+  for (const mode of MODES) {
+    for (const inputMode of ['hold', 'toggle'] as const) {
+      const touchCopy = tutorialContent(
+        mode,
+        'Quickmatch',
+        { scoreLimit: 25 },
+        inputMode,
+        'touch',
+      ).steps.map((step) => step.body).join(' ');
+
+      assert.doesNotMatch(touchCopy, /Space/, `${mode}:${inputMode} mentions Space on touch`);
+      assert.doesNotMatch(touchCopy, /arrow keys/i, `${mode}:${inputMode} mentions arrow keys on touch`);
+      assert.match(touchCopy, /NOS button/, `${mode}:${inputMode} must name the NOS button`);
+      if (inputMode === 'hold') {
+        assert.match(touchCopy, /hold the NOS button/i);
+      } else {
+        assert.match(touchCopy, /tap the NOS button/i);
+      }
+    }
+  }
+
+  const touchSolo = tutorialContent('solo', 'Quickmatch', { scoreLimit: null }, 'hold', 'touch');
+  assert.match(touchSolo.steps[0].body, /d-pad/);
+});
+
+test('the keyboard surface is the default, so existing call sites are unchanged', () => {
+  for (const mode of MODES) {
+    const implicit = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'hold');
+    const explicit = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'hold', 'keyboard');
+    assert.deepEqual(implicit, explicit);
+  }
+});

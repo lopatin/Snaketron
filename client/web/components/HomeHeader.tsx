@@ -2,8 +2,18 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { LobbyMember, User } from '../types';
 import type { AccountModalView } from './AccountModal';
-import { HistoryIcon, KeyIcon, LogoutIcon, UserIcon, UserPlusIcon } from './Icons';
+import {
+  FullscreenEnterIcon,
+  FullscreenExitIcon,
+  HistoryIcon,
+  KeyIcon,
+  LogoutIcon,
+  UserIcon,
+  UserPlusIcon,
+} from './Icons';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { useFullscreen } from '../hooks/useFullscreen';
+import { useInputSurface } from '../hooks/useInputSurface';
 
 interface HomeHeaderProps {
   activePage?: 'play' | 'leaderboards';
@@ -33,6 +43,12 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onLogout,
 }) => {
   const { isCrazyGamesBuild, portalUser, userAccountAvailable } = useCrazyGames();
+  const fullscreen = useFullscreen();
+  const inputSurface = useInputSurface();
+  // The CrazyGames portal owns fullscreen chrome, and desktop users have F11;
+  // this toggle exists for phones and tablets browsing snaketron.io directly.
+  const showFullscreenToggle =
+    inputSurface === 'touch' && fullscreen.supported && !isCrazyGamesBuild;
   const [isSocialOpen, setIsSocialOpen] = useState(false);
   const [isAccountOpen, setIsAccountOpen] = useState(false);
   const socialMenuRef = useRef<HTMLDivElement>(null);
@@ -181,6 +197,20 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
         </nav>
 
         <div className="home-account home-account-menu" ref={accountMenuRef}>
+          {showFullscreenToggle && (
+            <button
+              type="button"
+              className="home-fullscreen-toggle"
+              onClick={fullscreen.toggle}
+              aria-label={fullscreen.active ? 'Exit full screen' : 'Enter full screen'}
+              title={fullscreen.active ? 'Exit full screen' : 'Full screen'}
+              data-testid="home-fullscreen-toggle"
+            >
+              {fullscreen.active
+                ? <FullscreenExitIcon className="home-fullscreen-icon" />
+                : <FullscreenEnterIcon className="home-fullscreen-icon" />}
+            </button>
+          )}
           {isCrazyGamesBuild ? (
             portalUser ? (
               <div

@@ -18,6 +18,44 @@ body.crazygames-build [contenteditable='true'] {
   user-select: text;
 }
 
+/* Mobile browser hygiene for every build ----------------------------------
+   The gray tap flash reads as broken paint on a white design, a downward
+   rubber-band mid-match triggers pull-to-refresh straight out of a live
+   game, and double-tap-to-zoom adds delay to every gameplay button. Text
+   entry keeps normal selection behavior. */
+html {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  overscroll-behavior-y: contain;
+}
+
+button,
+[role="button"],
+label,
+kbd {
+  touch-action: manipulation;
+}
+
+/* During a live match on a touch surface the page is one fixed screen:
+   long-press text selection and the iOS callout only ever fire by accident
+   there. Scoped to the touch surface so desktop players can still copy chat
+   messages and final scores; text controls opt back in everywhere. */
+.game-arena-screen.is-touch-surface {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.game-arena-screen.is-touch-surface input,
+.game-arena-screen.is-touch-surface textarea,
+.game-arena-screen.is-touch-surface [contenteditable='true'] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
 /* Custom theme configuration for Tailwind v4 */
 @theme {
   --color-black-70: rgba(0, 0, 0, 0.7);
@@ -42,6 +80,11 @@ body.crazygames-build [contenteditable='true'] {
    This is the original Snaketron scoreboard language: editorial spacing,
    white paper, graphite rules, blue/red match data, and no broadcast chrome. */
 :root {
+  /* Mirrored as custom properties so canvas sizing in JS can read the same
+     insets the fixed chrome offsets itself by (see GameArena calculateSizes). */
+  --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-inset-left: env(safe-area-inset-left, 0px);
+  --safe-area-inset-right: env(safe-area-inset-right, 0px);
   --game-hud-top-footprint: 132px;
   --game-scoreboard-footprint: 64px;
   --game-graphite: #3f3f41;
@@ -1976,6 +2019,33 @@ body {
   padding: 0 20px;
 }
 
+/* Touch-surface fullscreen toggle, shown beside the account cluster. */
+.home-fullscreen-toggle {
+  display: flex;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: rgb(0 0 0 / 60%);
+  cursor: pointer;
+  transition: border-color 150ms ease, color 150ms ease;
+}
+
+.home-fullscreen-toggle:hover,
+.home-fullscreen-toggle:focus-visible {
+  border-color: #3b82f6;
+  color: rgb(0 0 0 / 80%);
+}
+
+.home-fullscreen-icon {
+  width: 18px;
+  height: 18px;
+}
+
 .home-account-action {
   padding: 8px 0;
   border: 0;
@@ -2928,8 +2998,8 @@ a.home-social-icon:hover {
 
 .home-utility-dock {
   position: fixed;
-  bottom: 20px;
-  left: 20px;
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  left: calc(20px + env(safe-area-inset-left, 0px));
   z-index: 40;
   display: flex;
   align-items: center;
@@ -3224,8 +3294,8 @@ a.home-social-icon:hover {
 }
 
 .home-lobby-chat {
-  right: 20px;
-  bottom: 20px;
+  right: calc(20px + env(safe-area-inset-right, 0px));
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
 }
 
 .home-nav-link:focus-visible,
@@ -3381,8 +3451,18 @@ a.home-social-icon:hover {
     font-size: 10px;
   }
 
-  .home-account-name {
-    display: none;
+  /* Keep identity visible but bounded; an unbounded nickname pushed the
+     account cluster off the right edge of narrow screens. */
+  .home-account-username {
+    overflow: hidden;
+    max-width: 76px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .home-fullscreen-toggle {
+    width: 36px;
+    height: 36px;
   }
 
   .home-account {
@@ -3461,8 +3541,8 @@ a.home-social-icon:hover {
   }
 
   .home-utility-dock {
-    bottom: 14px;
-    left: 12px;
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
     gap: 6px;
   }
 
@@ -3474,12 +3554,12 @@ a.home-social-icon:hover {
   }
 
   .home-lobby-chat {
-    right: 12px;
-    bottom: 14px;
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   }
 
   .home-page .home-lobby-chat.is-expanded {
-    bottom: 72px;
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
   }
 
   .home-lobby-chat > div {
@@ -3814,4 +3894,27 @@ a.home-social-icon:hover {
       2px 0 0 0 rgba(0, 0, 0, 0.8);              /* Outer line (right side of border) */
   }
 
+}
+
+/* Very narrow screens: the account cluster shares the header's right edge
+   with the fullscreen toggle, so identity gets one compact, ellipsized slot
+   and the "(guest)" suffix yields — the Sign in options inside the menu
+   already say what guest status means. */
+@media (max-width: 480px) {
+  .home-account {
+    gap: 6px;
+    padding: 0;
+  }
+
+  .home-account-trigger {
+    max-width: 100px;
+  }
+
+  .home-account-guest-suffix {
+    display: none;
+  }
+
+  .home-account-username {
+    max-width: 84px;
+  }
 }
