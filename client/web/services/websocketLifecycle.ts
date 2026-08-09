@@ -143,12 +143,27 @@ export function plannedDrainRemainingMs(
 }
 
 export function activeGameIdFromPath(pathname: string): number | null {
-  const match = pathname.match(/^\/play\/(\d+)(?:\/|$)/);
+  const match = pathname.match(/^\/play\/(\d+)(?:[/?#]|$)/);
   if (!match) {
     return null;
   }
   const value = Number(match[1]);
   return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff ? value : null;
+}
+
+/**
+ * Resolve the active game from either router strategy used by the client.
+ * BrowserRouter stores the route in pathname, while embedded builds (including
+ * CrazyGames) use HashRouter and leave pathname pointing at the static asset.
+ */
+export function activeGameIdFromLocation(
+  location: Pick<Location, 'pathname' | 'hash'>,
+): number | null {
+  const hashPath = location.hash.startsWith('#')
+    ? location.hash.slice(1)
+    : location.hash;
+
+  return activeGameIdFromPath(hashPath) ?? activeGameIdFromPath(location.pathname);
 }
 
 export function isSnapshotForGame(rawMessage: any, gameId: number): boolean {

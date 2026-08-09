@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useId } from 'react';
 import { ChatMessage } from '../types';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
 
 interface LobbyChatProps {
   messages: ChatMessage[];
@@ -32,6 +33,7 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
   initialExpanded = false,
   autoOpenEligible = true
 }) => {
+  const { settings: { disableChat } } = useCrazyGames();
   const [inputValue, setInputValue] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -123,7 +125,7 @@ export const LobbyChat: React.FC<LobbyChatUIProps> = ({
     setIsExpanded(true);
   };
 
-  if (!initialExpanded) {
+  if (!initialExpanded || disableChat) {
     return null; // Hidden in mobile mode
   }
 

@@ -1,4 +1,5 @@
 pub mod api;
+mod chat_moderation;
 pub mod cluster_membership;
 pub mod completion;
 pub mod db;

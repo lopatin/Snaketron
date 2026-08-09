@@ -52,6 +52,7 @@ jsonwebtoken = "9.3"
 bincode = { version = "2.0", features = ["serde"] }
 flate2 = "1.0"
 rand = "0.8"
+rustrict = { version = "0.7.38", default-features = false, features = ["censor"] }
 # HTTP API dependencies
 axum = { version = "0.7", features = ["tokio", "ws"] }
 tower = { version = "0.5", features = ["full"] }

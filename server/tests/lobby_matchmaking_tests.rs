@@ -1,4 +1,4 @@
-use ::common::{GameEvent, GameState, GameType, QueueMode, TeamId};
+use ::common::{GameEvent, GameState, GameStatus, GameType, QueueMode, TeamId};
 use anyhow::Result;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -975,6 +975,17 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
             .get(RedisKeys::matchmaking_lobby_active_game(&lobby.lobby_code))
             .await?;
         assert_eq!(mapped_game, winner_id.to_string());
+        for member in &lobby.members {
+            let pending_key =
+                RedisKeys::matchmaking_lobby_user_pending_game(&lobby.lobby_code, member.user_id);
+            let pending_game: String = redis.get(&pending_key).await?;
+            assert_eq!(pending_game, winner_id.to_string());
+            let pending_ttl_ms: i64 = redis.pttl(&pending_key).await?;
+            assert!(
+                pending_ttl_ms > 0 && pending_ttl_ms <= 15 * 60 * 1_000,
+                "member handoff must have a bounded positive TTL, got {pending_ttl_ms}ms"
+            );
+        }
         let queue_identity_exists: bool = redis
             .exists(RedisKeys::matchmaking_lobby_queue_identity(
                 &lobby.lobby_code,
@@ -1686,6 +1697,18 @@ async fn create_lobby_and_queue(
     game_type: GameType,
     queue_mode: QueueMode,
 ) -> Result<Vec<TestClient>> {
+    let (_, clients) =
+        create_lobby_and_queue_with_code(env, server_idx, user_ids, game_type, queue_mode).await?;
+    Ok(clients)
+}
+
+async fn create_lobby_and_queue_with_code(
+    env: &TestEnvironment,
+    server_idx: usize,
+    user_ids: &[i32],
+    game_type: GameType,
+    queue_mode: QueueMode,
+) -> Result<(String, Vec<TestClient>)> {
     let server_addr = env.ws_addr(server_idx).expect("Server should exist");
 
     // Connect all clients
@@ -1739,7 +1762,7 @@ async fn create_lobby_and_queue(
         })
         .await?;
 
-    Ok(clients)
+    Ok((lobby_code, clients))
 }
 
 // Wait for a single client to receive JoinGame and first snapshot
@@ -1804,6 +1827,53 @@ async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result
     }
 
     Ok(game_id.expect("Should have a game_id"))
+}
+
+async fn wait_for_game_completion(client: &mut TestClient, game_id: u32) -> Result<()> {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if let WSMessage::GameEvent(event) = client.receive_message().await?
+                && event.game_id == game_id
+                && let GameEvent::Snapshot { game_state } = event.event
+                && matches!(game_state.status, GameStatus::Complete { .. })
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await?
+}
+
+async fn wait_for_matchmaking_slots_to_clear(
+    lobby_code: &str,
+    user_ids: &[i32],
+    completed_game_id: u32,
+) -> Result<()> {
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let completed_game_id = completed_game_id.to_string();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let lobby_game: Option<String> = redis
+                .get(RedisKeys::matchmaking_lobby_active_game(lobby_code))
+                .await?;
+            let mut retained_completed_game = lobby_game.as_deref() == Some(&completed_game_id);
+            for user_id in user_ids {
+                let user_game: Option<String> = redis
+                    .get(RedisKeys::matchmaking_user_active_game(*user_id as u32))
+                    .await?;
+                retained_completed_game |= user_game.as_deref() == Some(&completed_game_id);
+            }
+
+            if !retained_completed_game {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?
 }
 
 // Helper to get team assignment for a player from game snapshot
@@ -2297,6 +2367,66 @@ async fn test_ffa_single_lobby() -> Result<()> {
     let game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
 
     println!("FFA game created from single lobby: {}", game_id);
+
+    for client in clients {
+        client.disconnect().await?;
+    }
+    env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_member_ffa_lobby_play_again_routes_every_member_to_new_match() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    let mut env = TestEnvironment::new("two_member_ffa_lobby_play_again").await?;
+    env.add_server().await?;
+    env.create_user().await?;
+    env.create_user().await?;
+
+    let user_ids = [env.user_ids()[0], env.user_ids()[1]];
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let (lobby_code, mut clients) = create_lobby_and_queue_with_code(
+        &env,
+        0,
+        &user_ids,
+        game_type.clone(),
+        QueueMode::Quickmatch,
+    )
+    .await?;
+
+    let first_game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
+    for client in &mut clients {
+        client.confirm_ready(first_game_id).await?;
+    }
+
+    // With no input, the two default FFA spawns collide and produce a real
+    // terminal snapshot. Observe completion on both sockets before simulating
+    // the host's Play Again click.
+    wait_for_game_completion(&mut clients[0], first_game_id).await?;
+    wait_for_game_completion(&mut clients[1], first_game_id).await?;
+    wait_for_matchmaking_slots_to_clear(&lobby_code, &user_ids, first_game_id).await?;
+
+    // Only the host asks for another round. Queue admission is lobby-scoped,
+    // so every retained member must be routed to the resulting match.
+    clients[0]
+        .send_message(WSMessage::QueueForMatch {
+            game_type,
+            queue_mode: QueueMode::Quickmatch,
+        })
+        .await?;
+
+    let second_game_id = wait_for_all_clients_to_join_game(&mut clients).await?;
+    assert_ne!(
+        second_game_id, first_game_id,
+        "Play Again must create a distinct match"
+    );
+    for client in &mut clients {
+        client.confirm_ready(second_game_id).await?;
+    }
+    wait_for_game_completion(&mut clients[0], second_game_id).await?;
+    wait_for_game_completion(&mut clients[1], second_game_id).await?;
+    wait_for_matchmaking_slots_to_clear(&lobby_code, &user_ids, second_game_id).await?;
 
     for client in clients {
         client.disconnect().await?;

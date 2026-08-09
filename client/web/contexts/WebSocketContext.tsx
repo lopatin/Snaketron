@@ -24,6 +24,7 @@ import {
 } from '../constants';
 import { useLatency } from './LatencyContext';
 import { useAuth } from './AuthContext';
+import { useCrazyGames } from './CrazyGamesContext';
 import {
   detectBestRegion,
   fetchRegionMetadata,
@@ -40,7 +41,7 @@ import {
   advanceCandidateGameWatermark,
   authenticationTimeoutMs,
   candidateDeadlineDelayMs,
-  activeGameIdFromPath,
+  activeGameIdFromLocation,
   isCommandOwner,
   isRetryableMatchmakingAdmissionFailure,
   isSnapshotForGame,
@@ -250,6 +251,11 @@ export const useWebSocket = (): WebSocketContextType => {
 };
 
 export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
+  const {
+    inviteParams,
+    isInstantMultiplayer,
+    settings: { disableChat },
+  } = useCrazyGames();
   const storedPreferences = useMemo(() => loadStoredLobbyPreferences(), []);
   const [isConnected, setIsConnected] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number>(0);
@@ -258,9 +264,17 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyMembers, setLobbyMembers] = useState<LobbyMember[]>([]);
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
+
+  useEffect(() => {
+    if (disableChat) {
+      setLobbyChatMessages([]);
+      setGameChatMessages([]);
+    }
+  }, [disableChat]);
   const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences | null>(storedPreferences);
   const [matchmakingStatus, setMatchmakingStatus] = useState<MatchmakingStatus>('idle');
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
+  const [lobbyRestorationComplete, setLobbyRestorationComplete] = useState(false);
   const [serverCapabilities, setServerCapabilities] = useState<ReadonlySet<string>>(new Set());
   const currentLobbyRef = useRef<Lobby | null>(null);
   const desiredLobbyPreferencesRef = useRef<LobbyPreferences | null>(storedPreferences);
@@ -402,10 +416,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     if (typeof window === 'undefined') {
       hasLoadedStoredLobbyRef.current = true;
+      setLobbyRestorationComplete(true);
       return;
     }
 
     try {
+      if (isInstantMultiplayer || inviteParams?.lobbyCode || inviteParams?.roomCode) {
+        // Platform-directed multiplayer launches always supersede an
+        // unrelated lobby persisted from a prior visit.
+        window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+        storedLobbyRef.current = null;
+        return;
+      }
       const raw = window.localStorage.getItem(LOBBY_STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
@@ -425,8 +447,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
     } finally {
       hasLoadedStoredLobbyRef.current = true;
+      if (!storedLobbyRef.current) {
+        setLobbyRestorationComplete(true);
+      }
     }
-  }, []);
+  }, [inviteParams?.lobbyCode, inviteParams?.roomCode, isInstantMultiplayer]);
 
   const persistLobby = useCallback((lobby: { id: number | null; code: string }) => {
     storedLobbyRef.current = { id: lobby.id, code: lobby.code.toUpperCase() };
@@ -626,7 +651,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     )?.toUpperCase() ?? null;
     const desiredGameId = typeof window === 'undefined'
       ? null
-      : activeGameIdFromPath(window.location.pathname);
+      : activeGameIdFromLocation(window.location);
     if (
       candidate.expectedLobbyCode !== desiredLobbyCode ||
       candidate.expectedGameId !== desiredGameId
@@ -778,7 +803,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clearGameWarmRetryTimeout(candidate);
     candidate.contextRestoreStartedAtMs = Date.now();
     const lobbyCode = currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null;
-    const gameId = typeof window === 'undefined' ? null : activeGameIdFromPath(window.location.pathname);
+    const gameId = typeof window === 'undefined'
+      ? null
+      : activeGameIdFromLocation(window.location);
     candidate.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
     candidate.expectedGameId = gameId;
     candidate.lobbyReady = candidate.expectedLobbyCode === null;
@@ -1002,7 +1029,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         const lobbyCode = currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null;
         const gameId = typeof window === 'undefined'
           ? null
-          : activeGameIdFromPath(window.location.pathname);
+          : activeGameIdFromLocation(window.location);
         slot.contextRestoreStartedAtMs = nowMs;
         slot.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
         slot.expectedGameId = gameId;
@@ -1669,6 +1696,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [authenticateConnection, getToken]);
 
   const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
+    if (disableChat) {
+      return;
+    }
     const trimmed = message.trim();
     if (!trimmed) {
       return;
@@ -1676,7 +1706,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
     console.log(`Sending ${scope} chat message`, trimmed);
     sendMessage({ Chat: trimmed });
-  }, [sendMessage]);
+  }, [disableChat, sendMessage]);
 
   const beginResponseTrackedRequest = useCallback(() => {
     const generation = activeSlotRef.current?.generation;
@@ -2288,6 +2318,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const cleanup = onMessage('LobbyChatMessage', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.LobbyChatMessage ?? message;
       if (!payload || typeof payload.message !== 'string') {
         return;
@@ -2345,7 +2378,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   useEffect(() => {
     return onMessage('AccessDenied', (message: any) => {
@@ -2359,6 +2392,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const cleanup = onMessage('LobbyChatHistory', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.LobbyChatHistory ?? message;
       if (!payload) {
         return;
@@ -2427,7 +2463,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   // Handle lobby updates
   useEffect(() => {
@@ -2527,6 +2563,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const cleanup = onMessage('GameChatHistory', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.GameChatHistory ?? message;
       if (!payload) {
         return;
@@ -2595,10 +2634,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   useEffect(() => {
     const cleanup = onMessage('GameChatMessage', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.GameChatMessage ?? message;
       if (!payload || typeof payload.message !== 'string') {
         return;
@@ -2656,7 +2698,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   useEffect(() => {
     const resetGameChat = (gameId: number | null) => {
@@ -2738,10 +2780,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     if (currentLobby) {
+      setLobbyRestorationComplete(true);
       return;
     }
 
     if (!storedLobbyRef.current || !storedLobbyRef.current.code) {
+      setLobbyRestorationComplete(true);
       return;
     }
 
@@ -2782,6 +2826,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       })
       .finally(() => {
         restoreInProgressRef.current = false;
+        if (!cancelled) {
+          setLobbyRestorationComplete(true);
+        }
       });
 
     return () => {
@@ -2801,6 +2848,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     connectToRegion,
     currentRegionUrl,
     latencyMs,
+    lobbyRestorationComplete,
     currentLobby,
     lobbyMembers,
     lobbyChatMessages,

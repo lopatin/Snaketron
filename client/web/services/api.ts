@@ -37,6 +37,13 @@ interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
 }
 
+// Portal sessions are intentionally isolated from first-party username/
+// password sessions. The CrazyGames pilot uses this only for a guest token;
+// the full account exchange will mint the same internal JWT under this key.
+export const AUTH_TOKEN_STORAGE_KEY = process.env.CRAZYGAMES_BUILD === 'true'
+  ? 'snaketron:crazygames:session-token'
+  : 'token';
+
 class API {
   private baseURL: string;
 
@@ -47,14 +54,14 @@ class API {
   }
 
   private getToken(): string | null {
-    return localStorage.getItem('token');
+    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
   }
 
   setAuthToken(token: string | null): void {
     if (token) {
-      localStorage.setItem('token', token);
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
     } else {
-      localStorage.removeItem('token');
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     }
   }
 

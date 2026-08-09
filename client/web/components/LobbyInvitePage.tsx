@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
+import { crazyGamesGuestNickname } from '../services/crazyGames';
 import { User } from '../types';
 
 const generateGuestNickname = (lobbyCode: string) => {
@@ -14,6 +16,7 @@ const LobbyInvitePage: React.FC = () => {
   const { lobbyCode: rawCode } = useParams<{ lobbyCode: string }>();
   const lobbyCode = (rawCode ?? '').toUpperCase();
   const navigate = useNavigate();
+  const { isCrazyGamesBuild, portalUser } = useCrazyGames();
   const { user, createGuest, loading: authLoading, getToken } = useAuth();
   const { isConnected, joinLobby, waitForSessionReady } = useWebSocket();
 
@@ -35,7 +38,10 @@ const LobbyInvitePage: React.FC = () => {
 
     if (!activeUser) {
       setStatusMessage('Creating guest profile…');
-      const { user: guestUser, token } = await createGuest(generateGuestNickname(lobbyCode));
+      const guestNickname = isCrazyGamesBuild
+        ? crazyGamesGuestNickname(portalUser?.username)
+        : generateGuestNickname(lobbyCode);
+      const { user: guestUser, token } = await createGuest(guestNickname);
       latestUserRef.current = guestUser;
       activeUser = guestUser;
       resolvedToken = token;
@@ -48,7 +54,14 @@ const LobbyInvitePage: React.FC = () => {
     }
 
     await waitForSessionReady();
-  }, [createGuest, getToken, lobbyCode, waitForSessionReady]);
+  }, [
+    createGuest,
+    getToken,
+    isCrazyGamesBuild,
+    lobbyCode,
+    portalUser?.username,
+    waitForSessionReady,
+  ]);
 
   useEffect(() => {
     if (hasSucceededRef.current) {

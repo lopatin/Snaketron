@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { BrowserRouter, HashRouter, Navigate, Route, matchPath, useLocation } from 'react-router-dom';
 import './index.css';
 import { AccountModal } from './components/AccountModal';
@@ -19,20 +19,31 @@ import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
+import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
+import { CrazyGamesAdOverlay, CrazyGamesBridge } from './components/CrazyGamesBridge';
 
 function AppContent() {
   const location = useLocation();
   const { user } = useAuth();
+  const { isCrazyGamesBuild, showAuthPrompt } = useCrazyGames();
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
 
+  const handleOpenAuth = useCallback(() => {
+    if (isCrazyGamesBuild) {
+      void showAuthPrompt();
+      return;
+    }
+    setIsAuthModalOpen(true);
+  }, [isCrazyGamesBuild, showAuthPrompt]);
+
   useEffect(() => {
-    if (location.pathname === '/auth') {
+    if (location.pathname === '/auth' && !isCrazyGamesBuild) {
       setIsAuthModalOpen(true);
     }
-  }, [location.pathname]);
+  }, [isCrazyGamesBuild, location.pathname]);
 
   useEffect(() => {
     if (!user || user.isGuest) {
@@ -49,7 +60,7 @@ function AppContent() {
           path="/"
           element={
             <NewHome
-              onOpenAuth={() => setIsAuthModalOpen(true)}
+              onOpenAuth={handleOpenAuth}
               onOpenAccount={setAccountModalView}
             />
           }
@@ -59,15 +70,21 @@ function AppContent() {
           path="/leaderboards"
           element={
             <Leaderboard
-              onOpenAuth={() => setIsAuthModalOpen(true)}
+              onOpenAuth={handleOpenAuth}
               onOpenAccount={setAccountModalView}
             />
           }
         />
         <Route path="/profile" element={<Navigate to="/" replace />} />
         <Route path="/history" element={<Navigate to="/" replace />} />
-        <Route path="/game-modes/:category" element={<GameModeSelector />} />
-        <Route path="/custom" element={<CustomGameCreator />} />
+        <Route
+          path="/game-modes/:category"
+          element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <GameModeSelector />}
+        />
+        <Route
+          path="/custom"
+          element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <CustomGameCreator />}
+        />
         <Route path="/lobby/:lobbyCode" element={<LobbyInvitePage />} />
         <Route
           path="/game/:gameCode"
@@ -87,7 +104,7 @@ function AppContent() {
         />
       </AnimatedRoutes>
       <AuthModal
-        isOpen={isAuthModalOpen}
+        isOpen={isAuthModalOpen && !isCrazyGamesBuild}
         onClose={() => setIsAuthModalOpen(false)}
       />
       <AccountModal
@@ -99,23 +116,29 @@ function AppContent() {
   );
 }
 
-// The itch.io build is served from a static path with no History-API
+// Embedded static builds are served from deep paths with no History-API
 // fallback, so client routes live in the URL hash there. The regular build
 // keeps clean History-API URLs.
-const Router = process.env.ITCH_BUILD === 'true' ? HashRouter : BrowserRouter;
+const Router = process.env.ITCH_BUILD === 'true' || process.env.CRAZYGAMES_BUILD === 'true'
+  ? HashRouter
+  : BrowserRouter;
 
 function App() {
   return (
     <Router>
-      <AuthProvider>
-        <UIProvider>
-          <LatencyProvider>
-            <WebSocketProvider>
-              <AppContent />
-            </WebSocketProvider>
-          </LatencyProvider>
-        </UIProvider>
-      </AuthProvider>
+      <CrazyGamesProvider>
+        <AuthProvider>
+          <UIProvider>
+            <LatencyProvider>
+              <WebSocketProvider>
+                <CrazyGamesBridge />
+                <AppContent />
+                <CrazyGamesAdOverlay />
+              </WebSocketProvider>
+            </LatencyProvider>
+          </UIProvider>
+        </AuthProvider>
+      </CrazyGamesProvider>
     </Router>
   );
 }

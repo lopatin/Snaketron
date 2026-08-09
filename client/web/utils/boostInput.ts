@@ -1,3 +1,5 @@
+import { gameStorage } from '../services/gameStorage.ts';
+
 export type BoostInputMode = 'hold' | 'toggle';
 export type BoostInputCommand = 'ActivateBoost' | 'DeactivateBoost';
 export type BoostKeyAction = 'ignore' | 'prevent-default' | 'activate';
@@ -53,15 +55,7 @@ const SUPPRESS_DECISION: BoostInputDecision = {
 };
 
 function browserStorage(): StorageLike | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
+  return typeof window === 'undefined' ? null : gameStorage;
 }
 
 export function loadBoostInputMode(

@@ -283,6 +283,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
         isOpen={showInviteModal}
         onClose={() => setShowInviteModal(false)}
         lobbyCode={currentLobby?.code || null}
+        region={currentLobby?.region || null}
       />
 
       {/* Join Game Modal */}

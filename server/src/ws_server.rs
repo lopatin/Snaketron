@@ -327,12 +327,16 @@ enum LobbyMatchHint {
     },
 }
 
+fn refresh_connection_username(metadata: &mut PlayerMetadata, username: String) {
+    metadata.username = username;
+}
+
 async fn handle_guest_nickname_update(
     db: &Arc<dyn Database>,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     user_cache: UserCache,
     lobby: &Option<LobbyJoinHandle>,
-    metadata: &PlayerMetadata,
+    metadata: &mut PlayerMetadata,
     ws_tx: &mpsc::Sender<Message>,
     nickname: String,
 ) -> Result<()> {
@@ -358,6 +362,13 @@ async fn handle_guest_nickname_update(
     }
 
     db.update_guest_username(metadata.user_id, &trimmed).await?;
+
+    // The database is authoritative, but this connection's metadata is what
+    // subsequent chat and lobby actions use. Keep it in sync immediately once
+    // the durable rename commits, even if a later cache invalidation or lobby
+    // update notification fails.
+    refresh_connection_username(metadata, trimmed.clone());
+
     user_cache
         .remove_from_redis(metadata.user_id as u32)
         .await?;
@@ -1043,7 +1054,7 @@ async fn handle_websocket_connection(
 
                                             // Handle lobby state transitions
                                             if entering_lobby
-                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &mut new_state {
+                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), metadata, .. } = &mut new_state {
                                                 if let Some(handle) = lobby_update_handle.take() {
                                                     handle.abort();
                                                 }
@@ -1054,6 +1065,7 @@ async fn handle_websocket_connection(
                                                     let mut lobby_rx = take_lobby_update_receiver(&mut lobby_handle.rx);
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
+                                                    let lobby_user_id_for_match = metadata.user_id as u32;
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let cancellation_token_clone = cancellation_token.clone();
                                                     let lobby_manager_clone = lobby_manager.clone();
@@ -1136,6 +1148,7 @@ async fn handle_websocket_connection(
                                                     lobby_match_handle = Some(tokio::spawn(async move {
                                                         subscribe_to_lobby_match_notifications(
                                                             lobby_code_for_match,
+                                                            lobby_user_id_for_match,
                                                             pubsub_manager_clone_for_match,
                                                             redis_clone_for_match,
                                                             ws_tx_clone_for_match,
@@ -1300,8 +1313,9 @@ async fn handle_websocket_connection(
 
 async fn publish_lobby_chat_message(
     mut redis: RedisConnection,
-    payload: LobbyChatBroadcast,
+    mut payload: LobbyChatBroadcast,
 ) -> Result<()> {
+    payload.message = crate::chat_moderation::censor_chat_message(&payload.message);
     let channel = RedisKeys::lobby_chat_channel(&payload.lobby_code);
     let history_key = RedisKeys::lobby_chat_history_key(&payload.lobby_code);
     let serialized =
@@ -1326,8 +1340,9 @@ async fn publish_lobby_chat_message(
 
 async fn publish_game_chat_message(
     mut redis: RedisConnection,
-    payload: GameChatBroadcast,
+    mut payload: GameChatBroadcast,
 ) -> Result<()> {
+    payload.message = crate::chat_moderation::censor_chat_message(&payload.message);
     let channel = RedisKeys::game_chat_channel(payload.game_id);
     let history_key = RedisKeys::game_chat_history_key(payload.game_id);
     let serialized =
@@ -3017,58 +3032,134 @@ async fn send_game_warming(ws_tx: &mpsc::Sender<Message>, game_id: u32) {
     }
 }
 
-fn unsent_lobby_match(mapped_game_id: Option<u32>, last_sent_game_id: Option<u32>) -> Option<u32> {
-    mapped_game_id.filter(|game_id| Some(*game_id) != last_sent_game_id)
+fn next_lobby_match(
+    active_game_id: Option<u32>,
+    pending_game_id: Option<u32>,
+    last_sent_game_id: Option<u32>,
+    retry_unacknowledged: bool,
+) -> Option<u32> {
+    let mapped_game_id = active_game_id.or(pending_game_id)?;
+    let is_unacknowledged = pending_game_id == Some(mapped_game_id);
+    (Some(mapped_game_id) != last_sent_game_id || (retry_unacknowledged && is_unacknowledged))
+        .then_some(mapped_game_id)
+}
+
+fn parse_lobby_match_mapping(
+    raw_game_id: Option<String>,
+    mapping_key: &str,
+    lobby_code: &str,
+    user_id: u32,
+) -> Option<u32> {
+    raw_game_id.and_then(|raw_game_id| match raw_game_id.parse::<u32>() {
+        Ok(game_id) => Some(game_id),
+        Err(error) => {
+            error!(
+                lobby_code,
+                user_id,
+                mapping_key,
+                raw_game_id,
+                %error,
+                "Ignoring malformed durable lobby match mapping"
+            );
+            None
+        }
+    })
+}
+
+/// A successful, participant-authorized `JoinGame` is the delivery
+/// acknowledgement. Compare-delete prevents a delayed acknowledgement for an
+/// earlier round from consuming a newer assignment written to the same key.
+async fn acknowledge_lobby_match_handoff(
+    redis: &RedisConnection,
+    lobby_code: &str,
+    user_id: u32,
+    game_id: u32,
+) -> Result<bool> {
+    let pending_mapping_key = RedisKeys::matchmaking_lobby_user_pending_game(lobby_code, user_id);
+    let mut redis = redis.clone();
+    let acknowledged: i32 = redis::Script::new(
+        r#"
+        local value_type = redis.call('TYPE', KEYS[1])
+        if type(value_type) == 'table' then value_type = value_type.ok end
+        if value_type ~= 'none' and value_type ~= 'string' then return -1 end
+        if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+        redis.call('DEL', KEYS[1])
+        return 1
+        "#,
+    )
+    .key(&pending_mapping_key)
+    .arg(game_id)
+    .invoke_async(&mut redis)
+    .await
+    .context("failed to acknowledge lobby match handoff")?;
+    match acknowledged {
+        1 => Ok(true),
+        0 => Ok(false),
+        -1 => Err(anyhow::anyhow!(
+            "lobby match handoff has an unexpected Redis type"
+        )),
+        other => Err(anyhow::anyhow!(
+            "unexpected lobby match handoff acknowledgement result {other}"
+        )),
+    }
 }
 
 async fn reconcile_lobby_match(
     lobby_code: &str,
+    user_id: u32,
     redis: &mut RedisConnection,
     ws_tx: &mpsc::Sender<Message>,
     last_sent_game_id: &mut Option<u32>,
+    retry_unacknowledged: bool,
 ) -> bool {
-    let mapping_key = RedisKeys::matchmaking_lobby_active_game(lobby_code);
-    let raw_game_id: Option<String> = match redis.get(&mapping_key).await {
-        Ok(game_id) => game_id,
-        Err(error) => {
-            warn!(
-                lobby_code,
-                %error,
-                "Failed to reconcile durable lobby match mapping"
-            );
-            return true;
-        }
-    };
-    let mapped_game_id = match raw_game_id {
-        Some(raw_game_id) => match raw_game_id.parse::<u32>() {
-            Ok(game_id) => Some(game_id),
+    let active_mapping_key = RedisKeys::matchmaking_lobby_active_game(lobby_code);
+    let pending_mapping_key = RedisKeys::matchmaking_lobby_user_pending_game(lobby_code, user_id);
+    let (raw_active_game_id, raw_pending_game_id): (Option<String>, Option<String>) =
+        match redis::cmd("MGET")
+            .arg(&active_mapping_key)
+            .arg(&pending_mapping_key)
+            .query_async(redis)
+            .await
+        {
+            Ok(game_ids) => game_ids,
             Err(error) => {
-                error!(
+                warn!(
                     lobby_code,
-                    mapping_key,
-                    raw_game_id,
+                    user_id,
                     %error,
-                    "Ignoring malformed durable lobby match mapping"
+                    "Failed to reconcile durable lobby match mappings"
                 );
                 return true;
             }
-        },
-        None => None,
-    };
-    let Some(game_id) = unsent_lobby_match(mapped_game_id, *last_sent_game_id) else {
+        };
+    let active_game_id =
+        parse_lobby_match_mapping(raw_active_game_id, &active_mapping_key, lobby_code, user_id);
+    let pending_game_id = parse_lobby_match_mapping(
+        raw_pending_game_id,
+        &pending_mapping_key,
+        lobby_code,
+        user_id,
+    );
+    let Some(game_id) = next_lobby_match(
+        active_game_id,
+        pending_game_id,
+        *last_sent_game_id,
+        retry_unacknowledged,
+    ) else {
         return true;
     };
 
     let message = match serde_json::to_string(&WSMessage::JoinGame(game_id)) {
         Ok(message) => message,
         Err(error) => {
-            error!(lobby_code, game_id, %error, "Failed to serialize lobby match join");
+            error!(lobby_code, user_id, game_id, %error, "Failed to serialize lobby match join");
             return true;
         }
     };
     if let Err(error) = ws_tx.send(Message::Text(message.into())).await {
         debug!(
             lobby_code,
+            user_id,
             game_id,
             %error,
             "WebSocket closed while forwarding durable lobby match"
@@ -3079,7 +3170,7 @@ async fn reconcile_lobby_match(
     *last_sent_game_id = Some(game_id);
     info!(
         lobby_code,
-        game_id, "Forwarded durable lobby match to WebSocket"
+        user_id, game_id, "Forwarded durable lobby match to WebSocket"
     );
     true
 }
@@ -3090,6 +3181,7 @@ async fn reconcile_lobby_match(
 /// WebSocket itself remains healthy.
 async fn subscribe_to_lobby_match_notifications(
     lobby_code: String,
+    user_id: u32,
     pubsub_manager: Arc<PubSubManager>,
     redis: impl Into<RedisConnection>,
     ws_tx: mpsc::Sender<Message>,
@@ -3118,7 +3210,16 @@ async fn subscribe_to_lobby_match_notifications(
         };
 
         info!(lobby_code, channel, "Subscribed to lobby match hints");
-        if !reconcile_lobby_match(&lobby_code, &mut redis, &ws_tx, &mut last_sent_game_id).await {
+        if !reconcile_lobby_match(
+            &lobby_code,
+            user_id,
+            &mut redis,
+            &ws_tx,
+            &mut last_sent_game_id,
+            false,
+        )
+        .await
+        {
             return;
         }
 
@@ -3133,9 +3234,11 @@ async fn subscribe_to_lobby_match_notifications(
                 _ = reconciliation.tick() => {
                     if !reconcile_lobby_match(
                         &lobby_code,
+                        user_id,
                         &mut redis,
                         &ws_tx,
                         &mut last_sent_game_id,
+                        true,
                     ).await {
                         return;
                     }
@@ -3151,9 +3254,11 @@ async fn subscribe_to_lobby_match_notifications(
                             );
                             if !reconcile_lobby_match(
                                 &lobby_code,
+                                user_id,
                                 &mut redis,
                                 &ws_tx,
                                 &mut last_sent_game_id,
+                                false,
                             ).await {
                                 return;
                             }
@@ -3511,12 +3616,13 @@ async fn process_ws_message(
         } => {
             match ws_message {
                 WSMessage::UpdateNickname { nickname } => {
+                    let mut metadata = metadata;
                     if let Err(e) = handle_guest_nickname_update(
                         db,
                         lobby_manager,
                         user_cache.clone(),
                         &lobby,
-                        &metadata,
+                        &mut metadata,
                         ws_tx,
                         nickname,
                     )
@@ -3720,6 +3826,32 @@ async fn process_ws_message(
                             game_id: None,
                             websocket_id,
                         });
+                    }
+
+                    if let Some(lobby_handle) = lobby.as_ref() {
+                        match acknowledge_lobby_match_handoff(
+                            redis,
+                            &lobby_handle.lobby_code,
+                            user_id,
+                            requested_game_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => debug!(
+                                lobby_code = lobby_handle.lobby_code,
+                                user_id,
+                                game_id = requested_game_id,
+                                "Acknowledged lobby match handoff"
+                            ),
+                            Ok(false) => {}
+                            Err(error) => warn!(
+                                lobby_code = lobby_handle.lobby_code,
+                                user_id,
+                                game_id = requested_game_id,
+                                %error,
+                                "Authorized game join but could not acknowledge its lobby handoff"
+                            ),
+                        }
                     }
 
                     Ok(ConnectionState::Authenticated {
@@ -4716,16 +4848,17 @@ fn ensure_custom_game_access(matchmaking_pool: MatchmakingPool) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
+        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput, PlayerMetadata,
         TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
-        canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
-        game_join_denied, game_join_failure_message, log_client_protocol_version,
-        missing_game_join_failure, next_game_subscription_input, next_outbound_message,
-        queue_planned_drain_notice, recovery_bridge_snapshot, require_game_command_publication,
+        acknowledge_lobby_match_handoff, canonical_command_identity, command_outcomes_for_user,
+        ensure_custom_game_access, game_join_denied, game_join_failure_message,
+        log_client_protocol_version, missing_game_join_failure, next_game_subscription_input,
+        next_lobby_match, next_outbound_message, queue_planned_drain_notice,
+        recovery_bridge_snapshot, refresh_connection_username, require_game_command_publication,
         send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
         send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
         snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
-        take_lobby_update_receiver, unsent_lobby_match, validate_game_matchmaking_pool,
+        take_lobby_update_receiver, validate_game_matchmaking_pool,
     };
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -4737,7 +4870,7 @@ mod lifecycle_protocol_tests {
         SessionCommandOutcomes, SessionCommandRejectionFence,
     };
     use crate::redis_keys::RedisKeys;
-    use crate::redis_utils::create_connection_manager;
+    use crate::redis_utils::{RedisConnection, create_connection_manager};
     use common::{
         ClientCommandIdentityV2, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
         QueueMode,
@@ -4749,6 +4882,23 @@ mod lifecycle_protocol_tests {
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn successful_guest_rename_refreshes_same_socket_identity() {
+        let mut metadata = PlayerMetadata {
+            user_id: 7,
+            username: "Guest1234".to_owned(),
+            token: "session-token".to_owned(),
+            is_guest: true,
+            matchmaking_pool: MatchmakingPool::Public,
+        };
+
+        refresh_connection_username(&mut metadata, "CrazyPlayer".to_owned());
+
+        assert_eq!(metadata.username, "CrazyPlayer");
+        assert_eq!(metadata.user_id, 7);
+        assert_eq!(metadata.token, "session-token");
+    }
 
     #[test]
     fn slow_command_publish_logging_uses_a_strict_one_second_threshold() {
@@ -5160,18 +5310,36 @@ mod lifecycle_protocol_tests {
 
     #[test]
     fn lobby_match_reconciliation_covers_commit_before_subscribe() {
-        assert_eq!(unsent_lobby_match(Some(42), None), Some(42));
+        assert_eq!(next_lobby_match(Some(42), Some(42), None, false), Some(42));
+        assert_eq!(next_lobby_match(None, Some(42), None, false), Some(42));
     }
 
     #[test]
-    fn lobby_match_reconciliation_deduplicates_hints_and_allows_play_again() {
-        assert_eq!(unsent_lobby_match(Some(42), Some(42)), None);
-        assert_eq!(unsent_lobby_match(Some(43), Some(42)), Some(43));
-        assert_eq!(unsent_lobby_match(None, Some(42)), None);
+    fn lobby_match_reconciliation_retries_until_ack_and_allows_play_again() {
+        assert_eq!(
+            next_lobby_match(Some(42), Some(42), Some(42), false),
+            None,
+            "push hints must be deduplicated"
+        );
+        assert_eq!(
+            next_lobby_match(None, Some(42), Some(42), true),
+            Some(42),
+            "periodic reconciliation must retry an unacknowledged handoff after active cleanup"
+        );
+        assert_eq!(
+            next_lobby_match(Some(42), None, Some(42), true),
+            None,
+            "acknowledged active matches must stay deduplicated"
+        );
+        assert_eq!(
+            next_lobby_match(Some(43), Some(43), Some(42), false),
+            Some(43)
+        );
+        assert_eq!(next_lobby_match(None, None, Some(42), true), None);
     }
 
     #[tokio::test]
-    async fn live_lobby_listener_recovers_committed_and_missed_hints_once() {
+    async fn live_lobby_listener_survives_active_cleanup_until_member_acknowledges() {
         let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
         let client = Client::open(redis_url).unwrap();
         let (pubsub_tx, _pubsub_rx) = broadcast::channel(128);
@@ -5181,10 +5349,17 @@ mod lifecycle_protocol_tests {
         let pubsub_redis = create_connection_manager(client.clone(), pubsub_tx.clone())
             .await
             .unwrap();
+        let ack_redis = RedisConnection::from(
+            create_connection_manager(client.clone(), pubsub_tx.clone())
+                .await
+                .unwrap(),
+        );
         let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx));
         let mut control = client.get_multiplexed_async_connection().await.unwrap();
         let lobby_code = format!("LISTENER-{}", uuid::Uuid::new_v4());
+        let user_id = 77_u32;
         let mapping_key = RedisKeys::matchmaking_lobby_active_game(&lobby_code);
+        let pending_key = RedisKeys::matchmaking_lobby_user_pending_game(&lobby_code, user_id);
         let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
         let first_game_id = 42_001_u32;
         let second_game_id = 42_002_u32;
@@ -5195,10 +5370,15 @@ mod lifecycle_protocol_tests {
             .set::<_, _, ()>(&mapping_key, first_game_id)
             .await
             .unwrap();
+        control
+            .set::<_, _, ()>(&pending_key, first_game_id)
+            .await
+            .unwrap();
         let (ws_tx, mut ws_rx) = mpsc::channel(8);
         let cancellation = CancellationToken::new();
         let listener = tokio::spawn(subscribe_to_lobby_match_notifications(
-            lobby_code,
+            lobby_code.clone(),
+            user_id,
             pubsub_manager,
             redis,
             ws_tx,
@@ -5213,6 +5393,11 @@ mod lifecycle_protocol_tests {
             decode_ws_message(first),
             WSMessage::JoinGame(game_id) if game_id == first_game_id
         ));
+        assert!(
+            acknowledge_lobby_match_handoff(&ack_redis, &lobby_code, user_id, first_game_id)
+                .await
+                .unwrap()
+        );
 
         let duplicate_hint = serde_json::json!({
             "type": "MatchFound",
@@ -5233,10 +5418,15 @@ mod lifecycle_protocol_tests {
             "duplicate hints must not forward a second JoinGame"
         );
 
-        // Deliberately publish no hint for the later game. The periodic
-        // durable read is the recovery path for an at-most-once Pub/Sub loss.
-        control
-            .set::<_, _, ()>(&mapping_key, second_game_id)
+        // Deliberately publish no hint for the later game, then simulate a
+        // short round completing before the listener's next five-second read.
+        // The admission lock is gone; only the per-member handoff remains.
+        redis::pipe()
+            .atomic()
+            .set(&mapping_key, second_game_id)
+            .set(&pending_key, second_game_id)
+            .del(&mapping_key)
+            .query_async::<()>(&mut control)
             .await
             .unwrap();
         let second = timeout(Duration::from_secs(6), ws_rx.recv())
@@ -5247,11 +5437,35 @@ mod lifecycle_protocol_tests {
             decode_ws_message(second),
             WSMessage::JoinGame(game_id) if game_id == second_game_id
         ));
+
+        assert!(
+            !acknowledge_lobby_match_handoff(&ack_redis, &lobby_code, user_id, first_game_id)
+                .await
+                .unwrap(),
+            "a delayed acknowledgement must not consume the newer round"
+        );
+        assert!(
+            acknowledge_lobby_match_handoff(&ack_redis, &lobby_code, user_id, second_game_id)
+                .await
+                .unwrap()
+        );
+        control
+            .publish::<_, _, ()>(
+                &channel,
+                serde_json::json!({
+                    "type": "MatchFound",
+                    "game_id": second_game_id,
+                    "partition_id": 2,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
         assert!(
             timeout(Duration::from_millis(250), ws_rx.recv())
                 .await
                 .is_err(),
-            "periodic reads must not repeat the same JoinGame"
+            "an acknowledged handoff must not repeat JoinGame on later hints"
         );
 
         cancellation.cancel();
@@ -5259,7 +5473,10 @@ mod lifecycle_protocol_tests {
             .await
             .expect("listener ignored cancellation")
             .expect("listener task panicked");
-        control.del::<_, ()>(&mapping_key).await.unwrap();
+        control
+            .del::<_, ()>((mapping_key, pending_key))
+            .await
+            .unwrap();
     }
 
     #[test]

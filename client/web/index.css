@@ -1,5 +1,23 @@
 @import "tailwindcss";
 
+/* CrazyGames' mobile iframe contract prevents long-press selection and the
+   browser magnifier over the game surface. Text-entry controls opt back in. */
+body.crazygames-build {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+body.crazygames-build input,
+body.crazygames-build textarea,
+body.crazygames-build [contenteditable='true'] {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+}
+
 /* Custom theme configuration for Tailwind v4 */
 @theme {
   --color-black-70: rgba(0, 0, 0, 0.7);

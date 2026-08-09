@@ -5,11 +5,16 @@ import { initWasm } from './wasm';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { crazyGames } from './services/crazyGames';
 
 // Kick off WASM initialization; consumers await initWasm()/read getWasm().
-initWasm().catch(error => {
-  console.error('Failed to initialize WASM module', error);
-});
+initWasm()
+  .catch(error => {
+    console.error('Failed to initialize WASM module', error);
+  })
+  .finally(() => {
+    crazyGames.loadingStop();
+  });
 
 // mount
 const container = document.getElementById('root');

@@ -66,6 +66,21 @@ impl RedisKeys {
         )
     }
 
+    /// Per-member delivery handoff for a committed lobby match.
+    ///
+    /// Unlike the active-game mappings, terminal cleanup does not remove this
+    /// key. The gateway compare-deletes it only after this user successfully
+    /// authorizes the matching `JoinGame`, so a missed Pub/Sub notification
+    /// remains recoverable even when a short round has already completed.
+    pub fn matchmaking_lobby_user_pending_game(lobby_code: &str, user_id: u32) -> String {
+        format!(
+            "matchmaking:{{{}}}:lobby:{}:user:{}:pending-game",
+            Self::MATCHMAKING_TAG,
+            lobby_code,
+            user_id
+        )
+    }
+
     /// Exact serialized queue entry currently admitted for a lobby.
     pub fn matchmaking_lobby_queue_identity(lobby_code: &str) -> String {
         format!(
@@ -438,6 +453,10 @@ mod tests {
         assert!(RedisKeys::matchmaking_user_status(123).contains("{snaketron:mm}"));
         assert!(RedisKeys::matchmaking_user_active_game(123).ends_with("123:active-game"));
         assert!(RedisKeys::matchmaking_lobby_active_game("ABC123").ends_with("ABC123:active-game"));
+        assert!(
+            RedisKeys::matchmaking_lobby_user_pending_game("ABC123", 123)
+                .ends_with("ABC123:user:123:pending-game")
+        );
         assert_eq!(
             RedisKeys::readiness_write_canary("use1", "task:boot"),
             "snaketron:readiness:use1:task:boot"
@@ -497,6 +516,7 @@ mod tests {
             RedisKeys::matchmaking_user_active_game(1),
             RedisKeys::matchmaking_user_queue_identity(1),
             RedisKeys::matchmaking_lobby_active_game("ABC"),
+            RedisKeys::matchmaking_lobby_user_pending_game("ABC", 1),
             RedisKeys::matchmaking_lobby_queue_identity("ABC"),
             RedisKeys::matchmaking_lobby_notification_channel("ABC"),
             RedisKeys::lobby_metadata("ABC"),
