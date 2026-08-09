@@ -10,6 +10,8 @@ const isProduction = process.env.NODE_ENV === 'production';
 // asset URLs must resolve relative to the page ('auto' publicPath + base
 // href "./" in index.html) and routing must not rely on the History API.
 const isItchBuild = process.env.ITCH_BUILD === 'true';
+const isCrazyGamesBuild = process.env.CRAZYGAMES_BUILD === 'true';
+const isEmbeddedBuild = isItchBuild || isCrazyGamesBuild;
 
 module.exports = {
   entry: "./bootstrap.ts",
@@ -18,7 +20,7 @@ module.exports = {
     filename: isProduction ? "[name].[contenthash].js" : "[name].js",
     chunkFilename: isProduction ? "[name].[contenthash].js" : "[name].js",
     assetModuleFilename: isProduction ? "[name].[contenthash][ext]" : "[name][ext]",
-    publicPath: isItchBuild ? 'auto' : '/',
+    publicPath: isEmbeddedBuild ? 'auto' : '/',
     clean: true,
   },
   resolve: {
@@ -59,6 +61,8 @@ module.exports = {
       inject: 'body',
       templateParameters: {
         itchBuild: isItchBuild,
+        crazyGamesBuild: isCrazyGamesBuild,
+        embeddedBuild: isEmbeddedBuild,
       },
     }),
     new webpack.DefinePlugin({
@@ -66,6 +70,9 @@ module.exports = {
       'process.env.REACT_APP_API_URL': JSON.stringify(process.env.REACT_APP_API_URL || ''),
       'process.env.REACT_APP_ENVIRONMENT': JSON.stringify(process.env.REACT_APP_ENVIRONMENT || 'development'),
       'process.env.ITCH_BUILD': JSON.stringify(isItchBuild ? 'true' : ''),
+      'process.env.CRAZYGAMES_BUILD': JSON.stringify(isCrazyGamesBuild ? 'true' : ''),
+      'process.env.CRAZYGAMES_ADS_ENABLED': JSON.stringify(process.env.CRAZYGAMES_ADS_ENABLED || ''),
+      'process.env.CRAZYGAMES_DATA_ENABLED': JSON.stringify(process.env.CRAZYGAMES_DATA_ENABLED || ''),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')
     })
   ],

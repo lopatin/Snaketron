@@ -113,6 +113,7 @@ struct MatchCommitLobby {
 #[derive(Serialize)]
 struct MatchCommitUser {
     active_game_key: String,
+    pending_game_key: String,
     queue_status_key: String,
     queue_identity_key: String,
     queue_identity_value: String,
@@ -126,6 +127,7 @@ struct MatchCommitPlan {
     outbox_payload: String,
     created_at_ms: i64,
     game_id: String,
+    pending_game_ttl_ms: i64,
     active_match_json: String,
     matchmaking_pool: String,
     lobbies: Vec<MatchCommitLobby>,
@@ -134,6 +136,10 @@ struct MatchCommitPlan {
 }
 
 const GAME_CREATED_OUTBOX_SCHEMA_VERSION: u16 = 1;
+/// A pending match assignment outlives the readiness gate and normal short
+/// rounds, while still self-cleaning if a client disappears before it can
+/// acknowledge the handoff.
+const LOBBY_MATCH_HANDOFF_TTL_MS: i64 = 15 * 60 * 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameCreatedOutboxRecord {
@@ -472,6 +478,10 @@ for _, user in ipairs(plan.users) do
     if redis.call('GET', user.queue_identity_key) ~= user.queue_identity_value then
         return {3, 'user-queue-entry-changed'}
     end
+    local pending_type = key_type(user.pending_game_key)
+    if pending_type ~= 'none' and pending_type ~= 'string' then
+        return {0, 'user-pending-game-wrong-type'}
+    end
 end
 
 for _, lobby in ipairs(plan.lobbies) do
@@ -491,6 +501,7 @@ for _, lobby in ipairs(plan.lobbies) do
 end
 for _, user in ipairs(plan.users) do
     redis.call('SET', user.active_game_key, plan.game_id)
+    redis.call('SET', user.pending_game_key, plan.game_id, 'PX', plan.pending_game_ttl_ms)
     redis.call('DEL', user.queue_status_key)
     redis.call('DEL', user.queue_identity_key)
 end
@@ -562,6 +573,7 @@ impl MatchCommitPlan {
         }
         for user in &self.users {
             keys.push(&user.active_game_key);
+            keys.push(&user.pending_game_key);
             keys.push(&user.queue_status_key);
             keys.push(&user.queue_identity_key);
         }
@@ -1108,6 +1120,10 @@ impl MatchmakingManager {
                 }
                 commit_users.push(MatchCommitUser {
                     active_game_key: RedisKeys::matchmaking_user_active_game(member.user_id),
+                    pending_game_key: RedisKeys::matchmaking_lobby_user_pending_game(
+                        &lobby.lobby_code,
+                        member.user_id,
+                    ),
                     queue_status_key: RedisKeys::matchmaking_user_status(member.user_id),
                     queue_identity_key: RedisKeys::matchmaking_user_queue_identity(member.user_id),
                     queue_identity_value: queue_identity_value.clone(),
@@ -1152,6 +1168,7 @@ impl MatchmakingManager {
             outbox_payload: serde_json::to_string(&outbox_record)?,
             created_at_ms: match_info.created_at,
             game_id: game_id.to_string(),
+            pending_game_ttl_ms: LOBBY_MATCH_HANDOFF_TTL_MS,
             active_match_json: active_match_json.clone(),
             matchmaking_pool: matchmaking_pool.to_string(),
             lobbies: commit_lobbies,

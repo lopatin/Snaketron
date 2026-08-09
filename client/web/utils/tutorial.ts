@@ -1,4 +1,5 @@
 import type { GameState, GameType, QueueMode } from '../types';
+import { gameStorage } from '../services/gameStorage.ts';
 import type { BoostInputMode } from './boostInput';
 
 /**
@@ -249,7 +250,7 @@ const SEEN_STORAGE_KEY = 'snaketron:tutorial-seen:v1';
 
 const readSeen = (): Record<string, boolean> => {
   try {
-    const raw = window.localStorage.getItem(SEEN_STORAGE_KEY);
+    const raw = gameStorage.getItem(SEEN_STORAGE_KEY);
     if (!raw) {
       return {};
     }
@@ -268,7 +269,7 @@ export const hasSeenTutorial = (key: TutorialKey): boolean => readSeen()[key] ==
 
 export const markTutorialSeen = (key: TutorialKey): void => {
   try {
-    window.localStorage.setItem(
+    gameStorage.setItem(
       SEEN_STORAGE_KEY,
       JSON.stringify({ ...readSeen(), [key]: true }),
     );

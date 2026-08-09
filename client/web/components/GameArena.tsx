@@ -22,7 +22,8 @@ import IdleKickDialog from './IdleKickDialog';
 import IdleWarningBanner from './IdleWarningBanner';
 import LoadingScreen from './LoadingScreen';
 import TutorialModal from './TutorialModal';
-import { simulationStartMs } from '../utils/gamePresentation';
+import { buildMatchPresentation, simulationStartMs } from '../utils/gamePresentation';
+import { crazyGames } from '../services/crazyGames';
 import {
   hasSeenTutorial,
   markTutorialSeen,
@@ -169,6 +170,8 @@ export default function GameArena() {
   const lastVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
   const scoreEffectsRef = useRef(createScoreEffectRuntime());
+  const platformResultReportedForGameRef = useRef<string | null>(null);
+  const platformGameplayObservedForGameRef = useRef<string | null>(null);
   // The gameplay key listeners are installed once for the arena's lifetime, so
   // they read modal ownership through a ref rather than being torn down and
   // rebuilt every time the briefing opens or closes.
@@ -388,6 +391,44 @@ export default function GameArena() {
   const isGameInteractionActive = isGameObservationActive && !localWasIdleKicked;
 
   useEffect(() => {
+    crazyGames.loadingStart();
+    return () => {
+      crazyGames.loadingStop();
+      crazyGames.gameplayStop();
+      crazyGames.clearGameContext();
+    };
+  }, [gameId]);
+
+  useEffect(() => {
+    if (isGameObservationActive || currentGameLoadFailure) {
+      crazyGames.loadingStop();
+    }
+  }, [currentGameLoadFailure, isGameObservationActive]);
+
+  const platformGameType = useMemo(() => {
+    const gameType = (gameState ?? committedState)?.game_type;
+    if (!gameType) {
+      return null;
+    }
+    return typeof gameType === 'string'
+      ? gameType
+      : Object.keys(gameType)[0] ?? 'Unknown';
+  }, [committedState?.game_type, gameState?.game_type]);
+  const platformQueueMode = (committedState ?? gameState)?.queue_mode ?? queueMode;
+
+  useEffect(() => {
+    if (!platformGameType) {
+      return;
+    }
+    crazyGames.setGameContext({
+      gameId,
+      gameType: platformGameType,
+      queueMode: platformQueueMode,
+      lobbyCode: currentLobby?.code ?? 'matchmaking',
+    });
+  }, [currentLobby?.code, gameId, platformGameType, platformQueueMode]);
+
+  useEffect(() => {
     if (currentGameLoadFailure) {
       // Allow an explicit retry or a future authenticated reconnect to issue JoinGame again.
       joinedGameIdRef.current = null;
@@ -536,6 +577,39 @@ export default function GameArena() {
       // They must explicitly click "Menu" to leave or wait for host to "Play Again"
     }
   }, [gameState, user?.id, gameOver, isGameComplete, stopEngine]);
+
+  useEffect(() => {
+    const completedState = committedState ?? gameState;
+    if (
+      !isGameComplete ||
+      !completedState ||
+      platformResultReportedForGameRef.current === gameId
+    ) {
+      return;
+    }
+
+    platformResultReportedForGameRef.current = gameId;
+    const playedThisPageSession = platformGameplayObservedForGameRef.current === gameId;
+    const presentation = buildMatchPresentation(
+      completedState,
+      user?.id,
+      completedState.queue_mode,
+    );
+    if (
+      playedThisPageSession &&
+      completedState.queue_mode === 'Competitive' &&
+      presentation.currentPlayer?.isWinner
+    ) {
+      crazyGames.happyTime();
+    }
+
+    if (playedThisPageSession) {
+      // Match completion is the game's only natural commercial break. Direct
+      // navigation/reconnect to an old result never earns an ad request.
+      crazyGames.gameplayStop();
+      void crazyGames.requestAd('midgame');
+    }
+  }, [committedState, gameId, gameState, isGameComplete, user?.id]);
 
   // Screen->game direction mapping now lives in Rust (screenDirectionToGame,
   // client/src/render.rs), sharing the rotation convention with the renderer.
@@ -1010,6 +1084,33 @@ export default function GameArena() {
   // A match still held by the readiness gate has no countdown to show — the
   // briefing owns the screen until it resolves.
   const showCountdown = countdownSeconds > 0;
+  const platformStatus = (committedState ?? gameState)?.status;
+  const platformGameStarted = Boolean(
+    typeof platformStatus === 'object' &&
+    platformStatus !== null &&
+    'Started' in platformStatus,
+  );
+  const platformGameplayActive =
+    isGameInteractionActive &&
+    isLocalUserPlaying &&
+    platformGameStarted &&
+    !connectionStale &&
+    !isAwaitingReadiness &&
+    !isGameComplete &&
+    !gameOver &&
+    !showBriefing &&
+    !showHelp &&
+    !showCountdown;
+
+  useEffect(() => {
+    if (platformGameplayActive) {
+      platformGameplayObservedForGameRef.current = gameId;
+      crazyGames.gameplayStart();
+    } else {
+      crazyGames.gameplayStop();
+    }
+    return () => crazyGames.gameplayStop();
+  }, [gameId, platformGameplayActive]);
   const localIdle = buildPlayerIdlePresentation(gameState ?? committedState, user?.id);
   const idleWarning =
     isGameInteractionActive &&

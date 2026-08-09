@@ -1,10 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { LobbyModal } from './LobbyModal';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { crazyGames } from '../services/crazyGames';
 
 interface InviteFriendsModalProps {
   isOpen: boolean;
   onClose: () => void;
   lobbyCode: string | null;
+  region?: string | null;
 }
 
 type CopyState = 'idle' | 'copied' | 'failed';
@@ -29,7 +32,9 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
   isOpen,
   onClose,
   lobbyCode,
+  region,
 }) => {
+  const { isCrazyGamesBuild, available } = useCrazyGames();
   const [codeCopyState, setCodeCopyState] = useState<CopyState>('idle');
   const [linkCopyState, setLinkCopyState] = useState<CopyState>('idle');
   const [latestCopyTarget, setLatestCopyTarget] = useState<CopyTarget | null>(null);
@@ -44,13 +49,24 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
     if (!lobbyCode || typeof window === 'undefined') {
       return '';
     }
-    // The itch.io embed lives on itch's static host, so a link to its own
+    if (isCrazyGamesBuild && available) {
+      const inviteParams: Record<string, string> = { lobbyCode };
+      if (region) {
+        inviteParams.region = region;
+      }
+      const portalLink = crazyGames.inviteLink(inviteParams);
+      if (portalLink) {
+        return portalLink;
+      }
+    }
+
+    // Embedded builds live on a portal static host, so a link to their own
     // origin would strand invitees; send them to the canonical site instead.
-    const origin = process.env.ITCH_BUILD === 'true'
+    const origin = process.env.ITCH_BUILD === 'true' || isCrazyGamesBuild
       ? 'https://snaketron.io'
       : window.location.origin;
     return `${origin}/lobby/${encodeURIComponent(lobbyCode)}`;
-  }, [lobbyCode]);
+  }, [available, isCrazyGamesBuild, lobbyCode, region]);
 
   const clearResetTimer = (target: CopyTarget) => {
     const timer = resetTimersRef.current[target];

@@ -132,6 +132,7 @@ export interface WebSocketContextType {
   latencyMs: number;
 
   // Lobby state
+  lobbyRestorationComplete: boolean;
   currentLobby: Lobby | null;
   lobbyMembers: LobbyMember[];
   lobbyChatMessages: ChatMessage[];

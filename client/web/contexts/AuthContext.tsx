@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, isApiError } from '../services/api';
+import { api, AUTH_TOKEN_STORAGE_KEY, isApiError } from '../services/api';
 import { AuthContextType, User } from '../types';
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -24,7 +24,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   // Check if user is logged in on mount
   useEffect(() => {
-    const token = localStorage.getItem('token');
+    const token = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
     if (token) {
       fetchCurrentUser();
     } else {
@@ -113,7 +113,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   }, [navigate]);
 
   const getToken = useCallback((): string | null => {
-    return localStorage.getItem('token');
+    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
   }, []);
 
   const value: AuthContextType = {

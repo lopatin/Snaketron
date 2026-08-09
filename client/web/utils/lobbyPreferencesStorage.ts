@@ -1,4 +1,5 @@
 import { LobbyGameMode, LobbyPreferences } from '../types';
+import { gameStorage } from '../services/gameStorage.ts';
 
 const LAST_LOBBY_PREFERENCES_KEY = 'lastLobbyPreferences';
 const LEGACY_LAST_MODES_KEY = 'lastSelectedGameModes';
@@ -44,12 +45,8 @@ const clonePreferences = (preferences: LobbyPreferences): LobbyPreferences => ({
 });
 
 export const loadStoredLobbyPreferences = (): LobbyPreferences | null => {
-  if (typeof window === 'undefined' || !window?.localStorage) {
-    return null;
-  }
-
   try {
-    const raw = window.localStorage.getItem(LAST_LOBBY_PREFERENCES_KEY);
+    const raw = gameStorage.getItem(LAST_LOBBY_PREFERENCES_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       const modes = sanitizeModes(parsed?.selectedModes ?? parsed?.selected_modes);
@@ -68,7 +65,7 @@ export const loadStoredLobbyPreferences = (): LobbyPreferences | null => {
       };
     }
 
-    const legacy = window.localStorage.getItem(LEGACY_LAST_MODES_KEY);
+    const legacy = gameStorage.getItem(LEGACY_LAST_MODES_KEY);
     if (legacy) {
       try {
         const parsedLegacy = JSON.parse(legacy);
@@ -91,16 +88,12 @@ export const loadStoredLobbyPreferences = (): LobbyPreferences | null => {
 };
 
 export const persistStoredLobbyPreferences = (preferences: LobbyPreferences): void => {
-  if (typeof window === 'undefined' || !window?.localStorage) {
-    return;
-  }
-
   try {
     const sanitized = clonePreferences(preferences);
     if (sanitized.selectedModes.length === 0) {
       sanitized.selectedModes = [...DEFAULT_LOBBY_PREFERENCES.selectedModes];
     }
-    window.localStorage.setItem(LAST_LOBBY_PREFERENCES_KEY, JSON.stringify(sanitized));
+    gameStorage.setItem(LAST_LOBBY_PREFERENCES_KEY, JSON.stringify(sanitized));
   } catch (error) {
     console.warn('Failed to persist lobby preferences', error);
   }

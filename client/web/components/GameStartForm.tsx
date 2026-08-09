@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
@@ -9,6 +9,8 @@ import {
   loadStoredLobbyPreferences,
   persistStoredLobbyPreferences,
 } from '../utils/lobbyPreferencesStorage';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { crazyGamesGuestNickname } from '../services/crazyGames';
 
 const areModeSetsEqual = (a: Set<LobbyGameMode> | null, b: Set<LobbyGameMode> | null) => {
   if (a === b) {
@@ -56,7 +58,18 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   errorMessage = null,
   playersOnline = null,
 }) => {
-  const [nickname, setNickname] = useState(currentUsername || '');
+  const { isCrazyGamesBuild, portalUser, userAccountAvailable } = useCrazyGames();
+  const portalNickname = useMemo(
+    () => portalUser ? crazyGamesGuestNickname(portalUser.username) : '',
+    [portalUser?.username],
+  );
+  // A signed-in CrazyGames profile is the recognizable multiplayer identity.
+  // If an existing backend guest was restored, the debounced update below
+  // renames that guest to the latest portal display name.
+  const effectiveUsername = portalNickname || currentUsername || '';
+  const hasPlatformIdentity = Boolean(isCrazyGamesBuild && portalUser);
+  const locksNickname = isAuthenticated || hasPlatformIdentity;
+  const [nickname, setNickname] = useState(effectiveUsername);
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
   const [selectedModes, setSelectedModes] = useState<Set<LobbyGameMode> | null>(null);
   const [isCompetitive, setIsCompetitive] = useState<boolean | null>(null);
@@ -73,8 +86,10 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   // Auto-focus on nickname field when component mounts
   useEffect(() => {
-    nicknameInputRef.current?.focus();
-  }, []);
+    if (!locksNickname) {
+      nicknameInputRef.current?.focus();
+    }
+  }, [locksNickname]);
 
   // Keep local selection state in sync with lobby-wide preferences
   useEffect(() => {
@@ -123,7 +138,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   // Sync nickname with currentUsername when it changes (for guest users)
   useEffect(() => {
-    if (!currentUsername) {
+    if (!effectiveUsername) {
       return;
     }
 
@@ -131,12 +146,16 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       setHasAutoSetNickname(true);
     }
 
-    if (prevUsernameRef.current !== currentUsername) {
-      setNickname(currentUsername);
-      lastSubmittedNicknameRef.current = currentUsername;
-      prevUsernameRef.current = currentUsername;
+    if (prevUsernameRef.current !== effectiveUsername) {
+      setNickname(effectiveUsername);
+      // CrazyGamesBridge owns the server rename for portal identities so it
+      // works on invite/game routes too; do not duplicate that WS command here.
+      lastSubmittedNicknameRef.current = hasPlatformIdentity || effectiveUsername === currentUsername
+        ? effectiveUsername
+        : null;
+      prevUsernameRef.current = effectiveUsername;
     }
-  }, [currentUsername, hasAutoSetNickname]);
+  }, [currentUsername, effectiveUsername, hasAutoSetNickname, hasPlatformIdentity]);
 
   useEffect(() => {
     if (!user || !user.isGuest) {
@@ -249,33 +268,35 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
             onChange={(e) => setNickname(e.target.value)}
             placeholder="Nickname"
             className={`w-full bg-white px-4 py-3 text-base border-2 rounded-lg transition-colors ${
-              isAuthenticated
+              locksNickname
                 ? 'border-gray-300 cursor-default'
                 : 'border-gray-300 focus:outline-none focus:border-blue-500'
             }`}
-            disabled={isLoading || isAuthenticated}
+            disabled={isLoading || locksNickname}
             minLength={3}
             required
-            readOnly={isAuthenticated}
+            readOnly={locksNickname}
           />
 
           {/* Guest notice + sign-in link. Hidden entirely once the player has
               a real account, since neither half applies to them. */}
-          {!isAuthenticated && (
+          {!locksNickname && (
             <div className="mt-2 px-1 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span className="text-[13px] text-gray-500 whitespace-nowrap">
-                Playing as guest
+                {isCrazyGamesBuild ? 'Playing as CrazyGames guest' : 'Playing as guest'}
               </span>
-              <button
-                type="button"
-                onClick={onSignInClick}
-                className="
-                  text-[13px] whitespace-nowrap text-blue-600 cursor-pointer
-                  hover:underline focus-visible:underline
-                "
-              >
-                Sign in or create account
-              </button>
+              {(!isCrazyGamesBuild || userAccountAvailable) && (
+                <button
+                  type="button"
+                  onClick={onSignInClick}
+                  className="
+                    text-[13px] whitespace-nowrap text-blue-600 cursor-pointer
+                    hover:underline focus-visible:underline
+                  "
+                >
+                  {isCrazyGamesBuild ? 'Sign in with CrazyGames' : 'Sign in or create account'}
+                </button>
+              )}
             </div>
           )}
 

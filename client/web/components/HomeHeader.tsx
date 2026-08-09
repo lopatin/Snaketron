@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { LobbyMember, User } from '../types';
 import type { AccountModalView } from './AccountModal';
 import { HistoryIcon, KeyIcon, LogoutIcon, UserIcon, UserPlusIcon } from './Icons';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
 
 interface HomeHeaderProps {
   activePage?: 'play' | 'leaderboards';
@@ -31,6 +32,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onOpenAccount,
   onLogout,
 }) => {
+  const { isCrazyGamesBuild, portalUser, userAccountAvailable } = useCrazyGames();
   const [isSocialOpen, setIsSocialOpen] = useState(false);
   const [isAccountOpen, setIsAccountOpen] = useState(false);
   const socialMenuRef = useRef<HTMLDivElement>(null);
@@ -179,7 +181,32 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
         </nav>
 
         <div className="home-account home-account-menu" ref={accountMenuRef}>
-          {currentUser && !currentUser.isGuest ? (
+          {isCrazyGamesBuild ? (
+            portalUser ? (
+              <div
+                className="home-account-action flex items-center gap-2"
+                aria-label={`Playing as ${portalUser.username} through CrazyGames`}
+              >
+                <img
+                  src={portalUser.profilePictureUrl}
+                  alt=""
+                  className="h-7 w-7 rounded-full border border-black/20 object-cover"
+                  referrerPolicy="no-referrer"
+                />
+                <span className="home-account-username">{portalUser.username}</span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={onAuthClick}
+                className="home-account-action"
+                disabled={!userAccountAvailable}
+                title={userAccountAvailable ? undefined : 'CrazyGames account login is unavailable in this embed'}
+              >
+                {userAccountAvailable ? 'Sign in with CrazyGames' : 'Playing as guest'}
+              </button>
+            )
+          ) : currentUser && !currentUser.isGuest ? (
             <>
               <button
                 ref={accountTriggerRef}

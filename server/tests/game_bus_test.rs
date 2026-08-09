@@ -1379,6 +1379,8 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
         let user_spectator_key = RedisKeys::matchmaking_user_active_game(202);
         let lobby_a_key = RedisKeys::matchmaking_lobby_active_game("LOBBY-A");
         let lobby_b_key = RedisKeys::matchmaking_lobby_active_game("LOBBY-B");
+        let player_handoff_key = RedisKeys::matchmaking_lobby_user_pending_game("LOBBY-A", 101);
+        let spectator_handoff_key = RedisKeys::matchmaking_lobby_user_pending_game("LOBBY-B", 202);
         let game_value = game_id.to_string();
         let _: () = redis
             .hset(
@@ -1392,6 +1394,8 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             &user_spectator_key,
             &lobby_a_key,
             &lobby_b_key,
+            &player_handoff_key,
+            &spectator_handoff_key,
         ] {
             let _: () = redis.set(key, &game_value).await?;
         }
@@ -1470,6 +1474,13 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             &lobby_b_key,
         ] {
             assert_eq!(redis.get::<_, Option<String>>(key).await?, None);
+        }
+        for handoff_key in [&player_handoff_key, &spectator_handoff_key] {
+            assert_eq!(
+                redis.get::<_, Option<String>>(handoff_key).await?,
+                Some(game_value.clone()),
+                "terminal cleanup must not erase an unacknowledged member handoff"
+            );
         }
         assert_eq!(
             redis

@@ -397,6 +397,10 @@ export const useGameEngine = ({
       // Parse and send to server. The command envelope contains only u32
       // fields (CommandId tick/user_id/sequence_number), so JSON.parse is
       // lossless here — unlike the inbound event path with its u64 hashes.
+      if (!commandMessageJson) {
+        console.error('WASM engine did not return a command envelope');
+        return false;
+      }
       const commandMessage: GameCommandMessage = JSON.parse(commandMessageJson);
       console.log('Command message from engine:', commandMessage, 'at', Date.now());
 
