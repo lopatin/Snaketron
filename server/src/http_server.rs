@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, options, post},
+    routing::{get, options, post, put},
 };
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -18,6 +18,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::api::auth::{self, AuthState};
+use crate::api::crazygames;
 use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::{AuthMiddlewareState, auth_middleware};
@@ -232,6 +233,7 @@ pub async fn install_http_application(
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: Some(state.user_cache.clone()),
+        crazygames_verifier: crazygames::configured_verifier_from_env()?,
     };
     let auth_middleware_state = AuthMiddlewareState {
         jwt_manager: jwt_manager.clone(),
@@ -246,10 +248,16 @@ pub async fn install_http_application(
 
     // Create rate limiter for username check endpoint
     let username_check_limiter = rate_limit_layer(1000, 60);
+    let crazygames_exchange_limiter = rate_limit_layer(60, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
+        .route(
+            "/api/auth/crazygames/preferences",
+            put(crazygames::save_preferences)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -296,6 +304,15 @@ pub async fn install_http_application(
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/guest", post(auth::create_guest))
+        .route(
+            "/api/auth/crazygames/exchange",
+            post(crazygames::exchange)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    crazygames_exchange_limiter,
+                    rate_limit_middleware,
+                )),
+        )
         .route(
             "/api/auth/check-username",
             post(auth::check_username).layer(middleware::from_fn_with_state(

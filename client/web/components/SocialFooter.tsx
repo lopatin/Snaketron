@@ -1,7 +1,10 @@
 import React from 'react';
+import { Link } from 'react-router-dom';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
 
 export const SocialFooter: React.FC = () => {
   const currentYear = new Date().getFullYear();
+  const { isCrazyGamesBuild } = useCrazyGames();
 
   return (
     <footer className="home-social-footer">
@@ -42,6 +45,14 @@ export const SocialFooter: React.FC = () => {
         </span>
 
       </div>
+      {isCrazyGamesBuild && (
+        <p className="mx-auto mb-2 max-w-md px-4 text-center text-xs text-gray-600">
+          Signed-in play uses your CrazyGames profile and saves progress on Snaketron servers.{' '}
+          <Link to="/privacy" className="font-semibold text-blue-700 hover:underline">
+            Privacy &amp; data deletion
+          </Link>
+        </p>
+      )}
       <p className="home-copyright">© {currentYear} Snaketron</p>
     </footer>
   );

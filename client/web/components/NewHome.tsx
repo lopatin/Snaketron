@@ -25,7 +25,7 @@ interface NewHomeProps {
 
 export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
-  const { user, createGuest, logout } = useAuth();
+  const { user, ensurePlayableSession, logout } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -114,10 +114,9 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     setIsLoading(true);
     setStartError(null);
     try {
-      // If not logged in, create guest user
-      if (!user) {
-        await createGuest(nickname);
-      }
+      // In CrazyGames this waits for verified account restoration before it
+      // may create a guest. In other builds it preserves the existing flow.
+      await ensurePlayableSession(nickname);
 
       // Wait for the active regional socket to acknowledge this exact session
       // before issuing lobby or matchmaking commands.
@@ -177,13 +176,11 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
 
     setIsCreatingInvite(true);
     try {
-      if (!user) {
-        try {
-          await createGuest(generateGuestNickname());
-        } catch (error) {
-          console.error('Guest creation failed for lobby invite:', error);
-          return;
-        }
+      try {
+        await ensurePlayableSession(generateGuestNickname());
+      } catch (error) {
+        console.error('Player session creation failed for lobby invite:', error);
+        return;
       }
 
       await waitForSessionReady();

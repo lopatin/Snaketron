@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
@@ -30,6 +31,111 @@ pub struct User {
     pub guest_token: Option<String>,
     #[serde(default)]
     pub is_stress_test: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crazygames_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_picture_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_iat: Option<i64>,
+}
+
+/// The verified, server-side view of a CrazyGames identity.  None of these
+/// fields may be populated from `getUser()` or other client-controlled data;
+/// they come exclusively from a successfully verified CrazyGames JWT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrazyGamesProfile {
+    pub provider_user_id: String,
+    pub username: String,
+    pub avatar_url: String,
+    pub profile_iat: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrazyGamesAccountResolution {
+    Created,
+    GuestClaimed,
+    Returning,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrazyGamesGuestPromotion {
+    Check,
+    Allow,
+    #[default]
+    Decline,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CrazyGamesPreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tutorial_seen: Option<HashMap<String, bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lobby_preferences: Option<CrazyGamesLobbyPreferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boost_input_mode: Option<CrazyGamesBoostInputMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CrazyGamesLobbyPreferences {
+    pub selected_modes: Vec<String>,
+    pub competitive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrazyGamesBoostInputMode {
+    Hold,
+    Toggle,
+}
+
+impl CrazyGamesPreferences {
+    /// Merge an incoming full/partial preference snapshot. Tutorial completion
+    /// is monotonic; device races can never make a completed tutorial unseen.
+    /// Other present fields use last-write-wins, while omitted fields retain
+    /// their current value.
+    pub fn merge(&self, incoming: &Self) -> Self {
+        let tutorial_seen = match (&self.tutorial_seen, &incoming.tutorial_seen) {
+            (None, None) => None,
+            (current, next) => {
+                let mut merged = current.clone().unwrap_or_default();
+                for (tutorial, seen) in next.iter().flat_map(|items| items.iter()) {
+                    if *seen || !merged.contains_key(tutorial) {
+                        merged.insert(tutorial.clone(), *seen);
+                    }
+                }
+                Some(merged)
+            }
+        };
+
+        Self {
+            tutorial_seen,
+            lobby_preferences: incoming
+                .lobby_preferences
+                .clone()
+                .or_else(|| self.lobby_preferences.clone()),
+            boost_input_mode: incoming.boost_input_mode.or(self.boost_input_mode),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CrazyGamesAccount {
+    pub user: User,
+    pub profile: CrazyGamesProfile,
+    pub resolution: CrazyGamesAccountResolution,
+    pub preferences: CrazyGamesPreferences,
+}
+
+#[derive(Debug, Clone)]
+pub enum CrazyGamesAccountOutcome {
+    Resolved(Box<CrazyGamesAccount>),
+    GuestLinkConsentRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

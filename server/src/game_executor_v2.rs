@@ -3150,7 +3150,10 @@ mod tests {
     use super::*;
     use crate::cluster_membership::{BootIdentity, ClusterNamespace};
     use crate::db::ServerRegistration;
-    use crate::db::models::{CustomLobby, Game, GamePlayer, HighScoreEntry, RankingEntry, User};
+    use crate::db::models::{
+        CrazyGamesAccountOutcome, CrazyGamesGuestPromotion, CrazyGamesPreferences,
+        CrazyGamesProfile, CustomLobby, Game, GamePlayer, HighScoreEntry, RankingEntry, User,
+    };
     use crate::redis_keys::RedisKeys;
     use crate::redis_utils::RedisConnection;
     use crate::replication::{GameStateReader, ReplicationManager};
@@ -4721,6 +4724,16 @@ mod tests {
         unused_database_method!(update_user_mmr(user_id: i32, mmr: i32) -> ());
         unused_database_method!(update_guest_username(user_id: i32, username: &str) -> ());
         unused_database_method!(add_user_xp(user_id: i32, xp_to_add: i32) -> i32);
+        unused_database_method!(resolve_crazygames_account(
+            profile: &CrazyGamesProfile,
+            guest_candidate_user_id: Option<i32>,
+            guest_promotion: CrazyGamesGuestPromotion,
+            initial_preferences: Option<&CrazyGamesPreferences>
+        ) -> CrazyGamesAccountOutcome);
+        unused_database_method!(save_crazygames_preferences(
+            user_id: i32,
+            preferences: &CrazyGamesPreferences
+        ) -> CrazyGamesPreferences);
         unused_database_method!(update_user_mmr_by_mode(
             user_id: i32,
             mmr_delta: i32,

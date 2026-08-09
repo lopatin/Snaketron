@@ -37,15 +37,44 @@ interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
 }
 
+export interface CrazyGamesPreferences {
+  tutorialSeen?: Record<string, boolean>;
+  lobbyPreferences?: {
+    selectedModes: string[];
+    competitive: boolean;
+  };
+  boostInputMode?: 'hold' | 'toggle';
+}
+
+export type CrazyGamesGuestPromotion = 'check' | 'allow' | 'decline';
+
+export type CrazyGamesExchangeResolution = 'created' | 'guestClaimed' | 'returning';
+
+export interface CrazyGamesExchangeUser extends UserInfo {
+  authSource: 'crazygames';
+  avatarUrl?: string | null;
+}
+
+export interface CrazyGamesExchangeResponse {
+  token: string;
+  expiresAt: number;
+  resolution: CrazyGamesExchangeResolution;
+  user: CrazyGamesExchangeUser;
+  preferences: CrazyGamesPreferences;
+}
+
 // Portal sessions are intentionally isolated from first-party username/
-// password sessions. The CrazyGames pilot uses this only for a guest token;
-// the full account exchange will mint the same internal JWT under this key.
+// password sessions. This key stores only Snaketron's internal JWT; the
+// short-lived CrazyGames token is never persisted.
 export const AUTH_TOKEN_STORAGE_KEY = process.env.CRAZYGAMES_BUILD === 'true'
   ? 'snaketron:crazygames:session-token'
   : 'token';
+const IS_CRAZY_GAMES_BUILD = process.env.CRAZYGAMES_BUILD === 'true';
 
 class API {
   private baseURL: string;
+  private crazyGamesMemoryToken: string | null = null;
+  private crazyGamesTokenLoaded = false;
 
   constructor() {
     // Base API host; endpoints below include the /api prefix explicitly
@@ -54,15 +83,71 @@ class API {
   }
 
   private getToken(): string | null {
-    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    if (!IS_CRAZY_GAMES_BUILD) {
+      return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+    if (this.crazyGamesTokenLoaded) {
+      return this.crazyGamesMemoryToken;
+    }
+    this.crazyGamesTokenLoaded = true;
+    try {
+      this.crazyGamesMemoryToken = sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // In-memory auth still works when an embed blocks Web Storage.
+    }
+    if (this.crazyGamesMemoryToken) {
+      return this.crazyGamesMemoryToken;
+    }
+    // One-time migration from the earlier shared-tab pilot. All new reads and
+    // writes are tab-scoped so another portal account cannot replace this
+    // tab's bearer token.
+    try {
+      const legacyToken = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+      if (legacyToken) {
+        this.crazyGamesMemoryToken = legacyToken;
+        try {
+          sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, legacyToken);
+        } catch {
+          // Memory remains authoritative for this page lifetime.
+        }
+      }
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // Shared storage is optional and is never used as the live CG source.
+    }
+    return this.crazyGamesMemoryToken;
   }
 
   setAuthToken(token: string | null): void {
-    if (token) {
-      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
-    } else {
-      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    if (!IS_CRAZY_GAMES_BUILD) {
+      if (token) {
+        localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+      } else {
+        localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      }
+      return;
     }
+
+    this.crazyGamesTokenLoaded = true;
+    this.crazyGamesMemoryToken = token;
+    try {
+      if (token) {
+        sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+      } else {
+        sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      }
+    } catch {
+      // Memory remains authoritative until the next full page load.
+    }
+    try {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // Best-effort cleanup of the shared-tab legacy key.
+    }
+  }
+
+  getAuthToken(): string | null {
+    return this.getToken();
   }
 
   // T must be specified by the caller (typically a generated wire DTO). The
@@ -116,12 +201,42 @@ class API {
   }
 
   async createGuest(nickname: string): Promise<CreateGuestResponse> {
-    const data = await this.request<CreateGuestResponse>('/api/auth/guest', {
+    return this.request<CreateGuestResponse>('/api/auth/guest', {
       method: 'POST',
       body: JSON.stringify({ nickname }),
     });
-    this.setAuthToken(data.token);
-    return data;
+  }
+
+  /**
+   * Exchange a short-lived CrazyGames JWT without ever persisting it. The
+   * optional internal bearer attached by request() lets the server inspect or
+   * promote an eligible guest according to the caller's explicit consent.
+   */
+  async exchangeCrazyGamesToken(
+    token: string,
+    guestPromotion: CrazyGamesGuestPromotion,
+    initialPreferences?: CrazyGamesPreferences,
+  ): Promise<CrazyGamesExchangeResponse> {
+    return this.request<CrazyGamesExchangeResponse>('/api/auth/crazygames/exchange', {
+      method: 'POST',
+      body: JSON.stringify({
+        token,
+        guestPromotion,
+        ...(initialPreferences ? { initialPreferences } : {}),
+      }),
+    });
+  }
+
+  async saveCrazyGamesPreferences(
+    preferences: CrazyGamesPreferences,
+  ): Promise<CrazyGamesPreferences> {
+    const response = await this.request<{ preferences: CrazyGamesPreferences }>(
+      '/api/auth/crazygames/preferences', {
+      method: 'PUT',
+      body: JSON.stringify(preferences),
+      },
+    );
+    return response.preferences;
   }
 
   async checkUsername(username: string): Promise<CheckUsernameResult> {

@@ -1,14 +1,14 @@
 // A dependency graph that contains any wasm must all be imported
-// asynchronously. Initialize the portal SDK first so its cloud data and
-// settings are ready before React reads any persisted preferences.
+// asynchronously. Initialize the portal SDK first so account availability and
+// settings are resolved before React selects its session/storage path.
 import('./services/crazyGames')
   .then(async ({ crazyGames }) => {
     await crazyGames.init();
     crazyGames.loadingStart();
   })
   .catch((error) => {
-    // The game deliberately remains playable if the SDK script is blocked or
-    // the build is hosted outside an enabled CrazyGames environment.
+    // Continue to the React shell so it can expose the deterministic account
+    // error/guest path instead of leaving a blank iframe.
     console.error('CrazyGames initialization failed:', error);
   })
   .then(() => import('./main'))

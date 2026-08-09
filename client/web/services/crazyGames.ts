@@ -1,6 +1,34 @@
 export type CrazyGamesEnvironment = 'local' | 'crazygames' | 'disabled';
 export type CrazyGamesAdState = 'idle' | 'requesting' | 'playing';
 export type CrazyGamesAdType = 'midgame' | 'rewarded';
+export type CrazyGamesAccountStatus =
+  | 'disabled'
+  | 'checking'
+  | 'authenticated'
+  | 'signed-out'
+  | 'unavailable'
+  | 'error';
+export type CrazyGamesAccountErrorCode =
+  | 'userNotAuthenticated'
+  | 'userAccountUnavailable'
+  | 'sdkUnavailable'
+  | 'invalidToken'
+  | 'unknown';
+
+export interface CrazyGamesAccountError {
+  code: CrazyGamesAccountErrorCode;
+  message: string;
+}
+
+export class CrazyGamesAccountException extends Error {
+  readonly code: CrazyGamesAccountErrorCode;
+
+  constructor(error: CrazyGamesAccountError) {
+    super(error.message);
+    this.name = 'CrazyGamesAccountException';
+    this.code = error.code;
+  }
+}
 
 export interface CrazyGamesPortalUser {
   __dangerousUserId: string;
@@ -105,8 +133,8 @@ interface CrazyGamesSdk {
     listFriends(input: { page: number; size: number }): Promise<CrazyGamesFriendsPage>;
     showAuthPrompt(): Promise<CrazyGamesPortalUser>;
     showAccountLinkPrompt(): Promise<{ response: 'yes' | 'no' }>;
-    addAuthListener(listener: (user: CrazyGamesPortalUser) => void): void;
-    removeAuthListener(listener: (user: CrazyGamesPortalUser) => void): void;
+    addAuthListener(listener: (user: CrazyGamesPortalUser | null) => void): void;
+    removeAuthListener(listener: (user: CrazyGamesPortalUser | null) => void): void;
   };
   data: CrazyGamesDataModule;
 }
@@ -123,6 +151,9 @@ export interface CrazyGamesSnapshot {
   settings: CrazyGamesGameSettings;
   portalUser: CrazyGamesPortalUser | null;
   userAccountAvailable: boolean;
+  accountStatus: CrazyGamesAccountStatus;
+  accountError: CrazyGamesAccountError | null;
+  authChangeSequence: number;
   systemInfo: CrazyGamesSystemInfo | null;
   isInstantMultiplayer: boolean;
   inviteParams: CrazyGamesInviteParams | null;
@@ -147,6 +178,7 @@ const ARE_CRAZY_GAMES_ADS_ENABLED = process.env.CRAZYGAMES_ADS_ENABLED === 'true
 const IS_CRAZY_GAMES_DATA_ENABLED = process.env.CRAZYGAMES_DATA_ENABLED === 'true';
 const SDK_INIT_TIMEOUT_MS = 15_000;
 const AD_REQUEST_TIMEOUT_MS = 15_000;
+const PROFILE_LOOKUP_DELAY_MS = 300;
 
 const DEFAULT_SETTINGS: CrazyGamesGameSettings = {
   disableChat: false,
@@ -170,6 +202,33 @@ const errorMessage = (error: unknown): string => {
   return String(error ?? 'Unknown CrazyGames SDK error');
 };
 
+const errorCode = (error: unknown): string => {
+  if (error && typeof error === 'object' && 'code' in error) {
+    return String((error as { code?: unknown }).code ?? '');
+  }
+  return '';
+};
+
+/** Normalize the SDK's Error/string/object variants without exposing them to callers. */
+export const normalizeCrazyGamesAccountError = (error: unknown): CrazyGamesAccountError => {
+  const message = errorMessage(error);
+  const normalized = `${errorCode(error)} ${message}`.replace(/[\s_-]+/g, '').toLowerCase();
+
+  if (normalized.includes('usernotauthenticated') || normalized.includes('notauthenticated')) {
+    return { code: 'userNotAuthenticated', message };
+  }
+  if (normalized.includes('useraccountunavailable') || normalized.includes('accountunavailable')) {
+    return { code: 'userAccountUnavailable', message };
+  }
+  if (normalized.includes('sdknotavailable') || normalized.includes('sdkunavailable')) {
+    return { code: 'sdkUnavailable', message };
+  }
+  if (normalized.includes('invalidtoken') || normalized.includes('emptytoken')) {
+    return { code: 'invalidToken', message };
+  }
+  return { code: 'unknown', message };
+};
+
 const normalizedSettings = (
   settings: Partial<CrazyGamesGameSettings> | undefined,
 ): CrazyGamesGameSettings => ({
@@ -178,9 +237,9 @@ const normalizedSettings = (
 });
 
 /**
- * The CrazyGames SDK is deliberately isolated behind this adapter. Every
- * portal call fails open so an unavailable/disabled SDK can never make the
- * game itself unplayable.
+ * The CrazyGames SDK is deliberately isolated behind this adapter. Cosmetic,
+ * ad, and room calls fail open. Account-token failures remain typed so the
+ * authentication layer can avoid restoring the wrong player's cached session.
  */
 class CrazyGamesService {
   private sdk: CrazyGamesSdk | null = null;
@@ -188,6 +247,9 @@ class CrazyGamesService {
   private listeners = new Set<(snapshot: CrazyGamesSnapshot) => void>();
   private gameplayActive = false;
   private loadingActive = false;
+  private profileLookupScheduled = false;
+  private accountLinkPromptActive = false;
+  private userTokenFlight: Promise<string> | null = null;
 
   private snapshot: CrazyGamesSnapshot = {
     isCrazyGamesBuild: IS_CRAZY_GAMES_BUILD,
@@ -197,6 +259,9 @@ class CrazyGamesService {
     settings: DEFAULT_SETTINGS,
     portalUser: null,
     userAccountAvailable: false,
+    accountStatus: IS_CRAZY_GAMES_BUILD ? 'checking' : 'disabled',
+    accountError: null,
+    authChangeSequence: 0,
     systemInfo: null,
     isInstantMultiplayer: false,
     inviteParams: null,
@@ -215,8 +280,8 @@ class CrazyGamesService {
     this.updateSnapshot({ settings: normalizedSettings(settings) });
   };
 
-  private readonly authListener = (user: CrazyGamesPortalUser) => {
-    this.updateSnapshot({ portalUser: user });
+  private readonly authListener = (user: CrazyGamesPortalUser | null) => {
+    this.publishAuthChange(user);
   };
 
   private readonly roomJoinListener = (params: CrazyGamesInviteParams) => {
@@ -248,6 +313,53 @@ class CrazyGamesService {
     });
   }
 
+  private publishAuthChange(user: CrazyGamesPortalUser | null): void {
+    this.updateSnapshot({
+      portalUser: user,
+      accountStatus: user ? 'authenticated' : 'signed-out',
+      accountError: user ? null : {
+        code: 'userNotAuthenticated',
+        message: 'CrazyGames user signed out',
+      },
+      authChangeSequence: this.snapshot.authChangeSequence + 1,
+    });
+  }
+
+  private schedulePortalProfileLookup(): void {
+    const sdk = this.sdk;
+    if (
+      this.profileLookupScheduled ||
+      !sdk ||
+      !this.snapshot.userAccountAvailable ||
+      this.snapshot.portalUser
+    ) {
+      return;
+    }
+    this.profileLookupScheduled = true;
+    setTimeout(() => {
+      // Account-token retrieval is the security-critical User-module call.
+      // Only start this cosmetic lookup after it has resolved, never beside
+      // it, since the portal may rate-limit or serialize User-module calls.
+      if (this.sdk !== sdk || !this.canUseSdk(sdk) || this.snapshot.portalUser) {
+        return;
+      }
+      if (this.accountLinkPromptActive) {
+        this.profileLookupScheduled = false;
+        this.schedulePortalProfileLookup();
+        return;
+      }
+      void sdk.user.getUser()
+        .then((portalUser) => {
+          if (this.sdk === sdk && portalUser) {
+            this.updateSnapshot({ portalUser });
+          }
+        })
+        .catch((error) => {
+          console.info('CrazyGames user profile unavailable:', errorMessage(error));
+        });
+    }, PROFILE_LOOKUP_DELAY_MS);
+  }
+
   private canUseSdk(sdk: CrazyGamesSdk | null): sdk is CrazyGamesSdk {
     return Boolean(sdk && this.snapshot.available);
   }
@@ -271,6 +383,11 @@ class CrazyGamesService {
       this.updateSnapshot({
         initialized: true,
         initializationError: 'CrazyGames SDK script was not available',
+        accountStatus: 'unavailable',
+        accountError: {
+          code: 'sdkUnavailable',
+          message: 'CrazyGames SDK script was not available',
+        },
       });
       return this.snapshot;
     }
@@ -299,6 +416,20 @@ class CrazyGamesService {
         environment,
         settings: available ? normalizedSettings(sdk.game.settings) : DEFAULT_SETTINGS,
         userAccountAvailable: available && sdk.user.isUserAccountAvailable === true,
+        accountStatus: available
+          ? sdk.user.isUserAccountAvailable === true ? 'checking' : 'unavailable'
+          : 'unavailable',
+        accountError: available && sdk.user.isUserAccountAvailable === true
+          ? null
+          : {
+              // A loaded SDK can deliberately report a disabled environment
+              // on affiliate/non-CrazyGames embeds. That is a supported
+              // guest-only state, not a failed SDK bootstrap.
+              code: 'userAccountUnavailable',
+              message: available
+                ? 'CrazyGames user accounts are unavailable in this embed'
+                : 'CrazyGames account services are unavailable in this embed',
+            },
         systemInfo: available ? sdk.user.systemInfo ?? null : null,
         isInstantMultiplayer: available && sdk.game.isInstantMultiplayer === true,
         initializationError: null,
@@ -312,16 +443,6 @@ class CrazyGamesService {
       sdk.game.addJoinRoomListener(this.roomJoinListener);
       sdk.user.addAuthListener(this.authListener);
       this.publishInvite(sdk.game.inviteParams ?? null);
-
-      if (sdk.user.isUserAccountAvailable === true) {
-        // Profile lookup is not part of the render-critical SDK bootstrap. A
-        // slow account service must never hold the game on a blank page.
-        void sdk.user.getUser()
-          .then((portalUser) => this.updateSnapshot({ portalUser }))
-          .catch((error) => {
-            console.info('CrazyGames user is not authenticated:', errorMessage(error));
-          });
-      }
 
       void sdk.ad.hasAdblock()
         .then((hasAdblock) => this.updateSnapshot({ hasAdblock }))
@@ -338,6 +459,8 @@ class CrazyGamesService {
         available: false,
         environment: 'disabled',
         initializationError: errorMessage(error),
+        accountStatus: 'error',
+        accountError: normalizeCrazyGamesAccountError(error),
       });
       return this.snapshot;
     }
@@ -484,7 +607,10 @@ class CrazyGamesService {
     }
     try {
       const user = await this.sdk.user.showAuthPrompt();
-      this.updateSnapshot({ portalUser: user });
+      // Some SDK environments emit the auth listener and some only resolve
+      // the prompt. Publishing here makes both paths observable; consumers
+      // collapse duplicate events into one hard reload.
+      this.publishAuthChange(user);
       return user;
     } catch (error) {
       const message = errorMessage(error);
@@ -495,17 +621,76 @@ class CrazyGamesService {
     }
   };
 
-  getUserToken = async (): Promise<string | null> => {
-    if (!this.canUseSdk(this.sdk) || !this.snapshot.portalUser) {
-      return null;
+  getUserToken = (): Promise<string> => {
+    if (this.userTokenFlight) {
+      return this.userTokenFlight;
     }
-    try {
-      return await this.sdk.user.getUserToken();
-    } catch (error) {
-      console.info('CrazyGames user token unavailable:', errorMessage(error));
-      return null;
-    }
+    const flight = this.requestUserToken();
+    this.userTokenFlight = flight;
+    const clearFlight = () => {
+      if (this.userTokenFlight === flight) {
+        this.userTokenFlight = null;
+      }
+    };
+    // Clear only when the actual SDK promise settles. Auth-layer timeouts may
+    // stop waiting, but Retry must never start a concurrent User-module call.
+    void flight.then(clearFlight, clearFlight);
+    return flight;
   };
+
+  private async requestUserToken(): Promise<string> {
+    if (!this.canUseSdk(this.sdk)) {
+      const initializedGuestOnlyEmbed = Boolean(
+        this.sdk &&
+        this.snapshot.initialized &&
+        this.snapshot.initializationError === null &&
+        this.snapshot.environment === 'disabled',
+      );
+      const error: CrazyGamesAccountError = {
+        code: initializedGuestOnlyEmbed ? 'userAccountUnavailable' : 'sdkUnavailable',
+        message: initializedGuestOnlyEmbed
+          ? 'CrazyGames account services are unavailable in this embed'
+          : this.snapshot.initializationError ?? 'CrazyGames SDK is unavailable',
+      };
+      this.updateSnapshot({ accountStatus: 'unavailable', accountError: error });
+      throw new CrazyGamesAccountException(error);
+    }
+    if (!this.snapshot.userAccountAvailable) {
+      const error: CrazyGamesAccountError = {
+        code: 'userAccountUnavailable',
+        message: 'CrazyGames user accounts are unavailable in this embed',
+      };
+      this.updateSnapshot({ accountStatus: 'unavailable', accountError: error });
+      throw new CrazyGamesAccountException(error);
+    }
+    this.updateSnapshot({ accountStatus: 'checking', accountError: null });
+    try {
+      const token = await this.sdk.user.getUserToken();
+      if (typeof token !== 'string' || token.trim() === '') {
+        throw new CrazyGamesAccountException({
+          code: 'invalidToken',
+          message: 'CrazyGames returned an empty user token',
+        });
+      }
+      this.updateSnapshot({ accountStatus: 'authenticated', accountError: null });
+      this.schedulePortalProfileLookup();
+      return token;
+    } catch (error) {
+      const normalized = error instanceof CrazyGamesAccountException
+        ? { code: error.code, message: error.message }
+        : normalizeCrazyGamesAccountError(error);
+      const accountStatus: CrazyGamesAccountStatus = normalized.code === 'userNotAuthenticated'
+        ? 'signed-out'
+        : normalized.code === 'userAccountUnavailable' || normalized.code === 'sdkUnavailable'
+          ? 'unavailable'
+          : 'error';
+      this.updateSnapshot({ accountStatus, accountError: normalized });
+      if (normalized.code !== 'userNotAuthenticated') {
+        console.info('CrazyGames user token unavailable:', normalized.message);
+      }
+      throw new CrazyGamesAccountException(normalized);
+    }
+  }
 
   listFriends = async (page = 1, size = 50): Promise<CrazyGamesFriendsPage | null> => {
     if (!this.canUseSdk(this.sdk) || !this.snapshot.portalUser) {
@@ -523,14 +708,18 @@ class CrazyGamesService {
   };
 
   showAccountLinkPrompt = async (): Promise<'yes' | 'no' | null> => {
-    if (!this.canUseSdk(this.sdk) || !this.snapshot.portalUser) {
+    if (!this.canUseSdk(this.sdk) || !this.snapshot.userAccountAvailable) {
       return null;
     }
+    this.accountLinkPromptActive = true;
     try {
-      return (await this.sdk.user.showAccountLinkPrompt()).response;
+      const response = (await this.sdk.user.showAccountLinkPrompt()).response;
+      return response === 'yes' || response === 'no' ? response : null;
     } catch (error) {
       console.info('CrazyGames account link prompt unavailable:', errorMessage(error));
       return null;
+    } finally {
+      this.accountLinkPromptActive = false;
     }
   };
 

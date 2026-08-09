@@ -11,6 +11,7 @@ use aws_sdk_dynamodb::types::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -34,7 +35,17 @@ const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
 const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
 const GUEST_UPGRADE_MAX_ATTEMPTS: usize = 8;
+const CRAZYGAMES_IDENTITY_MAX_ATTEMPTS: usize = 8;
 const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
+
+#[derive(Debug, Clone)]
+struct CrazyGamesIdentityRecord {
+    user_id: i32,
+    provider_user_id: String,
+    username: String,
+    avatar_url: String,
+    profile_iat: i64,
+}
 
 #[derive(Clone, Copy)]
 enum UserProgressMutation {
@@ -946,7 +957,7 @@ impl DynamoDatabase {
         }))
     }
 
-    async fn completion_user_target(&self, user_id: u32) -> Result<(String, bool)> {
+    async fn completion_user_target(&self, user_id: u32) -> Result<(String, bool, bool)> {
         let response = self
             .client
             .get_item()
@@ -954,7 +965,7 @@ impl DynamoDatabase {
             .key("pk", Self::av_s(format!("USER#{user_id}")))
             .key("sk", Self::av_s("META"))
             .consistent_read(true)
-            .projection_expression("username, isGuest")
+            .projection_expression("username, isGuest, authProvider")
             .send()
             .await
             .context("Failed to read completion effect user")?;
@@ -963,10 +974,10 @@ impl DynamoDatabase {
             .ok_or_else(|| anyhow!("user {user_id} disappeared before completion effect"))?;
         let username = Self::extract_string(&item, "username")
             .ok_or_else(|| anyhow!("user {user_id} has no username"))?;
-        Ok((
-            username,
-            Self::extract_bool(&item, "isGuest").unwrap_or(false),
-        ))
+        let is_guest = Self::extract_bool(&item, "isGuest").unwrap_or(false);
+        let uses_username_mirror = !is_guest
+            && Self::extract_string(&item, "authProvider").as_deref() != Some("crazygames");
+        Ok((username, is_guest, uses_username_mirror))
     }
 
     fn user_progress_value(user: &User, field: &str) -> Result<i32> {
@@ -1015,7 +1026,7 @@ impl DynamoDatabase {
                 .with_context(|| format!("Failed to build canonical {field} mutation"))?;
             let mut mutations = vec![TransactWriteItem::builder().update(main_update).build()];
 
-            if !user.is_guest {
+            if !user.is_guest && user.auth_provider.as_deref() != Some("crazygames") {
                 let mirror_update = Update::builder()
                     .table_name(self.usernames_table())
                     .key("username", Self::av_s(&user.username))
@@ -1060,6 +1071,320 @@ impl DynamoDatabase {
         }
 
         unreachable!("user progress mutation attempt loop always returns")
+    }
+
+    fn crazygames_identity_pk(provider_user_id: &str) -> String {
+        let digest = Sha256::digest(provider_user_id.as_bytes());
+        format!("IDENTITY#CRAZYGAMES#{}", hex::encode(digest))
+    }
+
+    async fn get_crazygames_identity(
+        &self,
+        provider_user_id: &str,
+    ) -> Result<Option<CrazyGamesIdentityRecord>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(Self::crazygames_identity_pk(provider_user_id)),
+            )
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read CrazyGames identity mapping")?;
+
+        let Some(item) = response.item else {
+            return Ok(None);
+        };
+        let stored_provider_user_id = Self::extract_string(&item, "providerUserId")
+            .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?;
+        if stored_provider_user_id != provider_user_id {
+            return Err(anyhow!(
+                "CrazyGames identity hash collision or corrupt mapping"
+            ));
+        }
+        Ok(Some(CrazyGamesIdentityRecord {
+            user_id: Self::extract_number(&item, "userId")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+            provider_user_id: stored_provider_user_id,
+            username: Self::extract_string(&item, "username")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+            avatar_url: Self::extract_string(&item, "profilePictureUrl")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+            profile_iat: Self::extract_i64(&item, "profileIat")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+        }))
+    }
+
+    async fn get_crazygames_preferences_with_version(
+        &self,
+        user_id: i32,
+    ) -> Result<(CrazyGamesPreferences, i64)> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("PREFERENCES#CRAZYGAMES"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read CrazyGames preferences")?;
+
+        let Some(item) = response.item else {
+            return Ok((CrazyGamesPreferences::default(), 0));
+        };
+        let preferences = Self::extract_string(&item, "preferences")
+            .ok_or_else(|| anyhow!("CrazyGames preferences are corrupt"))
+            .and_then(|value| {
+                serde_json::from_str(&value).context("CrazyGames preferences are corrupt")
+            })?;
+        let version = Self::extract_i64(&item, "version")
+            .ok_or_else(|| anyhow!("CrazyGames preferences are corrupt"))?;
+        Ok((preferences, version))
+    }
+
+    fn crazygames_preferences_put(
+        &self,
+        user_id: i32,
+        preferences: &CrazyGamesPreferences,
+        version: i64,
+        expected_version: Option<i64>,
+    ) -> Result<Put> {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        item.insert("sk".to_string(), Self::av_s("PREFERENCES#CRAZYGAMES"));
+        item.insert("schemaVersion".to_string(), Self::av_n(1));
+        item.insert("version".to_string(), Self::av_n(version));
+        item.insert(
+            "preferences".to_string(),
+            Self::av_s(
+                serde_json::to_string(preferences)
+                    .context("Failed to serialize CrazyGames preferences")?,
+            ),
+        );
+        item.insert("updatedAt".to_string(), Self::av_s(Utc::now().to_rfc3339()));
+
+        let mut put = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(item));
+        if let Some(expected_version) = expected_version {
+            put = put
+                .condition_expression("attribute_not_exists(pk) OR #version=:expected_version")
+                .expression_attribute_names("#version", "version")
+                .expression_attribute_values(":expected_version", Self::av_n(expected_version));
+        }
+        put.build()
+            .context("Failed to build CrazyGames preferences write")
+    }
+
+    fn crazygames_identity_put(
+        &self,
+        profile: &CrazyGamesProfile,
+        user_id: i32,
+        now: DateTime<Utc>,
+    ) -> Result<Put> {
+        let mut item = HashMap::new();
+        item.insert(
+            "pk".to_string(),
+            Self::av_s(Self::crazygames_identity_pk(&profile.provider_user_id)),
+        );
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("provider".to_string(), Self::av_s("crazygames"));
+        item.insert(
+            "providerUserId".to_string(),
+            Self::av_s(&profile.provider_user_id),
+        );
+        item.insert("userId".to_string(), Self::av_n(user_id));
+        item.insert("username".to_string(), Self::av_s(&profile.username));
+        item.insert(
+            "profilePictureUrl".to_string(),
+            Self::av_s(&profile.avatar_url),
+        );
+        item.insert("profileIat".to_string(), Self::av_n(profile.profile_iat));
+        item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
+        item.insert(
+            "lastAuthenticatedAt".to_string(),
+            Self::av_s(now.to_rfc3339()),
+        );
+
+        Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build CrazyGames identity mapping")
+    }
+
+    fn new_crazygames_user_put(
+        &self,
+        profile: &CrazyGamesProfile,
+        user_id: i32,
+        now: DateTime<Utc>,
+    ) -> Result<Put> {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("gsi1pk".to_string(), Self::av_s("USER"));
+        item.insert("gsi1sk".to_string(), Self::av_s(now.to_rfc3339()));
+        item.insert("id".to_string(), Self::av_n(user_id));
+        item.insert("username".to_string(), Self::av_s(&profile.username));
+        item.insert("passwordHash".to_string(), Self::av_s(""));
+        item.insert("mmr".to_string(), Self::av_n(1000));
+        item.insert("rankedMmr".to_string(), Self::av_n(1000));
+        item.insert("casualMmr".to_string(), Self::av_n(1000));
+        item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
+        item.insert("isGuest".to_string(), Self::av_bool(false));
+        item.insert("isStressTest".to_string(), Self::av_bool(false));
+        item.insert("authProvider".to_string(), Self::av_s("crazygames"));
+        item.insert(
+            "crazyGamesUserId".to_string(),
+            Self::av_s(&profile.provider_user_id),
+        );
+        item.insert(
+            "profilePictureUrl".to_string(),
+            Self::av_s(&profile.avatar_url),
+        );
+        item.insert("profileIat".to_string(), Self::av_n(profile.profile_iat));
+
+        Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build CrazyGames user")
+    }
+
+    async fn update_crazygames_profile_if_newer(
+        &self,
+        current: &CrazyGamesIdentityRecord,
+        profile: &CrazyGamesProfile,
+    ) -> Result<CrazyGamesIdentityRecord> {
+        let mut observed = current.clone();
+        let mut last_error = None;
+        for attempt in 0..CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+            if profile.profile_iat <= observed.profile_iat {
+                return Ok(observed);
+            }
+
+            let identity_update = Update::builder()
+                .table_name(self.main_table())
+                .key(
+                    "pk",
+                    Self::av_s(Self::crazygames_identity_pk(&profile.provider_user_id)),
+                )
+                .key("sk", Self::av_s("META"))
+                .update_expression(concat!(
+                    "SET username=:username, profilePictureUrl=:avatar, ",
+                    "profileIat=:profile_iat, lastAuthenticatedAt=:now"
+                ))
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND providerUserId=:provider_user_id AND ",
+                    "(attribute_not_exists(profileIat) OR profileIat<:profile_iat)"
+                ))
+                .expression_attribute_values(":username", Self::av_s(&profile.username))
+                .expression_attribute_values(":avatar", Self::av_s(&profile.avatar_url))
+                .expression_attribute_values(":profile_iat", Self::av_n(profile.profile_iat))
+                .expression_attribute_values(
+                    ":provider_user_id",
+                    Self::av_s(&profile.provider_user_id),
+                )
+                .expression_attribute_values(":now", Self::av_s(Utc::now().to_rfc3339()))
+                .build()
+                .context("Failed to build CrazyGames identity profile update")?;
+            let user_update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{}", observed.user_id)))
+                .key("sk", Self::av_s("META"))
+                .update_expression(
+                    "SET username=:username, profilePictureUrl=:avatar, profileIat=:profile_iat",
+                )
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND authProvider=:provider AND ",
+                    "crazyGamesUserId=:provider_user_id AND ",
+                    "(attribute_not_exists(profileIat) OR profileIat<:profile_iat)"
+                ))
+                .expression_attribute_values(":username", Self::av_s(&profile.username))
+                .expression_attribute_values(":avatar", Self::av_s(&profile.avatar_url))
+                .expression_attribute_values(":profile_iat", Self::av_n(profile.profile_iat))
+                .expression_attribute_values(":provider", Self::av_s("crazygames"))
+                .expression_attribute_values(
+                    ":provider_user_id",
+                    Self::av_s(&profile.provider_user_id),
+                )
+                .build()
+                .context("Failed to build CrazyGames user profile update")?;
+
+            match self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().update(identity_update).build())
+                .transact_items(TransactWriteItem::builder().update(user_update).build())
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    return Ok(CrazyGamesIdentityRecord {
+                        user_id: observed.user_id,
+                        provider_user_id: profile.provider_user_id.clone(),
+                        username: profile.username.clone(),
+                        avatar_url: profile.avatar_url.clone(),
+                        profile_iat: profile.profile_iat,
+                    });
+                }
+                Err(error) => {
+                    observed = self
+                        .get_crazygames_identity(&profile.provider_user_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("CrazyGames identity mapping disappeared"))?;
+                    if observed.profile_iat >= profile.profile_iat {
+                        return Ok(observed);
+                    }
+                    last_error =
+                        Some(anyhow!(error).context("Failed to update CrazyGames profile"));
+                    if attempt + 1 < CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+                        let exponent = attempt.min(6) as u32;
+                        sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to update CrazyGames profile")))
+    }
+
+    async fn load_crazygames_account(
+        &self,
+        identity: CrazyGamesIdentityRecord,
+        resolution: CrazyGamesAccountResolution,
+    ) -> Result<CrazyGamesAccount> {
+        let user = self
+            .get_user_by_id(identity.user_id)
+            .await?
+            .ok_or_else(|| anyhow!("CrazyGames identity mapping points to a missing user"))?;
+        if user.is_guest
+            || user.auth_provider.as_deref() != Some("crazygames")
+            || user.crazygames_user_id.as_deref() != Some(&identity.provider_user_id)
+        {
+            return Err(anyhow!("CrazyGames identity mapping is corrupt"));
+        }
+        let (preferences, _) = self
+            .get_crazygames_preferences_with_version(identity.user_id)
+            .await?;
+        Ok(CrazyGamesAccount {
+            user,
+            profile: CrazyGamesProfile {
+                provider_user_id: identity.provider_user_id,
+                username: identity.username,
+                avatar_url: identity.avatar_url,
+                profile_iat: identity.profile_iat,
+            },
+            resolution,
+            preferences,
+        })
     }
 
     async fn transact_completion_effect(
@@ -1417,6 +1742,10 @@ impl Database for DynamoDatabase {
             is_guest: false,
             guest_token: None,
             is_stress_test: false,
+            auth_provider: None,
+            crazygames_user_id: None,
+            profile_picture_url: None,
+            profile_iat: None,
         })
     }
 
@@ -1475,6 +1804,10 @@ impl Database for DynamoDatabase {
             is_guest: true,
             guest_token: Some(guest_token.to_string()),
             is_stress_test,
+            auth_provider: None,
+            crazygames_user_id: None,
+            profile_picture_url: None,
+            profile_iat: None,
         })
     }
 
@@ -1646,6 +1979,10 @@ impl Database for DynamoDatabase {
                     is_guest: Self::extract_bool(&item, "isGuest").unwrap_or(false),
                     guest_token: Self::extract_string(&item, "guestToken"),
                     is_stress_test: Self::extract_bool(&item, "isStressTest").unwrap_or(false),
+                    auth_provider: Self::extract_string(&item, "authProvider"),
+                    crazygames_user_id: Self::extract_string(&item, "crazyGamesUserId"),
+                    profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
+                    profile_iat: Self::extract_i64(&item, "profileIat"),
                 };
                 Ok(Some(user))
             }
@@ -1717,6 +2054,311 @@ impl Database for DynamoDatabase {
             xp_to_add, user_id, new_xp
         );
         Ok(new_xp)
+    }
+
+    async fn resolve_crazygames_account(
+        &self,
+        profile: &CrazyGamesProfile,
+        guest_candidate_user_id: Option<i32>,
+        guest_promotion: CrazyGamesGuestPromotion,
+        initial_preferences: Option<&CrazyGamesPreferences>,
+    ) -> Result<CrazyGamesAccountOutcome> {
+        // Browser preferences are safe to import only when the caller proves
+        // ownership of an eligible guest through its internal bearer token.
+        // A newly created provider identity may be opening a browser last used
+        // by another linked account, so it must start from its own empty
+        // canonical snapshot instead of inheriting unscoped local state.
+        let guest_preferences = initial_preferences.cloned().unwrap_or_default();
+        let mut guest_candidate_user_id = match guest_promotion {
+            CrazyGamesGuestPromotion::Check | CrazyGamesGuestPromotion::Allow => {
+                guest_candidate_user_id
+            }
+            CrazyGamesGuestPromotion::Decline => None,
+        };
+        let mut last_error = None;
+
+        for attempt in 0..CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+            if let Some(current) = self
+                .get_crazygames_identity(&profile.provider_user_id)
+                .await?
+            {
+                let current = self
+                    .update_crazygames_profile_if_newer(&current, profile)
+                    .await?;
+                return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                    self.load_crazygames_account(current, CrazyGamesAccountResolution::Returning)
+                        .await?,
+                )));
+            }
+
+            if let Some(candidate_id) = guest_candidate_user_id {
+                let eligible = self
+                    .get_user_by_id(candidate_id)
+                    .await?
+                    .is_some_and(|user| user.is_guest && !user.is_stress_test);
+                if eligible {
+                    if guest_promotion == CrazyGamesGuestPromotion::Check {
+                        // Close the most useful race window before reporting
+                        // consent: a concurrent first launch may have created
+                        // the identity while we inspected the guest. Both
+                        // reads are strongly consistent, and this branch does
+                        // not write the guest, identity, or preferences.
+                        if let Some(current) = self
+                            .get_crazygames_identity(&profile.provider_user_id)
+                            .await?
+                        {
+                            let current = self
+                                .update_crazygames_profile_if_newer(&current, profile)
+                                .await?;
+                            return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                self.load_crazygames_account(
+                                    current,
+                                    CrazyGamesAccountResolution::Returning,
+                                )
+                                .await?,
+                            )));
+                        }
+                        return Ok(CrazyGamesAccountOutcome::GuestLinkConsentRequired);
+                    }
+
+                    let now = Utc::now();
+                    let identity_put = self.crazygames_identity_put(profile, candidate_id, now)?;
+                    let user_update = Update::builder()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("USER#{candidate_id}")))
+                        .key("sk", Self::av_s("META"))
+                        .update_expression(concat!(
+                            "SET username=:username, isGuest=:not_guest, ",
+                            "isStressTest=:not_stress, authProvider=:provider, ",
+                            "crazyGamesUserId=:provider_user_id, ",
+                            "profilePictureUrl=:avatar, profileIat=:profile_iat ",
+                            "REMOVE guestToken"
+                        ))
+                        .condition_expression(concat!(
+                            "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                            "isGuest=:guest AND ",
+                            "(attribute_not_exists(isStressTest) OR isStressTest=:not_stress)"
+                        ))
+                        .expression_attribute_values(":username", Self::av_s(&profile.username))
+                        .expression_attribute_values(":not_guest", Self::av_bool(false))
+                        .expression_attribute_values(":not_stress", Self::av_bool(false))
+                        .expression_attribute_values(":guest", Self::av_bool(true))
+                        .expression_attribute_values(":provider", Self::av_s("crazygames"))
+                        .expression_attribute_values(
+                            ":provider_user_id",
+                            Self::av_s(&profile.provider_user_id),
+                        )
+                        .expression_attribute_values(":avatar", Self::av_s(&profile.avatar_url))
+                        .expression_attribute_values(
+                            ":profile_iat",
+                            Self::av_n(profile.profile_iat),
+                        )
+                        .build()
+                        .context("Failed to build CrazyGames guest claim")?;
+                    let preferences_put =
+                        self.crazygames_preferences_put(candidate_id, &guest_preferences, 1, None)?;
+                    let result = self
+                        .client
+                        .transact_write_items()
+                        .client_request_token(uuid::Uuid::new_v4().to_string())
+                        .transact_items(TransactWriteItem::builder().put(identity_put).build())
+                        .transact_items(TransactWriteItem::builder().update(user_update).build())
+                        .transact_items(TransactWriteItem::builder().put(preferences_put).build())
+                        .send()
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            let identity = self
+                                .get_crazygames_identity(&profile.provider_user_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow!("CrazyGames identity claim committed without mapping")
+                                })?;
+                            info!(
+                                "Claimed public guest {} for a verified CrazyGames identity",
+                                candidate_id
+                            );
+                            return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                self.load_crazygames_account(
+                                    identity,
+                                    CrazyGamesAccountResolution::GuestClaimed,
+                                )
+                                .await?,
+                            )));
+                        }
+                        Err(error) => {
+                            if let Some(winner) = self
+                                .get_crazygames_identity(&profile.provider_user_id)
+                                .await?
+                            {
+                                let winner = self
+                                    .update_crazygames_profile_if_newer(&winner, profile)
+                                    .await?;
+                                return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                    self.load_crazygames_account(
+                                        winner,
+                                        CrazyGamesAccountResolution::Returning,
+                                    )
+                                    .await?,
+                                )));
+                            }
+                            if !self
+                                .get_user_by_id(candidate_id)
+                                .await?
+                                .is_some_and(|user| user.is_guest && !user.is_stress_test)
+                            {
+                                // A concurrent password registration won. Never
+                                // attach CrazyGames to that unrelated account.
+                                guest_candidate_user_id = None;
+                            }
+                            last_error = Some(anyhow!(error).context(
+                                "Failed to atomically claim guest for CrazyGames identity",
+                            ));
+                        }
+                    }
+                } else {
+                    guest_candidate_user_id = None;
+                }
+            }
+
+            if guest_candidate_user_id.is_none() {
+                let user_id = self.generate_id_for_entity("USER").await?;
+                let now = Utc::now();
+                let identity_put = self.crazygames_identity_put(profile, user_id, now)?;
+                let user_put = self.new_crazygames_user_put(profile, user_id, now)?;
+                let preferences_put = self.crazygames_preferences_put(
+                    user_id,
+                    &CrazyGamesPreferences::default(),
+                    1,
+                    None,
+                )?;
+                let result = self
+                    .client
+                    .transact_write_items()
+                    .client_request_token(uuid::Uuid::new_v4().to_string())
+                    .transact_items(TransactWriteItem::builder().put(identity_put).build())
+                    .transact_items(TransactWriteItem::builder().put(user_put).build())
+                    .transact_items(TransactWriteItem::builder().put(preferences_put).build())
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => {
+                        let identity = self
+                            .get_crazygames_identity(&profile.provider_user_id)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow!("CrazyGames account creation committed without mapping")
+                            })?;
+                        info!(
+                            "Created user {} for a verified CrazyGames identity",
+                            user_id
+                        );
+                        return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                            self.load_crazygames_account(
+                                identity,
+                                CrazyGamesAccountResolution::Created,
+                            )
+                            .await?,
+                        )));
+                    }
+                    Err(error) => {
+                        if let Some(winner) = self
+                            .get_crazygames_identity(&profile.provider_user_id)
+                            .await?
+                        {
+                            let winner = self
+                                .update_crazygames_profile_if_newer(&winner, profile)
+                                .await?;
+                            return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                self.load_crazygames_account(
+                                    winner,
+                                    CrazyGamesAccountResolution::Returning,
+                                )
+                                .await?,
+                            )));
+                        }
+                        last_error = Some(
+                            anyhow!(error)
+                                .context("Failed to atomically create CrazyGames account"),
+                        );
+                    }
+                }
+            }
+
+            if attempt + 1 < CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+                let exponent = attempt.min(6) as u32;
+                sleep(Duration::from_millis(1_u64 << exponent)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to resolve CrazyGames identity")))
+    }
+
+    async fn save_crazygames_preferences(
+        &self,
+        user_id: i32,
+        preferences: &CrazyGamesPreferences,
+    ) -> Result<CrazyGamesPreferences> {
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| anyhow!("User not found"))?;
+        if user.is_guest || user.auth_provider.as_deref() != Some("crazygames") {
+            return Err(anyhow!("User is not linked to CrazyGames"));
+        }
+
+        let mut last_error = None;
+        for attempt in 0..CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+            let (current, version) = self
+                .get_crazygames_preferences_with_version(user_id)
+                .await?;
+            let merged = current.merge(preferences);
+            let preference_put =
+                self.crazygames_preferences_put(user_id, &merged, version + 1, Some(version))?;
+            let user_check = ConditionCheck::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("META"))
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                    "authProvider=:provider AND isGuest=:not_guest"
+                ))
+                .expression_attribute_values(":provider", Self::av_s("crazygames"))
+                .expression_attribute_values(":not_guest", Self::av_bool(false))
+                .build()
+                .context("Failed to build CrazyGames preference owner check")?;
+            match self
+                .client
+                .transact_write_items()
+                .transact_items(
+                    TransactWriteItem::builder()
+                        .condition_check(user_check)
+                        .build(),
+                )
+                .transact_items(TransactWriteItem::builder().put(preference_put).build())
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(merged),
+                Err(error) => {
+                    let current_user = self.get_user_by_id(user_id).await?;
+                    if !current_user.is_some_and(|user| {
+                        !user.is_guest && user.auth_provider.as_deref() == Some("crazygames")
+                    }) {
+                        return Err(anyhow!("User is not linked to CrazyGames"));
+                    }
+                    last_error = Some(
+                        anyhow!(error).context("Failed to atomically save CrazyGames preferences"),
+                    );
+                    if attempt + 1 < CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+                        let exponent = attempt.min(6) as u32;
+                        sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to save CrazyGames preferences")))
     }
 
     async fn update_user_mmr_by_mode(
@@ -2144,7 +2786,7 @@ impl Database for DynamoDatabase {
                 CompletionEffect::AddXp {
                     user_id, amount, ..
                 } => {
-                    let (current_username, is_guest) =
+                    let (current_username, is_guest, uses_username_mirror) =
                         self.completion_user_target(*user_id).await?;
                     let main_update = Update::builder()
                         .table_name(self.main_table())
@@ -2162,7 +2804,7 @@ impl Database for DynamoDatabase {
                         .context("Failed to build idempotent XP update")?;
                     let mut mutations =
                         vec![TransactWriteItem::builder().update(main_update).build()];
-                    if !is_guest {
+                    if uses_username_mirror {
                         let mirror_update = Update::builder()
                             .table_name(self.usernames_table())
                             .key("username", Self::av_s(current_username))
@@ -2182,7 +2824,7 @@ impl Database for DynamoDatabase {
                     queue_mode,
                     ..
                 } => {
-                    let (current_username, is_guest) =
+                    let (current_username, is_guest, uses_username_mirror) =
                         self.completion_user_target(*user_id).await?;
                     let field = match queue_mode {
                         common::QueueMode::Competitive => "rankedMmr",
@@ -2204,7 +2846,7 @@ impl Database for DynamoDatabase {
                         .context("Failed to build idempotent MMR update")?;
                     let mut mutations =
                         vec![TransactWriteItem::builder().update(main_update).build()];
-                    if !is_guest {
+                    if uses_username_mirror {
                         let mirror_update = Update::builder()
                             .table_name(self.usernames_table())
                             .key("username", Self::av_s(current_username))

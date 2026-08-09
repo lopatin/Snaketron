@@ -186,7 +186,9 @@ pub async fn get_leaderboard(
         // Check if there are more results
         let has_more = high_scores.len() > limit;
 
-        // Transform high scores to response format
+        // Preserve the established constant-read path. Names in score rows are
+        // historical snapshots; current verified profile data is used for
+        // active account/lobby identity without amplifying public reads.
         let response_entries: Vec<LeaderboardEntry> = high_scores
             .into_iter()
             .take(limit)

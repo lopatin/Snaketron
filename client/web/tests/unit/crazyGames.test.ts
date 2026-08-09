@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   crazyGames,
   crazyGamesGuestNickname,
+  normalizeCrazyGamesAccountError,
 } from '../../services/crazyGames.ts';
 
 type InviteParams = Record<string, string>;
@@ -12,7 +13,9 @@ const withInviteSdk = async (
   assertion: (input: {
     service: typeof crazyGames;
     emitJoinRoom: (params: InviteParams) => void;
+    getUserTokenCalls: () => number;
   }) => Promise<void>,
+  environment: 'local' | 'crazygames' | 'disabled' = 'local',
 ) => {
   const previousBuild = process.env.CRAZYGAMES_BUILD;
   const previousAds = process.env.CRAZYGAMES_ADS_ENABLED;
@@ -20,13 +23,14 @@ const withInviteSdk = async (
   const hadWindow = 'window' in globalThis;
   const previousWindow = (globalThis as any).window;
   let joinRoomListener: ((params: InviteParams) => void) | null = null;
+  let userTokenCalls = 0;
 
   process.env.CRAZYGAMES_BUILD = 'true';
   process.env.CRAZYGAMES_ADS_ENABLED = 'false';
   process.env.CRAZYGAMES_DATA_ENABLED = 'false';
 
   const sdk = {
-    environment: 'local',
+    environment,
     init: async () => {},
     ad: {
       hasAdblock: async () => false,
@@ -70,7 +74,7 @@ const withInviteSdk = async (
     user: {
       isUserAccountAvailable: false,
       getUser: async () => null,
-      getUserToken: async () => '',
+      getUserToken: async () => { userTokenCalls += 1; return ''; },
       listFriends: async () => ({ friends: [], page: 1, size: 50, hasMore: false, total: 0 }),
       showAuthPrompt: async () => { throw new Error('not authenticated'); },
       showAccountLinkPrompt: async () => ({ response: 'no' as const }),
@@ -91,6 +95,7 @@ const withInviteSdk = async (
         assert.ok(joinRoomListener, 'CrazyGames join-room listener was registered');
         joinRoomListener(params);
       },
+      getUserTokenCalls: () => userTokenCalls,
     });
   } finally {
     if (hadWindow) {
@@ -111,12 +116,56 @@ test('CrazyGames display names become valid, recognizable guest nicknames', () =
   assert.match(crazyGamesGuestNickname('x'), /^CGPlayer\d{4}$/);
 });
 
+test('CrazyGames account errors are normalized from SDK codes and messages', () => {
+  assert.deepEqual(
+    normalizeCrazyGamesAccountError({ code: 'userNotAuthenticated', message: 'sign in first' }),
+    { code: 'userNotAuthenticated', message: 'sign in first' },
+  );
+  assert.equal(
+    normalizeCrazyGamesAccountError(new Error('The user is not authenticated')).code,
+    'userNotAuthenticated',
+  );
+  assert.equal(
+    normalizeCrazyGamesAccountError({ code: 'unexpected', message: 'network failed' }).code,
+    'unknown',
+  );
+});
+
 test('the adapter fails open outside a CrazyGames build', async () => {
   const snapshot = await crazyGames.init();
   assert.equal(snapshot.isCrazyGamesBuild, false);
   assert.equal(snapshot.available, false);
   assert.equal(crazyGames.getDataModule(), null);
   assert.deepEqual(await crazyGames.requestAd('midgame'), { status: 'disabled' });
+});
+
+test('an embed without CrazyGames account support never calls account functionality', async () => {
+  await withInviteSdk(null, async ({ service, getUserTokenCalls }) => {
+    await service.init();
+    await assert.rejects(
+      service.getUserToken(),
+      (error: any) => error?.code === 'userAccountUnavailable',
+    );
+    assert.equal(getUserTokenCalls(), 0);
+    assert.equal(service.getSnapshot().accountStatus, 'unavailable');
+  });
+});
+
+test('a successfully initialized disabled SDK environment is guest-only, not a bootstrap failure', async () => {
+  await withInviteSdk(null, async ({ service, getUserTokenCalls }) => {
+    const snapshot = await service.init();
+    assert.equal(snapshot.initialized, true);
+    assert.equal(snapshot.available, false);
+    assert.equal(snapshot.environment, 'disabled');
+    assert.equal(snapshot.initializationError, null);
+    assert.equal(snapshot.accountError?.code, 'userAccountUnavailable');
+    await assert.rejects(
+      service.getUserToken(),
+      (error: any) => error?.code === 'userAccountUnavailable',
+    );
+    assert.equal(getUserTokenCalls(), 0);
+    assert.equal(service.getSnapshot().accountStatus, 'unavailable');
+  }, 'disabled');
 });
 
 test('cold-start inviteParams are published for the invitation bridge', async () => {
@@ -271,7 +320,9 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     assert.equal(initialized.available, true);
     assert.equal(initialized.environment, 'local');
     assert.equal(initialized.isInstantMultiplayer, true);
-    assert.equal(service.getSnapshot().portalUser?.username, 'Portal.Player');
+    // Cosmetic profile lookup is deliberately deferred until after the
+    // security-critical token call, so SDK User-module calls never overlap.
+    assert.equal(service.getSnapshot().portalUser, null);
     assert.equal(service.getSnapshot().inviteSequence, 1);
 
     settingsListener({ disableChat: true, muteAudio: true });
@@ -298,8 +349,15 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
 
     authListener({ ...portalUser, username: 'Renamed.Player' });
     assert.equal(service.getSnapshot().portalUser?.username, 'Renamed.Player');
+    assert.equal(service.getSnapshot().authChangeSequence, 1);
     assert.equal(await service.getUserToken(), 'signed.jwt');
+    assert.equal(service.getSnapshot().accountStatus, 'authenticated');
     assert.equal(await service.requestBanner({ id: 'banner', width: 728, height: 90 }), true);
+
+    authListener(null);
+    assert.equal(service.getSnapshot().portalUser, null);
+    assert.equal(service.getSnapshot().accountStatus, 'signed-out');
+    assert.equal(service.getSnapshot().authChangeSequence, 2);
   } finally {
     if (hadWindow) {
       (globalThis as any).window = previousWindow;
@@ -309,5 +367,106 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     process.env.CRAZYGAMES_BUILD = previousBuild;
     process.env.CRAZYGAMES_ADS_ENABLED = previousAds;
     process.env.CRAZYGAMES_DATA_ENABLED = previousData;
+  }
+});
+
+test('getUserToken is single-flight and runs before the display-only portal profile', async () => {
+  const previousBuild = process.env.CRAZYGAMES_BUILD;
+  const hadWindow = 'window' in globalThis;
+  const previousWindow = (globalThis as any).window;
+  process.env.CRAZYGAMES_BUILD = 'true';
+  let tokenCalls = 0;
+  let profileCalls = 0;
+  let linkPromptCalls = 0;
+  let linkPromptResponse = 'no';
+  let resolveToken: ((token: string) => void) | null = null;
+
+  const noOpGame = {
+    settings: {},
+    addSettingsChangeListener: () => {},
+    removeSettingsChangeListener: () => {},
+    addJoinRoomListener: () => {},
+    removeJoinRoomListener: () => {},
+    gameplayStart: () => {},
+    gameplayStop: () => {},
+    loadingStart: () => {},
+    loadingStop: () => {},
+    happytime: () => {},
+    reportGameCompletedPercentage: () => {},
+    setGameContext: () => {},
+    clearGameContext: () => {},
+    updateRoom: () => {},
+    leftRoom: () => {},
+    inviteLink: () => '',
+    getInviteParam: () => null,
+  };
+  (globalThis as any).window = {
+    CrazyGames: {
+      SDK: {
+        environment: 'local',
+        init: async () => {},
+        ad: { hasAdblock: async () => false, requestAd: () => {} },
+        banner: {
+          requestBanner: async () => {}, requestResponsiveBanner: async () => {},
+          clearBanner: () => {}, clearAllBanners: () => {},
+        },
+        data: { clear: () => {}, getItem: () => null, removeItem: () => {}, setItem: () => {} },
+        game: noOpGame,
+        user: {
+          isUserAccountAvailable: true,
+          getUser: () => {
+            profileCalls += 1;
+            return new Promise(() => {});
+          },
+          getUserToken: () => new Promise<string>((resolve) => {
+            tokenCalls += 1;
+            resolveToken = resolve;
+          }),
+          listFriends: async () => ({ friends: [], page: 1, size: 50, hasMore: false, total: 0 }),
+          showAuthPrompt: async () => { throw new Error('cancelled'); },
+          showAccountLinkPrompt: async () => {
+            linkPromptCalls += 1;
+            return { response: linkPromptResponse };
+          },
+          addAuthListener: () => {},
+          removeAuthListener: () => {},
+        },
+      },
+    },
+  };
+
+  try {
+    const module = await import(`../../services/crazyGames.ts?token-first=${Date.now()}`);
+    const service = module.crazyGames as typeof crazyGames;
+    await service.init();
+    assert.equal(service.getSnapshot().portalUser, null);
+    assert.equal(profileCalls, 0);
+    const firstToken = service.getUserToken();
+    const concurrentToken = service.getUserToken();
+    assert.equal(tokenCalls, 1);
+    assert.equal(profileCalls, 0);
+    assert.ok(resolveToken);
+    resolveToken('fresh.jwt');
+    assert.deepEqual(await Promise.all([firstToken, concurrentToken]), [
+      'fresh.jwt',
+      'fresh.jwt',
+    ]);
+    assert.equal(service.getSnapshot().accountStatus, 'authenticated');
+    assert.equal(service.getSnapshot().portalUser, null);
+    assert.equal(await service.showAccountLinkPrompt(), 'no');
+    assert.equal(linkPromptCalls, 1);
+    assert.equal(profileCalls, 0);
+    linkPromptResponse = 'unexpected';
+    assert.equal(await service.showAccountLinkPrompt(), null);
+    assert.equal(linkPromptCalls, 2);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(profileCalls, 1);
+  } finally {
+    if (hadWindow) {
+      (globalThis as any).window = previousWindow;
+    } else {
+      delete (globalThis as any).window;
+    }
+    process.env.CRAZYGAMES_BUILD = previousBuild;
   }
 });

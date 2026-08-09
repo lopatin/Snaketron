@@ -8,7 +8,7 @@ import {
 
 interface CrazyGamesContextValue extends CrazyGamesSnapshot {
   showAuthPrompt: () => Promise<CrazyGamesPortalUser | null>;
-  getUserToken: () => Promise<string | null>;
+  getUserToken: () => Promise<string>;
   listFriends: (page?: number, size?: number) => Promise<CrazyGamesFriendsPage | null>;
   showAccountLinkPrompt: () => Promise<'yes' | 'no' | null>;
 }
