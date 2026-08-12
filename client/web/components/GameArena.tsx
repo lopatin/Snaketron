@@ -1021,9 +1021,22 @@ export default function GameArena() {
   // Local intent, distinct from the server's record of it. A dropped
   // confirmation or a mid-gate resync would otherwise leave a player who
   // already pressed Ready staring at the briefing again.
-  const [readyPressedForGameId, setReadyPressedForGameId] = useState<string | null>(null);
+  const [readyIntent, setReadyIntent] = useState<{
+    gameId: string;
+    source: 'manual' | 'automatic';
+  } | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
-  const hasPressedReady = readyPressedForGameId === gameId;
+  const currentReadyIntent = readyIntent?.gameId === gameId ? readyIntent.source : null;
+  const hasPressedReady = currentReadyIntent !== null;
+  // Read this before the auto-ready effect runs so a returning player never
+  // mounts the briefing for a frame. A manual press records its provenance
+  // before marking the tutorial seen, preserving the intentional waiting view.
+  const shouldAutoReady = currentReadyIntent === 'automatic' || Boolean(
+    currentReadyIntent === null &&
+    isAwaitingReadiness &&
+    tutorial &&
+    hasSeenTutorial(tutorial.key),
+  );
   // Treat the local click as ready immediately instead of briefly counting the
   // player among the people they are now waiting for while the server echoes it.
   const pendingReadyCount = Math.max(
@@ -1034,12 +1047,12 @@ export default function GameArena() {
   );
 
   useEffect(() => {
-    setReadyPressedForGameId((pressed) => (pressed === gameId ? pressed : null));
+    setReadyIntent((intent) => (intent?.gameId === gameId ? intent : null));
     setHelpOpen(false);
   }, [gameId]);
 
-  const confirmReady = useCallback(() => {
-    setReadyPressedForGameId(gameId);
+  const confirmReady = useCallback((source: 'manual' | 'automatic') => {
+    setReadyIntent({ gameId, source });
     if (tutorial) {
       markTutorialSeen(tutorial.key);
     }
@@ -1057,11 +1070,11 @@ export default function GameArena() {
       !tutorial ||
       hasPressedReady ||
       localUserIsReady ||
-      !hasSeenTutorial(tutorial.key)
+      !shouldAutoReady
     ) {
       return;
     }
-    confirmReady();
+    confirmReady('automatic');
   }, [
     confirmReady,
     hasPressedReady,
@@ -1069,6 +1082,7 @@ export default function GameArena() {
     isGameInteractionActive,
     isLocalUserPlaying,
     localUserIsReady,
+    shouldAutoReady,
     tutorial,
   ]);
 
@@ -1102,6 +1116,7 @@ export default function GameArena() {
     isAwaitingReadiness &&
     isLocalUserPlaying &&
     isGameInteractionActive &&
+    !shouldAutoReady &&
     !gameOver,
   );
   // `!localWasIdleKicked` is what the effect below cannot do on its own: state
@@ -1788,7 +1803,7 @@ export default function GameArena() {
           }
           pendingCount={pendingReadyCount}
           isReady={localUserIsReady || hasPressedReady}
-          onReady={confirmReady}
+          onReady={() => confirmReady('manual')}
           onClose={() => setHelpOpen(false)}
         />
       )}
