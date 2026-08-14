@@ -2066,16 +2066,33 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
   }
 });
 
-test('Combo callout stays hidden between chains and re-pops for every pickup', async ({ page }) => {
+test('Combo callout meter drains and re-pops for every pickup', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 900 });
   const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
   const callout = page.getByTestId('combo-callout');
   const burst = page.getByTestId('combo-callout-burst');
+  const meter = page.getByTestId('combo-callout-meter');
+  const meterFill = page.getByTestId('combo-callout-meter-fill');
   const announcement = page.getByTestId('combo-callout-announcement');
+  const readMeterGeometry = () => meter.evaluate((track) => {
+    const fill = track.querySelector('[data-testid="combo-callout-meter-fill"]');
+    if (!fill) throw new Error('Combo meter fill is missing');
+    const trackRect = track.getBoundingClientRect();
+    const fillRect = fill.getBoundingClientRect();
+    return {
+      modelRatio: Number(fill.getAttribute('data-fill-ratio')),
+      renderedRatio: fillRect.width / trackRect.width,
+      leftDelta: Math.abs(fillRect.left - trackRect.left),
+      rightGap: trackRect.right - fillRect.right,
+      trackWidth: trackRect.width,
+    };
+  });
 
   await expect(callout).toHaveCount(1);
   await expect(callout).toHaveAttribute('data-active', 'false');
   await expect(burst).toHaveCount(0);
+  await expect(meter).toHaveCount(0);
+  await expect(meterFill).toHaveCount(0);
 
   await emitServerMessage(
     page,
@@ -2086,13 +2103,35 @@ test('Combo callout stays hidden between chains and re-pops for every pickup', a
   await expect(burst).toHaveText(/\+2\s*Combo!/i);
   await expect(burst).toHaveAttribute('data-animation-key', '42:1');
   await expect(announcement).toHaveText('Combo active; next food is worth 2 points');
+  await expect(meter).toBeVisible();
+  await expect(meterFill).toHaveCSS('transform-origin', /^0px /);
+  const fullMeter = await readMeterGeometry();
+  expect(fullMeter.modelRatio).toBeGreaterThan(0);
+  expect(Math.abs(fullMeter.renderedRatio - fullMeter.modelRatio)).toBeLessThan(0.03);
+  expect(fullMeter.leftDelta).toBeLessThanOrEqual(1);
   const buildingBurst = await burst.elementHandle();
   if (!buildingBurst) throw new Error('building Combo burst is missing');
+
+  // Drive the authoritative timer directly instead of sleeping against the
+  // production one-second window. The right edge retreats while the left edge
+  // stays anchored, making this deterministic even on a busy CI runner.
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(12, 7, 1, COMBO_CALLOUT_TEST_WINDOW_MS / 2),
+  );
+  await expect.poll(async () => {
+    const current = await readMeterGeometry();
+    return current.modelRatio < fullMeter.modelRatio - 0.25
+      && Math.abs(current.renderedRatio - current.modelRatio) < 0.03
+      && current.leftDelta <= 1
+      && current.rightGap > current.trackWidth * 0.2;
+  }).toBe(true);
 
   await emitServerMessage(
     page,
     socketIndex,
-    comboSnapshot(12, 7, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
+    comboSnapshot(13, 8, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
   );
   await expect(burst).toHaveText(/\+3\s*Combo!/i);
   await expect(burst).toHaveAttribute('data-animation-key', '42:2');
@@ -2109,13 +2148,16 @@ test('Combo callout stays hidden between chains and re-pops for every pickup', a
   await emitServerMessage(
     page,
     socketIndex,
-    comboSnapshot(13, 8, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
+    comboSnapshot(14, 9, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
   );
   await expect(burst).toHaveText(/\+3\s*Combo!/i);
   await expect(burst).toHaveAttribute('data-animation-key', '42:3');
   expect(await firstMaxBurst.evaluate((element) => element.isConnected)).toBe(false);
 
-  await emitServerMessage(page, socketIndex, comboSnapshot(14, 9, 0, 0));
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(meter).toBeHidden();
+
+  await emitServerMessage(page, socketIndex, comboSnapshot(15, 10, 0, 0));
   await expect(callout).toHaveAttribute('data-active', 'false');
   await expect(burst).toHaveCount(0);
   await expect(announcement).toHaveText('');

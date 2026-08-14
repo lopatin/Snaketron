@@ -1485,8 +1485,8 @@ struct CarriedFoodLabel {
 // ---------------------------------------------------------------------------
 
 const FOOD_VALUE_LABEL_MIN_PX: f64 = 5.0;
-const FOOD_VALUE_LABEL_MAX_PX: f64 = 9.0;
-const FOOD_VALUE_LABEL_SIZE_RATIO: f64 = 0.68;
+const FOOD_VALUE_LABEL_MAX_PX: f64 = 10.0;
+const FOOD_VALUE_LABEL_SIZE_RATIO: f64 = 0.76;
 const FOOD_VALUE_LABEL_ADVANCE_EM: f64 = 0.68;
 const FOOD_VALUE_LABEL_HALO_RATIO: f64 = 0.13;
 const FOOD_VALUE_LABEL_HALO_MIN_PX: f64 = 0.55;
@@ -2955,6 +2955,9 @@ mod tests {
                 "food value at cell {cell_size} overflows without hitting the floor"
             );
         }
+
+        assert!((food_value_label_layout(10.0, 1).font_px - 7.6).abs() < 1e-9);
+        assert_eq!(food_value_label_layout(15.0, 1).font_px, 10.0);
 
         let font = food_value_label_font(7.0);
         assert!(font.starts_with("900 7px "));

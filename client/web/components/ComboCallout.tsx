@@ -39,6 +39,18 @@ const ComboCallout: React.FC<ComboCalloutProps> = ({
       >
         <span className="game-combo-callout__value">+{hud.nextFoodValue}</span>
         <span className="game-combo-callout__label">Combo!</span>
+        <span
+          className="game-combo-callout__meter"
+          data-testid="combo-callout-meter"
+          aria-hidden="true"
+        >
+          <span
+            className="game-combo-callout__meter-fill"
+            data-testid="combo-callout-meter-fill"
+            data-fill-ratio={hud.fillRatio.toFixed(3)}
+            style={{ transform: `scaleX(${hud.fillRatio})` }}
+          />
+        </span>
       </strong>
     )}
   </div>

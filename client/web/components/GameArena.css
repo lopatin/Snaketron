@@ -48,9 +48,11 @@
   --combo-callout-accent: #78ad7a;
   --combo-callout-edge: #315335;
   --combo-callout-shadow: #315335;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto auto;
   align-items: center;
-  gap: clamp(4px, 0.7vw, 7px);
+  column-gap: clamp(4px, 0.7vw, 7px);
+  row-gap: clamp(3px, 0.5vw, 5px);
   padding: clamp(5px, 0.8vw, 8px) clamp(9px, 1.6vw, 15px);
   border: 2px solid #17231b;
   border-radius: 7px;
@@ -93,6 +95,28 @@
 .game-combo-callout__label {
   font-size: clamp(11px, 2.1vw, 16px);
   letter-spacing: 0.035em;
+}
+
+.game-combo-callout__meter {
+  grid-column: 1 / -1;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(23 35 27 / 14%);
+  box-shadow: inset 0 0 0 1px rgb(23 35 27 / 12%);
+}
+
+.game-combo-callout__meter-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--combo-callout-edge);
+  box-shadow: inset 0 1px rgb(255 255 255 / 48%);
+  transform-origin: left center;
+  transition: transform 50ms linear;
+  will-change: transform;
 }
 
 @keyframes combo-callout-pop {
@@ -756,6 +780,7 @@
 
   .game-combo-callout__burst {
     padding: 4px 8px;
+    row-gap: 3px;
   }
 
   .game-idle-warning {
@@ -948,6 +973,10 @@
     animation: none;
     transition: none;
   }
+
+  .game-combo-callout__meter {
+    display: none;
+  }
 }
 
 @media (forced-colors: active) {
@@ -960,6 +989,17 @@
     box-shadow: none;
     text-shadow: none;
     forced-color-adjust: auto;
+  }
+
+  .game-combo-callout__meter {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    box-shadow: none;
+  }
+
+  .game-combo-callout__meter-fill {
+    background: Highlight;
+    box-shadow: none;
   }
 
   .game-idle-warning,

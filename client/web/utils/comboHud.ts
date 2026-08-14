@@ -20,6 +20,7 @@ export type ComboHudTone = 'idle' | 'building' | 'maxed';
 export interface ComboHudView {
   active: boolean;
   remainingMs: number;
+  fillRatio: number;
   nextFoodValue: number;
   nextLabel: string;
   tone: ComboHudTone;
@@ -44,6 +45,7 @@ export function buildComboHudView(
   const rawRemainingMs = finiteNonNegative(snake.combo.remaining_ms);
   const remainingMs = Math.min(windowMs, rawRemainingMs);
   const active = snake.is_alive && windowMs > 0 && remainingMs > 0;
+  const fillRatio = active ? remainingMs / windowMs : 0;
   const chainCount = Math.floor(finiteNonNegative(snake.combo.chain_count));
   const nextFoodValue = active
     ? Math.min(maxFoodValue, chainCount + 1)
@@ -60,6 +62,7 @@ export function buildComboHudView(
   return {
     active,
     remainingMs,
+    fillRatio,
     nextFoodValue,
     nextLabel,
     tone,
