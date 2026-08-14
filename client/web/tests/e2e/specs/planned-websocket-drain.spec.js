@@ -891,6 +891,37 @@ test('an identity acquired on an open anonymous socket still gets a handshake de
   ).toEqual([{ code: 4013, reason: 'authentication timed out' }]);
 });
 
+test('a returning player is auto-readied without mounting the briefing', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      'snaketron:tutorial-seen:v1',
+      JSON.stringify({ 'duel:casual': true }),
+    );
+
+    window.__briefingMountCount = 0;
+    const briefingSelector = '[data-testid="tutorial-modal"][data-variant="briefing"]';
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          if (node.matches(briefingSelector)) {
+            window.__briefingMountCount += 1;
+          }
+          window.__briefingMountCount += node.querySelectorAll(briefingSelector).length;
+        }
+      }
+    }).observe(document, { childList: true, subtree: true });
+  });
+
+  const initialTutorialFrame = tutorialSnapshot();
+  initialTutorialFrame.GameEvent.event.Snapshot.game_state.readiness.ready_user_ids = [8];
+  const socketIndex = await establishActiveGame(page, initialTutorialFrame);
+
+  await expect.poll(() => socketMessages(page, socketIndex, 'PlayerReady')).toHaveLength(1);
+  await expect(page.getByTestId('tutorial-modal')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__briefingMountCount)).toBe(0);
+});
+
 test('the pre-match guide reveals one animated real-arena step at a time', async ({ page }) => {
   await page.addInitScript(() => {
     window.__tutorialScoreReadouts = [];
