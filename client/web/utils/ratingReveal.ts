@@ -37,6 +37,18 @@ export const ratedGameTypeParam = (gameType: GameType | undefined): RatedGameTyp
   return null;
 };
 
+/**
+ * Visible post-match rating progress belongs to competitive ladders only.
+ * Quickmatch MMR may still exist for matchmaking, but it is not a player-facing
+ * rank and should never create a rating panel in the results card.
+ */
+export const postMatchRatingGameTypeParam = (
+  queueMode: QueueMode | undefined,
+  gameType: GameType | undefined,
+): RatedGameTypeParam | null => (
+  queueMode === 'Competitive' ? ratedGameTypeParam(gameType) : null
+);
+
 export const queueModeParam = (queueMode: QueueMode): 'competitive' | 'quickmatch' => (
   queueMode === 'Competitive' ? 'competitive' : 'quickmatch'
 );
@@ -136,7 +148,7 @@ export const buildRatingReveal = (
 };
 
 export type MatchRatingState =
-  /** Not a rated ladder match, or no authenticated player. */
+  /** No player-visible competitive ladder, or no authenticated player. */
   | { phase: 'idle' }
   /** Match finished; waiting for the persisted numbers to land. */
   | { phase: 'pending' }

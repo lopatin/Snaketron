@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::api::middleware::AuthUser;
 use crate::db::Database;
-use crate::season::{Season, get_current_season};
+use crate::season::{Season, get_current_season, get_ranking_region};
 use common::{GameType, QueueMode};
 
 /// Query parameters for leaderboard endpoint
@@ -136,6 +136,10 @@ pub async fn get_leaderboard(
 
     // Get season (default to current)
     let season = query.season.unwrap_or_else(get_current_season);
+    let ranking_region = query
+        .region
+        .as_deref()
+        .map(|region| get_ranking_region(Some(region)));
 
     // Parse limit and offset with constraints
     let limit = query.limit.unwrap_or(25).clamp(1, 100);
@@ -148,7 +152,7 @@ pub async fn get_leaderboard(
     if matches!(game_type, GameType::Solo) {
         info!(
             "Fetching Solo high scores - region: {:?}, season: {}, limit: {}, offset: {}",
-            query.region.as_deref(),
+            ranking_region.as_deref(),
             season,
             limit,
             offset
@@ -158,7 +162,7 @@ pub async fn get_leaderboard(
             .db
             .get_high_scores(
                 &game_type,
-                query.region.as_deref(),
+                ranking_region.as_deref(),
                 season,
                 offset + fetch_limit,
             )
@@ -225,7 +229,7 @@ pub async fn get_leaderboard(
         .get_leaderboard(
             &queue_mode,
             Some(&game_type),
-            query.region.as_deref(), // Pass region if specified, None for global
+            ranking_region.as_deref(), // Pass region if specified, None for global
             season,
             offset + fetch_limit, // Fetch up to offset + limit + 1
         )
@@ -347,13 +351,14 @@ pub async fn get_my_ranking(
     // Get season (default to current)
     let season = query.season.unwrap_or_else(get_current_season);
 
-    // Get region (default to us-east-1 if not specified)
-    let region = query.region.as_deref().unwrap_or("us-east-1");
+    // Matchmaking exposes logical IDs such as `use1`, while the established
+    // ranking keyspace uses physical IDs such as `us-east-1`.
+    let region = get_ranking_region(query.region.as_deref());
 
     // Get user's ranking from database
     let ranking = match state
         .db
-        .get_user_ranking(auth_user.user_id, &queue_mode, &game_type, region, season)
+        .get_user_ranking(auth_user.user_id, &queue_mode, &game_type, &region, season)
         .await
     {
         Ok(Some(entry)) => {
@@ -363,7 +368,7 @@ pub async fn get_my_ranking(
                 .get_leaderboard(
                     &queue_mode,
                     Some(&game_type),
-                    Some(region),
+                    Some(&region),
                     season,
                     10000, // Large limit to get all entries
                 )

@@ -12,6 +12,7 @@ import {
 import {
   buildRatingReveal,
   countDurationMs,
+  postMatchRatingGameTypeParam,
   queueModeParam,
   ratedGameTypeParam,
   ratingHasSettled,
@@ -90,6 +91,20 @@ test('only ladder game types map to a ranking query parameter', () => {
 
   assert.equal(queueModeParam('Competitive'), 'competitive');
   assert.equal(queueModeParam('Quickmatch'), 'quickmatch');
+});
+
+test('post-match rating progress is limited to competitive ladder matches', () => {
+  const duel: GameType = { TeamMatch: { per_team: 1 } };
+  const twoVTwo: GameType = { TeamMatch: { per_team: 2 } };
+  const ffa: GameType = { FreeForAll: { max_players: 8 } };
+
+  assert.equal(postMatchRatingGameTypeParam('Competitive', duel), 'duel');
+  assert.equal(postMatchRatingGameTypeParam('Competitive', twoVTwo), '2v2');
+  assert.equal(postMatchRatingGameTypeParam('Competitive', ffa), 'ffa');
+  assert.equal(postMatchRatingGameTypeParam('Quickmatch', duel), null);
+  assert.equal(postMatchRatingGameTypeParam('Quickmatch', twoVTwo), null);
+  assert.equal(postMatchRatingGameTypeParam('Quickmatch', ffa), null);
+  assert.equal(postMatchRatingGameTypeParam(undefined, duel), null);
 });
 
 test('snapshots require a persisted MMR value', () => {
