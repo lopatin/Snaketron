@@ -5884,7 +5884,7 @@ mod tests {
         // zeroing it would make every snapshot round trip fail admission.
         game.rng = None;
 
-        // Pin the shipped policy as well as the lower-level tick behavior.
+        // Pin the generic/legacy fallback as well as the lower-level behavior.
         assert_eq!(game.properties.player_idle_timeout_ms, 60_000);
         assert_eq!(game.properties.player_idle_warning_ms, 10_000);
         game

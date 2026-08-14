@@ -110,19 +110,11 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
   },
   {
     id: 'quickmatch',
-    label: 'Quickmatch · casual',
-    state: {
-      phase: 'ready',
-      reveal: buildRatingReveal(
-        'Quickmatch',
-        '2v2',
-        snapshot(1190, 3, 1, null),
-        snapshot(1240, 4, 1, null),
-      ),
-    },
+    label: 'Quickmatch · no rating',
+    state: null,
   },
   { id: 'pending', label: 'Pending · tallying', state: { phase: 'pending' } },
-  // Solo and custom matches have no ladder: the card renders without a band.
+  // Quickmatch, solo, and custom matches render the card without a rating band.
   { id: 'none', label: 'No rating (solo/custom)', state: null },
 ];
 

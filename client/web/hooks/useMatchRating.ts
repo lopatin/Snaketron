@@ -4,8 +4,8 @@ import { api } from '../services/api';
 import { loadRegionPreference } from '../utils/regionPreference';
 import {
   buildRatingReveal,
+  postMatchRatingGameTypeParam,
   queueModeParam,
-  ratedGameTypeParam,
   ratingHasSettled,
   snapshotFromResponse,
   RATING_POLL_INTERVAL_MS,
@@ -15,7 +15,7 @@ import {
 } from '../utils/ratingReveal';
 
 /**
- * Drives the post-match rating reveal for one game.
+ * Drives the competitive post-match rating reveal for one game.
  *
  * A baseline ranking snapshot is fetched while the match is still running;
  * after completion the endpoint is polled until the persisted MMR write
@@ -31,8 +31,11 @@ export const useMatchRating = (
 ): MatchRatingState => {
   const [state, setState] = useState<MatchRatingState>({ phase: 'idle' });
 
-  const gameTypeParam = ratedGameTypeParam(gameState?.game_type);
   const queueMode = gameState?.queue_mode ?? null;
+  const gameTypeParam = postMatchRatingGameTypeParam(
+    queueMode ?? undefined,
+    gameState?.game_type,
+  );
   const eligible = gameTypeParam !== null && queueMode !== null && userId !== undefined;
 
   // Baseline for the current gameId. `undefined` = not fetched yet;

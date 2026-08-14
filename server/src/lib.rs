@@ -19,6 +19,7 @@ pub mod mmr_persistence;
 mod otel_metrics;
 pub mod partition_assignment;
 pub mod partition_lease;
+pub mod player_idle;
 pub mod pubsub_manager;
 pub mod recovery;
 pub mod redis_keys;

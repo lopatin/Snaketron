@@ -60,6 +60,9 @@ services:
       SNAKETRON_ENV: dev
       # New team matches snapshot this once at creation (valid range 1.000-2.000).
       SNAKETRON_BOOST_SPEED_MULTIPLIER: "1.500"
+      # New multiplayer matches warn after 10s idle, then kick after a 10s countdown.
+      SNAKETRON_PLAYER_IDLE_GRACE_MS: "${SNAKETRON_PLAYER_IDLE_GRACE_MS:-10000}"
+      SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS: "${SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS:-10000}"
       # Logging
       RUST_LOG: info,server=debug
       # Replay directory (using volume)

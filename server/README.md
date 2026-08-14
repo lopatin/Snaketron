@@ -51,6 +51,13 @@ Required environment variables:
 Optional gameplay balance:
 
 - `SNAKETRON_BOOST_SPEED_MULTIPLIER`: Boosted snake speed for newly created duel and 2v2 matches. Accepts `1.000` through `2.000` with up to three decimal places; defaults to `1.500`. The server validates it at startup and snapshots the resolved value into each match.
+- `SNAKETRON_PLAYER_IDLE_GRACE_MS`: Time without gameplay input before the kick countdown begins. Defaults to `10000`.
+- `SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS`: Length of the visible kick countdown after the idle grace period. Defaults to `10000`.
+
+The server validates both inactivity phases at startup and snapshots their sum
+as the authoritative kick deadline alongside the countdown length. Existing
+matches retain the policy they started with; after a server restart, changed
+values apply to new matches without a client deployment.
 
 Completed game retention:
 

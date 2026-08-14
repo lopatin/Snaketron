@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::player_idle::PlayerIdleConfig;
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
@@ -593,12 +594,13 @@ pub struct MatchmakingManager {
     max_retries: u32,
     retry_delay: Duration,
     boost_config: BoostConfig,
+    player_idle_config: PlayerIdleConfig,
 }
 
 impl MatchmakingManager {
     /// Create a new Redis matchmaking manager
     pub fn new(redis: impl Into<RedisConnection>) -> Result<Self> {
-        Self::new_with_boost_config(redis, BoostConfig::default())
+        Self::new_with_gameplay_config(redis, BoostConfig::default(), PlayerIdleConfig::default())
     }
 
     /// Create a matchmaking manager with the Boost balance resolved at server
@@ -608,6 +610,17 @@ impl MatchmakingManager {
         redis: impl Into<RedisConnection>,
         boost_config: BoostConfig,
     ) -> Result<Self> {
+        Self::new_with_gameplay_config(redis, boost_config, PlayerIdleConfig::default())
+    }
+
+    /// Create a matchmaking manager with every server-owned gameplay policy
+    /// resolved at startup. New matches snapshot these values and active games
+    /// never re-read process configuration.
+    pub fn new_with_gameplay_config(
+        redis: impl Into<RedisConnection>,
+        boost_config: BoostConfig,
+        player_idle_config: PlayerIdleConfig,
+    ) -> Result<Self> {
         boost_config
             .validate()
             .context("Invalid matchmaking Boost configuration")?;
@@ -616,11 +629,16 @@ impl MatchmakingManager {
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
             boost_config,
+            player_idle_config,
         })
     }
 
     pub(crate) fn boost_config(&self) -> &BoostConfig {
         &self.boost_config
+    }
+
+    pub(crate) fn player_idle_config(&self) -> PlayerIdleConfig {
+        self.player_idle_config
     }
 
     /// Add a lobby to the matchmaking queue for multiple game types
