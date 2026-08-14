@@ -1,6 +1,5 @@
 :root {
   --game-boost-indicator-height: 40px;
-  --game-combo-indicator-height: 34px;
 }
 
 .game-arena-stage {
@@ -27,148 +26,90 @@
   align-items: stretch;
 }
 
-.game-arena-frame.has-boost-indicator .game-arena-panel,
-.game-arena-frame.has-combo-indicator .game-arena-panel {
+.game-arena-frame.has-boost-indicator .game-arena-panel {
   position: relative;
   z-index: 3;
 }
 
-/* Combo chase rail --------------------------------------------------------
-   Ten field-cell segments make the one-second rule visible at a glance. The
-   filled cells stay at the leading edge, so the snake's tail disappears as
-   the window drains. This is predicted, read-only game state: no hover or
-   pointer affordance competes with steering. */
-.game-combo-hud {
-  --combo-accent: #85b885;
-  --combo-accent-edge: #5e8a5e;
-  --combo-accent-ink: #315335;
-  --combo-surface: #f6f8f6;
-  --combo-empty: rgb(94 138 94 / 12%);
-  --combo-frame: rgb(70 88 78 / 64%);
-  position: relative;
-  z-index: 2;
-  width: calc(100% - 10px);
-  height: var(--game-combo-indicator-height);
-  flex: 0 0 var(--game-combo-indicator-height);
-  align-self: center;
-  margin-top: -2px;
-  opacity: 0;
+/* Combo callout -----------------------------------------------------------
+   The arena stays completely quiet between chains. Each pickup mounts one
+   fixed-position burst over the field, keeping the acknowledgement readable
+   without moving either the canvas or the Boost control beneath it. */
+.game-combo-callout {
+  position: absolute;
+  top: clamp(8px, 2.5%, 16px);
+  left: 50%;
+  z-index: 6;
   pointer-events: none;
-  transform: translateY(-5px);
-  transition: opacity 160ms ease, transform 200ms ease;
+  transform: translateX(-50%);
 }
 
-.game-combo-hud.is-visible {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-.game-combo-hud.is-maxed {
-  --combo-accent: #f8c84a;
-  --combo-accent-edge: #a87500;
-  --combo-accent-ink: #785200;
-  --combo-empty: rgb(168 117 0 / 12%);
-  --combo-frame: rgb(120 82 0 / 62%);
-  --combo-surface: #fffaf0;
-}
-
-.game-combo-rail {
-  display: grid;
-  box-sizing: border-box;
-  width: 100%;
-  height: 100%;
-  grid-template-columns: 58px minmax(0, 1fr) 82px;
+.game-combo-callout__burst {
+  --combo-callout-accent: #78ad7a;
+  --combo-callout-edge: #315335;
+  --combo-callout-shadow: #315335;
+  display: flex;
   align-items: center;
-  border: 1px solid var(--combo-frame);
-  border-top-color: rgb(117 137 125 / 38%);
-  border-radius: 0 0 6px 6px;
-  background: linear-gradient(180deg, #fff 0%, var(--combo-surface) 100%);
+  gap: clamp(4px, 0.7vw, 7px);
+  padding: clamp(5px, 0.8vw, 8px) clamp(9px, 1.6vw, 15px);
+  border: 2px solid #17231b;
+  border-radius: 7px;
+  background:
+    linear-gradient(135deg, rgb(255 255 255 / 98%), rgb(246 250 246 / 98%));
   box-shadow:
-    0 2px 0 rgb(23 32 27 / 6%),
-    inset 0 1px 0 rgb(255 255 255 / 80%);
-  color: var(--combo-accent-ink);
-  font-variant-numeric: tabular-nums;
-}
-
-.game-combo-rail__title,
-.game-combo-rail__next {
-  display: grid;
-  height: 100%;
-  place-items: center;
+    0 4px 0 var(--combo-callout-shadow),
+    0 8px 16px rgb(20 33 24 / 22%);
+  color: var(--combo-callout-edge);
+  font-family: "Arial Black", Arial, sans-serif;
   font-style: italic;
+  font-variant-numeric: tabular-nums;
   font-weight: 950;
-  line-height: 1;
+  line-height: 0.9;
   text-transform: uppercase;
   white-space: nowrap;
-  transition: color 120ms ease;
+  animation: combo-callout-pop 360ms cubic-bezier(0.2, 0.82, 0.2, 1.16) both;
+  transform-origin: 50% 30%;
 }
 
-.game-combo-rail__title {
-  border-right: 1px solid rgb(49 78 58 / 15%);
-  font-size: 9px;
-  letter-spacing: 0.095em;
+.game-combo-callout__burst.is-maxed {
+  --combo-callout-accent: #f4c642;
+  --combo-callout-edge: #745000;
+  --combo-callout-shadow: #9c6d00;
+  background:
+    linear-gradient(135deg, rgb(255 255 255 / 98%), rgb(255 249 226 / 98%));
 }
 
-.game-combo-rail__next {
-  border-left: 1px solid rgb(49 78 58 / 15%);
-  color: var(--game-muted, #667085);
-  font-size: 8px;
+.game-combo-callout__value {
+  color: var(--combo-callout-accent);
+  font-size: clamp(20px, 4vw, 30px);
+  letter-spacing: -0.055em;
+  text-shadow:
+    1px 0 var(--combo-callout-edge),
+    -1px 0 var(--combo-callout-edge),
+    0 1px var(--combo-callout-edge),
+    0 -1px var(--combo-callout-edge);
+}
+
+.game-combo-callout__label {
+  font-size: clamp(11px, 2.1vw, 16px);
   letter-spacing: 0.035em;
 }
 
-.game-combo-hud.is-active .game-combo-rail__next {
-  color: var(--combo-accent-ink);
-  font-size: 9px;
-}
+@keyframes combo-callout-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.76) rotate(-3deg);
+  }
 
-.game-combo-rail__cells {
-  display: grid;
-  min-width: 0;
-  height: 100%;
-  grid-template-columns: repeat(10, minmax(2px, 1fr));
-  align-items: center;
-  gap: clamp(1px, 0.65vw, 3px);
-  padding: 0 clamp(7px, 1.5vw, 12px);
-}
+  62% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.08) rotate(1deg);
+  }
 
-.game-combo-rail__cell {
-  position: relative;
-  box-sizing: border-box;
-  height: 12px;
-  border: 1px solid rgb(49 78 58 / 16%);
-  border-radius: 2px;
-  background: var(--combo-empty);
-  opacity: 0.68;
-  transform: scale(0.86);
-  transition:
-    background-color 90ms linear,
-    border-color 90ms linear,
-    opacity 90ms linear,
-    transform 90ms linear;
-}
-
-.game-combo-rail__cell.is-filled {
-  border-color: var(--combo-accent-edge);
-  background: var(--combo-accent);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 38%);
-  opacity: 1;
-  transform: scale(1);
-}
-
-.game-combo-rail__cell.is-head {
-  border-radius: 999px;
-}
-
-.game-combo-hud.is-active .game-combo-rail__cell.is-head::after {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--combo-accent-ink);
-  content: "";
-  transform: translate(-50%, -50%);
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1) rotate(0);
+  }
 }
 
 .game-boost-hud {
@@ -766,7 +707,6 @@
 @media (max-width: 760px) {
   :root {
     --game-boost-indicator-height: 36px;
-    --game-combo-indicator-height: 32px;
   }
 
   .game-arena-utility-anchor {
@@ -791,45 +731,23 @@
   .game-boost-meter__value {
     font-size: 14px;
   }
-
-  .game-combo-rail {
-    grid-template-columns: 50px minmax(0, 1fr) 76px;
-  }
-
-  .game-combo-rail__title,
-  .game-combo-hud.is-active .game-combo-rail__next {
-    font-size: 8px;
-  }
-
-  .game-combo-rail__next {
-    font-size: 7px;
-  }
-
-  .game-combo-rail__cell {
-    height: 11px;
-  }
 }
 
 @media (max-width: 580px), (max-height: 520px) and (orientation: landscape) {
   :root {
     --game-boost-indicator-height: 32px;
-    --game-combo-indicator-height: 28px;
   }
 
   .game-arena-stage {
     padding-bottom: 48px;
   }
 
-  .game-combo-rail {
-    grid-template-columns: 46px minmax(0, 1fr) 70px;
+  .game-combo-callout {
+    top: 6px;
   }
 
-  .game-combo-rail__cells {
-    padding-inline: 6px;
-  }
-
-  .game-combo-rail__cell {
-    height: 9px;
+  .game-combo-callout__burst {
+    padding: 4px 8px;
   }
 
   .game-idle-warning {
@@ -1010,10 +928,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .game-combo-hud,
-  .game-combo-rail__title,
-  .game-combo-rail__next,
-  .game-combo-rail__cell,
+  .game-combo-callout__burst,
   .game-boost-hud,
   .game-boost-meter,
   .game-boost-meter__fill,
@@ -1028,25 +943,17 @@
 }
 
 @media (forced-colors: active) {
-  .game-combo-rail,
-  .game-combo-rail__cell {
+  .game-combo-callout__burst,
+  .game-combo-callout__value,
+  .game-combo-callout__label {
     border-color: CanvasText;
     background: Canvas;
     color: CanvasText;
+    box-shadow: none;
+    text-shadow: none;
     forced-color-adjust: auto;
   }
 
-  .game-combo-rail__cell.is-filled {
-    border-color: Highlight;
-    background: Highlight;
-  }
-
-  .game-combo-hud.is-active .game-combo-rail__cell.is-head::after {
-    background: HighlightText;
-  }
-
-  .game-combo-rail__title,
-  .game-combo-rail__next,
   .game-idle-warning,
   .game-idle-warning__flag,
   .game-idle-warning__action,

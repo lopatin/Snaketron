@@ -21,6 +21,10 @@ const ANONYMOUS_SOCKET_OBSERVATION_MS = 8_000;
 // The values themselves are pinned by tests/unit/connectionBanner.test.ts.
 const CONNECTION_BANNER_SHOW_DELAY_MS = 800;
 const CONNECTION_BANNER_MIN_VISIBLE_MS = 1_200;
+// This test expires the callout with an explicit snapshot. A long, valid
+// window keeps slow CI from racing the real predictor between UI assertions;
+// unit and engine tests continue to pin the production rule at one second.
+const COMBO_CALLOUT_TEST_WINDOW_MS = 60_000;
 
 const gameState = (tick = 5) => ({
   tick,
@@ -92,6 +96,23 @@ const snapshot = (streamSequence, tick = 5) => ({
     event: { Snapshot: { game_state: gameState(tick) } },
   },
 });
+
+const comboSnapshot = (streamSequence, tick, chainCount, remainingMs) => {
+  const frame = snapshot(streamSequence, tick);
+  const state = frame.GameEvent.event.Snapshot.game_state;
+  state.start_ms = Date.now() - tick * state.properties.tick_duration_ms;
+  state.properties.combo = {
+    window_ms: COMBO_CALLOUT_TEST_WINDOW_MS,
+    max_food_value: 3,
+    rules_version: 1,
+  };
+  state.arena.snakes[0].combo = {
+    chain_count: chainCount,
+    remaining_ms: remainingMs,
+  };
+  state.arena.food = [{ x: 24, y: 20 }];
+  return frame;
+};
 
 const boostSnapshot = (streamSequence, tick = 5) => {
   const state = gameState(tick);
@@ -1956,6 +1977,61 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
       fullPage: true,
     });
   }
+});
+
+test('Combo callout stays hidden between chains and re-pops for every pickup', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
+  const callout = page.getByTestId('combo-callout');
+  const burst = page.getByTestId('combo-callout-burst');
+  const announcement = page.getByTestId('combo-callout-announcement');
+
+  await expect(callout).toHaveCount(1);
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(11, 6, 1, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(callout).toHaveAttribute('data-active', 'true');
+  await expect(burst).toHaveText(/\+2\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:1');
+  await expect(announcement).toHaveText('Combo active; next food is worth 2 points');
+  const buildingBurst = await burst.elementHandle();
+  if (!buildingBurst) throw new Error('building Combo burst is missing');
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(12, 7, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(burst).toHaveText(/\+3\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:2');
+  await expect(burst).toHaveClass(/is-maxed/);
+  await expect(announcement).toHaveText(
+    'Combo active; next food is worth 3 points, maximum value',
+  );
+  expect(await buildingBurst.evaluate((element) => element.isConnected)).toBe(false);
+  const firstMaxBurst = await burst.elementHandle();
+  if (!firstMaxBurst) throw new Error('first max Combo burst is missing');
+
+  // The displayed value is already capped, but a later pickup still gets a
+  // fresh keyed burst instead of leaving the previous animation untouched.
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(13, 8, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(burst).toHaveText(/\+3\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:3');
+  expect(await firstMaxBurst.evaluate((element) => element.isConnected)).toBe(false);
+
+  await emitServerMessage(page, socketIndex, comboSnapshot(14, 9, 0, 0));
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(announcement).toHaveText('');
 });
 
 test('Snaketron game shell restores the original scoreboard language and free-floating roster', async ({ page }) => {

@@ -1501,7 +1501,7 @@ struct FoodValueLabelLayout {
 fn food_value_label_layout(cell_size: f64, characters: usize) -> FoodValueLabelLayout {
     // The one-pixel food outline belongs to the icon, so a tiny label may use
     // that same overscan. At the 5px arena floor, the legibility clamp wins by
-    // a fraction of a pixel instead of collapsing the two-character mark.
+    // a fraction of a pixel instead of collapsing the value mark.
     let available_width = cell_size + 2.0;
     let font_for_width = available_width / (FOOD_VALUE_LABEL_ADVANCE_EM * characters.max(1) as f64);
     let font_px = (cell_size * FOOD_VALUE_LABEL_SIZE_RATIO)
@@ -1517,6 +1517,10 @@ fn food_value_label_layout(cell_size: f64, characters: usize) -> FoodValueLabelL
 
 fn food_value_label_font(size: f64) -> String {
     format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+}
+
+fn combo_food_label_text(value: u32) -> String {
+    value.to_string()
 }
 
 fn combo_food_label_value(
@@ -2053,7 +2057,7 @@ pub fn render_game_state(
         // Spectators and inactive chains resolve `None` above and retain the
         // original clean food art.
         if let Some(value) = local_food_value {
-            let text = format!("+{value}");
+            let text = combo_food_label_text(value);
             let layout = food_value_label_layout(cell_size, text.chars().count());
             ctx.save();
             ctx.set_text_align("center");
@@ -2074,7 +2078,7 @@ pub fn render_game_state(
                 );
                 let center_x = tx * cell_size + cell_size / 2.0;
                 // A quarter physical pixel counters the optical low bias of a
-                // bold plus/digit pair on Canvas' `middle` baseline.
+                // bold digit on Canvas' `middle` baseline.
                 let center_y = ty * cell_size + cell_size / 2.0 - 0.25;
                 ctx.stroke_text(&text, center_x, center_y)?;
                 ctx.fill_text(&text, center_x, center_y)?;
@@ -2927,13 +2931,16 @@ mod tests {
         assert_eq!(combo_food_label_value(2, 0, 3, true), None);
         assert_eq!(combo_food_label_value(2, 500, 3, false), None);
         assert_eq!(combo_food_label_value(0, 500, 1, true), None);
+
+        assert_eq!(combo_food_label_text(2), "2");
+        assert_eq!(combo_food_label_text(3), "3");
     }
 
     #[test]
     fn food_value_label_stays_readable_across_every_arena_cell_size() {
         for cell_size in 5..=15 {
             let cell_size = f64::from(cell_size);
-            let layout = food_value_label_layout(cell_size, 2);
+            let layout = food_value_label_layout(cell_size, 1);
 
             assert!(layout.font_px >= FOOD_VALUE_LABEL_MIN_PX);
             assert!(layout.font_px <= FOOD_VALUE_LABEL_MAX_PX);
@@ -2941,11 +2948,11 @@ mod tests {
             assert!(layout.halo_px <= FOOD_VALUE_LABEL_HALO_MAX_PX);
             assert!(layout.halo_px < layout.font_px * 0.2);
 
-            let natural_width = layout.font_px * FOOD_VALUE_LABEL_ADVANCE_EM * 2.0;
+            let natural_width = layout.font_px * FOOD_VALUE_LABEL_ADVANCE_EM;
             assert!(
                 natural_width <= cell_size + 2.0 + 1e-9
                     || layout.font_px == FOOD_VALUE_LABEL_MIN_PX,
-                "two-character value at cell {cell_size} overflows without hitting the floor"
+                "food value at cell {cell_size} overflows without hitting the floor"
             );
         }
 

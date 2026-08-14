@@ -61,7 +61,7 @@ import type {
 } from '../utils/crashExplosion';
 import type { PredictedScoreVisualState } from '../utils/scoreEffects';
 import BoostCanisterMark from './BoostCanisterMark';
-import ComboChaseRail from './ComboChaseRail';
+import ComboCallout from './ComboCallout';
 import TouchControls, {
   TOUCH_LANDSCAPE_SIDE_RESERVE_PX,
   TOUCH_PORTRAIT_BOTTOM_RESERVE_PX,
@@ -553,17 +553,6 @@ export default function GameArena() {
             rootStyle.getPropertyValue('--game-boost-indicator-height'),
           ) || 40
         : 0;
-      const sizeLocalPlayer = user?.id !== undefined
-        ? state.players?.[user.id]
-        : undefined;
-      const hasLocalComboHud = Boolean(
-        sizeLocalPlayer && state.arena.snakes?.[sizeLocalPlayer.snake_id],
-      );
-      const comboIndicatorHeight = hasLocalComboHud
-        ? Number.parseFloat(
-            rootStyle.getPropertyValue('--game-combo-indicator-height'),
-          ) || 34
-        : 0;
       const safeAreaInset = (side: 'bottom' | 'left' | 'right'): number =>
         Number.parseFloat(rootStyle.getPropertyValue(`--safe-area-inset-${side}`)) || 0;
       // Strict comparison to match CSS: `orientation: portrait` matches when
@@ -575,7 +564,7 @@ export default function GameArena() {
       if (isTouchSurface) {
         // Touch layouts budget the real in-flow chrome instead of the legacy
         // desktop slack: the fixed scoreboard band, the roster anchor row, the
-        // combo/charge rails, and the control-cluster reserves that mirror the
+        // charge rail, and the control-cluster reserves that mirror the
         // stage padding in GameArena.css (safe-area insets included, which are
         // only non-zero on notched phones in fullscreen). Every unspent pixel
         // here is arena, which matters on a phone.
@@ -594,12 +583,11 @@ export default function GameArena() {
           ? TOUCH_LANDSCAPE_SIDE_RESERVE_PX * 2 + safeAreaInset('left') + safeAreaInset('right')
           : 0;
         availableHeight = vh - scoreboardFootprint - anchorFootprint -
-          boostIndicatorHeight - comboIndicatorHeight - touchBottomReserve -
+          boostIndicatorHeight - touchBottomReserve -
           (isLandscapeViewport ? (compactLandscape ? 14 : 22) : 16);
         availableWidth = vw - 28 - touchSideReserve;
       } else {
-        availableHeight = vh - hudHeight - boostIndicatorHeight -
-          comboIndicatorHeight - 58 - 32 - 10;
+        availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10;
         availableWidth = vw - 32 - 10;
       }
       
@@ -633,7 +621,7 @@ export default function GameArena() {
     window.addEventListener('resize', calculateSizes);
 
     return () => window.removeEventListener('resize', calculateSizes);
-  }, [gameState, committedState, rotation, isTouchSurface, user?.id]);
+  }, [gameState, committedState, rotation, isTouchSurface]);
 
   // Check for game completion
   useEffect(() => {
@@ -1240,7 +1228,7 @@ export default function GameArena() {
     : null;
 
   const currentStatus = gameState?.status;
-  const isBoostGameTerminal = Boolean(
+  const isGameTerminal = Boolean(
     gameOver ||
     currentStatus === 'Stopped' ||
     (typeof currentStatus === 'object' && currentStatus !== null && 'Complete' in currentStatus),
@@ -1252,7 +1240,7 @@ export default function GameArena() {
   // deliberately left out and read at event time instead, exactly like the
   // keydown path, so a briefing opening mid-game swallows taps immediately.
   steerContextRef.current = {
-    canSteer: Boolean(gameState) && isGameInteractionActive && !isBoostGameTerminal,
+    canSteer: Boolean(gameState) && isGameInteractionActive && !isGameTerminal,
     rotation,
   };
   const boostInputContext: BoostInputContext = {
@@ -1266,9 +1254,9 @@ export default function GameArena() {
       localSnake?.is_alive &&
       isGameInteractionActive &&
       !isModalOwningInput &&
-      !isBoostGameTerminal
+      !isGameTerminal
     ),
-    gameOver: isBoostGameTerminal,
+    gameOver: isGameTerminal,
   };
   boostInputContextRef.current = boostInputContext;
 
@@ -1637,11 +1625,25 @@ export default function GameArena() {
     </div>
   ) : null;
 
-  // This footprint remains mounted while the player is alive, dead, or
-  // between chains. Only its cells drain, so a combo starting or expiring can
-  // never move the arena or the optional Boost control beneath it.
-  const comboControl = localSnake && comboHud ? (
-    <ComboChaseRail hud={comboHud} isVisible={isArenaVisible} />
+  // Keep the live region mounted, but render its visual burst only while the
+  // engine-owned combo window and gameplay surface are both active. The chain
+  // count is the animation identity so every capped +3 pickup still re-pops.
+  const comboCallout = localSnake && comboHud ? (
+    <ComboCallout
+      hud={comboHud}
+      isVisible={Boolean(
+        isArenaVisible &&
+        isGameInteractionActive &&
+        !isGameTerminal &&
+        !isWaitingForSnapshot &&
+        !currentGameLoadFailure &&
+        !connectionStale &&
+        !idleWarning &&
+        !showCountdown &&
+        !isModalOwningInput
+      )}
+      pickupIdentity={`${gameId}:${localSnake.combo.chain_count}`}
+    />
   ) : null;
 
   if (showAuthLoading) {
@@ -1686,9 +1688,7 @@ export default function GameArena() {
           />
           {/* Game Canvas */}
           <div
-            className={`game-arena-frame${comboControl ? ' has-combo-indicator' : ''}${
-              boostControl ? ' has-boost-indicator' : ''
-            }`}
+            className={`game-arena-frame${boostControl ? ' has-boost-indicator' : ''}`}
             style={{ width: `${panelSize.width}px` }}
           >
             <div
@@ -1714,6 +1714,7 @@ export default function GameArena() {
                   border: 'none'
                 }}
               />
+              {comboCallout}
               {currentGameLoadFailure && (
                 <div
                   className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-30 px-6 text-center"
@@ -1800,7 +1801,6 @@ export default function GameArena() {
                 </div>
               )}
             </div>
-            {comboControl}
             {boostControl}
           </div>
           <GameControlsHint
