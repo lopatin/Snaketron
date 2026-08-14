@@ -464,6 +464,7 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
             revision: uuid::Uuid::new_v4(),
             ended_at_ms: now,
             server_id: 1,
+            season: Some(0),
             final_state: final_state.clone(),
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };
@@ -1331,6 +1332,7 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             revision: uuid::Uuid::new_v4(),
             ended_at_ms: now,
             server_id: 42,
+            season: Some(1),
             final_state: final_state.clone(),
             effects: vec![
                 CompletionEffect::PersistGame { id: "game".into() },

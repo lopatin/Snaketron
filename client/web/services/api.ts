@@ -8,6 +8,7 @@ import {
   UserRankingResponse,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
+import type { NewsTickerResponse } from '../types/generated';
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -265,6 +266,10 @@ class API {
 
   async getCurrentUser(): Promise<UserInfo> {
     return this.request<UserInfo>('/api/auth/me');
+  }
+
+  async getNewsTicker(): Promise<NewsTickerResponse> {
+    return this.request<NewsTickerResponse>('/api/news');
   }
 
   async getLeaderboard(

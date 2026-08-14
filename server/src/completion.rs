@@ -7,7 +7,7 @@
 
 use crate::db::Database;
 use crate::mmr_persistence::calculate_mmr_effect_specs;
-use crate::season::{get_current_season, get_region};
+use crate::season::{Season, get_current_season, get_region};
 use anyhow::{Result, anyhow};
 use common::{GameState, GameStatus, GameType, QueueMode};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,11 @@ pub struct CompletionRecordV1 {
     pub revision: Uuid,
     pub ended_at_ms: i64,
     pub server_id: u64,
+    /// Season captured before the durable completion commit. Older records
+    /// deserialize without it and remain replayable, but cannot feed seasonal
+    /// news because their cohort is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<Season>,
     pub final_state: GameState,
     pub effects: Vec<CompletionEffect>,
 }
@@ -125,6 +130,19 @@ impl CompletionRecordV1 {
                 ));
             }
             effect.validate_identity(self)?;
+            let effect_season = match effect {
+                CompletionEffect::UpdateRanking { season, .. }
+                | CompletionEffect::InsertHighScore { season, .. } => Some(*season),
+                _ => None,
+            };
+            if let (Some(record_season), Some(effect_season)) = (self.season, effect_season)
+                && record_season != effect_season
+            {
+                return Err(anyhow!(
+                    "completion season {record_season} does not match effect {} season {effect_season}",
+                    effect.id()
+                ));
+            }
             if matches!(effect, CompletionEffect::PersistGame { .. }) {
                 persist_game_count += 1;
             }
@@ -477,6 +495,7 @@ pub async fn materialize_completion(
         ));
     }
 
+    let season = get_current_season();
     let mut effects = vec![CompletionEffect::PersistGame {
         id: "game".to_string(),
     }];
@@ -499,7 +518,6 @@ pub async fn materialize_completion(
         }
 
         let region = get_region();
-        let season = get_current_season();
         if matches!(final_state.game_type, GameType::Solo) {
             for user_id in player_ids {
                 let player = final_state
@@ -553,6 +571,7 @@ pub async fn materialize_completion(
         revision: Uuid::new_v4(),
         ended_at_ms,
         server_id,
+        season: Some(season),
         final_state,
         effects,
     };
@@ -653,10 +672,19 @@ mod tests {
             revision: Uuid::new_v4(),
             ended_at_ms: 10,
             server_id: 1,
+            season: Some(0),
             final_state: state,
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };
         assert!(record.validate().is_ok());
+
+        let mut legacy_record = record.clone();
+        legacy_record.season = None;
+        let serialized = serde_json::to_value(&legacy_record).unwrap();
+        assert!(
+            serialized.get("season").is_none(),
+            "legacy records must retain their pre-season serialization shape"
+        );
 
         record.effects.push(CompletionEffect::AddXp {
             id: "xp:7".into(),

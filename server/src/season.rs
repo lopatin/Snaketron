@@ -1,10 +1,134 @@
+use std::env::VarError;
+use std::error::Error;
+use std::fmt;
+use std::sync::OnceLock;
+
 pub type Season = u32;
 
-/// Get the current season identifier.
-/// Placeholder until a season schedule/roller exists.
+pub const CURRENT_SEASON_ENV: &str = "SNAKETRON_CURRENT_SEASON";
+pub const DEFAULT_CURRENT_SEASON: Season = 0;
+/// DynamoDB model readers use signed 32-bit numeric fields throughout the
+/// existing leaderboard schema, so configuration must stay in that range.
+pub const MAX_CURRENT_SEASON: Season = i32::MAX as Season;
+
+static CURRENT_SEASON: OnceLock<Season> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentSeasonConfigError {
+    Empty,
+    Invalid(String),
+    OutOfRange(String),
+    NotUnicode,
+    AlreadyInitialized {
+        initialized: Season,
+        configured: Season,
+    },
+}
+
+impl fmt::Display for CurrentSeasonConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(
+                formatter,
+                "{CURRENT_SEASON_ENV} must not be empty when it is set"
+            ),
+            Self::Invalid(value) => write!(
+                formatter,
+                "{CURRENT_SEASON_ENV} must be an unsigned base-10 integer, got {value:?}"
+            ),
+            Self::OutOfRange(value) => write!(
+                formatter,
+                "{CURRENT_SEASON_ENV} is outside the supported season range, got {value:?}"
+            ),
+            Self::NotUnicode => write!(formatter, "{CURRENT_SEASON_ENV} must be valid UTF-8"),
+            Self::AlreadyInitialized {
+                initialized,
+                configured,
+            } => write!(
+                formatter,
+                "current season is already initialized to {initialized}, but the environment now resolves to {configured}"
+            ),
+        }
+    }
+}
+
+impl Error for CurrentSeasonConfigError {}
+
+/// Resolve and cache the season used by this server process.
+///
+/// Call this during startup, after loading any `.env` file and before starting
+/// database-backed services. An unset value defaults to Season 0 for local
+/// development; an explicitly configured value must be valid.
+pub fn initialize_current_season() -> Result<Season, CurrentSeasonConfigError> {
+    let configured = current_season_from_env()?;
+
+    if let Some(&initialized) = CURRENT_SEASON.get() {
+        return if initialized == configured {
+            Ok(initialized)
+        } else {
+            Err(CurrentSeasonConfigError::AlreadyInitialized {
+                initialized,
+                configured,
+            })
+        };
+    }
+
+    // Another thread could initialize between the check and the set. Reading
+    // the stored value afterward keeps this correct without a mutable global.
+    let _ = CURRENT_SEASON.set(configured);
+    let initialized = *CURRENT_SEASON
+        .get()
+        .expect("current season must be set by this point");
+
+    if initialized == configured {
+        Ok(initialized)
+    } else {
+        Err(CurrentSeasonConfigError::AlreadyInitialized {
+            initialized,
+            configured,
+        })
+    }
+}
+
+/// Return the immutable current season for this process.
+///
+/// The main server initializes this value explicitly so invalid deployment
+/// configuration fails startup. Lazy initialization remains as a safeguard for
+/// library consumers and local tools that do not run the server binary.
 pub fn get_current_season() -> Season {
-    // TODO: replace with real season scheduler/roller
-    0
+    *CURRENT_SEASON.get_or_init(|| {
+        current_season_from_env().unwrap_or_else(|error| {
+            panic!("invalid current-season configuration: {error}");
+        })
+    })
+}
+
+fn current_season_from_env() -> Result<Season, CurrentSeasonConfigError> {
+    match std::env::var(CURRENT_SEASON_ENV) {
+        Ok(value) => parse_current_season(Some(&value)),
+        Err(VarError::NotPresent) => parse_current_season(None),
+        Err(VarError::NotUnicode(_)) => Err(CurrentSeasonConfigError::NotUnicode),
+    }
+}
+
+fn parse_current_season(value: Option<&str>) -> Result<Season, CurrentSeasonConfigError> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_CURRENT_SEASON);
+    };
+
+    if value.is_empty() {
+        return Err(CurrentSeasonConfigError::Empty);
+    }
+
+    if !value.bytes().all(|character| character.is_ascii_digit()) {
+        return Err(CurrentSeasonConfigError::Invalid(value.to_string()));
+    }
+
+    value
+        .parse::<Season>()
+        .ok()
+        .filter(|season| *season <= MAX_CURRENT_SEASON)
+        .ok_or_else(|| CurrentSeasonConfigError::OutOfRange(value.to_string()))
 }
 
 fn resolve_storage_region(
@@ -84,8 +208,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_season_non_negative() {
-        assert_eq!(get_current_season(), 0);
+    fn missing_current_season_defaults_to_season_zero() {
+        assert_eq!(parse_current_season(None), Ok(DEFAULT_CURRENT_SEASON));
+    }
+
+    #[test]
+    fn parses_supported_current_seasons() {
+        assert_eq!(parse_current_season(Some("0")), Ok(0));
+        assert_eq!(parse_current_season(Some("12")), Ok(12));
+        assert_eq!(
+            parse_current_season(Some(&MAX_CURRENT_SEASON.to_string())),
+            Ok(MAX_CURRENT_SEASON)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_non_decimal_current_seasons() {
+        assert_eq!(
+            parse_current_season(Some("")),
+            Err(CurrentSeasonConfigError::Empty)
+        );
+
+        for value in ["-1", "+1", " 1", "1 ", "1.5", "season-1"] {
+            assert_eq!(
+                parse_current_season(Some(value)),
+                Err(CurrentSeasonConfigError::Invalid(value.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_current_season_larger_than_storage_type() {
+        let value = (u64::from(MAX_CURRENT_SEASON) + 1).to_string();
+        assert_eq!(
+            parse_current_season(Some(&value)),
+            Err(CurrentSeasonConfigError::OutOfRange(value))
+        );
     }
 
     #[test]

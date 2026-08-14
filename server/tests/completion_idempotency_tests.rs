@@ -43,6 +43,7 @@ fn completion_record(
         revision: Uuid::new_v4(),
         ended_at_ms,
         server_id: 42,
+        season: Some(1),
         final_state,
         effects,
     }

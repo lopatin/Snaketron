@@ -142,6 +142,10 @@ pub enum CrazyGamesAccountOutcome {
 pub struct Game {
     pub id: i32,
     pub server_id: Option<i32>,
+    /// Season captured when the completion became durable. Legacy rows do not
+    /// have this field and are deliberately excluded from seasonal news.
+    #[serde(default)]
+    pub season: Option<crate::season::Season>,
     pub game_type: JsonValue,
     pub game_state: Option<JsonValue>,
     pub status: String,
@@ -151,6 +155,10 @@ pub struct Game {
     pub game_mode: String,
     pub is_private: bool,
     pub game_code: Option<String>,
+    /// Internal proof that completion persistence verified this result as a
+    /// public source. Legacy rows without proof fail closed for news.
+    #[serde(default, skip_serializing)]
+    pub news_eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +230,26 @@ pub struct HighScoreEntry {
     pub game_type: String, // "solo"
     pub season: u32,
     pub timestamp: DateTime<Utc>,
+    /// Whether the source game was verified public when this row was written.
+    /// Legacy rows lack that proof and intentionally fail closed.
+    #[serde(default, skip_serializing)]
+    pub news_eligible: bool,
+}
+
+/// Whether a news read came from the globally ordered leaderboard index or
+/// from a bounded, unordered compatibility scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewsLeaderboardCoverage {
+    OrderedGlobalIndex,
+    BoundedSample,
+}
+
+/// An optional, proven Solo leader. The winning row's immutable timestamp is
+/// when that score was posted.
+#[derive(Debug, Clone)]
+pub struct NewsHighScoreSnapshot {
+    pub leader: Option<HighScoreEntry>,
+    pub coverage: NewsLeaderboardCoverage,
 }
 
 // DynamoDB specific models for single table design

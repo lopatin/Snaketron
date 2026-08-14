@@ -59,6 +59,13 @@ as the authoritative kick deadline alongside the countdown length. Existing
 matches retain the policy they started with; after a server restart, changed
 values apply to new matches without a client deployment.
 
+Current season:
+
+- `SNAKETRON_CURRENT_SEASON`: Base-10 season number from `0` through `2147483647`, used by all seasonal leaderboard reads, ranking writes, completed-game records, and news headlines.
+- The server validates and freezes this value at startup. Empty, signed, fractional, whitespace-padded, non-numeric, and out-of-range values fail startup before database-backed services begin.
+- An unset value defaults to `0` for local development. `docker-compose.prod.yml` requires an explicit value so production cannot silently fall back to Season 0.
+- Deploy a season change consistently across all server instances. A mixed-version rollout with different current seasons would split reads and writes between seasons.
+
 Completed game retention:
 
 - `SNAKETRON_COMPLETED_GAME_RETENTION_DAYS`: Number of days to retain final game snapshots in DynamoDB (default: `30`)

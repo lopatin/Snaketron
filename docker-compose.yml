@@ -58,6 +58,8 @@ services:
       SNAKETRON_GRPC_PORT: 50051
       SNAKETRON_REGION: us
       SNAKETRON_ENV: dev
+      # All seasonal reads and writes use this process-wide value.
+      SNAKETRON_CURRENT_SEASON: "${SNAKETRON_CURRENT_SEASON:-0}"
       # New team matches snapshot this once at creation (valid range 1.000-2.000).
       SNAKETRON_BOOST_SPEED_MULTIPLIER: "1.500"
       # New multiplayer matches warn after 10s idle, then kick after a 10s countdown.
