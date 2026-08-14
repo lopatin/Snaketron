@@ -21,7 +21,7 @@ use tracing::warn;
 
 use crate::db::Database;
 use crate::db::models::{Game, HighScoreEntry, NewsHighScoreSnapshot, NewsLeaderboardCoverage};
-use crate::season::{Season, get_current_season};
+use crate::season::{Season, get_season_at};
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const CACHE_TTL_SECONDS: u32 = 60;
@@ -115,6 +115,7 @@ impl NewsState {
 
 struct CachedNews {
     expires_at: Instant,
+    season: Season,
     response: NewsTickerResponse,
 }
 
@@ -123,22 +124,32 @@ struct CachedNews {
 /// set of DynamoDB reads rather than a cache stampede.
 pub async fn get_news(State(state): State<NewsState>) -> Json<NewsTickerResponse> {
     let mut cache = state.cache.lock().await;
+    let now = Utc::now();
+    let season = get_season_at(now);
     if let Some(cached) = cache.as_ref()
-        && cached.expires_at > Instant::now()
+        && cached_news_is_reusable(cached, season, Instant::now())
     {
         return Json(cached.response.clone());
     }
 
-    let response = build_news_response(state.db.as_ref(), Utc::now()).await;
+    let response = build_news_response(state.db.as_ref(), season, now).await;
     *cache = Some(CachedNews {
         expires_at: Instant::now() + CACHE_TTL,
+        season,
         response: response.clone(),
     });
     Json(response)
 }
 
-async fn build_news_response(db: &dyn Database, now: DateTime<Utc>) -> NewsTickerResponse {
-    let season = get_current_season();
+fn cached_news_is_reusable(cached: &CachedNews, season: Season, now: Instant) -> bool {
+    cached.expires_at > now && cached.season == season
+}
+
+async fn build_news_response(
+    db: &dyn Database,
+    season: Season,
+    now: DateTime<Utc>,
+) -> NewsTickerResponse {
     let solo = GameType::Solo;
 
     let (games, high_score_snapshot) = tokio::join!(
@@ -1412,6 +1423,29 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0)
             .single()
             .unwrap()
+    }
+
+    #[test]
+    fn news_cache_never_crosses_a_season_boundary() {
+        let response = NewsTickerResponse {
+            items: Vec::new(),
+            generated_at: test_time().to_rfc3339(),
+            refresh_after_seconds: CACHE_TTL_SECONDS,
+        };
+        let now = Instant::now();
+        let cached = CachedNews {
+            expires_at: now + Duration::from_secs(60),
+            season: 0,
+            response,
+        };
+
+        assert!(cached_news_is_reusable(&cached, 0, now));
+        assert!(!cached_news_is_reusable(&cached, 1, now));
+        assert!(!cached_news_is_reusable(
+            &cached,
+            0,
+            now + Duration::from_secs(61)
+        ));
     }
 
     fn observation(id: usize, value: f64, metric: MetricKey, confidence: f64) -> MetricObservation {

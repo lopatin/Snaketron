@@ -7,8 +7,9 @@
 
 use crate::db::Database;
 use crate::mmr_persistence::calculate_mmr_effect_specs;
-use crate::season::{Season, get_current_season, get_region};
+use crate::season::{Season, get_region, get_season_at};
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use common::{GameState, GameStatus, GameType, QueueMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -495,7 +496,7 @@ pub async fn materialize_completion(
         ));
     }
 
-    let season = get_current_season();
+    let season = season_for_completion_timestamp(ended_at_ms)?;
     let mut effects = vec![CompletionEffect::PersistGame {
         id: "game".to_string(),
     }];
@@ -579,6 +580,12 @@ pub async fn materialize_completion(
     Ok(record)
 }
 
+fn season_for_completion_timestamp(ended_at_ms: i64) -> Result<Season> {
+    let ended_at = DateTime::<Utc>::from_timestamp_millis(ended_at_ms)
+        .ok_or_else(|| anyhow!("invalid completion timestamp {ended_at_ms}"))?;
+    Ok(get_season_at(ended_at))
+}
+
 fn username_for(state: &GameState, user_id: u32) -> String {
     state
         .usernames
@@ -606,6 +613,7 @@ pub async fn apply_all_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use common::{GameStatus, GameType, QueueMode};
 
     #[test]
@@ -644,6 +652,24 @@ mod tests {
     fn rejects_non_terminal_state_without_touching_database() {
         let state = GameState::new(10, 10, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
         assert!(!matches!(state.status, GameStatus::Complete { .. }));
+    }
+
+    #[test]
+    fn completion_timestamp_selects_the_season_at_the_exact_rollover() {
+        let before = Utc
+            .with_ymd_and_hms(2026, 9, 30, 23, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+            + 999;
+        let boundary = Utc
+            .with_ymd_and_hms(2026, 10, 1, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(season_for_completion_timestamp(before).unwrap(), 0);
+        assert_eq!(season_for_completion_timestamp(boundary).unwrap(), 1);
     }
 
     #[test]

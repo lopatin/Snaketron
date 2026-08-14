@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import type { AccountModalView } from './AccountModal';
 import { HomeHeader } from './HomeHeader';
@@ -548,6 +548,7 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [seasons, setSeasons] = useState<number[]>([]);
   const [selectedSeason, setSelectedSeason] = useState<number | null>(() => parseSeasonParam(searchParams.get('season')));
+  const currentSeasonRef = useRef<number | null>(null);
   const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(() => {
     const queryMode = searchParams.get('mode');
     return isValidLeaderboardMode(queryMode) ? queryMode : DEFAULT_LEADERBOARD_MODE;
@@ -570,14 +571,26 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
   });
   const currentRegionId = selectedWsRegion?.id ?? regions[0]?.id ?? '';
 
-  // Fetch seasons once so we can hydrate the query defaults
+  // Refresh this lightweight, clock-derived endpoint so a tab left open over
+  // a UTC quarter boundary adopts the newly rolled season without reloading.
   useEffect(() => {
+    let active = true;
+    let latestRequest = 0;
     const fetchSeasons = async () => {
+      const request = ++latestRequest;
       try {
         const data = await api.getSeasons();
+        if (!active || request !== latestRequest) {
+          return;
+        }
+        const previousCurrent = currentSeasonRef.current;
+        currentSeasonRef.current = data.current;
         setSeasons(data.seasons);
         setSelectedSeason(prev => {
-          if (prev != null) {
+          if (previousCurrent != null && prev === previousCurrent) {
+            return data.current;
+          }
+          if (prev != null && data.seasons.includes(prev)) {
             return prev;
           }
           if (data.current != null) {
@@ -585,13 +598,36 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
           }
           return data.seasons[0] ?? null;
         });
+        if (previousCurrent != null && previousCurrent !== data.current) {
+          setSearchParams(previous => {
+            if (parseSeasonParam(previous.get('season')) !== previousCurrent) {
+              return previous;
+            }
+            const next = new URLSearchParams(previous);
+            next.set('season', data.current.toString());
+            return next;
+          }, { replace: true });
+        }
       } catch (err) {
         console.error('Failed to fetch seasons:', err);
       }
     };
 
-    fetchSeasons();
-  }, []);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchSeasons();
+      }
+    };
+    void fetchSeasons();
+    const intervalId = window.setInterval(fetchSeasons, 60_000);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [setSearchParams]);
 
   // Sync local selections from URL (and season list) whenever the URL changes
   useEffect(() => {

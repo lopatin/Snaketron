@@ -1,134 +1,41 @@
-use std::env::VarError;
-use std::error::Error;
-use std::fmt;
-use std::sync::OnceLock;
+use chrono::{DateTime, Datelike, Utc};
 
 pub type Season = u32;
 
-pub const CURRENT_SEASON_ENV: &str = "SNAKETRON_CURRENT_SEASON";
-pub const DEFAULT_CURRENT_SEASON: Season = 0;
-/// DynamoDB model readers use signed 32-bit numeric fields throughout the
-/// existing leaderboard schema, so configuration must stay in that range.
-pub const MAX_CURRENT_SEASON: Season = i32::MAX as Season;
+/// Snaketron seasons follow the UTC calendar quarters used by the original
+/// leaderboard implementation. Existing numeric Season 0 data remains in the
+/// launch season (Q3 2026); the first automatic rollover is Q4 2026.
+const SEASON_ZERO_YEAR: i32 = 2026;
+const SEASON_ZERO_QUARTER: i64 = 2; // Zero-based: Q3.
+const QUARTERS_PER_YEAR: i64 = 4;
 
-static CURRENT_SEASON: OnceLock<Season> = OnceLock::new();
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CurrentSeasonConfigError {
-    Empty,
-    Invalid(String),
-    OutOfRange(String),
-    NotUnicode,
-    AlreadyInitialized {
-        initialized: Season,
-        configured: Season,
-    },
-}
-
-impl fmt::Display for CurrentSeasonConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => write!(
-                formatter,
-                "{CURRENT_SEASON_ENV} must not be empty when it is set"
-            ),
-            Self::Invalid(value) => write!(
-                formatter,
-                "{CURRENT_SEASON_ENV} must be an unsigned base-10 integer, got {value:?}"
-            ),
-            Self::OutOfRange(value) => write!(
-                formatter,
-                "{CURRENT_SEASON_ENV} is outside the supported season range, got {value:?}"
-            ),
-            Self::NotUnicode => write!(formatter, "{CURRENT_SEASON_ENV} must be valid UTF-8"),
-            Self::AlreadyInitialized {
-                initialized,
-                configured,
-            } => write!(
-                formatter,
-                "current season is already initialized to {initialized}, but the environment now resolves to {configured}"
-            ),
-        }
-    }
-}
-
-impl Error for CurrentSeasonConfigError {}
-
-/// Resolve and cache the season used by this server process.
+/// Resolve the season containing one authoritative UTC timestamp.
 ///
-/// Call this during startup, after loading any `.env` file and before starting
-/// database-backed services. An unset value defaults to Season 0 for local
-/// development; an explicitly configured value must be valid.
-pub fn initialize_current_season() -> Result<Season, CurrentSeasonConfigError> {
-    let configured = current_season_from_env()?;
+/// All timestamps before the numeric-season launch are deliberately folded
+/// into Season 0 so existing leaderboard and high-score rows remain readable.
+/// From 2026-10-01T00:00:00Z onward the value increments at every UTC calendar
+/// quarter boundary without configuration, deployment, or process restart.
+pub fn get_season_at(timestamp: DateTime<Utc>) -> Season {
+    let quarter = i64::from(timestamp.month0() / 3);
+    let quarter_index = i64::from(timestamp.year()) * QUARTERS_PER_YEAR + quarter;
+    let season_zero_index = i64::from(SEASON_ZERO_YEAR) * QUARTERS_PER_YEAR + SEASON_ZERO_QUARTER;
+    let elapsed_quarters = quarter_index.saturating_sub(season_zero_index).max(0);
 
-    if let Some(&initialized) = CURRENT_SEASON.get() {
-        return if initialized == configured {
-            Ok(initialized)
-        } else {
-            Err(CurrentSeasonConfigError::AlreadyInitialized {
-                initialized,
-                configured,
-            })
-        };
-    }
-
-    // Another thread could initialize between the check and the set. Reading
-    // the stored value afterward keeps this correct without a mutable global.
-    let _ = CURRENT_SEASON.set(configured);
-    let initialized = *CURRENT_SEASON
-        .get()
-        .expect("current season must be set by this point");
-
-    if initialized == configured {
-        Ok(initialized)
-    } else {
-        Err(CurrentSeasonConfigError::AlreadyInitialized {
-            initialized,
-            configured,
-        })
-    }
+    Season::try_from(elapsed_quarters)
+        .expect("chrono's supported year range fits in the numeric season storage type")
 }
 
-/// Return the immutable current season for this process.
-///
-/// The main server initializes this value explicitly so invalid deployment
-/// configuration fails startup. Lazy initialization remains as a safeguard for
-/// library consumers and local tools that do not run the server binary.
+/// Resolve the season active at the instant this function is called.
 pub fn get_current_season() -> Season {
-    *CURRENT_SEASON.get_or_init(|| {
-        current_season_from_env().unwrap_or_else(|error| {
-            panic!("invalid current-season configuration: {error}");
-        })
-    })
+    get_season_at(Utc::now())
 }
 
-fn current_season_from_env() -> Result<Season, CurrentSeasonConfigError> {
-    match std::env::var(CURRENT_SEASON_ENV) {
-        Ok(value) => parse_current_season(Some(&value)),
-        Err(VarError::NotPresent) => parse_current_season(None),
-        Err(VarError::NotUnicode(_)) => Err(CurrentSeasonConfigError::NotUnicode),
-    }
-}
-
-fn parse_current_season(value: Option<&str>) -> Result<Season, CurrentSeasonConfigError> {
-    let Some(value) = value else {
-        return Ok(DEFAULT_CURRENT_SEASON);
-    };
-
-    if value.is_empty() {
-        return Err(CurrentSeasonConfigError::Empty);
-    }
-
-    if !value.bytes().all(|character| character.is_ascii_digit()) {
-        return Err(CurrentSeasonConfigError::Invalid(value.to_string()));
-    }
-
-    value
-        .parse::<Season>()
-        .ok()
-        .filter(|season| *season <= MAX_CURRENT_SEASON)
-        .ok_or_else(|| CurrentSeasonConfigError::OutOfRange(value.to_string()))
+/// Return every numeric season through the supplied timestamp, newest first.
+/// This keeps Season 0 selectable after later rollovers instead of orphaning
+/// the leaderboard data created during launch.
+pub fn seasons_at(timestamp: DateTime<Utc>) -> Vec<Season> {
+    let current = get_season_at(timestamp);
+    (0..=current).rev().collect()
 }
 
 fn resolve_storage_region(
@@ -206,49 +113,39 @@ pub fn get_ranking_region(requested_region: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
-    #[test]
-    fn missing_current_season_defaults_to_season_zero() {
-        assert_eq!(parse_current_season(None), Ok(DEFAULT_CURRENT_SEASON));
+    fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+            .single()
+            .unwrap()
     }
 
     #[test]
-    fn parses_supported_current_seasons() {
-        assert_eq!(parse_current_season(Some("0")), Ok(0));
-        assert_eq!(parse_current_season(Some("12")), Ok(12));
-        assert_eq!(
-            parse_current_season(Some(&MAX_CURRENT_SEASON.to_string())),
-            Ok(MAX_CURRENT_SEASON)
-        );
+    fn season_zero_absorbs_history_and_the_launch_quarter() {
+        assert_eq!(get_season_at(utc(2020, 1, 1, 0, 0, 0)), 0);
+        assert_eq!(get_season_at(utc(2026, 7, 1, 0, 0, 0)), 0);
+        assert_eq!(get_season_at(utc(2026, 9, 30, 23, 59, 59)), 0);
     }
 
     #[test]
-    fn rejects_empty_or_non_decimal_current_seasons() {
-        assert_eq!(
-            parse_current_season(Some("")),
-            Err(CurrentSeasonConfigError::Empty)
-        );
-
-        for value in ["-1", "+1", " 1", "1 ", "1.5", "season-1"] {
-            assert_eq!(
-                parse_current_season(Some(value)),
-                Err(CurrentSeasonConfigError::Invalid(value.to_string()))
-            );
-        }
+    fn seasons_roll_exactly_on_utc_quarter_boundaries() {
+        assert_eq!(get_season_at(utc(2026, 10, 1, 0, 0, 0)), 1);
+        assert_eq!(get_season_at(utc(2026, 12, 31, 23, 59, 59)), 1);
+        assert_eq!(get_season_at(utc(2027, 1, 1, 0, 0, 0)), 2);
+        assert_eq!(get_season_at(utc(2027, 4, 1, 0, 0, 0)), 3);
+        assert_eq!(get_season_at(utc(2027, 7, 1, 0, 0, 0)), 4);
+        assert_eq!(get_season_at(utc(2027, 10, 1, 0, 0, 0)), 5);
     }
 
     #[test]
-    fn rejects_current_season_larger_than_storage_type() {
-        let value = (u64::from(MAX_CURRENT_SEASON) + 1).to_string();
-        assert_eq!(
-            parse_current_season(Some(&value)),
-            Err(CurrentSeasonConfigError::OutOfRange(value))
-        );
+    fn seasons_are_newest_first_and_preserve_season_zero() {
+        assert_eq!(seasons_at(utc(2026, 8, 14, 12, 0, 0)), vec![0]);
+        assert_eq!(seasons_at(utc(2027, 7, 1, 0, 0, 0)), vec![4, 3, 2, 1, 0]);
     }
 
     #[test]
     fn test_region_default() {
-        // Test that we can get a region (might be from env or default)
         let region = get_region();
         assert!(!region.is_empty());
     }

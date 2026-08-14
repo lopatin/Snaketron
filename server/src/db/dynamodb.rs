@@ -21,7 +21,7 @@ use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, canonical_json_bytes,
 };
-use crate::season::{Season, get_current_season};
+use crate::season::{Season, get_season_at};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -941,6 +941,38 @@ impl DynamoDatabase {
             season: Self::extract_number(item, "season")
                 .map(|stored_season| stored_season as Season)
                 .unwrap_or(season),
+            updated_at: Self::extract_string(item, "updatedAt")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+        })
+    }
+
+    /// Parse a leaderboard row only when its durable numeric season exactly
+    /// matches the requested partition. This is a second line of defense for
+    /// scan fallbacks and prevents Season 1 from admitting Season 10 rows.
+    fn leaderboard_entry_from_item(
+        item: &HashMap<String, AttributeValue>,
+        requested_season: Season,
+    ) -> Option<RankingEntry> {
+        let stored_season = Self::extract_number(item, "season")?;
+        let stored_season = Season::try_from(stored_season).ok()?;
+        if stored_season != requested_season {
+            return None;
+        }
+
+        Some(RankingEntry {
+            user_id: Self::extract_number(item, "userId")?,
+            username: Self::extract_string(item, "username")?,
+            mmr: Self::extract_number(item, "mmr")?,
+            games_played: Self::extract_number(item, "gamesPlayed")?,
+            wins: Self::extract_number(item, "wins")?,
+            losses: Self::extract_number(item, "losses")?,
+            region: Self::extract_string(item, "region")?,
+            queue_mode: Self::extract_string(item, "queueMode")?,
+            game_type: Self::extract_string(item, "gameType")
+                .unwrap_or_else(|| "unknown".to_string()),
+            season: stored_season,
             updated_at: Self::extract_string(item, "updatedAt")
                 .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
                 .map(|timestamp| timestamp.with_timezone(&Utc))
@@ -2971,7 +3003,7 @@ impl Database for DynamoDatabase {
         }
 
         let ended_at = Utc::now();
-        let season = get_current_season();
+        let season = get_season_at(ended_at);
         let created_at =
             DateTime::<Utc>::from_timestamp_millis(game_state.start_ms).unwrap_or(ended_at);
         let configured_retention = std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV).ok();
@@ -3882,9 +3914,7 @@ impl Database for DynamoDatabase {
                 // Prefer the GameTypeSeasonIndex to query all regions in a single partition
                 let game_type_season =
                     format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
-                let mut gsi_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
-
-                match self
+                let gsi_items = match self
                     .client
                     .query()
                     .table_name(self.rankings_table())
@@ -3896,17 +3926,20 @@ impl Database for DynamoDatabase {
                     .await
                 {
                     Ok(response) => {
-                        gsi_items = response.items.unwrap_or_default();
+                        // A successful empty query is authoritative for a new
+                        // season. Only an unavailable index justifies scanning.
+                        Some(response.items.unwrap_or_default())
                     }
                     Err(err) => {
                         warn!(
                             "Falling back to scan for global rankings (GameTypeSeasonIndex not available?): {:?}",
                             err
                         );
+                        None
                     }
-                }
+                };
 
-                if !gsi_items.is_empty() {
+                if let Some(gsi_items) = gsi_items {
                     gsi_items
                 } else {
                     // Fallback: scan across all regions for the requested season
@@ -3920,9 +3953,10 @@ impl Database for DynamoDatabase {
                             .client
                             .scan()
                             .table_name(self.rankings_table())
-                            .filter_expression("begins_with(pk, :prefix) AND contains(pk, :season)")
+                            .filter_expression("begins_with(pk, :prefix) AND #season = :season")
+                            .expression_attribute_names("#season", "season")
                             .expression_attribute_values(":prefix", Self::av_s(&pk_prefix))
-                            .expression_attribute_values(":season", Self::av_s(&season_str))
+                            .expression_attribute_values(":season", Self::av_n(season))
                             .limit((target_items - items.len()) as i32);
 
                         if let Some(ref lek) = last_evaluated_key {
@@ -3953,11 +3987,13 @@ impl Database for DynamoDatabase {
                 .client
                 .scan()
                 .table_name(self.rankings_table())
-                .filter_expression("begins_with(pk, :prefix)")
+                .filter_expression("begins_with(pk, :prefix) AND #season = :season")
+                .expression_attribute_names("#season", "season")
                 .expression_attribute_values(
                     ":prefix",
-                    Self::av_s(format!("RANKING#{}", queue_mode_str)),
+                    Self::av_s(format!("RANKING#{}#", queue_mode_str)),
                 )
+                .expression_attribute_values(":season", Self::av_n(season))
                 .limit(limit as i32)
                 .send()
                 .await
@@ -3969,27 +4005,7 @@ impl Database for DynamoDatabase {
         // Parse results into RankingEntry
         let mut entries: Vec<RankingEntry> = items
             .into_iter()
-            .filter_map(|item| {
-                Some(RankingEntry {
-                    user_id: Self::extract_number(&item, "userId")?,
-                    username: Self::extract_string(&item, "username")?,
-                    mmr: Self::extract_number(&item, "mmr")?,
-                    games_played: Self::extract_number(&item, "gamesPlayed")?,
-                    wins: Self::extract_number(&item, "wins")?,
-                    losses: Self::extract_number(&item, "losses")?,
-                    region: Self::extract_string(&item, "region")?,
-                    queue_mode: Self::extract_string(&item, "queueMode")?,
-                    game_type: Self::extract_string(&item, "gameType")
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    season: Self::extract_number(&item, "season")
-                        .map(|s| s as Season)
-                        .unwrap_or(season),
-                    updated_at: Self::extract_string(&item, "updatedAt")
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(Utc::now),
-                })
-            })
+            .filter_map(|item| Self::leaderboard_entry_from_item(&item, season))
             .collect();
 
         // Sort by MMR descending (in case we scanned multiple regions)
@@ -5003,6 +5019,25 @@ mod tests {
             DynamoDatabase::av_s("2026-08-14T12:00:00Z"),
         );
         item
+    }
+
+    #[test]
+    fn leaderboard_rows_require_an_exact_numeric_season() {
+        let mut season_one = ranking_item(1, 1_500);
+        season_one.insert("season".to_string(), DynamoDatabase::av_n(1));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&season_one, 1).is_some());
+
+        let mut season_ten = ranking_item(10, 1_900);
+        season_ten.insert("season".to_string(), DynamoDatabase::av_n(10));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&season_ten, 1).is_none());
+
+        let mut legacy = ranking_item(2, 1_400);
+        legacy.remove("season");
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&legacy, 1).is_none());
+
+        let mut invalid = ranking_item(3, 1_300);
+        invalid.insert("season".to_string(), DynamoDatabase::av_n(-1));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&invalid, 1).is_none());
     }
 
     fn high_score_item(

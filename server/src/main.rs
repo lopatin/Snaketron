@@ -37,13 +37,6 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_ansi(use_ansi))
         .init();
 
-    let current_season = server::season::initialize_current_season()
-        .context("Failed to resolve the current season")?;
-    info!(
-        season = current_season,
-        "Current season configuration initialized"
-    );
-
     let metrics =
         server::telemetry::init_metrics().context("Failed to initialize OpenTelemetry metrics")?;
     if !metrics.is_enabled() {

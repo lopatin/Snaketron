@@ -21,8 +21,6 @@ services:
       SNAKETRON_DB_NAME: ${PROD_DB_NAME}
       # Production region
       SNAKETRON_REGION: ${AWS_REGION}
-      # Require an explicit season in production; never inherit the local default.
-      SNAKETRON_CURRENT_SEASON: "${SNAKETRON_CURRENT_SEASON:?SNAKETRON_CURRENT_SEASON must be set for production}"
       # Production logging
       RUST_LOG: info
       # Disable test mode in production
