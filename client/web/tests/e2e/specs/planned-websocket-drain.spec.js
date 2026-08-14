@@ -1498,6 +1498,82 @@ test('Boost HUD touch control starts and stops the local snake Boost', async ({ 
   ]);
 });
 
+test('mobile Hold recovers after a swallowed release and releases outside the button', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.addInitScript(() => {
+    sessionStorage.setItem('snaketron:forced-input-surface', 'touch');
+  });
+  const socketIndex = await establishActiveGame(page);
+  await emitServerMessage(page, socketIndex, boostSnapshot(11, 6));
+
+  const logicalBoostCommands = async () => {
+    const deliveries = await socketMessages(page, socketIndex, 'GameCommandV2');
+    return [...new Map(deliveries.map((message) => {
+      const envelope = message.GameCommandV2;
+      return [envelope.command_id.sequence, envelope.command.command];
+    })).values()];
+  };
+  const boostButton = page.getByTestId('touch-boost-button');
+  await expect(boostButton).toBeVisible();
+  await expect(boostButton).toBeEnabled();
+
+  await boostButton.dispatchEvent('pointerdown', {
+    pointerId: 11,
+    pointerType: 'touch',
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    bubbles: true,
+    cancelable: true,
+  });
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+  ]);
+
+  // Mobile can background the page without delivering this button's pointerup.
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+  ]);
+
+  // The stale pointer id from the interrupted gesture must not poison Hold.
+  await boostButton.dispatchEvent('pointerdown', {
+    pointerId: 12,
+    pointerType: 'touch',
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    bubbles: true,
+    cancelable: true,
+  });
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+    { ActivateBoost: { snake_id: 0 } },
+  ]);
+
+  // Capture may be unavailable in an embed; a window-level release is the
+  // fallback when the finger ends outside the physical button.
+  await page.evaluate(() => {
+    window.dispatchEvent(new PointerEvent('pointerup', {
+      pointerId: 12,
+      pointerType: 'touch',
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+  ]);
+});
+
 test('the focused Hold Boost control starts and stops on one Space hold', async ({ page }) => {
   const socketIndex = await establishActiveGame(page);
   await emitServerMessage(page, socketIndex, boostSnapshot(11, 6));
