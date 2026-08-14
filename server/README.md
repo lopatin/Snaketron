@@ -66,9 +66,15 @@ Season schedule:
 - Completed games derive their immutable season from the authoritative completion timestamp, so a delayed retry after a boundary cannot move a result into another season.
 - Skill rating carries across season boundaries; seasonal ranking wins/losses and Solo high-score partitions restart in the new season.
 
+Administration:
+
+- `SNAKETRON_ADMIN_USER_IDS`: Comma-separated durable numeric user IDs allowed to use `/api/admin/*`. Authorization is recalculated from the current database user on every authenticated request; guests and stress-test users are never administrators.
+- Runtime announcement, post-match ad, and history-retention settings are stored in DynamoDB and managed through `/api/admin/config`. The safe defaults are ads disabled with a 10-minute minimum interval, snapshots retained for 30 days, and compact summaries retained for 365 days.
+- Match-history projections are created by the immutable completion pipeline. Existing completed-game rows are not retroactively projected, so a deployment begins recording browseable history with the first completion processed after rollout; backfill requires an explicit migration from retained snapshots.
+
 Completed game retention:
 
-- `SNAKETRON_COMPLETED_GAME_RETENTION_DAYS`: Number of days to retain final game snapshots in DynamoDB (default: `30`)
+- `SNAKETRON_COMPLETED_GAME_RETENTION_DAYS`: Compatibility setting for the legacy direct completed-game upsert path (default: `30`). Immutable completion processing uses the runtime history configuration instead.
 - Completed snapshots use the `ttl` attribute on the main DynamoDB table. At startup, the server waits boundedly for that table to become `ACTIVE`, verifies TTL with `dynamodb:DescribeTimeToLive`, and enables it with `dynamodb:UpdateTimeToLive` when necessary.
 - The server fails startup if it cannot verify that TTL is `ENABLING` or `ENABLED` on exactly the `ttl` attribute. The runtime IAM role therefore always needs `dynamodb:DescribeTimeToLive`; it also needs `dynamodb:UpdateTimeToLive` unless deployment automation guarantees TTL is already configured.
 - Prefer configuring the same TTL setting in deployment infrastructure. The startup check remains fail-fast so expired snapshots do not silently accumulate when infrastructure or IAM drifts.

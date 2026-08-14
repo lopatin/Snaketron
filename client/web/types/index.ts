@@ -41,6 +41,18 @@ export type {
   UserRankingResponse,
   RegionMetadata,
   HealthResponse,
+  MatchHistoryPage,
+  MatchHistoryPlayer,
+  MatchHistorySummary,
+  PublicRuntimeConfig,
+  RuntimeAdsConfig,
+  RuntimeAnnouncementConfig,
+  RuntimeConfig,
+  RuntimeConfigActor,
+  RuntimeConfigAuditPage,
+  RuntimeConfigRecord,
+  RuntimeHistoryConfig,
+  UpdateRuntimeConfigRequest,
 } from './generated';
 
 // Typed WebSocket protocol surface derived from the generated WSMessage union.
@@ -65,6 +77,7 @@ export interface User {
   mmr?: number;
   token?: string;
   isGuest?: boolean;
+  isAdmin?: boolean;
   authSource?: 'crazygames' | string;
   avatarUrl?: string | null;
 }

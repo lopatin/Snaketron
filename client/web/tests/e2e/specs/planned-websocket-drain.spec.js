@@ -624,6 +624,12 @@ test.beforeEach(async ({ page }) => {
         return nativeFetch(input, init);
       } else if (url.endsWith('/api/auth/me')) {
         payload = { id: 7, username: 'drain-tester', mmr: 1000, isGuest: false };
+      } else if (url.endsWith('/api/config')) {
+        payload = {
+          version: 1,
+          announcement: { enabled: false, message: '' },
+          ads: { postMatchEnabled: false, minimumIntervalMinutes: 10 },
+        };
       } else if (url.endsWith('/api/regions')) {
         payload = [{
           id: 'test-region',

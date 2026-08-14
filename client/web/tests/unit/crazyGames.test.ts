@@ -324,6 +324,12 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     // security-critical token call, so SDK User-module calls never overlap.
     assert.equal(service.getSnapshot().portalUser, null);
     assert.equal(service.getSnapshot().inviteSequence, 1);
+    assert.equal(service.getSnapshot().adsEnabled, false);
+    service.configureRuntimeAds({
+      postMatchEnabled: true,
+      minimumIntervalMinutes: 10,
+    });
+    assert.equal(service.getSnapshot().adsEnabled, true);
 
     settingsListener({ disableChat: true, muteAudio: true });
     assert.deepEqual(service.getSnapshot().settings, { disableChat: true, muteAudio: true });
@@ -342,6 +348,8 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     service.loadingStop();
     service.gameplayStart();
     assert.deepEqual(await service.requestAd('midgame'), { status: 'finished' });
+    assert.deepEqual(await service.requestAd('midgame'), { status: 'disabled' });
+    assert.equal(calls.filter((call) => call === 'adRequested').length, 1);
     assert.deepEqual(
       calls.filter((call) => ['loadingStart', 'loadingStop', 'gameplayStart', 'gameplayStop', 'adRequested'].includes(call)),
       ['loadingStart', 'loadingStop', 'gameplayStart', 'adRequested', 'gameplayStop'],
@@ -353,6 +361,10 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     assert.equal(await service.getUserToken(), 'signed.jwt');
     assert.equal(service.getSnapshot().accountStatus, 'authenticated');
     assert.equal(await service.requestBanner({ id: 'banner', width: 728, height: 90 }), true);
+
+    service.configureRuntimeAds({ postMatchEnabled: false, minimumIntervalMinutes: 10 });
+    assert.equal(service.getSnapshot().adsEnabled, false);
+    assert.deepEqual(await service.requestAd('midgame'), { status: 'disabled' });
 
     authListener(null);
     assert.equal(service.getSnapshot().portalUser, null);

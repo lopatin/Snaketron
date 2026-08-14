@@ -77,6 +77,19 @@ test('an early Start Game click waits for the authenticated regional socket', as
     const { pathname } = new URL(route.request().url());
     const corsHeaders = { 'access-control-allow-origin': '*' };
 
+    if (pathname === '/api/config') {
+      await route.fulfill({
+        contentType: 'application/json',
+        headers: corsHeaders,
+        body: JSON.stringify({
+          version: 1,
+          announcement: { enabled: false, message: '' },
+          ads: { postMatchEnabled: false, minimumIntervalMinutes: 10 },
+        }),
+      });
+      return;
+    }
+
     if (pathname === '/api/regions') {
       await regionGate;
       await route.fulfill({

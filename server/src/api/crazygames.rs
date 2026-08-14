@@ -391,6 +391,7 @@ pub struct CrazyGamesUserInfo {
     pub casual_mmr: i32,
     pub xp: i32,
     pub is_guest: bool,
+    pub is_admin: bool,
     pub auth_source: &'static str,
     pub avatar_url: String,
 }
@@ -590,6 +591,7 @@ pub async fn exchange(
             casual_mmr: account.user.casual_mmr,
             xp: account.user.xp,
             is_guest: false,
+            is_admin: super::middleware::is_admin_user(&account.user),
             auth_source: "crazygames",
             avatar_url: account.profile.avatar_url,
         },
@@ -917,6 +919,7 @@ rAxdQqJU63eb3D0Nhs/4EJ72x6BgNXb/sQ1O/0Xv67v8BcQk7aodmvj+LfvTsERu
                 casual_mmr: 990,
                 xp: 12,
                 is_guest: false,
+                is_admin: false,
                 auth_source: "crazygames",
                 avatar_url: "https://images.crazygames.com/avatar.png".to_string(),
             },
@@ -926,6 +929,7 @@ rAxdQqJU63eb3D0Nhs/4EJ72x6BgNXb/sQ1O/0Xv67v8BcQk7aodmvj+LfvTsERu
         assert_eq!(value["expiresAt"], 42);
         assert_eq!(value["resolution"], "guestClaimed");
         assert_eq!(value["user"]["isGuest"], false);
+        assert_eq!(value["user"]["isAdmin"], false);
         assert_eq!(value["user"]["authSource"], "crazygames");
         assert_eq!(
             value["user"]["avatarUrl"],

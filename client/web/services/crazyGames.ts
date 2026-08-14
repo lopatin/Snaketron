@@ -173,6 +173,11 @@ export interface CrazyGamesAdResult {
   error?: CrazyGamesAdError;
 }
 
+export interface CrazyGamesRuntimeAdConfig {
+  postMatchEnabled: boolean;
+  minimumIntervalMinutes: number;
+}
+
 const IS_CRAZY_GAMES_BUILD = process.env.CRAZYGAMES_BUILD === 'true';
 const ARE_CRAZY_GAMES_ADS_ENABLED = process.env.CRAZYGAMES_ADS_ENABLED === 'true';
 const IS_CRAZY_GAMES_DATA_ENABLED = process.env.CRAZYGAMES_DATA_ENABLED === 'true';
@@ -250,6 +255,8 @@ class CrazyGamesService {
   private profileLookupScheduled = false;
   private accountLinkPromptActive = false;
   private userTokenFlight: Promise<string> | null = null;
+  private minimumAdIntervalMs = 0;
+  private lastAdStartedAtMs: number | null = null;
 
   private snapshot: CrazyGamesSnapshot = {
     isCrazyGamesBuild: IS_CRAZY_GAMES_BUILD,
@@ -269,7 +276,9 @@ class CrazyGamesService {
     hasAdblock: null,
     adState: 'idle',
     lastAdError: null,
-    adsEnabled: IS_CRAZY_GAMES_BUILD && ARE_CRAZY_GAMES_ADS_ENABLED,
+    // Runtime configuration must explicitly opt in as a second, server-owned
+    // kill switch. A missing or failed config request therefore fails closed.
+    adsEnabled: false,
     dataEnabled: IS_CRAZY_GAMES_BUILD && IS_CRAZY_GAMES_DATA_ENABLED,
     iapEnabled: false,
     leaderboardsEnabled: false,
@@ -294,6 +303,18 @@ class CrazyGamesService {
     this.listeners.add(listener);
     listener(this.snapshot);
     return () => this.listeners.delete(listener);
+  };
+
+  configureRuntimeAds = (config: CrazyGamesRuntimeAdConfig): void => {
+    const intervalMinutes = Number.isFinite(config.minimumIntervalMinutes)
+      ? Math.min(1_440, Math.max(1, Math.trunc(config.minimumIntervalMinutes)))
+      : 10;
+    this.minimumAdIntervalMs = intervalMinutes * 60_000;
+    this.updateSnapshot({
+      adsEnabled: IS_CRAZY_GAMES_BUILD
+        && ARE_CRAZY_GAMES_ADS_ENABLED
+        && config.postMatchEnabled === true,
+    });
   };
 
   private updateSnapshot(update: Partial<CrazyGamesSnapshot>): void {
@@ -728,6 +749,12 @@ class CrazyGamesService {
     if (!this.snapshot.adsEnabled || !this.canUseSdk(sdk)) {
       return Promise.resolve({ status: 'disabled' });
     }
+    if (
+      this.lastAdStartedAtMs !== null
+      && Date.now() - this.lastAdStartedAtMs < this.minimumAdIntervalMs
+    ) {
+      return Promise.resolve({ status: 'disabled' });
+    }
     if (this.snapshot.adState !== 'idle') {
       return Promise.resolve({
         status: 'error',
@@ -768,6 +795,7 @@ class CrazyGamesService {
                 clearTimeout(requestTimeout);
                 requestTimeout = null;
               }
+              this.lastAdStartedAtMs = Date.now();
               this.gameplayStop();
               this.updateSnapshot({ adState: 'playing' });
             }
