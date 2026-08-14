@@ -614,6 +614,17 @@ test.beforeEach(async ({ page }) => {
         payload = { 'test-region': 1 };
       } else if (url === 'http://snaketron.test/api/health') {
         payload = { status: 'ok' };
+      } else if (url.includes('/api/leaderboard/me?') && window.__ratingFixture) {
+        const fixture = window.__ratingFixture;
+        fixture.requests.push(url);
+        if (fixture.requests.length === 1) {
+          payload = fixture.before;
+        } else {
+          while (!fixture.release) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          payload = fixture.after;
+        }
       } else {
         throw new Error(`Unexpected fetch in planned-drain test: ${url} (${init?.method || 'GET'})`);
       }
@@ -2034,6 +2045,54 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
   }
 });
 
+test('competitive results settle on the persisted regional ranking and remain visible', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__ratingFixture = {
+      before: { rank: 18, mmr: 1000, wins: 4, losses: 2, winRate: 66.7 },
+      after: { rank: 14, mmr: 1025, wins: 5, losses: 2, winRate: 71.4 },
+      requests: [],
+      release: false,
+    };
+  });
+
+  const liveFrame = completedBoostSnapshot(10, 1200);
+  const liveState = liveFrame.GameEvent.event.Snapshot.game_state;
+  liveState.status = { Started: { server_id: 1 } };
+  liveState.queue_mode = 'Competitive';
+  liveState.properties.score_limit = 50;
+  const socketIndex = await establishActiveGame(page, liveFrame);
+
+  await expect.poll(() => page.evaluate(() => window.__ratingFixture.requests.length)).toBe(1);
+  const [baselineUrl] = await page.evaluate(() => window.__ratingFixture.requests);
+  const baselineParams = new URL(baselineUrl).searchParams;
+  expect(Object.fromEntries(baselineParams)).toEqual({
+    queue_mode: 'competitive',
+    game_type: 'duel',
+    region: 'test-region',
+  });
+
+  const finalFrame = completedBoostSnapshot(11, 1201);
+  const finalState = finalFrame.GameEvent.event.Snapshot.game_state;
+  finalState.start_ms = liveState.start_ms;
+  finalState.queue_mode = 'Competitive';
+  finalState.properties.score_limit = 50;
+  await emitServerMessage(page, socketIndex, finalFrame);
+
+  const scoreCard = page.getByTestId('game-over-card');
+  const rating = scoreCard.getByTestId('rating-reveal');
+  await expect(scoreCard).toBeVisible();
+  await expect(rating).toHaveAttribute('data-phase', 'pending');
+  await expect.poll(() => page.evaluate(() => window.__ratingFixture.requests.length)).toBe(2);
+
+  await page.evaluate(() => {
+    window.__ratingFixture.release = true;
+  });
+  await expect(rating).toHaveAttribute('data-phase', 'settled');
+  await expect(rating.getByTestId('rating-reveal-value')).toHaveText('1025');
+  await expect(rating.getByTestId('rating-reveal-delta')).toHaveText('+25');
+  await expect(rating).toBeVisible();
+});
+
 test('Snaketron game shell restores the original scoreboard language and free-floating roster', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 1200 });
   const liveFrame = completedBoostSnapshot(10, 1200);
@@ -2366,6 +2425,12 @@ test('Snaketron game shell restores the original scoreboard language and free-fl
   await emitServerMessage(page, socketIndex, finalFrame);
   const scoreCard = page.getByTestId('game-over-card');
   await expect(scoreCard).toBeVisible();
+  // Let completion effects flush: a Quickmatch result must never mount the
+  // competitive rating placeholder while its score card is open.
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  expect(await scoreCard.getByTestId('rating-reveal').count()).toBe(0);
   await expect(page.getByTestId('game-roster-band').getByRole('button')).toHaveCount(2);
   await expect(page.getByTestId('game-roster-band')
     .getByRole('button', { name: 'Score card' })).toHaveAttribute('aria-expanded', 'true');
