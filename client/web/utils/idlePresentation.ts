@@ -159,7 +159,7 @@ export const buildPlayerIdlePresentation = (
       remainingMs,
       remainingSeconds,
       progress,
-      isUrgent: remainingMs <= Math.min(5_000, warningMs / 2),
+      isUrgent: remainingMs <= warningMs / 2,
     },
   };
 };
