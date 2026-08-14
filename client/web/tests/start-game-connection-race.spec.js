@@ -50,7 +50,7 @@ test('an early Start Game click waits for the authenticated regional socket', as
           socket.send(JSON.stringify({
             Authenticated: {
               task_boot_id: 'start-race-test',
-              protocol_version: 7,
+              protocol_version: 8,
               capabilities: REQUIRED_CAPABILITIES,
               socket_generation: 1,
             },
@@ -151,7 +151,7 @@ test('an early Start Game click waits for the authenticated regional socket', as
       {
         Authenticate: {
           token: 'guest-race-token',
-          protocol_version: 7,
+          protocol_version: 8,
         },
       },
       'CreateLobby',

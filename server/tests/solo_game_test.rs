@@ -289,6 +289,7 @@ async fn test_solo_game() -> Result<()> {
                     GameEvent::FoodEaten {
                         snake_id: eating_snake_id,
                         position,
+                        ..
                     } => {
                         if *eating_snake_id == snake_id {
                             println!(

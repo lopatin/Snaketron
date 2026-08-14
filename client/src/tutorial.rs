@@ -133,6 +133,11 @@ fn add_crash_cue(state: &mut GameState, snake_id: u32, crash_position: Position)
     });
 }
 
+fn pose_combo(snake: &mut Snake, chain_count: u32, remaining_ms: u32) {
+    snake.combo.chain_count = chain_count;
+    snake.combo.remaining_ms = remaining_ms;
+}
+
 /// A team match laid out exactly as matchmaking builds one: 60x40, 10-cell
 /// end zones, a centered goal opening, and the canonical twelve-canister NOS
 /// field.
@@ -239,14 +244,14 @@ fn frame_team_carry(elapsed_ms: u32) -> GameState {
 
     let snake = if banked {
         if let Some(scores) = state.team_scores.as_mut() {
-            scores.insert(TeamId(0), 1);
+            scores.insert(TeamId(0), 3);
         }
         state.recent_goals.push(TeamGoal {
             tick: TEAM_CARRY_BANK_MS / BOOST_TICK_INTERVAL_MS,
             team_id: TeamId(0),
             snake_id: 0,
             position: position(8, 20),
-            points: 1,
+            points: 3,
         });
         Snake::for_illustration(
             vec![position(8, 20), position(5, 20)],
@@ -259,7 +264,9 @@ fn frame_team_carry(elapsed_ms: u32) -> GameState {
     } else {
         let head_x = lerp_cell(elapsed_ms, 250, 1_500, 18, 8);
         Snake::for_illustration(
-            straight_body(position(head_x, 20), Direction::Left, 6),
+            // Two chained pickups are worth +1 then +2: three carried growth
+            // cells, all of which are banked below.
+            straight_body(position(head_x, 20), Direction::Left, 7),
             Direction::Left,
             Some(TeamId(0)),
             0,
@@ -268,6 +275,10 @@ fn frame_team_carry(elapsed_ms: u32) -> GameState {
         )
     };
     state.arena.snakes.push(snake);
+    if !banked {
+        let combo_window_ms = state.properties.combo.window_ms;
+        pose_combo(&mut state.arena.snakes[0], 2, combo_window_ms);
+    }
     state.arena.food = vec![position(17, 15), position(20, 25), position(23, 18)];
     state
 }
@@ -352,17 +363,20 @@ fn frame_team_danger(elapsed_ms: u32) -> GameState {
     state
 }
 
-/// FFA food: the collision tick keeps the original length and queues two
-/// growth cells; the next two occupied cells extrude that growth behind the
-/// head exactly as `Snake::step_forward` does.
+/// FFA food: the first (ordinary +1) pickup keeps the collision-tick length and
+/// queues one growth cell; the next occupied cell extrudes it behind the head
+/// exactly as `Snake::step_forward` does.
 fn frame_ffa_food(elapsed_ms: u32) -> GameState {
     const EAT_MS: u32 = 1_450;
-    const GROWN_MS: u32 = 1_900;
+    const GROWN_MS: u32 = 1_700;
     let eaten = elapsed_ms >= EAT_MS;
-    let (body, pending_growth) = if eaten {
-        let head_x = lerp_cell(elapsed_ms, EAT_MS, GROWN_MS, 22, 24);
+    let (body, pending_growth) = if elapsed_ms > GROWN_MS {
+        let head_x = lerp_cell(elapsed_ms, GROWN_MS, 2_100, 23, 27);
+        (straight_body(position(head_x, 20), Direction::Right, 6), 0)
+    } else if eaten {
+        let head_x = lerp_cell(elapsed_ms, EAT_MS, GROWN_MS, 22, 23);
         let grown = u32::try_from(head_x - 22).unwrap_or(0);
-        (vec![position(head_x, 20), position(18, 20)], 2 - grown)
+        (vec![position(head_x, 20), position(18, 20)], 1 - grown)
     } else {
         let head_x = lerp_cell(elapsed_ms, 250, 1_400, 12, 21);
         (straight_body(position(head_x, 20), Direction::Right, 5), 0)
@@ -376,6 +390,22 @@ fn frame_ffa_food(elapsed_ms: u32) -> GameState {
         true,
         false,
     ));
+    state.usernames.insert(1, "YOU".to_owned());
+    state.players.insert(
+        1,
+        Player {
+            user_id: 1,
+            snake_id: 0,
+        },
+    );
+    if eaten {
+        let remaining_ms = state
+            .properties
+            .combo
+            .window_ms
+            .saturating_sub(elapsed_ms - EAT_MS);
+        pose_combo(&mut state.arena.snakes[0], 1, remaining_ms);
+    }
 
     state.arena.food = vec![position(14, 14), position(27, 25)];
     if !eaten {
@@ -384,12 +414,12 @@ fn frame_ffa_food(elapsed_ms: u32) -> GameState {
     state
 }
 
-/// Solo food includes a real turn. It rounds the corner at (20,23), eats at
-/// (20,18), then spends the next two moves extruding precisely two cells.
+/// Solo food includes a real turn. It rounds the corner at (20,23), eats its
+/// first ordinary +1 at (20,18), then extrudes precisely one cell.
 fn frame_solo_food(elapsed_ms: u32) -> GameState {
     const TURN_MS: u32 = 800;
     const EAT_MS: u32 = 1_450;
-    const GROWN_MS: u32 = 1_750;
+    const GROWN_MS: u32 = 1_600;
 
     let (body, direction, pending_growth) = if elapsed_ms < TURN_MS {
         let head_x = lerp_cell(elapsed_ms, 150, 750, 14, 20);
@@ -409,23 +439,31 @@ fn frame_solo_food(elapsed_ms: u32) -> GameState {
         body.dedup();
         (body, Direction::Up, 0)
     } else if elapsed_ms <= GROWN_MS {
-        let head_y = lerp_cell(elapsed_ms, EAT_MS, GROWN_MS, 18, 16);
+        let head_y = lerp_cell(elapsed_ms, EAT_MS, GROWN_MS, 18, 17);
         let grown = u32::try_from(18 - head_y).unwrap_or(0);
         (
             vec![position(20, head_y), position(20, 22)],
             Direction::Up,
-            2 - grown,
+            1 - grown,
         )
     } else {
-        let head_y = lerp_cell(elapsed_ms, GROWN_MS, 2_100, 16, 14);
+        let head_y = lerp_cell(elapsed_ms, GROWN_MS, 2_100, 17, 14);
         (
-            straight_body(position(20, head_y), Direction::Up, 7),
+            straight_body(position(20, head_y), Direction::Up, 6),
             Direction::Up,
             0,
         )
     };
 
     let mut state = solo_scene_with_snake(elapsed_ms, body, direction, pending_growth, false);
+    if elapsed_ms >= EAT_MS {
+        let remaining_ms = state
+            .properties
+            .combo
+            .window_ms
+            .saturating_sub(elapsed_ms - EAT_MS);
+        pose_combo(&mut state.arena.snakes[0], 1, remaining_ms);
+    }
     state.arena.food = vec![position(14, 14), position(27, 25)];
     if elapsed_ms < EAT_MS {
         state.arena.food.push(position(20, 18));
@@ -686,7 +724,7 @@ fn score_effect_for(scene_id: &str) -> Option<TutorialScoreEffect> {
         start_ms: TEAM_CARRY_BANK_MS,
         team_id: 0,
         snake_id: 0,
-        points: 1,
+        points: 3,
         origin: position(8, 20),
         arena_width: TEAM_ARENA_WIDTH,
         arena_height: TEAM_ARENA_HEIGHT,
@@ -1000,11 +1038,15 @@ mod tests {
                 .as_ref()
                 .and_then(|scores| scores.get(&TeamId(0)))
                 .copied(),
-            Some(1)
+            Some(3)
         );
         assert_eq!(carry_poster.recent_goals.len(), 1);
         assert_eq!(carry_poster.recent_goals[0].position, position(8, 20));
-        assert_eq!(carry_poster.recent_goals[0].points, 1);
+        assert_eq!(carry_poster.recent_goals[0].points, 3);
+        assert_eq!(carry_early.arena.snakes[0].combo.chain_count, 2);
+        assert!(carry_early.arena.snakes[0].combo.remaining_ms > 0);
+        assert_eq!(carry_poster.arena.snakes[0].combo.chain_count, 0);
+        assert_eq!(carry_poster.arena.snakes[0].combo.remaining_ms, 0);
 
         for scene_id in ["team-boost", "ffa-boost"] {
             let early = scene(scene_id, 0).state;
@@ -1038,7 +1080,21 @@ mod tests {
             assert!(early.arena.food.contains(&eaten_food));
             assert!(!poster.arena.food.contains(&eaten_food));
             assert!(snake_length(&poster.arena.snakes[0]) > snake_length(&early.arena.snakes[0]));
+            assert_eq!(early.arena.snakes[0].combo.remaining_ms, 0);
+            assert_eq!(poster.arena.snakes[0].combo.chain_count, 1);
+            assert!(poster.arena.snakes[0].combo.remaining_ms > 0);
         }
+
+        // The renderer resolves food labels through the local player's snake,
+        // so the FFA lesson must carry the same player mapping as a live game.
+        assert_eq!(
+            scene("ffa-food", SCENE_POSTER_MS)
+                .state
+                .players
+                .get(&1)
+                .map(|player| player.snake_id),
+            Some(0)
+        );
 
         let solo_food_early = scene("solo-food", 0).state;
         let solo_food_after_turn = scene("solo-food", 1_000).state;
@@ -1117,7 +1173,7 @@ mod tests {
                 .and_then(|scores| scores.get(&TeamId(0)))
                 .copied()
                 .expect("team score");
-            let expected_length = if score == 0 { 6 } else { 4 };
+            let expected_length = if score == 0 { 7 } else { 4 };
             assert_eq!(
                 snake_length(&state.arena.snakes[0]),
                 expected_length,
@@ -1144,14 +1200,14 @@ mod tests {
                 } else {
                     assert_eq!(
                         length + snake.food,
-                        initial_length + 2,
-                        "{scene_id} must account for exactly two growth cells at {elapsed_ms}ms"
+                        initial_length + 1,
+                        "{scene_id} must account for exactly one growth cell at {elapsed_ms}ms"
                     );
                     assert!(length >= previous_length);
                 }
                 previous_length = length;
             }
-            assert_eq!(previous_length, initial_length + 2);
+            assert_eq!(previous_length, initial_length + 1);
         }
     }
 

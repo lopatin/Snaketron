@@ -4,13 +4,16 @@ export const DEFAULT_TICK_INTERVAL_MS = 100;
 // comes from GameProperties.tick_duration_ms, never from this poll cadence.
 export const EXECUTOR_POLL_INTERVAL_MS = 10;
 export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
-// Gameplay protocol version, reported to the server for observability only.
-// It is advisory on both ends: the server admits every version, and a client
-// is never blocked or asked to reload over a mismatch. A shipped build cannot
-// update itself — an itch.io bundle has no reload-to-upgrade path — so every
-// gameplay protocol change must stay backwards compatible instead.
+// Gameplay protocol version. Predictive simulation requires an exact match:
+// protocol 8 changes scoring and physical growth, so continuing with a stale
+// engine would produce permanent body-geometry divergence.
 // Tracks WS_PROTOCOL_VERSION in server/src/lifecycle.rs.
-export const GAMEPLAY_PROTOCOL_VERSION = 7;
+export const GAMEPLAY_PROTOCOL_VERSION = 8;
+export const isGameplayProtocolCompatible = (serverVersion: unknown): boolean =>
+  Number(serverVersion) === GAMEPLAY_PROTOCOL_VERSION;
+export const GAMEPLAY_UPDATE_REQUIRED_PREFIX = 'Gameplay update required';
+export const isGameplayUpdateRequiredReason = (reason: unknown): boolean =>
+  typeof reason === 'string' && reason.startsWith(GAMEPLAY_UPDATE_REQUIRED_PREFIX);
 export const buildGameplayAuthentication = (token: string) => ({
   Authenticate: {
     token,

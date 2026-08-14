@@ -518,6 +518,38 @@ async fn enqueue_delivery_until_handoff(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingComboMetric {
+    snake_id: u32,
+    points: u32,
+    combo_chain: u32,
+    combo_remaining_ms_before: u32,
+    boost_active: bool,
+}
+
+impl PendingComboMetric {
+    fn from_event(event: &GameEvent) -> Option<Self> {
+        let GameEvent::FoodEaten {
+            snake_id,
+            points,
+            combo_chain,
+            combo_remaining_ms_before,
+            boost_active,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        Some(Self {
+            snake_id: *snake_id,
+            points: *points,
+            combo_chain: *combo_chain,
+            combo_remaining_ms_before: *combo_remaining_ms_before,
+            boost_active: *boost_active,
+        })
+    }
+}
+
 struct GameActor {
     server_id: u64,
     game_id: u32,
@@ -537,6 +569,10 @@ struct GameActor {
     completion_committed: bool,
     pending_completion: Option<CompletionRecordV1>,
     completion_materialization_retry_at: Option<Instant>,
+    /// Food events generated in a catch-up or terminal batch are represented
+    /// durably by the recovery/terminal snapshot instead of individual event
+    /// publications. Retain their metric context until that boundary commits.
+    pending_combo_metrics: Vec<PendingComboMetric>,
     idle_mapping_cleanup_complete: HashSet<u32>,
     idle_mapping_cleanup_retry_at: Option<Instant>,
     last_checkpoint_success: Instant,
@@ -615,6 +651,29 @@ async fn supervise_actor_run(
 }
 
 impl GameActor {
+    fn retain_combo_metrics_from_events(&mut self, events: &[(u32, u64, GameEvent)]) {
+        self.pending_combo_metrics.extend(
+            events
+                .iter()
+                .filter_map(|(_, _, event)| PendingComboMetric::from_event(event)),
+        );
+    }
+
+    fn flush_pending_combo_metrics(&mut self) {
+        let pending = std::mem::take(&mut self.pending_combo_metrics);
+        let state = self.engine.get_committed_state();
+        for metric in pending {
+            crate::resilience_metrics::record_combo_food_collected(
+                state,
+                metric.snake_id,
+                metric.points,
+                metric.combo_chain,
+                metric.combo_remaining_ms_before,
+                metric.boost_active,
+            );
+        }
+    }
+
     // Recovery construction intentionally receives the complete fenced actor context.
     #[allow(clippy::too_many_arguments)]
     fn from_envelope(
@@ -661,6 +720,7 @@ impl GameActor {
             completion_committed: false,
             pending_completion: None,
             completion_materialization_retry_at: None,
+            pending_combo_metrics: Vec::new(),
             idle_mapping_cleanup_complete: HashSet::new(),
             idle_mapping_cleanup_retry_at: None,
             last_checkpoint_success,
@@ -1039,7 +1099,8 @@ impl GameActor {
             let (submitted_at_ms, _) = validate_stream_id(stream_id)?;
             let submitted_at_ms = i64::try_from(submitted_at_ms)
                 .context("command stream timestamp exceeds signed milliseconds")?;
-            let _ = self.engine.run_until(submitted_at_ms)?;
+            let catch_up_events = self.engine.run_until(submitted_at_ms)?;
+            self.retain_combo_metrics_from_events(&catch_up_events);
             if self.engine.get_committed_state().is_complete() {
                 // Catch-up can discover terminal state only after the outer
                 // delivery check. Give this accepted stream entry a durable
@@ -1248,6 +1309,26 @@ impl GameActor {
             event,
         };
         self.bus.publish_event_fenced(&self.guard, &message).await?;
+        if let GameEvent::FoodEaten {
+            snake_id,
+            points,
+            combo_chain,
+            combo_remaining_ms_before,
+            boost_active,
+            ..
+        } = &message.event
+        {
+            // Publication is the durability boundary: retries or fenced
+            // failures above must never inflate gameplay telemetry.
+            crate::resilience_metrics::record_combo_food_collected(
+                self.engine.get_committed_state(),
+                *snake_id,
+                *points,
+                *combo_chain,
+                *combo_remaining_ms_before,
+                *boost_active,
+            );
+        }
         if let GameEvent::BoostPacketCollected {
             pad_id, snake_id, ..
         } = &message.event
@@ -1451,7 +1532,8 @@ impl GameActor {
         // intentionally not emitted as deltas; one fresh snapshot reanchors all
         // consumers after the recovery checkpoint is durable.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let _ = self.engine.run_until(now_ms)?;
+        let catch_up_events = self.engine.run_until(now_ms)?;
+        self.retain_combo_metrics_from_events(&catch_up_events);
         // Durable decisions have now replayed in stream order. Merge the
         // incumbent's planned-handoff publication watermark only after that
         // replay, so decisions at or below the marker still restore state and
@@ -1470,6 +1552,10 @@ impl GameActor {
             return Ok(());
         }
         self.checkpoint().await?;
+        // Catch-up deltas are intentionally collapsed into the checkpoint and
+        // fresh snapshot rather than republished individually. The successful
+        // fenced checkpoint is their first durable observability boundary.
+        self.flush_pending_combo_metrics();
         if self.start_event_pending {
             self.publish_event(GameEvent::StatusUpdated {
                 status: GameStatus::Started {
@@ -1645,6 +1731,7 @@ impl GameActor {
             // derive Complete even if the explicit status event is withheld.
             // Drop the whole transition batch and let the fenced completion
             // transaction publish one full terminal snapshot instead.
+            self.retain_combo_metrics_from_events(&events);
             self.commit_completion_until_handoff().await?;
             return Ok(());
         }
@@ -1727,6 +1814,10 @@ impl GameActor {
         // same record after a crash. A regional database outage must not hold
         // gameplay authority or terminate unrelated actors.
         self.completion_committed = true;
+        // Terminal-tick FoodEaten deltas are intentionally represented by the
+        // fenced completion snapshot. Flush only after that snapshot commits,
+        // retaining the contexts across materialization retries above.
+        self.flush_pending_combo_metrics();
         Ok(())
     }
 
@@ -3168,6 +3259,32 @@ mod tests {
         );
         assert_eq!(
             boost_activation_snake_id(&GameCommand::DeactivateBoost { snake_id: 7 }),
+            None
+        );
+    }
+
+    #[test]
+    fn discarded_batches_retain_exact_combo_metric_context() {
+        let event = GameEvent::FoodEaten {
+            snake_id: 4,
+            position: Position { x: 8, y: 9 },
+            points: 3,
+            combo_chain: 7,
+            combo_remaining_ms_before: 425,
+            boost_active: true,
+        };
+        assert_eq!(
+            PendingComboMetric::from_event(&event),
+            Some(PendingComboMetric {
+                snake_id: 4,
+                points: 3,
+                combo_chain: 7,
+                combo_remaining_ms_before: 425,
+                boost_active: true,
+            })
+        );
+        assert_eq!(
+            PendingComboMetric::from_event(&GameEvent::SnakeDied { snake_id: 4 }),
             None
         );
     }
@@ -5181,7 +5298,7 @@ mod tests {
             // engine events across distinct simulation quanta.
             state.arena.snakes[0].body = vec![Position { x: 10, y: 20 }, Position { x: 13, y: 20 }];
             state.arena.snakes[0].direction = Direction::Left;
-            state.arena.snakes[0].food = 2;
+            state.arena.snakes[0].food = 1;
             state.arena.snakes[2].body = vec![Position { x: 30, y: 0 }, Position { x: 30, y: 3 }];
             state.arena.snakes[2].direction = Direction::Up;
             state.arena.snakes[3].body = vec![Position { x: 40, y: 30 }, Position { x: 37, y: 30 }];

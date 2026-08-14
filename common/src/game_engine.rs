@@ -863,7 +863,7 @@ mod tests {
         snake.body = vec![Position { x: 10, y: 18 }, Position { x: 13, y: 18 }];
         snake.direction = Direction::Left;
         snake.is_alive = true;
-        snake.food = 4;
+        snake.food = 2;
 
         let tick_ms = state.properties.tick_duration_ms as i64;
         (GameEngine::new_from_state(1, state), tick_ms)

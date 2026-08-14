@@ -1,5 +1,6 @@
 :root {
   --game-boost-indicator-height: 40px;
+  --game-combo-indicator-height: 34px;
 }
 
 .game-arena-stage {
@@ -26,9 +27,148 @@
   align-items: stretch;
 }
 
-.game-arena-frame.has-boost-indicator .game-arena-panel {
+.game-arena-frame.has-boost-indicator .game-arena-panel,
+.game-arena-frame.has-combo-indicator .game-arena-panel {
+  position: relative;
+  z-index: 3;
+}
+
+/* Combo chase rail --------------------------------------------------------
+   Ten field-cell segments make the one-second rule visible at a glance. The
+   filled cells stay at the leading edge, so the snake's tail disappears as
+   the window drains. This is predicted, read-only game state: no hover or
+   pointer affordance competes with steering. */
+.game-combo-hud {
+  --combo-accent: #85b885;
+  --combo-accent-edge: #5e8a5e;
+  --combo-accent-ink: #315335;
+  --combo-surface: #f6f8f6;
+  --combo-empty: rgb(94 138 94 / 12%);
+  --combo-frame: rgb(70 88 78 / 64%);
   position: relative;
   z-index: 2;
+  width: calc(100% - 10px);
+  height: var(--game-combo-indicator-height);
+  flex: 0 0 var(--game-combo-indicator-height);
+  align-self: center;
+  margin-top: -2px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-5px);
+  transition: opacity 160ms ease, transform 200ms ease;
+}
+
+.game-combo-hud.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.game-combo-hud.is-maxed {
+  --combo-accent: #f8c84a;
+  --combo-accent-edge: #a87500;
+  --combo-accent-ink: #785200;
+  --combo-empty: rgb(168 117 0 / 12%);
+  --combo-frame: rgb(120 82 0 / 62%);
+  --combo-surface: #fffaf0;
+}
+
+.game-combo-rail {
+  display: grid;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  grid-template-columns: 58px minmax(0, 1fr) 82px;
+  align-items: center;
+  border: 1px solid var(--combo-frame);
+  border-top-color: rgb(117 137 125 / 38%);
+  border-radius: 0 0 6px 6px;
+  background: linear-gradient(180deg, #fff 0%, var(--combo-surface) 100%);
+  box-shadow:
+    0 2px 0 rgb(23 32 27 / 6%),
+    inset 0 1px 0 rgb(255 255 255 / 80%);
+  color: var(--combo-accent-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.game-combo-rail__title,
+.game-combo-rail__next {
+  display: grid;
+  height: 100%;
+  place-items: center;
+  font-style: italic;
+  font-weight: 950;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: color 120ms ease;
+}
+
+.game-combo-rail__title {
+  border-right: 1px solid rgb(49 78 58 / 15%);
+  font-size: 9px;
+  letter-spacing: 0.095em;
+}
+
+.game-combo-rail__next {
+  border-left: 1px solid rgb(49 78 58 / 15%);
+  color: var(--game-muted, #667085);
+  font-size: 8px;
+  letter-spacing: 0.035em;
+}
+
+.game-combo-hud.is-active .game-combo-rail__next {
+  color: var(--combo-accent-ink);
+  font-size: 9px;
+}
+
+.game-combo-rail__cells {
+  display: grid;
+  min-width: 0;
+  height: 100%;
+  grid-template-columns: repeat(10, minmax(2px, 1fr));
+  align-items: center;
+  gap: clamp(1px, 0.65vw, 3px);
+  padding: 0 clamp(7px, 1.5vw, 12px);
+}
+
+.game-combo-rail__cell {
+  position: relative;
+  box-sizing: border-box;
+  height: 12px;
+  border: 1px solid rgb(49 78 58 / 16%);
+  border-radius: 2px;
+  background: var(--combo-empty);
+  opacity: 0.68;
+  transform: scale(0.86);
+  transition:
+    background-color 90ms linear,
+    border-color 90ms linear,
+    opacity 90ms linear,
+    transform 90ms linear;
+}
+
+.game-combo-rail__cell.is-filled {
+  border-color: var(--combo-accent-edge);
+  background: var(--combo-accent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 38%);
+  opacity: 1;
+  transform: scale(1);
+}
+
+.game-combo-rail__cell.is-head {
+  border-radius: 999px;
+}
+
+.game-combo-hud.is-active .game-combo-rail__cell.is-head::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--combo-accent-ink);
+  content: "";
+  transform: translate(-50%, -50%);
 }
 
 .game-boost-hud {
@@ -626,6 +766,7 @@
 @media (max-width: 760px) {
   :root {
     --game-boost-indicator-height: 36px;
+    --game-combo-indicator-height: 32px;
   }
 
   .game-arena-utility-anchor {
@@ -650,15 +791,45 @@
   .game-boost-meter__value {
     font-size: 14px;
   }
+
+  .game-combo-rail {
+    grid-template-columns: 50px minmax(0, 1fr) 76px;
+  }
+
+  .game-combo-rail__title,
+  .game-combo-hud.is-active .game-combo-rail__next {
+    font-size: 8px;
+  }
+
+  .game-combo-rail__next {
+    font-size: 7px;
+  }
+
+  .game-combo-rail__cell {
+    height: 11px;
+  }
 }
 
 @media (max-width: 580px), (max-height: 520px) and (orientation: landscape) {
   :root {
     --game-boost-indicator-height: 32px;
+    --game-combo-indicator-height: 28px;
   }
 
   .game-arena-stage {
     padding-bottom: 48px;
+  }
+
+  .game-combo-rail {
+    grid-template-columns: 46px minmax(0, 1fr) 70px;
+  }
+
+  .game-combo-rail__cells {
+    padding-inline: 6px;
+  }
+
+  .game-combo-rail__cell {
+    height: 9px;
   }
 
   .game-idle-warning {
@@ -839,6 +1010,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .game-combo-hud,
+  .game-combo-rail__title,
+  .game-combo-rail__next,
+  .game-combo-rail__cell,
   .game-boost-hud,
   .game-boost-meter,
   .game-boost-meter__fill,
@@ -853,6 +1028,25 @@
 }
 
 @media (forced-colors: active) {
+  .game-combo-rail,
+  .game-combo-rail__cell {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .game-combo-rail__cell.is-filled {
+    border-color: Highlight;
+    background: Highlight;
+  }
+
+  .game-combo-hud.is-active .game-combo-rail__cell.is-head::after {
+    background: HighlightText;
+  }
+
+  .game-combo-rail__title,
+  .game-combo-rail__next,
   .game-idle-warning,
   .game-idle-warning__flag,
   .game-idle-warning__action,

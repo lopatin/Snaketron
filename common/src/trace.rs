@@ -25,7 +25,11 @@ use serde::{Deserialize, Serialize};
 /// a version-2 trace replayed against this fingerprint would pass the version
 /// guard and then report divergence at every tick, which is precisely what the
 /// guard exists to prevent.
-pub const TRACE_FORMAT_VERSION: u32 = 3;
+///
+/// Version 4 adds the authoritative combo configuration and each snake's
+/// combo countdown/chain state to the fingerprint. Replaying an older trace
+/// against the combo-aware engine would otherwise report misleading drift.
+pub const TRACE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceSide {

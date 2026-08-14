@@ -47,6 +47,7 @@ import {
   type BoostInputMode,
 } from '../utils/boostInput';
 import { buildBoostHudView } from '../utils/boostHud';
+import { buildComboHudView } from '../utils/comboHud';
 import { buildPlayerIdlePresentation } from '../utils/idlePresentation';
 import {
   createScoreEffectRuntime,
@@ -60,6 +61,7 @@ import type {
 } from '../utils/crashExplosion';
 import type { PredictedScoreVisualState } from '../utils/scoreEffects';
 import BoostCanisterMark from './BoostCanisterMark';
+import ComboChaseRail from './ComboChaseRail';
 import TouchControls, {
   TOUCH_LANDSCAPE_SIDE_RESERVE_PX,
   TOUCH_PORTRAIT_BOTTOM_RESERVE_PX,
@@ -551,6 +553,17 @@ export default function GameArena() {
             rootStyle.getPropertyValue('--game-boost-indicator-height'),
           ) || 40
         : 0;
+      const sizeLocalPlayer = user?.id !== undefined
+        ? state.players?.[user.id]
+        : undefined;
+      const hasLocalComboHud = Boolean(
+        sizeLocalPlayer && state.arena.snakes?.[sizeLocalPlayer.snake_id],
+      );
+      const comboIndicatorHeight = hasLocalComboHud
+        ? Number.parseFloat(
+            rootStyle.getPropertyValue('--game-combo-indicator-height'),
+          ) || 34
+        : 0;
       const safeAreaInset = (side: 'bottom' | 'left' | 'right'): number =>
         Number.parseFloat(rootStyle.getPropertyValue(`--safe-area-inset-${side}`)) || 0;
       // Strict comparison to match CSS: `orientation: portrait` matches when
@@ -562,10 +575,10 @@ export default function GameArena() {
       if (isTouchSurface) {
         // Touch layouts budget the real in-flow chrome instead of the legacy
         // desktop slack: the fixed scoreboard band, the roster anchor row, the
-        // charge strip, and the control-cluster reserves that mirror the stage
-        // padding in GameArena.css (safe-area insets included, which are only
-        // non-zero on notched phones in fullscreen). Every unspent pixel here
-        // is arena, which matters on a phone.
+        // combo/charge rails, and the control-cluster reserves that mirror the
+        // stage padding in GameArena.css (safe-area insets included, which are
+        // only non-zero on notched phones in fullscreen). Every unspent pixel
+        // here is arena, which matters on a phone.
         const scoreboardFootprint = Number.parseFloat(
           rootStyle.getPropertyValue('--game-scoreboard-footprint'),
         ) || 64;
@@ -581,11 +594,12 @@ export default function GameArena() {
           ? TOUCH_LANDSCAPE_SIDE_RESERVE_PX * 2 + safeAreaInset('left') + safeAreaInset('right')
           : 0;
         availableHeight = vh - scoreboardFootprint - anchorFootprint -
-          boostIndicatorHeight - touchBottomReserve -
+          boostIndicatorHeight - comboIndicatorHeight - touchBottomReserve -
           (isLandscapeViewport ? (compactLandscape ? 14 : 22) : 16);
         availableWidth = vw - 28 - touchSideReserve;
       } else {
-        availableHeight = vh - hudHeight - boostIndicatorHeight - 58 - 32 - 10;
+        availableHeight = vh - hudHeight - boostIndicatorHeight -
+          comboIndicatorHeight - 58 - 32 - 10;
         availableWidth = vw - 32 - 10;
       }
       
@@ -619,7 +633,7 @@ export default function GameArena() {
     window.addEventListener('resize', calculateSizes);
 
     return () => window.removeEventListener('resize', calculateSizes);
-  }, [gameState, committedState, rotation, isTouchSurface]);
+  }, [gameState, committedState, rotation, isTouchSurface, user?.id]);
 
   // Check for game completion
   useEffect(() => {
@@ -1220,6 +1234,10 @@ export default function GameArena() {
   const boostHud = boostConfig && localSnake
     ? buildBoostHudView(boostConfig, localSnake, isGameInteractionActive, gameOver)
     : null;
+  const comboConfig = gameState?.properties.combo ?? null;
+  const comboHud = comboConfig && localSnake
+    ? buildComboHudView(comboConfig, localSnake)
+    : null;
 
   const currentStatus = gameState?.status;
   const isBoostGameTerminal = Boolean(
@@ -1619,6 +1637,13 @@ export default function GameArena() {
     </div>
   ) : null;
 
+  // This footprint remains mounted while the player is alive, dead, or
+  // between chains. Only its cells drain, so a combo starting or expiring can
+  // never move the arena or the optional Boost control beneath it.
+  const comboControl = localSnake && comboHud ? (
+    <ComboChaseRail hud={comboHud} isVisible={isArenaVisible} />
+  ) : null;
+
   if (showAuthLoading) {
     return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please sign in to play'} />;
   }
@@ -1661,7 +1686,9 @@ export default function GameArena() {
           />
           {/* Game Canvas */}
           <div
-            className={`game-arena-frame${boostControl ? ' has-boost-indicator' : ''}`}
+            className={`game-arena-frame${comboControl ? ' has-combo-indicator' : ''}${
+              boostControl ? ' has-boost-indicator' : ''
+            }`}
             style={{ width: `${panelSize.width}px` }}
           >
             <div
@@ -1773,6 +1800,7 @@ export default function GameArena() {
                 </div>
               )}
             </div>
+            {comboControl}
             {boostControl}
           </div>
           <GameControlsHint

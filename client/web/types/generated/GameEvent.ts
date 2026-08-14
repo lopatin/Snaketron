@@ -8,7 +8,23 @@ import type { GameStatus } from "./GameStatus";
 import type { Position } from "./Position";
 import type { TeamId } from "./TeamId";
 
-export type GameEvent = { "SnakeTurned": { snake_id: number, direction: Direction, } } | { "SnakeDied": { snake_id: number, } } | { "PlayerIdleKicked": { user_id: number, snake_id: number, } } | { "FoodSpawned": { position: Position, } } | { "FoodEaten": { snake_id: number, position: Position, } } | { "BoostPacketCollected": { pad_id: number, snake_id: number, charge_ms_after: number, respawn_at_tick: number, } } | { "Snapshot": { game_state: GameState, } } | { "CommandScheduled": { command_message: GameCommandMessage, } } | { "CommandScheduledV2": { command_id: ClientCommandIdentityV2, command_message: GameCommandMessage,
+export type GameEvent = { "SnakeTurned": { snake_id: number, direction: Direction, } } | { "SnakeDied": { snake_id: number, } } | { "PlayerIdleKicked": { user_id: number, snake_id: number, } } | { "FoodSpawned": { position: Position, } } | { "FoodEaten": { snake_id: number, position: Position,
+/**
+ * Exact score and physical growth awarded by this pickup.
+ */
+points: number,
+/**
+ * One-based depth of this pickup in the current uninterrupted chain.
+ */
+combo_chain: number,
+/**
+ * Meter value immediately before this pickup refilled it.
+ */
+combo_remaining_ms_before: number,
+/**
+ * Whether authoritative Boost was active at the instant of pickup.
+ */
+boost_active: boolean, } } | { "BoostPacketCollected": { pad_id: number, snake_id: number, charge_ms_after: number, respawn_at_tick: number, } } | { "Snapshot": { game_state: GameState, } } | { "CommandScheduled": { command_message: GameCommandMessage, } } | { "CommandScheduledV2": { command_id: ClientCommandIdentityV2, command_message: GameCommandMessage,
 /**
  * True when the executor is returning a previously recorded outcome;
  * replicas must not schedule the same logical command again.

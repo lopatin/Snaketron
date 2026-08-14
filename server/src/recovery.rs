@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-/// Bumped to 5: Solo and free-for-all now carry Boost, which moves them to the
+/// Bumped to 6: food value, physical growth, personal scoring, and team cargo
+/// now follow the authoritative per-snake combo state. Resuming a version-5
+/// checkpoint would silently switch an in-flight match from the old fixed
+/// two-segment growth model to combo scoring, so the recovery gate rejects it.
+///
+/// Version 5: Solo and free-for-all now carry Boost, which moves them to the
 /// 50ms simulation quantum, and 2v2/free-for-all carry double food. A
 /// checkpoint written before this change deserializes cleanly — `boost` and
 /// `unlimited` both default — but describes a match the current invariants
@@ -19,7 +24,7 @@ use std::time::{Duration, Instant};
 ///
 /// (4 was: team matches carry `score_limit` instead of `time_limit_ms`, and
 /// snakes carry a latched Boost intent.)
-pub const RECOVERY_SCHEMA_VERSION: u16 = 5;
+pub const RECOVERY_SCHEMA_VERSION: u16 = 6;
 pub const DEFAULT_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_secs(10);

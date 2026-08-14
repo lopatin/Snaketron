@@ -2,6 +2,7 @@
 import type { Direction } from "./Direction";
 import type { Position } from "./Position";
 import type { SnakeBoost } from "./SnakeBoost";
+import type { SnakeCombo } from "./SnakeCombo";
 import type { TeamId } from "./TeamId";
 
 export type Snake = {
@@ -18,4 +19,9 @@ speed_milli: number,
 /**
  * Residual milli-milliseconds toward the snake's next cell movement.
  */
-movement_credit: number, boost: SnakeBoost, };
+movement_credit: number, boost: SnakeBoost,
+/**
+ * Current per-life combo meter. Historical snapshots deserialize as an
+ * inactive combo, which is the only safe state to infer without events.
+ */
+combo: SnakeCombo, };

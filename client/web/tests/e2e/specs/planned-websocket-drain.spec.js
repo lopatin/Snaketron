@@ -468,7 +468,7 @@ async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
   await emitServerMessage(page, oldSocketIndex, {
     Authenticated: {
       task_boot_id: 'old-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -520,7 +520,7 @@ async function establishAuthenticatedLobby(page) {
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
       task_boot_id: 'lobby-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -572,7 +572,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'new-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -1404,7 +1404,7 @@ test('a command with an ambiguous crash send is retried once with its stable ide
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-after-crash',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -3953,17 +3953,14 @@ test('window blur releases default Hold Boost once', async ({ page }) => {
   ]);
 });
 
-// A shipped build cannot update itself — an itch.io bundle has no
-// reload-to-upgrade path at all — so no protocol disagreement may ever strand
-// the player behind a screen they have no way to act on. Every one of these
-// mismatches has to degrade to a console warning and keep playing.
-test('a mismatched server protocol and missing capabilities still authenticate', async ({ page }) => {
+test('a mismatched server protocol is rejected before deterministic gameplay', async ({ page }) => {
   await page.goto('/');
   await expect.poll(() => page.evaluate(() => (
     window.__wsInstance ? window.__mockSockets.indexOf(window.__wsInstance) : -1
   ))).toBeGreaterThanOrEqual(0);
   const socketIndex = await page.evaluate(() => window.__mockSockets.indexOf(window.__wsInstance));
   await expect.poll(() => socketMessages(page, socketIndex, 'Authenticate')).toHaveLength(1);
+  const joinCountBefore = (await socketMessages(page, socketIndex, 'JoinLobby')).length;
 
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
@@ -3974,34 +3971,31 @@ test('a mismatched server protocol and missing capabilities still authenticate',
     },
   });
 
-  // Reaching JoinLobby proves the handshake was accepted despite both mismatches.
-  await expect.poll(() => socketMessages(page, socketIndex, 'JoinLobby')).toHaveLength(2);
+  await expect.poll(() => page.evaluate(
+    (index) => window.__mockSockets[index].closeCalls,
+    socketIndex,
+  )).toEqual([{ code: 4008, reason: 'gameplay protocol mismatch' }]);
+  expect((await socketMessages(page, socketIndex, 'JoinLobby')).length).toBe(joinCountBefore);
   await expect(page.getByTestId('client-update-required')).toHaveCount(0);
-  expect(await page.evaluate((index) => window.__mockSockets[index].closeCalls, socketIndex))
-    .toEqual([]);
 });
 
-test('a legacy client-update denial no longer strands the player', async ({ page }) => {
+test('an update-required denial closes without reconnecting the incompatible client', async ({ page }) => {
   const socketIndex = await establishAuthenticatedLobby(page);
   const socketCount = await page.evaluate(() => window.__mockSockets.length);
 
   await emitServerMessage(page, socketIndex, {
-    AccessDenied: { reason: 'Client update required' },
+    AccessDenied: {
+      reason: 'Gameplay update required: client protocol 7, server protocol 8',
+    },
   });
-  await page.waitForTimeout(250);
 
-  await expect(page.getByTestId('client-update-required')).toHaveCount(0);
-  expect(await page.evaluate((index) => ({
+  await expect.poll(() => page.evaluate((index) => ({
     connected: window.__wsContext?.isConnected,
-    activeSocketIndex: window.__wsInstance
-      ? window.__mockSockets.indexOf(window.__wsInstance)
-      : -1,
     closeCalls: window.__mockSockets[index].closeCalls,
     socketCount: window.__mockSockets.length,
   }), socketIndex)).toEqual({
-    connected: true,
-    activeSocketIndex: socketIndex,
-    closeCalls: [],
+    connected: false,
+    closeCalls: [{ code: 4008, reason: 'gameplay protocol mismatch' }],
     socketCount,
   });
 });
@@ -4064,7 +4058,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-lobby-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -4104,7 +4098,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, acknowledgedReplacementIndex, {
     Authenticated: {
       task_boot_id: 'acknowledged-replacement-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 3,
     },
@@ -4232,7 +4226,7 @@ test('planned lobby handoff replays only after the candidate restores authoritat
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'planned-lobby-replacement',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },

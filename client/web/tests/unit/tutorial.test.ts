@@ -161,7 +161,8 @@ test('team copy races to the score limit it is handed, never a baked-in number',
       assert.match(text, new RegExp(`First to ${limit}\\b`));
       assert.match(text, /rival base/);
       // No other target may appear alongside it.
-      const numbers = text.match(/\b\d+\b/g) ?? [];
+      // `+3` is the universal combo cap, not a team score target.
+      const numbers = text.match(/(?<!\+)\b\d+\b/g) ?? [];
       assert.deepEqual(
         numbers.filter((n) => n !== String(limit)),
         [],
@@ -175,7 +176,8 @@ test('a team match with no score limit describes the rule without inventing a nu
   const text = tutorialContent('duel', 'Quickmatch', { scoreLimit: null })
     .steps.map((step) => step.body)
     .join(' ');
-  assert.doesNotMatch(text, /\b\d+\b/);
+  // The universal `+3` combo cap is allowed; no bare team target is.
+  assert.doesNotMatch(text, /(?<!\+)\b\d+\b/);
   assert.match(text, /score target/i);
 });
 
@@ -240,10 +242,17 @@ test('progressive steps stay concise enough to scan one at a time', () => {
   }
 });
 
-test('duel opens with the exact glanceable scoring instruction', () => {
+test('every mode teaches the universal combo rule in its opening instruction', () => {
+  for (const mode of MODES) {
+    const opening = tutorialContent(mode, 'Quickmatch').steps[0];
+    assert.match(opening.body, /food/i);
+    assert.match(opening.body, /\+3/);
+    assert.match(opening.body, /COMBO drains/i);
+  }
+
   assert.equal(
     tutorialContent('duel', 'Quickmatch').steps[0].body,
-    'Return food to base to score points.',
+    'Chain food to +3 before COMBO drains; bank at base.',
   );
 });
 

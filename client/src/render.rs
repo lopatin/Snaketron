@@ -1474,6 +1474,65 @@ struct CarriedFoodLabel {
     ink: &'static str,
 }
 
+// ---------------------------------------------------------------------------
+// Player-relative food value
+//
+// Food has one authoritative position but a different prospective value for
+// each player. The renderer therefore resolves the local predicted snake once
+// and stamps that value onto every food only while its combo is live. A
+// spectator (or a player with an expired chain) sees the ordinary unlabelled
+// food instead.
+// ---------------------------------------------------------------------------
+
+const FOOD_VALUE_LABEL_MIN_PX: f64 = 5.0;
+const FOOD_VALUE_LABEL_MAX_PX: f64 = 9.0;
+const FOOD_VALUE_LABEL_SIZE_RATIO: f64 = 0.68;
+const FOOD_VALUE_LABEL_ADVANCE_EM: f64 = 0.68;
+const FOOD_VALUE_LABEL_HALO_RATIO: f64 = 0.13;
+const FOOD_VALUE_LABEL_HALO_MIN_PX: f64 = 0.55;
+const FOOD_VALUE_LABEL_HALO_MAX_PX: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FoodValueLabelLayout {
+    font_px: f64,
+    halo_px: f64,
+}
+
+fn food_value_label_layout(cell_size: f64, characters: usize) -> FoodValueLabelLayout {
+    // The one-pixel food outline belongs to the icon, so a tiny label may use
+    // that same overscan. At the 5px arena floor, the legibility clamp wins by
+    // a fraction of a pixel instead of collapsing the two-character mark.
+    let available_width = cell_size + 2.0;
+    let font_for_width = available_width / (FOOD_VALUE_LABEL_ADVANCE_EM * characters.max(1) as f64);
+    let font_px = (cell_size * FOOD_VALUE_LABEL_SIZE_RATIO)
+        .min(font_for_width)
+        .clamp(FOOD_VALUE_LABEL_MIN_PX, FOOD_VALUE_LABEL_MAX_PX);
+
+    FoodValueLabelLayout {
+        font_px,
+        halo_px: (font_px * FOOD_VALUE_LABEL_HALO_RATIO)
+            .clamp(FOOD_VALUE_LABEL_HALO_MIN_PX, FOOD_VALUE_LABEL_HALO_MAX_PX),
+    }
+}
+
+fn food_value_label_font(size: f64) -> String {
+    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+}
+
+fn combo_food_label_value(
+    chain_count: u32,
+    remaining_ms: u32,
+    max_food_value: u32,
+    is_alive: bool,
+) -> Option<u32> {
+    if !is_alive || remaining_ms == 0 {
+        return None;
+    }
+
+    let value = chain_count.saturating_add(1).min(max_food_value.max(1));
+    (value > 1).then_some(value)
+}
+
 /// Renders a typed game state to a canvas element.
 ///
 /// This is the core renderer: it reads the engine's own `GameState` directly
@@ -1552,6 +1611,16 @@ pub fn render_game_state(
         } else {
             (None, None)
         };
+    let local_food_value = local_snake_id
+        .and_then(|snake_id| arena.snakes.get(snake_id))
+        .and_then(|snake| {
+            combo_food_label_value(
+                snake.combo.chain_count,
+                snake.combo.remaining_ms,
+                state.properties.combo.max_food_value,
+                snake.is_alive,
+            )
+        });
 
     // Draw team zones if present
     let team_zone_config_data = arena.team_zone_config.as_ref();
@@ -1977,6 +2046,40 @@ pub fn render_game_state(
                 2.0 * std::f64::consts::PI,
             )?;
             ctx.fill();
+        }
+
+        // Third pass: the same food is worth the same prospective amount to
+        // this local player, so every item receives one compact white mark.
+        // Spectators and inactive chains resolve `None` above and retain the
+        // original clean food art.
+        if let Some(value) = local_food_value {
+            let text = format!("+{value}");
+            let layout = food_value_label_layout(cell_size, text.chars().count());
+            ctx.save();
+            ctx.set_text_align("center");
+            ctx.set_text_baseline("middle");
+            ctx.set_line_join("round");
+            ctx.set_font(&food_value_label_font(layout.font_px));
+            ctx.set_line_width(layout.halo_px);
+            ctx.set_stroke_style_str("#416c45");
+            ctx.set_fill_style_str("#ffffff");
+
+            for food in &arena.food {
+                let (tx, ty) = transform_coords(
+                    food.x as f64,
+                    food.y as f64,
+                    game_width,
+                    game_height,
+                    rotation_int,
+                );
+                let center_x = tx * cell_size + cell_size / 2.0;
+                // A quarter physical pixel counters the optical low bias of a
+                // bold plus/digit pair on Canvas' `middle` baseline.
+                let center_y = ty * cell_size + cell_size / 2.0 - 0.25;
+                ctx.stroke_text(&text, center_x, center_y)?;
+                ctx.fill_text(&text, center_x, center_y)?;
+            }
+            ctx.restore();
         }
     }
 
@@ -2808,6 +2911,46 @@ mod tests {
         let font = carried_food_label_font(9.0);
 
         assert!(font.starts_with("900 9px "));
+        assert!(font.contains("Arial Black"));
+        assert!(!font.to_ascii_lowercase().contains("italic"));
+    }
+
+    #[test]
+    fn combo_food_labels_follow_the_local_snakes_next_value_and_cap() {
+        assert_eq!(combo_food_label_value(1, 1_000, 3, true), Some(2));
+        assert_eq!(combo_food_label_value(2, 750, 3, true), Some(3));
+        assert_eq!(combo_food_label_value(99, 50, 3, true), Some(3));
+
+        // The first ordinary food, expiry, death, and a defensive cap of one
+        // all preserve the original unlabelled food art.
+        assert_eq!(combo_food_label_value(0, 0, 3, true), None);
+        assert_eq!(combo_food_label_value(2, 0, 3, true), None);
+        assert_eq!(combo_food_label_value(2, 500, 3, false), None);
+        assert_eq!(combo_food_label_value(0, 500, 1, true), None);
+    }
+
+    #[test]
+    fn food_value_label_stays_readable_across_every_arena_cell_size() {
+        for cell_size in 5..=15 {
+            let cell_size = f64::from(cell_size);
+            let layout = food_value_label_layout(cell_size, 2);
+
+            assert!(layout.font_px >= FOOD_VALUE_LABEL_MIN_PX);
+            assert!(layout.font_px <= FOOD_VALUE_LABEL_MAX_PX);
+            assert!(layout.halo_px >= FOOD_VALUE_LABEL_HALO_MIN_PX);
+            assert!(layout.halo_px <= FOOD_VALUE_LABEL_HALO_MAX_PX);
+            assert!(layout.halo_px < layout.font_px * 0.2);
+
+            let natural_width = layout.font_px * FOOD_VALUE_LABEL_ADVANCE_EM * 2.0;
+            assert!(
+                natural_width <= cell_size + 2.0 + 1e-9
+                    || layout.font_px == FOOD_VALUE_LABEL_MIN_PX,
+                "two-character value at cell {cell_size} overflows without hitting the floor"
+            );
+        }
+
+        let font = food_value_label_font(7.0);
+        assert!(font.starts_with("900 7px "));
         assert!(font.contains("Arial Black"));
         assert!(!font.to_ascii_lowercase().contains("italic"));
     }
