@@ -14,7 +14,6 @@ const fulfillRuntimeConfig = route => route.fulfill({
   body: JSON.stringify({
     version: 1,
     announcement: { enabled: false, message: '' },
-    ads: { postMatchEnabled: false, minimumIntervalMinutes: 10 },
   }),
 });
 

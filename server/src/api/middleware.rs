@@ -185,6 +185,7 @@ mod tests {
             ranked_mmr: 1_000,
             casual_mmr: 1_000,
             xp: 0,
+            games_played: 0,
             created_at: Utc::now(),
             is_guest: false,
             guest_token: None,

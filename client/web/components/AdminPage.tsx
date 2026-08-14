@@ -18,6 +18,18 @@ const SECTION_LABELS: Array<{ id: AdminSection; label: string; compactLabel: str
   { id: 'audit', label: 'Audit', compactLabel: 'Audit' },
 ];
 
+const AD_DISTRIBUTIONS = [
+  { id: 'web', label: 'Website' },
+  { id: 'crazygames', label: 'CrazyGames' },
+  { id: 'itch', label: 'itch.io' },
+] as const;
+
+const enabledAdDistributions = (config: RuntimeConfig): string[] => (
+  AD_DISTRIBUTIONS
+    .filter(({ id }) => config.ads.distributions[id].enabled)
+    .map(({ label }) => label)
+);
+
 const dateTime = (value: number): string => {
   if (!value) return 'Initial defaults';
   return new Intl.DateTimeFormat(undefined, {
@@ -49,6 +61,13 @@ const validateConfig = (config: RuntimeConfig): string | null => {
     return 'Announcement messages cannot exceed 280 characters.';
   }
   if (
+    !Number.isInteger(config.ads.minimumGamesPlayed)
+    || config.ads.minimumGamesPlayed < 0
+    || config.ads.minimumGamesPlayed > 10000
+  ) {
+    return 'Minimum games played must be a whole number from 0 to 10,000.';
+  }
+  if (
     !Number.isInteger(config.ads.minimumIntervalMinutes)
     || config.ads.minimumIntervalMinutes < 1
     || config.ads.minimumIntervalMinutes > 1440
@@ -74,6 +93,7 @@ const validateConfig = (config: RuntimeConfig): string | null => {
 
 const AdminOverview: React.FC<{ record: RuntimeConfigRecord | null }> = ({ record }) => {
   const config = record?.config;
+  const distributions = config ? enabledAdDistributions(config) : [];
   return (
     <section className="admin-section" aria-labelledby="admin-overview-title">
       <div className="admin-section-heading">
@@ -94,12 +114,14 @@ const AdminOverview: React.FC<{ record: RuntimeConfigRecord | null }> = ({ recor
             : 'No player-facing service notice.'}</p>
         </div>
         <div>
-          <dt>Post-match ads</dt>
-          <dd data-tone={config?.ads.postMatchEnabled ? 'active' : 'quiet'}>
-            {config?.ads.postMatchEnabled ? 'Allowed' : 'Killed'}
+          <dt>Pre-match video ads</dt>
+          <dd data-tone={config?.ads.enabled ? 'active' : 'quiet'}>
+            {config?.ads.enabled ? 'Enabled' : 'Disabled'}
           </dd>
           <p>{config
-            ? `${config.ads.minimumIntervalMinutes} minute minimum interval. Build flags remain authoritative.`
+            ? `${distributions.length > 0
+              ? `Distributions: ${distributions.join(', ')}`
+              : 'No distributions enabled'} · ${config.ads.minimumGamesPlayed} game minimum · ${config.ads.minimumIntervalMinutes} minute interval.`
             : 'Loading the current runtime record.'}</p>
         </div>
         <div>
@@ -235,38 +257,93 @@ const AdminConfiguration: React.FC<{
         </fieldset>
 
         <fieldset>
-          <legend>Advertising</legend>
+          <legend>Pre-match video advertising</legend>
           <label className="admin-toggle-row">
             <span>
-              <strong>Allow post-match ads</strong>
-              <small>This can only disable a build-time ad capability; it cannot enable one.</small>
+              <strong>Enable pre-match video ads</strong>
+              <small>The server decides whether an eligible lobby enters an ad break before matchmaking.</small>
             </span>
             <input
               type="checkbox"
-              checked={draft.ads.postMatchEnabled}
+              aria-label="Enable pre-match video ads"
+              checked={draft.ads.enabled}
               onChange={(event) => setDraft({
                 ...draft,
-                ads: { ...draft.ads, postMatchEnabled: event.target.checked },
+                ads: { ...draft.ads, enabled: event.target.checked },
               })}
             />
           </label>
-          <label className="admin-field">
-            <span>Minimum interval</span>
-            <span className="admin-number-input">
-              <input
-                type="number"
-                min={1}
-                max={1440}
-                step={1}
-                value={draft.ads.minimumIntervalMinutes}
-                onChange={(event) => setDraft({
-                  ...draft,
-                  ads: { ...draft.ads, minimumIntervalMinutes: numberValue(event.target.value) },
-                })}
-              />
-              <em>minutes</em>
-            </span>
-          </label>
+          <div className="admin-field-grid">
+            {AD_DISTRIBUTIONS.map(({ id, label }) => (
+              <label className="admin-toggle-row" key={id}>
+                <span>
+                  <strong>{label}</strong>
+                  <small>Allow the server to schedule ads for this distribution.</small>
+                </span>
+                <input
+                  type="checkbox"
+                  aria-label={`Enable ads for ${label}`}
+                  checked={draft.ads.distributions[id].enabled}
+                  onChange={(event) => setDraft({
+                    ...draft,
+                    ads: {
+                      ...draft.ads,
+                      distributions: {
+                        ...draft.ads.distributions,
+                        [id]: {
+                          ...draft.ads.distributions[id],
+                          enabled: event.target.checked,
+                        },
+                      },
+                    },
+                  })}
+                />
+              </label>
+            ))}
+            <label className="admin-field">
+              <span>Minimum games played</span>
+              <span className="admin-number-input">
+                <input
+                  type="number"
+                  min={0}
+                  max={10000}
+                  step={1}
+                  value={draft.ads.minimumGamesPlayed}
+                  onChange={(event) => setDraft({
+                    ...draft,
+                    ads: { ...draft.ads, minimumGamesPlayed: numberValue(event.target.value) },
+                  })}
+                />
+                <em>games</em>
+              </span>
+              <small>Every member of the lobby must have completed at least this many games.</small>
+            </label>
+            <label className="admin-field">
+              <span>Minimum interval</span>
+              <span className="admin-number-input">
+                <input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  step={1}
+                  value={draft.ads.minimumIntervalMinutes}
+                  onChange={(event) => setDraft({
+                    ...draft,
+                    ads: { ...draft.ads, minimumIntervalMinutes: numberValue(event.target.value) },
+                  })}
+                />
+                <em>minutes</em>
+              </span>
+              <small>
+                The server enforces this cooldown per targeted player; if any targeted lobby
+                member is still inside it, the whole lobby skips the break.
+              </small>
+            </label>
+            <small className="admin-retention-note">
+              Deployment settings choose the provider for each distribution. These controls only
+              authorize server-scheduled lobby ad breaks within those capabilities.
+            </small>
+          </div>
         </fieldset>
 
         <fieldset>
@@ -394,7 +471,12 @@ const AdminAudit: React.FC = () => {
                   : 'System defaults'}</p>
                 <dl>
                   <div><dt>Notice</dt><dd>{entry.config.announcement.enabled ? 'On' : 'Off'}</dd></div>
-                  <div><dt>Ads</dt><dd>{entry.config.ads.postMatchEnabled ? 'Allowed' : 'Killed'}</dd></div>
+                  <div>
+                    <dt>Pre-match ads</dt>
+                    <dd>{entry.config.ads.enabled
+                      ? `Enabled · ${enabledAdDistributions(entry.config).join(', ') || 'no distributions'} · ${entry.config.ads.minimumGamesPlayed}+ games · ${entry.config.ads.minimumIntervalMinutes}m interval`
+                      : 'Disabled'}</dd>
+                  </div>
                   <div><dt>Summary</dt><dd>{entry.config.history.summaryRetentionDays}d</dd></div>
                 </dl>
               </li>

@@ -20,11 +20,15 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
-import { CrazyGamesAdOverlay, CrazyGamesBridge } from './components/CrazyGamesBridge';
+import { CrazyGamesBridge } from './components/CrazyGamesBridge';
 import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
 import { AdminRoute } from './components/AdminRoute';
 import { RuntimeAnnouncement } from './components/RuntimeAnnouncement';
 import { RuntimeConfigProvider, useRuntimeConfig } from './contexts/RuntimeConfigContext';
+import { AdsProvider } from './contexts/AdsContext';
+import { AdBannerLayout } from './components/AdBannerLayout';
+import { PreMatchAdBreak } from './components/PreMatchAdBreak';
+import { isDurableBannerRoute } from './services/ads/bannerPlan';
 
 const IS_EMBEDDED_BUILD = process.env.ITCH_BUILD === 'true'
   || process.env.CRAZYGAMES_BUILD === 'true';
@@ -51,6 +55,7 @@ function AppContent() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
+  const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
   const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
   const showRuntimeAnnouncement = config.announcement.enabled
@@ -123,10 +128,16 @@ function AppContent() {
   }
 
   return (
-    <div className={`app-shell min-h-screen flex flex-col${showRuntimeAnnouncement ? ' has-runtime-announcement' : ''}`}>
+    <div className={`app-shell app-route-layout min-h-screen flex flex-col${
+      showRuntimeAnnouncement ? ' has-runtime-announcement' : ''
+    }${isBannerScreenEligible ? ' app-route-layout--banner-safe' : ''}`}>
       {showRuntimeAnnouncement && <RuntimeAnnouncement />}
       {showBackdrop && <ArenaBackdrop />}
       <MatchmakingBanner />
+      <AdBannerLayout
+        isGameplayActive={isGameArenaActive}
+        isScreenEligible={isBannerScreenEligible}
+      />
       <AnimatedRoutes>
         <Route
           path="/"
@@ -228,9 +239,11 @@ function App() {
             <UIProvider>
               <LatencyProvider>
                 <WebSocketProvider>
-                  <CrazyGamesBridge />
-                  <AppContent />
-                  <CrazyGamesAdOverlay />
+                  <AdsProvider>
+                    <CrazyGamesBridge />
+                    <AppContent />
+                    <PreMatchAdBreak />
+                  </AdsProvider>
                 </WebSocketProvider>
               </LatencyProvider>
             </UIProvider>

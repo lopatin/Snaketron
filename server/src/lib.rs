@@ -1,3 +1,4 @@
+pub mod ads;
 pub mod api;
 mod chat_filter;
 pub mod cluster_membership;

@@ -1547,6 +1547,9 @@ mod tests {
                     user_id: *user_id,
                     username: format!("player_{user_id}"),
                     ts: queued_at as f64,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 })
                 .collect(),
             avg_mmr: 1000,
@@ -1555,6 +1558,7 @@ mod tests {
             queued_at,
             requesting_user_id: user_ids[0],
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         }
     }
 
@@ -2042,6 +2046,9 @@ mod tests {
                 user_id: 5,
                 username: "solo_player".to_string(),
                 ts: 100.0,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: None,
             }],
             avg_mmr: 1000,
             game_types: vec![GameType::Solo],
@@ -2049,6 +2056,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 5,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::Solo)
@@ -2070,11 +2078,17 @@ mod tests {
                     user_id: 10,
                     username: "player_one".to_string(),
                     ts: 123.0,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 },
                 LobbyMember {
                     user_id: 11,
                     username: "player_two".to_string(),
                     ts: 124.0,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 },
             ],
             avg_mmr: 1200,
@@ -2083,6 +2097,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 10,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 1 })
@@ -2117,6 +2132,9 @@ mod tests {
                     user_id,
                     username: format!("player_{user_id}"),
                     ts: f64::from(user_id),
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 })
                 .collect(),
             avg_mmr: 1200,
@@ -2125,6 +2143,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 20,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 2 })

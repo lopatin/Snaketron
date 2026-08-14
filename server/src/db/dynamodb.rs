@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::create_table::{CreateTableError, CreateTableOutput};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, ConditionCheck,
     CreateGlobalSecondaryIndexAction, Delete, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
@@ -45,6 +46,54 @@ const PAGE_CURSOR_MAX_BYTES: usize = 2_048;
 const HISTORY_GSI_PARTITION: &str = "MATCH_HISTORY";
 const RUNTIME_CONFIG_PK: &str = "CONFIG#RUNTIME";
 const RUNTIME_CONFIG_CURRENT_SK: &str = "CURRENT";
+const RUNTIME_CONFIG_SCHEMA_VERSION_V1: u16 = 1;
+const MAX_PRE_MATCH_AD_BREAK_USERS: usize = 4;
+const MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES: usize = 36;
+
+const fn runtime_config_schema_version_v1() -> u16 {
+    RUNTIME_CONFIG_SCHEMA_VERSION_V1
+}
+
+const fn default_ad_interval_minutes_v1() -> u16 {
+    10
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RuntimeAdsConfigV1 {
+    // Kept only to decode schema-v1 rows. It must never authorize a pre-match
+    // ad when the record is upconverted.
+    post_match_enabled: bool,
+    minimum_interval_minutes: u16,
+}
+
+impl Default for RuntimeAdsConfigV1 {
+    fn default() -> Self {
+        Self {
+            post_match_enabled: false,
+            minimum_interval_minutes: default_ad_interval_minutes_v1(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RuntimeConfigV1 {
+    announcement: RuntimeAnnouncementConfig,
+    ads: RuntimeAdsConfigV1,
+    history: RuntimeHistoryConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeConfigRecordV1 {
+    #[serde(default = "runtime_config_schema_version_v1")]
+    schema_version: u16,
+    version: u64,
+    config: RuntimeConfigV1,
+    updated_by: Option<RuntimeConfigActor>,
+    updated_at_ms: i64,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -900,14 +949,63 @@ impl DynamoDatabase {
     ) -> Result<RuntimeConfigRecord> {
         let record = Self::extract_string(item, "recordJson")
             .ok_or_else(|| anyhow!("runtime config row is missing recordJson"))?;
-        let record: RuntimeConfigRecord =
+        let value: JsonValue =
             serde_json::from_str(&record).context("Runtime config row is corrupt")?;
-        if record.schema_version != RUNTIME_CONFIG_SCHEMA_VERSION {
-            return Err(anyhow!(
-                "runtime config row uses unsupported schemaVersion {}",
-                record.schema_version
-            ));
-        }
+        let schema_version = match value.get("schemaVersion") {
+            Some(value) => value
+                .as_u64()
+                .and_then(|version| u16::try_from(version).ok())
+                .ok_or_else(|| anyhow!("runtime config row has an invalid schemaVersion"))?,
+            // Records written before schemaVersion was persisted have the v1
+            // shape and must follow the same safe upconversion path.
+            None => RUNTIME_CONFIG_SCHEMA_VERSION_V1,
+        };
+        let record = match schema_version {
+            RUNTIME_CONFIG_SCHEMA_VERSION_V1 => {
+                let legacy: RuntimeConfigRecordV1 = serde_json::from_value(value)
+                    .context("Runtime config row contains an invalid version-1 record")?;
+                if legacy.schema_version != RUNTIME_CONFIG_SCHEMA_VERSION_V1 {
+                    return Err(anyhow!(
+                        "runtime config row uses unsupported schemaVersion {}",
+                        legacy.schema_version
+                    ));
+                }
+                let RuntimeConfigV1 {
+                    announcement,
+                    ads: legacy_ads,
+                    history,
+                } = legacy.config;
+                let RuntimeAdsConfigV1 {
+                    post_match_enabled: _,
+                    minimum_interval_minutes,
+                } = legacy_ads;
+                // The interval has equivalent cooldown meaning. The old
+                // post-match switch intentionally does not enable any new
+                // pre-match policy or distribution.
+                let ads = RuntimeAdsConfig {
+                    minimum_interval_minutes,
+                    ..RuntimeAdsConfig::default()
+                };
+                RuntimeConfigRecord {
+                    schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+                    version: legacy.version,
+                    config: RuntimeConfig {
+                        announcement,
+                        ads,
+                        history,
+                    },
+                    updated_by: legacy.updated_by,
+                    updated_at_ms: legacy.updated_at_ms,
+                }
+            }
+            RUNTIME_CONFIG_SCHEMA_VERSION => serde_json::from_value(value)
+                .context("Runtime config row contains an invalid version-2 record")?,
+            version => {
+                return Err(anyhow!(
+                    "runtime config row uses unsupported schemaVersion {version}"
+                ));
+            }
+        };
         record
             .config
             .validate()
@@ -1292,6 +1390,62 @@ impl DynamoDatabase {
             leader: Self::unique_public_high_score_leader(&ordered_head),
             coverage: NewsLeaderboardCoverage::OrderedGlobalIndex,
         })
+    }
+
+    fn validate_pre_match_ad_break_claim(
+        break_id: &str,
+        user_ids: &[u32],
+        now_ms: i64,
+        minimum_interval_ms: i64,
+        policy_version: u64,
+    ) -> Result<i64> {
+        if break_id.is_empty()
+            || break_id.len() > MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES
+            || break_id.chars().any(char::is_control)
+        {
+            return Err(anyhow!(
+                "pre-match ad break ID must be 1 to {MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES} bytes and contain no control characters"
+            ));
+        }
+        if user_ids.is_empty() || user_ids.len() > MAX_PRE_MATCH_AD_BREAK_USERS {
+            return Err(anyhow!(
+                "pre-match ad break must target between 1 and {MAX_PRE_MATCH_AD_BREAK_USERS} users"
+            ));
+        }
+        for (index, user_id) in user_ids.iter().enumerate() {
+            if *user_id == 0 || *user_id > i32::MAX as u32 {
+                return Err(anyhow!("pre-match ad break contains an invalid user ID"));
+            }
+            if user_ids[..index].contains(user_id) {
+                return Err(anyhow!("pre-match ad break contains a duplicate user ID"));
+            }
+        }
+        if now_ms < 0 {
+            return Err(anyhow!("pre-match ad break timestamp must not be negative"));
+        }
+        if minimum_interval_ms <= 0 {
+            return Err(anyhow!(
+                "pre-match ad break minimum interval must be positive"
+            ));
+        }
+        if policy_version == 0 {
+            return Err(anyhow!(
+                "pre-match ad break policy version must be positive"
+            ));
+        }
+        now_ms
+            .checked_sub(minimum_interval_ms)
+            .ok_or_else(|| anyhow!("pre-match ad break cooldown cutoff overflow"))
+    }
+
+    fn transaction_cancellation_is_conditional(error: &TransactWriteItemsError) -> bool {
+        match error {
+            TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
+                .cancellation_reasons()
+                .iter()
+                .any(|reason| reason.code() == Some("ConditionalCheckFailed")),
+            _ => false,
+        }
     }
 
     fn runtime_game_identity(game_id: i32, game_state: &common::GameState) -> String {
@@ -1762,6 +1916,7 @@ impl DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
@@ -2219,6 +2374,7 @@ impl Database for DynamoDatabase {
         username_item.insert("rankedMmr".to_string(), Self::av_n(1000));
         username_item.insert("casualMmr".to_string(), Self::av_n(1000));
         username_item.insert("xp".to_string(), Self::av_n(0));
+        username_item.insert("gamesPlayed".to_string(), Self::av_n(0));
 
         // This will fail if username already exists
         self.client
@@ -2243,6 +2399,7 @@ impl Database for DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
@@ -2263,6 +2420,7 @@ impl Database for DynamoDatabase {
             ranked_mmr: 1000,
             casual_mmr: 1000,
             xp: 0,
+            games_played: 0,
             created_at: now,
             is_guest: false,
             guest_token: None,
@@ -2299,6 +2457,7 @@ impl Database for DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(true));
         item.insert("isStressTest".to_string(), Self::av_bool(is_stress_test));
@@ -2325,6 +2484,7 @@ impl Database for DynamoDatabase {
             ranked_mmr: 1000,
             casual_mmr: 1000,
             xp: 0,
+            games_played: 0,
             created_at: now,
             is_guest: true,
             guest_token: Some(guest_token.to_string()),
@@ -2366,6 +2526,7 @@ impl Database for DynamoDatabase {
             username_item.insert("rankedMmr".to_string(), Self::av_n(guest.ranked_mmr));
             username_item.insert("casualMmr".to_string(), Self::av_n(guest.casual_mmr));
             username_item.insert("xp".to_string(), Self::av_n(guest.xp));
+            username_item.insert("gamesPlayed".to_string(), Self::av_n(guest.games_played));
 
             let username_put = Put::builder()
                 .table_name(self.usernames_table())
@@ -2397,7 +2558,9 @@ impl Database for DynamoDatabase {
                     "(attribute_not_exists(isStressTest) OR isStressTest=:not_stress) AND ",
                     "username=:old_username AND passwordHash=:old_password_hash AND ",
                     "mmr=:mmr AND rankedMmr=:ranked_mmr AND ",
-                    "casualMmr=:casual_mmr AND xp=:xp"
+                    "casualMmr=:casual_mmr AND xp=:xp AND ",
+                    "(gamesPlayed=:games_played OR ",
+                    "(attribute_not_exists(gamesPlayed) AND :games_played=:zero))"
                 ))
                 .expression_attribute_values(":username", Self::av_s(username))
                 .expression_attribute_values(":password_hash", Self::av_s(password_hash))
@@ -2410,6 +2573,8 @@ impl Database for DynamoDatabase {
                 .expression_attribute_values(":ranked_mmr", Self::av_n(guest.ranked_mmr))
                 .expression_attribute_values(":casual_mmr", Self::av_n(guest.casual_mmr))
                 .expression_attribute_values(":xp", Self::av_n(guest.xp))
+                .expression_attribute_values(":games_played", Self::av_n(guest.games_played))
+                .expression_attribute_values(":zero", Self::av_n(0))
                 .build()
                 .context("Failed to build in-place guest account upgrade")?;
 
@@ -2497,6 +2662,7 @@ impl Database for DynamoDatabase {
                     ranked_mmr: Self::extract_number(&item, "rankedMmr").unwrap_or(1000),
                     casual_mmr: Self::extract_number(&item, "casualMmr").unwrap_or(1000),
                     xp: Self::extract_number(&item, "xp").unwrap_or(0),
+                    games_played: Self::extract_number(&item, "gamesPlayed").unwrap_or(0),
                     created_at: Self::extract_string(&item, "createdAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
@@ -3598,6 +3764,67 @@ impl Database for DynamoDatabase {
         })
     }
 
+    async fn try_claim_pre_match_ad_break(
+        &self,
+        break_id: &str,
+        user_ids: &[u32],
+        now_ms: i64,
+        minimum_interval_ms: i64,
+        policy_version: u64,
+    ) -> Result<bool> {
+        let cutoff_ms = Self::validate_pre_match_ad_break_claim(
+            break_id,
+            user_ids,
+            now_ms,
+            minimum_interval_ms,
+            policy_version,
+        )?;
+        let mut updates = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            let update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("AD#PRE_MATCH"))
+                .update_expression(concat!(
+                    "SET #last_break_at=:now, #break_id=:break_id, ",
+                    "#policy_version=:policy_version"
+                ))
+                .condition_expression(concat!(
+                    "attribute_not_exists(#last_break_at) OR ",
+                    "#last_break_at<=:cutoff OR #break_id=:break_id"
+                ))
+                .expression_attribute_names("#last_break_at", "lastBreakAtMs")
+                .expression_attribute_names("#break_id", "breakId")
+                .expression_attribute_names("#policy_version", "policyVersion")
+                .expression_attribute_values(":now", Self::av_n(now_ms))
+                .expression_attribute_values(":cutoff", Self::av_n(cutoff_ms))
+                .expression_attribute_values(":break_id", Self::av_s(break_id))
+                .expression_attribute_values(":policy_version", Self::av_n(policy_version))
+                .build()
+                .context("Failed to build pre-match ad-break cooldown claim")?;
+            updates.push(TransactWriteItem::builder().update(update).build());
+        }
+
+        match self
+            .client
+            .transact_write_items()
+            .client_request_token(break_id)
+            .set_transact_items(Some(updates))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("Failed to claim pre-match ad-break cooldown"),
+        }
+    }
+
     async fn apply_completion_effect(
         &self,
         completion: &CompletionRecordV1,
@@ -3800,6 +4027,23 @@ impl Database for DynamoDatabase {
                                 .context("Failed to build player match history write")?;
                             mutations.push(TransactWriteItem::builder().put(user_history).build());
                         }
+                    }
+
+                    // This durable v8+ completion counter is the advertisement
+                    // eligibility source of truth. Keeping it in this replay-safe
+                    // transaction makes each newly claimed completion count once.
+                    for user_id in completion.final_state.players.keys() {
+                        let progress_update = Update::builder()
+                            .table_name(self.main_table())
+                            .key("pk", Self::av_s(format!("USER#{user_id}")))
+                            .key("sk", Self::av_s("META"))
+                            .update_expression("ADD gamesPlayed :one")
+                            .condition_expression("attribute_exists(pk) AND attribute_exists(sk)")
+                            .expression_attribute_values(":one", Self::av_n(1))
+                            .build()
+                            .context("Failed to build games-played update")?;
+                        mutations
+                            .push(TransactWriteItem::builder().update(progress_update).build());
                     }
                     debug_assert!(mutations.len() + 2 <= 100);
                     mutations
@@ -5770,6 +6014,118 @@ mod tests {
         assert!(!DynamoDatabase::high_score_matches_sort_key(
             &high_score_item("top", 2_000, true),
             &out_of_range
+        ));
+    }
+
+    #[test]
+    fn runtime_config_reader_safely_upconverts_version_one() {
+        let item = HashMap::from([(
+            "recordJson".to_string(),
+            DynamoDatabase::av_s(
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "version": 17,
+                    "config": {
+                        "announcement": {
+                            "enabled": true,
+                            "message": "Maintenance soon"
+                        },
+                        "ads": {
+                            "postMatchEnabled": true,
+                            "minimumIntervalMinutes": 22
+                        },
+                        "history": {
+                            "snapshotRetentionDays": 45,
+                            "summaryRetentionDays": 400
+                        }
+                    },
+                    "updatedBy": {
+                        "userId": 7,
+                        "username": "operator"
+                    },
+                    "updatedAtMs": 123456
+                })
+                .to_string(),
+            ),
+        )]);
+
+        let record = DynamoDatabase::runtime_config_record_from_item(&item).unwrap();
+
+        assert_eq!(record.schema_version, RUNTIME_CONFIG_SCHEMA_VERSION);
+        assert_eq!(record.version, 17);
+        assert!(record.config.announcement.enabled);
+        assert_eq!(record.config.announcement.message, "Maintenance soon");
+        assert_eq!(record.config.history.snapshot_retention_days, 45);
+        assert_eq!(record.config.history.summary_retention_days, 400);
+        assert_eq!(record.config.ads.minimum_interval_minutes, 22);
+        assert_eq!(record.config.ads.minimum_games_played, 1);
+        assert!(!record.config.ads.enabled);
+        assert!(!record.config.ads.distributions.web.enabled);
+        assert!(!record.config.ads.distributions.crazygames.enabled);
+        assert!(!record.config.ads.distributions.itch.enabled);
+        assert_eq!(record.updated_by.unwrap().username, "operator");
+        assert_eq!(record.updated_at_ms, 123456);
+    }
+
+    #[test]
+    fn pre_match_ad_break_claim_validation_is_strict() {
+        assert_eq!(
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "12345678-1234-1234-1234-123456789012",
+                &[1, 2, 3, 4],
+                100_000,
+                60_000,
+                9,
+            )
+            .unwrap(),
+            40_000
+        );
+
+        for invalid in [
+            DynamoDatabase::validate_pre_match_ad_break_claim("", &[1], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "12345678-1234-1234-1234-1234567890123",
+                &[1],
+                100,
+                10,
+                1,
+            ),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "break",
+                &[1, 2, 3, 4, 5],
+                100,
+                10,
+                1,
+            ),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1, 1], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[0], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], -1, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], 100, 0, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], 100, 10, 0),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[test]
+    fn only_conditional_transaction_cancellation_is_an_ineligible_claim() {
+        use aws_sdk_dynamodb::types::CancellationReason;
+        use aws_sdk_dynamodb::types::error::TransactionCanceledException;
+
+        let cancelled = |code: &str| {
+            TransactWriteItemsError::TransactionCanceledException(
+                TransactionCanceledException::builder()
+                    .cancellation_reasons(CancellationReason::builder().code(code).build())
+                    .build(),
+            )
+        };
+
+        assert!(DynamoDatabase::transaction_cancellation_is_conditional(
+            &cancelled("ConditionalCheckFailed")
+        ));
+        assert!(!DynamoDatabase::transaction_cancellation_is_conditional(
+            &cancelled("TransactionConflict")
         ));
     }
 

@@ -63,6 +63,14 @@ services:
       # New multiplayer matches warn after 10s idle, then kick after a 10s countdown.
       SNAKETRON_PLAYER_IDLE_GRACE_MS: "${SNAKETRON_PLAYER_IDLE_GRACE_MS:-10000}"
       SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS: "${SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS:-10000}"
+      # Advertisement policy is resolved by the server at startup and is off by default.
+      # Each distribution remains disabled until it names a provider. Its
+      # placement-specific switches then inherit that distribution's enabled state.
+      SNAKETRON_ADS_ENABLED: "false"
+      SNAKETRON_ADS_WEB_PROVIDER: "none"
+      SNAKETRON_ADS_CRAZYGAMES_PROVIDER: "none"
+      SNAKETRON_ADS_ITCH_PROVIDER: "none"
+      SNAKETRON_AD_BREAK_TIMEOUT_SECONDS: "120"
       # Logging
       RUST_LOG: info,server=debug
       # Replay directory (using volume)

@@ -250,6 +250,18 @@ pub trait Database: Send + Sync {
             "runtime configuration audit is not supported by this database"
         ))
     }
+    /// Atomically reserve one pre-match ad-break opportunity for every
+    /// targeted user. Alternate database implementations fail closed for ads.
+    async fn try_claim_pre_match_ad_break(
+        &self,
+        _break_id: &str,
+        _user_ids: &[u32],
+        _now_ms: i64,
+        _minimum_interval_ms: i64,
+        _policy_version: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     /// Apply one immutable completion effect with its idempotency marker in
     /// the same database transaction as the mutation.
     async fn apply_completion_effect(

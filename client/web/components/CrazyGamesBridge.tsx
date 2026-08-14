@@ -26,7 +26,6 @@ export const CrazyGamesBridge: React.FC = () => {
     authChangeSequence,
     portalUser,
     settings: { muteAudio },
-    adState,
   } = useCrazyGames();
   const {
     user,
@@ -63,7 +62,7 @@ export const CrazyGamesBridge: React.FC = () => {
       return;
     }
 
-    const enforcedMute = muteAudio || adState === 'playing';
+    const enforcedMute = muteAudio;
     const previousMute = new Map<HTMLMediaElement, boolean>();
     const applyMute = (root: ParentNode) => {
       for (const media of root.querySelectorAll<HTMLMediaElement>('audio, video')) {
@@ -94,7 +93,7 @@ export const CrazyGamesBridge: React.FC = () => {
       observer.disconnect();
       restoreMute();
     };
-  }, [adState, isCrazyGamesBuild, muteAudio]);
+  }, [isCrazyGamesBuild, muteAudio]);
 
   useEffect(() => {
     if (!isCrazyGamesBuild) {
@@ -277,28 +276,4 @@ export const CrazyGamesBridge: React.FC = () => {
   ]);
 
   return null;
-};
-
-export const CrazyGamesAdOverlay: React.FC = () => {
-  const { adState } = useCrazyGames();
-  if (adState === 'idle') {
-    return null;
-  }
-
-  return (
-    <div
-      className="fixed inset-0 z-[9998] flex items-center justify-center bg-black/55"
-      role="status"
-      aria-live="assertive"
-      aria-label={adState === 'requesting' ? 'Preparing advertisement' : 'Advertisement playing'}
-      data-testid="crazygames-ad-overlay"
-    >
-      {adState === 'requesting' && (
-        <div className="flex items-center gap-3 border-2 border-white bg-black px-5 py-4 text-sm font-black uppercase tracking-1 text-white">
-          <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/40 border-t-white" aria-hidden="true" />
-          Preparing ad…
-        </div>
-      )}
-    </div>
-  );
 };

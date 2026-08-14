@@ -9,6 +9,7 @@ const REQUIRED_CAPABILITIES = [
   'command-outcome-barrier-v1',
   'terminal-command-cutoff-v1',
 ];
+const CURRENT_PROTOCOL_VERSION = 9;
 
 const RETRYABLE_MATCHMAKING_ADMISSION_REASON =
   'Failed to queue lobby: Failed to add lobby to matchmaking queue';
@@ -489,7 +490,7 @@ async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
   await emitServerMessage(page, oldSocketIndex, {
     Authenticated: {
       task_boot_id: 'old-task',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -541,7 +542,7 @@ async function establishAuthenticatedLobby(page) {
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
       task_boot_id: 'lobby-task',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -593,7 +594,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'new-task',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -628,7 +629,6 @@ test.beforeEach(async ({ page }) => {
         payload = {
           version: 1,
           announcement: { enabled: false, message: '' },
-          ads: { postMatchEnabled: false, minimumIntervalMinutes: 10 },
         };
       } else if (url.endsWith('/api/regions')) {
         payload = [{
@@ -1442,7 +1442,7 @@ test('a command with an ambiguous crash send is retried once with its stable ide
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-after-crash',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -4260,7 +4260,7 @@ test('an update-required denial closes without reconnecting the incompatible cli
 
   await emitServerMessage(page, socketIndex, {
     AccessDenied: {
-      reason: 'Gameplay update required: client protocol 7, server protocol 8',
+      reason: `Gameplay update required: client protocol ${CURRENT_PROTOCOL_VERSION - 1}, server protocol ${CURRENT_PROTOCOL_VERSION}`,
     },
   });
 
@@ -4333,7 +4333,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-lobby-task',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -4373,7 +4373,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, acknowledgedReplacementIndex, {
     Authenticated: {
       task_boot_id: 'acknowledged-replacement-task',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 3,
     },
@@ -4501,7 +4501,7 @@ test('planned lobby handoff replays only after the candidate restores authoritat
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'planned-lobby-replacement',
-      protocol_version: 8,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },

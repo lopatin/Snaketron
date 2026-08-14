@@ -26,6 +26,11 @@ export type {
   GameCommandMessage,
   CommandId,
   SyncStatus,
+  AdBreakResolution,
+  BannerAdsConfig,
+  ClientAdsConfig,
+  LobbyAdBreakView,
+  VideoAdsConfig,
   LobbyMember,
   WSMessage,
   // HTTP DTOs (server/src/api/*)
@@ -57,7 +62,12 @@ export type {
 
 // Typed WebSocket protocol surface derived from the generated WSMessage union.
 import type { OutboundMessage, WSMessageTag, TypedMessage } from './protocol';
-import type { Direction, LobbyMember } from './generated';
+import type {
+  ClientAdsConfig,
+  Direction,
+  LobbyAdBreakView,
+  LobbyMember,
+} from './generated';
 export type { OutboundMessage, WSMessageTag, TypedMessage, PayloadOf } from './protocol';
 
 // Leaderboard entry aliases: the components predate the generated names but the
@@ -113,6 +123,7 @@ export interface Lobby {
   hostUserId: number;
   region: string;
   state: LobbyState;
+  adBreak?: LobbyAdBreakView | null;
 }
 
 export type ChatScope = 'lobby' | 'game';
@@ -129,7 +140,7 @@ export interface ChatMessage {
   timestamp: Date;
 }
 
-export type LobbyState = 'waiting' | 'queued' | 'matched';
+export type LobbyState = 'waiting' | 'ad_break' | 'queued' | 'matched';
 export type LobbyGameMode = 'duel' | '2v2' | 'solo' | 'ffa';
 export type MatchmakingStatus = 'idle' | 'queued' | 'joining';
 
@@ -160,6 +171,7 @@ export interface WebSocketContextType {
   ) => void;
   currentRegionUrl: string | null;
   latencyMs: number;
+  adConfiguration: ClientAdsConfig;
 
   // Lobby state
   lobbyRestorationComplete: boolean;

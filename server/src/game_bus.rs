@@ -2051,46 +2051,101 @@ impl GameBus {
             lobby_codes.extend(active_match.lobby_codes);
         }
 
-        let mut mapping_keys: Vec<String> = user_ids
+        let user_mapping_keys: Vec<String> = user_ids
             .into_iter()
             .map(RedisKeys::matchmaking_user_active_game)
             .collect();
-        mapping_keys.extend(
-            lobby_codes
-                .into_iter()
-                .map(|code| RedisKeys::matchmaking_lobby_active_game(&code)),
-        );
+        let lobby_keys: Vec<(String, String)> = lobby_codes
+            .into_iter()
+            .map(|code| {
+                (
+                    RedisKeys::matchmaking_lobby_active_game(&code),
+                    RedisKeys::lobby_metadata(&code),
+                )
+            })
+            .collect();
         let script = redis::Script::new(
             r#"
             local active_type = redis.call('TYPE', KEYS[1])
             if type(active_type) == 'table' then active_type = active_type.ok end
             if active_type ~= 'none' and active_type ~= 'hash' then return -1 end
-            for i = 2, #KEYS do
+
+            local user_count = tonumber(ARGV[2])
+            local lobby_count = tonumber(ARGV[3])
+            if not user_count or not lobby_count
+                or #KEYS ~= 1 + user_count + (lobby_count * 2) then
+                return -2
+            end
+
+            for i = 2, 1 + user_count do
                 local value_type = redis.call('TYPE', KEYS[i])
                 if type(value_type) == 'table' then value_type = value_type.ok end
                 if value_type ~= 'none' and value_type ~= 'string' then return -1 end
             end
-            for i = 2, #KEYS do
+            for index = 0, lobby_count - 1 do
+                local mapping_index = 2 + user_count + (index * 2)
+                local metadata_index = mapping_index + 1
+                local mapping_type = redis.call('TYPE', KEYS[mapping_index])
+                if type(mapping_type) == 'table' then mapping_type = mapping_type.ok end
+                if mapping_type ~= 'none' and mapping_type ~= 'string' then return -1 end
+                local metadata_type = redis.call('TYPE', KEYS[metadata_index])
+                if type(metadata_type) == 'table' then metadata_type = metadata_type.ok end
+                if metadata_type ~= 'none' and metadata_type ~= 'hash' then return -1 end
+            end
+
+            -- The active-match hash remains the repair worklist until every
+            -- exact lobby has left `matched` and every mapping is gone. Reset
+            -- metadata before deleting mappings so an ambiguous retry cannot
+            -- strand Play Again behind a durable matched state.
+            for index = 0, lobby_count - 1 do
+                local mapping_index = 2 + user_count + (index * 2)
+                local metadata_index = mapping_index + 1
+                if redis.call('GET', KEYS[mapping_index]) == ARGV[1] then
+                    if redis.call('HGET', KEYS[metadata_index], 'state') == 'matched' then
+                        redis.call('HSET', KEYS[metadata_index], 'state', 'waiting')
+                        redis.call('PEXPIRE', KEYS[metadata_index], ARGV[4])
+                    end
+                end
+            end
+            for i = 2, 1 + user_count do
                 if redis.call('GET', KEYS[i]) == ARGV[1] then
                     redis.call('DEL', KEYS[i])
                 end
             end
+            for index = 0, lobby_count - 1 do
+                local mapping_index = 2 + user_count + (index * 2)
+                if redis.call('GET', KEYS[mapping_index]) == ARGV[1] then
+                    redis.call('DEL', KEYS[mapping_index])
+                end
+            end
+            -- Retire discoverability last; any preceding partial provider
+            -- error leaves this exact cleanup retryable from ActiveMatch.
             redis.call('HDEL', KEYS[1], ARGV[1])
             return 1
             "#,
         );
         let mut invocation = script.prepare_invoke();
         invocation.key(active_matches_key);
-        for key in &mapping_keys {
+        for key in &user_mapping_keys {
             invocation.key(key);
+        }
+        for (mapping_key, metadata_key) in &lobby_keys {
+            invocation.key(mapping_key);
+            invocation.key(metadata_key);
         }
         let result: i32 = invocation
             .arg(record.game_id)
+            .arg(user_mapping_keys.len())
+            .arg(lobby_keys.len())
+            .arg(crate::lobby_manager::LOBBY_METADATA_IDLE_TTL_MS)
             .invoke_async(&mut redis)
             .await
             .context("failed to clean terminal matchmaking mappings")?;
-        if result != 1 {
-            anyhow::bail!("terminal matchmaking cleanup found a key with the wrong type");
+        match result {
+            1 => {}
+            -1 => anyhow::bail!("terminal matchmaking cleanup found a key with the wrong type"),
+            -2 => anyhow::bail!("terminal matchmaking cleanup key layout was invalid"),
+            other => anyhow::bail!("unknown terminal matchmaking cleanup result {other}"),
         }
         Ok(())
     }

@@ -11,7 +11,7 @@ test('the latest runtime config response may reaffirm the current version', () =
   }), true);
 });
 
-test('an obsolete same-version response cannot undo a newer fail-closed refresh', () => {
+test('an obsolete same-version response cannot supersede a newer refresh attempt', () => {
   assert.equal(shouldApplyRuntimeConfigResponse({
     requestSequence: 2,
     latestRequestSequence: 3,

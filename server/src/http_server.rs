@@ -17,6 +17,7 @@ use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
+use crate::ads::AdsConfig;
 use crate::api::admin;
 use crate::api::auth::{self, AuthState};
 use crate::api::crazygames;
@@ -169,6 +170,8 @@ pub struct HttpServerState {
     pub lifecycle: TaskLifecycle,
     /// Region-scoped authoritative recovery namespace.
     pub cluster_namespace: ClusterNamespace,
+    /// Deployment advertisement capabilities advertised to every WebSocket session.
+    pub ads_config: Arc<AdsConfig>,
 }
 
 /// Install the combined API and WebSocket application behind the already-bound
@@ -192,6 +195,7 @@ pub async fn install_http_application(
     lobby_manager: Arc<LobbyManager>,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    ads_config: Arc<AdsConfig>,
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
@@ -216,6 +220,7 @@ pub async fn install_http_application(
         user_cache,
         lifecycle: lifecycle.clone(),
         cluster_namespace,
+        ads_config,
     };
 
     // Start background task to update user count in Redis every 5 seconds
@@ -498,6 +503,7 @@ async fn websocket_handler(
                 state.region,
                 lifecycle.clone(),
                 state.cluster_namespace,
+                state.ads_config,
             )
             .await;
             crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());

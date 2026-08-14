@@ -69,7 +69,7 @@ Season schedule:
 Administration:
 
 - `SNAKETRON_ADMIN_USER_IDS`: Comma-separated durable numeric user IDs allowed to use `/api/admin/*`. Authorization is recalculated from the current database user on every authenticated request; guests and stress-test users are never administrators.
-- Runtime announcement, post-match ad, and history-retention settings are stored in DynamoDB and managed through `/api/admin/config`. The safe defaults are ads disabled with a 10-minute minimum interval, snapshots retained for 30 days, and compact summaries retained for 365 days.
+- Runtime announcements, provider-neutral pre-match ad policy, and history-retention settings are stored in DynamoDB and managed through `/api/admin/config`. The safe defaults disable every ad distribution with a one-game threshold and 10-minute durable interval, retain snapshots for 30 days, and retain compact summaries for 365 days.
 - Match-history projections are created by the immutable completion pipeline. Existing completed-game rows are not retroactively projected, so a deployment begins recording browseable history with the first completion processed after rollout; backfill requires an explicit migration from retained snapshots.
 
 Completed game retention:

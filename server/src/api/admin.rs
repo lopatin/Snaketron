@@ -9,9 +9,9 @@ use serde::{Deserialize, Deserializer};
 use tracing::error;
 
 use crate::db::models::{
-    MatchHistoryPage, PublicRuntimeConfig, RuntimeAdsConfig, RuntimeAnnouncementConfig,
-    RuntimeConfig, RuntimeConfigActor, RuntimeConfigAuditPage, RuntimeConfigRecord,
-    RuntimeHistoryConfig,
+    MatchHistoryPage, PublicRuntimeConfig, RuntimeAdsConfig, RuntimeAdsDistributionsConfig,
+    RuntimeAnnouncementConfig, RuntimeConfig, RuntimeConfigActor, RuntimeConfigAuditPage,
+    RuntimeConfigRecord, RuntimeDistributionAdsConfig, RuntimeHistoryConfig,
 };
 
 use super::auth::AuthState;
@@ -38,8 +38,24 @@ struct StrictRuntimeAnnouncementConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StrictRuntimeAdsConfig {
-    post_match_enabled: bool,
+    enabled: bool,
+    minimum_games_played: u32,
     minimum_interval_minutes: u16,
+    distributions: StrictRuntimeAdsDistributionsConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StrictRuntimeAdsDistributionsConfig {
+    web: StrictRuntimeDistributionAdsConfig,
+    crazygames: StrictRuntimeDistributionAdsConfig,
+    itch: StrictRuntimeDistributionAdsConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StrictRuntimeDistributionAdsConfig {
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +81,20 @@ impl From<StrictRuntimeConfig> for RuntimeConfig {
                 message: config.announcement.message,
             },
             ads: RuntimeAdsConfig {
-                post_match_enabled: config.ads.post_match_enabled,
+                enabled: config.ads.enabled,
+                minimum_games_played: config.ads.minimum_games_played,
                 minimum_interval_minutes: config.ads.minimum_interval_minutes,
+                distributions: RuntimeAdsDistributionsConfig {
+                    web: RuntimeDistributionAdsConfig {
+                        enabled: config.ads.distributions.web.enabled,
+                    },
+                    crazygames: RuntimeDistributionAdsConfig {
+                        enabled: config.ads.distributions.crazygames.enabled,
+                    },
+                    itch: RuntimeDistributionAdsConfig {
+                        enabled: config.ads.distributions.itch.enabled,
+                    },
+                },
             },
             history: RuntimeHistoryConfig {
                 snapshot_retention_days: config.history.snapshot_retention_days,
@@ -327,8 +355,14 @@ mod tests {
                     "message": ""
                 },
                 "ads": {
-                    "postMatchEnabled": false,
+                    "enabled": false,
+                    "minimumGamesPlayed": 1,
                     "minimumIntervalMinutes": 10,
+                    "distributions": {
+                        "web": { "enabled": false },
+                        "crazygames": { "enabled": false },
+                        "itch": { "enabled": false }
+                    },
                     "unexpected": true
                 },
                 "history": {
@@ -338,6 +372,41 @@ mod tests {
             }
         }));
         assert!(nested.is_err());
+    }
+
+    #[test]
+    fn config_update_accepts_explicit_distribution_policy() {
+        let request = serde_json::from_value::<UpdateRuntimeConfigRequest>(serde_json::json!({
+            "expectedVersion": 3,
+            "config": {
+                "announcement": {
+                    "enabled": false,
+                    "message": ""
+                },
+                "ads": {
+                    "enabled": true,
+                    "minimumGamesPlayed": 2,
+                    "minimumIntervalMinutes": 15,
+                    "distributions": {
+                        "web": { "enabled": false },
+                        "crazygames": { "enabled": true },
+                        "itch": { "enabled": false }
+                    }
+                },
+                "history": {
+                    "snapshotRetentionDays": 30,
+                    "summaryRetentionDays": 365
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(request.config.ads.enabled);
+        assert_eq!(request.config.ads.minimum_games_played, 2);
+        assert_eq!(request.config.ads.minimum_interval_minutes, 15);
+        assert!(!request.config.ads.distributions.web.enabled);
+        assert!(request.config.ads.distributions.crazygames.enabled);
+        assert!(!request.config.ads.distributions.itch.enabled);
     }
 
     #[test]

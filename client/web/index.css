@@ -94,6 +94,293 @@ kbd {
   --game-rule: #d1d5db;
   --game-muted: #667085;
   --game-boost: #f8c84a;
+  --ad-bottom-reserve: 0px;
+  --ad-bottom-total-reserve: calc(var(--ad-bottom-reserve) + var(--safe-area-inset-bottom));
+  --ad-side-reserve: 0px;
+}
+
+/* Every route starts with safe-area-only spacing. The durable banner allowlist
+   opts into the live provider reserves as one shared layout contract. */
+.app-route-layout {
+  --ad-route-bottom-reserve: var(--safe-area-inset-bottom);
+  --ad-route-side-reserve: 0px;
+}
+
+.app-route-layout--banner-safe {
+  --ad-route-bottom-reserve: var(--ad-bottom-total-reserve);
+  --ad-route-side-reserve: var(--ad-side-reserve);
+}
+
+/* Advertising -------------------------------------------------------------
+   Ad inventory borrows the game's paper/graphite scoreboard language. The
+   small segmented lane is the one expressive mark: it reads as both a snake
+   body and a lobby resolving one player at a time. */
+.ad-banner-layout {
+  position: relative;
+  z-index: 50;
+}
+
+.ad-banner-slot {
+  box-sizing: border-box;
+  color: var(--game-muted);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 1.25px;
+  text-transform: uppercase;
+}
+
+.ad-banner-slot--bottom {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 55;
+  display: flex;
+  min-height: var(--ad-bottom-total-reserve);
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3px;
+  padding: 4px max(0px, env(safe-area-inset-right, 0px))
+    env(safe-area-inset-bottom, 0px) max(0px, env(safe-area-inset-left, 0px));
+  border-top: 2px solid var(--game-rule);
+  background: rgba(255, 255, 255, 0.98);
+}
+
+.ad-banner-slot--left-rail,
+.ad-banner-slot--right-rail {
+  position: fixed;
+  top: calc((100dvh - var(--ad-bottom-total-reserve)) / 2);
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  transform: translateY(-50%);
+}
+
+.ad-banner-slot--left-rail {
+  left: calc(10px + env(safe-area-inset-left, 0px));
+}
+
+.ad-banner-slot--right-rail {
+  right: calc(10px + env(safe-area-inset-right, 0px));
+}
+
+.ad-banner-label {
+  display: block;
+  height: 13px;
+  line-height: 13px;
+}
+
+.ad-banner-host {
+  position: relative;
+  display: grid;
+  max-width: 100vw;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid #e5e7eb;
+  background:
+    radial-gradient(circle at 1px 1px, rgba(63, 63, 65, 0.12) 1px, transparent 1.2px)
+    0 0 / 12px 12px,
+    #f8fafc;
+  isolation: isolate;
+}
+
+.ad-banner-host > :not(.ad-banner-placeholder) {
+  position: relative;
+  z-index: 2;
+}
+
+.ad-banner-placeholder {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #9ca3af;
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.ad-break-backdrop {
+  position: fixed;
+  z-index: 9998;
+  inset: 0;
+  display: grid;
+  padding: 20px;
+  background: rgba(248, 250, 252, 0.92);
+  -webkit-backdrop-filter: blur(9px);
+  backdrop-filter: blur(9px);
+  place-items: center;
+  animation: ad-break-backdrop-in 160ms ease-out both;
+}
+
+.ad-break-backdrop.is-playing {
+  background: rgba(0, 0, 0, 0.62);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.ad-break-dialog {
+  width: min(100%, 430px);
+  padding: 28px 28px 26px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  outline: none;
+  background: var(--game-paper);
+  box-shadow: 8px 8px 0 rgba(63, 63, 65, 0.16);
+  text-align: left;
+  animation: ad-break-dialog-in 180ms ease-out both;
+}
+
+.ad-break-backdrop.is-playing .ad-break-dialog {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+.ad-break-rule {
+  display: flex;
+  height: 12px;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 24px;
+}
+
+.ad-break-rule span {
+  width: 23px;
+  height: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 3px;
+  background: #f1f5f9;
+  transform: skewX(-10deg);
+}
+
+.ad-break-rule span.is-resolved {
+  border-color: var(--game-blue);
+  background: var(--game-blue);
+}
+
+.ad-break-rule span.is-resolved:last-of-type {
+  border-color: var(--game-red);
+  background: var(--game-red);
+}
+
+.ad-break-kicker {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--game-blue);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+}
+
+.ad-break-dialog h2 {
+  margin: 0;
+  color: var(--game-graphite);
+  font-size: clamp(22px, 5vw, 28px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.5px;
+  line-height: 1.04;
+  text-transform: uppercase;
+}
+
+.ad-break-dialog p {
+  margin: 13px 0 0;
+  color: var(--game-muted);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.ad-break-status {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--game-rule);
+  color: var(--game-graphite);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.ad-break-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid #dbeafe;
+  border-top-color: var(--game-blue);
+  border-radius: 50%;
+  animation: spin 850ms linear infinite;
+}
+
+.ad-break-ready-mark {
+  display: grid;
+  width: 19px;
+  height: 19px;
+  place-items: center;
+  border-radius: 4px;
+  background: var(--game-blue);
+  color: #fff;
+  font-size: 12px;
+  font-style: normal;
+}
+
+@keyframes ad-break-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ad-break-dialog-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 700px) {
+  .ad-break-backdrop {
+    padding: 12px;
+  }
+
+  .ad-break-dialog {
+    padding: 24px 20px 22px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ad-break-backdrop,
+  .ad-break-dialog,
+  .ad-break-spinner {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .ad-banner-slot,
+  .ad-banner-host,
+  .ad-break-dialog,
+  .ad-break-rule span,
+  .ad-break-status {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
 }
 
 .game-hud-shell {
@@ -3238,7 +3525,7 @@ body {
   height: 72px;
   align-items: center;
   justify-content: space-between;
-  padding: 0 32px;
+  padding: 0 calc(32px + var(--ad-route-side-reserve));
 }
 
 .home-top-nav {
@@ -4170,7 +4457,8 @@ body {
   flex: 1;
   align-items: center;
   justify-content: center;
-  padding: 84px 20px 76px;
+  padding: 84px calc(20px + var(--ad-route-side-reserve))
+    calc(76px + var(--ad-route-bottom-reserve));
 }
 
 .account-profile-details {
@@ -4245,7 +4533,8 @@ body {
   box-sizing: border-box;
   width: 100%;
   min-height: 100svh;
-  padding: 128px clamp(24px, 5vw, 96px) 120px;
+  padding: 128px max(clamp(24px, 5vw, 96px), var(--ad-route-side-reserve))
+    calc(120px + var(--ad-route-bottom-reserve));
 }
 
 .leaderboard-content {
@@ -4551,7 +4840,7 @@ body {
 .home-social-footer {
   position: fixed;
   z-index: 30;
-  bottom: 20px;
+  bottom: calc(20px + var(--ad-route-bottom-reserve));
   left: 50%;
   display: grid;
   justify-items: center;
@@ -4661,8 +4950,8 @@ a.home-social-icon:hover {
 
 .home-utility-dock {
   position: fixed;
-  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
-  left: calc(20px + env(safe-area-inset-left, 0px));
+  bottom: calc(20px + var(--ad-route-bottom-reserve));
+  left: calc(20px + env(safe-area-inset-left, 0px) + var(--ad-route-side-reserve));
   z-index: 40;
   display: flex;
   align-items: center;
@@ -4957,8 +5246,8 @@ a.home-social-icon:hover {
 }
 
 .home-lobby-chat {
-  right: calc(20px + env(safe-area-inset-right, 0px));
-  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  right: calc(20px + env(safe-area-inset-right, 0px) + var(--ad-route-side-reserve));
+  bottom: calc(20px + var(--ad-route-bottom-reserve));
 }
 
 .home-nav-link:focus-visible,
@@ -5148,7 +5437,7 @@ a.home-social-icon:hover {
 
   .home-main {
     align-items: flex-start;
-    padding: 154px 6px 112px;
+    padding: 154px 6px calc(112px + var(--ad-route-bottom-reserve));
   }
 
   .home-brand-lockup {
@@ -5190,7 +5479,7 @@ a.home-social-icon:hover {
 
   .leaderboard-main {
     min-height: 0;
-    padding: 126px 6px 32px;
+    padding: 126px 6px calc(32px + var(--ad-route-bottom-reserve));
   }
 
   .leaderboard-content {
@@ -5241,7 +5530,7 @@ a.home-social-icon:hover {
   }
 
   .home-utility-dock {
-    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(14px + var(--ad-route-bottom-reserve));
     left: calc(12px + env(safe-area-inset-left, 0px));
     gap: 6px;
   }
@@ -5255,11 +5544,11 @@ a.home-social-icon:hover {
 
   .home-lobby-chat {
     right: calc(12px + env(safe-area-inset-right, 0px));
-    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(14px + var(--ad-route-bottom-reserve));
   }
 
   .home-page .home-lobby-chat.is-expanded {
-    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(72px + var(--ad-route-bottom-reserve));
   }
 
   .home-lobby-chat > div {

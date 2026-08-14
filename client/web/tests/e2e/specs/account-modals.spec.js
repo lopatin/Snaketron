@@ -23,7 +23,6 @@ test.beforeEach(async ({ page }) => {
         payload = {
           version: 1,
           announcement: { enabled: false, message: '' },
-          ads: { postMatchEnabled: false, minimumIntervalMinutes: 10 },
         };
       } else if (url.includes('/api/history?')) {
         payload = {

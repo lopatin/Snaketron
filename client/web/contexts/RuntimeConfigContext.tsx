@@ -9,7 +9,6 @@ import React, {
 } from 'react';
 import { api } from '../services/api';
 import type { PublicRuntimeConfig, RuntimeConfig, RuntimeConfigRecord } from '../types';
-import { crazyGames } from '../services/crazyGames';
 import { shouldApplyRuntimeConfigResponse } from '../utils/runtimeConfigOrdering';
 
 export const SAFE_RUNTIME_CONFIG: RuntimeConfig = {
@@ -18,8 +17,14 @@ export const SAFE_RUNTIME_CONFIG: RuntimeConfig = {
     message: '',
   },
   ads: {
-    postMatchEnabled: false,
+    enabled: false,
+    minimumGamesPlayed: 1,
     minimumIntervalMinutes: 10,
+    distributions: {
+      web: { enabled: false },
+      crazygames: { enabled: false },
+      itch: { enabled: false },
+    },
   },
   history: {
     snapshotRetentionDays: 30,
@@ -58,9 +63,6 @@ export const RuntimeConfigProvider: React.FC<{ children: React.ReactNode }> = ({
     setRecord(nextRecord);
     setError(null);
     hasLoadedConfig.current = true;
-    crazyGames.configureRuntimeAds(
-      'config' in nextRecord ? nextRecord.config.ads : nextRecord.ads,
-    );
   }, []);
 
   const refresh = useCallback(async () => {
@@ -71,9 +73,8 @@ export const RuntimeConfigProvider: React.FC<{ children: React.ReactNode }> = ({
     }
     try {
       const nextRecord = await api.getRuntimeConfig();
-      // Once a newer refresh has failed closed, an older response carrying
-      // the already-known version must not re-authorize ads. Still accept a
-      // genuinely newer durable version regardless of request ordering.
+      // A response from an obsolete request cannot replace the result of a
+      // newer refresh. A genuinely newer durable version is still accepted.
       if (shouldApplyRuntimeConfigResponse({
         requestSequence: sequence,
         latestRequestSequence: refreshSequence.current,
@@ -83,15 +84,12 @@ export const RuntimeConfigProvider: React.FC<{ children: React.ReactNode }> = ({
         applyRecord(nextRecord);
       }
     } catch (nextError) {
-      // Keep the last-good announcement visible, but treat every failed
-      // latest refresh as loss of ad authorization. Ignore an obsolete
-      // failure if another request or an admin save already applied a newer
-      // configuration while this request was in flight.
+      // Keep the last-good announcement visible. Ignore an obsolete failure
+      // if another request or an admin save already applied a newer version.
       if (
         sequence === refreshSequence.current
         && appliedVersion.current <= versionAtStart
       ) {
-        crazyGames.configureRuntimeAds(SAFE_RUNTIME_CONFIG.ads);
         if (!hasLoadedConfig.current) {
           setError(messageFromError(nextError));
         }
@@ -124,7 +122,6 @@ export const RuntimeConfigProvider: React.FC<{ children: React.ReactNode }> = ({
     return {
       ...SAFE_RUNTIME_CONFIG,
       announcement: record.announcement,
-      ads: record.ads,
     };
   }, [record]);
 

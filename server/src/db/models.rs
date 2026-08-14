@@ -26,6 +26,9 @@ pub struct User {
     pub ranked_mmr: i32,
     pub casual_mmr: i32,
     pub xp: i32,
+    /// Lifetime completed matches across modes, regions, and seasons.
+    #[serde(default)]
+    pub games_played: i32,
     pub created_at: DateTime<Utc>,
     pub is_guest: bool,
     pub guest_token: Option<String>,
@@ -194,6 +197,8 @@ pub struct LobbyMetadata {
     pub state: String, // waiting | queued | matched
     #[serde(default)]
     pub matchmaking_pool: crate::matchmaking_pool::MatchmakingPool,
+    #[serde(default)]
+    pub ad_break: Option<crate::ads::LobbyAdBreak>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,7 +320,7 @@ impl MatchHistoryPage {
     }
 }
 
-pub const RUNTIME_CONFIG_SCHEMA_VERSION: u16 = 1;
+pub const RUNTIME_CONFIG_SCHEMA_VERSION: u16 = 2;
 
 const fn runtime_config_schema_version() -> u16 {
     RUNTIME_CONFIG_SCHEMA_VERSION
@@ -330,20 +335,42 @@ pub struct RuntimeAnnouncementConfig {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeDistributionAdsConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeAdsDistributionsConfig {
+    pub web: RuntimeDistributionAdsConfig,
+    pub crazygames: RuntimeDistributionAdsConfig,
+    pub itch: RuntimeDistributionAdsConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct RuntimeAdsConfig {
-    pub post_match_enabled: bool,
+    pub enabled: bool,
+    pub minimum_games_played: u32,
     pub minimum_interval_minutes: u16,
+    pub distributions: RuntimeAdsDistributionsConfig,
 }
 
 impl Default for RuntimeAdsConfig {
     fn default() -> Self {
         Self {
-            post_match_enabled: false,
+            enabled: false,
+            minimum_games_played: 1,
             minimum_interval_minutes: 10,
+            distributions: RuntimeAdsDistributionsConfig::default(),
         }
     }
 }
@@ -378,6 +405,7 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub const MAX_ANNOUNCEMENT_CHARACTERS: usize = 280;
+    pub const MAX_AD_MINIMUM_GAMES_PLAYED: u32 = 10_000;
     pub const MAX_AD_INTERVAL_MINUTES: u16 = 24 * 60;
     pub const MAX_HISTORY_RETENTION_DAYS: u16 = 3650;
 
@@ -394,6 +422,12 @@ impl RuntimeConfig {
         }
         if self.announcement.message.chars().any(char::is_control) {
             return Err("announcement message must not contain control characters".into());
+        }
+        if self.ads.minimum_games_played > Self::MAX_AD_MINIMUM_GAMES_PLAYED {
+            return Err(format!(
+                "minimum games played must be at most {}",
+                Self::MAX_AD_MINIMUM_GAMES_PLAYED
+            ));
         }
         if !(1..=Self::MAX_AD_INTERVAL_MINUTES).contains(&self.ads.minimum_interval_minutes) {
             return Err(format!(
@@ -454,7 +488,6 @@ pub struct PublicRuntimeConfig {
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub version: u64,
     pub announcement: RuntimeAnnouncementConfig,
-    pub ads: RuntimeAdsConfig,
 }
 
 impl From<&RuntimeConfigRecord> for PublicRuntimeConfig {
@@ -462,7 +495,6 @@ impl From<&RuntimeConfigRecord> for PublicRuntimeConfig {
         Self {
             version: record.version,
             announcement: record.config.announcement.clone(),
-            ads: record.config.ads.clone(),
         }
     }
 }
@@ -523,10 +555,15 @@ mod tests {
     #[test]
     fn runtime_config_defaults_are_safe_and_valid() {
         let config = RuntimeConfig::default();
+        assert_eq!(RUNTIME_CONFIG_SCHEMA_VERSION, 2);
         assert!(!config.announcement.enabled);
         assert!(config.announcement.message.is_empty());
-        assert!(!config.ads.post_match_enabled);
+        assert!(!config.ads.enabled);
+        assert_eq!(config.ads.minimum_games_played, 1);
         assert_eq!(config.ads.minimum_interval_minutes, 10);
+        assert!(!config.ads.distributions.web.enabled);
+        assert!(!config.ads.distributions.crazygames.enabled);
+        assert!(!config.ads.distributions.itch.enabled);
         assert_eq!(config.history.snapshot_retention_days, 30);
         assert_eq!(config.history.summary_retention_days, 365);
         assert!(config.validate().is_ok());
@@ -541,6 +578,10 @@ mod tests {
         config.announcement.message = "Maintenance soon".to_string();
         config.history.snapshot_retention_days = 366;
         config.history.summary_retention_days = 365;
+        assert!(config.validate().is_err());
+
+        config.history.snapshot_retention_days = 30;
+        config.ads.minimum_games_played = RuntimeConfig::MAX_AD_MINIMUM_GAMES_PLAYED + 1;
         assert!(config.validate().is_err());
     }
 
@@ -559,7 +600,7 @@ mod tests {
         let value = serde_json::to_value(PublicRuntimeConfig::from(&record)).unwrap();
         assert_eq!(value["version"], 3);
         assert!(value.get("announcement").is_some());
-        assert!(value.get("ads").is_some());
+        assert!(value.get("ads").is_none());
         assert!(value.get("history").is_none());
         assert!(value.get("updatedBy").is_none());
         assert!(value.get("updatedAtMs").is_none());
@@ -569,7 +610,13 @@ mod tests {
     fn persisted_runtime_config_tolerates_missing_and_unknown_fields() {
         let config: RuntimeConfig = serde_json::from_value(serde_json::json!({
             "ads": {
-                "postMatchEnabled": true,
+                "enabled": true,
+                "minimumGamesPlayed": 4,
+                "distributions": {
+                    "web": { "enabled": true },
+                    "crazygames": { "enabled": false },
+                    "itch": { "enabled": false }
+                },
                 "futureAdSetting": "ignored"
             },
             "futureSection": {
@@ -579,8 +626,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.announcement, RuntimeAnnouncementConfig::default());
-        assert!(config.ads.post_match_enabled);
+        assert!(config.ads.enabled);
+        assert_eq!(config.ads.minimum_games_played, 4);
         assert_eq!(config.ads.minimum_interval_minutes, 10);
+        assert!(config.ads.distributions.web.enabled);
+        assert!(!config.ads.distributions.crazygames.enabled);
+        assert!(!config.ads.distributions.itch.enabled);
         assert_eq!(config.history, RuntimeHistoryConfig::default());
     }
 

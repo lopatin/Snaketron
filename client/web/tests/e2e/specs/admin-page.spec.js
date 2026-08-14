@@ -8,11 +8,20 @@ test.beforeEach(async ({ page }) => {
     localStorage.setItem('__admin-test-authorized', 'true');
 
     window.__adminRecord = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       version: 1,
       config: {
         announcement: { enabled: false, message: '' },
-        ads: { postMatchEnabled: false, minimumIntervalMinutes: 10 },
+        ads: {
+          enabled: false,
+          minimumGamesPlayed: 1,
+          minimumIntervalMinutes: 10,
+          distributions: {
+            web: { enabled: false },
+            crazygames: { enabled: false },
+            itch: { enabled: false },
+          },
+        },
         history: { snapshotRetentionDays: 30, summaryRetentionDays: 365 },
       },
       updatedAtMs: 1_725_000_000_000,
@@ -43,7 +52,6 @@ test.beforeEach(async ({ page }) => {
         payload = {
           version: window.__adminRecord.version,
           announcement: window.__adminRecord.config.announcement,
-          ads: window.__adminRecord.config.ads,
         };
       } else if (pathname === '/api/admin/config' && (init?.method || 'GET') === 'PUT') {
         window.__adminPutBody = JSON.parse(init.body);
@@ -129,12 +137,27 @@ test('admin can inspect history, publish runtime controls, and review audit data
   await expect(page.getByRole('heading', { name: 'Configuration' })).toBeVisible();
   await page.getByLabel('Publish banner').check();
   await page.getByLabel('Message').fill('Scheduled maintenance begins after this round.');
+  await page.getByLabel('Enable pre-match video ads').check();
+  await page.getByLabel('Enable ads for Website').check();
+  await page.getByLabel('Enable ads for CrazyGames').check();
+  await page.getByLabel('Minimum games played').fill('3');
+  await page.getByLabel('Minimum interval').fill('15');
   await page.getByRole('button', { name: 'Publish configuration' }).click();
   await expect(page.getByText('Configuration v2 is live.')).toBeVisible();
   await expect(
     page.getByLabel('Service announcement').getByText('Scheduled maintenance begins after this round.'),
   ).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__adminPutBody.expectedVersion)).toBe(1);
+  await expect.poll(() => page.evaluate(() => window.__adminPutBody.config.ads)).toEqual({
+    enabled: true,
+    minimumGamesPlayed: 3,
+    minimumIntervalMinutes: 15,
+    distributions: {
+      web: { enabled: true },
+      crazygames: { enabled: true },
+      itch: { enabled: false },
+    },
+  });
 
   await page.getByRole('button', { name: /Match history/ }).click();
   await expect(page.getByRole('heading', { name: 'Match history' })).toBeVisible();
@@ -147,6 +170,10 @@ test('admin can inspect history, publish runtime controls, and review audit data
   await expect(page.getByRole('heading', { name: 'Audit' })).toBeVisible();
   await expect(page.getByText('Version 2', { exact: true })).toBeVisible();
   await expect(page.getByText('OpsAdmin (#1)', { exact: true })).toBeVisible();
+  await expect(page.getByText(
+    'Enabled · Website, CrazyGames · 3+ games · 15m interval',
+    { exact: true },
+  )).toBeVisible();
 });
 
 test('a non-admin cannot open the admin route or see its account action', async ({ page }) => {
