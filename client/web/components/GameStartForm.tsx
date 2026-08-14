@@ -3,7 +3,12 @@ import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { PlayersOnline } from './PlayersOnline';
+import { NewsTicker } from './NewsTicker';
 import { LobbyPreferences, LobbyGameMode } from '../types';
+import {
+  getTickerPlayPreferences,
+  type NewsTickerPlayAction,
+} from '../utils/newsTicker';
 import {
   DEFAULT_LOBBY_PREFERENCES,
   loadStoredLobbyPreferences,
@@ -241,14 +246,28 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     }
   }, [startButtonDisabled]);
 
+  const handleTickerPlay = (action: NewsTickerPlayAction) => {
+    if (!canEdit || isLoading) {
+      return;
+    }
+
+    const preferences = getTickerPlayPreferences(action);
+    setSelectedModes(new Set(preferences.selectedModes));
+    setIsCompetitive(preferences.competitive);
+    onPreferencesChange?.(preferences);
+  };
+
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
       {/* Logo */}
-      <div className="flex flex-col items-center mb-8">
+      <div className="home-brand-lockup">
         <img src="SnaketronLogo.png" alt="Snaketron" className="h-8 w-auto opacity-80" />
         <p className="mt-3 text-xs font-bold italic uppercase tracking-1 text-gray-500">
           Competitive multiplayer Snake
         </p>
+        <NewsTicker
+          onPlay={canEdit && !isLoading ? handleTickerPlay : undefined}
+        />
       </div>
 
       <div className="p-8">
@@ -328,6 +347,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                   type="button"
                   onClick={() => toggleMode(mode.id)}
                   disabled={!canEdit || isLoading}
+                  aria-pressed={Boolean(isSelected)}
                   className={`
                     game-mode-choice relative py-4 px-4 rounded-lg font-black uppercase tracking-1 text-base
                     transition-all border-2

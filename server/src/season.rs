@@ -1,10 +1,41 @@
+use chrono::{DateTime, Datelike, Utc};
+
 pub type Season = u32;
 
-/// Get the current season identifier.
-/// Placeholder until a season schedule/roller exists.
+/// Snaketron seasons follow the UTC calendar quarters used by the original
+/// leaderboard implementation. Existing numeric Season 0 data remains in the
+/// launch season (Q3 2026); the first automatic rollover is Q4 2026.
+const SEASON_ZERO_YEAR: i32 = 2026;
+const SEASON_ZERO_QUARTER: i64 = 2; // Zero-based: Q3.
+const QUARTERS_PER_YEAR: i64 = 4;
+
+/// Resolve the season containing one authoritative UTC timestamp.
+///
+/// All timestamps before the numeric-season launch are deliberately folded
+/// into Season 0 so existing leaderboard and high-score rows remain readable.
+/// From 2026-10-01T00:00:00Z onward the value increments at every UTC calendar
+/// quarter boundary without configuration, deployment, or process restart.
+pub fn get_season_at(timestamp: DateTime<Utc>) -> Season {
+    let quarter = i64::from(timestamp.month0() / 3);
+    let quarter_index = i64::from(timestamp.year()) * QUARTERS_PER_YEAR + quarter;
+    let season_zero_index = i64::from(SEASON_ZERO_YEAR) * QUARTERS_PER_YEAR + SEASON_ZERO_QUARTER;
+    let elapsed_quarters = quarter_index.saturating_sub(season_zero_index).max(0);
+
+    Season::try_from(elapsed_quarters)
+        .expect("chrono's supported year range fits in the numeric season storage type")
+}
+
+/// Resolve the season active at the instant this function is called.
 pub fn get_current_season() -> Season {
-    // TODO: replace with real season scheduler/roller
-    0
+    get_season_at(Utc::now())
+}
+
+/// Return every numeric season through the supplied timestamp, newest first.
+/// This keeps Season 0 selectable after later rollovers instead of orphaning
+/// the leaderboard data created during launch.
+pub fn seasons_at(timestamp: DateTime<Utc>) -> Vec<Season> {
+    let current = get_season_at(timestamp);
+    (0..=current).rev().collect()
 }
 
 fn resolve_storage_region(
@@ -82,15 +113,39 @@ pub fn get_ranking_region(requested_region: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+            .single()
+            .unwrap()
+    }
 
     #[test]
-    fn test_season_non_negative() {
-        assert_eq!(get_current_season(), 0);
+    fn season_zero_absorbs_history_and_the_launch_quarter() {
+        assert_eq!(get_season_at(utc(2020, 1, 1, 0, 0, 0)), 0);
+        assert_eq!(get_season_at(utc(2026, 7, 1, 0, 0, 0)), 0);
+        assert_eq!(get_season_at(utc(2026, 9, 30, 23, 59, 59)), 0);
+    }
+
+    #[test]
+    fn seasons_roll_exactly_on_utc_quarter_boundaries() {
+        assert_eq!(get_season_at(utc(2026, 10, 1, 0, 0, 0)), 1);
+        assert_eq!(get_season_at(utc(2026, 12, 31, 23, 59, 59)), 1);
+        assert_eq!(get_season_at(utc(2027, 1, 1, 0, 0, 0)), 2);
+        assert_eq!(get_season_at(utc(2027, 4, 1, 0, 0, 0)), 3);
+        assert_eq!(get_season_at(utc(2027, 7, 1, 0, 0, 0)), 4);
+        assert_eq!(get_season_at(utc(2027, 10, 1, 0, 0, 0)), 5);
+    }
+
+    #[test]
+    fn seasons_are_newest_first_and_preserve_season_zero() {
+        assert_eq!(seasons_at(utc(2026, 8, 14, 12, 0, 0)), vec![0]);
+        assert_eq!(seasons_at(utc(2027, 7, 1, 0, 0, 0)), vec![4, 3, 2, 1, 0]);
     }
 
     #[test]
     fn test_region_default() {
-        // Test that we can get a region (might be from env or default)
         let region = get_region();
         assert!(!region.is_empty());
     }

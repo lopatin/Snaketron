@@ -22,6 +22,7 @@ use crate::api::crazygames;
 use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::{AuthMiddlewareState, auth_middleware};
+use crate::api::news::{self, NewsState};
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
 use crate::cluster_membership::ClusterNamespace;
@@ -289,6 +290,12 @@ pub async fn install_http_application(
         .route("/api/seasons", get(leaderboard::list_seasons))
         .with_state(leaderboard_state.clone());
 
+    // Build the public arena-news feed separately so its process-wide cache
+    // coalesces leaderboard and recent-game reads across all home-page loads.
+    let news_routes = Router::new()
+        .route("/api/news", get(news::get_news))
+        .with_state(NewsState::new(db.clone()));
+
     // Build protected leaderboard routes (requires authentication)
     let protected_leaderboard_routes = Router::new()
         .route("/api/leaderboard/me", get(leaderboard::get_my_ranking))
@@ -325,6 +332,7 @@ pub async fn install_http_application(
         .merge(protected_routes)
         .merge(region_routes)
         .merge(leaderboard_routes)
+        .merge(news_routes)
         .merge(protected_leaderboard_routes)
         .merge(debug_routes)
         .with_state(auth_state);

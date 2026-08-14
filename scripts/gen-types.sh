@@ -20,7 +20,7 @@ mkdir -p "$OUT"
 TS_RS_EXPORT_DIR="$OUT" cargo test -p common --features ts-gen export_bindings -- --quiet
 # server: the WSMessage protocol envelope + lobby/chat payloads (pulls in the
 # common types via the chained `common/ts-gen` feature).
-TS_RS_EXPORT_DIR="$OUT" cargo test -p server --features ts-gen export_bindings -- --quiet
+TS_RS_EXPORT_DIR="$OUT" cargo test -p server --lib --features ts-gen export_bindings -- --quiet
 
 # ts-rs can leave spaces at the ends of wrapped doc-comment lines. Normalize
 # generated output so repository whitespace checks and regeneration CI agree.

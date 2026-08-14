@@ -21,7 +21,7 @@ use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, canonical_json_bytes,
 };
-use crate::season::Season;
+use crate::season::{Season, get_season_at};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -37,6 +37,7 @@ const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
 const GUEST_UPGRADE_MAX_ATTEMPTS: usize = 8;
 const CRAZYGAMES_IDENTITY_MAX_ATTEMPTS: usize = 8;
 const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
+const RECENT_COMPLETED_GAMES_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
 struct CrazyGamesIdentityRecord {
@@ -742,6 +743,8 @@ impl DynamoDatabase {
         Ok(Game {
             id: game_id,
             server_id: Self::extract_number(item, "serverId"),
+            season: Self::extract_number(item, "season")
+                .and_then(|season| Season::try_from(season).ok()),
             game_type: Self::extract_string(item, "gameType")
                 .and_then(|value| serde_json::from_str(&value).ok())
                 .unwrap_or(json!({})),
@@ -755,6 +758,9 @@ impl DynamoDatabase {
                 .unwrap_or_else(|| "matchmaking".to_string()),
             is_private: Self::extract_bool(item, "isPrivate").unwrap_or(false),
             game_code: Self::extract_string(item, "gameCode"),
+            news_eligible: Self::extract_bool(item, "newsEligible") == Some(true)
+                && Self::extract_bool(item, "isPrivate") == Some(false)
+                && Self::extract_string(item, "gameCode").is_none(),
         })
     }
 
@@ -767,6 +773,385 @@ impl DynamoDatabase {
 
     fn item_is_expired(item: &HashMap<String, AttributeValue>, now_epoch_seconds: i64) -> bool {
         Self::extract_i64(item, "ttl").is_some_and(|ttl| ttl <= now_epoch_seconds)
+    }
+
+    /// Resolve source privacy before completion persistence. A new runtime
+    /// match can use its server-owned state as the fallback. Existing metadata
+    /// must explicitly attest public visibility; an already-completed legacy
+    /// row must carry the newer durable proof or fail closed.
+    fn source_game_item_is_news_eligible(
+        item: Option<&HashMap<String, AttributeValue>>,
+        new_game_fallback: bool,
+    ) -> bool {
+        let Some(item) = item else {
+            return new_game_fallback;
+        };
+        if Self::extract_string(item, "status").as_deref() == Some("complete") {
+            return Self::extract_bool(item, "newsEligible") == Some(true)
+                && Self::extract_bool(item, "isPrivate") == Some(false)
+                && Self::extract_string(item, "gameCode").is_none();
+        }
+        Self::extract_bool(item, "isPrivate") == Some(false)
+            && Self::extract_string(item, "gameCode").is_none()
+    }
+
+    /// Public attribution requires affirmative completion provenance. Missing
+    /// legacy fields and non-terminal rows fail closed.
+    fn completed_game_item_is_news_eligible(
+        item: Option<&HashMap<String, AttributeValue>>,
+    ) -> bool {
+        item.is_some_and(|item| {
+            Self::extract_bool(item, "newsEligible") == Some(true)
+                && Self::extract_bool(item, "isPrivate") == Some(false)
+                && Self::extract_string(item, "gameCode").is_none()
+                && Self::extract_string(item, "status").as_deref() == Some("complete")
+        })
+    }
+
+    fn new_game_state_is_news_eligible(game_state: &common::GameState) -> bool {
+        !game_state.is_stress_test
+            && game_state.game_code.is_none()
+            && !matches!(game_state.game_type, common::GameType::Custom { .. })
+    }
+
+    async fn completed_game_is_news_eligible(&self, game_id: u32) -> Result<bool> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("isPrivate, gameCode, newsEligible, #status")
+            .expression_attribute_names("#status", "status")
+            .send()
+            .await
+            .context("Failed to read completed-game privacy provenance")?;
+
+        Ok(Self::completed_game_item_is_news_eligible(
+            response.item.as_ref(),
+        ))
+    }
+
+    async fn source_game_is_news_eligible(
+        &self,
+        game_id: i32,
+        new_game_fallback: bool,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("isPrivate, gameCode, newsEligible, #status")
+            .expression_attribute_names("#status", "status")
+            .send()
+            .await
+            .context("Failed to read source-game privacy metadata")?;
+
+        Ok(Self::source_game_item_is_news_eligible(
+            response.item.as_ref(),
+            new_game_fallback,
+        ))
+    }
+
+    fn recent_completed_games_page_limit(remaining: usize) -> Option<i32> {
+        (remaining > 0).then(|| {
+            i32::try_from(remaining.min(RECENT_COMPLETED_GAMES_PAGE_SIZE))
+                .expect("recent completed-game page size fits in i32")
+        })
+    }
+
+    fn recent_completed_games_from_items(
+        items: Vec<HashMap<String, AttributeValue>>,
+        now_epoch_seconds: i64,
+    ) -> Result<Vec<Game>> {
+        items
+            .into_iter()
+            .filter(|item| !Self::item_is_expired(item, now_epoch_seconds))
+            .map(|item| {
+                let game_id = Self::extract_number(&item, "id")
+                    .context("Recent completed game is missing a valid id")?;
+                Self::game_from_item(game_id, &item)
+            })
+            .collect()
+    }
+
+    fn append_recent_completed_games_from_items(
+        games: &mut Vec<Game>,
+        items: Vec<HashMap<String, AttributeValue>>,
+        now_epoch_seconds: i64,
+        limit: usize,
+    ) -> Result<()> {
+        let remaining = limit.saturating_sub(games.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let mut accepted = Self::recent_completed_games_from_items(items, now_epoch_seconds)?;
+        accepted.truncate(remaining);
+        games.append(&mut accepted);
+        Ok(())
+    }
+
+    fn high_score_entry_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Option<HighScoreEntry> {
+        let stored_season = Self::extract_number(item, "season")?;
+        Some(HighScoreEntry {
+            game_id: Self::extract_string(item, "gameId")?,
+            user_id: Self::extract_number(item, "userId")?,
+            username: Self::extract_string(item, "username")?,
+            score: Self::extract_number(item, "score")?,
+            region: Self::extract_string(item, "region")?,
+            game_type: Self::extract_string(item, "gameType")?,
+            season: Season::try_from(stored_season).ok()?,
+            timestamp: Self::extract_string(item, "timestamp")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))?,
+            news_eligible: Self::extract_bool(item, "newsEligible") == Some(true),
+        })
+    }
+
+    fn user_ranking_from_items<'a>(
+        items: impl IntoIterator<Item = &'a HashMap<String, AttributeValue>>,
+        user_id: i32,
+        queue_mode: &str,
+        game_type: &str,
+        region: &str,
+        season: Season,
+    ) -> Option<RankingEntry> {
+        let item = items
+            .into_iter()
+            .find(|item| Self::extract_number(item, "userId") == Some(user_id))?;
+
+        Some(RankingEntry {
+            user_id: Self::extract_number(item, "userId").unwrap_or(user_id),
+            username: Self::extract_string(item, "username").unwrap_or_default(),
+            mmr: Self::extract_number(item, "mmr").unwrap_or(1000),
+            games_played: Self::extract_number(item, "gamesPlayed").unwrap_or(0),
+            wins: Self::extract_number(item, "wins").unwrap_or(0),
+            losses: Self::extract_number(item, "losses").unwrap_or(0),
+            region: Self::extract_string(item, "region").unwrap_or_else(|| region.to_string()),
+            queue_mode: Self::extract_string(item, "queueMode")
+                .unwrap_or_else(|| queue_mode.to_string()),
+            game_type: Self::extract_string(item, "gameType")
+                .unwrap_or_else(|| game_type.to_string()),
+            season: Self::extract_number(item, "season")
+                .map(|stored_season| stored_season as Season)
+                .unwrap_or(season),
+            updated_at: Self::extract_string(item, "updatedAt")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+        })
+    }
+
+    /// Parse a leaderboard row only when its durable numeric season exactly
+    /// matches the requested partition. This is a second line of defense for
+    /// scan fallbacks and prevents Season 1 from admitting Season 10 rows.
+    fn leaderboard_entry_from_item(
+        item: &HashMap<String, AttributeValue>,
+        requested_season: Season,
+    ) -> Option<RankingEntry> {
+        let stored_season = Self::extract_number(item, "season")?;
+        let stored_season = Season::try_from(stored_season).ok()?;
+        if stored_season != requested_season {
+            return None;
+        }
+
+        Some(RankingEntry {
+            user_id: Self::extract_number(item, "userId")?,
+            username: Self::extract_string(item, "username")?,
+            mmr: Self::extract_number(item, "mmr")?,
+            games_played: Self::extract_number(item, "gamesPlayed")?,
+            wins: Self::extract_number(item, "wins")?,
+            losses: Self::extract_number(item, "losses")?,
+            region: Self::extract_string(item, "region")?,
+            queue_mode: Self::extract_string(item, "queueMode")?,
+            game_type: Self::extract_string(item, "gameType")
+                .unwrap_or_else(|| "unknown".to_string()),
+            season: stored_season,
+            updated_at: Self::extract_string(item, "updatedAt")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+        })
+    }
+
+    fn unique_public_high_score_leader(
+        ordered_head: &[Option<HighScoreEntry>],
+    ) -> Option<HighScoreEntry> {
+        let leader = ordered_head.first()?.as_ref()?;
+        if !leader.news_eligible {
+            return None;
+        }
+        if let Some(runner_up) = ordered_head.get(1) {
+            let runner_up = runner_up.as_ref()?;
+            if leader.score <= runner_up.score {
+                return None;
+            }
+        }
+        Some(leader.clone())
+    }
+
+    fn high_score_matches_sort_key(
+        item: &HashMap<String, AttributeValue>,
+        entry: &HighScoreEntry,
+    ) -> bool {
+        if !(0..=99_999_999).contains(&entry.score) {
+            return false;
+        }
+        let inverted = 99_999_999_i64 - i64::from(entry.score);
+        let expected_legacy = format!("SCORE#{inverted:08}#GAME#{}", entry.game_id);
+        let expected_completion = format!("{expected_legacy}#USER#{}", entry.user_id);
+        Self::extract_string(item, "sk")
+            .is_some_and(|sort_key| sort_key == expected_legacy || sort_key == expected_completion)
+    }
+
+    fn legacy_high_score_source_item_is_news_eligible(
+        item: Option<&HashMap<String, AttributeValue>>,
+        entry: &HighScoreEntry,
+    ) -> bool {
+        let Some(item) = item else {
+            return false;
+        };
+        if Self::extract_string(item, "status").as_deref() != Some("complete")
+            || Self::extract_bool(item, "isPrivate") != Some(false)
+            || Self::extract_string(item, "gameCode").is_some()
+        {
+            return false;
+        }
+        let Some(state) = Self::extract_string(item, "gameState")
+            .and_then(|value| serde_json::from_str::<common::GameState>(&value).ok())
+        else {
+            return false;
+        };
+        if state.is_stress_test
+            || state.game_code.is_some()
+            || !matches!(state.game_type, common::GameType::Solo)
+            || !matches!(state.status, common::GameStatus::Complete { .. })
+        {
+            return false;
+        }
+        let Ok(user_id) = u32::try_from(entry.user_id) else {
+            return false;
+        };
+        let Some(player) = state.players.get(&user_id) else {
+            return false;
+        };
+        state.scores.get(&player.snake_id).copied() == u32::try_from(entry.score).ok()
+            && state.usernames.get(&user_id) == Some(&entry.username)
+    }
+
+    /// Upgrade an old unmarked score only while its retained source snapshot
+    /// can still prove the exact public result. Missing/expired source games
+    /// remain ineligible rather than turning uncertainty into a headline.
+    async fn backfill_legacy_high_score_news_eligibility(
+        &self,
+        item: &HashMap<String, AttributeValue>,
+        entry: &HighScoreEntry,
+    ) -> Result<bool> {
+        if item.contains_key("newsEligible") {
+            return Ok(entry.news_eligible);
+        }
+        let Ok(game_id) = entry.game_id.parse::<i32>() else {
+            return Ok(false);
+        };
+        let source = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("isPrivate, gameCode, gameState, #status")
+            .expression_attribute_names("#status", "status")
+            .send()
+            .await
+            .context("Failed to verify a legacy high-score source")?;
+        if !Self::legacy_high_score_source_item_is_news_eligible(source.item.as_ref(), entry) {
+            return Ok(false);
+        }
+
+        let Some(pk) = Self::extract_string(item, "pk") else {
+            return Ok(false);
+        };
+        let Some(sk) = Self::extract_string(item, "sk") else {
+            return Ok(false);
+        };
+        let response = self
+            .client
+            .update_item()
+            .table_name(self.high_scores_table())
+            .key("pk", Self::av_s(pk))
+            .key("sk", Self::av_s(sk))
+            .update_expression("SET newsEligible = if_not_exists(newsEligible, :news_eligible)")
+            .expression_attribute_values(":news_eligible", Self::av_bool(true))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await
+            .context("Failed to backfill legacy high-score provenance")?;
+
+        Ok(response
+            .attributes
+            .as_ref()
+            .and_then(|attributes| Self::extract_bool(attributes, "newsEligible"))
+            == Some(true))
+    }
+
+    async fn query_global_news_high_score_snapshot(
+        &self,
+        game_type: &str,
+        season: Season,
+    ) -> Result<NewsHighScoreSnapshot> {
+        let partition = format!("{game_type}#{season}");
+        // No filter is applied: these must be the actual first two rows so a
+        // private or malformed top row cannot promote the next public score.
+        // One bounded read is enough to prove a unique leader and cannot walk
+        // an append-only season partition looking for eligible rows.
+        let response = self
+            .client
+            .query()
+            .table_name(self.high_scores_table())
+            .index_name("GameTypeSeasonIndex")
+            .key_condition_expression("gameTypeSeason = :partition")
+            .expression_attribute_values(":partition", Self::av_s(&partition))
+            .scan_index_forward(true)
+            .limit(2)
+            .send()
+            .await
+            .context("Failed to query ordered global news high scores")?;
+        let mut ordered_head = Vec::with_capacity(2);
+        for (index, item) in response
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            let mut parsed = Self::high_score_entry_from_item(&item).filter(|entry| {
+                entry.game_type == game_type
+                    && entry.season == season
+                    && Self::high_score_matches_sort_key(&item, entry)
+            });
+            if index == 0
+                && let Some(entry) = parsed.as_mut()
+                && !entry.news_eligible
+                && self
+                    .backfill_legacy_high_score_news_eligibility(&item, entry)
+                    .await?
+            {
+                entry.news_eligible = true;
+            }
+            ordered_head.push(parsed);
+        }
+
+        Ok(NewsHighScoreSnapshot {
+            leader: Self::unique_public_high_score_leader(&ordered_head),
+            coverage: NewsLeaderboardCoverage::OrderedGlobalIndex,
+        })
     }
 
     fn runtime_game_identity(game_id: i32, game_state: &common::GameState) -> String {
@@ -2530,6 +2915,56 @@ impl Database for DynamoDatabase {
         }
     }
 
+    async fn get_recent_completed_games(&self, limit: usize) -> Result<Vec<Game>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut games = Vec::with_capacity(limit.min(RECENT_COMPLETED_GAMES_PAGE_SIZE));
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+        let now_epoch_seconds = Utc::now().timestamp();
+
+        while games.len() < limit {
+            let remaining = limit - games.len();
+            let page_limit = Self::recent_completed_games_page_limit(remaining)
+                .expect("remaining recent-game count is positive");
+            let mut request = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI1")
+                .key_condition_expression(
+                    "gsi1pk = :game_partition AND begins_with(gsi1sk, :complete_prefix)",
+                )
+                .expression_attribute_values(":game_partition", Self::av_s("GAME"))
+                .expression_attribute_values(":complete_prefix", Self::av_s("complete#"))
+                .scan_index_forward(false)
+                .limit(page_limit);
+            if let Some(key) = &last_evaluated_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to query recent completed games")?;
+            let next_key = response.last_evaluated_key;
+            Self::append_recent_completed_games_from_items(
+                &mut games,
+                response.items.unwrap_or_default(),
+                now_epoch_seconds,
+                limit,
+            )?;
+
+            let Some(next_key) = next_key else {
+                break;
+            };
+            last_evaluated_key = Some(next_key);
+        }
+
+        Ok(games)
+    }
+
     async fn update_game_status(&self, game_id: i32, status: &str) -> Result<()> {
         let now = Utc::now();
 
@@ -2568,6 +3003,7 @@ impl Database for DynamoDatabase {
         }
 
         let ended_at = Utc::now();
+        let season = get_season_at(ended_at);
         let created_at =
             DateTime::<Utc>::from_timestamp_millis(game_state.start_ms).unwrap_or(ended_at);
         let configured_retention = std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV).ok();
@@ -2598,13 +3034,32 @@ impl Database for DynamoDatabase {
         } else {
             "matchmaking"
         };
+        let news_eligible = match self
+            .source_game_is_news_eligible(
+                game_id,
+                Self::new_game_state_is_news_eligible(game_state),
+            )
+            .await
+        {
+            Ok(eligible) => eligible,
+            Err(error) => {
+                warn!(
+                    game_id,
+                    %error,
+                    "Could not verify completed-game source for public news; failing closed"
+                );
+                false
+            }
+        };
 
         let mut update_expression = concat!(
             "SET gsi1pk = :gsi1pk, gsi1sk = :gsi1sk, id = :id, ",
             "serverId = :server_id, gameType = :game_type, gameState = :game_state, ",
             "#status = :status, endedAt = :ended_at, lastActivity = :last_activity, ",
             "createdAt = :created_at, gameMode = :game_mode, ",
-            "isPrivate = :is_private, runtimeIdentity = :runtime_identity, #ttl = :ttl"
+            "isPrivate = if_not_exists(isPrivate, :is_private), ",
+            "runtimeIdentity = :runtime_identity, season = :season, ",
+            "newsEligible = :news_eligible, #ttl = :ttl"
         )
         .to_string();
 
@@ -2643,7 +3098,9 @@ impl Database for DynamoDatabase {
             .expression_attribute_values(":last_activity", Self::av_s(ended_at.to_rfc3339()))
             .expression_attribute_values(":created_at", Self::av_s(created_at.to_rfc3339()))
             .expression_attribute_values(":game_mode", Self::av_s(game_mode))
+            .expression_attribute_values(":season", Self::av_n(season))
             .expression_attribute_values(":runtime_identity", Self::av_s(runtime_identity))
+            .expression_attribute_values(":news_eligible", Self::av_bool(news_eligible))
             .expression_attribute_values(
                 ":is_private",
                 Self::av_bool(game_state.game_code.is_some()),
@@ -2712,6 +3169,25 @@ impl Database for DynamoDatabase {
                     } else {
                         "matchmaking"
                     };
+                    let news_eligible = match self
+                        .source_game_is_news_eligible(
+                            completion.game_id as i32,
+                            Self::new_game_state_is_news_eligible(&completion.final_state),
+                        )
+                        .await
+                    {
+                        Ok(eligible) => eligible,
+                        Err(error) => {
+                            // Result persistence is mandatory; public news is
+                            // optional and must fail closed under uncertainty.
+                            warn!(
+                                game_id = completion.game_id,
+                                %error,
+                                "Could not verify completion source for public news; failing closed"
+                            );
+                            false
+                        }
+                    };
                     let runtime_identity = Self::runtime_game_identity(
                         completion.game_id as i32,
                         &completion.final_state,
@@ -2721,12 +3197,16 @@ impl Database for DynamoDatabase {
                         "SET gsi1pk=:gsi1pk, gsi1sk=:gsi1sk, id=:id, serverId=:server, ",
                         "gameType=:game_type, gameState=:game_state, #status=:status, ",
                         "endedAt=:ended, lastActivity=:ended, createdAt=:created, ",
-                        "gameMode=:mode, isPrivate=:private, runtimeIdentity=:runtime, ",
-                        "completionRevision=:revision, #ttl=:ttl"
+                        "gameMode=:mode, isPrivate=if_not_exists(isPrivate,:private), ",
+                        "runtimeIdentity=:runtime, completionRevision=:revision, ",
+                        "newsEligible=:news_eligible, #ttl=:ttl"
                     )
                     .to_string();
                     if completion.final_state.game_code.is_some() {
                         expression.push_str(", gameCode=:game_code");
+                    }
+                    if completion.season.is_some() {
+                        expression.push_str(", season=:season");
                     }
 
                     let mut update = Update::builder()
@@ -2768,10 +3248,14 @@ impl Database for DynamoDatabase {
                             ":revision",
                             Self::av_s(completion.revision.to_string()),
                         )
+                        .expression_attribute_values(":news_eligible", Self::av_bool(news_eligible))
                         .expression_attribute_values(":ttl", Self::av_n(ttl));
                     if let Some(game_code) = &completion.final_state.game_code {
                         update =
                             update.expression_attribute_values(":game_code", Self::av_s(game_code));
+                    }
+                    if let Some(season) = completion.season {
+                        update = update.expression_attribute_values(":season", Self::av_n(season));
                     }
                     vec![
                         TransactWriteItem::builder()
@@ -3052,6 +3536,20 @@ impl Database for DynamoDatabase {
                     season,
                     ..
                 } => {
+                    let news_eligible = match self
+                        .completed_game_is_news_eligible(completion.game_id)
+                        .await
+                    {
+                        Ok(eligible) => eligible,
+                        Err(error) => {
+                            warn!(
+                                game_id = completion.game_id,
+                                %error,
+                                "Could not verify high-score source for public news; failing closed"
+                            );
+                            false
+                        }
+                    };
                     let game_type_string = Self::game_type_to_string(game_type);
                     let inverted = 99_999_999_i64 - i64::from(*score);
                     let pk = format!("SCORE#{game_type_string}#{season}#{region}");
@@ -3084,6 +3582,7 @@ impl Database for DynamoDatabase {
                             "completionRevision",
                             Self::av_s(completion.revision.to_string()),
                         )
+                        .item("newsEligible", Self::av_bool(news_eligible))
                         .condition_expression(
                             "attribute_not_exists(pk) AND attribute_not_exists(sk)",
                         )
@@ -3336,7 +3835,6 @@ impl Database for DynamoDatabase {
         item.insert("gameType".to_string(), Self::av_s(&game_type_str));
         item.insert("season".to_string(), Self::av_n(season));
         item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
-
         // Delete old entry if MMR changed (SK will be different)
         if let Some(prev_mmr) = old_mmr
             && prev_mmr != mmr
@@ -3416,9 +3914,7 @@ impl Database for DynamoDatabase {
                 // Prefer the GameTypeSeasonIndex to query all regions in a single partition
                 let game_type_season =
                     format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
-                let mut gsi_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
-
-                match self
+                let gsi_items = match self
                     .client
                     .query()
                     .table_name(self.rankings_table())
@@ -3430,17 +3926,20 @@ impl Database for DynamoDatabase {
                     .await
                 {
                     Ok(response) => {
-                        gsi_items = response.items.unwrap_or_default();
+                        // A successful empty query is authoritative for a new
+                        // season. Only an unavailable index justifies scanning.
+                        Some(response.items.unwrap_or_default())
                     }
                     Err(err) => {
                         warn!(
                             "Falling back to scan for global rankings (GameTypeSeasonIndex not available?): {:?}",
                             err
                         );
+                        None
                     }
-                }
+                };
 
-                if !gsi_items.is_empty() {
+                if let Some(gsi_items) = gsi_items {
                     gsi_items
                 } else {
                     // Fallback: scan across all regions for the requested season
@@ -3454,9 +3953,10 @@ impl Database for DynamoDatabase {
                             .client
                             .scan()
                             .table_name(self.rankings_table())
-                            .filter_expression("begins_with(pk, :prefix) AND contains(pk, :season)")
+                            .filter_expression("begins_with(pk, :prefix) AND #season = :season")
+                            .expression_attribute_names("#season", "season")
                             .expression_attribute_values(":prefix", Self::av_s(&pk_prefix))
-                            .expression_attribute_values(":season", Self::av_s(&season_str))
+                            .expression_attribute_values(":season", Self::av_n(season))
                             .limit((target_items - items.len()) as i32);
 
                         if let Some(ref lek) = last_evaluated_key {
@@ -3487,11 +3987,13 @@ impl Database for DynamoDatabase {
                 .client
                 .scan()
                 .table_name(self.rankings_table())
-                .filter_expression("begins_with(pk, :prefix)")
+                .filter_expression("begins_with(pk, :prefix) AND #season = :season")
+                .expression_attribute_names("#season", "season")
                 .expression_attribute_values(
                     ":prefix",
-                    Self::av_s(format!("RANKING#{}", queue_mode_str)),
+                    Self::av_s(format!("RANKING#{}#", queue_mode_str)),
                 )
+                .expression_attribute_values(":season", Self::av_n(season))
                 .limit(limit as i32)
                 .send()
                 .await
@@ -3503,27 +4005,7 @@ impl Database for DynamoDatabase {
         // Parse results into RankingEntry
         let mut entries: Vec<RankingEntry> = items
             .into_iter()
-            .filter_map(|item| {
-                Some(RankingEntry {
-                    user_id: Self::extract_number(&item, "userId")?,
-                    username: Self::extract_string(&item, "username")?,
-                    mmr: Self::extract_number(&item, "mmr")?,
-                    games_played: Self::extract_number(&item, "gamesPlayed")?,
-                    wins: Self::extract_number(&item, "wins")?,
-                    losses: Self::extract_number(&item, "losses")?,
-                    region: Self::extract_string(&item, "region")?,
-                    queue_mode: Self::extract_string(&item, "queueMode")?,
-                    game_type: Self::extract_string(&item, "gameType")
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    season: Self::extract_number(&item, "season")
-                        .map(|s| s as Season)
-                        .unwrap_or(season),
-                    updated_at: Self::extract_string(&item, "updatedAt")
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(Utc::now),
-                })
-            })
+            .filter_map(|item| Self::leaderboard_entry_from_item(&item, season))
             .collect();
 
         // Sort by MMR descending (in case we scanned multiple regions)
@@ -3555,49 +4037,43 @@ impl Database for DynamoDatabase {
             queue_mode_str, game_type_str, region, season
         );
 
-        // Query all rankings for this PK and filter in memory for the user
-        // We can't use filter on sk since it's a key attribute
-        let response = self
-            .client
-            .query()
-            .table_name(self.rankings_table())
-            .key_condition_expression("pk = :pk")
-            .expression_attribute_values(":pk", Self::av_s(&pk))
-            .consistent_read(true)
-            .send()
-            .await
-            .context("Failed to query rankings")?;
+        // A ranking partition can exceed DynamoDB's 1 MiB response page. Keep
+        // following LastEvaluatedKey until the requested user is found or the
+        // partition is genuinely exhausted.
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut request = self
+                .client
+                .query()
+                .table_name(self.rankings_table())
+                .key_condition_expression("pk = :pk")
+                .filter_expression("#user_id = :user_id_number OR #user_id = :user_id_string")
+                .expression_attribute_names("#user_id", "userId")
+                .expression_attribute_values(":pk", Self::av_s(&pk))
+                .expression_attribute_values(":user_id_number", Self::av_n(user_id))
+                .expression_attribute_values(":user_id_string", Self::av_s(user_id.to_string()))
+                .consistent_read(true);
+            if let Some(key) = &last_evaluated_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
 
-        let items = response.items.unwrap_or_default();
+            let response = request.send().await.context("Failed to query rankings")?;
+            if let Some(entry) = Self::user_ranking_from_items(
+                response.items.as_deref().unwrap_or_default(),
+                user_id,
+                queue_mode_str,
+                &game_type_str,
+                region,
+                season,
+            ) {
+                return Ok(Some(entry));
+            }
 
-        // Filter in memory for the specific user
-        let user_item = items
-            .iter()
-            .find(|item| Self::extract_number(item, "userId") == Some(user_id));
-
-        let item = match user_item {
-            Some(item) => item,
-            None => return Ok(None),
-        };
-        Ok(Some(RankingEntry {
-            user_id: Self::extract_number(item, "userId").unwrap_or(user_id),
-            username: Self::extract_string(item, "username").unwrap_or_default(),
-            mmr: Self::extract_number(item, "mmr").unwrap_or(1000),
-            games_played: Self::extract_number(item, "gamesPlayed").unwrap_or(0),
-            wins: Self::extract_number(item, "wins").unwrap_or(0),
-            losses: Self::extract_number(item, "losses").unwrap_or(0),
-            region: Self::extract_string(item, "region").unwrap_or(region.to_string()),
-            queue_mode: Self::extract_string(item, "queueMode")
-                .unwrap_or(queue_mode_str.to_string()),
-            game_type: Self::extract_string(item, "gameType").unwrap_or(game_type_str.clone()),
-            season: Self::extract_number(item, "season")
-                .map(|s| s as Season)
-                .unwrap_or(season),
-            updated_at: Self::extract_string(item, "updatedAt")
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
-        }))
+            let Some(next_key) = response.last_evaluated_key else {
+                return Ok(None);
+            };
+            last_evaluated_key = Some(next_key);
+        }
     }
 
     async fn insert_high_score(
@@ -3647,6 +4123,8 @@ impl Database for DynamoDatabase {
             .item("season", Self::av_n(season))
             .item("gameTypeSeason", Self::av_s(&game_type_season))
             .item("timestamp", Self::av_s(&timestamp))
+            // This legacy API cannot verify the source game's privacy.
+            .item("newsEligible", Self::av_bool(false))
             .send()
             .await
             .context("Failed to insert high score")?;
@@ -3710,6 +4188,7 @@ impl Database for DynamoDatabase {
                             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(Utc::now),
+                        news_eligible: Self::extract_bool(&item, "newsEligible") == Some(true),
                     };
                     debug!(
                         "Parsed high score entry - user: {}, score: {}, game_id: {}",
@@ -3759,6 +4238,7 @@ impl Database for DynamoDatabase {
                                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(Utc::now),
+                            news_eligible: Self::extract_bool(&item, "newsEligible") == Some(true),
                         };
                         Some(entry)
                     })
@@ -3833,6 +4313,7 @@ impl Database for DynamoDatabase {
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(Utc::now),
+                    news_eligible: Self::extract_bool(&item, "newsEligible") == Some(true),
                 };
                 Some(entry)
             })
@@ -3846,6 +4327,31 @@ impl Database for DynamoDatabase {
             entries.len()
         );
         Ok(entries)
+    }
+
+    async fn get_news_high_score_snapshot(
+        &self,
+        game_type: &common::GameType,
+        season: Season,
+    ) -> Result<NewsHighScoreSnapshot> {
+        self.create_high_scores_table_if_not_exists().await?;
+        let game_type = Self::game_type_to_string(game_type);
+        match self
+            .query_global_news_high_score_snapshot(&game_type, season)
+            .await
+        {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Withholding Solo-leader claims and using a bounded sample because GameTypeSeasonIndex is unavailable"
+                );
+                Ok(NewsHighScoreSnapshot {
+                    leader: None,
+                    coverage: NewsLeaderboardCoverage::BoundedSample,
+                })
+            }
+        }
     }
 }
 
@@ -4243,6 +4749,21 @@ mod tests {
             Some(ended_at)
         );
         assert_eq!(game.game_state, Some(json!({ "tick": 42 })));
+        assert_eq!(game.season, None, "legacy rows have no proven season");
+        assert!(!game.news_eligible, "legacy rows must fail closed");
+
+        item.insert("season".to_string(), DynamoDatabase::av_n(7));
+        item.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        item.insert("newsEligible".to_string(), DynamoDatabase::av_bool(true));
+        let current = DynamoDatabase::game_from_item(123, &item).unwrap();
+        assert_eq!(current.season, Some(7));
+        assert!(current.news_eligible);
+
+        item.insert("season".to_string(), DynamoDatabase::av_n(-1));
+        assert_eq!(
+            DynamoDatabase::game_from_item(123, &item).unwrap().season,
+            None
+        );
     }
 
     #[test]
@@ -4258,6 +4779,379 @@ mod tests {
 
         let item_without_ttl = HashMap::new();
         assert!(!DynamoDatabase::item_is_expired(&item_without_ttl, 101));
+    }
+
+    #[test]
+    fn completed_game_news_provenance_requires_explicit_public_terminal_row() {
+        let mut public = HashMap::new();
+        public.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        public.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        public.insert("newsEligible".to_string(), DynamoDatabase::av_bool(true));
+        assert!(DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &public
+        )));
+
+        let mut private = public.clone();
+        private.insert("isPrivate".to_string(), DynamoDatabase::av_bool(true));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &private
+        )));
+
+        let mut code_gated = public.clone();
+        code_gated.insert("gameCode".to_string(), DynamoDatabase::av_s("SECRET"));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &code_gated
+        )));
+
+        let mut legacy = public.clone();
+        legacy.remove("newsEligible");
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &legacy
+        )));
+
+        let mut unfinished = public.clone();
+        unfinished.insert("status".to_string(), DynamoDatabase::av_s("started"));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &unfinished
+        )));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(None));
+    }
+
+    #[test]
+    fn source_game_news_provenance_preserves_private_metadata_and_legacy_uncertainty() {
+        assert!(DynamoDatabase::source_game_item_is_news_eligible(
+            None, true
+        ));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            None, false
+        ));
+
+        let mut waiting_public = HashMap::new();
+        waiting_public.insert("status".to_string(), DynamoDatabase::av_s("waiting"));
+        waiting_public.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        assert!(DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&waiting_public),
+            false
+        ));
+
+        let mut waiting_private = waiting_public.clone();
+        waiting_private.insert("isPrivate".to_string(), DynamoDatabase::av_bool(true));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&waiting_private),
+            true
+        ));
+
+        let mut code_gated = waiting_public.clone();
+        code_gated.insert("gameCode".to_string(), DynamoDatabase::av_s("SECRET"));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&code_gated),
+            true
+        ));
+
+        let mut completed_legacy = waiting_public.clone();
+        completed_legacy.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&completed_legacy),
+            true
+        ));
+
+        let mut completed_verified = completed_legacy.clone();
+        completed_verified.insert("newsEligible".to_string(), DynamoDatabase::av_bool(true));
+        assert!(DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&completed_verified),
+            false
+        ));
+    }
+
+    #[test]
+    fn legacy_score_backfill_requires_an_exact_public_source_result() {
+        let score_item = high_score_item("42", 2_000, false);
+        let entry = DynamoDatabase::high_score_entry_from_item(&score_item).unwrap();
+        let user_id = u32::try_from(entry.user_id).unwrap();
+        let mut state = common::GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            1,
+        );
+        let player = state
+            .add_player(user_id, Some(entry.username.clone()))
+            .unwrap();
+        state.scores.insert(player.snake_id, 2_000);
+        state.status = common::GameStatus::Complete {
+            winning_snake_id: Some(player.snake_id),
+        };
+
+        let mut source = HashMap::new();
+        source.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        source.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        source.insert(
+            "gameState".to_string(),
+            DynamoDatabase::av_s(serde_json::to_string(&state).unwrap()),
+        );
+        assert!(
+            DynamoDatabase::legacy_high_score_source_item_is_news_eligible(Some(&source), &entry)
+        );
+
+        source.insert("isPrivate".to_string(), DynamoDatabase::av_bool(true));
+        assert!(
+            !DynamoDatabase::legacy_high_score_source_item_is_news_eligible(Some(&source), &entry)
+        );
+
+        source.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        let mut wrong_score = entry;
+        wrong_score.score += 1;
+        assert!(
+            !DynamoDatabase::legacy_high_score_source_item_is_news_eligible(
+                Some(&source),
+                &wrong_score
+            )
+        );
+    }
+
+    #[test]
+    fn recent_completed_game_page_limit_is_bounded_without_capping_the_total() {
+        assert_eq!(DynamoDatabase::recent_completed_games_page_limit(0), None);
+        assert_eq!(
+            DynamoDatabase::recent_completed_games_page_limit(1),
+            Some(1)
+        );
+        assert_eq!(
+            DynamoDatabase::recent_completed_games_page_limit(
+                RECENT_COMPLETED_GAMES_PAGE_SIZE + 56
+            ),
+            Some(RECENT_COMPLETED_GAMES_PAGE_SIZE as i32)
+        );
+        assert_eq!(
+            DynamoDatabase::recent_completed_games_page_limit(56),
+            Some(56)
+        );
+    }
+
+    #[test]
+    fn recent_completed_games_exclude_expired_rows_and_preserve_query_order() {
+        fn completed_item(
+            id: i32,
+            ended_at: &str,
+            ttl: Option<i64>,
+        ) -> HashMap<String, AttributeValue> {
+            let mut item = HashMap::new();
+            item.insert("id".to_string(), DynamoDatabase::av_n(id));
+            item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+            item.insert("endedAt".to_string(), DynamoDatabase::av_s(ended_at));
+            if let Some(ttl) = ttl {
+                item.insert("ttl".to_string(), DynamoDatabase::av_n(ttl));
+            }
+            item
+        }
+
+        let items = vec![
+            completed_item(30, "2026-08-14T12:03:00+00:00", None),
+            completed_item(20, "2026-08-14T12:02:00+00:00", Some(99)),
+            completed_item(10, "2026-08-14T12:01:00+00:00", Some(101)),
+        ];
+
+        let games = DynamoDatabase::recent_completed_games_from_items(items, 100).unwrap();
+
+        assert_eq!(
+            games.iter().map(|game| game.id).collect::<Vec<_>>(),
+            vec![30, 10]
+        );
+    }
+
+    #[test]
+    fn recent_completed_games_fill_the_accepted_limit_across_filtered_pages() {
+        fn completed_item(id: i32, ttl: Option<i64>) -> HashMap<String, AttributeValue> {
+            let mut item = HashMap::new();
+            item.insert("id".to_string(), DynamoDatabase::av_n(id));
+            item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+            if let Some(ttl) = ttl {
+                item.insert("ttl".to_string(), DynamoDatabase::av_n(ttl));
+            }
+            item
+        }
+
+        let mut games = Vec::new();
+        DynamoDatabase::append_recent_completed_games_from_items(
+            &mut games,
+            vec![completed_item(30, None), completed_item(20, Some(99))],
+            100,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            games.iter().map(|game| game.id).collect::<Vec<_>>(),
+            vec![30]
+        );
+
+        DynamoDatabase::append_recent_completed_games_from_items(
+            &mut games,
+            vec![completed_item(10, None), completed_item(9, None)],
+            100,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            games.iter().map(|game| game.id).collect::<Vec<_>>(),
+            vec![30, 10]
+        );
+    }
+
+    fn ranking_item(user_id: i32, mmr: i32) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("userId".to_string(), DynamoDatabase::av_n(user_id));
+        item.insert(
+            "username".to_string(),
+            DynamoDatabase::av_s(format!("player-{user_id}")),
+        );
+        item.insert("mmr".to_string(), DynamoDatabase::av_n(mmr));
+        item.insert("gamesPlayed".to_string(), DynamoDatabase::av_n(20));
+        item.insert("wins".to_string(), DynamoDatabase::av_n(12));
+        item.insert("losses".to_string(), DynamoDatabase::av_n(8));
+        item.insert("region".to_string(), DynamoDatabase::av_s("test"));
+        item.insert("queueMode".to_string(), DynamoDatabase::av_s("ranked"));
+        item.insert("gameType".to_string(), DynamoDatabase::av_s("duel"));
+        item.insert("season".to_string(), DynamoDatabase::av_n(0));
+        item.insert(
+            "updatedAt".to_string(),
+            DynamoDatabase::av_s("2026-08-14T12:00:00Z"),
+        );
+        item
+    }
+
+    #[test]
+    fn leaderboard_rows_require_an_exact_numeric_season() {
+        let mut season_one = ranking_item(1, 1_500);
+        season_one.insert("season".to_string(), DynamoDatabase::av_n(1));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&season_one, 1).is_some());
+
+        let mut season_ten = ranking_item(10, 1_900);
+        season_ten.insert("season".to_string(), DynamoDatabase::av_n(10));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&season_ten, 1).is_none());
+
+        let mut legacy = ranking_item(2, 1_400);
+        legacy.remove("season");
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&legacy, 1).is_none());
+
+        let mut invalid = ranking_item(3, 1_300);
+        invalid.insert("season".to_string(), DynamoDatabase::av_n(-1));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&invalid, 1).is_none());
+    }
+
+    fn high_score_item(
+        game_id: &str,
+        score: i32,
+        news_eligible: bool,
+    ) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("gameId".to_string(), DynamoDatabase::av_s(game_id));
+        item.insert("userId".to_string(), DynamoDatabase::av_n(score));
+        item.insert(
+            "username".to_string(),
+            DynamoDatabase::av_s(format!("player-{score}")),
+        );
+        item.insert("score".to_string(), DynamoDatabase::av_n(score));
+        let inverted = (99_999_999_i64 - i64::from(score)).max(0);
+        item.insert(
+            "sk".to_string(),
+            DynamoDatabase::av_s(format!("SCORE#{inverted:08}#GAME#{game_id}")),
+        );
+        item.insert("region".to_string(), DynamoDatabase::av_s("test"));
+        item.insert("gameType".to_string(), DynamoDatabase::av_s("solo"));
+        item.insert("season".to_string(), DynamoDatabase::av_n(0));
+        item.insert(
+            "timestamp".to_string(),
+            DynamoDatabase::av_s("2026-08-14T12:00:00Z"),
+        );
+        item.insert(
+            "newsEligible".to_string(),
+            DynamoDatabase::av_bool(news_eligible),
+        );
+        item
+    }
+
+    #[test]
+    fn user_ranking_search_can_find_a_match_on_a_later_page() {
+        let pages = [
+            vec![ranking_item(1, 1_500), ranking_item(2, 1_400)],
+            vec![ranking_item(42, 1_300)],
+        ];
+
+        let entry = pages.iter().find_map(|page| {
+            DynamoDatabase::user_ranking_from_items(page, 42, "ranked", "duel", "test", 0)
+        });
+
+        assert_eq!(entry.map(|entry| entry.user_id), Some(42));
+    }
+
+    #[test]
+    fn ordered_score_head_requires_a_public_strictly_greater_top() {
+        let private_top =
+            DynamoDatabase::high_score_entry_from_item(&high_score_item("private", 2_000, false));
+        let public_runner_up =
+            DynamoDatabase::high_score_entry_from_item(&high_score_item("public", 1_900, true));
+        assert!(
+            DynamoDatabase::unique_public_high_score_leader(&[
+                private_top,
+                public_runner_up.clone()
+            ])
+            .is_none()
+        );
+
+        let tied = DynamoDatabase::high_score_entry_from_item(&high_score_item("tie", 1_900, true));
+        assert!(
+            DynamoDatabase::unique_public_high_score_leader(&[public_runner_up, tied]).is_none()
+        );
+
+        let top = DynamoDatabase::high_score_entry_from_item(&high_score_item("top", 2_000, true));
+        let runner_up =
+            DynamoDatabase::high_score_entry_from_item(&high_score_item("runner", 1_900, true));
+        assert_eq!(
+            DynamoDatabase::unique_public_high_score_leader(&[top.clone(), runner_up.clone()])
+                .map(|entry| entry.game_id),
+            Some("top".to_string())
+        );
+        assert!(DynamoDatabase::unique_public_high_score_leader(&[runner_up, top]).is_none());
+        assert!(DynamoDatabase::unique_public_high_score_leader(&[None]).is_none());
+    }
+
+    #[test]
+    fn news_score_value_must_match_its_ordering_key() {
+        let mut item = high_score_item("top", 2_000, true);
+        let entry = DynamoDatabase::high_score_entry_from_item(&item).unwrap();
+        assert!(DynamoDatabase::high_score_matches_sort_key(&item, &entry));
+
+        item.insert(
+            "sk".to_string(),
+            DynamoDatabase::av_s("SCORE#99999999#GAME#top"),
+        );
+        assert!(!DynamoDatabase::high_score_matches_sort_key(&item, &entry));
+
+        let mut wrong_game = high_score_item("top", 2_000, true);
+        wrong_game.insert(
+            "sk".to_string(),
+            DynamoDatabase::av_s("SCORE#99997999#GAME#some-other-game"),
+        );
+        assert!(!DynamoDatabase::high_score_matches_sort_key(
+            &wrong_game,
+            &entry
+        ));
+
+        let mut out_of_range = entry;
+        out_of_range.score = 100_000_000;
+        assert!(!DynamoDatabase::high_score_matches_sort_key(
+            &high_score_item("top", 2_000, true),
+            &out_of_range
+        ));
+    }
+
+    #[test]
+    fn news_scores_with_missing_timestamps_fail_closed() {
+        let mut score = high_score_item("score", 2_000, true);
+        score.remove("timestamp");
+        assert!(DynamoDatabase::high_score_entry_from_item(&score).is_none());
     }
 
     #[test]

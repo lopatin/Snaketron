@@ -3,13 +3,14 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::api::middleware::AuthUser;
 use crate::db::Database;
-use crate::season::{Season, get_current_season, get_ranking_region};
+use crate::season::{Season, get_current_season, get_ranking_region, get_season_at, seasons_at};
 use common::{GameType, QueueMode};
 
 /// Query parameters for leaderboard endpoint
@@ -288,12 +289,11 @@ pub async fn get_leaderboard(
     })
 }
 
-/// List available seasons
-/// Returns a list of all seasons that have ranking data
+/// List every season that has begun, newest first.
 pub async fn list_seasons(State(_state): State<LeaderboardState>) -> Json<SeasonsResponse> {
-    // Placeholder: return only the current season until season schedule/roller exists
-    let current_season = get_current_season();
-    let seasons = vec![current_season];
+    let now = Utc::now();
+    let current_season = get_season_at(now);
+    let seasons = seasons_at(now);
 
     Json(SeasonsResponse {
         seasons,

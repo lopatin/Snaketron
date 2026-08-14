@@ -153,6 +153,19 @@ pub trait Database: Send + Sync {
         season: Season,
         limit: usize,
     ) -> Result<Vec<HighScoreEntry>>;
+    /// Return a global Solo snapshot for news. Backends must opt into leader
+    /// claims by proving their read is globally ordered and by inspecting the
+    /// actual top row before applying public-attribution filters.
+    async fn get_news_high_score_snapshot(
+        &self,
+        _game_type: &common::GameType,
+        _season: Season,
+    ) -> Result<NewsHighScoreSnapshot> {
+        Ok(NewsHighScoreSnapshot {
+            leader: None,
+            coverage: NewsLeaderboardCoverage::BoundedSample,
+        })
+    }
 
     // Game operations
     /// Allocate a globally unique game ID from durable storage.
@@ -169,6 +182,14 @@ pub trait Database: Send + Sync {
     ) -> Result<i32>;
     async fn get_game_by_id(&self, game_id: i32) -> Result<Option<Game>>;
     async fn get_game_by_code(&self, game_code: &str) -> Result<Option<Game>>;
+    /// Return the newest durable completed games first.
+    ///
+    /// Backends that do not provide a completion index safely expose no recent
+    /// games instead of blocking unrelated server features on this optional
+    /// read model.
+    async fn get_recent_completed_games(&self, _limit: usize) -> Result<Vec<Game>> {
+        Ok(Vec::new())
+    }
     async fn update_game_status(&self, game_id: i32, status: &str) -> Result<()>;
     /// Persist the final authoritative state for a completed runtime game.
     ///

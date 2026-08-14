@@ -59,6 +59,13 @@ as the authoritative kick deadline alongside the countdown length. Existing
 matches retain the policy they started with; after a server restart, changed
 values apply to new matches without a client deployment.
 
+Season schedule:
+
+- Seasons roll automatically on UTC calendar quarters; there is no current-season environment variable or deployment step.
+- Existing and pre-launch numeric data remains in Season 0 through `2026-09-30T23:59:59.999Z`. Season 1 begins at `2026-10-01T00:00:00Z`, Season 2 at `2027-01-01T00:00:00Z`, and subsequent seasons begin every January, April, July, and October.
+- Completed games derive their immutable season from the authoritative completion timestamp, so a delayed retry after a boundary cannot move a result into another season.
+- Skill rating carries across season boundaries; seasonal ranking wins/losses and Solo high-score partitions restart in the new season.
+
 Completed game retention:
 
 - `SNAKETRON_COMPLETED_GAME_RETENTION_DAYS`: Number of days to retain final game snapshots in DynamoDB (default: `30`)

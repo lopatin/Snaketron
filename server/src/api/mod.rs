@@ -3,6 +3,7 @@ pub mod crazygames;
 pub mod jwt;
 pub mod leaderboard;
 pub mod middleware;
+pub mod news;
 pub mod rate_limit;
 pub mod regions;
 pub mod server;

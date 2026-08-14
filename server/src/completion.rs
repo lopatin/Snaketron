@@ -7,8 +7,9 @@
 
 use crate::db::Database;
 use crate::mmr_persistence::calculate_mmr_effect_specs;
-use crate::season::{get_current_season, get_region};
+use crate::season::{Season, get_region, get_season_at};
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use common::{GameState, GameStatus, GameType, QueueMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +59,11 @@ pub struct CompletionRecordV1 {
     pub revision: Uuid,
     pub ended_at_ms: i64,
     pub server_id: u64,
+    /// Season captured before the durable completion commit. Older records
+    /// deserialize without it and remain replayable, but cannot feed seasonal
+    /// news because their cohort is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<Season>,
     pub final_state: GameState,
     pub effects: Vec<CompletionEffect>,
 }
@@ -125,6 +131,19 @@ impl CompletionRecordV1 {
                 ));
             }
             effect.validate_identity(self)?;
+            let effect_season = match effect {
+                CompletionEffect::UpdateRanking { season, .. }
+                | CompletionEffect::InsertHighScore { season, .. } => Some(*season),
+                _ => None,
+            };
+            if let (Some(record_season), Some(effect_season)) = (self.season, effect_season)
+                && record_season != effect_season
+            {
+                return Err(anyhow!(
+                    "completion season {record_season} does not match effect {} season {effect_season}",
+                    effect.id()
+                ));
+            }
             if matches!(effect, CompletionEffect::PersistGame { .. }) {
                 persist_game_count += 1;
             }
@@ -477,6 +496,7 @@ pub async fn materialize_completion(
         ));
     }
 
+    let season = season_for_completion_timestamp(ended_at_ms)?;
     let mut effects = vec![CompletionEffect::PersistGame {
         id: "game".to_string(),
     }];
@@ -499,7 +519,6 @@ pub async fn materialize_completion(
         }
 
         let region = get_region();
-        let season = get_current_season();
         if matches!(final_state.game_type, GameType::Solo) {
             for user_id in player_ids {
                 let player = final_state
@@ -553,11 +572,18 @@ pub async fn materialize_completion(
         revision: Uuid::new_v4(),
         ended_at_ms,
         server_id,
+        season: Some(season),
         final_state,
         effects,
     };
     record.validate()?;
     Ok(record)
+}
+
+fn season_for_completion_timestamp(ended_at_ms: i64) -> Result<Season> {
+    let ended_at = DateTime::<Utc>::from_timestamp_millis(ended_at_ms)
+        .ok_or_else(|| anyhow!("invalid completion timestamp {ended_at_ms}"))?;
+    Ok(get_season_at(ended_at))
 }
 
 fn username_for(state: &GameState, user_id: u32) -> String {
@@ -587,6 +613,7 @@ pub async fn apply_all_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use common::{GameStatus, GameType, QueueMode};
 
     #[test]
@@ -628,6 +655,24 @@ mod tests {
     }
 
     #[test]
+    fn completion_timestamp_selects_the_season_at_the_exact_rollover() {
+        let before = Utc
+            .with_ymd_and_hms(2026, 9, 30, 23, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+            + 999;
+        let boundary = Utc
+            .with_ymd_and_hms(2026, 10, 1, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(season_for_completion_timestamp(before).unwrap(), 0);
+        assert_eq!(season_for_completion_timestamp(boundary).unwrap(), 1);
+    }
+
+    #[test]
     fn stress_completion_rejects_player_progression_effects() {
         let mut state = GameState::new(
             60,
@@ -653,10 +698,19 @@ mod tests {
             revision: Uuid::new_v4(),
             ended_at_ms: 10,
             server_id: 1,
+            season: Some(0),
             final_state: state,
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };
         assert!(record.validate().is_ok());
+
+        let mut legacy_record = record.clone();
+        legacy_record.season = None;
+        let serialized = serde_json::to_value(&legacy_record).unwrap();
+        assert!(
+            serialized.get("season").is_none(),
+            "legacy records must retain their pre-season serialization shape"
+        );
 
         record.effects.push(CompletionEffect::AddXp {
             id: "xp:7".into(),
