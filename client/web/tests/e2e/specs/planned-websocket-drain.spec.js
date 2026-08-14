@@ -23,7 +23,7 @@ const CONNECTION_BANNER_SHOW_DELAY_MS = 800;
 const CONNECTION_BANNER_MIN_VISIBLE_MS = 1_200;
 // This test expires the callout with an explicit snapshot. A long, valid
 // window keeps slow CI from racing the real predictor between UI assertions;
-// unit and engine tests continue to pin the production rule at one second.
+// unit and engine tests continue to pin the production rule at two seconds.
 const COMBO_CALLOUT_TEST_WINDOW_MS = 60_000;
 
 const gameState = (tick = 5) => ({
@@ -2113,7 +2113,7 @@ test('Combo callout meter drains and re-pops for every pickup', async ({ page })
   if (!buildingBurst) throw new Error('building Combo burst is missing');
 
   // Drive the authoritative timer directly instead of sleeping against the
-  // production one-second window. The right edge retreats while the left edge
+  // production two-second window. The right edge retreats while the left edge
   // stays anchored, making this deterministic even on a busy CI runner.
   await emitServerMessage(
     page,

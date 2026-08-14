@@ -35,13 +35,13 @@ mod sorted_hash_set {
 const DEFAULT_SNAKE_LENGTH: usize = 4;
 
 /// Default time available to continue a combo after each food pickup.
-pub const DEFAULT_COMBO_WINDOW_MS: u32 = 1_000;
+pub const DEFAULT_COMBO_WINDOW_MS: u32 = 2_000;
 /// Food values progress 1, 2, 3 and remain capped at 3 for the chain.
 pub const DEFAULT_COMBO_MAX_FOOD_VALUE: u32 = 3;
 /// Semantic version of the authoritative combo scoring rules.
 pub const COMBO_RULES_VERSION: u16 = 1;
 /// Defensive upper bound for snapshotted tuning. The production default is
-/// one second; the larger ceiling permits experiments without accepting an
+/// two seconds; the larger ceiling permits experiments without accepting an
 /// effectively permanent meter from malformed state.
 const MAX_COMBO_WINDOW_MS: u32 = 60_000;
 
@@ -5229,7 +5229,11 @@ mod tests {
             );
             assert_eq!(
                 *combo_remaining_ms_before,
-                if *combo_chain == 1 { 0 } else { 900 }
+                if *combo_chain == 1 {
+                    0
+                } else {
+                    DEFAULT_COMBO_WINDOW_MS - game.normal_movement_interval_ms()
+                }
             );
             assert!(!boost_active);
         }
@@ -5249,7 +5253,8 @@ mod tests {
     }
 
     #[test]
-    fn combo_expires_after_exactly_one_second_of_authoritative_time() {
+    fn combo_expires_after_exactly_two_seconds_of_authoritative_time() {
+        assert_eq!(DEFAULT_COMBO_WINDOW_MS, 2_000);
         let mut game = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
         let player = game.add_player(1, None).expect("add player");
         let snake = &mut game.arena.snakes[player.snake_id as usize];
@@ -5265,10 +5270,21 @@ mod tests {
             1
         );
 
-        let expiry_quanta = DEFAULT_COMBO_WINDOW_MS / game.properties.tick_duration_ms;
-        for _ in 0..expiry_quanta {
+        let tick_duration_ms = game.properties.tick_duration_ms;
+        assert_eq!(DEFAULT_COMBO_WINDOW_MS % tick_duration_ms, 0);
+        let expiry_quanta = DEFAULT_COMBO_WINDOW_MS / tick_duration_ms;
+        for _ in 1..expiry_quanta {
             game.tick_forward(true).expect("Combo drain quantum");
         }
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize].combo,
+            SnakeCombo {
+                chain_count: 1,
+                remaining_ms: tick_duration_ms,
+            }
+        );
+
+        game.tick_forward(true).expect("final Combo drain quantum");
         assert_eq!(
             game.arena.snakes[player.snake_id as usize].combo,
             SnakeCombo::default()

@@ -110,7 +110,7 @@ sum by (game_type, game_queue_mode) (
 ## Reading the dashboard
 
 - A low enhanced-food share together with a median remaining window near zero
-  suggests the one-second window is too tight for that mode or map.
+  suggests the two-second window is too tight for that mode or map.
 - A high p95 chain depth and average points per food approaching `3` suggest
   sustained combos are common; compare game duration and death-rate panels to
   decide whether the extra physical growth is producing the desired action.

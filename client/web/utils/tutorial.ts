@@ -81,7 +81,7 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
  *   length.
  * - Entering the *enemy* end zone kills you; it is not a scoring move.
  * - Combo timing and food value come from `properties.combo`; the briefing
- *   describes the +3 cap without baking in its one-second default window.
+ *   describes the +3 cap without baking in the configured window length.
  * - Every matchmade mode has Boost. Space is the key and the default binding
  *   is hold-to-boost. Duel, 2v2 and FFA fill the tank from NOS pickups on the
  *   map; Solo's tank never empties and has nothing to collect

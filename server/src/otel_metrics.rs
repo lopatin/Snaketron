@@ -33,7 +33,8 @@ const ACTOR_BATCH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 const COMBO_CHAIN_DEPTH_BUCKETS: &[f64] =
     &[1.0, 2.0, 3.0, 4.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0];
 const COMBO_REMAINING_WINDOW_BUCKETS_MS: &[f64] = &[
-    0.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1_000.0,
+    0.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1_000.0, 1_200.0,
+    1_400.0, 1_600.0, 1_800.0, 2_000.0,
 ];
 
 struct OtelMetrics {
@@ -1266,5 +1267,18 @@ mod tests {
         for (points, expected) in [(1, "1"), (2, "2"), (3, "3"), (0, "other"), (999, "other")] {
             assert_eq!(combo_food_value(points), expected);
         }
+    }
+
+    #[test]
+    fn combo_remaining_window_histogram_covers_the_production_default() {
+        assert_eq!(
+            COMBO_REMAINING_WINDOW_BUCKETS_MS.last().copied(),
+            Some(f64::from(common::DEFAULT_COMBO_WINDOW_MS))
+        );
+        assert!(
+            COMBO_REMAINING_WINDOW_BUCKETS_MS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
     }
 }

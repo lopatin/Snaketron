@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildComboHudView } from '../../utils/comboHud.ts';
 
-const config = { window_ms: 1000, max_food_value: 3 };
+const config = { window_ms: 2000, max_food_value: 3 };
 
 const snake = (
   chainCount: number,
@@ -14,8 +14,8 @@ const snake = (
 });
 
 test('combo callout announces +2 after the first food', () => {
-  const full = buildComboHudView(config, snake(1, 1000));
-  const half = buildComboHudView(config, snake(1, 500));
+  const full = buildComboHudView(config, snake(1, 2000));
+  const half = buildComboHudView(config, snake(1, 1000));
   const finalSlice = buildComboHudView(config, snake(1, 1));
 
   assert.equal(full.active, true);
@@ -26,7 +26,7 @@ test('combo callout announces +2 after the first food', () => {
   assert.equal(half.active, true);
   assert.equal(half.fillRatio, 0.5);
   assert.equal(finalSlice.active, true);
-  assert.equal(finalSlice.fillRatio, 0.001);
+  assert.equal(finalSlice.fillRatio, 0.0005);
   assert.equal(full.ariaValueText, half.ariaValueText);
   assert.equal(half.ariaValueText, finalSlice.ariaValueText);
   assert.match(half.ariaValueText, /next food is worth 2 points/);
@@ -76,7 +76,7 @@ test('custom combo windows are read from the snapshot', () => {
 
 test('malformed countdown values are clamped instead of breaking the callout', () => {
   const overfull = buildComboHudView(config, snake(1, 5000));
-  assert.equal(overfull.remainingMs, 1000);
+  assert.equal(overfull.remainingMs, 2000);
   assert.equal(overfull.fillRatio, 1);
   assert.equal(overfull.active, true);
 
