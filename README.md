@@ -14,6 +14,7 @@ What if Snake was an E-Sport? Snaketron is a competitive online multiplayer Snak
 
 - **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
 - **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with server-moderated chat and invite links
+- **Combos**: every food pickup refills a two-second chain; consecutive food is worth—and physically grows the snake by—`+1`, `+1`, `+2`, then `+3` per pickup
 - **Boost**: hold-to-boost speed bursts fueled by collectible Boost pads (unlimited fuel in Solo)
 - **Accounts**: register/login with JWT auth, or play instantly as a guest
 - **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP

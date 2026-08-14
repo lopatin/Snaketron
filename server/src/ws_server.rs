@@ -39,21 +39,18 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// The gameplay protocol version a client reports is advisory. No client is
-/// ever turned away for reporting an old, newer, or missing version: a shipped
-/// build cannot update itself — an itch.io bundle has no reload-to-upgrade
-/// path at all — so an "update required" dead end would strand the player with
-/// nothing to do. Every gameplay protocol change must therefore stay backwards
-/// compatible, and a mismatch is only ever logged so a rollout stays visible.
-fn log_client_protocol_version(protocol_version: Option<u16>) {
+/// Deterministic simulation requires both peers to run the same gameplay
+/// rules. In particular, protocol 8 changes scoring and physical growth, so an
+/// older predictive engine cannot safely continue against this server.
+fn validate_client_protocol_version(protocol_version: Option<u16>) -> Result<()> {
     match protocol_version {
-        Some(version) if version == WS_PROTOCOL_VERSION => {}
-        Some(version) => warn!(
-            "Admitting client on gameplay protocol version {version}; this server speaks {WS_PROTOCOL_VERSION}"
-        ),
-        None => warn!(
-            "Admitting legacy client that reported no gameplay protocol version; this server speaks {WS_PROTOCOL_VERSION}"
-        ),
+        Some(version) if version == WS_PROTOCOL_VERSION => Ok(()),
+        Some(version) => Err(anyhow!(
+            "Gameplay update required: client protocol {version}, server protocol {WS_PROTOCOL_VERSION}"
+        )),
+        None => Err(anyhow!(
+            "Gameplay update required: client did not report a protocol version; server protocol {WS_PROTOCOL_VERSION}"
+        )),
     }
 }
 
@@ -63,11 +60,12 @@ fn log_client_protocol_version(protocol_version: Option<u16>) {
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum WSMessage {
-    /// Legacy authentication shape. Still honored: it authenticates exactly
-    /// like `Authenticate`, just without a reported protocol version.
+    /// Legacy authentication shape. It remains parseable so the server can
+    /// return an explicit update-required denial instead of a malformed-frame
+    /// error, but it is no longer admitted to deterministic gameplay.
     Token(String),
-    /// Client -> server authentication. The reported version is advisory —
-    /// see `log_client_protocol_version`; it never gates admission.
+    /// Client -> server authentication. The reported version must exactly
+    /// match [`WS_PROTOCOL_VERSION`].
     Authenticate {
         token: String,
         protocol_version: u16,
@@ -3635,9 +3633,9 @@ async fn subscribe_to_lobby_chat(
     Ok(())
 }
 
-/// Shared admission path for both authentication shapes. `protocol_version` is
-/// `None` for the legacy `Token` shape and is never a reason to refuse the
-/// connection — see `log_client_protocol_version`.
+/// Shared admission path for both authentication shapes. A legacy `Token` has
+/// no version and receives the same explicit update-required denial as any
+/// other incompatible predictive client.
 #[allow(clippy::too_many_arguments)]
 async fn authenticate_ws_connection(
     jwt_token: String,
@@ -3653,7 +3651,17 @@ async fn authenticate_ws_connection(
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
 ) -> Result<ConnectionState> {
-    log_client_protocol_version(protocol_version);
+    if let Err(error) = validate_client_protocol_version(protocol_version) {
+        warn!(%error, "Rejecting incompatible gameplay client");
+        let denial = WSMessage::AccessDenied {
+            reason: error.to_string(),
+        };
+        ws_tx
+            .send(Message::Text(serde_json::to_string(&denial)?.into()))
+            .await
+            .context("WebSocket closed before protocol mismatch denial")?;
+        return Ok(ConnectionState::Unauthenticated);
+    }
     debug!("Received WebSocket authentication request");
     match jwt_verifier.verify(&jwt_token).await {
         Ok(user_token) => {
@@ -5117,15 +5125,14 @@ mod lifecycle_protocol_tests {
         abort_and_join_game_event_forwarder, acknowledge_lobby_match_handoff,
         canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
         game_join_denied, game_join_failure_message, load_game_chat_history,
-        log_client_protocol_version, missing_game_join_failure, next_game_subscription_input,
-        next_lobby_match, next_outbound_message, publish_game_chat_message,
-        queue_planned_drain_notice, recovery_bridge_snapshot, refresh_connection_username,
-        repair_legacy_chat_history, require_game_command_publication,
-        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
-        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
-        snapshot_requires_command_outcomes, subscribe_to_game_chat,
+        missing_game_join_failure, next_game_subscription_input, next_lobby_match,
+        next_outbound_message, publish_game_chat_message, queue_planned_drain_notice,
+        recovery_bridge_snapshot, refresh_connection_username, repair_legacy_chat_history,
+        require_game_command_publication, send_command_outcomes_from_resolved,
+        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
+        slow_command_publish_wait_ms, snapshot_requires_command_outcomes, subscribe_to_game_chat,
         subscribe_to_lobby_match_notifications, take_lobby_update_receiver,
-        validate_game_matchmaking_pool,
+        validate_client_protocol_version, validate_game_matchmaking_pool,
     };
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -5332,7 +5339,7 @@ mod lifecycle_protocol_tests {
     }
 
     #[test]
-    fn authentication_request_reports_an_advisory_protocol_version() {
+    fn authentication_request_reports_the_required_protocol_version() {
         let value = serde_json::to_value(WSMessage::Authenticate {
             token: "jwt".to_owned(),
             protocol_version: WS_PROTOCOL_VERSION,
@@ -5345,22 +5352,23 @@ mod lifecycle_protocol_tests {
         );
     }
 
-    /// A stale, newer, or version-less client must never be refused: a shipped
-    /// build (an itch.io bundle above all) cannot update itself, so refusing it
-    /// would strand the player. Reporting a version only produces a log line.
     #[test]
-    fn every_reported_protocol_version_is_admitted() {
-        log_client_protocol_version(Some(WS_PROTOCOL_VERSION));
-        log_client_protocol_version(Some(WS_PROTOCOL_VERSION.saturating_sub(1)));
-        log_client_protocol_version(Some(WS_PROTOCOL_VERSION.saturating_add(1)));
-        log_client_protocol_version(Some(0));
-        log_client_protocol_version(None);
+    fn only_the_exact_gameplay_protocol_is_admitted() {
+        assert!(validate_client_protocol_version(Some(WS_PROTOCOL_VERSION)).is_ok());
+        for version in [
+            WS_PROTOCOL_VERSION.saturating_sub(1),
+            WS_PROTOCOL_VERSION.saturating_add(1),
+            0,
+        ] {
+            let error = validate_client_protocol_version(Some(version)).unwrap_err();
+            assert!(error.to_string().contains("Gameplay update required"));
+        }
+        let error = validate_client_protocol_version(None).unwrap_err();
+        assert!(error.to_string().contains("did not report"));
     }
 
-    /// The legacy version-less shape still authenticates rather than being
-    /// answered with a denial the player cannot act on.
     #[test]
-    fn the_legacy_token_shape_is_still_accepted() {
+    fn the_legacy_token_shape_remains_parseable_for_an_explicit_denial() {
         let value = serde_json::to_value(WSMessage::Token("jwt".to_owned())).unwrap();
         assert_eq!(value["Token"], "jwt");
 

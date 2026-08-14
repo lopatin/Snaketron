@@ -21,6 +21,10 @@ const ANONYMOUS_SOCKET_OBSERVATION_MS = 8_000;
 // The values themselves are pinned by tests/unit/connectionBanner.test.ts.
 const CONNECTION_BANNER_SHOW_DELAY_MS = 800;
 const CONNECTION_BANNER_MIN_VISIBLE_MS = 1_200;
+// This test expires the callout with an explicit snapshot. A long, valid
+// window keeps slow CI from racing the real predictor between UI assertions;
+// unit and engine tests continue to pin the production rule at two seconds.
+const COMBO_CALLOUT_TEST_WINDOW_MS = 60_000;
 
 const gameState = (tick = 5) => ({
   tick,
@@ -92,6 +96,23 @@ const snapshot = (streamSequence, tick = 5) => ({
     event: { Snapshot: { game_state: gameState(tick) } },
   },
 });
+
+const comboSnapshot = (streamSequence, tick, chainCount, remainingMs) => {
+  const frame = snapshot(streamSequence, tick);
+  const state = frame.GameEvent.event.Snapshot.game_state;
+  state.start_ms = Date.now() - tick * state.properties.tick_duration_ms;
+  state.properties.combo = {
+    window_ms: COMBO_CALLOUT_TEST_WINDOW_MS,
+    max_food_value: 3,
+    rules_version: 1,
+  };
+  state.arena.snakes[0].combo = {
+    chain_count: chainCount,
+    remaining_ms: remainingMs,
+  };
+  state.arena.food = [{ x: 24, y: 20 }];
+  return frame;
+};
 
 const boostSnapshot = (streamSequence, tick = 5) => {
   const state = gameState(tick);
@@ -468,7 +489,7 @@ async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
   await emitServerMessage(page, oldSocketIndex, {
     Authenticated: {
       task_boot_id: 'old-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -520,7 +541,7 @@ async function establishAuthenticatedLobby(page) {
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
       task_boot_id: 'lobby-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -572,7 +593,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'new-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -1415,7 +1436,7 @@ test('a command with an ambiguous crash send is retried once with its stable ide
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-after-crash',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -2043,6 +2064,113 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
       fullPage: true,
     });
   }
+});
+
+test('Combo callout stays hidden while priming, then drains and re-pops', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
+  const callout = page.getByTestId('combo-callout');
+  const burst = page.getByTestId('combo-callout-burst');
+  const meter = page.getByTestId('combo-callout-meter');
+  const meterFill = page.getByTestId('combo-callout-meter-fill');
+  const announcement = page.getByTestId('combo-callout-announcement');
+  const readMeterGeometry = () => meter.evaluate((track) => {
+    const fill = track.querySelector('[data-testid="combo-callout-meter-fill"]');
+    if (!fill) throw new Error('Combo meter fill is missing');
+    const trackRect = track.getBoundingClientRect();
+    const fillRect = fill.getBoundingClientRect();
+    return {
+      modelRatio: Number(fill.getAttribute('data-fill-ratio')),
+      renderedRatio: fillRect.width / trackRect.width,
+      leftDelta: Math.abs(fillRect.left - trackRect.left),
+      rightGap: trackRect.right - fillRect.right,
+      trackWidth: trackRect.width,
+    };
+  });
+
+  await expect(callout).toHaveCount(1);
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(meter).toHaveCount(0);
+  await expect(meterFill).toHaveCount(0);
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(11, 6, 1, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(meter).toHaveCount(0);
+  await expect(announcement).toHaveText('');
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(12, 7, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(callout).toHaveAttribute('data-active', 'true');
+  await expect(burst).toHaveText(/\+2\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:2');
+  await expect(announcement).toHaveText('Combo active; next food is worth 2 points');
+  await expect(meter).toBeVisible();
+  await expect(meterFill).toHaveCSS('transform-origin', /^0px /);
+  const fullMeter = await readMeterGeometry();
+  expect(fullMeter.modelRatio).toBeGreaterThan(0);
+  expect(Math.abs(fullMeter.renderedRatio - fullMeter.modelRatio)).toBeLessThan(0.03);
+  expect(fullMeter.leftDelta).toBeLessThanOrEqual(1);
+  const buildingBurst = await burst.elementHandle();
+  if (!buildingBurst) throw new Error('building Combo burst is missing');
+
+  // Drive the authoritative timer directly instead of sleeping against the
+  // production two-second window. The right edge retreats while the left edge
+  // stays anchored, making this deterministic even on a busy CI runner.
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(13, 8, 2, COMBO_CALLOUT_TEST_WINDOW_MS / 2),
+  );
+  await expect.poll(async () => {
+    const current = await readMeterGeometry();
+    return current.modelRatio < fullMeter.modelRatio - 0.25
+      && Math.abs(current.renderedRatio - current.modelRatio) < 0.03
+      && current.leftDelta <= 1
+      && current.rightGap > current.trackWidth * 0.2;
+  }).toBe(true);
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(14, 9, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(burst).toHaveText(/\+3\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:3');
+  await expect(burst).toHaveClass(/is-maxed/);
+  await expect(announcement).toHaveText(
+    'Combo active; next food is worth 3 points, maximum value',
+  );
+  expect(await buildingBurst.evaluate((element) => element.isConnected)).toBe(false);
+  const firstMaxBurst = await burst.elementHandle();
+  if (!firstMaxBurst) throw new Error('first max Combo burst is missing');
+
+  // The displayed value is already capped, but a later pickup still gets a
+  // fresh keyed burst instead of leaving the previous animation untouched.
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(15, 10, 4, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(burst).toHaveText(/\+3\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:4');
+  expect(await firstMaxBurst.evaluate((element) => element.isConnected)).toBe(false);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(meter).toBeHidden();
+
+  await emitServerMessage(page, socketIndex, comboSnapshot(16, 11, 0, 0));
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(announcement).toHaveText('');
 });
 
 test('competitive results settle on the persisted regional ranking and remain visible', async ({ page }) => {
@@ -4094,17 +4222,14 @@ test('window blur releases default Hold Boost once', async ({ page }) => {
   ]);
 });
 
-// A shipped build cannot update itself — an itch.io bundle has no
-// reload-to-upgrade path at all — so no protocol disagreement may ever strand
-// the player behind a screen they have no way to act on. Every one of these
-// mismatches has to degrade to a console warning and keep playing.
-test('a mismatched server protocol and missing capabilities still authenticate', async ({ page }) => {
+test('a mismatched server protocol is rejected before deterministic gameplay', async ({ page }) => {
   await page.goto('/');
   await expect.poll(() => page.evaluate(() => (
     window.__wsInstance ? window.__mockSockets.indexOf(window.__wsInstance) : -1
   ))).toBeGreaterThanOrEqual(0);
   const socketIndex = await page.evaluate(() => window.__mockSockets.indexOf(window.__wsInstance));
   await expect.poll(() => socketMessages(page, socketIndex, 'Authenticate')).toHaveLength(1);
+  const joinCountBefore = (await socketMessages(page, socketIndex, 'JoinLobby')).length;
 
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
@@ -4115,34 +4240,31 @@ test('a mismatched server protocol and missing capabilities still authenticate',
     },
   });
 
-  // Reaching JoinLobby proves the handshake was accepted despite both mismatches.
-  await expect.poll(() => socketMessages(page, socketIndex, 'JoinLobby')).toHaveLength(2);
+  await expect.poll(() => page.evaluate(
+    (index) => window.__mockSockets[index].closeCalls,
+    socketIndex,
+  )).toEqual([{ code: 4008, reason: 'gameplay protocol mismatch' }]);
+  expect((await socketMessages(page, socketIndex, 'JoinLobby')).length).toBe(joinCountBefore);
   await expect(page.getByTestId('client-update-required')).toHaveCount(0);
-  expect(await page.evaluate((index) => window.__mockSockets[index].closeCalls, socketIndex))
-    .toEqual([]);
 });
 
-test('a legacy client-update denial no longer strands the player', async ({ page }) => {
+test('an update-required denial closes without reconnecting the incompatible client', async ({ page }) => {
   const socketIndex = await establishAuthenticatedLobby(page);
   const socketCount = await page.evaluate(() => window.__mockSockets.length);
 
   await emitServerMessage(page, socketIndex, {
-    AccessDenied: { reason: 'Client update required' },
+    AccessDenied: {
+      reason: 'Gameplay update required: client protocol 7, server protocol 8',
+    },
   });
-  await page.waitForTimeout(250);
 
-  await expect(page.getByTestId('client-update-required')).toHaveCount(0);
-  expect(await page.evaluate((index) => ({
+  await expect.poll(() => page.evaluate((index) => ({
     connected: window.__wsContext?.isConnected,
-    activeSocketIndex: window.__wsInstance
-      ? window.__mockSockets.indexOf(window.__wsInstance)
-      : -1,
     closeCalls: window.__mockSockets[index].closeCalls,
     socketCount: window.__mockSockets.length,
   }), socketIndex)).toEqual({
-    connected: true,
-    activeSocketIndex: socketIndex,
-    closeCalls: [],
+    connected: false,
+    closeCalls: [{ code: 4008, reason: 'gameplay protocol mismatch' }],
     socketCount,
   });
 });
@@ -4205,7 +4327,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-lobby-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -4245,7 +4367,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, acknowledgedReplacementIndex, {
     Authenticated: {
       task_boot_id: 'acknowledged-replacement-task',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 3,
     },
@@ -4373,7 +4495,7 @@ test('planned lobby handoff replays only after the candidate restores authoritat
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'planned-lobby-replacement',
-      protocol_version: 7,
+      protocol_version: 8,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },

@@ -15,7 +15,11 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
-/// Bumped for the executor expansion from ten to fifty partitions. Partition
+/// Version 10 introduces combo-aware food events and state. Mixed executors
+/// would disagree about growth, score, and the event wire shape, so they must
+/// not co-own partitions during a rolling deploy.
+///
+/// Version 9 expanded executors from ten to fifty partitions. Partition
 /// selection and Redis key families are not encoded in serde payloads, so a
 /// mixed deployment would otherwise route the same game to different owners.
 ///
@@ -29,7 +33,7 @@ pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
 /// with every player's idle clock reset to tick zero. The version gate refuses
 /// incompatible envelopes and keeps mixed-version executors from co-owning
 /// partitions during a rolling deploy.
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 9;
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 10;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);

@@ -74,6 +74,22 @@ pub struct SnakeBoost {
     pub intent: bool,
 }
 
+/// Per-life combo progress owned by one snake.
+///
+/// `remaining_ms == 0` is the single inactive representation and always pairs
+/// with `chain_count == 0`. A successful pickup starts or extends the chain
+/// and refills the timer from the match's snapshotted [`crate::ComboConfig`].
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct SnakeCombo {
+    /// Number of pickups in the current uninterrupted combo, saturating at
+    /// `u32::MAX` so even an artificially long match remains deterministic.
+    pub chain_count: u32,
+    /// Authoritative simulation time left before the chain expires.
+    pub remaining_ms: u32,
+}
+
 /// The observable edge produced by converging `active` toward `intent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoostResolution {
@@ -101,6 +117,10 @@ pub struct Snake {
     pub(crate) movement_credit: u32,
     #[serde(default)]
     pub(crate) boost: SnakeBoost,
+    /// Current per-life combo meter. Historical snapshots deserialize as an
+    /// inactive combo, which is the only safe state to infer without events.
+    #[serde(default)]
+    pub combo: SnakeCombo,
 }
 
 fn default_snake_speed_milli() -> u16 {
@@ -128,6 +148,7 @@ impl Snake {
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
             boost: SnakeBoost::default(),
+            combo: SnakeCombo::default(),
         }
     }
 
@@ -171,6 +192,7 @@ impl Snake {
                 // ever resolved, so the two can never drift apart.
                 intent: boost_active,
             },
+            combo: SnakeCombo::default(),
         }
     }
 
@@ -380,6 +402,26 @@ impl Snake {
         };
     }
 
+    /// Drain one authoritative simulation quantum from the combo meter.
+    /// Expiry is normalized immediately so callers never have to interpret a
+    /// stale chain count paired with an empty meter.
+    pub(crate) fn drain_combo(&mut self, elapsed_ms: u32) {
+        if self.combo.remaining_ms == 0 {
+            self.combo.chain_count = 0;
+            return;
+        }
+
+        self.combo.remaining_ms = self.combo.remaining_ms.saturating_sub(elapsed_ms);
+        if self.combo.remaining_ms == 0 {
+            self.combo.chain_count = 0;
+        }
+    }
+
+    /// Clear combo progress at a life boundary (death, banking, or respawn).
+    pub(crate) fn reset_combo(&mut self) {
+        self.combo = SnakeCombo::default();
+    }
+
     pub fn head(&self) -> Result<&Position> {
         self.body.first().context("Snake has no head")
     }
@@ -523,6 +565,7 @@ mod tests {
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
             boost: SnakeBoost::default(),
+            combo: SnakeCombo::default(),
         }
     }
 
@@ -536,6 +579,29 @@ mod tests {
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
         assert_eq!(snake.movement_credit, 0);
         assert_eq!(snake.boost, SnakeBoost::default());
+        assert_eq!(snake.combo, SnakeCombo::default());
+    }
+
+    #[test]
+    fn combo_drain_expires_to_one_normalized_inactive_state() {
+        let mut snake = snake_with_body(vec![], Direction::Right);
+        snake.combo = SnakeCombo {
+            chain_count: 7,
+            remaining_ms: 100,
+        };
+
+        snake.drain_combo(40);
+        assert_eq!(snake.combo.remaining_ms, 60);
+        assert_eq!(snake.combo.chain_count, 7);
+
+        snake.drain_combo(60);
+        assert_eq!(snake.combo, SnakeCombo::default());
+
+        // A malformed historical inactive state is normalized on the next
+        // quantum rather than carrying a phantom chain forever.
+        snake.combo.chain_count = 99;
+        snake.drain_combo(50);
+        assert_eq!(snake.combo, SnakeCombo::default());
     }
 
     #[test]

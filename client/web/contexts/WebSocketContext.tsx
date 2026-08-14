@@ -21,6 +21,8 @@ import { record as recordTrace } from '../utils/syncTrace';
 import {
   buildGameplayAuthentication,
   GAMEPLAY_PROTOCOL_VERSION,
+  isGameplayProtocolCompatible,
+  isGameplayUpdateRequiredReason,
 } from '../constants';
 import { useLatency } from './LatencyContext';
 import { useAuth } from './AuthContext';
@@ -999,6 +1001,17 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       ? rawMessage.AccessDenied.reason
       : null;
     if (
+      slot.role === 'active' &&
+      activeSlotRef.current === slot &&
+      isGameplayUpdateRequiredReason(accessDeniedReason)
+    ) {
+      dispatchRawMessage(slot, rawMessage, rawText);
+      reconnectEnabledRef.current = false;
+      clearAuthenticationTimeout(slot);
+      slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'gameplay protocol mismatch');
+      return;
+    }
+    if (
       pendingMatchmakingIntent &&
       messageMatchesPendingIdentity &&
       isRetryableMatchmakingAdmissionFailure(accessDeniedReason) &&
@@ -1097,18 +1110,29 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (rawMessage?.Authenticated) {
       const nowMs = Date.now();
       const payload = rawMessage.Authenticated;
-      // A protocol or capability mismatch is reported, never enforced. Blocking
-      // here would strand a shipped build that cannot update itself — an
-      // itch.io bundle has no reload-to-upgrade path — so we always play on and
-      // keep the gameplay protocol backwards compatible instead.
-      if (Number(payload?.protocol_version) !== GAMEPLAY_PROTOCOL_VERSION) {
-        console.warn(
-          'Server gameplay protocol differs:',
-          payload?.protocol_version,
-          'client speaks:',
-          GAMEPLAY_PROTOCOL_VERSION,
-          '- continuing anyway',
-        );
+      const serverProtocolVersion = Number(payload?.protocol_version);
+      if (!isGameplayProtocolCompatible(payload?.protocol_version)) {
+        const reason = `Gameplay update required: client protocol ${GAMEPLAY_PROTOCOL_VERSION}, server protocol ${
+          Number.isFinite(serverProtocolVersion) ? serverProtocolVersion : 'unknown'
+        }`;
+        console.error(reason);
+        clearAuthenticationTimeout(slot);
+        if (slot.role === 'candidate') {
+          slot.role = 'retired';
+          candidateSlotRef.current = null;
+          slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'gameplay protocol mismatch');
+          recoverAfterCandidateFailure(slot);
+          return;
+        }
+
+        // Surface the same typed denial an incompatible new server sends to an
+        // old client, then stop reconnecting this build into a deterministic
+        // simulation it cannot reproduce.
+        const denial = { AccessDenied: { reason } };
+        dispatchRawMessage(slot, denial, JSON.stringify(denial));
+        reconnectEnabledRef.current = false;
+        slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'gameplay protocol mismatch');
+        return;
       }
       slot.capabilities = Array.isArray(payload?.capabilities)
         ? payload.capabilities.filter((value: unknown): value is string => typeof value === 'string')

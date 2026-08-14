@@ -28,7 +28,112 @@
 
 .game-arena-frame.has-boost-indicator .game-arena-panel {
   position: relative;
-  z-index: 2;
+  z-index: 3;
+}
+
+/* Combo callout -----------------------------------------------------------
+   The arena stays completely quiet between chains. Each pickup mounts one
+   fixed-position burst over the field, keeping the acknowledgement readable
+   without moving either the canvas or the Boost control beneath it. */
+.game-combo-callout {
+  position: absolute;
+  top: clamp(8px, 2.5%, 16px);
+  left: 50%;
+  z-index: 6;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.game-combo-callout__burst {
+  --combo-callout-accent: #78ad7a;
+  --combo-callout-edge: #315335;
+  --combo-callout-shadow: #315335;
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  column-gap: clamp(4px, 0.7vw, 7px);
+  row-gap: clamp(3px, 0.5vw, 5px);
+  padding: clamp(5px, 0.8vw, 8px) clamp(9px, 1.6vw, 15px);
+  border: 2px solid #17231b;
+  border-radius: 7px;
+  background:
+    linear-gradient(135deg, rgb(255 255 255 / 98%), rgb(246 250 246 / 98%));
+  box-shadow:
+    0 4px 0 var(--combo-callout-shadow),
+    0 8px 16px rgb(20 33 24 / 22%);
+  color: var(--combo-callout-edge);
+  font-family: "Arial Black", Arial, sans-serif;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+  font-weight: 950;
+  line-height: 0.9;
+  text-transform: uppercase;
+  white-space: nowrap;
+  animation: combo-callout-pop 360ms cubic-bezier(0.2, 0.82, 0.2, 1.16) both;
+  transform-origin: 50% 30%;
+}
+
+.game-combo-callout__burst.is-maxed {
+  --combo-callout-accent: #f4c642;
+  --combo-callout-edge: #745000;
+  --combo-callout-shadow: #9c6d00;
+  background:
+    linear-gradient(135deg, rgb(255 255 255 / 98%), rgb(255 249 226 / 98%));
+}
+
+.game-combo-callout__value {
+  color: var(--combo-callout-accent);
+  font-size: clamp(20px, 4vw, 30px);
+  letter-spacing: -0.055em;
+  text-shadow:
+    1px 0 var(--combo-callout-edge),
+    -1px 0 var(--combo-callout-edge),
+    0 1px var(--combo-callout-edge),
+    0 -1px var(--combo-callout-edge);
+}
+
+.game-combo-callout__label {
+  font-size: clamp(11px, 2.1vw, 16px);
+  letter-spacing: 0.035em;
+}
+
+.game-combo-callout__meter {
+  grid-column: 1 / -1;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(23 35 27 / 14%);
+  box-shadow: inset 0 0 0 1px rgb(23 35 27 / 12%);
+}
+
+.game-combo-callout__meter-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--combo-callout-edge);
+  box-shadow: inset 0 1px rgb(255 255 255 / 48%);
+  transform-origin: left center;
+  transition: transform 50ms linear;
+  will-change: transform;
+}
+
+@keyframes combo-callout-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.76) rotate(-3deg);
+  }
+
+  62% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.08) rotate(1deg);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1) rotate(0);
+  }
 }
 
 .game-boost-hud {
@@ -669,6 +774,15 @@
     padding-bottom: 48px;
   }
 
+  .game-combo-callout {
+    top: 6px;
+  }
+
+  .game-combo-callout__burst {
+    padding: 4px 8px;
+    row-gap: 3px;
+  }
+
   .game-idle-warning {
     top: 6px;
     right: 6px;
@@ -847,6 +961,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .game-combo-callout__burst,
   .game-boost-hud,
   .game-boost-meter,
   .game-boost-meter__fill,
@@ -858,9 +973,35 @@
     animation: none;
     transition: none;
   }
+
+  .game-combo-callout__meter {
+    display: none;
+  }
 }
 
 @media (forced-colors: active) {
+  .game-combo-callout__burst,
+  .game-combo-callout__value,
+  .game-combo-callout__label {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    box-shadow: none;
+    text-shadow: none;
+    forced-color-adjust: auto;
+  }
+
+  .game-combo-callout__meter {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    box-shadow: none;
+  }
+
+  .game-combo-callout__meter-fill {
+    background: Highlight;
+    box-shadow: none;
+  }
+
   .game-idle-warning,
   .game-idle-warning__flag,
   .game-idle-warning__action,

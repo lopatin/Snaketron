@@ -64,6 +64,8 @@ struct Counters {
     boost_activations: AtomicU64,
     boost_manual_stops: AtomicU64,
     boost_depletions: AtomicU64,
+    combo_food_collections: AtomicU64,
+    combo_points_awarded: AtomicU64,
     game_actor_advances: AtomicU64,
     game_actor_batch_quanta_sum: AtomicU64,
     game_actor_batch_quanta_max: AtomicU64,
@@ -161,6 +163,45 @@ struct BoostMetricDimensions {
     queue_mode: &'static str,
     team_side: &'static str,
     speed_band: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComboMetricDimensions {
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+}
+
+fn combo_metric_dimensions(state: &GameState, snake_id: u32) -> ComboMetricDimensions {
+    let game_type = match &state.game_type {
+        GameType::TeamMatch { per_team: 1 } => "duel",
+        GameType::TeamMatch { per_team: 2 } => "2v2",
+        GameType::TeamMatch { .. } => "other-team",
+        GameType::Solo => "solo",
+        GameType::FreeForAll { .. } => "free-for-all",
+        GameType::Custom { .. } => "custom",
+    };
+    let queue_mode = match &state.queue_mode {
+        QueueMode::Quickmatch => "quickmatch",
+        QueueMode::Competitive => "competitive",
+    };
+    let team_side = match state
+        .arena
+        .snakes
+        .get(snake_id as usize)
+        .and_then(|snake| snake.team_id)
+        .map(|team| team.0)
+    {
+        Some(0) => "team-0",
+        Some(1) => "team-1",
+        _ => "unknown",
+    };
+
+    ComboMetricDimensions {
+        game_type,
+        queue_mode,
+        team_side,
+    }
 }
 
 fn boost_metric_dimensions(state: &GameState, snake_id: u32) -> BoostMetricDimensions {
@@ -322,6 +363,36 @@ pub fn record_boost_lifecycle_transition(state: &GameState, transition: BoostLif
             );
         }
     }
+}
+
+/// Record one authoritative food collection after its event, catch-up
+/// checkpoint, or terminal snapshot has crossed a fenced durability boundary.
+/// All labels come from finite enums or finite value buckets; no game, user,
+/// player, command, or snake identifier is exported.
+pub fn record_combo_food_collected(
+    state: &GameState,
+    snake_id: u32,
+    points: u32,
+    combo_chain: u32,
+    combo_remaining_ms_before: u32,
+    boost_active: bool,
+) {
+    counters()
+        .combo_food_collections
+        .fetch_add(1, Ordering::Relaxed);
+    counters()
+        .combo_points_awarded
+        .fetch_add(u64::from(points), Ordering::Relaxed);
+    let dimensions = combo_metric_dimensions(state, snake_id);
+    crate::otel_metrics::record_combo_food_collected(
+        dimensions.game_type,
+        dimensions.queue_mode,
+        dimensions.team_side,
+        points,
+        combo_chain,
+        combo_remaining_ms_before,
+        boost_active,
+    );
 }
 
 counter_fn!(record_websocket_opened, websocket_opens);
@@ -526,6 +597,8 @@ struct CounterSnapshot {
     boost_activations: u64,
     boost_manual_stops: u64,
     boost_depletions: u64,
+    combo_food_collections: u64,
+    combo_points_awarded: u64,
     game_actor_advances: u64,
     game_actor_batch_quanta_sum: u64,
     game_actor_batch_quanta_max: u64,
@@ -608,6 +681,8 @@ fn take_counter_snapshot() -> CounterSnapshot {
         boost_activations: counters.boost_activations.swap(0, Ordering::Relaxed),
         boost_manual_stops: counters.boost_manual_stops.swap(0, Ordering::Relaxed),
         boost_depletions: counters.boost_depletions.swap(0, Ordering::Relaxed),
+        combo_food_collections: counters.combo_food_collections.swap(0, Ordering::Relaxed),
+        combo_points_awarded: counters.combo_points_awarded.swap(0, Ordering::Relaxed),
         game_actor_advances: counters.game_actor_advances.swap(0, Ordering::Relaxed),
         game_actor_batch_quanta_sum: counters
             .game_actor_batch_quanta_sum
@@ -1549,6 +1624,12 @@ fn emf_document(
         ("BoostActivations", counters.boost_activations, "Count"),
         ("BoostManualStops", counters.boost_manual_stops, "Count"),
         ("BoostDepletions", counters.boost_depletions, "Count"),
+        (
+            "ComboFoodCollections",
+            counters.combo_food_collections,
+            "Count",
+        ),
+        ("ComboPointsAwarded", counters.combo_points_awarded, "Count"),
         ("GameActorAdvances", counters.game_actor_advances, "Count"),
         (
             "GameActorBatchQuantaSum",
@@ -1931,6 +2012,7 @@ mod tests {
                 snake_id: boost_snake_id,
             },
         );
+        record_combo_food_collected(&boost_state, boost_snake_id, 3, 7, 425, true);
         record_websocket_resync_requested(2);
         record_websocket_resync_accepted(1);
         record_websocket_resync_rejected(1);
@@ -1976,6 +2058,8 @@ mod tests {
         assert!(snapshot.boost_activations >= 1);
         assert!(snapshot.boost_manual_stops >= 1);
         assert!(snapshot.boost_depletions >= 1);
+        assert!(snapshot.combo_food_collections >= 1);
+        assert!(snapshot.combo_points_awarded >= 3);
         assert!(snapshot.websocket_resync_requests >= 2);
         assert!(snapshot.websocket_resync_accepted >= 1);
         assert!(snapshot.websocket_resync_rejected >= 1);
@@ -2029,13 +2113,18 @@ mod tests {
 
     #[test]
     fn emf_dimensions_keep_only_websocket_gauge_per_task() {
+        let counters = CounterSnapshot {
+            combo_food_collections: 4,
+            combo_points_awarded: 9,
+            ..CounterSnapshot::default()
+        };
         let main = emf_document(
             "test",
             "us-test-1",
             "boot-id",
             true,
             RegionalGauges::default(),
-            CounterSnapshot::default(),
+            counters,
             123,
         );
         assert_eq!(
@@ -2056,6 +2145,15 @@ mod tests {
                 .iter()
                 .all(|definition| definition["Name"] != "ActiveWebSockets")
         );
+        assert_eq!(main["ComboFoodCollections"], 4);
+        assert_eq!(main["ComboPointsAwarded"], 9);
+        for name in ["ComboFoodCollections", "ComboPointsAwarded"] {
+            assert!(
+                main_metrics.iter().any(|definition| {
+                    definition["Name"] == name && definition["Unit"] == "Count"
+                })
+            );
+        }
 
         let sockets = active_websockets_emf_document("test", "us-test-1", "boot-id", 7, 123);
         assert_eq!(
@@ -2332,6 +2430,32 @@ mod tests {
         );
         assert_eq!(
             boost_metric_dimensions(&state, u32::MAX).team_side,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn combo_metric_dimensions_are_finite_labels_without_identifiers() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Competitive,
+            None,
+            0,
+        );
+        let player = state.add_player(9_876_543, None).unwrap();
+
+        assert_eq!(
+            combo_metric_dimensions(&state, player.snake_id),
+            ComboMetricDimensions {
+                game_type: "2v2",
+                queue_mode: "competitive",
+                team_side: "team-0",
+            }
+        );
+        assert_eq!(
+            combo_metric_dimensions(&state, u32::MAX).team_side,
             "unknown"
         );
     }

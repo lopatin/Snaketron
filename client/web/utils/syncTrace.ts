@@ -13,7 +13,7 @@ import { DEFAULT_TICK_INTERVAL_MS } from '../constants';
 // Must equal TRACE_FORMAT_VERSION in common/src/trace.rs, which documents what
 // each version's fingerprint layout covers. The offline RCA tooling rejects a
 // trace whose version does not match the fingerprint it is replaying against.
-export const TRACE_FORMAT_VERSION = 3;
+export const TRACE_FORMAT_VERSION = 4;
 const MAX_RECORDS = 20000;
 
 export type TraceRecord =

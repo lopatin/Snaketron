@@ -47,6 +47,7 @@ import {
   type BoostInputMode,
 } from '../utils/boostInput';
 import { buildBoostHudView } from '../utils/boostHud';
+import { buildComboHudView } from '../utils/comboHud';
 import { buildPlayerIdlePresentation } from '../utils/idlePresentation';
 import {
   createScoreEffectRuntime,
@@ -60,6 +61,7 @@ import type {
 } from '../utils/crashExplosion';
 import type { PredictedScoreVisualState } from '../utils/scoreEffects';
 import BoostCanisterMark from './BoostCanisterMark';
+import ComboCallout from './ComboCallout';
 import TouchControls, {
   TOUCH_LANDSCAPE_SIDE_RESERVE_PX,
   TOUCH_PORTRAIT_BOTTOM_RESERVE_PX,
@@ -639,10 +641,10 @@ export default function GameArena() {
       if (isTouchSurface) {
         // Touch layouts budget the real in-flow chrome instead of the legacy
         // desktop slack: the fixed scoreboard band, the roster anchor row, the
-        // charge strip, and the control-cluster reserves that mirror the stage
-        // padding in GameArena.css (safe-area insets included, which are only
-        // non-zero on notched phones in fullscreen). Every unspent pixel here
-        // is arena, which matters on a phone.
+        // charge rail, and the control-cluster reserves that mirror the
+        // stage padding in GameArena.css (safe-area insets included, which are
+        // only non-zero on notched phones in fullscreen). Every unspent pixel
+        // here is arena, which matters on a phone.
         const scoreboardFootprint = Number.parseFloat(
           rootStyle.getPropertyValue('--game-scoreboard-footprint'),
         ) || 64;
@@ -1297,9 +1299,13 @@ export default function GameArena() {
   const boostHud = boostConfig && localSnake
     ? buildBoostHudView(boostConfig, localSnake, isGameInteractionActive, gameOver)
     : null;
+  const comboConfig = gameState?.properties.combo ?? null;
+  const comboHud = comboConfig && localSnake
+    ? buildComboHudView(comboConfig, localSnake)
+    : null;
 
   const currentStatus = gameState?.status;
-  const isBoostGameTerminal = Boolean(
+  const isGameTerminal = Boolean(
     gameOver ||
     currentStatus === 'Stopped' ||
     (typeof currentStatus === 'object' && currentStatus !== null && 'Complete' in currentStatus),
@@ -1311,7 +1317,7 @@ export default function GameArena() {
   // deliberately left out and read at event time instead, exactly like the
   // keydown path, so a briefing opening mid-game swallows taps immediately.
   steerContextRef.current = {
-    canSteer: Boolean(gameState) && isGameInteractionActive && !isBoostGameTerminal,
+    canSteer: Boolean(gameState) && isGameInteractionActive && !isGameTerminal,
     rotation,
   };
   const boostInputContext: BoostInputContext = {
@@ -1325,9 +1331,9 @@ export default function GameArena() {
       localSnake?.is_alive &&
       isGameInteractionActive &&
       !isModalOwningInput &&
-      !isBoostGameTerminal
+      !isGameTerminal
     ),
-    gameOver: isBoostGameTerminal,
+    gameOver: isGameTerminal,
   };
   boostInputContextRef.current = boostInputContext;
 
@@ -1696,6 +1702,28 @@ export default function GameArena() {
     </div>
   ) : null;
 
+  // Keep the live region mounted, but render its visual burst only while the
+  // engine-owned combo window has reached an enhanced tier and the gameplay
+  // surface is active. The chain count is the animation identity so every
+  // capped +3 pickup still re-pops.
+  const comboCallout = localSnake && comboHud ? (
+    <ComboCallout
+      hud={comboHud}
+      isVisible={Boolean(
+        isArenaVisible &&
+        isGameInteractionActive &&
+        !isGameTerminal &&
+        !isWaitingForSnapshot &&
+        !currentGameLoadFailure &&
+        !connectionStale &&
+        !idleWarning &&
+        !showCountdown &&
+        !isModalOwningInput
+      )}
+      pickupIdentity={`${gameId}:${localSnake.combo.chain_count}`}
+    />
+  ) : null;
+
   if (showAuthLoading) {
     return <LoadingScreen message={authLoading ? 'Authenticating...' : 'Please sign in to play'} />;
   }
@@ -1764,6 +1792,7 @@ export default function GameArena() {
                   border: 'none'
                 }}
               />
+              {comboCallout}
               {currentGameLoadFailure && (
                 <div
                   className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-30 px-6 text-center"

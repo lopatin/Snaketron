@@ -76,15 +76,18 @@ export const tutorialKey = (mode: TutorialMode, queueMode: QueueMode): TutorialK
  *   target is 25 in Quickmatch and 50 in Competitive, but the copy never
  *   hardcodes either: it reads `properties.score_limit` off the same state the
  *   engine completes against, so the briefing cannot outlive a rule change.
- * - Banking is `carried_segments / 2`, so one food eaten is one team point,
- *   and the snake respawns at starting length afterwards.
+ * - Each awarded combo point queues one physical growth segment. Team banking
+ *   scores every carried awarded segment, then respawns the snake at starting
+ *   length.
  * - Entering the *enemy* end zone kills you; it is not a scoring move.
- * - Food adds two body segments, and personal score is length minus two.
+ * - Combo timing and food value come from `properties.combo`; the briefing
+ *   describes the +3 cap without baking in the configured window length.
  * - Every matchmade mode has Boost. Space is the key and the default binding
  *   is hold-to-boost. Duel, 2v2 and FFA fill the tank from NOS pickups on the
  *   map; Solo's tank never empties and has nothing to collect
  *   (`boost_config_for` in `common/src/game_state.rs`).
- * - 2v2 and FFA carry double food (`food_target_for`); duel and Solo do not.
+ * - 2v2 and FFA spawn double food density (`food_target_for`); duel and Solo
+ *   do not.
  * - Solo and FFA have no clock and no score target, and end only when every
  *   snake is dead.
  * - Competitive duel and 2v2 use the higher score target described above. The
@@ -121,15 +124,12 @@ const teamSteps = (
   return [
     {
       scene: 'team-carry',
-      title: mode === 'duel' ? 'BANK POINTS' : 'SCORE TOGETHER',
-      body:
-        mode === 'duel'
-          ? 'Return food to base to score points.'
-          : 'Return food to base to score for your team.',
+      title: mode === 'duel' ? 'CHAIN & BANK' : 'CHAIN & SCORE',
+      body: 'Two foods start COMBO; reach +3 before it drains; bank.',
       visualLabel:
         mode === 'duel'
-          ? 'A snake returns through the gate labeled YOU; the team score increases.'
-          : 'A teammate returns through the gate labeled YOU; the shared team score increases.',
+          ? 'A snake carries a combo through the gate labeled YOU; the team score increases.'
+          : 'A teammate carries a combo through the gate labeled YOU; the shared team score increases.',
     },
     collectibleBoostStep(inputMode, inputSurface),
     {
@@ -147,9 +147,9 @@ const ffaSteps = (
 ): [TutorialStep, TutorialStep, TutorialStep] => [
   {
     scene: 'ffa-food',
-    title: 'GROW',
-    body: 'Eat food to grow and score.',
-    visualLabel: 'A snake eats food, grows two segments, and gains two points.',
+    title: 'COMBO & GROW',
+    body: 'Two foods start COMBO; reach +3 before it drains.',
+    visualLabel: 'A snake eats ordinary food; one more quick pickup starts COMBO.',
   },
   { ...collectibleBoostStep(inputMode, inputSurface), scene: 'ffa-boost' },
   {
@@ -166,12 +166,12 @@ const soloSteps = (
 ): [TutorialStep, TutorialStep, TutorialStep] => [
   {
     scene: 'solo-food',
-    title: 'MOVE & GROW',
+    title: 'COMBO & GROW',
     body:
       inputSurface === 'touch'
-        ? 'Steer with the d-pad to eat, grow, and score.'
-        : 'Use arrow keys to eat, grow, and score.',
-    visualLabel: 'The solo snake turns toward food and grows.',
+        ? 'D-pad: two foods start COMBO; reach +3 before it drains.'
+        : 'Arrows: two foods start COMBO; reach +3 before it drains.',
+    visualLabel: 'The solo snake eats ordinary food; one more quick pickup starts COMBO.',
   },
   {
     scene: 'solo-boost',

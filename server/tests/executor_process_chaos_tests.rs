@@ -867,9 +867,25 @@ async fn assert_successor_assignment(
     Ok(())
 }
 
+fn game_id_for_seed(seed: u32) -> u32 {
+    // Keep the ID in `PARTITION` while reserving one additional partition
+    // stride for the retention scenario's derived `expired_game_id`.
+    const MAX_BUCKET: u32 = (u32::MAX - PARTITION - PARTITION_COUNT) / PARTITION_COUNT;
+    let bucket = seed % (MAX_BUCKET + 1);
+    bucket * PARTITION_COUNT + PARTITION
+}
+
 fn unique_game_id() -> u32 {
-    let raw = Uuid::new_v4().as_u128() as u32 % 100_000_000;
-    raw * PARTITION_COUNT + PARTITION
+    game_id_for_seed(Uuid::new_v4().as_u128() as u32)
+}
+
+#[test]
+fn generated_game_ids_preserve_partition_and_derived_id_headroom() {
+    for seed in [0, 1, 85_899_345, 100_000_000, u32::MAX] {
+        let game_id = game_id_for_seed(seed);
+        assert_eq!(game_id % PARTITION_COUNT, PARTITION);
+        assert!(game_id.checked_add(PARTITION_COUNT).is_some());
+    }
 }
 
 async fn run_fault_scenario(redis_url: &str, fault: Fault) -> Result<()> {

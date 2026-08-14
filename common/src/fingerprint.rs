@@ -125,6 +125,8 @@ impl GameState {
             h.write_u32(snake.boost.charge_ms);
             h.write_u8(snake.boost.active as u8);
             h.write_u8(snake.boost.intent as u8);
+            h.write_u32(snake.combo.chain_count);
+            h.write_u32(snake.combo.remaining_ms);
             match snake.team_id {
                 Some(team) => {
                     h.write_u8(1);
@@ -186,6 +188,18 @@ impl GameState {
         for (snake_id, score) in scores {
             h.write_u32(snake_id);
             h.write_u32(score);
+        }
+
+        let mut food_pickups: Vec<(u32, u32)> = self
+            .food_pickups
+            .iter()
+            .map(|(snake_id, count)| (*snake_id, *count))
+            .collect();
+        food_pickups.sort_unstable();
+        h.write_u32(food_pickups.len() as u32);
+        for (snake_id, count) in food_pickups {
+            h.write_u32(snake_id);
+            h.write_u32(count);
         }
 
         match &self.team_scores {
@@ -269,6 +283,9 @@ impl GameState {
             }
             None => h.write_u8(0),
         }
+        h.write_u32(self.properties.combo.window_ms);
+        h.write_u32(self.properties.combo.max_food_value);
+        h.write_u16(self.properties.combo.rules_version);
         h.write_u32(self.properties.player_idle_timeout_ms);
         h.write_u32(self.properties.player_idle_warning_ms);
 
@@ -451,6 +468,36 @@ mod tests {
             }
             assert_ne!(baseline.sync_hash(), changed.sync_hash());
         }
+    }
+
+    #[test]
+    fn hash_detects_combo_state_configuration_and_raw_pickups() {
+        let mut baseline = test_state();
+        baseline.add_player(1, None).unwrap();
+
+        let mut changed = baseline.clone();
+        changed.arena.snakes[0].combo.chain_count = 2;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.arena.snakes[0].combo.remaining_ms = 750;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.properties.combo.window_ms = 1_250;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.properties.combo.max_food_value = 2;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.properties.combo.rules_version += 1;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.food_pickups.insert(0, 1);
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
     }
 
     #[test]
