@@ -130,6 +130,9 @@ TypeScript types for everything crossing the WebSocket are generated from the Ru
 
 ### Advertisement Configuration
 
+See [the advertising design](docs/advertising-design.md) for the authority and
+lobby-state diagrams plus desktop, mobile, fallback, and admin screenshots.
+
 Advertisement capability is resolved by the server at startup and sent to each
 browser session. The browser reports which distribution build it is running
 (`web`, `crazygames`, or `itch`); the server maps that distribution to its
