@@ -4,6 +4,7 @@ import { AdBreakResolutionOutbox } from '../../services/ads/adBreakOutbox.ts';
 import { resolveAdAttemptBeforeDeadline } from '../../services/ads/adBreakCoordinator.ts';
 import { bannerRetryDelayMs } from '../../services/ads/bannerLifecycle.ts';
 import {
+  bottomBannerReservePx,
   isDurableBannerRoute,
   planBannerPlacements,
 } from '../../services/ads/bannerPlan.ts';
@@ -217,6 +218,19 @@ test('banner planning is mobile-bottom-only and desktop-provider-aware', () => {
     isScreenEligible: true,
     isGameplayActive: false,
   }).map(({ slot }) => slot), ['bottom']);
+});
+
+test('only the bottom banner reserves route layout space', () => {
+  assert.equal(bottomBannerReservePx([
+    { slot: 'left-rail', width: 160, height: 600 },
+    { slot: 'right-rail', width: 160, height: 600 },
+  ]), 0, 'floating desktop rails do not narrow or offset page content');
+
+  assert.equal(bottomBannerReservePx([
+    { slot: 'bottom', width: 970, height: 90 },
+    { slot: 'left-rail', width: 160, height: 600 },
+    { slot: 'right-rail', width: 160, height: 600 },
+  ]), 114, 'the bottom banner and its chrome reserve a row');
 });
 
 test('providers can prohibit banners during gameplay', () => {

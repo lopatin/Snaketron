@@ -19,6 +19,8 @@ export interface BannerPlanInput {
   isGameplayActive: boolean;
 }
 
+const BOTTOM_BANNER_CHROME_HEIGHT = 24;
+
 const DURABLE_BANNER_ROUTES = new Set(['/', '/leaderboards']);
 
 /**
@@ -29,6 +31,15 @@ export const isDurableBannerRoute = (pathname: string): boolean => {
   const trimmed = pathname.trim();
   const normalized = trimmed.length > 1 ? trimmed.replace(/\/+$/, '') : trimmed;
   return DURABLE_BANNER_ROUTES.has(normalized || '/');
+};
+
+/**
+ * Only the bottom placement participates in document layout. Desktop rails
+ * are fixed viewport overlays and must never narrow or offset page content.
+ */
+export const bottomBannerReservePx = (placements: BannerPlacement[]): number => {
+  const bottom = placements.find(({ slot }) => slot === 'bottom');
+  return bottom ? bottom.height + BOTTOM_BANNER_CHROME_HEIGHT : 0;
 };
 
 const bottomSize = (viewportWidth: number): { width: number; height: number } => {

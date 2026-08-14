@@ -90,9 +90,11 @@ The generic layout supports one bottom placement on mobile and desktop plus two
 desktop rails when the provider permits three concurrent banners. Provider
 capabilities may reduce the selected set; for example, the CrazyGames adapter
 caps itself at two concurrent banners. These captures use neutral sponsor-space
-placeholders rather than simulated ad creative.
+placeholders rather than simulated ad creative. The desktop rails are fixed
+viewport overlays: they never create columns, narrow the app, or move its
+controls. Only the bottom placement reserves layout space.
 
-### Desktop: bottom bar and both rails
+### Desktop: reserved bottom bar and floating rails
 
 ![Desktop banner layout](screenshots/ads/banner-layout-desktop.png)
 

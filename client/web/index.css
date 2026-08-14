@@ -96,19 +96,16 @@ kbd {
   --game-boost: #f8c84a;
   --ad-bottom-reserve: 0px;
   --ad-bottom-total-reserve: calc(var(--ad-bottom-reserve) + var(--safe-area-inset-bottom));
-  --ad-side-reserve: 0px;
 }
 
 /* Every route starts with safe-area-only spacing. The durable banner allowlist
-   opts into the live provider reserves as one shared layout contract. */
+   opts into the live bottom-banner reserve as one shared layout contract. */
 .app-route-layout {
   --ad-route-bottom-reserve: var(--safe-area-inset-bottom);
-  --ad-route-side-reserve: 0px;
 }
 
 .app-route-layout--banner-safe {
   --ad-route-bottom-reserve: var(--ad-bottom-total-reserve);
-  --ad-route-side-reserve: var(--ad-side-reserve);
 }
 
 /* Advertising -------------------------------------------------------------
@@ -150,6 +147,8 @@ kbd {
 
 .ad-banner-slot--left-rail,
 .ad-banner-slot--right-rail {
+  /* Rails float over the viewport edge. They intentionally reserve no page
+     width; only the bottom placement participates in route layout. */
   position: fixed;
   top: calc((100dvh - var(--ad-bottom-total-reserve)) / 2);
   z-index: 25;
@@ -3525,7 +3524,7 @@ body {
   height: 72px;
   align-items: center;
   justify-content: space-between;
-  padding: 0 calc(32px + var(--ad-route-side-reserve));
+  padding: 0 32px;
 }
 
 .home-top-nav {
@@ -4457,8 +4456,7 @@ body {
   flex: 1;
   align-items: center;
   justify-content: center;
-  padding: 84px calc(20px + var(--ad-route-side-reserve))
-    calc(76px + var(--ad-route-bottom-reserve));
+  padding: 84px 20px calc(76px + var(--ad-route-bottom-reserve));
 }
 
 .account-profile-details {
@@ -4533,8 +4531,7 @@ body {
   box-sizing: border-box;
   width: 100%;
   min-height: 100svh;
-  padding: 128px max(clamp(24px, 5vw, 96px), var(--ad-route-side-reserve))
-    calc(120px + var(--ad-route-bottom-reserve));
+  padding: 128px clamp(24px, 5vw, 96px) calc(120px + var(--ad-route-bottom-reserve));
 }
 
 .leaderboard-content {
@@ -4951,7 +4948,7 @@ a.home-social-icon:hover {
 .home-utility-dock {
   position: fixed;
   bottom: calc(20px + var(--ad-route-bottom-reserve));
-  left: calc(20px + env(safe-area-inset-left, 0px) + var(--ad-route-side-reserve));
+  left: calc(20px + env(safe-area-inset-left, 0px));
   z-index: 40;
   display: flex;
   align-items: center;
@@ -5246,7 +5243,7 @@ a.home-social-icon:hover {
 }
 
 .home-lobby-chat {
-  right: calc(20px + env(safe-area-inset-right, 0px) + var(--ad-route-side-reserve));
+  right: calc(20px + env(safe-area-inset-right, 0px));
   bottom: calc(20px + var(--ad-route-bottom-reserve));
 }
 

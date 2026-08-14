@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAds } from '../contexts/AdsContext';
 import { bannerRetryDelayMs } from '../services/ads/bannerLifecycle';
 import {
+  bottomBannerReservePx,
   planBannerPlacements,
   type BannerPlacement,
 } from '../services/ads/bannerPlan';
@@ -197,29 +198,18 @@ export const AdBannerLayout: React.FC<AdBannerLayoutProps> = ({
   const visiblePlacementKey = visiblePlacements.map(placementSignature).join('|');
 
   useEffect(() => {
-    const bottom = visiblePlacements.find(({ slot }) => slot === 'bottom');
-    const rails = visiblePlacements.filter(({ slot }) => slot !== 'bottom');
+    const bottomReserve = bottomBannerReservePx(visiblePlacements);
     const root = document.documentElement;
-    if (bottom) {
+    if (bottomReserve > 0) {
       root.dataset.adBottomVisible = 'true';
-      root.style.setProperty('--ad-bottom-reserve', `${bottom.height + 24}px`);
+      root.style.setProperty('--ad-bottom-reserve', `${bottomReserve}px`);
     } else {
       delete root.dataset.adBottomVisible;
       root.style.setProperty('--ad-bottom-reserve', '0px');
-    }
-    if (rails.length > 0) {
-      const railWidth = Math.max(...rails.map(({ width }) => width));
-      root.dataset.adSideVisible = 'true';
-      root.style.setProperty('--ad-side-reserve', `${railWidth + 20}px`);
-    } else {
-      delete root.dataset.adSideVisible;
-      root.style.setProperty('--ad-side-reserve', '0px');
     }
     return () => {
       delete root.dataset.adBottomVisible;
-      delete root.dataset.adSideVisible;
       root.style.setProperty('--ad-bottom-reserve', '0px');
-      root.style.setProperty('--ad-side-reserve', '0px');
     };
   }, [visiblePlacementKey]);
 
