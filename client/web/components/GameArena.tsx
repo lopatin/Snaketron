@@ -81,6 +81,97 @@ function useBoostPointerBinding(
   sendBoostDecision: (decision: BoostInputDecision) => void,
 ) {
   const pointerIdRef = useRef<number | null>(null);
+  const pointerTargetRef = useRef<HTMLButtonElement | null>(null);
+  const sendBoostDecisionRef = useRef(sendBoostDecision);
+  sendBoostDecisionRef.current = sendBoostDecision;
+
+  const finishPointer = useCallback((
+    pointerId: number,
+    preventDefault?: () => void,
+  ) => {
+    if (pointerIdRef.current !== pointerId) {
+      return;
+    }
+    pointerIdRef.current = null;
+
+    const pointerTarget = pointerTargetRef.current;
+    pointerTargetRef.current = null;
+    const controller = controllerRef.current;
+    if (!controller) {
+      return;
+    }
+
+    const decision = controller.handlePointerUp(pointerId, contextRef.current);
+    if (decision.preventDefault) {
+      preventDefault?.();
+    }
+    try {
+      if (pointerTarget?.hasPointerCapture(pointerId)) {
+        pointerTarget.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // The browser may already have released capture during cancellation.
+    }
+    sendBoostDecisionRef.current(decision);
+  }, [contextRef, controllerRef]);
+
+  // Pointer capture is the fast path, but older embedded browsers can reject
+  // it and mobile lifecycle changes can retarget the final event. Observe the
+  // release at the window as a fallback so leaving or disabling the button
+  // cannot strand its Hold edge.
+  const finishPointerRef = useRef(finishPointer);
+  finishPointerRef.current = finishPointer;
+  useEffect(() => {
+    const finishGlobalPointer = (event: PointerEvent) => {
+      finishPointerRef.current(event.pointerId, () => {
+        if (event.cancelable) {
+          event.preventDefault();
+        }
+      });
+    };
+    const handleGlobalLostPointerCapture = (event: PointerEvent) => {
+      if (pointerIdRef.current !== event.pointerId) {
+        return;
+      }
+
+      const pointerTarget = pointerTargetRef.current;
+      try {
+        // WebKit can deliver an older lost-capture event after capture has
+        // already moved to the button. Do not let that stale event release a
+        // newer live hold that reused the same pointer id.
+        if (pointerTarget?.hasPointerCapture(event.pointerId)) {
+          return;
+        }
+      } catch {
+        // Without capture introspection, target identity is the safe fallback.
+      }
+      if (event.target !== pointerTarget && event.target !== document) {
+        return;
+      }
+      finishGlobalPointer(event);
+    };
+
+    window.addEventListener('pointerup', finishGlobalPointer, true);
+    window.addEventListener('pointercancel', finishGlobalPointer, true);
+    window.addEventListener('lostpointercapture', handleGlobalLostPointerCapture, true);
+    return () => {
+      window.removeEventListener('pointerup', finishGlobalPointer, true);
+      window.removeEventListener('pointercancel', finishGlobalPointer, true);
+      window.removeEventListener('lostpointercapture', handleGlobalLostPointerCapture, true);
+
+      const pointerId = pointerIdRef.current;
+      const pointerTarget = pointerTargetRef.current;
+      pointerIdRef.current = null;
+      pointerTargetRef.current = null;
+      try {
+        if (pointerId !== null && pointerTarget?.hasPointerCapture(pointerId)) {
+          pointerTarget.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // Arena teardown has already cleared the controller's physical holds.
+      }
+    };
+  }, []);
 
   const onPointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
     const controller = controllerRef.current;
@@ -88,15 +179,20 @@ function useBoostPointerBinding(
       return;
     }
 
-    // One hold per button: a second finger landing on the same button must
-    // not claim the capture (its release would then be unmatchable) or
-    // inflate the controller's hold count past what this button can release.
-    if (pointerIdRef.current !== null) {
-      event.preventDefault();
-      return;
+    const heldPointerId = pointerIdRef.current;
+    if (heldPointerId !== null) {
+      // One live hold per button. If a controller-level safety reset already
+      // cleared this id, however, the DOM cache is stale and must not poison
+      // every later Hold press on this button.
+      if (controller.isPointerHeld(heldPointerId)) {
+        event.preventDefault();
+        return;
+      }
+      pointerIdRef.current = null;
+      pointerTargetRef.current = null;
     }
 
-    const decision = controller.handlePointerDown(contextRef.current);
+    const decision = controller.handlePointerDown(event.pointerId, contextRef.current);
     if (decision.preventDefault) {
       event.preventDefault();
     }
@@ -105,38 +201,19 @@ function useBoostPointerBinding(
     // is a physical fact the controller has already recorded, and skipping this
     // would drop the matching release and leave the hold latched on forever.
     pointerIdRef.current = event.pointerId;
+    pointerTargetRef.current = event.currentTarget;
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
       // Synthetic and older embedded browsers may not expose pointer capture;
       // pointerup/cancel still delivers the matching release in the common path.
     }
-    sendBoostDecision(decision);
-  }, [contextRef, controllerRef, sendBoostDecision]);
+    sendBoostDecisionRef.current(decision);
+  }, [contextRef, controllerRef]);
 
   const onPointerRelease = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    if (pointerIdRef.current !== event.pointerId) {
-      return;
-    }
-    pointerIdRef.current = null;
-
-    const controller = controllerRef.current;
-    if (!controller) {
-      return;
-    }
-    const decision = controller.handlePointerUp(contextRef.current);
-    if (decision.preventDefault) {
-      event.preventDefault();
-    }
-    try {
-      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
-    } catch {
-      // The browser may already have released capture during cancellation.
-    }
-    sendBoostDecision(decision);
-  }, [contextRef, controllerRef, sendBoostDecision]);
+    finishPointer(event.pointerId, () => event.preventDefault());
+  }, [finishPointer]);
 
   return { onPointerDown, onPointerRelease };
 }
@@ -301,8 +378,8 @@ export default function GameArena() {
     if (!controller) {
       return;
     }
-    // Per-button pointer ids need no reset here: a release arriving after
-    // teardown finds physicalPointerDown already false and is ignored.
+    // Clearing controller-owned pointer ids also lets every retained DOM
+    // binding recognize and replace a stale cached id on its next press.
     const decision = controller.teardown(boostInputContextRef.current);
     if (decision.command) {
       sendBoostCommandRef.current(decision.command);

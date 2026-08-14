@@ -101,6 +101,14 @@
   cursor: default;
 }
 
+/* Keep the button itself as the pointer-capture target. In particular, WebKit
+   can emit a transient lostpointercapture when implicit touch capture starts on
+   a nested SVG and explicit capture then moves to its parent button. */
+.game-boost-meter *,
+.touch-boost * {
+  pointer-events: none;
+}
+
 .game-boost-meter__canister {
   display: block;
   width: 38px;
