@@ -5,7 +5,7 @@ use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use common::{BoostConfig, GameType};
+use common::{BoostConfig, GameType, MATCH_READY_WINDOW_MS};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -595,6 +595,7 @@ pub struct MatchmakingManager {
     retry_delay: Duration,
     boost_config: BoostConfig,
     player_idle_config: PlayerIdleConfig,
+    match_ready_window_ms: i64,
 }
 
 impl MatchmakingManager {
@@ -621,15 +622,37 @@ impl MatchmakingManager {
         boost_config: BoostConfig,
         player_idle_config: PlayerIdleConfig,
     ) -> Result<Self> {
+        Self::new_with_gameplay_config_and_ready_window(
+            redis,
+            boost_config,
+            player_idle_config,
+            MATCH_READY_WINDOW_MS,
+        )
+    }
+
+    /// Create a matchmaking manager with an explicitly resolved pre-match
+    /// readiness window. Production supplies [`MATCH_READY_WINDOW_MS`]; tests
+    /// may use a shorter window while exercising the same durable deadline and
+    /// executor transition.
+    pub fn new_with_gameplay_config_and_ready_window(
+        redis: impl Into<RedisConnection>,
+        boost_config: BoostConfig,
+        player_idle_config: PlayerIdleConfig,
+        match_ready_window_ms: i64,
+    ) -> Result<Self> {
         boost_config
             .validate()
             .context("Invalid matchmaking Boost configuration")?;
+        if match_ready_window_ms <= 0 {
+            return Err(anyhow!("match readiness window must be positive"));
+        }
         Ok(Self {
             redis: redis.into(),
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
             boost_config,
             player_idle_config,
+            match_ready_window_ms,
         })
     }
 
@@ -639,6 +662,10 @@ impl MatchmakingManager {
 
     pub(crate) fn player_idle_config(&self) -> PlayerIdleConfig {
         self.player_idle_config
+    }
+
+    pub(crate) fn match_ready_window_ms(&self) -> i64 {
+        self.match_ready_window_ms
     }
 
     /// Add a lobby to the matchmaking queue for multiple game types

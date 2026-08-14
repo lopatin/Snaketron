@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "snaketron"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 common = { path = "../common" }
