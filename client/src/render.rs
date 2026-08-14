@@ -1533,7 +1533,10 @@ fn combo_food_label_value(
         return None;
     }
 
-    let value = chain_count.saturating_add(1).min(max_food_value.max(1));
+    // The first pickup only primes the two-second chain. The second pickup is
+    // still ordinary and unlocks +2 for the next food; each later pickup
+    // advances the prospective value until it reaches the configured cap.
+    let value = chain_count.max(1).min(max_food_value.max(1));
     (value > 1).then_some(value)
 }
 
@@ -2921,8 +2924,9 @@ mod tests {
 
     #[test]
     fn combo_food_labels_follow_the_local_snakes_next_value_and_cap() {
-        assert_eq!(combo_food_label_value(1, 1_000, 3, true), Some(2));
-        assert_eq!(combo_food_label_value(2, 750, 3, true), Some(3));
+        assert_eq!(combo_food_label_value(1, 1_000, 3, true), None);
+        assert_eq!(combo_food_label_value(2, 750, 3, true), Some(2));
+        assert_eq!(combo_food_label_value(3, 500, 3, true), Some(3));
         assert_eq!(combo_food_label_value(99, 50, 3, true), Some(3));
 
         // The first ordinary food, expiry, death, and a defensive cap of one

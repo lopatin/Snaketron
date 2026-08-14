@@ -5,7 +5,9 @@ state is durable: ordinary collections follow a fenced `FoodEaten`
 publication, recovery catch-up collections follow the fenced checkpoint that
 absorbs their deltas, and terminal-tick collections follow the fenced
 completion snapshot. Failed or fenced writes do not increment the metrics, and
-replay consumers do not record them again.
+replay consumers do not record them again. A chain awards `1`, `1`, `2`, then
+`3` points per pickup and remains capped at `3`; the first two ordinary pickups
+therefore measure how often players successfully activate the enhanced tiers.
 
 ## OpenTelemetry instruments
 
@@ -92,8 +94,8 @@ histogram_quantile(
 
 Depending on the exporter, the unit suffix may instead be `_ms`; inspect the
 exported series once and adjust the metric name only. Filtering to enhanced
-food removes the expected zero-valued first pickup of every chain, so this
-panel measures successful continuation timing rather than chain starts.
+food removes both ordinary setup pickups (including the zero-window chain
+start), so this panel measures continuation timing after a combo activates.
 
 **Boost-assisted collection share**
 

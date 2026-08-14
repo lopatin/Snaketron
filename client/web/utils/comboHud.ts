@@ -44,12 +44,15 @@ export function buildComboHudView(
   const maxFoodValue = Math.max(1, Math.floor(finiteNonNegative(config.max_food_value)));
   const rawRemainingMs = finiteNonNegative(snake.combo.remaining_ms);
   const remainingMs = Math.min(windowMs, rawRemainingMs);
-  const active = snake.is_alive && windowMs > 0 && remainingMs > 0;
-  const fillRatio = active ? remainingMs / windowMs : 0;
+  const timerActive = snake.is_alive && windowMs > 0 && remainingMs > 0;
   const chainCount = Math.floor(finiteNonNegative(snake.combo.chain_count));
-  const nextFoodValue = active
-    ? Math.min(maxFoodValue, chainCount + 1)
+  // Pickup one primes the timer and pickup two is still worth one point. Only
+  // after that second pickup does the player enter the visible +2 state.
+  const nextFoodValue = timerActive
+    ? Math.min(maxFoodValue, Math.max(1, chainCount))
     : 1;
+  const active = timerActive && nextFoodValue > 1;
+  const fillRatio = active ? remainingMs / windowMs : 0;
   const maxed = active && nextFoodValue >= maxFoodValue && maxFoodValue > 1;
   const tone: ComboHudTone = !active ? 'idle' : maxed ? 'maxed' : 'building';
   const nextLabel = active ? `+${nextFoodValue} Combo!` : '';

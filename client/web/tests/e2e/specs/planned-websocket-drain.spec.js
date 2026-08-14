@@ -2066,7 +2066,7 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
   }
 });
 
-test('Combo callout meter drains and re-pops for every pickup', async ({ page }) => {
+test('Combo callout stays hidden while priming, then drains and re-pops', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 900 });
   const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
   const callout = page.getByTestId('combo-callout');
@@ -2099,9 +2099,19 @@ test('Combo callout meter drains and re-pops for every pickup', async ({ page })
     socketIndex,
     comboSnapshot(11, 6, 1, COMBO_CALLOUT_TEST_WINDOW_MS),
   );
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(meter).toHaveCount(0);
+  await expect(announcement).toHaveText('');
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(12, 7, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
   await expect(callout).toHaveAttribute('data-active', 'true');
   await expect(burst).toHaveText(/\+2\s*Combo!/i);
-  await expect(burst).toHaveAttribute('data-animation-key', '42:1');
+  await expect(burst).toHaveAttribute('data-animation-key', '42:2');
   await expect(announcement).toHaveText('Combo active; next food is worth 2 points');
   await expect(meter).toBeVisible();
   await expect(meterFill).toHaveCSS('transform-origin', /^0px /);
@@ -2118,7 +2128,7 @@ test('Combo callout meter drains and re-pops for every pickup', async ({ page })
   await emitServerMessage(
     page,
     socketIndex,
-    comboSnapshot(12, 7, 1, COMBO_CALLOUT_TEST_WINDOW_MS / 2),
+    comboSnapshot(13, 8, 2, COMBO_CALLOUT_TEST_WINDOW_MS / 2),
   );
   await expect.poll(async () => {
     const current = await readMeterGeometry();
@@ -2131,10 +2141,10 @@ test('Combo callout meter drains and re-pops for every pickup', async ({ page })
   await emitServerMessage(
     page,
     socketIndex,
-    comboSnapshot(13, 8, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
+    comboSnapshot(14, 9, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
   );
   await expect(burst).toHaveText(/\+3\s*Combo!/i);
-  await expect(burst).toHaveAttribute('data-animation-key', '42:2');
+  await expect(burst).toHaveAttribute('data-animation-key', '42:3');
   await expect(burst).toHaveClass(/is-maxed/);
   await expect(announcement).toHaveText(
     'Combo active; next food is worth 3 points, maximum value',
@@ -2148,16 +2158,16 @@ test('Combo callout meter drains and re-pops for every pickup', async ({ page })
   await emitServerMessage(
     page,
     socketIndex,
-    comboSnapshot(14, 9, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
+    comboSnapshot(15, 10, 4, COMBO_CALLOUT_TEST_WINDOW_MS),
   );
   await expect(burst).toHaveText(/\+3\s*Combo!/i);
-  await expect(burst).toHaveAttribute('data-animation-key', '42:3');
+  await expect(burst).toHaveAttribute('data-animation-key', '42:4');
   expect(await firstMaxBurst.evaluate((element) => element.isConnected)).toBe(false);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await expect(meter).toBeHidden();
 
-  await emitServerMessage(page, socketIndex, comboSnapshot(15, 10, 0, 0));
+  await emitServerMessage(page, socketIndex, comboSnapshot(16, 11, 0, 0));
   await expect(callout).toHaveAttribute('data-active', 'false');
   await expect(burst).toHaveCount(0);
   await expect(announcement).toHaveText('');

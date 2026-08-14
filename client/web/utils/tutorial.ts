@@ -125,7 +125,7 @@ const teamSteps = (
     {
       scene: 'team-carry',
       title: mode === 'duel' ? 'CHAIN & BANK' : 'CHAIN & SCORE',
-      body: 'Chain food to +3 before COMBO drains; bank at base.',
+      body: 'Two foods start COMBO; reach +3 before it drains; bank.',
       visualLabel:
         mode === 'duel'
           ? 'A snake carries a combo through the gate labeled YOU; the team score increases.'
@@ -148,8 +148,8 @@ const ffaSteps = (
   {
     scene: 'ffa-food',
     title: 'COMBO & GROW',
-    body: 'Chain food to +3 before COMBO drains.',
-    visualLabel: 'A snake eats; the remaining food becomes worth +2 while the snake grows.',
+    body: 'Two foods start COMBO; reach +3 before it drains.',
+    visualLabel: 'A snake eats ordinary food; one more quick pickup starts COMBO.',
   },
   { ...collectibleBoostStep(inputMode, inputSurface), scene: 'ffa-boost' },
   {
@@ -169,9 +169,9 @@ const soloSteps = (
     title: 'COMBO & GROW',
     body:
       inputSurface === 'touch'
-        ? 'Use the d-pad; chain food to +3 before COMBO drains.'
-        : 'Use arrow keys; chain food to +3 before COMBO drains.',
-    visualLabel: 'The solo snake turns, eats, and makes the remaining food worth +2.',
+        ? 'D-pad: two foods start COMBO; reach +3 before it drains.'
+        : 'Arrows: two foods start COMBO; reach +3 before it drains.',
+    visualLabel: 'The solo snake eats ordinary food; one more quick pickup starts COMBO.',
   },
   {
     scene: 'solo-boost',

@@ -244,14 +244,14 @@ fn frame_team_carry(elapsed_ms: u32) -> GameState {
 
     let snake = if banked {
         if let Some(scores) = state.team_scores.as_mut() {
-            scores.insert(TeamId(0), 3);
+            scores.insert(TeamId(0), 4);
         }
         state.recent_goals.push(TeamGoal {
             tick: TEAM_CARRY_BANK_MS / BOOST_TICK_INTERVAL_MS,
             team_id: TeamId(0),
             snake_id: 0,
             position: position(8, 20),
-            points: 3,
+            points: 4,
         });
         Snake::for_illustration(
             vec![position(8, 20), position(5, 20)],
@@ -264,9 +264,9 @@ fn frame_team_carry(elapsed_ms: u32) -> GameState {
     } else {
         let head_x = lerp_cell(elapsed_ms, 250, 1_500, 18, 8);
         Snake::for_illustration(
-            // Two chained pickups are worth +1 then +2: three carried growth
-            // cells, all of which are banked below.
-            straight_body(position(head_x, 20), Direction::Left, 7),
+            // Three chained pickups are worth +1, +1, then +2: four carried
+            // growth cells, all of which are banked below.
+            straight_body(position(head_x, 20), Direction::Left, 8),
             Direction::Left,
             Some(TeamId(0)),
             0,
@@ -277,7 +277,7 @@ fn frame_team_carry(elapsed_ms: u32) -> GameState {
     state.arena.snakes.push(snake);
     if !banked {
         let combo_window_ms = state.properties.combo.window_ms;
-        pose_combo(&mut state.arena.snakes[0], 2, combo_window_ms);
+        pose_combo(&mut state.arena.snakes[0], 3, combo_window_ms);
     }
     state.arena.food = vec![position(17, 15), position(20, 25), position(23, 18)];
     state
@@ -724,7 +724,7 @@ fn score_effect_for(scene_id: &str) -> Option<TutorialScoreEffect> {
         start_ms: TEAM_CARRY_BANK_MS,
         team_id: 0,
         snake_id: 0,
-        points: 3,
+        points: 4,
         origin: position(8, 20),
         arena_width: TEAM_ARENA_WIDTH,
         arena_height: TEAM_ARENA_HEIGHT,
@@ -1038,12 +1038,12 @@ mod tests {
                 .as_ref()
                 .and_then(|scores| scores.get(&TeamId(0)))
                 .copied(),
-            Some(3)
+            Some(4)
         );
         assert_eq!(carry_poster.recent_goals.len(), 1);
         assert_eq!(carry_poster.recent_goals[0].position, position(8, 20));
-        assert_eq!(carry_poster.recent_goals[0].points, 3);
-        assert_eq!(carry_early.arena.snakes[0].combo.chain_count, 2);
+        assert_eq!(carry_poster.recent_goals[0].points, 4);
+        assert_eq!(carry_early.arena.snakes[0].combo.chain_count, 3);
         assert!(carry_early.arena.snakes[0].combo.remaining_ms > 0);
         assert_eq!(carry_poster.arena.snakes[0].combo.chain_count, 0);
         assert_eq!(carry_poster.arena.snakes[0].combo.remaining_ms, 0);
@@ -1173,7 +1173,7 @@ mod tests {
                 .and_then(|scores| scores.get(&TeamId(0)))
                 .copied()
                 .expect("team score");
-            let expected_length = if score == 0 { 7 } else { 4 };
+            let expected_length = if score == 0 { 8 } else { 4 };
             assert_eq!(
                 snake_length(&state.arena.snakes[0]),
                 expected_length,

@@ -1703,8 +1703,9 @@ export default function GameArena() {
   ) : null;
 
   // Keep the live region mounted, but render its visual burst only while the
-  // engine-owned combo window and gameplay surface are both active. The chain
-  // count is the animation identity so every capped +3 pickup still re-pops.
+  // engine-owned combo window has reached an enhanced tier and the gameplay
+  // surface is active. The chain count is the animation identity so every
+  // capped +3 pickup still re-pops.
   const comboCallout = localSnake && comboHud ? (
     <ComboCallout
       hud={comboHud}

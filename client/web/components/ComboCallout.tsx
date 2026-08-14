@@ -10,7 +10,8 @@ export interface ComboCalloutProps {
 /**
  * A transient arena announcement driven entirely by predicted engine state.
  * The live-region wrapper stays mounted between chains while the visual burst
- * remounts for every pickup, including repeated food at the capped +3 tier.
+ * appears once two quick setup pickups unlock +2, then remounts for every
+ * enhanced pickup, including repeated food at the capped +3 tier.
  */
 const ComboCallout: React.FC<ComboCalloutProps> = ({
   hud,

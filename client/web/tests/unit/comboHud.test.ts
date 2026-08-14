@@ -13,10 +13,22 @@ const snake = (
   combo: { chain_count: chainCount, remaining_ms: remainingMs },
 });
 
-test('combo callout announces +2 after the first food', () => {
-  const full = buildComboHudView(config, snake(1, 2000));
-  const half = buildComboHudView(config, snake(1, 1000));
-  const finalSlice = buildComboHudView(config, snake(1, 1));
+test('the first food primes the timer without showing a combo', () => {
+  const primed = buildComboHudView(config, snake(1, 2000));
+
+  assert.equal(primed.active, false);
+  assert.equal(primed.remainingMs, 2000);
+  assert.equal(primed.fillRatio, 0);
+  assert.equal(primed.nextFoodValue, 1);
+  assert.equal(primed.nextLabel, '');
+  assert.equal(primed.tone, 'idle');
+  assert.equal(primed.ariaValueText, 'Combo inactive');
+});
+
+test('combo callout announces +2 after the second food', () => {
+  const full = buildComboHudView(config, snake(2, 2000));
+  const half = buildComboHudView(config, snake(2, 1000));
+  const finalSlice = buildComboHudView(config, snake(2, 1));
 
   assert.equal(full.active, true);
   assert.equal(full.fillRatio, 1);
@@ -33,7 +45,7 @@ test('combo callout announces +2 after the first food', () => {
 });
 
 test('combo callout upgrades to +3 and stays capped there', () => {
-  for (const chainCount of [2, 3, 99]) {
+  for (const chainCount of [3, 4, 99]) {
     const hud = buildComboHudView(config, snake(chainCount, 750));
     assert.equal(hud.nextFoodValue, 3);
     assert.equal(hud.nextLabel, '+3 Combo!');
@@ -57,7 +69,7 @@ test('expired and dead snakes produce no visible callout text', () => {
 test('custom combo windows are read from the snapshot', () => {
   const hud = buildComboHudView(
     { window_ms: 1250, max_food_value: 3 },
-    snake(1, 625),
+    snake(2, 625),
   );
 
   assert.equal(hud.remainingMs, 625);
@@ -68,14 +80,14 @@ test('custom combo windows are read from the snapshot', () => {
 
   const capped = buildComboHudView(
     { window_ms: 1250, max_food_value: 3 },
-    snake(2, 625),
+    snake(3, 625),
   );
   assert.equal(capped.nextLabel, '+3 Combo!');
   assert.equal(capped.tone, 'maxed');
 });
 
 test('malformed countdown values are clamped instead of breaking the callout', () => {
-  const overfull = buildComboHudView(config, snake(1, 5000));
+  const overfull = buildComboHudView(config, snake(2, 5000));
   assert.equal(overfull.remainingMs, 2000);
   assert.equal(overfull.fillRatio, 1);
   assert.equal(overfull.active, true);

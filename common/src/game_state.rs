@@ -36,7 +36,7 @@ const DEFAULT_SNAKE_LENGTH: usize = 4;
 
 /// Default time available to continue a combo after each food pickup.
 pub const DEFAULT_COMBO_WINDOW_MS: u32 = 2_000;
-/// Food values progress 1, 2, 3 and remain capped at 3 for the chain.
+/// Food values progress 1, 1, 2, 3 and remain capped at 3 for the chain.
 pub const DEFAULT_COMBO_MAX_FOOD_VALUE: u32 = 3;
 /// Semantic version of the authoritative combo scoring rules.
 pub const COMBO_RULES_VERSION: u16 = 1;
@@ -913,7 +913,10 @@ impl ComboConfig {
     }
 
     fn food_value_for_chain(&self, chain_count: u32) -> u32 {
-        chain_count.max(1).min(self.max_food_value.max(1))
+        chain_count
+            .saturating_sub(1)
+            .max(1)
+            .min(self.max_food_value.max(1))
     }
 }
 
@@ -5181,7 +5184,7 @@ mod tests {
     }
 
     #[test]
-    fn combo_awards_one_two_three_then_caps_and_grows_by_awarded_points() {
+    fn combo_awards_one_one_two_three_then_caps_and_grows_by_awarded_points() {
         let mut game = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
         let player = game.add_player(1, None).expect("add player");
         let snake = &mut game.arena.snakes[player.snake_id as usize];
@@ -5189,7 +5192,7 @@ mod tests {
         snake.direction = Direction::Right;
 
         let mut food_events = Vec::new();
-        for expected_points in [1, 2, 3, 3] {
+        for expected_points in [1, 1, 2, 3, 3] {
             let head = *game.arena.snakes[player.snake_id as usize]
                 .head()
                 .expect("head");
@@ -5241,15 +5244,15 @@ mod tests {
         let snake = &game.arena.snakes[player.snake_id as usize];
         let physical_growth =
             snake.length().saturating_sub(game.starting_snake_length()) as u32 + snake.food;
-        assert_eq!(physical_growth, 9, "1 + 2 + 3 + 3 physical cells");
-        assert_eq!(game.scores[&player.snake_id], 9);
-        assert_eq!(game.food_pickups[&player.snake_id], 4);
-        assert_eq!(snake.combo.chain_count, 4);
+        assert_eq!(physical_growth, 10, "1 + 1 + 2 + 3 + 3 physical cells");
+        assert_eq!(game.scores[&player.snake_id], 10);
+        assert_eq!(game.food_pickups[&player.snake_id], 5);
+        assert_eq!(snake.combo.chain_count, 5);
         assert_eq!(snake.combo.remaining_ms, DEFAULT_COMBO_WINDOW_MS);
 
         // Combo value affects score/growth, while XP remains one unit per
         // pellet (plus the existing winner bonus).
-        assert_eq!(game.inactivity_xp_awards(Some(player.snake_id))[&1], 90);
+        assert_eq!(game.inactivity_xp_awards(Some(player.snake_id))[&1], 100);
     }
 
     #[test]

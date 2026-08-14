@@ -247,12 +247,13 @@ test('every mode teaches the universal combo rule in its opening instruction', (
     const opening = tutorialContent(mode, 'Quickmatch').steps[0];
     assert.match(opening.body, /food/i);
     assert.match(opening.body, /\+3/);
-    assert.match(opening.body, /COMBO drains/i);
+    assert.match(opening.body, /two foods/i);
+    assert.match(opening.body, /drains/i);
   }
 
   assert.equal(
     tutorialContent('duel', 'Quickmatch').steps[0].body,
-    'Chain food to +3 before COMBO drains; bank at base.',
+    'Two foods start COMBO; reach +3 before it drains; bank.',
   );
 });
 
@@ -285,7 +286,7 @@ test('touch surfaces teach the d-pad and NOS button instead of keyboard keys', (
   }
 
   const touchSolo = tutorialContent('solo', 'Quickmatch', { scoreLimit: null }, 'hold', 'touch');
-  assert.match(touchSolo.steps[0].body, /d-pad/);
+  assert.match(touchSolo.steps[0].body, /d-pad/i);
 });
 
 test('the keyboard surface is the default, so existing call sites are unchanged', () => {
