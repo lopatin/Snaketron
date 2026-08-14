@@ -321,22 +321,13 @@ const fn runtime_config_schema_version() -> u16 {
     RUNTIME_CONFIG_SCHEMA_VERSION
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct RuntimeAnnouncementConfig {
     pub enabled: bool,
     pub message: String,
-}
-
-impl Default for RuntimeAnnouncementConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            message: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
