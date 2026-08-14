@@ -22,6 +22,7 @@ use crate::matchmaking_manager::{
     MatchmakingManager, QueuedPlayer,
 };
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::player_idle::PlayerIdleConfig;
 
 // --- Configuration Constants ---
 /// Anchors `GameState::start_ms`, which is the match's durable runtime
@@ -1304,6 +1305,7 @@ async fn prepare_game_from_lobbies(
         rng_seed,
         start_ms,
         matchmaking_manager.boost_config(),
+        matchmaking_manager.player_idle_config(),
     )?;
     game_state.is_stress_test = matchmaking_pool == MatchmakingPool::Stress;
 
@@ -1446,8 +1448,9 @@ fn build_match_game_state(
     rng_seed: Option<u64>,
     start_ms: i64,
     boost_config: &BoostConfig,
+    player_idle_config: PlayerIdleConfig,
 ) -> Result<GameState> {
-    if let Some(mut mode_config) = boost_config_for(&game_type, width, height) {
+    let mut state = if let Some(mut mode_config) = boost_config_for(&game_type, width, height) {
         // Startup configuration owns balance. The mode owns its fuel model and
         // layout: FFA uses the canonical field pads while Solo is unlimited
         // and has no pads. Copying only balance fields prevents a team-shaped
@@ -1465,12 +1468,17 @@ fn build_match_game_state(
             rng_seed,
             start_ms,
             mode_config,
-        )
+        )?
     } else {
-        Ok(GameState::new(
-            width, height, game_type, queue_mode, rng_seed, start_ms,
-        ))
-    }
+        GameState::new(width, height, game_type, queue_mode, rng_seed, start_ms)
+    };
+
+    state.properties.player_idle_timeout_ms = player_idle_config.total_timeout_ms();
+    state.properties.player_idle_warning_ms = player_idle_config.kick_countdown_ms();
+    state
+        .validate_boost_invariants()
+        .context("Configured match state failed validation")?;
+    Ok(state)
 }
 
 async fn create_game_from_lobbies(
@@ -1594,6 +1602,7 @@ mod tests {
             speed_milli: 1_750,
             ..BoostConfig::default()
         };
+        let player_idle_config = PlayerIdleConfig::default();
 
         let cases = [
             (60, 40, GameType::TeamMatch { per_team: 1 }, 2, 3, false),
@@ -1611,6 +1620,7 @@ mod tests {
                     Some(7),
                     123,
                     &boost_config,
+                    player_idle_config,
                 )?;
                 for user_id in 1..=player_count {
                     state.add_player(user_id, None)?;
@@ -1646,6 +1656,59 @@ mod tests {
                 state.validate_boost_invariants()?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn default_player_idle_policy_warns_at_ten_seconds_and_kicks_at_twenty() -> Result<()> {
+        let state = build_match_game_state(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            123,
+            &BoostConfig::default(),
+            PlayerIdleConfig::default(),
+        )?;
+
+        assert_eq!(state.properties.player_idle_timeout_ms, 20_000);
+        assert_eq!(state.properties.player_idle_warning_ms, 10_000);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_player_idle_policy_is_snapshotted_into_every_match_branch() -> Result<()> {
+        let player_idle_config = PlayerIdleConfig::new(12_345, 6_789)?;
+        let cases = [
+            (60, 40, GameType::TeamMatch { per_team: 1 }),
+            (40, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::Solo),
+            (
+                40,
+                40,
+                GameType::Custom {
+                    settings: common::CustomGameSettings::default(),
+                },
+            ),
+        ];
+
+        for (width, height, game_type) in cases {
+            let state = build_match_game_state(
+                width,
+                height,
+                game_type,
+                QueueMode::Quickmatch,
+                Some(7),
+                123,
+                &BoostConfig::default(),
+                player_idle_config,
+            )?;
+
+            assert_eq!(state.properties.player_idle_timeout_ms, 19_134);
+            assert_eq!(state.properties.player_idle_warning_ms, 6_789);
+        }
+
         Ok(())
     }
 

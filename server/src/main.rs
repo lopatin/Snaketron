@@ -4,6 +4,9 @@ use server::db::{Database, dynamodb::DynamoDatabase};
 use server::game_server::{
     BOOST_SPEED_MULTIPLIER_ENV, GameServer, GameServerConfig, resolve_boost_config,
 };
+use server::player_idle::{
+    PLAYER_IDLE_COUNTDOWN_MS_ENV, PLAYER_IDLE_GRACE_MS_ENV, resolve_player_idle_config,
+};
 use server::ws_server::TestJwtVerifier;
 use std::env;
 use std::sync::Arc;
@@ -117,6 +120,20 @@ async fn main() -> Result<()> {
         "Resolved Boost balance for new duel and 2v2 matches"
     );
 
+    let configured_idle_grace_ms = env::var(PLAYER_IDLE_GRACE_MS_ENV).ok();
+    let configured_idle_countdown_ms = env::var(PLAYER_IDLE_COUNTDOWN_MS_ENV).ok();
+    let player_idle_config = resolve_player_idle_config(
+        configured_idle_grace_ms.as_deref(),
+        configured_idle_countdown_ms.as_deref(),
+    )
+    .context("Invalid player inactivity configuration")?;
+    info!(
+        idle_grace_ms = player_idle_config.idle_grace_ms(),
+        kick_countdown_ms = player_idle_config.kick_countdown_ms(),
+        total_timeout_ms = player_idle_config.total_timeout_ms(),
+        "Resolved inactivity policy for new multiplayer matches"
+    );
+
     // Create server configuration
     let config = GameServerConfig {
         db: db.clone(),
@@ -130,6 +147,7 @@ async fn main() -> Result<()> {
         replay_dir,
         redis_url: redis_url.clone(),
         boost_config,
+        player_idle_config,
     };
 
     let mut game_server = GameServer::start(config).await?;

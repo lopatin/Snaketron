@@ -17,6 +17,7 @@ use crate::http_server::{DeferredHttpServer, install_http_application};
 use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
+use crate::player_idle::PlayerIdleConfig;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_utils::{RedisClient, create_connection_manager_until_available};
 use crate::region_cache::RegionCache;
@@ -194,6 +195,8 @@ pub struct GameServerConfig {
     pub redis_url: String,
     /// Boost rules resolved and validated once at process startup.
     pub boost_config: BoostConfig,
+    /// Inactivity phases resolved once at startup and snapshotted per match.
+    pub player_idle_config: PlayerIdleConfig,
 }
 
 /// A complete game server instance with all components
@@ -259,6 +262,7 @@ impl GameServer {
             replay_dir: _,
             redis_url,
             boost_config,
+            player_idle_config,
         } = config;
 
         boost_config
@@ -447,8 +451,12 @@ impl GameServer {
         lobby_manager.start_lobby_update_forwarder();
 
         // Create the matchmaking manager
-        let matchmaking = MatchmakingManager::new_with_boost_config(redis.clone(), boost_config)
-            .context("Failed to create matchmaking manager")?;
+        let matchmaking = MatchmakingManager::new_with_gameplay_config(
+            redis.clone(),
+            boost_config,
+            player_idle_config,
+        )
+        .context("Failed to create matchmaking manager")?;
         let outbox_matchmaking = matchmaking.clone();
         let matchmaking_manager = Arc::new(tokio::sync::Mutex::new(matchmaking));
 
@@ -958,6 +966,7 @@ pub async fn start_test_server_with_grpc(
         replay_dir,
         redis_url: redis_url.clone(),
         boost_config: BoostConfig::default(),
+        player_idle_config: PlayerIdleConfig::default(),
     };
 
     let game_server = GameServer::start(config).await?;
