@@ -46,6 +46,14 @@ spectrogram does not show:
 - `qc.py` — clipping, DC offset, stereo width. It caught the limiter not
   holding its ceiling (samples at full scale despite a −1 dB threshold, which
   clips on lossy conversion) and a DC offset from asymmetric saturation.
+- `loudness.py` — K-weighted (BS.1770) level around each cue. Flat RMS
+  underweights 1–6 kHz, which is exactly where a bright effect lives; the goal
+  flourish measured *below* the bed on RMS and was still the most prominent
+  thing in the film.
+- `balance.py` — how far each effect pokes above the bed floor. Aim for the
+  effect's sustained level to sit within ~1 dB of the bed and let only its
+  transient above; ~+5 dB of sustained level is what "the effects are much
+  louder than the music" sounds like.
 - `pump.py` — the sidechain recovery ramp **between** kicks. Measuring at the
   kick catches the kick's own energy and reads as the opposite of ducking.
 
@@ -55,6 +63,12 @@ Two authoring rules the measurements enforce:
    from the first kick to the last — 4 dB of range across the whole record,
    which is what "not exciting" means in numbers. `SECTION_GAIN` in `song.py`
    authors the curve; the master chain is deliberately gentle so it survives.
-2. **Sidechain release is tempo-tied.** At 120 BPM the beat gap is 500 ms; a
+2. **A pitched effect must agree with the chord it lands on.** The goal
+   flourish was A–C–E over a bar of G major: no shared tones and a semitone
+   between its C and the chord's B. It read as "too loud" and trimming it 6 dB
+   changed nothing, because loudness was never the problem — the ear picks a
+   clashing note out of a mix at any level. `sfx.bank()` now takes the chord,
+   and `song.chord_at()` says what it is at a given second.
+3. **Sidechain release is tempo-tied.** At 120 BPM the beat gap is 500 ms; a
    240 ms release leaves half of every beat static and the groove stops
    breathing.

@@ -54,11 +54,23 @@ def boost(length=1.0) -> np.ndarray:
     return out / (np.max(np.abs(out)) + 1e-9) * 0.9
 
 
-def bank(length=1.3) -> np.ndarray:
-    """Points banked. A bright major arpeggio flourish that resolves upward."""
+# The goal flourish is the one SFX that is *pitched*, so it is the one that can
+# be out of key. Shipped as A-C-E over a bar of G major: no shared tones and a
+# C against the B, which is a semitone. A clashing note is picked out by the ear
+# at any level — trimming its gain 6 dB did nothing, because loudness was never
+# the problem. It has to agree with the chord it lands on.
+def bank(length=1.3, chord=('G', 'B', 'D'), low_octave=4) -> np.ndarray:
+    """Points banked: a rising arpeggio through `chord`, resolving to its octave.
+
+    `chord` must be the harmony sounding underneath at the moment it plays —
+    see `song.chord_at()`. The default is the chord under the launch trailer's
+    bank cue at 6.10 s.
+    """
     n = int(length * SR)
     out = np.zeros((2, n))
-    for i, nm in enumerate(['A4', 'C5', 'E5', 'A5']):
+    voicing = [f'{chord[0]}{low_octave}', f'{chord[1]}{low_octave}',
+               f'{chord[2]}{low_octave + 1}', f'{chord[0]}{low_octave + 1}']
+    for i, nm in enumerate(voicing):
         start = int(i * 0.052 * SR)
         seg = n - start
         v = supersaw(note(nm), seg, voices=5, detune_cents=12)
@@ -103,10 +115,15 @@ def stamp(length=0.5) -> np.ndarray:
     return out / (np.max(np.abs(out)) + 1e-9) * 0.8
 
 
+# The launch trailer's bank cue lands at 6.10 s, on the G of the Am-F-C-G
+# progression. If that cue moves, or another film uses a different bed, this
+# has to move with it: see `song.chord_at()`.
+BANK_CHORD = ('G', 'B', 'D')
+
 SET = {
     'impact.wav': impact,
     'boost.wav': boost,
-    'bank.wav': bank,
+    'bank.wav': lambda: bank(chord=BANK_CHORD),
     'whoosh.wav': card_push,
     'stamp.wav': stamp,
 }
