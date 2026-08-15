@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-RENDERER_VERSION = 7
+RENDERER_VERSION = 8
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 # Brand ground truth (see references/brand.md). SnakeTron is a light product:
@@ -76,6 +76,46 @@ def _caption_y_frac(item: dict[str, Any]) -> float:
     """
     line = int(item.get("line", 0))
     return CAPTION_BASE_Y_FRAC + line * CAPTION_STACK_Y_FRAC
+
+
+# Caption entrance. A caption that simply switches on is the one element in an
+# otherwise fully eased film that moves linearly — it reads as a subtitle track
+# rather than as part of the cut. It fades up fast and pops: overshooting its
+# size, dipping just under, and settling, all inside a third of a second.
+CAPTION_POP_MS = 300
+CAPTION_POP_AMOUNT = 0.22
+CAPTION_FADE_MS = 110
+
+
+def _caption_pop(start: float, anchor_x: str, anchor_y: str) -> tuple[str, str, str]:
+    """Per-frame scale and overlay offsets for a caption's entrance.
+
+    Returns `(scale_factor, overlay_x, overlay_y)` as ffmpeg expressions.
+
+    The caption is rasterized into a full-frame transparent plate, so scaling
+    it scales about the frame's origin and would slide the text across the
+    screen. Offsetting the overlay by `anchor * (1 - scale)` pins one point of
+    the plate instead — the caption's own inner edge and vertical middle — so
+    it grows away from the margin it is aligned to and cannot walk off frame.
+    """
+    span = max(CAPTION_POP_MS / 1000, 1e-6)
+    phase = f"clip((t-{start:.6f})/{span:.6f}\\,0\\,1)"
+    # A single damped beat: 1+A at the start, under 1 at the trough, exactly 1
+    # at the end because the (1-u)^2 envelope closes.
+    scale = f"(1+{CAPTION_POP_AMOUNT}*pow(1-{phase}\\,2)*cos({phase}*8))"
+    return scale, f"{anchor_x}*(1-{scale})", f"{anchor_y}*(1-{scale})"
+
+
+def _caption_anchor(item: dict[str, Any], width: int, height: int) -> tuple[str, str]:
+    """The point on the plate that the entrance scales about."""
+    margin = (
+        1 - CAPTION_MARGIN_FRAC if _caption_side(item) == "right" else CAPTION_MARGIN_FRAC
+    )
+    size = max(48, round(height * CAPTION_SIZE_FRAC))
+    return (
+        f"{width * margin:.3f}",
+        f"{height * _caption_y_frac(item) + size / 2:.3f}",
+    )
 
 
 def _caption_side(item: dict[str, Any]) -> str:
@@ -252,6 +292,10 @@ def _segment_filter(
                         ),
                         y=f"h*{_caption_y_frac(item):.4f}",
                         enable=f"between(t\\,{start:.6f}\\,{end:.6f})",
+                        # NOTE: drawtext captions do not pop in — `fontsize`
+                        # takes no time expression. The Pillow raster path is
+                        # the supported one; this exists for hosts whose
+                        # ffmpeg lacks the raster inputs.
                     )
                 )
         if texts and not use_drawtext:
@@ -264,9 +308,17 @@ def _segment_filter(
                 start = float(item["at_local"])
                 end = start + float(item["dur_output"])
                 source = f"[{raster_callout_input + offset}:v]"
+                anchor_x, anchor_y = _caption_anchor(item, width, height)
+                scale, over_x, over_y = _caption_pop(start, anchor_x, anchor_y)
+                # The looped still shares the plate's timeline (no -itsoffset),
+                # so `fade`'s `st` and the scale expression's `t` are the same
+                # clock the overlay's `enable` window is written against.
                 filters.append(
-                    f"{source}format=rgba[callout{offset}];"
-                    f"[pretext{offset}][callout{offset}]overlay=0:0:"
+                    f"{source}format=rgba,"
+                    f"fade=t=in:st={start:.6f}:d={CAPTION_FADE_MS / 1000:.3f}:alpha=1,"
+                    f"scale=w='iw*{scale}':h='ih*{scale}':eval=frame[callout{offset}];"
+                    f"[pretext{offset}][callout{offset}]"
+                    f"overlay=x='{over_x}':y='{over_y}':"
                     f"enable='between(t,{start:.6f},{end:.6f})'[pretext{offset + 1}]"
                 )
             chain_input = f"[pretext{len(texts)}]"

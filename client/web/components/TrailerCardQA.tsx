@@ -93,24 +93,27 @@ const FlowFieldBackdrop: React.FC<{ elapsedMs: number; intensity?: number }> = (
 };
 
 /**
- * The end slate is a three-beat sequence, not a held frame: the logo lands
- * first, the call to action snaps in after it, and both leave together with
- * the logo mirroring the entrance it made at the top of the film.
+ * The end slate is a sequence on the way in — the logo lands, then the call to
+ * action snaps in after it — and then it simply stays. Nothing animates out.
+ *
+ * A trailer's last frame is the one a paused or looping player sits on, so it
+ * has to be the finished lockup and not whatever a fade happened to leave
+ * behind. That is the opposite of every other card here, where a held frame is
+ * the defect.
  *
  * `OUTRO` is expressed in ms rather than fractions so the beats keep their
- * feel if the card's length is retimed; the exit is anchored to the end.
+ * feel if the card's length is retimed.
  */
 const OUTRO = {
   logoIn: 220,
   logoInMs: 780,
   ctaIn: 980,
   ctaInMs: 620,
-  exitMs: 820,
 };
 
 /**
- * The logo is *dropped* in and *lifted* out — one fast vertical move on a
- * single axis, married to the fade.
+ * The logo is *dropped* in — one fast vertical move on a single axis, married
+ * to the fade. It is never lifted back out; see `OUTRO`.
  *
  * It used to enter on a slow rise combined with a scale ramp, which read as a
  * diagonal parallax float: two simultaneous transforms at different rates make
@@ -120,7 +123,6 @@ const OUTRO = {
  */
 const LOGO_DROP_PX = 190;
 const LOGO_DROP_MS = 560;
-const LOGO_LIFT_PX = 240;
 
 const LogoSlate: React.FC<{ elapsedMs: number; mode: 'intro' | 'outro'; durationMs: number }> = ({
   elapsedMs,
@@ -128,15 +130,12 @@ const LogoSlate: React.FC<{ elapsedMs: number; mode: 'intro' | 'outro'; duration
   durationMs,
 }) => {
   const intro = mode === 'intro';
-  const exitStart = durationMs - OUTRO.exitMs;
-  const exit = intro ? 0 : easeInCubic((elapsedMs - exitStart) / OUTRO.exitMs);
   const dropStart = intro ? 250 : OUTRO.logoIn;
   // easeOutBack lands it slightly past centre and settles back: the overshoot
   // is what makes a drop read as a drop rather than a slide.
   const drop = easeOutBack((elapsedMs - dropStart) / LOGO_DROP_MS);
-  // Falls from above; the exit accelerates back the same way it came.
-  const offsetY = -(1 - drop) * LOGO_DROP_PX - exit * LOGO_LIFT_PX;
-  const opacity = easeOutCubic((elapsedMs - dropStart) / 320) * (1 - exit);
+  const offsetY = -(1 - drop) * LOGO_DROP_PX;
+  const opacity = easeOutCubic((elapsedMs - dropStart) / 320);
 
   // The call to action arrives on a damped wiggle — the one deliberately
   // playful move in the film, and the last thing a viewer sees.
@@ -147,7 +146,7 @@ const LogoSlate: React.FC<{ elapsedMs: number; mode: 'intro' | 'outro'; duration
   // out in white, so any part of them that lands ahead of the bar is white on
   // paper and simply missing.
   const ctaBar = easeOutCubic((elapsedMs - OUTRO.ctaIn) / 240);
-  const ctaOpacity = clamp01((elapsedMs - OUTRO.ctaIn - 170) / 200) * (1 - exit);
+  const ctaOpacity = clamp01((elapsedMs - OUTRO.ctaIn - 170) / 200);
 
   return (
     <div className="trailer-card trailer-card--logo">
@@ -175,7 +174,7 @@ const LogoSlate: React.FC<{ elapsedMs: number; mode: 'intro' | 'outro'; duration
         <div
           className="trailer-card__cta"
           style={{
-            opacity: clamp01((elapsedMs - OUTRO.ctaIn) / 120) * (1 - exit),
+            opacity: clamp01((elapsedMs - OUTRO.ctaIn) / 120),
             transform: `translateY(${((1 - ctaSettle) * 30).toFixed(2)}px) `
               + `rotate(${ctaWiggle.toFixed(2)}deg) `
               + `scale(${(0.82 + 0.18 * ctaSettle).toFixed(3)})`,

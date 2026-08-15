@@ -45,6 +45,10 @@ band — not two lines of copy in the same corner, and not one merged phrase.
   the first, and both run to the cut — so they leave with the shot rather than
   blinking out while it is still playing. Set each `dur` so `at + dur` equals
   the clip's `out`.
+- **Captions arrive, they do not switch on.** `render.py` fades each one up
+  over ~110 ms and pops it: in oversized, a dip just under, settling at rest
+  inside 300 ms. It is automatic; the point is that a hard on/off is the one
+  linear move in an otherwise fully eased film and reads as a subtitle track.
 - **`line` still exists** for the rare third caption, but a stacked pair reads
   as a block of copy dumped in one corner; that is what the side split fixes.
 - Anchor each to the moment it describes — `meta:combo`, not a guessed
@@ -96,6 +100,10 @@ dropped in among gameplay.
   empty arena after the fireball. One to one-and-a-half seconds after the
   payoff is enough to register it; past that the shot is over and the video
   does not know it.
+- **The end slate is the one card allowed to hold.** Nothing on it animates
+  out: a trailer's last frame is what a paused or looping player sits on, so it
+  has to be the finished lockup rather than whatever a fade left behind. Every
+  other held frame in this file is a defect; this one is the deliverable.
 - **Give every non-gameplay card the drifting dot field** (`arenaFlowField.ts`,
   the same field as the home screen). It keeps the frame alive, unifies the
   non-gameplay frames into one language, and prevents frozen-frame QC failures.
