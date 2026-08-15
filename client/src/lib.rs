@@ -1,5 +1,6 @@
 mod render;
 mod scenario;
+mod skin;
 mod tutorial;
 
 use common::{
@@ -271,12 +272,44 @@ impl GameClient {
     #[wasm_bindgen(js_name = getPredictedVisualStateJson)]
     pub fn get_predicted_visual_state_json(&self) -> Result<String, JsValue> {
         let state = self.render_state();
+
+        // A goal celebration is dressed by whoever *scored*, so the theme
+        // travels with the cue: it is resolved here, once, from the scorer's
+        // skin, rather than leaving the web layer to work out whose colours to
+        // use while an effect is already in flight.
+        let goals: Vec<serde_json::Value> = state
+            .recent_goals
+            .iter()
+            .map(|goal| {
+                let scorer = state
+                    .players
+                    .iter()
+                    .find(|(_, player)| player.snake_id == goal.snake_id)
+                    .map(|(user_id, _)| *user_id);
+                let skin = skin::skin_registry().resolve(
+                    scorer
+                        .and_then(|id| state.skins.get(&id))
+                        .map(String::as_str),
+                );
+                let theme = skin
+                    .celebration_theme()
+                    .unwrap_or(skin::classic::CLASSIC_CELEBRATION_THEME);
+                let mut value = serde_json::to_value(goal).unwrap_or(serde_json::Value::Null);
+                if let Some(object) = value.as_object_mut()
+                    && let Ok(theme) = serde_json::to_value(theme)
+                {
+                    object.insert("celebration".to_string(), theme);
+                }
+                value
+            })
+            .collect();
+
         serde_json::to_string(&serde_json::json!({
             "predicted_tick": state.current_tick(),
             "committed_tick": self.engine.current_tick(),
             "tick_duration_ms": state.properties.tick_duration_ms,
             "cues": &state.recent_crashes,
-            "goals": &state.recent_goals,
+            "goals": goals,
         }))
         .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -357,24 +390,42 @@ impl GameClient {
     }
 
     /// Render the engine's current predicted state directly to a canvas — no
-    /// JSON round-trip. `draw_celebration` runs behind snakes; `draw_post_snakes`
-    /// runs above the completed arena frame for impacts such as explosions.
+    /// JSON round-trip. `draw_celebration` is invoked after the field and pickups
+    /// but before snakes, so JavaScript-owned cosmetic effects can share this
+    /// canvas without covering gameplay actors; `draw_post_snakes` runs above the
+    /// completed arena frame for impacts such as explosions.
+    ///
+    /// `anim_ms` is the caller's presentation clock (the animation-frame
+    /// timestamp in the arena), which animated skins paint from. It is
+    /// cosmetic: nothing derived from it reaches game state or the sync
+    /// fingerprint. `reduced_motion` mirrors the viewer's OS preference.
     #[wasm_bindgen(js_name = render)]
+    // A flat argument list because this is the JavaScript boundary; grouping
+    // them would mean building an object per frame on the JS side.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         canvas: &web_sys::HtmlCanvasElement,
         cell_size: f64,
         rotation: f64,
         local_user_id: Option<u32>,
+        anim_ms: f64,
+        reduced_motion: bool,
+        local_skin_ref: Option<String>,
         draw_celebration: &js_sys::Function,
         draw_post_snakes: &js_sys::Function,
     ) -> Result<(), JsValue> {
         render::render_game_state(
             self.render_state(),
             canvas,
-            cell_size,
-            local_user_id,
-            rotation as i32,
+            render::FrameOptions {
+                cell_size,
+                local_user_id,
+                rotation: rotation as i32,
+                anim_ms,
+                reduced_motion,
+                local_skin_ref: local_skin_ref.as_deref(),
+            },
             draw_celebration,
             draw_post_snakes,
         )
@@ -753,6 +804,16 @@ mod tests {
                 "snake_id": 0,
                 "position": { "x": 9, "y": 18 },
                 "points": 2,
+                // A celebration is dressed by whoever scored, so the cue
+                // carries the scorer's theme rather than leaving the web layer
+                // to look it up while the effect is already running.
+                "celebration": {
+                    "effect": "goal-impact-wave",
+                    "friendly_accent": "#5299bb",
+                    "enemy_accent": "#d45454",
+                    "readout_friendly": "#2b6f8c",
+                    "readout_enemy": "#a83232",
+                },
             }]),
             "the payload must carry predicted goal cues under the `goals` key"
         );

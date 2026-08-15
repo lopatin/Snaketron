@@ -7,14 +7,19 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, ConditionCheck,
     CreateGlobalSecondaryIndexAction, Delete, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
-    KeySchemaElement, KeyType, Projection, ProjectionType, Put, ReturnValue, ScalarAttributeType,
-    TableStatus, TimeToLiveSpecification, TimeToLiveStatus, TransactWriteItem, Update,
+    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, Put, ReturnValue,
+    ScalarAttributeType, TableStatus, TimeToLiveSpecification, TimeToLiveStatus, TransactWriteItem,
+    Update,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -1364,6 +1369,62 @@ impl DynamoDatabase {
         })
     }
 
+    /// Sort key of a user's ranking *pointer* — the item that makes "what is
+    /// this user's standing on this ladder?" a keyed read.
+    ///
+    /// The ladder rows are keyed `MMR#{inverted}#USER#{id}` so the partition
+    /// sorts by rating, which means a user cannot be looked up by key at all.
+    /// The pointer duplicates the row's fields under a second, user-addressed
+    /// sort key. `"MMR#" < "USER#"`, so every pointer sorts after every ladder
+    /// row and a top-N leaderboard query never reaches them.
+    fn ranking_pointer_sk(user_id: i32) -> String {
+        format!("USER#{}", user_id)
+    }
+
+    /// A pointer recording that a user has *no* row on this ladder.
+    ///
+    /// Without it, every unranked visitor to the leaderboard would re-run the
+    /// legacy full-partition scan on each request, since a miss is otherwise
+    /// indistinguishable from "not yet migrated".
+    fn absent_ranking_pointer(pk: &str, user_id: i32) -> HashMap<String, AttributeValue> {
+        // Deliberately carries no `userId`, so a tombstone can never parse as
+        // a ranking even if the `absent` flag is ever dropped.
+        HashMap::from([
+            ("pk".to_string(), Self::av_s(pk)),
+            (
+                "sk".to_string(),
+                Self::av_s(Self::ranking_pointer_sk(user_id)),
+            ),
+            ("absent".to_string(), Self::av_bool(true)),
+            ("updatedAt".to_string(), Self::av_s(Utc::now().to_rfc3339())),
+        ])
+    }
+
+    /// Store a pointer discovered by the legacy scan, without ever overwriting
+    /// one that already exists.
+    ///
+    /// The condition is what makes this safe to run on a read path: a scan
+    /// racing a concurrent `upsert_ranking` must not be able to roll the
+    /// user's counters back to the values it happened to observe.
+    async fn backfill_ranking_pointer(&self, item: HashMap<String, AttributeValue>) {
+        let result = self
+            .client
+            .put_item()
+            .table_name(self.rankings_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+
+        // A lost race is the expected outcome, not an error, and any other
+        // failure only costs the next reader one more scan.
+        if let Err(err) = result
+            && err.code() != Some("ConditionalCheckFailedException")
+        {
+            debug!("Ranking pointer backfill did not apply: {:?}", err);
+        }
+    }
+
     fn user_ranking_from_items<'a>(
         items: impl IntoIterator<Item = &'a HashMap<String, AttributeValue>>,
         user_id: i32,
@@ -1396,6 +1457,76 @@ impl DynamoDatabase {
                 .map(|timestamp| timestamp.with_timezone(&Utc))
                 .unwrap_or_else(Utc::now),
         })
+    }
+
+    /// Reduce a leaderboard to one row per player, keeping the strongest.
+    ///
+    /// A player owns one ranking row per region they have played a ranked game
+    /// in, each holding the rating they carried at the time. The global ladder
+    /// therefore returns the same player once per region, which both duplicates
+    /// them in the standings and pushes real competitors off the page. The
+    /// surviving row is the highest-rated one, which is the row the global
+    /// board already surfaced for that player before the collapse.
+    ///
+    /// Expects MMR-descending input, which every caller sorts beforehand.
+    fn collapse_ranking_rows_per_user(entries: &mut Vec<RankingEntry>) {
+        let mut seen: HashSet<i32> = HashSet::with_capacity(entries.len());
+        entries.retain(|entry| seen.insert(entry.user_id));
+    }
+
+    /// Read the cross-region season partition until it can supply `limit`
+    /// distinct players.
+    ///
+    /// The index is sorted by the same inverted-MMR sort key as the base
+    /// table, so pages arrive strongest-first and the first row seen for a
+    /// player is the one that survives [`Self::collapse_ranking_rows_per_user`].
+    /// Paging matters because duplicates and DynamoDB's 1 MiB page ceiling both
+    /// cost rows a single query would have counted toward the requested limit.
+    async fn query_global_ranking_pages(
+        &self,
+        game_type_season: &str,
+        season: Season,
+        limit: usize,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
+        const MAX_PAGES: usize = 20;
+
+        let page_size = i32::try_from(limit).unwrap_or(i32::MAX);
+        let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
+        let mut distinct_users: HashSet<i32> = HashSet::new();
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+
+        for _ in 0..MAX_PAGES {
+            let mut request = self
+                .client
+                .query()
+                .table_name(self.rankings_table())
+                .index_name("GameTypeSeasonIndex")
+                .key_condition_expression("gameTypeSeason = :gts")
+                .expression_attribute_values(":gts", Self::av_s(game_type_season))
+                .limit(page_size);
+            if let Some(key) = &last_evaluated_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to query global leaderboard index")?;
+
+            for item in response.items.unwrap_or_default() {
+                if let Some(entry) = Self::leaderboard_entry_from_item(&item, season) {
+                    distinct_users.insert(entry.user_id);
+                }
+                items.push(item);
+            }
+
+            last_evaluated_key = response.last_evaluated_key;
+            if last_evaluated_key.is_none() || distinct_users.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(items)
     }
 
     /// Parse a leaderboard row only when its durable numeric season exactly
@@ -2646,6 +2777,7 @@ impl Database for DynamoDatabase {
             crazygames_user_id: None,
             profile_picture_url: None,
             profile_iat: None,
+            selected_skin: None,
         })
     }
 
@@ -2710,6 +2842,7 @@ impl Database for DynamoDatabase {
             crazygames_user_id: None,
             profile_picture_url: None,
             profile_iat: None,
+            selected_skin: None,
         })
     }
 
@@ -2891,6 +3024,7 @@ impl Database for DynamoDatabase {
                     crazygames_user_id: Self::extract_string(&item, "crazyGamesUserId"),
                     profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
                     profile_iat: Self::extract_i64(&item, "profileIat"),
+                    selected_skin: Self::extract_string(&item, "selectedSkin"),
                 };
                 Ok(Some(user))
             }
@@ -3302,6 +3436,55 @@ impl Database for DynamoDatabase {
         }
 
         Ok(mmr_map)
+    }
+
+    async fn get_users_are_guests(&self, user_ids: &[i32]) -> Result<HashMap<i32, bool>> {
+        // One batched read per page of a public roster: BatchGetItem caps at
+        // 100 keys, and duplicate keys in one request are rejected outright.
+        const BATCH_GET_LIMIT: usize = 100;
+
+        let mut unique_ids: Vec<i32> = user_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        let mut guest_flags = HashMap::with_capacity(unique_ids.len());
+        for chunk in unique_ids.chunks(BATCH_GET_LIMIT) {
+            let mut keys = KeysAndAttributes::builder();
+            for user_id in chunk {
+                keys = keys.keys(HashMap::from([
+                    ("pk".to_string(), Self::av_s(format!("USER#{user_id}"))),
+                    ("sk".to_string(), Self::av_s("META")),
+                ]));
+            }
+            let keys = keys
+                // Aliased rather than inlined: attribute names in a projection
+                // are checked against DynamoDB's reserved-word list, and this
+                // read must not start failing on a name that LocalStack allows.
+                .projection_expression("#id, #is_guest")
+                .expression_attribute_names("#id", "id")
+                .expression_attribute_names("#is_guest", "isGuest")
+                .build()
+                .context("Failed to build guest-status batch keys")?;
+
+            let response = self
+                .client
+                .batch_get_item()
+                .request_items(self.main_table(), keys)
+                .send()
+                .await
+                .context("Failed to batch read guest status")?;
+
+            let responses = response.responses.unwrap_or_default();
+            for item in responses.get(&self.main_table()).into_iter().flatten() {
+                // An account with no stored flag predates guests and is a
+                // registered account; a missing ID is left out entirely.
+                if let Some(user_id) = Self::extract_number(item, "id") {
+                    guest_flags.insert(user_id, Self::extract_bool(item, "isGuest") == Some(true));
+                }
+            }
+        }
+
+        Ok(guest_flags)
     }
 
     // Game operations
@@ -4514,6 +4697,28 @@ impl Database for DynamoDatabase {
                     item.insert("season".into(), Self::av_n(season));
                     item.insert("updatedAt".into(), Self::av_s(&now));
 
+                    // Same row under the user-addressed sort key, so
+                    // `get_user_ranking` stays a keyed read. Written in this
+                    // transaction rather than after it: the guards above make
+                    // the ladder write conditional, and a pointer applied
+                    // outside those guards could describe a state the ladder
+                    // rejected. Unconditional, so it also clears any "no
+                    // ranking here" tombstone a reader left behind.
+                    let mut pointer = item.clone();
+                    pointer.insert(
+                        "sk".into(),
+                        Self::av_s(Self::ranking_pointer_sk(*user_id as i32)),
+                    );
+                    // Ladder rows are the only rows the GSI should surface; a
+                    // pointer in GameTypeSeasonIndex would double every global
+                    // leaderboard.
+                    pointer.remove("gameTypeSeason");
+                    let pointer_write = Put::builder()
+                        .table_name(self.rankings_table())
+                        .set_item(Some(pointer))
+                        .build()
+                        .context("Failed to build ranking pointer effect")?;
+
                     let mut ranking_mutations = match existing {
                         None => {
                             let put = Put::builder()
@@ -4597,6 +4802,7 @@ impl Database for DynamoDatabase {
                             }
                         }
                     };
+                    ranking_mutations.push(TransactWriteItem::builder().put(pointer_write).build());
                     ranking_mutations.insert(
                         0,
                         TransactWriteItem::builder()
@@ -4914,28 +5120,58 @@ impl Database for DynamoDatabase {
         item.insert("gameType".to_string(), Self::av_s(&game_type_str));
         item.insert("season".to_string(), Self::av_n(season));
         item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
-        // Delete old entry if MMR changed (SK will be different)
+
+        // The pointer is the same row under a user-addressed sort key. It is
+        // what makes `get_user_ranking` a keyed read, including the one this
+        // method just performed to derive the counters above.
+        let mut pointer = item.clone();
+        pointer.insert(
+            "sk".to_string(),
+            Self::av_s(Self::ranking_pointer_sk(user_id)),
+        );
+        // Ladder rows are the only rows the GSI should surface; a pointer in
+        // GameTypeSeasonIndex would double every global leaderboard.
+        pointer.remove("gameTypeSeason");
+
+        let ladder_row = Put::builder()
+            .table_name(self.rankings_table())
+            .set_item(Some(item))
+            .build()
+            .context("Failed to build ranking row write")?;
+        let pointer_row = Put::builder()
+            .table_name(self.rankings_table())
+            .set_item(Some(pointer))
+            .build()
+            .context("Failed to build ranking pointer write")?;
+
+        // Row, pointer, and the retired row move together. Applied separately,
+        // a crash between them would leave the pointer disagreeing with the
+        // ladder about a user's counters, and the next match would replay the
+        // increment off whichever one it happened to read.
+        let mut mutations = vec![
+            TransactWriteItem::builder().put(ladder_row).build(),
+            TransactWriteItem::builder().put(pointer_row).build(),
+        ];
+
+        // Retire the previous entry when a new MMR gave it a different SK.
         if let Some(prev_mmr) = old_mmr
             && prev_mmr != mmr
         {
             let old_inverted = 99999999 - prev_mmr.clamp(0, 99999999);
             let old_sk = format!("MMR#{:08}#USER#{}", old_inverted, user_id);
 
-            self.client
-                .delete_item()
+            let retired = Delete::builder()
                 .table_name(self.rankings_table())
                 .key("pk", Self::av_s(&pk))
                 .key("sk", Self::av_s(&old_sk))
-                .send()
-                .await
-                .ok(); // Ignore errors
+                .build()
+                .context("Failed to build retired ranking row delete")?;
+            mutations.push(TransactWriteItem::builder().delete(retired).build());
         }
 
-        // Insert new entry
         self.client
-            .put_item()
-            .table_name(self.rankings_table())
-            .set_item(Some(item))
+            .transact_write_items()
+            .set_transact_items(Some(mutations))
             .send()
             .await
             .context("Failed to upsert ranking")?;
@@ -4977,12 +5213,17 @@ impl Database for DynamoDatabase {
                     queue_mode_str, game_type_str, reg, season_str
                 );
 
+                // `begins_with` is load-bearing, not defensive: each user also
+                // has a `USER#{id}` pointer in this partition, and a ladder
+                // shorter than `limit` would otherwise page into the pointers
+                // and list every player twice.
                 let response = self
                     .client
                     .query()
                     .table_name(self.rankings_table())
-                    .key_condition_expression("pk = :pk")
+                    .key_condition_expression("pk = :pk AND begins_with(sk, :mmr_prefix)")
                     .expression_attribute_values(":pk", Self::av_s(&pk))
+                    .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
                     .limit(limit as i32)
                     .send()
                     .await
@@ -4994,20 +5235,13 @@ impl Database for DynamoDatabase {
                 let game_type_season =
                     format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
                 let gsi_items = match self
-                    .client
-                    .query()
-                    .table_name(self.rankings_table())
-                    .index_name("GameTypeSeasonIndex")
-                    .key_condition_expression("gameTypeSeason = :gts")
-                    .expression_attribute_values(":gts", Self::av_s(&game_type_season))
-                    .limit(limit as i32)
-                    .send()
+                    .query_global_ranking_pages(&game_type_season, season, limit)
                     .await
                 {
-                    Ok(response) => {
+                    Ok(items) => {
                         // A successful empty query is authoritative for a new
                         // season. Only an unavailable index justifies scanning.
-                        Some(response.items.unwrap_or_default())
+                        Some(items)
                     }
                     Err(err) => {
                         warn!(
@@ -5032,9 +5266,16 @@ impl Database for DynamoDatabase {
                             .client
                             .scan()
                             .table_name(self.rankings_table())
-                            .filter_expression("begins_with(pk, :prefix) AND #season = :season")
+                            // `begins_with(sk, ...)` excludes the per-user
+                            // `USER#{id}` pointers, which carry the same
+                            // attributes and would otherwise list twice.
+                            .filter_expression(concat!(
+                                "begins_with(pk, :prefix) AND #season = :season ",
+                                "AND begins_with(sk, :mmr_prefix)"
+                            ))
                             .expression_attribute_names("#season", "season")
                             .expression_attribute_values(":prefix", Self::av_s(&pk_prefix))
+                            .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
                             .expression_attribute_values(":season", Self::av_n(season))
                             .limit((target_items - items.len()) as i32);
 
@@ -5061,17 +5302,23 @@ impl Database for DynamoDatabase {
                 }
             }
         } else {
-            // Scan all game types and regions for a season
+            // Scan all game types and regions for a season. `begins_with(sk,
+            // ...)` excludes the per-user `USER#{id}` pointers, which carry the
+            // same attributes and would otherwise list twice.
             let response = self
                 .client
                 .scan()
                 .table_name(self.rankings_table())
-                .filter_expression("begins_with(pk, :prefix) AND #season = :season")
+                .filter_expression(concat!(
+                    "begins_with(pk, :prefix) AND #season = :season ",
+                    "AND begins_with(sk, :mmr_prefix)"
+                ))
                 .expression_attribute_names("#season", "season")
                 .expression_attribute_values(
                     ":prefix",
                     Self::av_s(format!("RANKING#{}#", queue_mode_str)),
                 )
+                .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
                 .expression_attribute_values(":season", Self::av_n(season))
                 .limit(limit as i32)
                 .send()
@@ -5089,6 +5336,7 @@ impl Database for DynamoDatabase {
 
         // Sort by MMR descending (in case we scanned multiple regions)
         entries.sort_by_key(|e| std::cmp::Reverse(e.mmr));
+        Self::collapse_ranking_rows_per_user(&mut entries);
         entries.truncate(limit);
 
         Ok(entries)
@@ -5116,8 +5364,39 @@ impl Database for DynamoDatabase {
             queue_mode_str, game_type_str, region, season
         );
 
-        // A ranking partition can exceed DynamoDB's 1 MiB response page. Keep
-        // following LastEvaluatedKey until the requested user is found or the
+        // Fast path: one keyed read of the user's pointer. This is the only
+        // path that should ever execute in steady state.
+        let pointer = self
+            .client
+            .get_item()
+            .table_name(self.rankings_table())
+            .key("pk", Self::av_s(&pk))
+            .key("sk", Self::av_s(Self::ranking_pointer_sk(user_id)))
+            // A single small item, so strong consistency costs ~1 RCU and
+            // keeps the read-modify-write in `upsert_ranking` correct.
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read ranking pointer")?;
+
+        if let Some(item) = pointer.item {
+            if Self::extract_bool(&item, "absent") == Some(true) {
+                return Ok(None);
+            }
+            return Ok(Self::user_ranking_from_items(
+                std::iter::once(&item),
+                user_id,
+                queue_mode_str,
+                &game_type_str,
+                region,
+                season,
+            ));
+        }
+
+        // Migration path, taken at most once per user per ladder: rows written
+        // before pointers existed can only be found by walking the partition.
+        // A ranking partition can exceed DynamoDB's 1 MiB response page, so
+        // keep following LastEvaluatedKey until the user is found or the
         // partition is genuinely exhausted.
         let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
@@ -5125,10 +5404,11 @@ impl Database for DynamoDatabase {
                 .client
                 .query()
                 .table_name(self.rankings_table())
-                .key_condition_expression("pk = :pk")
+                .key_condition_expression("pk = :pk AND begins_with(sk, :mmr_prefix)")
                 .filter_expression("#user_id = :user_id_number OR #user_id = :user_id_string")
                 .expression_attribute_names("#user_id", "userId")
                 .expression_attribute_values(":pk", Self::av_s(&pk))
+                .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
                 .expression_attribute_values(":user_id_number", Self::av_n(user_id))
                 .expression_attribute_values(":user_id_string", Self::av_s(user_id.to_string()))
                 .consistent_read(true);
@@ -5137,18 +5417,39 @@ impl Database for DynamoDatabase {
             }
 
             let response = request.send().await.context("Failed to query rankings")?;
-            if let Some(entry) = Self::user_ranking_from_items(
-                response.items.as_deref().unwrap_or_default(),
-                user_id,
-                queue_mode_str,
-                &game_type_str,
-                region,
-                season,
-            ) {
-                return Ok(Some(entry));
+            if let Some(item) = response
+                .items
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|item| Self::extract_number(item, "userId") == Some(user_id))
+            {
+                let entry = Self::user_ranking_from_items(
+                    std::iter::once(item),
+                    user_id,
+                    queue_mode_str,
+                    &game_type_str,
+                    region,
+                    season,
+                );
+
+                // Promote the row we just paid for, so no later request has to
+                // repeat this scan.
+                let mut promoted = item.clone();
+                promoted.insert(
+                    "sk".to_string(),
+                    Self::av_s(Self::ranking_pointer_sk(user_id)),
+                );
+                self.backfill_ranking_pointer(promoted).await;
+
+                return Ok(entry);
             }
 
             let Some(next_key) = response.last_evaluated_key else {
+                // Record the absence too — otherwise every unranked player on
+                // the leaderboard page re-scans this partition on every load.
+                self.backfill_ranking_pointer(Self::absent_ranking_pointer(&pk, user_id))
+                    .await;
                 return Ok(None);
             };
             last_evaluated_key = Some(next_key);

@@ -1251,6 +1251,39 @@ async fn create_lobby_matches(
 }
 
 /// Allocate an ID and construct all match data without mutating Valkey.
+/// Record a player's chosen skin on the match, after checking it is real.
+///
+/// The choice lives on the player's account, so it is read here rather than
+/// trusted from the client. Anything the catalogue does not recognise — an
+/// old id, a skin from a newer build, a hand-edited value — becomes the
+/// classic look. Cosmetics never block a join, and a lookup failure is not
+/// worth failing a match over either: the player simply appears in the
+/// default skin.
+async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_id: u32) {
+    let requested = match db.get_user_by_id(user_id as i32).await {
+        Ok(Some(user)) => user.selected_skin,
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(
+                user_id,
+                %error,
+                "could not read a player's skin; using the default"
+            );
+            None
+        }
+    };
+
+    let resolved = crate::skin_catalog::resolve_skin_ref(requested.as_deref());
+    if requested.is_some() && !crate::skin_catalog::is_known(requested.as_deref().unwrap_or("")) {
+        tracing::info!(
+            user_id,
+            requested = requested.as_deref().unwrap_or(""),
+            "unknown skin requested; falling back to the default"
+        );
+    }
+    game_state.set_player_skin(user_id, Some(resolved.to_string()));
+}
+
 async fn prepare_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
     game_type: &GameType,
@@ -1332,6 +1365,7 @@ async fn prepare_game_from_lobbies(
                         Some(member.username.clone()),
                         Some(assignment.team_id),
                     )?;
+                    apply_player_skin(&mut game_state, db, member.user_id).await;
 
                     all_players.push(QueuedPlayer {
                         user_id: member.user_id,
@@ -1378,6 +1412,7 @@ async fn prepare_game_from_lobbies(
                 }
 
                 game_state.add_player(member.user_id, Some(member.username.clone()))?;
+                apply_player_skin(&mut game_state, db, member.user_id).await;
 
                 all_players.push(QueuedPlayer {
                     user_id: member.user_id,

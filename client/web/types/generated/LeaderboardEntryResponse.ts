@@ -3,4 +3,18 @@
 /**
  * Leaderboard entry response format for frontend (for ranked/competitive modes)
  */
-export type LeaderboardEntryResponse = { rank: number, username: string, mmr: number, wins: number, losses: number, winRate: number, };
+export type LeaderboardEntryResponse = { rank: number,
+/**
+ * The account behind the row. Display names are not unique — guests are
+ * exempt from the username index — so this is the only way a client can
+ * tell which row is the signed-in player's. The board and
+ * [`get_my_ranking`] answer questions about different regions, so their
+ * rank numbers must never be compared to find that row. Account IDs are
+ * already visible to every client through lobby and gameplay messages.
+ */
+userId: number, username: string, mmr: number, wins: number, losses: number, winRate: number,
+/**
+ * Whether the account is a guest, so a name-alike can be told apart from
+ * a registered account of the same name.
+ */
+isGuest: boolean, };

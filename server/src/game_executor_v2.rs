@@ -5240,6 +5240,9 @@ mod tests {
             region: &str,
             season: crate::season::Season
         ) -> Option<RankingEntry>);
+        unused_database_method!(get_users_are_guests(
+            user_ids: &[i32]
+        ) -> std::collections::HashMap<i32, bool>);
         unused_database_method!(insert_high_score(
             game_id: &str,
             user_id: i32,

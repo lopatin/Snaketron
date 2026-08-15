@@ -1537,43 +1537,6 @@ button.game-scoreboard-brand {
   color: rgb(63 63 65 / 56%);
 }
 
-.rating-reveal-position {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  margin-left: auto;
-  animation: rating-position-in 260ms ease-out both;
-  color: rgb(63 63 65 / 56%);
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0.06em;
-}
-
-.rating-reveal-position em {
-  font-size: 9px;
-  font-style: normal;
-}
-
-.rating-reveal-position em.is-up {
-  color: #16a34a;
-}
-
-.rating-reveal-position em.is-down {
-  color: #e0433f;
-}
-
-@keyframes rating-position-in {
-  from {
-    opacity: 0;
-    transform: translateY(3px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 /* The division meter leans with the card's chevron motif: the whole track
    is a sharp parallelogram, quarter notches mark the climb to promotion. */
 .rating-reveal-meter {
@@ -2823,7 +2786,6 @@ button.game-scoreboard-brand {
      skipped outright under reduced motion, so there is no animation here to
      switch off — only the CSS-driven siblings. */
   .rating-reveal-ribbon,
-  .rating-reveal-position,
   .rating-reveal-tallying,
   .rating-reveal-beam {
     animation: none;
@@ -6028,4 +5990,132 @@ a.home-social-icon:hover {
   .home-account-username {
     max-width: 84px;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   Skin contact sheet (/qa/skins, development only).
+   Plain and dense on purpose: it is a place to look at snakes, not a page.
+   --------------------------------------------------------------------------- */
+.skins-qa {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+  background: #ffffff;
+}
+
+.skins-qa h1 {
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.skins-qa h2 {
+  margin: 28px 0 4px;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #475569;
+}
+
+.skins-qa-note {
+  margin: 0 0 12px;
+  color: #64748b;
+  font-size: 0.85rem;
+  max-width: 60ch;
+}
+
+.skins-qa-catalog {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skins-qa-catalog button {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.skins-qa-catalog button.is-selected {
+  border-color: #3c8dde;
+  box-shadow: inset 0 0 0 1px #3c8dde;
+}
+
+.skins-qa-catalog small {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.skins-qa-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.skins-qa-tile {
+  margin: 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.skins-qa-tile canvas {
+  display: block;
+}
+
+.skins-qa-tile figcaption {
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  color: #64748b;
+  border-top: 1px solid #f1f5f9;
+}
+
+.skins-qa-swatches {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.skins-qa-swatches li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+}
+
+.skins-qa-chip {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid;
+  display: inline-block;
+}
+
+.skins-qa-controls {
+  margin-bottom: 12px;
+}
+
+.skins-qa-controls button {
+  padding: 6px 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.skins-qa-controls button[aria-pressed='true'] {
+  border-color: #3c8dde;
+  color: #1d4ed8;
 }

@@ -360,10 +360,6 @@ const RatingReveal: React.FC<RatingRevealProps> = ({ state, onSettled, clockMs }
   const movement = reveal.movement;
   const showRibbon = settled && isCompetitive && !isPlacement && movement !== 'unchanged';
   const deltaTone = delta === null || delta === 0 ? 'zero' : delta > 0 ? 'up' : 'down';
-  const positionsClimbed =
-    reveal.before?.position != null && reveal.after.position != null
-      ? reveal.before.position - reveal.after.position
-      : null;
 
   const promotion = reducedMotion
     ? null
@@ -442,16 +438,6 @@ const RatingReveal: React.FC<RatingRevealProps> = ({ state, onSettled, clockMs }
               data-testid="rating-reveal-delta"
             >
               {delta > 0 ? `+${delta}` : delta === 0 ? '±0' : `${delta}`}
-            </span>
-          )}
-          {settled && positionsClimbed !== null && reveal.after.position !== null && (
-            <span className="rating-reveal-position">
-              #{reveal.after.position}
-              {positionsClimbed !== 0 && (
-                <em className={positionsClimbed > 0 ? 'is-up' : 'is-down'}>
-                  {positionsClimbed > 0 ? '▲' : '▼'}{Math.abs(positionsClimbed)}
-                </em>
-              )}
             </span>
           )}
         </div>

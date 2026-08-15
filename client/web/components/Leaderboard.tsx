@@ -37,6 +37,15 @@ const GAME_MODES: Array<{ id: LobbyGameMode; label: string }> = [
   { id: 'ffa', label: 'FFA' },
 ];
 
+/**
+ * Guest nicknames are not unique and are not reserved, so the same name can
+ * belong to several accounts. Naming the guest rows is what lets a player see
+ * that a name-alike above them is not their own account.
+ */
+const GuestTag: React.FC = () => (
+  <span className="flex-shrink-0 text-xs font-normal text-gray-500">(guest)</span>
+);
+
 const isValidLeaderboardMode = (mode: string | null): mode is LobbyGameMode =>
   Boolean(mode && GAME_MODES.some(gameMode => gameMode.id === mode));
 
@@ -59,7 +68,23 @@ const LeaderboardContent: React.FC<{
   selectedRegion: string;
   setSelectedRegion: (region: string) => void;
   seasons: number[];
+  /**
+   * Whether /api/seasons has answered (either way). Until it has, the season
+   * selection is provisional, and fetching on it would issue a request whose
+   * answer we are about to discard.
+   */
+  seasonsResolved: boolean;
   isAuthenticated: boolean;
+  /**
+   * The region this browser's websocket is actually connected to, or null when
+   * there is no live connection. It decides which region the player's own rank
+   * is reported for while Global is selected.
+   */
+  connectedRegionId: string | null;
+  /**
+   * The signed-in account, used to find its row among same-named players.
+   */
+  currentUserId: number | null;
 }> = ({
   selectedSeason,
   setSelectedSeason,
@@ -68,7 +93,10 @@ const LeaderboardContent: React.FC<{
   selectedRegion,
   setSelectedRegion,
   seasons,
-  isAuthenticated
+  seasonsResolved,
+  isAuthenticated,
+  connectedRegionId,
+  currentUserId
 }) => {
   const navigate = useNavigate();
   const { queueForMatch } = useGameWebSocket();
@@ -88,6 +116,29 @@ const LeaderboardContent: React.FC<{
       setUserRanking(null);
       return;
     }
+    if (!seasonsResolved) {
+      return;
+    }
+
+    // Selections settle over a couple of renders (the season list arrives
+    // after the first paint), so several of these can be in flight at once.
+    // Without this guard a slower earlier response lands last and replaces the
+    // current rank with a stale one.
+    let isCurrent = true;
+
+    // Your rank is always a rank *in one region* — rankings are stored per
+    // region, so there is no single global row to report. With Global
+    // selected, that region is the one this browser is connected to, so the
+    // badge reflects where you are playing; with no live connection the server
+    // answers for its own region. An explicit region selection wins outright.
+    //
+    // A page load that then opens a websocket asks twice: once for a badge to
+    // render immediately, and once more when the connected region is known.
+    // Waiting for the socket instead would leave the badge blank for as long
+    // as the connection takes, and indefinitely when it never arrives. The
+    // second ask is a single keyed read, and it supersedes the first.
+    const regionForOwnRank =
+      selectedRegion === 'global' ? connectedRegionId ?? undefined : selectedRegion;
 
     const fetchUserRanking = async () => {
       try {
@@ -95,20 +146,44 @@ const LeaderboardContent: React.FC<{
           'competitive',
           selectedMode,
           selectedSeason ?? undefined,
-          selectedRegion === 'global' ? undefined : selectedRegion
+          regionForOwnRank
         );
-        setUserRanking(data);
+        if (isCurrent) {
+          setUserRanking(data);
+        }
       } catch (err) {
+        // A failed request says nothing about the player's standing. Clearing
+        // it here is what turned a transient error into the badge dropping to
+        // UNRANKED and back; keep the last known rank instead.
         console.error('Failed to fetch user ranking:', err);
-        setUserRanking(null);
       }
     };
 
     fetchUserRanking();
-  }, [isAuthenticated, selectedSeason, selectedMode, selectedRegion]);
 
-  // Fetch leaderboard data when filters change (always use competitive mode)
+    return () => {
+      isCurrent = false;
+    };
+  }, [
+    isAuthenticated,
+    seasonsResolved,
+    selectedSeason,
+    selectedMode,
+    selectedRegion,
+    connectedRegionId,
+  ]);
+
+  // Fetch leaderboard data when filters change (always use competitive mode).
+  //
+  // Gated on the season list so a page load issues exactly one request. The
+  // season starts provisional — parsed from the URL, or absent — and only
+  // becomes final once /api/seasons answers; fetching before then produced up
+  // to three requests for the same table.
   useEffect(() => {
+    if (!seasonsResolved) {
+      return;
+    }
+
     const fetchLeaderboard = async () => {
       setLoading(true);
       setError(null);
@@ -137,7 +212,7 @@ const LeaderboardContent: React.FC<{
     };
 
     fetchLeaderboard();
-  }, [selectedSeason, selectedMode, selectedRegion, offset]);
+  }, [seasonsResolved, selectedSeason, selectedMode, selectedRegion, offset]);
 
   // Reset offset when filters change
   useEffect(() => {
@@ -424,8 +499,9 @@ const LeaderboardContent: React.FC<{
                     </div>
 
                     {/* Username */}
-                    <div className="flex items-center font-bold text-sm text-black-70 truncate">
-                      {entry.username}
+                    <div className="flex items-center gap-1 font-bold text-sm text-black-70 min-w-0">
+                      <span className="truncate">{entry.username}</span>
+                      {entry.isGuest && <GuestTag />}
                     </div>
 
                     {/* Score */}
@@ -443,11 +519,18 @@ const LeaderboardContent: React.FC<{
                 // Render ranking entry (Duel, 2v2, FFA)
                 const entryRank = getRankFromMMR(entry.mmr);
                 const entryRankLabel = formatRankLabel(entryRank);
+                // Matched on the account, never on the rank number: this board
+                // may be global while the badge above it reports one region,
+                // so their rank numbers describe different ladders.
+                const isOwnRow = currentUserId != null && entry.userId === currentUserId;
 
                 return (
                   <div
                     key={entry.rank}
-                    className="leaderboard-grid leaderboard-grid--ranked grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 hover:bg-gray-50 transition-colors"
+                    data-own-row={isOwnRow ? 'true' : undefined}
+                    className={`leaderboard-grid leaderboard-grid--ranked grid grid-cols-[50px_1fr_100px_80px_80px_80px] gap-2 px-4 py-3 transition-colors ${
+                      isOwnRow ? 'bg-blue-50' : 'hover:bg-gray-50'
+                    }`}
                   >
                     {/* Rank */}
                     <div className="flex items-center">
@@ -463,6 +546,12 @@ const LeaderboardContent: React.FC<{
                         className="w-6 h-6 flex-shrink-0"
                       />
                       <span className="truncate">{entry.username}</span>
+                      {entry.isGuest && <GuestTag />}
+                      {isOwnRow && (
+                        <span className="flex-shrink-0 px-1.5 py-0.5 rounded bg-blue-600 text-white font-black italic uppercase tracking-1 text-[10px]">
+                          You
+                        </span>
+                      )}
                     </div>
 
                     {/* MMR */}
@@ -544,6 +633,10 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [seasons, setSeasons] = useState<number[]>([]);
+  // Latched on the first answer from /api/seasons, success or failure. A
+  // failure still resolves the selection: `null` means "current season", which
+  // is what the API defaults to anyway, so the page loads either way.
+  const [seasonsResolved, setSeasonsResolved] = useState(false);
   const [selectedSeason, setSelectedSeason] = useState<number | null>(() => parseSeasonParam(searchParams.get('season')));
   const currentSeasonRef = useRef<number | null>(null);
   const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(() => {
@@ -567,6 +660,12 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
     onMessage,
   });
   const currentRegionId = selectedWsRegion?.id ?? regions[0]?.id ?? '';
+  // Where this browser is actually playing, as opposed to which region is
+  // merely selected: the socket may still be connecting or connected
+  // elsewhere. Only a live connection can speak for the player's own rank.
+  const connectedRegionId = isConnected
+    ? regions.find(region => region.wsUrl === currentRegionUrl)?.id ?? null
+    : null;
 
   // Refresh this lightweight, clock-derived endpoint so a tab left open over
   // a UTC quarter boundary adopts the newly rolled season without reloading.
@@ -607,6 +706,10 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
         }
       } catch (err) {
         console.error('Failed to fetch seasons:', err);
+      } finally {
+        if (active && request === latestRequest) {
+          setSeasonsResolved(true);
+        }
       }
     };
 
@@ -640,15 +743,22 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
       ? regionFromQuery
       : DEFAULT_LEADERBOARD_REGION;
 
-    const resolvedSeason =
-      seasons.length === 0
-        ? null
-        : seasonFromQuery != null && seasons.includes(seasonFromQuery)
-          ? seasonFromQuery
-          : seasons[0];
-
     setSelectedMode(prev => (prev === resolvedMode ? prev : resolvedMode));
     setSelectedLeaderboardRegion(prev => (prev === resolvedRegion ? prev : resolvedRegion));
+
+    // An empty list means /api/seasons has not answered yet, not that the URL's
+    // season is invalid. Discarding it here used to blank the selection on
+    // mount and then restore it a moment later, which is what turned one page
+    // load into three leaderboard requests.
+    if (seasons.length === 0) {
+      return;
+    }
+
+    const resolvedSeason =
+      seasonFromQuery != null && seasons.includes(seasonFromQuery)
+        ? seasonFromQuery
+        : seasons[0];
+
     setSelectedSeason(prev => (prev === resolvedSeason ? prev : resolvedSeason));
   }, [searchParams, seasons]);
 
@@ -791,7 +901,10 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
             selectedRegion={selectedLeaderboardRegion}
             setSelectedRegion={setSelectedLeaderboardRegion}
             seasons={seasons}
+            seasonsResolved={seasonsResolved}
             isAuthenticated={Boolean(user)}
+            connectedRegionId={connectedRegionId}
+            currentUserId={user?.id ?? null}
           />
         </main>
 

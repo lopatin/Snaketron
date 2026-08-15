@@ -28,6 +28,11 @@ interface UseGameEngineReturn {
     cellSize: number,
     rotation: number,
     localUserId: number | undefined,
+    /** Presentation clock for animated skins; never simulation time. */
+    animMs: number,
+    reducedMotion: boolean,
+    /** The viewer's skin, which dresses their snake and their bases. */
+    localSkinRef: string | undefined,
     drawCelebration: () => void,
     drawPostSnakes: () => void,
   ) => void;
@@ -324,6 +329,9 @@ export const useGameEngine = ({
       cellSize: number,
       rotation: number,
       localUserId: number | undefined,
+      animMs: number,
+      reducedMotion: boolean,
+      localSkinRef: string | undefined,
       drawCelebration: () => void,
       drawPostSnakes: () => void,
     ) => {
@@ -332,6 +340,9 @@ export const useGameEngine = ({
         cellSize,
         rotation,
         localUserId,
+        animMs,
+        reducedMotion,
+        localSkinRef,
         drawCelebration,
         drawPostSnakes,
       );

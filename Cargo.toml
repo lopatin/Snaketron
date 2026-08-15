@@ -5,6 +5,7 @@ members = [
     "common",
     "server",
     "client",
+    "skin-schema",
     "terminal",
     "bot",
     "loadtest"

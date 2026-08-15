@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "lantern@1",
+  "name": "Lantern",
+  "palette": {
+    "friendly": [
+      { "fill": "#9ec4ef", "outline": "#4d79ab" },
+      { "fill": "#7fa9e0", "outline": "#3a6296" }
+    ],
+    "enemy": [
+      { "fill": "#f0b478", "outline": "#ab6f30" },
+      { "fill": "#e59a5e", "outline": "#96581f" }
+    ],
+    "free_for_all": [
+      { "fill": "#9ec4ef", "outline": "#4d79ab" },
+      { "fill": "#f0b478", "outline": "#ab6f30" },
+      { "fill": "#aeb4bd", "outline": "#666d78" },
+      { "fill": "#e8cd7a", "outline": "#997f2b" }
+    ]
+  },
+  "head": {
+    "core_ratio": 0.38,
+    "core_color": "#1a2233",
+    "gradient": { "length_cells": 10.0, "max_opacity": 0.2, "color": "#fff6e0" }
+  },
+  "outline": {
+    "extra_px": 2.0,
+    "boost_band": { "color": "#fff200", "extra_px": 6.0 }
+  },
+  "animation": {
+    "period_ms": 4000.0,
+    "tracks": [
+      { "target": "body_lightness", "amplitude": 0.07, "phase": 0.0 },
+      { "target": "gradient_opacity", "amplitude": 0.09, "phase": 0.0 }
+    ]
+  }
+}

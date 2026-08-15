@@ -991,6 +991,7 @@ dependencies = [
  "js-sys",
  "serde",
  "serde_json",
+ "skin-schema",
  "wasm-bindgen",
  "wasm-logger",
  "web-sys",
@@ -3510,6 +3511,14 @@ name = "skillratings"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c8196a815d27d6dbd2439058a2cbf6597a549a68ca6368611df240df7c2987"
+
+[[package]]
+name = "skin-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "slab"

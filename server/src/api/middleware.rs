@@ -194,6 +194,7 @@ mod tests {
             crazygames_user_id: None,
             profile_picture_url: None,
             profile_iat: None,
+            selected_skin: None,
         }
     }
 

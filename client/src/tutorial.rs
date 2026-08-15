@@ -749,6 +749,7 @@ fn create_scratch_canvas() -> Result<web_sys::HtmlCanvasElement, JsValue> {
 
 fn render_scene(
     scene: &Scene,
+    elapsed_ms: u32,
     scratch: &web_sys::HtmlCanvasElement,
     target: &web_sys::HtmlCanvasElement,
     draw_celebration: &js_sys::Function,
@@ -784,9 +785,18 @@ fn render_scene(
     render::render_game_state(
         &scene.state,
         scratch,
-        cell_size,
-        Some(1),
-        0,
+        render::FrameOptions {
+            cell_size,
+            local_user_id: Some(1),
+            rotation: 0,
+            // Scenes drive animated skins from the scene clock, so a paused
+            // scene shows a still frame rather than one that keeps moving.
+            anim_ms: f64::from(elapsed_ms),
+            reduced_motion: false,
+            // Tutorials teach the canonical read of the board, so they always
+            // use the classic look whatever the player has selected.
+            local_skin_ref: None,
+        },
         draw_celebration,
         draw_post_snakes,
     )?;
@@ -880,6 +890,7 @@ impl TutorialScenePlayer {
         let scene = SCENES[self.scene_index].frame(elapsed_ms);
         render_scene(
             &scene,
+            elapsed_ms,
             &self.scratch,
             target,
             self.draw_celebration.as_ref().unchecked_ref(),
@@ -899,6 +910,7 @@ impl TutorialScenePlayer {
         let scene = SCENES[self.scene_index].frame(elapsed_ms);
         render_scene(
             &scene,
+            elapsed_ms,
             &self.scratch,
             target,
             draw_celebration,
@@ -919,6 +931,7 @@ impl TutorialScenePlayer {
         let scene = SCENES[self.scene_index].frame(elapsed_ms);
         render_scene(
             &scene,
+            elapsed_ms,
             &self.scratch,
             target,
             draw_celebration,

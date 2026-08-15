@@ -53,12 +53,15 @@ export const queueModeParam = (queueMode: QueueMode): 'competitive' | 'quickmatc
   queueMode === 'Competitive' ? 'competitive' : 'quickmatch'
 );
 
+/**
+ * Deliberately no ladder position. The API cannot answer "how many players
+ * are above me?" without reading its whole ranking partition, and this hook
+ * polls that endpoint up to eight times per rated match.
+ */
 export interface RatingSnapshot {
   mmr: number;
   wins: number;
   losses: number;
-  /** Leaderboard position, when the API computed one. */
-  position: number | null;
 }
 
 export const snapshotFromResponse = (
@@ -70,7 +73,6 @@ export const snapshotFromResponse = (
       mmr: response.mmr,
       wins: response.wins ?? 0,
       losses: response.losses ?? 0,
-      position: response.rank,
     }
 );
 

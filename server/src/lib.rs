@@ -34,6 +34,7 @@ pub mod replay_store;
 pub mod replication;
 pub mod resilience_metrics;
 pub mod season;
+pub mod skin_catalog;
 pub mod sync_trace;
 pub mod telemetry;
 pub mod user_cache;

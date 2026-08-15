@@ -880,9 +880,17 @@ fn render_scenario_frame(
     render::render_game_state(
         state,
         scratch,
-        cell_size,
-        core.local_user_id(),
-        rotation,
+        render::FrameOptions {
+            cell_size,
+            local_user_id: core.local_user_id(),
+            rotation,
+            // Capture is deterministic by construction: the harness owns the
+            // clock, so an animated skin must not paint from a wall clock.
+            // Reduced motion is off because a trailer is a video, not a UI.
+            anim_ms: 0.0,
+            reduced_motion: false,
+            local_skin_ref: None,
+        },
         draw_celebration,
         draw_post_snakes,
     )?;

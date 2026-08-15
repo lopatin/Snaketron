@@ -5,6 +5,7 @@ export const CRAZY_GAMES_PREFERENCE_KEYS = new Set([
   'snaketron:tutorial-seen:v1',
   'lastLobbyPreferences',
   'snaketron:boost-input-mode:v1',
+  'snaketron:skin:v1',
 ]);
 const CRAZY_GAMES_PREFERENCE_OWNER_KEY = 'snaketron:crazygames:preferences-owner';
 const MAX_TUTORIAL_KEYS = 128;

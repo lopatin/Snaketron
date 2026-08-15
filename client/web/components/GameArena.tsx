@@ -22,6 +22,7 @@ import IdleKickDialog from './IdleKickDialog';
 import IdleWarningBanner from './IdleWarningBanner';
 import LoadingScreen from './LoadingScreen';
 import TutorialModal from './TutorialModal';
+import { readSkinPreference } from '../utils/skinPreference';
 import { buildMatchPresentation, simulationStartMs } from '../utils/gamePresentation';
 import { crazyGames } from '../services/crazyGames';
 import {
@@ -256,6 +257,9 @@ export default function GameArena() {
   const visualEpochRef = useRef<number | null>(null);
   const lastVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
+  // The viewer's own skin. It dresses their bases and their snake; it is read
+  // once per mount because changing skins mid-match is not a thing.
+  const selectedSkinRef = useRef<string | null>(readSkinPreference());
   const scoreEffectsRef = useRef(createScoreEffectRuntime());
   const platformResultReportedForGameRef = useRef<string | null>(null);
   const platformGameplayObservedForGameRef = useRef<string | null>(null);
@@ -943,6 +947,11 @@ export default function GameArena() {
           cellSize,
           rotation,
           user?.id ?? undefined,
+          // Animated skins run off the presentation clock, not the simulation
+          // one, so they stay smooth regardless of tick rate.
+          now,
+          prefersReducedMotionRef.current,
+          selectedSkinRef.current ?? undefined,
           () => {
             drawScoreEffects(context, scoreEffectsRef.current, {
               nowMs: now,

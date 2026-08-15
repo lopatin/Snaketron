@@ -202,8 +202,8 @@ const RankUpCard: React.FC<{ elapsedMs: number }> = ({ elapsedMs }) => {
       reveal: buildRatingReveal(
         'Competitive',
         '2v2',
-        { mmr: 2280, wins: 61, losses: 40, position: 12 },
-        { mmr: 2320, wins: 62, losses: 40, position: 9 },
+        { mmr: 2280, wins: 61, losses: 40 },
+        { mmr: 2320, wins: 62, losses: 40 },
       ),
     }),
     [],
