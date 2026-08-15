@@ -59,6 +59,12 @@ const LeaderboardContent: React.FC<{
   selectedRegion: string;
   setSelectedRegion: (region: string) => void;
   seasons: number[];
+  /**
+   * Whether /api/seasons has answered (either way). Until it has, the season
+   * selection is provisional, and fetching on it would issue a request whose
+   * answer we are about to discard.
+   */
+  seasonsResolved: boolean;
   isAuthenticated: boolean;
 }> = ({
   selectedSeason,
@@ -68,6 +74,7 @@ const LeaderboardContent: React.FC<{
   selectedRegion,
   setSelectedRegion,
   seasons,
+  seasonsResolved,
   isAuthenticated
 }) => {
   const navigate = useNavigate();
@@ -88,6 +95,9 @@ const LeaderboardContent: React.FC<{
       setUserRanking(null);
       return;
     }
+    if (!seasonsResolved) {
+      return;
+    }
 
     const fetchUserRanking = async () => {
       try {
@@ -105,10 +115,19 @@ const LeaderboardContent: React.FC<{
     };
 
     fetchUserRanking();
-  }, [isAuthenticated, selectedSeason, selectedMode, selectedRegion]);
+  }, [isAuthenticated, seasonsResolved, selectedSeason, selectedMode, selectedRegion]);
 
-  // Fetch leaderboard data when filters change (always use competitive mode)
+  // Fetch leaderboard data when filters change (always use competitive mode).
+  //
+  // Gated on the season list so a page load issues exactly one request. The
+  // season starts provisional — parsed from the URL, or absent — and only
+  // becomes final once /api/seasons answers; fetching before then produced up
+  // to three requests for the same table.
   useEffect(() => {
+    if (!seasonsResolved) {
+      return;
+    }
+
     const fetchLeaderboard = async () => {
       setLoading(true);
       setError(null);
@@ -137,7 +156,7 @@ const LeaderboardContent: React.FC<{
     };
 
     fetchLeaderboard();
-  }, [selectedSeason, selectedMode, selectedRegion, offset]);
+  }, [seasonsResolved, selectedSeason, selectedMode, selectedRegion, offset]);
 
   // Reset offset when filters change
   useEffect(() => {
@@ -544,6 +563,10 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [seasons, setSeasons] = useState<number[]>([]);
+  // Latched on the first answer from /api/seasons, success or failure. A
+  // failure still resolves the selection: `null` means "current season", which
+  // is what the API defaults to anyway, so the page loads either way.
+  const [seasonsResolved, setSeasonsResolved] = useState(false);
   const [selectedSeason, setSelectedSeason] = useState<number | null>(() => parseSeasonParam(searchParams.get('season')));
   const currentSeasonRef = useRef<number | null>(null);
   const [selectedMode, setSelectedMode] = useState<LobbyGameMode>(() => {
@@ -607,6 +630,10 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
         }
       } catch (err) {
         console.error('Failed to fetch seasons:', err);
+      } finally {
+        if (active && request === latestRequest) {
+          setSeasonsResolved(true);
+        }
       }
     };
 
@@ -640,15 +667,22 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
       ? regionFromQuery
       : DEFAULT_LEADERBOARD_REGION;
 
-    const resolvedSeason =
-      seasons.length === 0
-        ? null
-        : seasonFromQuery != null && seasons.includes(seasonFromQuery)
-          ? seasonFromQuery
-          : seasons[0];
-
     setSelectedMode(prev => (prev === resolvedMode ? prev : resolvedMode));
     setSelectedLeaderboardRegion(prev => (prev === resolvedRegion ? prev : resolvedRegion));
+
+    // An empty list means /api/seasons has not answered yet, not that the URL's
+    // season is invalid. Discarding it here used to blank the selection on
+    // mount and then restore it a moment later, which is what turned one page
+    // load into three leaderboard requests.
+    if (seasons.length === 0) {
+      return;
+    }
+
+    const resolvedSeason =
+      seasonFromQuery != null && seasons.includes(seasonFromQuery)
+        ? seasonFromQuery
+        : seasons[0];
+
     setSelectedSeason(prev => (prev === resolvedSeason ? prev : resolvedSeason));
   }, [searchParams, seasons]);
 
@@ -791,6 +825,7 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
             selectedRegion={selectedLeaderboardRegion}
             setSelectedRegion={setSelectedLeaderboardRegion}
             seasons={seasons}
+            seasonsResolved={seasonsResolved}
             isAuthenticated={Boolean(user)}
           />
         </main>

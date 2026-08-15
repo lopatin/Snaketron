@@ -302,12 +302,14 @@ pub async fn list_seasons(State(_state): State<LeaderboardState>) -> Json<Season
 }
 
 /// User ranking response
+///
+/// Deliberately carries no ladder position. Deriving one meant reading the
+/// whole ranking partition per request, and this endpoint is polled after
+/// every rated match — see [`get_my_ranking`].
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct UserRankingResponse {
-    #[cfg_attr(feature = "ts-gen", ts(type = "number | null"))]
-    pub rank: Option<usize>,
     pub mmr: Option<i32>,
     pub wins: Option<i32>,
     pub losses: Option<i32>,
@@ -317,6 +319,10 @@ pub struct UserRankingResponse {
 
 /// Get current user's ranking
 /// Query parameters: queue_mode, game_type, season (optional), region (optional)
+///
+/// This is a hot endpoint: the post-match rating reveal polls it up to eight
+/// times per player per rated match, on top of leaderboard page loads. It must
+/// stay a single keyed read of one ranking partition.
 pub async fn get_my_ranking(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<LeaderboardState>,
@@ -362,24 +368,6 @@ pub async fn get_my_ranking(
         .await
     {
         Ok(Some(entry)) => {
-            // Calculate rank by querying all entries with higher MMR
-            let all_entries = state
-                .db
-                .get_leaderboard(
-                    &queue_mode,
-                    Some(&game_type),
-                    Some(&region),
-                    season,
-                    10000, // Large limit to get all entries
-                )
-                .await
-                .unwrap_or_default();
-
-            let rank = all_entries
-                .iter()
-                .position(|e| e.user_id == auth_user.user_id)
-                .map(|pos| pos + 1);
-
             let total_games = entry.wins + entry.losses;
             let win_rate = if total_games > 0 {
                 Some((entry.wins as f64 / total_games as f64) * 100.0)
@@ -388,7 +376,6 @@ pub async fn get_my_ranking(
             };
 
             UserRankingResponse {
-                rank,
                 mmr: Some(entry.mmr),
                 wins: Some(entry.wins),
                 losses: Some(entry.losses),
@@ -398,7 +385,6 @@ pub async fn get_my_ranking(
         Ok(None) | Err(_) => {
             // User has no ranking yet
             UserRankingResponse {
-                rank: None,
                 mmr: None,
                 wins: None,
                 losses: None,

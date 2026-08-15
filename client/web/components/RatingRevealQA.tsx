@@ -18,8 +18,7 @@ const snapshot = (
   mmr: number,
   wins: number,
   losses: number,
-  position: number | null,
-): RatingSnapshot => ({ mmr, wins, losses, position });
+): RatingSnapshot => ({ mmr, wins, losses });
 
 const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | null }> = [
   {
@@ -30,8 +29,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'duel',
-        snapshot(1190, 9, 4, 20),
-        snapshot(1215, 10, 4, 16),
+        snapshot(1190, 9, 4),
+        snapshot(1215, 10, 4),
       ),
     },
   },
@@ -43,8 +42,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'duel',
-        snapshot(1228, 12, 7, 31),
-        snapshot(1246, 13, 7, 29),
+        snapshot(1228, 12, 7),
+        snapshot(1246, 13, 7),
       ),
     },
   },
@@ -56,8 +55,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'duel',
-        snapshot(1246, 13, 8, 29),
-        snapshot(1229, 13, 9, 32),
+        snapshot(1246, 13, 8),
+        snapshot(1229, 13, 9),
       ),
     },
   },
@@ -69,8 +68,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'duel',
-        snapshot(1206, 13, 10, 33),
-        snapshot(1187, 13, 11, 38),
+        snapshot(1206, 13, 10),
+        snapshot(1187, 13, 11),
       ),
     },
   },
@@ -82,8 +81,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'ffa',
-        snapshot(1862, 40, 22, 9),
-        snapshot(1911, 41, 22, 7),
+        snapshot(1862, 40, 22),
+        snapshot(1911, 41, 22),
       ),
     },
   },
@@ -97,8 +96,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'duel',
-        snapshot(1620, 18, 11, 44),
-        snapshot(1650, 19, 11, 39),
+        snapshot(1620, 18, 11),
+        snapshot(1650, 19, 11),
       ),
     },
   },
@@ -110,8 +109,8 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
       reveal: buildRatingReveal(
         'Competitive',
         'duel',
-        snapshot(1246, 13, 8, 29),
-        snapshot(1246, 13, 8, 29),
+        snapshot(1246, 13, 8),
+        snapshot(1246, 13, 8),
       ),
     },
   },
@@ -120,7 +119,7 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
     label: 'First rated match',
     state: {
       phase: 'ready',
-      reveal: buildRatingReveal('Competitive', 'duel', null, snapshot(1020, 1, 0, 44)),
+      reveal: buildRatingReveal('Competitive', 'duel', null, snapshot(1020, 1, 0)),
     },
   },
   {
