@@ -30,41 +30,6 @@
       "source": "Generated for this repository"
     },
     {
-      "path": "sfx/impact.wav",
-      "name": "Impact",
-      "author": "SnakeTron project",
-      "license": "CC0-1.0",
-      "source": "Procedurally synthesized for this repository"
-    },
-    {
-      "path": "sfx/boost.wav",
-      "name": "Boost rise",
-      "author": "SnakeTron project",
-      "license": "CC0-1.0",
-      "source": "Procedurally synthesized for this repository"
-    },
-    {
-      "path": "sfx/bank.wav",
-      "name": "Bank confirmation",
-      "author": "SnakeTron project",
-      "license": "CC0-1.0",
-      "source": "Procedurally synthesized for this repository"
-    },
-    {
-      "path": "sfx/whoosh.wav",
-      "name": "Transition whoosh",
-      "author": "SnakeTron project",
-      "license": "CC0-1.0",
-      "source": "Procedurally synthesized for this repository"
-    },
-    {
-      "path": "launch-trailer/launch-bed.m4a",
-      "name": "Launch trailer synth bed",
-      "author": "SnakeTron project",
-      "license": "CC0-1.0",
-      "source": "Procedurally synthesized for this repository"
-    },
-    {
       "path": "cards/rank-up.html",
       "name": "Rank-up capture fixture",
       "author": "SnakeTron project",
@@ -77,6 +42,13 @@
       "author": "SnakeTron project",
       "license": "Project-owned original",
       "source": "Generated for this repository"
+    },
+    {
+      "path": "scripts/audio/",
+      "name": "SnakeTron trailer audio generator",
+      "author": "SnakeTron project",
+      "license": "CC0-1.0",
+      "source": "Original. Music bed and SFX are synthesized by scripts/audio/build.py; run it to regenerate any asset. No samples, no recordings, no network fetch."
     }
   ]
 }

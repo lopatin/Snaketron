@@ -1,0 +1,8 @@
+# Audio generation for the trailer bed and SFX.
+# pedalboard supplies JUCE-backed Ladder filters, reverb, compression and
+# limiting; hand-rolled biquads do not have the resonance or saturation that
+# make a filter sweep musical, and that sweep is the genre's whole signature.
+numpy>=2.0
+scipy>=1.14
+pedalboard>=0.9
+soundfile>=0.12
