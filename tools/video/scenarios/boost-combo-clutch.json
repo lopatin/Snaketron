@@ -1,105 +1,195 @@
 {
-  "format_version": 1,
-  "id": "boost-combo-clutch",
-  "world": {
-    "game_type": {
-      "FreeForAll": {
-        "max_players": 2
-      }
-    },
-    "queue_mode": "Quickmatch",
-    "rng_seed": null,
-    "overrides": {
-      "combo": {
-        "window_ms": 2000,
-        "max_food_value": 3
-      },
-      "player_idle_timeout_ms": 600000
-    }
+ "format_version": 1,
+ "id": "boost-combo-clutch",
+ "world": {
+  "game_type": {
+   "FreeForAll": {
+    "max_players": 3
+   }
   },
-  "pose": {
-    "snakes": [
-      {
-        "user_id": 1,
-        "name": "CLUTCH PILOT",
-        "body": [
-          {
-            "x": 4,
-            "y": 16
-          },
-          {
-            "x": 1,
-            "y": 16
-          }
-        ],
-        "direction": "Right",
-        "boost_charge_ms": 1500
-      }
+  "queue_mode": "Quickmatch",
+  "rng_seed": null,
+  "overrides": {
+   "combo": {
+    "window_ms": 2000,
+    "max_food_value": 3
+   },
+   "player_idle_timeout_ms": 600000
+  }
+ },
+ "pose": {
+  "snakes": [
+   {
+    "user_id": 1,
+    "name": "CLUTCH PILOT",
+    "body": [
+     {
+      "x": 4,
+      "y": 16
+     },
+     {
+      "x": 1,
+      "y": 16
+     }
     ],
-    "food": [
-      {
-        "x": 16,
-        "y": 16
-      },
-      {
-        "x": 19,
-        "y": 16
-      },
-      {
-        "x": 34,
-        "y": 28
-      },
-      {
-        "x": 9,
-        "y": 25
-      },
-      {
-        "x": 22,
-        "y": 33
-      },
-      {
-        "x": 30,
-        "y": 9
-      },
-      {
-        "x": 13,
-        "y": 6
-      },
-      {
-        "x": 37,
-        "y": 20
-      }
+    "direction": "Right",
+    "boost_charge_ms": 1500
+   },
+   {
+    "user_id": 2,
+    "name": "RIPTIDE",
+    "body": [
+     {
+      "x": 14,
+      "y": 10
+     },
+     {
+      "x": 8,
+      "y": 10
+     }
     ],
-    "start_tick": 0
-  },
-  "commands": [
-    {
-      "at_tick": 0,
-      "user_id": 1,
-      "command": "ActivateBoost"
-    },
-    {
-      "at_tick": 40,
-      "user_id": 1,
-      "command": {
-        "Turn": "Down"
-      }
-    }
+    "direction": "Right"
+   },
+   {
+    "user_id": 3,
+    "name": "HALO",
+    "body": [
+     {
+      "x": 26,
+      "y": 22
+     },
+     {
+      "x": 32,
+      "y": 22
+     }
+    ],
+    "direction": "Left"
+   }
   ],
-  "run_ticks": 70,
-  "presentation": {
-    "camera": {
-      "Follow": {
-        "snake_id": 0,
-        "width_cells": 18.0
-      }
-    },
-    "default_time_scale": 1.0,
-    "star_snake_id": 0,
-    "addons": {
-      "combo_callout": true,
-      "boost_meter": true
-    }
+  "food": [
+   {
+    "x": 16,
+    "y": 16
+   },
+   {
+    "x": 19,
+    "y": 16
+   },
+   {
+    "x": 34,
+    "y": 28
+   },
+   {
+    "x": 9,
+    "y": 25
+   },
+   {
+    "x": 22,
+    "y": 33
+   },
+   {
+    "x": 30,
+    "y": 9
+   },
+   {
+    "x": 13,
+    "y": 6
+   },
+   {
+    "x": 37,
+    "y": 20
+   },
+   {
+    "x": 11,
+    "y": 13
+   },
+   {
+    "x": 21,
+    "y": 12
+   },
+   {
+    "x": 25,
+    "y": 19
+   },
+   {
+    "x": 28,
+    "y": 14
+   },
+   {
+    "x": 31,
+    "y": 24
+   },
+   {
+    "x": 17,
+    "y": 21
+   },
+   {
+    "x": 23,
+    "y": 26
+   },
+   {
+    "x": 36,
+    "y": 16
+   },
+   {
+    "x": 12,
+    "y": 19
+   },
+   {
+    "x": 29,
+    "y": 31
+   },
+   {
+    "x": 33,
+    "y": 12
+   },
+   {
+    "x": 20,
+    "y": 29
+   },
+   {
+    "x": 15,
+    "y": 24
+   },
+   {
+    "x": 38,
+    "y": 25
+   },
+   {
+    "x": 26,
+    "y": 34
+   }
+  ],
+  "start_tick": 0
+ },
+ "commands": [
+  {
+   "at_tick": 0,
+   "user_id": 1,
+   "command": "ActivateBoost"
   },
-  "expect": []
+  {
+   "at_tick": 40,
+   "user_id": 1,
+   "command": {
+    "Turn": "Down"
+   }
+  }
+ ],
+ "run_ticks": 70,
+ "presentation": {
+  "camera": {
+   "Follow": {
+    "snake_id": 0,
+    "width_cells": 18.0
+   }
+  },
+  "default_time_scale": 1.0,
+  "star_snake_id": 0,
+  "addons": {
+   "combo_callout": true,
+   "boost_meter": true
+  }
+ },
+ "expect": []
 }

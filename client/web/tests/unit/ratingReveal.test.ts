@@ -39,8 +39,8 @@ test('band boundaries resolve to the higher band, matching the leaderboard', () 
   assert.deepEqual(getRankFromMMR(200), { tier: 'bronze', division: 2, mmr: 200 });
   assert.deepEqual(getRankFromMMR(1199), { tier: 'silver', division: 3, mmr: 1199 });
   assert.deepEqual(getRankFromMMR(1200), { tier: 'gold', division: 1, mmr: 1200 });
-  assert.deepEqual(getRankFromMMR(2600), { tier: 'grandmaster', division: 4, mmr: 2600 });
-  assert.deepEqual(getRankFromMMR(9999), { tier: 'grandmaster', division: 4, mmr: 9999 });
+  assert.deepEqual(getRankFromMMR(2600), { tier: 'grandmaster', division: 3, mmr: 2600 });
+  assert.deepEqual(getRankFromMMR(9999), { tier: 'grandmaster', division: 3, mmr: 9999 });
   // Negative MMR cannot leave the ladder.
   assert.deepEqual(getRankFromMMR(-50), { tier: 'bronze', division: 1, mmr: 0 });
 });
@@ -48,7 +48,7 @@ test('band boundaries resolve to the higher band, matching the leaderboard', () 
 test('rank labels use roman numeral divisions', () => {
   assert.equal(formatRankLabel(getRankFromMMR(1250)), 'Gold I');
   assert.equal(formatRankLabel(getRankFromMMR(1450)), 'Gold III');
-  assert.equal(formatRankLabel(getRankFromMMR(2650)), 'Grand Master IV');
+  assert.equal(formatRankLabel(getRankFromMMR(2650)), 'Grand Master III');
 });
 
 test('band progress is the fraction of the current division climbed', () => {
@@ -57,7 +57,7 @@ test('band progress is the fraction of the current division climbed', () => {
   assert.ok(rankBandProgress(1299) > 0.98);
   // The open-ended top band borrows the previous band's width and never
   // reports full, so the meter always has somewhere left to go.
-  assert.ok(rankBandProgress(2600) === 0);
+  assert.ok(rankBandProgress(2500) === 0);
   assert.ok(rankBandProgress(999999) < 1);
 });
 

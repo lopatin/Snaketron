@@ -3,7 +3,9 @@ import { flushSync } from 'react-dom';
 import { useSearchParams } from 'react-router-dom';
 import RatingReveal from './RatingReveal';
 import { buildRatingReveal } from '../utils/ratingReveal';
-import { getRankImage, getRankFromMMR } from '../utils/rank';
+import { getRankFromMMR } from '../utils/rank';
+import RankIcon from './RankIcon';
+import SoloTrophyIcon from './SoloTrophyIcon';
 import {
   defaultFlowFieldSpacing,
   drawArenaFlowField,
@@ -28,6 +30,10 @@ const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 /** Non-linear easings — the trailer never moves anything linearly. */
 const easeOutCubic = (t: number): number => 1 - Math.pow(1 - clamp01(t), 3);
 const easeInCubic = (t: number): number => Math.pow(clamp01(t), 3);
+const easeInOutCubic = (t: number): number => {
+  const p = clamp01(t);
+  return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+};
 const easeOutBack = (t: number): number => {
   const c = 1.70158;
   const p = clamp01(t) - 1;
@@ -41,12 +47,17 @@ interface CardDefinition {
 
 const CARDS: Record<string, CardDefinition> = {
   'logo-intro': { durationMs: 2600, anchors: { logo: 0.45 } },
-  'logo-outro': { durationMs: 3000, anchors: { logo: 0.2 } },
-  'rank-up': { durationMs: 5000, anchors: { reveal: 0.6, settle: 2.4 } },
-  rankings: { durationMs: 5000, anchors: { icons: 0.5 } },
+  // Three beats: the logo drops in, the call to action snaps in after it,
+  // then both leave together (see OUTRO).
+  'logo-outro': { durationMs: 3600, anchors: { logo: 0.22, cta: 0.98 } },
+  // The sweep runs 0.55s–1.97s, crossing into Grand Master at ~1.26s (the
+  // odometer eases in *and* out, so the boundary lands mid-count rather than
+  // in the first fifth). The card is that plus a beat to read the ribbon.
+  'rank-up': { durationMs: 2900, anchors: { reveal: 0.55, promote: 1.26, settle: 1.97 } },
+  rankings: { durationMs: 8000, anchors: { icons: 0.5, ladder: 3.4 } },
 };
 
-const RANK_SHOWCASE = [700, 1250, 1550, 1950, 2350];
+const RANK_SHOWCASE = [900, 1350, 1700, 2100, 2450];
 
 const FlowFieldBackdrop: React.FC<{ elapsedMs: number; intensity?: number }> = ({
   elapsedMs,
@@ -81,19 +92,62 @@ const FlowFieldBackdrop: React.FC<{ elapsedMs: number; intensity?: number }> = (
   return <canvas ref={canvasRef} className="trailer-card__field" />;
 };
 
+/**
+ * The end slate is a three-beat sequence, not a held frame: the logo lands
+ * first, the call to action snaps in after it, and both leave together with
+ * the logo mirroring the entrance it made at the top of the film.
+ *
+ * `OUTRO` is expressed in ms rather than fractions so the beats keep their
+ * feel if the card's length is retimed; the exit is anchored to the end.
+ */
+const OUTRO = {
+  logoIn: 220,
+  logoInMs: 780,
+  ctaIn: 980,
+  ctaInMs: 620,
+  exitMs: 820,
+};
+
+/**
+ * The logo is *dropped* in and *lifted* out — one fast vertical move on a
+ * single axis, married to the fade.
+ *
+ * It used to enter on a slow rise combined with a scale ramp, which read as a
+ * diagonal parallax float: two simultaneous transforms at different rates make
+ * the eye infer depth, and a wordmark drifting through space is the wrong
+ * register for a game whose whole language is snapped-to-grid. Vertical only,
+ * fast, with a small overshoot to give it weight.
+ */
+const LOGO_DROP_PX = 190;
+const LOGO_DROP_MS = 560;
+const LOGO_LIFT_PX = 240;
+
 const LogoSlate: React.FC<{ elapsedMs: number; mode: 'intro' | 'outro'; durationMs: number }> = ({
   elapsedMs,
   mode,
   durationMs,
 }) => {
   const intro = mode === 'intro';
-  const t = intro
-    ? easeOutBack((elapsedMs - 250) / 900)
-    : 1 - easeInCubic((elapsedMs - (durationMs - 900)) / 900);
-  const drift = intro ? (1 - easeOutCubic((elapsedMs - 250) / 1100)) * 26 : 0;
-  const opacity = intro
-    ? easeOutCubic((elapsedMs - 250) / 700)
-    : 1 - easeInCubic((elapsedMs - (durationMs - 900)) / 900);
+  const exitStart = durationMs - OUTRO.exitMs;
+  const exit = intro ? 0 : easeInCubic((elapsedMs - exitStart) / OUTRO.exitMs);
+  const dropStart = intro ? 250 : OUTRO.logoIn;
+  // easeOutBack lands it slightly past centre and settles back: the overshoot
+  // is what makes a drop read as a drop rather than a slide.
+  const drop = easeOutBack((elapsedMs - dropStart) / LOGO_DROP_MS);
+  // Falls from above; the exit accelerates back the same way it came.
+  const offsetY = -(1 - drop) * LOGO_DROP_PX - exit * LOGO_LIFT_PX;
+  const opacity = easeOutCubic((elapsedMs - dropStart) / 320) * (1 - exit);
+
+  // The call to action arrives on a damped wiggle — the one deliberately
+  // playful move in the film, and the last thing a viewer sees.
+  const ctaT = clamp01((elapsedMs - OUTRO.ctaIn) / OUTRO.ctaInMs);
+  const ctaSettle = easeOutBack(ctaT);
+  const ctaWiggle = (1 - ctaT) ** 2 * Math.sin(ctaT * 22) * 9;
+  // The accent bar wipes out from the centre *first*: the words are knocked
+  // out in white, so any part of them that lands ahead of the bar is white on
+  // paper and simply missing.
+  const ctaBar = easeOutCubic((elapsedMs - OUTRO.ctaIn) / 240);
+  const ctaOpacity = clamp01((elapsedMs - OUTRO.ctaIn - 170) / 200) * (1 - exit);
 
   return (
     <div className="trailer-card trailer-card--logo">
@@ -102,17 +156,40 @@ const LogoSlate: React.FC<{ elapsedMs: number; mode: 'intro' | 'outro'; duration
         className="trailer-card__lockup"
         style={{
           opacity,
-          transform: `translateY(${drift}px) scale(${0.94 + 0.06 * clamp01(t)})`,
+          transform: `translateY(${offsetY.toFixed(2)}px)`,
         }}
       >
         <img src="SnaketronLogo.png" alt="SnakeTron" />
         <span
           className="trailer-card__tagline"
-          style={{ opacity: intro ? easeOutCubic((elapsedMs - 900) / 700) : opacity }}
+          style={{
+            opacity: intro
+              ? easeOutCubic((elapsedMs - dropStart - 480) / 520)
+              : opacity,
+          }}
         >
           Competitive multiplayer Snake
         </span>
       </div>
+      {!intro && (
+        <div
+          className="trailer-card__cta"
+          style={{
+            opacity: clamp01((elapsedMs - OUTRO.ctaIn) / 120) * (1 - exit),
+            transform: `translateY(${((1 - ctaSettle) * 30).toFixed(2)}px) `
+              + `rotate(${ctaWiggle.toFixed(2)}deg) `
+              + `scale(${(0.82 + 0.18 * ctaSettle).toFixed(3)})`,
+          }}
+        >
+          <span
+            className="trailer-card__cta-bar"
+            style={{ transform: `scaleX(${clamp01(ctaBar).toFixed(3)})` }}
+          />
+          <span className="trailer-card__cta-text" style={{ opacity: ctaOpacity }}>
+            Play free
+          </span>
+        </div>
+      )}
     </div>
   );
 };
@@ -143,66 +220,168 @@ const RankUpCard: React.FC<{ elapsedMs: number }> = ({ elapsedMs }) => {
           transform: `translateY(${(1 - enter) * 22}px) scale(${(0.97 + 0.03 * enter) * 2.9})`,
         }}
       >
-        <RatingReveal state={state} />
+        {/* The odometer must run on the harness clock, not rAF: see the
+            `clockMs` prop docs. Without it the promotion is captured as a
+            still of its own aftermath. */}
+        <RatingReveal state={state} clockMs={elapsedMs} />
       </div>
     </div>
   );
 };
 
-const RankingsCard: React.FC<{ elapsedMs: number }> = ({ elapsedMs }) => (
-  <div className="trailer-card trailer-card--rankings">
-    <FlowFieldBackdrop elapsedMs={elapsedMs} intensity={1.5} />
-    <ol className="trailer-card__ranks">
-      {RANK_SHOWCASE.map((mmr, index) => {
-        const rank = getRankFromMMR(mmr);
-        const t = easeOutBack((elapsedMs - 260 - index * 130) / 620);
-        return (
-          <li
-            key={mmr}
+/**
+ * Ladder showcase. Two beats:
+ *
+ *  1. the rank badges stamp in under the caption, exactly as before;
+ *  2. the whole lockup lifts to the top and shrinks to make room for a real
+ *     leaderboard, which scrolls away under an accelerating ramp until the
+ *     rows smear into a vertical blur — the point being *how many* players
+ *     are ranked, not any individual row.
+ *
+ * The caption lives inside the card (rather than being burnt on by ffmpeg)
+ * precisely because it has to move with the lockup. It is styled to match the
+ * global caption band so the cut reads consistently.
+ */
+
+const LADDER_TOTAL = 12480;
+
+const NAME_PARTS_A = [
+  'Grid', 'Neon', 'Apex', 'Viper', 'Coil', 'Flux', 'Nova', 'Byte',
+  'Quantum', 'Rogue', 'Echo', 'Pulse', 'Cinder', 'Vector', 'Onyx', 'Halo',
+];
+const NAME_PARTS_B = [
+  'rider', 'fang', 'loop', 'strike', 'wire', 'drift', 'coil', 'runner',
+  'byte', 'spark', 'trail', 'snap', 'weave', 'dash', 'flare', 'lock',
+];
+
+/** Deterministic filler ladder — no clock, no RNG, identical every capture. */
+const LADDER_ROWS = Array.from({ length: 90 }, (_, index) => {
+  const a = NAME_PARTS_A[(index * 7 + 3) % NAME_PARTS_A.length];
+  const b = NAME_PARTS_B[(index * 11 + 5) % NAME_PARTS_B.length];
+  const suffix = index % 4 === 0 ? String(((index * 37) % 89) + 10) : '';
+  return {
+    place: index + 1,
+    name: `${a}${b}${suffix}`,
+    mmr: 2570 - index * 13 - ((index * 17) % 9),
+  };
+});
+
+const ROW_HEIGHT_PX = 58;
+
+const RankingsCard: React.FC<{ elapsedMs: number; durationMs: number }> = ({
+  elapsedMs,
+  durationMs,
+}) => {
+  // Beat boundaries, as fractions of the card's runtime.
+  const liftStart = durationMs * 0.3;
+  const liftEnd = durationMs * 0.42;
+  // The ladder appears and is already moving *before* the badges get out of
+  // its way: waiting for the lift to finish left a dead beat where the card
+  // had visibly changed its mind but nothing was happening yet.
+  const ladderStart = liftStart - durationMs * 0.06;
+  const scrollStart = ladderStart + durationMs * 0.02;
+  const scrollEnd = durationMs * 0.9;
+
+  const lift = easeInOutCubic((elapsedMs - liftStart) / (liftEnd - liftStart));
+  const scroll = clamp01((elapsedMs - scrollStart) / (scrollEnd - scrollStart));
+
+  // Speed ramps up rather than running flat: gentle enough at first to read a
+  // few names, then fast enough that the rows become texture.
+  const travel = Math.pow(scroll, 2.7);
+  const offset = travel * ROW_HEIGHT_PX * (LADDER_ROWS.length - 6);
+  // Blur tracks the derivative of the ramp, so it appears only once the list
+  // is genuinely moving fast.
+  const speed = 2.7 * Math.pow(Math.max(scroll, 0), 1.7);
+  const blur = clamp01(speed / 2.2) * 26;
+  // The ladder leaves on opacity alone. Pulling it back at the same time it
+  // smeared read as two competing moves — the rows were already dissolving,
+  // and shrinking the frame around them just made the shot feel retracted.
+  const listOpacity =
+    easeOutCubic((elapsedMs - ladderStart) / 520) *
+    (1 - easeInCubic((elapsedMs - scrollEnd) / (durationMs - scrollEnd)));
+
+  return (
+    <div className="trailer-card trailer-card--rankings">
+      <FlowFieldBackdrop elapsedMs={elapsedMs} intensity={1.5} />
+      <svg className="trailer-card__filters" aria-hidden="true">
+        <defs>
+          <filter id="ladder-vblur" x="-10%" y="-30%" width="120%" height="160%">
+            <feGaussianBlur stdDeviation={`0 ${blur.toFixed(2)}`} />
+          </filter>
+        </defs>
+      </svg>
+
+      <div
+        className="trailer-card__ladder-lockup"
+        style={{ transform: `translateY(${-lift * 16}vh)` }}
+      >
+        <p className="trailer-card__caption">
+          Global multiplayer and Classic Snake Leaderboards
+        </p>
+        <ol
+          className="trailer-card__ranks"
+          style={{ transform: `scale(${1 - lift * 0.46})` }}
+        >
+          {RANK_SHOWCASE.map((mmr, index) => {
+            const rank = getRankFromMMR(mmr);
+            const t = easeOutBack((elapsedMs - 260 - index * 130) / 620);
+            return (
+              <li
+                key={mmr}
+                style={{
+                  opacity: easeOutCubic((elapsedMs - 260 - index * 130) / 420),
+                  transform: `translateY(${(1 - clamp01(t)) * 26}px) scale(${
+                    0.86 + 0.14 * clamp01(t)
+                  })`,
+                }}
+              >
+                <RankIcon tier={rank.tier} division={rank.division} label={rank.tier} />
+              </li>
+            );
+          })}
+          <li className="trailer-card__trophy">
+            <SoloTrophyIcon label="Solo trophy" />
+          </li>
+        </ol>
+      </div>
+
+      <div
+        className="trailer-card__ladder"
+        style={{ opacity: clamp01(listOpacity) }}
+      >
+        <div className="trailer-card__ladder-head">
+          <span>Global · Season 1</span>
+          <strong>{LADDER_TOTAL.toLocaleString('en-US')} ranked players</strong>
+        </div>
+        <div className="trailer-card__ladder-window">
+          <ol
+            className="trailer-card__ladder-rows"
             style={{
-              opacity: easeOutCubic((elapsedMs - 260 - index * 130) / 420),
-              transform: `translateY(${(1 - clamp01(t)) * 26}px) scale(${
-                0.86 + 0.14 * clamp01(t)
-              })`,
+              transform: `translateY(${-offset}px)`,
+              filter: blur > 0.4 ? 'url(#ladder-vblur)' : undefined,
             }}
           >
-            <img src={getRankImage(rank.tier)} alt={rank.tier} />
-          </li>
-        );
-      })}
-      <li
-        className="trailer-card__trophy"
-        style={{
-          opacity: easeOutCubic((elapsedMs - 260 - RANK_SHOWCASE.length * 130) / 420),
-          transform: `scale(${
-            0.86 +
-            0.14 * clamp01(easeOutBack((elapsedMs - 260 - RANK_SHOWCASE.length * 130) / 620))
-          })`,
-        }}
-      >
-        {/* The Classic/solo ladder marks its leader with this trophy rather
-            than a rank badge (Leaderboard.tsx:226-240) — same path data, so
-            the trailer shows the real mark. */}
-        <svg
-          viewBox="0 0 64 64"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          role="img"
-          aria-label="Solo trophy"
-        >
-          <path d="M19 10h26v11c0 10-5.8 17-13 17s-13-7-13-17V10Z" />
-          <path d="M19 15H9v4c0 7.8 4.5 12.5 11.8 13.4" />
-          <path d="M45 15h10v4c0 7.8-4.5 12.5-11.8 13.4" />
-          <path d="M32 38v9" />
-          <path d="M25 47h14l3 7H22l3-7Z" />
-        </svg>
-      </li>
-    </ol>
-  </div>
-);
+            {LADDER_ROWS.map((row) => {
+              const rank = getRankFromMMR(row.mmr);
+              return (
+                <li key={row.place}>
+                  <span className="trailer-card__ladder-place">{row.place}</span>
+                  <RankIcon
+                    tier={rank.tier}
+                    division={rank.division}
+                    className="trailer-card__ladder-icon"
+                  />
+                  <span className="trailer-card__ladder-name">{row.name}</span>
+                  <span className="trailer-card__ladder-mmr">{row.mmr}</span>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const TrailerCardQA: React.FC = () => {
   const [params] = useSearchParams();
@@ -247,7 +426,8 @@ const TrailerCardQA: React.FC = () => {
   }, [definition, durationMs, step]);
 
   if (card === 'rank-up') return <RankUpCard elapsedMs={elapsedMs} />;
-  if (card === 'rankings') return <RankingsCard elapsedMs={elapsedMs} />;
+  if (card === 'rankings')
+    return <RankingsCard elapsedMs={elapsedMs} durationMs={durationMs} />;
   return (
     <LogoSlate
       elapsedMs={elapsedMs}

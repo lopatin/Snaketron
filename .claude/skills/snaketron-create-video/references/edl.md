@@ -48,8 +48,29 @@ Author JSON, not JSONC. Compile it before rendering.
 
 ## Vocabulary
 
-Use effects `shake`, `punch_in`, `rgb_split`, `glow`, `grain`, `vignette`, `lut`, and `letterbox`.
+Use effects `shake`, `punch_in`, `push_in`, `drift`, `rgb_split`, `glow`, `grain`, `vignette`, `lut`, and `letterbox`.
 
-Use transitions `fadeblack`, `dissolve`, `pixelize`, `slices`, `wipe_left`, `wipe_right`, `wipe_up`, and `wipe_down`.
+Use transitions `fadeblack`, `fadewhite`, `dissolve`, `pixelize`, `slices`, `wipe_left`, `wipe_right`, `wipe_up`, `wipe_down`, `smooth_left`, `smooth_right`, `smooth_up`, `smooth_down`, `circle_open`, `circle_close`, and `zoom_in`.
 
 Prefer a single strong impact stack—shake, punch, split, and SFX—at the payoff. Use grain, vignette, glow, LUT, and letterbox as restrained shot treatments.
+
+### Accents vs. moves
+
+`punch_in` is an **accent**: the zoom snaps on at `at` and eases back out over
+`dur`. Give it a short `dur` (0.3–0.5 s) on the frame of an impact.
+
+`push_in` and `drift` are **moves**: a continuous eased ramp that holds its
+final framing, spanning the whole shot.
+
+Do not reach for `punch_in` when you want a slow dolly — over a multi-second
+`dur` it is a *constant* scale for the whole window with a hard step at each
+end, which is visually identical to a still image. This is exactly how build 3
+shipped a 5-second frozen title card that passed every automated check:
+
+```json
+{ "t": "push_in", "at": 0.0, "dur": 3.4, "zoom": 1.08 }
+```
+
+Any shot that is not gameplay needs one of these. See the "never cut a static
+screenshot into a moving video" rule in [narrative.md](narrative.md) — a card
+whose own animation finishes early is a static screenshot for the remainder.

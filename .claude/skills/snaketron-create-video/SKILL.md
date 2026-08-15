@@ -11,7 +11,8 @@ Follow this workflow. Keep source timing in structured JSON; never hand-author a
    Start from `assets/launch-trailer/brief.md` and `launch-trailer.edl.json` for the launch sequence.
    Read [references/narrative.md](references/narrative.md) first — it covers captions, hook, energy, and motion vocabulary, and every rule in it comes from a defect that shipped.
    **Then stage each gameplay shot so the payoff is actually on camera** — see "Shot composition" below. This is the step that is easiest to skip and most expensive to get wrong: a shot whose advertised moment happens off-frame passes every automated check in this skill.
-2. Reuse `tools/video/clips/<slug>/master.mkv` plus `meta.json` when its scenario, seed, and `capture_vfps` fit. Otherwise run `node scripts/capture.mjs ...`. Capture slow motion at the VFPS required by the intended rate.
+2. Reuse `tools/video/clips/<slug>/master.mkv` plus `meta.json` when its scenario, seed, and `capture_vfps` fit. Otherwise run `node tools/video/capture.mjs --scenario <path> --out tools/video/clips/<slug> --virtual-time`. Capture slow motion at the VFPS required by the intended rate.
+   **Pass `--virtual-time` unless you have pinned `chrome-headless-shell`.** The BeginFrame path needs `HeadlessExperimental`, which Playwright's bundled Chromium does not expose; without the flag the renderer dies and the failure surfaces as the misleading `Capture contract was not installed within 30s: … browser has been closed`.
    For non-gameplay frames (logo slates, rank up, rankings) capture the **real app components** from the dev-only `/qa/trailer-card` route, so the video shows the product's own animation rather than a drawn replica:
 
    ```bash
@@ -50,14 +51,19 @@ A gameplay capture is a staged shot, not a recording of whatever the camera happ
 - **Give the frame scale references.** A scenario with `rng_seed: null` and an empty `pose.food` has *no food at all* — pose food explicitly. Keep a wall, team zone, or opponent in view. Target ≥ 15% non-background ink; build 1 shipped 6.5%.
 - **Check the HUD survives capture.** Addons that render as siblings below the arena viewport (the boost meter) are clipped by capture mode's full-bleed layout. If a shot advertises Boost, confirm the meter is actually in frame.
 - **Keep the subject large.** At the focus frame the subject's bounding box should span ≥ ⅓ of frame width. `punch_in` is a centre crop and cannot reframe a bad plate — fix framing at capture time.
+- **Populate the arena, and make the caption true of it.** Count the snakes actually inside the camera rect, not the ones in the scenario: a shot captioned "FREE FOR ALL!" shipped holding two, and a Boost/combo shot shipped holding one. Pose extras into lanes the star never occupies and food across the whole window, then diff the new `cue_timeline` against the old — the star's pickups, kills, and banks must land on the same ticks or every `meta:` anchor has moved. Give an extra whose path ends in a wall a turn command, or start it so its exit is off camera; a snake suiciding into a wall in frame reads as broken AI.
 
 ## Narrative and energy
 
 Full detail in [references/narrative.md](references/narrative.md); the rules that most often get skipped:
 
-- **Every scene has a caption.** Alternate a `quiet` setup line with an `impact` payoff line anchored to the moment it names. A scene with no caption is a scene the viewer cannot read in time.
+- **Every scene has exactly one caption**, an `impact` line anchored to the payoff it names. Do not add a setup line before it — pre-captions over-share and double the reading load. The only `quiet` caption is a closing call to action.
 - **Hook inside 5 seconds** — keep the intro slate short and land the biggest moment by ~4s.
 - **Never cut a static screenshot into a moving video.** Capture the real component animating (`/qa/trailer-card`), and give every non-gameplay card the drifting dot field so it stays alive.
+- **Prove the card animated before you cut it.** Mounting the real component is not enough: the component must take its time from the harness clock (`RatingReveal`'s `clockMs`), and the capture context must not request `reducedMotion: "reduce"`, which makes well-behaved components render their settled state. Tile the card's own master and check the values change. `splice_duplicate_frames` will not catch this — the flow field underneath is still drifting.
+- **Cut a shot to its payoff.** A card lasts as long as its animation plus one beat; a gameplay shot ends ~1–1.5s after the payoff. Use `push_in` (an eased dolly that holds) for whatever tail remains — never `punch_in`, which over a long `dur` is a constant scale, i.e. a still frame.
+- **Check the renderer's fixed-pixel weights before blaming the shot.** Capture draws a ~60px cell where a 1× display draws 15, so anything sized in absolute pixels (contours, glows, in-body labels) arrives at a quarter weight. Crop a frame 1:1 and measure against the body.
+- **One transform per entrance, and animate the call to action inside the card.** A translate plus a scale reads as a diagonal float; burnt-in `texts` cannot move at all.
 - **Default to 1.0× speed.** Cell-stepped snake motion reads as dropped frames in slow motion; only slow footage captured at matching high VFPS.
 - **One motion vocabulary** — two or three transitions, non-linear easing throughout, effects as brief accents. No vignette or grain on a paper ground.
 - **Captions sit in the band at ~0.655–0.75 frame height, left-aligned**, clear of the boost meter (bottom 12%), the centre score readout, and the top combo callout.

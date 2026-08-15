@@ -3,7 +3,7 @@
   "scenario_id": "boost-combo-clutch",
   "source_kind": "script-file",
   "source_file": "boost-combo-clutch.json",
-  "source_sha256": "f782041395215c9301bafa58b13002ba4cad2ddf635ba7e9545ac74e59eb72f8",
+  "source_sha256": "dcb29560dae69e28120d61f6e21271d2a057b236c88f7d980a22943ca24f42d2",
   "capture_vfps": 60,
   "encoded_fps": 60,
   "width": 1920,
@@ -28,7 +28,26 @@
     "tick_duration_ms": 50,
     "start_tick": 0,
     "end_tick": 70,
-    "crashes": [],
+    "crashes": [
+      {
+        "tick": 52,
+        "snake_id": 1,
+        "position": {
+          "x": 39,
+          "y": 10
+        },
+        "cause": "OutOfBounds"
+      },
+      {
+        "tick": 54,
+        "snake_id": 2,
+        "position": {
+          "x": 0,
+          "y": 22
+        },
+        "cause": "OutOfBounds"
+      }
+    ],
     "goals": [],
     "pickups": [
       {
@@ -59,7 +78,7 @@
       },
       {
         "tick": 56,
-        "sequence": 9,
+        "sequence": 11,
         "snake_id": 0,
         "position": {
           "x": 34,
@@ -71,7 +90,28 @@
         "boost_active": true
       }
     ],
-    "deaths": [],
+    "deaths": [
+      {
+        "tick": 52,
+        "sequence": 9,
+        "snake_id": 1,
+        "cause": "OutOfBounds",
+        "hold_position": {
+          "x": 39,
+          "y": 10
+        }
+      },
+      {
+        "tick": 54,
+        "sequence": 10,
+        "snake_id": 2,
+        "cause": "OutOfBounds",
+        "hold_position": {
+          "x": 0,
+          "y": 22
+        }
+      }
+    ],
     "heads": [
       {
         "tick": 0,
@@ -82,6 +122,24 @@
             "head": {
               "x": 4,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 14,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 26,
+              "y": 22
             },
             "is_alive": true
           }
@@ -98,6 +156,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 14,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 26,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -110,6 +186,24 @@
             "head": {
               "x": 5,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 15,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 25,
+              "y": 22
             },
             "is_alive": true
           }
@@ -126,6 +220,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 15,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 25,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -138,6 +250,24 @@
             "head": {
               "x": 7,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 16,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 24,
+              "y": 22
             },
             "is_alive": true
           }
@@ -154,6 +284,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 16,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 24,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -166,6 +314,24 @@
             "head": {
               "x": 8,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 17,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 23,
+              "y": 22
             },
             "is_alive": true
           }
@@ -182,6 +348,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 17,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 23,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -194,6 +378,24 @@
             "head": {
               "x": 10,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 18,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 22,
+              "y": 22
             },
             "is_alive": true
           }
@@ -210,6 +412,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 18,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 22,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -222,6 +442,24 @@
             "head": {
               "x": 11,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 19,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 21,
+              "y": 22
             },
             "is_alive": true
           }
@@ -238,6 +476,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 19,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 21,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -250,6 +506,24 @@
             "head": {
               "x": 13,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 20,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 20,
+              "y": 22
             },
             "is_alive": true
           }
@@ -266,6 +540,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 20,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 20,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -278,6 +570,24 @@
             "head": {
               "x": 14,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 21,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 19,
+              "y": 22
             },
             "is_alive": true
           }
@@ -294,6 +604,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 21,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 19,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -306,6 +634,24 @@
             "head": {
               "x": 16,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 22,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 18,
+              "y": 22
             },
             "is_alive": true
           }
@@ -322,6 +668,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 22,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 18,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -334,6 +698,24 @@
             "head": {
               "x": 17,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 23,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 17,
+              "y": 22
             },
             "is_alive": true
           }
@@ -350,6 +732,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 23,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 17,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -362,6 +762,24 @@
             "head": {
               "x": 19,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 24,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 16,
+              "y": 22
             },
             "is_alive": true
           }
@@ -378,6 +796,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 24,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 16,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -390,6 +826,24 @@
             "head": {
               "x": 20,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 25,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 15,
+              "y": 22
             },
             "is_alive": true
           }
@@ -406,6 +860,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 25,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 15,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -418,6 +890,24 @@
             "head": {
               "x": 22,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 26,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 14,
+              "y": 22
             },
             "is_alive": true
           }
@@ -434,6 +924,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 26,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 14,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -446,6 +954,24 @@
             "head": {
               "x": 23,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 27,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 13,
+              "y": 22
             },
             "is_alive": true
           }
@@ -462,6 +988,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 27,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 13,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -474,6 +1018,24 @@
             "head": {
               "x": 25,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 28,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 12,
+              "y": 22
             },
             "is_alive": true
           }
@@ -490,6 +1052,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 28,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 12,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -502,6 +1082,24 @@
             "head": {
               "x": 26,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 29,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 11,
+              "y": 22
             },
             "is_alive": true
           }
@@ -518,6 +1116,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 29,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 11,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -530,6 +1146,24 @@
             "head": {
               "x": 28,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 30,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 10,
+              "y": 22
             },
             "is_alive": true
           }
@@ -546,6 +1180,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 30,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 10,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -558,6 +1210,24 @@
             "head": {
               "x": 29,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 31,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 9,
+              "y": 22
             },
             "is_alive": true
           }
@@ -574,6 +1244,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 31,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 9,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -586,6 +1274,24 @@
             "head": {
               "x": 31,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 32,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 8,
+              "y": 22
             },
             "is_alive": true
           }
@@ -602,6 +1308,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 32,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 8,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -614,6 +1338,24 @@
             "head": {
               "x": 32,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 33,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 7,
+              "y": 22
             },
             "is_alive": true
           }
@@ -630,6 +1372,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 33,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 7,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -642,6 +1402,24 @@
             "head": {
               "x": 34,
               "y": 16
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 34,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 6,
+              "y": 22
             },
             "is_alive": true
           }
@@ -658,6 +1436,24 @@
               "y": 16
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 34,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 6,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -670,6 +1466,24 @@
             "head": {
               "x": 34,
               "y": 17
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 35,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 5,
+              "y": 22
             },
             "is_alive": true
           }
@@ -686,6 +1500,24 @@
               "y": 18
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 35,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 5,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -698,6 +1530,24 @@
             "head": {
               "x": 34,
               "y": 19
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 36,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 4,
+              "y": 22
             },
             "is_alive": true
           }
@@ -714,6 +1564,24 @@
               "y": 19
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 36,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 4,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -726,6 +1594,24 @@
             "head": {
               "x": 34,
               "y": 20
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 37,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 3,
+              "y": 22
             },
             "is_alive": true
           }
@@ -742,6 +1628,24 @@
               "y": 21
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 37,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 3,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -753,6 +1657,24 @@
             "user_id": 1,
             "head": {
               "x": 34,
+              "y": 22
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 38,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 2,
               "y": 22
             },
             "is_alive": true
@@ -770,6 +1692,24 @@
               "y": 22
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 38,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 2,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -782,6 +1722,24 @@
             "head": {
               "x": 34,
               "y": 23
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 1,
+              "y": 22
             },
             "is_alive": true
           }
@@ -798,6 +1756,24 @@
               "y": 24
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 1,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -810,6 +1786,24 @@
             "head": {
               "x": 34,
               "y": 25
+            },
+            "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
             },
             "is_alive": true
           }
@@ -826,6 +1820,24 @@
               "y": 25
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": true
           }
         ]
       },
@@ -840,6 +1852,24 @@
               "y": 26
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -854,6 +1884,24 @@
               "y": 27
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -868,6 +1916,24 @@
               "y": 28
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -882,6 +1948,24 @@
               "y": 28
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -896,6 +1980,24 @@
               "y": 29
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -910,6 +2012,24 @@
               "y": 30
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -924,6 +2044,24 @@
               "y": 31
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -938,6 +2076,24 @@
               "y": 31
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -952,6 +2108,24 @@
               "y": 32
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -966,6 +2140,24 @@
               "y": 32
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -980,6 +2172,24 @@
               "y": 33
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -994,6 +2204,24 @@
               "y": 33
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -1008,6 +2236,24 @@
               "y": 34
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -1022,6 +2268,24 @@
               "y": 34
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -1036,6 +2300,24 @@
               "y": 35
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -1050,6 +2332,24 @@
               "y": 36
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       },
@@ -1064,6 +2364,24 @@
               "y": 37
             },
             "is_alive": true
+          },
+          {
+            "snake_id": 1,
+            "user_id": 2,
+            "head": {
+              "x": 39,
+              "y": 10
+            },
+            "is_alive": false
+          },
+          {
+            "snake_id": 2,
+            "user_id": 3,
+            "head": {
+              "x": 0,
+              "y": 22
+            },
+            "is_alive": false
           }
         ]
       }
@@ -1101,10 +2419,56 @@
       "boost_active": true
     },
     {
+      "type": "crash",
+      "at_master_seconds": 2.6,
+      "tick": 52,
+      "snake_id": 1,
+      "position": {
+        "x": 39,
+        "y": 10
+      },
+      "cause": "OutOfBounds"
+    },
+    {
+      "type": "death",
+      "at_master_seconds": 2.6,
+      "tick": 52,
+      "sequence": 9,
+      "snake_id": 1,
+      "cause": "OutOfBounds",
+      "hold_position": {
+        "x": 39,
+        "y": 10
+      }
+    },
+    {
+      "type": "crash",
+      "at_master_seconds": 2.7,
+      "tick": 54,
+      "snake_id": 2,
+      "position": {
+        "x": 0,
+        "y": 22
+      },
+      "cause": "OutOfBounds"
+    },
+    {
+      "type": "death",
+      "at_master_seconds": 2.7,
+      "tick": 54,
+      "sequence": 10,
+      "snake_id": 2,
+      "cause": "OutOfBounds",
+      "hold_position": {
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
       "type": "pickup",
       "at_master_seconds": 2.8,
       "tick": 56,
-      "sequence": 9,
+      "sequence": 11,
       "snake_id": 0,
       "position": {
         "x": 34,
@@ -3428,6 +4792,6 @@
       "is_alive": true
     }
   ],
-  "master_sha256": "56b0d7f0b85080a0ef691212a6fff2b5bad03c36ed2f92e2d1c8672f464c0782",
+  "master_sha256": "8e888a23d4c805a83c0fee9c709cff6149943f70d6868030936eac14cf013055",
   "master_file": "master.mkv"
 }

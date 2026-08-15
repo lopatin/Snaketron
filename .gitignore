@@ -13,6 +13,12 @@ replays/
 traces/
 loadtest-reports/
 .video-cache/
+# Captured clip masters are lossless build artifacts — 156 MB and growing,
+# in a repo with no LFS. The reproducible part is checked in: the scenario
+# JSON that produced each one, and the clip contract under
+# .claude/skills/snaketron-create-video/assets/launch-trailer/clip-contracts/.
+# Re-capture with tools/video/capture.mjs / scripts/capture_card.mjs.
+tools/video/clips/*/master.mkv
 __pycache__/
 *.pyc
 

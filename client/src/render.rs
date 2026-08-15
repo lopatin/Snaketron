@@ -89,6 +89,25 @@ const NOS_ORANGE: &str = "#ff641e";
 const HEAD_CORE_RADIUS_RATIO: f64 = 0.38;
 
 const BOOST_OUTER_COLOR: &str = "#fff200";
+/// The largest cell the arena lays out, in CSS pixels
+/// (`GameArena.tsx` walks the cell down from here). Every pixel weight below
+/// is quoted *at this cell*, and scales with the cell above it.
+const ARENA_MAX_CELL_PX: f64 = 15.0;
+
+/// How much bigger everything drawn on the body gets, relative to the weights
+/// tuned at [`ARENA_MAX_CELL_PX`].
+///
+/// A fixed-pixel rim is only correct at one zoom. The arena canvas is not
+/// devicePixelRatio-scaled, so a 1× display genuinely draws a ≤15 px cell and
+/// these weights are the look — the scale is exactly 1 there, and 1× rendering
+/// is untouched. A high-DPI canvas draws the same cell several times larger
+/// (the trailer capture draws a ~60 px cell at deviceScaleFactor 4), where a
+/// 2 px contour reads as a scratch and the 6 px Boost band all but vanishes
+/// against the body it is supposed to be glowing around.
+fn body_detail_scale(cell_size: f64) -> f64 {
+    (cell_size / ARENA_MAX_CELL_PX).max(1.0)
+}
+
 const BOOST_OUTER_EXTRA: f64 = 6.0;
 const ORDINARY_OUTLINE_EXTRA: f64 = 2.0;
 const BOOST_MASK_EXTRA: f64 = 3.0;
@@ -103,7 +122,8 @@ enum SnakeOutlinePaint {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SnakeOutlineLayer {
     paint: SnakeOutlinePaint,
-    extra: f64,
+    /// Contour bleed outside the body at [`ARENA_MAX_CELL_PX`].
+    base_extra: f64,
 }
 
 impl SnakeOutlineLayer {
@@ -114,29 +134,34 @@ impl SnakeOutlineLayer {
         }
     }
 
+    /// Total contour bleed outside the body, split evenly across both sides.
+    fn extra(self, cell_size: f64) -> f64 {
+        self.base_extra * body_detail_scale(cell_size)
+    }
+
     fn line_width(self, cell_size: f64) -> f64 {
-        cell_size + self.extra
+        cell_size + self.extra(cell_size)
     }
 
     fn radius(self, cell_size: f64) -> f64 {
-        cell_size / 2.0 + self.extra / 2.0
+        (cell_size + self.extra(cell_size)) / 2.0
     }
 }
 
 const ACTIVE_SNAKE_OUTLINE_LAYERS: [SnakeOutlineLayer; 2] = [
     SnakeOutlineLayer {
         paint: SnakeOutlinePaint::BoostOuter,
-        extra: BOOST_OUTER_EXTRA,
+        base_extra: BOOST_OUTER_EXTRA,
     },
     SnakeOutlineLayer {
         paint: SnakeOutlinePaint::Ordinary,
-        extra: ORDINARY_OUTLINE_EXTRA,
+        base_extra: ORDINARY_OUTLINE_EXTRA,
     },
 ];
 
 const ORDINARY_SNAKE_OUTLINE_LAYERS: [SnakeOutlineLayer; 1] = [SnakeOutlineLayer {
     paint: SnakeOutlinePaint::Ordinary,
-    extra: ORDINARY_OUTLINE_EXTRA,
+    base_extra: ORDINARY_OUTLINE_EXTRA,
 }];
 
 fn snake_outline_layers(boost_active: bool) -> &'static [SnakeOutlineLayer] {
@@ -147,12 +172,13 @@ fn snake_outline_layers(boost_active: bool) -> &'static [SnakeOutlineLayer] {
     }
 }
 
-fn snake_mask_extra(boost_active: bool) -> f64 {
-    if boost_active {
+fn snake_mask_extra(boost_active: bool, cell_size: f64) -> f64 {
+    let base = if boost_active {
         BOOST_MASK_EXTRA
     } else {
         ORDINARY_MASK_EXTRA
-    }
+    };
+    base * body_detail_scale(cell_size)
 }
 
 const NOS_REGULAR_WIDTH_RATIO: f64 = 0.50;
@@ -553,7 +579,7 @@ fn draw_alive_snake_skin(
 
     let full_circle = 2.0 * std::f64::consts::PI;
     let outline_layers = snake_outline_layers(boost_active);
-    let mask_extra = snake_mask_extra(boost_active);
+    let mask_extra = snake_mask_extra(boost_active, cell_size);
 
     // Handle single-segment snake (just a head)
     if cells.len() == 1 {
@@ -1349,9 +1375,16 @@ pub fn screen_direction_to_game(direction: &str, rotation: f64) -> String {
 /// it. Two cells back clears the core while still reading as "at the head".
 const CARRIED_LABEL_OFFSET_CELLS: usize = 2;
 /// The arena canvas is not devicePixelRatio-scaled, so these are physical
-/// pixels. `GameArena.tsx` walks `cell_size` down through the integers 15..=5,
-/// and the floor keeps the number readable at the small end rather than
-/// letting it shrink with the cell into illegibility.
+/// pixels. On a 1× display `GameArena.tsx` walks `cell_size` down through the
+/// integers 15..=5, and the floor keeps the number readable at the small end
+/// rather than letting it shrink with the cell into illegibility.
+///
+/// The ceiling has to be a *ratio*, though, because physical pixels are not
+/// what the reader compares the glyph against — the snake is. At DPR 4 the
+/// cell arrives here around 60 px, and a flat 14 px ceiling drew the carried
+/// count at under a quarter of the body it sits inside: legible, but plainly
+/// a different UI's typography pasted onto the snake. The floor keeps 1×
+/// rendering unchanged, since 15 × the ratio lands just under it.
 const CARRIED_LABEL_MIN_PX: f64 = 7.0;
 const CARRIED_LABEL_MAX_PX: f64 = 14.0;
 /// Canvas strokes straddle the glyph outline, so the halo eats half its width
@@ -1364,7 +1397,6 @@ const CARRIED_LABEL_HALO_RATIO: f64 = 0.20;
 /// `cell_size` of fill plus the ordinary contour — which is the width the
 /// snake actually occupies on screen.
 const CARRIED_LABEL_ALONG_BODY_CELLS: f64 = 2.0;
-const CARRIED_LABEL_ACROSS_BODY_BLEED_PX: f64 = ORDINARY_OUTLINE_EXTRA;
 /// Advance width of one Arial Black digit, in em. Used to pick a font size the
 /// number fits at, rather than squashing glyphs horizontally into the band:
 /// team arenas render rotated, so most snakes read screen-vertical and the
@@ -1471,12 +1503,13 @@ fn carried_food_label_layout(
     let available = if horizontal_on_screen {
         cell_size * CARRIED_LABEL_ALONG_BODY_CELLS
     } else {
-        cell_size + CARRIED_LABEL_ACROSS_BODY_BLEED_PX
+        cell_size + ORDINARY_SNAKE_OUTLINE_LAYERS[0].extra(cell_size)
     };
     let per_digit = CARRIED_LABEL_DIGIT_ADVANCE_EM * digits.max(1) as f64;
+    let max_px = CARRIED_LABEL_MAX_PX * body_detail_scale(cell_size);
     let font_px = cell_size
         .min(available / per_digit)
-        .clamp(CARRIED_LABEL_MIN_PX, CARRIED_LABEL_MAX_PX);
+        .clamp(CARRIED_LABEL_MIN_PX, max_px);
 
     CarriedFoodLabelLayout {
         font_px,
@@ -2935,17 +2968,18 @@ mod tests {
 
     #[test]
     fn carried_label_layout_never_condenses_and_stays_within_its_clamp() {
-        // GameArena.tsx walks cell size down through the integers 15..=5, and
-        // the arena canvas is not devicePixelRatio-scaled, so these are
-        // physical pixels.
-        for cell_size in 5..=15 {
+        // On a 1x display GameArena.tsx walks cell size down through the
+        // integers 15..=5, and the arena canvas is not devicePixelRatio-scaled,
+        // so these are physical pixels. High-DPI displays and the trailer
+        // capture (deviceScaleFactor 4) hand this the same cell multiplied by
+        // the ratio, which is why the sweep runs well past 15.
+        for cell_size in 5..=64 {
             let cell_size = f64::from(cell_size);
             for digits in 1..=4 {
                 for horizontal in [true, false] {
                     let layout = carried_food_label_layout(cell_size, digits, horizontal);
 
                     assert!(layout.font_px >= CARRIED_LABEL_MIN_PX);
-                    assert!(layout.font_px <= CARRIED_LABEL_MAX_PX);
                     assert!(layout.font_px <= cell_size.max(CARRIED_LABEL_MIN_PX));
                     // The halo must never eat a whole stem of a 900-weight glyph.
                     assert!(layout.halo_px < layout.font_px * 0.25);
@@ -2955,7 +2989,7 @@ mod tests {
                     let available = if horizontal {
                         cell_size * CARRIED_LABEL_ALONG_BODY_CELLS
                     } else {
-                        cell_size + CARRIED_LABEL_ACROSS_BODY_BLEED_PX
+                        cell_size + ORDINARY_SNAKE_OUTLINE_LAYERS[0].extra(cell_size)
                     };
                     let natural = layout.font_px * CARRIED_LABEL_DIGIT_ADVANCE_EM * digits as f64;
                     assert!(
@@ -3087,7 +3121,49 @@ mod tests {
             2.0
         );
         assert_eq!(layers[1].radius(cell_size) - cell_size / 2.0, 1.0);
-        assert_eq!(snake_mask_extra(true), 3.0);
+        assert_eq!(snake_mask_extra(true, cell_size), 3.0);
+    }
+
+    /// The rim is a constant fraction of the body once the cell outgrows the
+    /// pixel floors, so a snake looks like the same object at 1x and at the
+    /// deviceScaleFactor 4 the trailer captures at. Before this, a 60 px cell
+    /// still got a 2 px contour and a 6 px Boost band.
+    #[test]
+    fn contour_weights_track_the_cell_once_it_outgrows_the_pixel_floors() {
+        // At the 15 CSS px cap the arena tops out at, the floors still win, so
+        // 1x rendering is untouched.
+        for layer in ACTIVE_SNAKE_OUTLINE_LAYERS {
+            assert_eq!(layer.extra(ARENA_MAX_CELL_PX), layer.base_extra);
+            assert_eq!(layer.extra(8.0), layer.base_extra, "1x rendering is untouched");
+        }
+        assert_eq!(snake_mask_extra(true, ARENA_MAX_CELL_PX), BOOST_MASK_EXTRA);
+        assert_eq!(snake_mask_extra(false, ARENA_MAX_CELL_PX), ORDINARY_MASK_EXTRA);
+
+        // Four times the cell gives four times the rim.
+        let big = 4.0 * ARENA_MAX_CELL_PX;
+        let [boost, ordinary] = ACTIVE_SNAKE_OUTLINE_LAYERS;
+        assert_eq!(ordinary.extra(big), 4.0 * ORDINARY_OUTLINE_EXTRA);
+        assert_eq!(boost.extra(big), 4.0 * BOOST_OUTER_EXTRA);
+        // The Boost band stays outside the ordinary contour at every size.
+        for cell in [5.0, 15.0, 30.0, 60.0, 120.0] {
+            assert!(boost.radius(cell) > ordinary.radius(cell));
+            assert!(snake_mask_extra(true, cell) > snake_mask_extra(false, cell));
+        }
+    }
+
+    /// The carried count reads as part of the snake, not as a UI label sitting
+    /// on top of it: past the pixel floor it is a fixed share of the body.
+    #[test]
+    fn carried_label_fills_the_body_at_high_dpi() {
+        for digits in 1..=2 {
+            let small = carried_food_label_layout(15.0, digits, true);
+            let large = carried_food_label_layout(60.0, digits, true);
+            assert!(
+                large.font_px / 60.0 >= small.font_px / 15.0 - 1e-9,
+                "{digits}-digit label lost ground against the body at 4x"
+            );
+            assert!(large.font_px >= 40.0, "{digits}-digit label still tiny at 4x");
+        }
     }
 
     #[test]
@@ -3103,7 +3179,7 @@ mod tests {
         assert_eq!(layers[0].line_width(cell_size), 12.0);
         assert_eq!(layers[0].radius(cell_size), 6.0);
         assert_eq!(layers[0].radius(cell_size) - cell_size / 2.0, 1.0);
-        assert_eq!(snake_mask_extra(false), 1.0);
+        assert_eq!(snake_mask_extra(false, cell_size), 1.0);
     }
 
     /// The two roster sizes the stylesheet actually lays out. The snake must

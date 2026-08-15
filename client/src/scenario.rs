@@ -1128,20 +1128,49 @@ mod tests {
                 "boost-combo-clutch",
                 include_str!("../../tools/video/scenarios/boost-combo-clutch.json"),
             ),
+            (
+                "ffa-four-snakes",
+                include_str!("../../tools/video/scenarios/ffa-four-snakes.json"),
+            ),
+            (
+                "solo-classic-run",
+                include_str!("../../tools/video/scenarios/solo-classic-run.json"),
+            ),
         ];
 
         for (name, json) in fixtures {
             let script = common::ScenarioScript::from_json(json).unwrap();
             let run = script.clone().load().unwrap().run().unwrap();
             let tick_ms = run.final_state.properties.tick_duration_ms;
+            let star = script.presentation.star_snake_id.unwrap_or(0);
 
             // Deaths are the payoff whose participants are easiest to pin
             // down: the victim must be visible, not merely the camera subject.
+            //
+            // Only deaths the *star* is party to are payoffs. A populated
+            // arena (narrative.md §7) has extras running their own lanes, and
+            // one of them leaving the field at the far side of the map is set
+            // dressing that is deliberately staged off camera — asserting on
+            // it would make "put more snakes in frame" and "keep the payoff in
+            // frame" mutually exclusive.
             let deaths: Vec<(u32, u32)> = run
                 .events
                 .iter()
                 .filter_map(|(tick, _, event)| match event {
-                    common::GameEvent::SnakeDied { snake_id, .. } => Some((*tick, *snake_id)),
+                    common::GameEvent::SnakeDied {
+                        snake_id, cause, ..
+                    } => {
+                        let killer = match cause {
+                            common::DeathCause::SnakeBody { killer_snake_id } => {
+                                Some(*killer_snake_id)
+                            }
+                            common::DeathCause::HeadToHead { other_snake_id } => {
+                                Some(*other_snake_id)
+                            }
+                            _ => None,
+                        };
+                        (*snake_id == star || killer == Some(star)).then_some((*tick, *snake_id))
+                    }
                     _ => None,
                 })
                 .collect();

@@ -239,8 +239,17 @@ async function main() {
     const context = await browser.newContext({
       viewport: { width: options.width, height: options.height },
       deviceScaleFactor: 1,
-      colorScheme: "dark",
-      reducedMotion: "reduce",
+      // SnakeTron is a light product; capturing under a dark preference
+      // invites a component to render a theme the trailer never shows.
+      colorScheme: "light",
+      // NOT "reduce". Determinism here comes from the harness owning the
+      // clock (stepMs) and from `animations: "disabled"` freezing CSS
+      // timelines at screenshot time — not from asking the product to stop
+      // animating. Under "reduce", any component that honours the preference
+      // renders its settled state, so a card built to show a reveal captures
+      // only the reveal's aftermath: the rank-up card shipped 5 seconds of a
+      // finished scoreboard because of exactly this.
+      reducedMotion: "no-preference",
     });
     const page = await context.newPage();
     page.on("pageerror", (error) => {

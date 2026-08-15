@@ -17,6 +17,8 @@ SCHEMA_VERSION = 1
 EFFECTS = {
     "shake",
     "punch_in",
+    "push_in",
+    "drift",
     "rgb_split",
     "glow",
     "grain",
@@ -225,6 +227,31 @@ def map_source_to_output(source_time: float, speed: list[dict[str, float]]) -> f
     return speed[-1]["output_end"]
 
 
+def _smoothstep(start: float, duration: float) -> str:
+    """Eased 0→1 ramp over [start, start+duration], saturating outside it.
+
+    ffmpeg's expression evaluator has no easing primitive, and a linear ramp
+    reads as a machine move rather than a camera one. `clip` saturates the
+    normalized phase so the caller never has to guard the ends: before the
+    ramp the value is exactly 0, after it exactly 1 — which is what lets an
+    eased zoom hold its final framing instead of popping back.
+    """
+    span = max(duration, 1e-6)
+    phase = f"clip((t-{start:.6f})/{span:.6f}\\,0\\,1)"
+    return f"({phase}*{phase}*(3-2*{phase}))"
+
+
+def _zoom_filters(width: int, height: int, factor_expr: str) -> list[str]:
+    """Scale by a per-frame factor, then re-crop to frame from the centre."""
+    return [
+        (
+            f"scale=w='ceil(iw*({factor_expr})/2)*2':"
+            f"h='ceil(ih*({factor_expr})/2)*2':eval=frame"
+        ),
+        f"crop={width}:{height}:x='(iw-ow)/2':y='(ih-oh)/2'",
+    ]
+
+
 def _effect_filters(
     effects: list[dict[str, Any]], width: int, height: int
 ) -> list[str]:
@@ -249,16 +276,41 @@ def _effect_filters(
                 ]
             )
         elif kind == "punch_in":
+            # An accent, not a move: the zoom snaps on at `at` (that instant
+            # attack IS the impact) and then eases back out across `dur`.
+            # Releasing on a step made the frame pop twice for one event, so
+            # only the attack is discontinuous.
             zoom = float(effect.get("zoom", 1.2))
+            release = f"(1-{_smoothstep(start, effect['dur_output'])})"
+            factor = f"1+{zoom - 1:.6f}*if({enabled}\\,{release}\\,0)"
+            filters.extend(_zoom_filters(width, height, factor))
+        elif kind == "push_in":
+            # A move, not an accent: a continuous eased dolly that holds its
+            # final framing. This is what a title card or any otherwise-still
+            # frame needs — `punch_in` over a long `dur` is a constant scale,
+            # which is indistinguishable from a static image.
+            zoom = float(effect.get("zoom", 1.06))
+            factor = f"1+{zoom - 1:.6f}*{_smoothstep(start, effect['dur_output'])}"
+            filters.extend(_zoom_filters(width, height, factor))
+        elif kind == "drift":
+            # Slow lateral/vertical travel across an overscanned plate. Pairs
+            # with `push_in` to keep a still frame alive without the zoom
+            # having to carry all of the motion on its own.
+            amount = float(effect.get("amount", 0.03))
+            angle = math.radians(float(effect.get("angle", 0.0)))
+            pad_x = math.ceil(width * abs(amount * math.cos(angle)) + 2)
+            pad_y = math.ceil(height * abs(amount * math.sin(angle)) + 2)
+            ramp = _smoothstep(start, effect["dur_output"])
+            travel_x = width * amount * math.cos(angle)
+            travel_y = height * amount * math.sin(angle)
             filters.extend(
                 [
+                    f"scale={width + 2 * pad_x}:{height + 2 * pad_y}",
                     (
-                        "scale=w='ceil(iw*(1+"
-                        f"{zoom - 1:.6f}*if({enabled},1,0))/2)*2':"
-                        "h='ceil(ih*(1+"
-                        f"{zoom - 1:.6f}*if({enabled},1,0))/2)*2':eval=frame"
+                        f"crop={width}:{height}:"
+                        f"x='{pad_x}+{travel_x:.4f}*{ramp}':"
+                        f"y='{pad_y}+{travel_y:.4f}*{ramp}'"
                     ),
-                    f"crop={width}:{height}:x='(iw-ow)/2':y='(ih-oh)/2'",
                 ]
             )
         elif kind == "rgb_split":

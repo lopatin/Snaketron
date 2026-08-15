@@ -3,36 +3,42 @@
   "scenario_id": "logo-outro",
   "fixture_id": "logo-outro",
   "source_kind": "fixture-card",
-  "source_file": "http://127.0.0.1:3000/qa/trailer-card?card=logo-outro",
+  "source_file": "http://127.0.0.1:3000/qa/trailer-card?card=logo-outro&ms=3600",
   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "source_params": {},
   "capture_vfps": 60,
   "encoded_fps": 60,
   "width": 1920,
   "height": 1080,
-  "duration": 4,
-  "duration_ms": 4000,
-  "frame_count": 240,
+  "duration": 3.6,
+  "duration_ms": 3600,
+  "frame_count": 216,
   "capture_path": "contract-screenshot",
   "deterministic_scope": "same-machine-software-raster",
-  "rendered_tick": 4000,
+  "rendered_tick": 3600,
   "anchors": {
-    "logo": 0.2
+    "cta": 0.98,
+    "logo": 0.22
   },
   "cue_track": {
     "anchors": {
-      "logo": 0.2
+      "logo": 0.22,
+      "cta": 0.98
     },
-    "duration": 3,
+    "duration": 3.6,
     "capture_vfps": 60,
     "encoded_fps": 60
   },
   "cue_timeline": [
     {
+      "type": "cta",
+      "at_master_seconds": 0.98
+    },
+    {
       "type": "logo",
-      "at_master_seconds": 0.2
+      "at_master_seconds": 0.22
     }
   ],
-  "master_sha256": "5a3d4a876b060b582e38002f73e95809e62c6c85ec21a28996555da319a15c69",
+  "master_sha256": "5fda45f8269adca79ea20cb8727d950f5abaa2de7b69d09e68e4a822265a3d58",
   "master_file": "master.mkv"
 }

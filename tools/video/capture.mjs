@@ -347,7 +347,9 @@ async function main() {
     const context = await browser.newContext({
       viewport: VIEWPORT,
       deviceScaleFactor: DEVICE_SCALE_FACTOR,
-      colorScheme: 'dark',
+      // SnakeTron renders light; capturing under a dark preference invites a
+      // component to show a theme the trailer never advertises.
+      colorScheme: 'light',
       reducedMotion: 'no-preference',
     });
     const page = await context.newPage();

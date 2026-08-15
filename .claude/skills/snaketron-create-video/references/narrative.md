@@ -14,27 +14,43 @@ it has cut away.
 
 - **No gameplay scene ships without a caption.** If you cannot write one, the
   shot has no point and should be cut.
-- Use two registers, and alternate them:
-  - **`quiet`** — lower-case sentence, sets up the shot ("Cut them off.",
-    "Carry the points home."). Lands early, ~0.2s in.
-  - **`impact`** — upper-case shout, names the payoff ("DEMOLITIONS!"). Lands
-    *on* the payoff anchor, not before it.
-- The setup→payoff pair is what creates narrative: the quiet line poses a
-  question, the impact line answers it as the action resolves.
+- **One caption per scene.** Name the payoff and stop:
+  **`impact`** — upper-case, short, landing *on* the payoff anchor
+  ("DEMOLITIONS!", "TEAM MATCHES!", "FREE FOR ALL!").
+- **Do not write a setup line for it.** An early "Cut them off." before a
+  demolition, or "Four snakes, one arena." before an FFA shot, tells the
+  viewer what they are about to see and then shows them — it over-shares, and
+  it doubles the reading load in a shot that is already brief. The footage is
+  the setup; the caption is the punchline.
+- The closing call to action is the one exception, and it does not belong in
+  `texts` at all: burnt-in ffmpeg captions cannot move, and the last thing on
+  screen should be the liveliest. Animate it inside the end-slate card
+  (`trailer-card__cta`) so it can arrive on its own beat.
 
-## 2. Captions are sequenced, never stacked by accident
+## 2. One shot, one idea — merge before you stack
 
-Two ideas need two captions with their own timing. `texts` takes an array:
+A scene that seems to need two captions almost always needs one caption and a
+tighter idea. A shot showing a boosted snake chaining pickups shipped as
 
 ```jsonc
 "texts": [
-  {"value": "BOOST!",   "at": 0.3,                "dur": 1.5, "style": "impact", "line": 0},
-  {"value": "COMBOS!",  "at": "meta:combo-0.2",   "dur": 1.6, "style": "impact", "line": 1}
+  {"value": "BOOST!",   "at": 0.3,              "dur": 1.5, "style": "impact", "line": 0},
+  {"value": "COMBOS!",  "at": "meta:combo-0.2", "dur": 1.6, "style": "impact", "line": 1}
 ]
 ```
 
-`line` stacks them so the second never lands on the first. Anchor each to the
-moment it describes — `COMBOS!` fires on the clutch pickup, not on a guess.
+and read as two labels competing for a three-second window. It is one idea:
+
+```jsonc
+"texts": [
+  {"value": "BOOST COMBOS!", "at": "meta:combo-0.2", "dur": 1.8, "style": "impact"}
+]
+```
+
+`texts` remains an array and `line` still stacks entries clear of one another,
+for the genuine two-beat scene. Treat reaching for it as a signal to re-cut the
+shot first. Whatever survives is anchored to the moment it describes —
+`meta:combo`, not a guessed timestamp.
 
 ## 3. Captions live in a band, clear of the game's own UI
 
@@ -67,6 +83,18 @@ dropped in among gameplay.
   (rank up, rankings), show its *animation* — mount the real component in
   `/qa/trailer-card` and capture it playing. `RatingReveal` runs its genuine
   promotion sequence; a still of the same thing reads as a slide deck.
+- **Verify the animation actually ran; do not assume it did.** Mounting the
+  real component is not enough — see "Cards must animate under capture" below.
+  Pull a frame strip of the card's own master before it goes anywhere near an
+  EDL, and confirm the values change from frame to frame.
+- **A card is only as long as its animation.** The rank-up card ran 5s for a
+  1.4s odometer, so 3 of its 5 seconds were a finished scoreboard. Cut the
+  clip to the animation plus one beat to read the result, and put a `push_in`
+  under whatever tail remains.
+- **Trim gameplay tails to the payoff.** The demolition shot held 3.1s of
+  empty arena after the fireball. One to one-and-a-half seconds after the
+  payoff is enough to register it; past that the shot is over and the video
+  does not know it.
 - **Give every non-gameplay card the drifting dot field** (`arenaFlowField.ts`,
   the same field as the home screen). It keeps the frame alive, unifies the
   non-gameplay frames into one language, and prevents frozen-frame QC failures.
@@ -74,7 +102,87 @@ dropped in among gameplay.
   rather than relying on a heading inside the captured UI. The caption is what
   carries continuity from the previous shot.
 
-## 6. Slow motion needs frame rate, and rarely earns its place
+## 6. Cards must animate *under capture*, not just in a browser
+
+The capture harness advances the page by calling `stepMs` on a clock it owns,
+and screenshots each frame. A component that animates itself off
+`requestAnimationFrame` or a CSS timeline is running on a completely different
+clock from the one the frames are numbered by. It will look perfect when you
+open the route in a browser and be a still image in the master.
+
+Two things have to be true, and both have failed in a shipped cut:
+
+1. **The component takes its time from the harness.** Give it an explicit prop
+   (`RatingReveal`'s `clockMs`) and pass the card's `elapsedMs`. Without it the
+   odometer finished during page load — before frame 0 — and all 300 frames
+   captured the settled state.
+2. **The capture context does not ask for reduced motion.** Playwright's
+   `reducedMotion: "reduce"` makes every well-behaved component render its
+   *settled* state, which is the exact opposite of what a card exists to show.
+   Determinism comes from owning the clock and from `animations: "disabled"` at
+   screenshot time, not from asking the product to stop animating. The context
+   also renders `colorScheme: "light"`, because that is the product.
+
+The check that catches both, before an EDL is written:
+
+```bash
+ffmpeg -i tools/video/clips/<card>/master.mkv \
+  -vf "select='not(mod(n\,17))',scale=700:-1,tile=2x6" -frames:v 1 /tmp/card.png
+```
+
+If the tiles are identical, the card did not animate — no amount of EDL work
+will fix it, and `splice_duplicate_frames` will not catch it because the flow
+field underneath is still drifting.
+
+## 7. Capture at 4× exposes every fixed-pixel weight in the renderer
+
+Capture lays the page out at 480×270 CSS and reaches 1080p with
+`deviceScaleFactor`, so the arena canvas draws a ~60 px cell where a 1×
+display draws 15. Anything sized in *pixels* rather than as a share of the
+cell therefore arrives at a quarter of its intended weight, and the shot reads
+as a different game's art:
+
+| Was | Symptom in the capture |
+|---|---|
+| Snake contour, flat 2 px | a hairline scratch around a 60 px body |
+| Boost band, flat 6 px | the glow all but gone at the moment it matters |
+| Carried-food numeral, capped at 14 px | a UI label pasted onto the snake |
+
+The fix belongs in the renderer, not the capture: `body_detail_scale` in
+`client/src/render.rs` quotes every body weight at the 15 px cell the arena
+caps at and scales it above that. 1× rendering is unchanged and high-DPI
+*displays* get the same repair for free — this was never only a trailer bug.
+
+When a shot looks subtly wrong at 1080p and you cannot name why, crop a frame
+1:1 and measure it against the body:
+
+```bash
+ffmpeg -i tools/video/clips/<slug>/master.mkv \
+  -vf "select='eq(n\,30)',crop=960:540:480:270" -frames:v 1 /tmp/crop.png
+```
+
+## 8. The caption has to be true of the frame
+
+A caption promises the viewer something; the frame has to deliver it in the
+same second.
+
+- **Count what is actually on camera.** A shot captioned "FREE FOR ALL!" held
+  two snakes; one captioned for Boost and combos held exactly one snake in an
+  otherwise empty arena. `Follow` frames one head, and everything staged more
+  than half a camera width away is simply not in the video.
+- **Populate the arena.** Pose opponents into lanes the camera holds and food
+  across the whole window — an empty paper ground reads as an unfinished game,
+  not a minimalist one. Target the ≥15% non-background ink from the shot
+  composition rules.
+- **Route extras where they cannot change the star's trace.** Put them on rows
+  and columns the star never occupies, then diff the new `cue_timeline`
+  against the old one: the star's pickups, kills, and banks must land on the
+  same ticks, or every `meta:` anchor in the EDL has silently moved.
+- **Do not let an extra die on camera for no reason.** A snake walking into a
+  wall at the edge of frame reads as broken AI. Give it a turn command, or
+  start it where its exit falls outside the camera rect.
+
+## 9. Slow motion needs frame rate, and rarely earns its place
 
 Cell-stepped snake motion does not slow down gracefully: the engine moves a
 snake a whole cell at a time, so at 0.25× you see four discrete steps a second
@@ -87,7 +195,7 @@ and the shot reads as dropped frames.
   cell-stepped. `compile_edl.py` enforces the VFPS half of that; the judgement
   is yours.
 
-## 7. Motion has one vocabulary
+## 10. Motion has one vocabulary
 
 A cut looks designed when every move belongs to the same family.
 
@@ -99,12 +207,22 @@ A cut looks designed when every move belongs to the same family.
   badges land on `easeOutBack` (a slight overshoot), exits use `easeInCubic`.
   These match the app's own curves (`cubic-bezier(0.2,0.8,0.2,1)` entrances,
   `cubic-bezier(0.2,1.4,0.3,1)` stamps).
+- **One transform per entrance.** A translate and a scale ramping together at
+  different rates is read as depth — the wordmark appeared to float diagonally
+  through space, which is the wrong register for a game drawn on a grid. The
+  logo is *dropped* in from above and *lifted* back out on a single vertical
+  axis, fast, with an `easeOutBack` overshoot doing the work the scale was
+  doing. Where entrance and exit bracket the film, mirror them.
+- **An odometer eases in and out, not just out.** A front-loaded count crosses
+  its division boundary in the first fifth and leaves 80% of the sweep with
+  nothing to happen; `easeInOutCubic` puts the crossing mid-count, which is
+  where the promotion beat belongs.
 - **Effects are accents, not decoration.** One impact gets a shake plus a 2px
   RGB split for ~0.12s. A 6px split for a quarter second reads as a rendering
   fault. Never apply a vignette or grain — they darken a paper-ground frame and
   fail the polarity gate.
 
-## 8. Cut on the beat, and let the tool do the arithmetic
+## 11. Cut on the beat, and let the tool do the arithmetic
 
 Beat-snapped cuts are a hard constraint, and every length change shifts every
 downstream cut. Do not solve it by hand:
@@ -117,7 +235,7 @@ python3 scripts/fit_beats.py assets/launch-trailer/launch-trailer.edl.json \
 It nudges each shot's `out` to the nearest beat and reports what it changed.
 Run it after any retiming, before rendering.
 
-## 9. Length comes from content, not from holding frames
+## 12. Length comes from content, not from holding frames
 
 If a cut is under its target length, extend the *scenarios* (more run ticks,
 another beat of action) or add a shot. Do not hold a finished animation on

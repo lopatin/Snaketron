@@ -13,7 +13,9 @@ import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { isConnectionReady } from '../utils/connectionBanner';
 import { LobbyGameMode, LeaderboardEntry, UserRankingResponse, isRankingEntry, isHighScoreEntry, GameType } from '../types';
-import { formatRankLabel, getRankFromMMR, getRankImage } from '../utils/rank';
+import { formatRankLabel, getRankFromMMR } from '../utils/rank';
+import RankIcon from './RankIcon';
+import SoloTrophyIcon from './SoloTrophyIcon';
 import { api } from '../services/api';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 
@@ -193,7 +195,6 @@ const LeaderboardContent: React.FC<{
 
   const rank = userRanking?.mmr != null ? getRankFromMMR(userRanking.mmr) : null;
   const rankTier = rank?.tier ?? 'unranked';
-  const rankImage = getRankImage(rankTier);
   const hasCompetitiveMMR = Boolean(rank);
   const rankLabel = rank ? formatRankLabel(rank) : 'UNRANKED';
   const isSoloMode = selectedMode === 'solo';
@@ -224,28 +225,17 @@ const LeaderboardContent: React.FC<{
         {/* Keep a stable left summary column as the selected game mode changes. */}
         <div className="leaderboard-mode-summary flex items-start gap-4">
           {isSoloMode ? (
-            <svg
+            <SoloTrophyIcon
               className="w-16 h-16 flex-shrink-0 text-black-70"
-              viewBox="0 0 64 64"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              role="img"
-              aria-label="Solo trophy"
-            >
-              <path d="M19 10h26v11c0 10-5.8 17-13 17s-13-7-13-17V10Z" />
-              <path d="M19 15H9v4c0 7.8 4.5 12.5 11.8 13.4" />
-              <path d="M45 15h10v4c0 7.8-4.5 12.5-11.8 13.4" />
-              <path d="M32 38v9" />
-              <path d="M25 47h14l3 7H22l3-7Z" />
-            </svg>
+              label="Solo trophy"
+            />
           ) : (
-            <img
-              src={rankImage}
-              alt={rankTier}
-              className="w-16 h-16 flex-shrink-0 object-contain"
+            <RankIcon
+              {...(rank
+                ? { tier: rank.tier, division: rank.division }
+                : { tier: 'unranked' as const })}
+              className="w-16 h-16 flex-shrink-0"
+              label={rankTier}
             />
           )}
           <div className="flex flex-col gap-1">
@@ -445,7 +435,6 @@ const LeaderboardContent: React.FC<{
               } else if (isRankingEntry(entry)) {
                 // Render ranking entry (Duel, 2v2, FFA)
                 const entryRank = getRankFromMMR(entry.mmr);
-                const entryRankImage = getRankImage(entryRank.tier);
                 const entryRankLabel = formatRankLabel(entryRank);
 
                 return (
@@ -460,10 +449,11 @@ const LeaderboardContent: React.FC<{
 
                     {/* Username */}
                     <div className="flex items-center gap-2 font-bold text-sm text-black-70 min-w-0">
-                      <img
-                        src={entryRankImage}
-                        alt={`${entryRankLabel} icon`}
+                      <RankIcon
+                        tier={entryRank.tier}
+                        division={entryRank.division}
                         className="w-6 h-6 flex-shrink-0"
+                        label={`${entryRankLabel} icon`}
                       />
                       <span className="truncate">{entry.username}</span>
                     </div>
