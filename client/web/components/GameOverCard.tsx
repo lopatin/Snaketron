@@ -209,6 +209,17 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
     ? `${presentation.sides[0]?.score ?? 0}–${presentation.sides[1]?.score ?? 0}`
     : current?.score.toString() ?? presentation.soloScore.toString();
 
+  // A highlight clip carries the star's name but not their ladder standing,
+  // and the only rank this client can read is the local player's own. Badge
+  // the caption when the star is that player; otherwise leave it off rather
+  // than assert a rank we have not been told.
+  const starRank = rating?.phase === 'ready' &&
+    highlight?.phase === 'ready' &&
+    current?.userId != null &&
+    highlight.clip.star_user_id === current.userId
+    ? rating.reveal.toRank
+    : null;
+
   return (
     <div
       className="game-over-backdrop"
@@ -260,6 +271,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
         {highlight && (
           <PlayOfTheGame
             highlight={highlight}
+            starRank={starRank}
             ratingSettled={ratingSettled}
             autoplayAllowed={
               highlight.phase !== 'ready' ||

@@ -25,11 +25,49 @@ test('valid PotG is network-free, legible at 560px, and starts inside the quickm
   expect(box.width).toBeLessThanOrEqual(560);
   await expect(band.locator('.potg-star__name')).toHaveText('BANKER');
   await expect(band.locator('.potg-reason')).toHaveText('Goal run — 15 points');
-  await expect(band.locator('.potg-star__skin')).toBeVisible();
   expect(await band.locator('.potg-star__name, .potg-reason').evaluateAll((nodes) => (
     nodes.every((node) => node.scrollWidth <= node.clientWidth)
   ))).toBe(true);
   expect(apiOrSocketRequests(requests)).toEqual([]);
+});
+
+test('the star wears a rank badge only when this client knows their rank', async ({ page }) => {
+  // No rating in scope: the clip alone never carries the star's standing, and
+  // a guessed badge would be a false claim about a real player's rank.
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+  const band = page.getByTestId('play-of-the-game');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await expect(band.locator('.potg-star__rank')).toHaveCount(0);
+
+  // The star is the local player and their post-match rating has landed.
+  await page.goto('/qa/play-of-the-game?state=ranked&chrome=0');
+  const ranked = page.getByTestId('play-of-the-game');
+  await expect(ranked.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await expect(ranked.locator('.potg-star__rank')).toBeVisible();
+});
+
+test('the lower third collapses to a one-line summary and back', async ({ page }) => {
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+  const band = page.getByTestId('play-of-the-game');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+
+  const lowerThird = band.getByTestId('potg-lower-third');
+  const toggle = band.getByTestId('potg-lower-third-toggle');
+  const expanded = await lowerThird.boundingBox();
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(band.locator('.potg-summary')).toBeVisible();
+  await expect(band.locator('.potg-star')).toHaveCount(0);
+
+  // The point of collapsing is to stop covering the arena.
+  const collapsed = await lowerThird.boundingBox();
+  expect(collapsed.width).toBeLessThan(expanded.width);
+  expect(collapsed.height).toBeLessThanOrEqual(expanded.height);
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(band.locator('.potg-star')).toBeVisible();
 });
 
 test('ready PotG lower third remains readable at the 375px mobile target', async ({ page }) => {
@@ -106,18 +144,21 @@ test('one-shot autoplay remains paused until IntersectionObserver reports the ba
   await expect(band).toHaveAttribute('data-playback', 'playing');
 });
 
-test('the terminal frame freezes with a Watch again control and replay restarts', async ({ page }) => {
+test('the terminal frame freezes and the replay control restarts it', async ({ page }) => {
   await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
 
   const band = page.getByTestId('play-of-the-game');
   await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
   await band.scrollIntoViewIfNeeded();
-  await expect(band).toHaveAttribute('data-playback', 'playing');
+  await expect(band).toHaveAttribute('data-playback', 'playing', { timeout: 5_000 });
   await expect(band).toHaveAttribute('data-playback', 'complete', { timeout: 15_000 });
 
+  // The control is an icon button matched to the results card's own close
+  // button, so it is identified by its accessible name, not by visible text.
   const replay = page.getByTestId('potg-replay');
   await expect(replay).toBeVisible();
-  await expect(replay).toHaveText(/Watch again/);
+  await expect(replay).toBeEnabled();
+  await expect(replay).toHaveAccessibleName(/Replay play of the game/i);
   await replay.click();
   await expect(band).toHaveAttribute('data-playback', 'playing');
 });

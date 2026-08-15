@@ -2,27 +2,38 @@ import React, {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
 } from 'react';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
 import { useAdsOptional } from '../contexts/AdsContext';
 import { crazyGames } from '../services/crazyGames';
-import type { HighlightClip } from '../types';
-import { resolveSnakeSkinColors } from '../utils/snakeSkin';
+import type { HighlightClip, Rank } from '../types';
 import {
   canAutoplayHighlight,
   formatHighlightReason,
   type MatchHighlightState,
 } from '../utils/highlightPresentation';
+import RankIcon from './RankIcon';
 import ScenarioCanvas, {
   type ScenarioCanvasFrame,
   type ScenarioCanvasHandle,
   type ScenarioPlaybackStatus,
 } from './ScenarioCanvas';
+import { ReplayIcon } from './TransportIcons';
 import './PlayOfTheGame.css';
 
 const VISIBLE_THRESHOLD = 0.62;
+
+/** How long the title holds at centre before it travels to its corner. */
+const INTRO_TITLE_HOLD_MS = 850;
+/** The journey itself. Kept in lockstep with the CSS transition duration. */
+const INTRO_TRAVEL_MS = 620;
+/** Height the title is blown up to at centre, relative to its resting size. */
+const INTRO_TITLE_SCALE = 3.1;
+
+type IntroPhase = 'idle' | 'title' | 'travelling' | 'done';
 
 interface SponsorSlotProps {
   reason: 'absent' | 'incompatible' | 'network';
@@ -75,11 +86,8 @@ const SponsorSlot: React.FC<SponsorSlotProps> = ({ reason }) => {
       <div id={containerId} className="potg-sponsor__sdk" />
       {!bannerLive && (
         <div className="potg-sponsor__fallback">
-          <span className="potg-sponsor__mark" aria-hidden="true">ST</span>
-          <span>
-            <strong>Replay booth</strong>
-            <small>Advertisement placement</small>
-          </span>
+          <strong>Replay booth</strong>
+          <small>Advertisement placement</small>
         </div>
       )}
     </aside>
@@ -102,6 +110,7 @@ const HighlightSkeleton: React.FC = () => (
 
 interface HighlightReplayProps {
   clip: HighlightClip;
+  starRank: Rank | null;
   ratingSettled: boolean;
   autoplayAllowed: boolean;
   onAutoplayStarted: (gameId: number) => void;
@@ -109,14 +118,18 @@ interface HighlightReplayProps {
 
 const HighlightReplay: React.FC<HighlightReplayProps> = ({
   clip,
+  starRank,
   ratingSettled,
   autoplayAllowed,
   onAutoplayStarted,
 }) => {
   const playerRef = useRef<ScenarioCanvasHandle>(null);
   const bandRef = useRef<HTMLElement>(null);
+  const kickerRef = useRef<HTMLSpanElement>(null);
   const autoplayStartedRef = useRef(false);
   const suspendedByGateRef = useRef(false);
+  const [introPhase, setIntroPhase] = useState<IntroPhase>('idle');
+  const [lowerThirdOpen, setLowerThirdOpen] = useState(true);
   const [playerReady, setPlayerReady] = useState(false);
   const [substantiallyVisible, setSubstantiallyVisible] = useState(false);
   const [documentVisible, setDocumentVisible] = useState(() => !document.hidden);
@@ -190,7 +203,10 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
     ) {
       autoplayStartedRef.current = true;
       onAutoplayStarted(clip.game_id);
-      void playerRef.current?.play().catch(() => setRenderFailed(true));
+      // The title card runs first and starts playback when it lands. Reduced
+      // motion never reaches this branch (canAutoplayHighlight gates on it),
+      // so the intro cannot strand a viewer who asked for no animation.
+      setIntroPhase('title');
     }
   }, [
     adState,
@@ -209,6 +225,49 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
     void playerRef.current?.pause().catch(() => undefined);
   }, []);
 
+  // Park the title at the centre of the band, scaled up, before the browser
+  // paints the frame that reveals it. Measuring both boxes (rather than
+  // hard-coding a translation) keeps the landing exact at any band size, and
+  // the resting position stays the element's real layout position so nothing
+  // has to be un-transformed afterwards.
+  useLayoutEffect(() => {
+    if (introPhase !== 'title') return;
+    const kicker = kickerRef.current;
+    const band = bandRef.current;
+    if (!kicker || !band) {
+      setIntroPhase('done');
+      return;
+    }
+    const from = kicker.getBoundingClientRect();
+    const into = band.getBoundingClientRect();
+    if (from.width === 0 || into.width === 0) {
+      setIntroPhase('done');
+      return;
+    }
+    const dx = (into.left + into.width / 2) - (from.left + from.width / 2);
+    const dy = (into.top + into.height / 2) - (from.top + from.height / 2);
+    kicker.style.transform =
+      `translate(${dx.toFixed(2)}px, ${dy.toFixed(2)}px) scale(${INTRO_TITLE_SCALE})`;
+  }, [introPhase]);
+
+  useEffect(() => {
+    if (introPhase !== 'title') return undefined;
+    const timer = window.setTimeout(() => setIntroPhase('travelling'), INTRO_TITLE_HOLD_MS);
+    return () => window.clearTimeout(timer);
+  }, [introPhase]);
+
+  useEffect(() => {
+    if (introPhase !== 'travelling') return undefined;
+    // Releasing the inline transform lets the CSS transition carry it home.
+    if (kickerRef.current) kickerRef.current.style.transform = '';
+    const timer = window.setTimeout(() => {
+      setIntroPhase('done');
+      setPlaybackStatus('playing');
+      void playerRef.current?.play().catch(() => setRenderFailed(true));
+    }, INTRO_TRAVEL_MS);
+    return () => window.clearTimeout(timer);
+  }, [introPhase]);
+
   const handleFrame = useCallback((frame: ScenarioCanvasFrame) => {
     // ScenarioCanvas commits its terminal frame while the animation loop is
     // technically still running, then freezes it immediately afterward.
@@ -226,23 +285,15 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
   }, []);
 
   const reason = formatHighlightReason(clip.reason);
-  const starSnake = clip.anchor.arena.snakes[clip.star_snake_id];
-  const starSkin = starSnake ? resolveSnakeSkinColors({
-    snake_index: clip.star_snake_id,
-    team_id: starSnake.team_id,
-    team_member_slot: clip.anchor.arena.snakes
-      .slice(0, clip.star_snake_id)
-      .filter((snake) => snake.team_id === starSnake.team_id)
-      .length,
-    snake_count: clip.anchor.arena.snakes.length,
-    is_team_game: clip.anchor.arena.team_zone_config !== null,
-    local_snake_id: clip.star_snake_id,
-    local_team_id: starSnake.team_id,
-  }) : null;
-  const starSkinStyle = {
-    '--potg-skin-fill': starSkin?.fill ?? '#3b82f6',
-    '--potg-skin-outline': starSkin?.outline ?? '#20232a',
-  } as React.CSSProperties;
+  const starBadge = starRank
+    ? (
+      <RankIcon
+        tier={starRank.tier}
+        division={starRank.division}
+        className="potg-star__rank"
+      />
+    )
+    : null;
 
   if (renderFailed) {
     return (
@@ -256,7 +307,7 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
         <span className="potg-kicker">Play of the game</span>
         <div className="potg-poster__caption">
           <strong>
-            <i className="potg-star__skin" style={starSkinStyle} aria-hidden="true" />
+            {starBadge}
             {clip.star_name}
           </strong>
           <span>{reason}</span>
@@ -267,6 +318,7 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
   }
 
   const complete = playbackStatus === 'complete';
+  const introRunning = introPhase === 'title' || introPhase === 'travelling';
 
   return (
     <section
@@ -275,6 +327,7 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
       aria-label={`Play of the game: ${clip.star_name}. ${reason}`}
       data-testid="play-of-the-game"
       data-playback={playbackStatus}
+      data-intro={introPhase}
     >
       <ScenarioCanvas
         ref={playerRef}
@@ -290,36 +343,67 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
         onError={() => setRenderFailed(true)}
       />
 
-      <div className="potg-broadcast" aria-hidden="true">
-        <span className="potg-kicker"><i /> Play of the game</span>
-        <span className="potg-live-bug">Replay</span>
-      </div>
-      <div className="potg-lower-third">
-        <span className="potg-star">
-          <i className="potg-star__skin" style={starSkinStyle} aria-hidden="true" />
-          <span className="potg-star__name">{clip.star_name}</span>
-        </span>
-        <span className="potg-reason">{reason}</span>
-      </div>
+      <span ref={kickerRef} className="potg-kicker is-title" aria-hidden="true">
+        Play of the game
+      </span>
 
-      {complete && (
+      <button
+        type="button"
+        className="potg-replay"
+        onClick={replay}
+        disabled={!playerReady || introRunning}
+        aria-label={`Replay play of the game by ${clip.star_name}`}
+        data-testid="potg-replay"
+      >
+        <ReplayIcon />
+      </button>
+
+      <div
+        className={`potg-lower-third${lowerThirdOpen ? '' : ' is-collapsed'}`}
+        data-testid="potg-lower-third"
+      >
+        {lowerThirdOpen ? (
+          <>
+            <span className="potg-star">
+              {starBadge}
+              <span className="potg-star__name">{clip.star_name}</span>
+            </span>
+            <span className="potg-reason">{reason}</span>
+          </>
+        ) : (
+          <span className="potg-summary">
+            {starBadge}
+            <span className="potg-star__name">{clip.star_name}</span>
+            <span className="potg-summary__reason">{reason}</span>
+          </span>
+        )}
         <button
           type="button"
-          className="potg-replay-overlay"
-          onClick={replay}
-          aria-label={`Replay play of the game by ${clip.star_name}`}
-          data-testid="potg-replay"
+          className="potg-lower-third__toggle"
+          onClick={() => setLowerThirdOpen((open) => !open)}
+          aria-expanded={lowerThirdOpen}
+          aria-label={lowerThirdOpen
+            ? 'Minimise the play of the game caption'
+            : 'Expand the play of the game caption'}
+          data-testid="potg-lower-third-toggle"
         >
-          <span aria-hidden="true">↺</span>
-          Watch again
+          <span aria-hidden="true">{lowerThirdOpen ? '▾' : '▴'}</span>
         </button>
-      )}
+      </div>
     </section>
   );
 };
 
 export interface PlayOfTheGameProps {
   highlight: MatchHighlightState;
+  /**
+   * The star's ladder rank, when this client can actually know it — today
+   * that means the star is the local player and their post-match rating has
+   * landed. A clip carries no rank for other players, and an invented badge
+   * would be a false claim about someone's standing, so the caption simply
+   * drops the badge rather than guessing.
+   */
+  starRank?: Rank | null;
   ratingSettled: boolean;
   autoplayAllowed: boolean;
   onAutoplayStarted: (gameId: number) => void;
@@ -327,6 +411,7 @@ export interface PlayOfTheGameProps {
 
 const PlayOfTheGame: React.FC<PlayOfTheGameProps> = ({
   highlight,
+  starRank = null,
   ratingSettled,
   autoplayAllowed,
   onAutoplayStarted,
@@ -341,6 +426,7 @@ const PlayOfTheGame: React.FC<PlayOfTheGameProps> = ({
     <HighlightReplay
       key={`${highlight.clip.game_id}:${highlight.clip.window.start_tick}`}
       clip={highlight.clip}
+      starRank={starRank}
       ratingSettled={ratingSettled}
       autoplayAllowed={autoplayAllowed}
       onAutoplayStarted={onAutoplayStarted}

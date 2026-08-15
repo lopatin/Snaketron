@@ -4,6 +4,7 @@ import validClipJson from '../fixtures/potg-goal-run.json';
 import type { HighlightClip } from '../types';
 import type { MatchHighlightState } from '../utils/highlightPresentation';
 import type { MatchPresentation } from '../utils/gamePresentation';
+import { buildRatingReveal, type MatchRatingState } from '../utils/ratingReveal';
 import GameOverCard from './GameOverCard';
 import './PlayOfTheGameQA.css';
 
@@ -15,6 +16,7 @@ import './PlayOfTheGameQA.css';
 
 type QaState =
   | 'ready'
+  | 'ranked'
   | 'pending'
   | 'unavailable'
   | 'incompatible'
@@ -23,6 +25,7 @@ type QaState =
 
 const STATES: readonly { id: QaState; label: string }[] = [
   { id: 'ready', label: 'Ready replay' },
+  { id: 'ranked', label: 'Ranked star' },
   { id: 'pending', label: 'Pending cut' },
   { id: 'unavailable', label: 'Unavailable / ad' },
   { id: 'incompatible', label: 'Version mismatch' },
@@ -55,8 +58,27 @@ const highlightForState = (state: QaState): MatchHighlightState => {
       return { phase: 'ready', clip };
     }
     case 'ready':
+    case 'ranked':
       return { phase: 'ready', clip: cloneClip() };
   }
+};
+
+/**
+ * The 'ranked' fixture is the only one that supplies a rating, because the
+ * star's badge can only be drawn when this client knows the star's rank —
+ * which today means the star is the local player and their post-match rating
+ * has landed. The fixture clip's star_user_id is the local player, so this
+ * state is what exercises the badge; every other state deliberately renders
+ * the caption without one.
+ */
+const rankedRating: MatchRatingState = {
+  phase: 'ready',
+  reveal: buildRatingReveal(
+    'Competitive',
+    'duel',
+    { mmr: 2281, wins: 61, losses: 44 },
+    { mmr: 2320, wins: 62, losses: 44 },
+  ),
 };
 
 const basePlayers: MatchPresentation['players'] = [
@@ -200,6 +222,7 @@ const PlayOfTheGameQA: React.FC = () => {
         gameId="4242"
         presentation={presentation}
         highlight={highlight}
+        rating={state === 'ranked' ? rankedRating : undefined}
         onDismiss={() => undefined}
         onMenu={() => undefined}
         onPlayAgain={() => undefined}

@@ -45,6 +45,7 @@ import { loadScenarioSprite } from '../utils/scenarioAssets';
 import { isScenarioCaptureMode } from '../utils/scenarioCaptureMode';
 import { initWasm } from '../wasm';
 import BoostMeter from './BoostMeter';
+import { PauseIcon, PlayIcon, ReplayIcon } from './TransportIcons';
 import ComboCallout from './ComboCallout';
 import './GameArena.css';
 import './ScenarioCanvas.css';
@@ -968,6 +969,7 @@ const ScenarioCanvas = forwardRef<ScenarioCanvasHandle, ScenarioCanvasProps>(({
     ? Math.min(1, Math.max(0, view.elapsedMs / view.durationMs))
     : 0;
   const isReady = view.status !== 'loading' && view.status !== 'error';
+  const isCaptureSurface = isScenarioCaptureMode();
   const motionMode = prefersReducedMotion && !explicitMotion
     ? 'reduced'
     : explicitMotion ? 'explicit' : 'animated';
@@ -998,6 +1000,21 @@ const ScenarioCanvas = forwardRef<ScenarioCanvasHandle, ScenarioCanvasProps>(({
           />
         )}
 
+        {addonView.boost && (
+          <div className="scenario-canvas__boost" data-testid="scenario-boost-addon">
+            <BoostMeter
+              mode="display"
+              hud={addonView.boost}
+              location="scenario-replay"
+              // Capture keeps the live game's full-width bottom meter, because
+              // trailer footage is meant to look like the product. Everywhere
+              // the replay is framed inside a card, the meter stands on the
+              // right instead so it does not eat the short edge.
+              orientation={isCaptureSurface ? 'horizontal' : 'vertical'}
+            />
+          </div>
+        )}
+
         {view.status === 'loading' && (
           <div className="scenario-canvas__message" role="status">
             <span className="scenario-canvas__loader" aria-hidden="true" />
@@ -1019,21 +1036,11 @@ const ScenarioCanvas = forwardRef<ScenarioCanvasHandle, ScenarioCanvasProps>(({
             onClick={() => void runtimeHandleRef.current?.play()}
             aria-label="Play replay animation"
           >
-            <span aria-hidden="true">▶</span>
+            <PlayIcon />
             Play replay
           </button>
         )}
       </div>
-
-      {addonView.boost && (
-        <div className="scenario-canvas__boost" data-testid="scenario-boost-addon">
-          <BoostMeter
-            mode="display"
-            hud={addonView.boost}
-            location="scenario-replay"
-          />
-        </div>
-      )}
 
       {controls && (
         <div
@@ -1055,7 +1062,7 @@ const ScenarioCanvas = forwardRef<ScenarioCanvasHandle, ScenarioCanvasProps>(({
             aria-label={view.status === 'playing' ? 'Pause replay' : 'Play replay'}
             data-testid="scenario-play-toggle"
           >
-            <span aria-hidden="true">{view.status === 'playing' ? 'Ⅱ' : '▶'}</span>
+            {view.status === 'playing' ? <PauseIcon /> : <PlayIcon />}
           </button>
           <time className="scenario-canvas__time is-current">
             {formatScenarioTimecode(view.elapsedMs)}
@@ -1089,7 +1096,7 @@ const ScenarioCanvas = forwardRef<ScenarioCanvasHandle, ScenarioCanvasProps>(({
             aria-label="Replay from the beginning"
             data-testid="scenario-replay"
           >
-            <span aria-hidden="true">↺</span>
+            <ReplayIcon />
           </button>
         </div>
       )}

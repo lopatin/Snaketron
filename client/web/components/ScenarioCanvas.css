@@ -3,8 +3,6 @@
   --scenario-graphite: #3f3f41;
   --scenario-blue: #3b82f6;
   --scenario-red: #ef4444;
-  --scenario-coral: #f6707b;
-  --scenario-gold: #f8c84a;
   --scenario-rule: #d1d5db;
   width: 100%;
   color: var(--scenario-graphite);
@@ -24,9 +22,9 @@
   position: relative;
   overflow: hidden;
   width: 100%;
-  border: 2px solid var(--scenario-graphite);
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
   background: var(--scenario-paper);
-  box-shadow: 8px 8px 0 rgb(63 63 65 / 16%);
 }
 
 .scenario-canvas__surface {
@@ -86,102 +84,93 @@
   right: 14px;
   bottom: 14px;
   display: inline-flex;
-  min-height: 38px;
+  min-height: 34px;
   align-items: center;
-  gap: 8px;
-  padding: 0 14px;
-  border: 2px solid var(--scenario-graphite);
-  border-radius: 0;
+  gap: 7px;
+  padding: 0 13px;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
   background: #fff;
-  box-shadow: 4px 4px 0 var(--scenario-graphite);
-  color: var(--scenario-graphite);
-  font-family: "Arial Black", Impact, sans-serif;
-  font-size: 10px;
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  color: #14181f;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
   cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
 }
 
 .scenario-canvas__poster-play:hover {
+  border-color: var(--scenario-blue);
   background: #eff6ff;
 }
 
+/* The Boost meter stands on the replay's right edge rather than docking under
+   it: a 21:9 frame has no vertical band to spare, and a floating meter has to
+   be a closed rectangle instead of borrowing the arena border for its top. */
 .scenario-canvas__boost {
-  width: calc(100% - 20px);
-  margin: 0 auto;
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2;
+  /* Anchored to the bottom and kept short: a full-height column of charge
+     reads as a wall down the side of the arena, and the top-right corner is
+     reserved for the replay control. */
+  height: min(52%, 112px);
+  pointer-events: none;
 }
 
 .scenario-canvas__boost .game-boost-hud {
-  width: 100%;
-  margin: -2px 0 0;
   opacity: 1;
   transform: none;
 }
 
-/* The one broadcast flourish: a deliberately slanted timecode/playhead rail.
-   Every other surface stays square and quiet so this reads as the replay's
-   identity rather than generic dashboard chrome. */
 .scenario-canvas__rail {
   position: relative;
   display: grid;
-  min-height: 46px;
-  grid-template-columns: 34px auto minmax(64px, 1fr) auto auto 34px;
+  min-height: 42px;
+  grid-template-columns: 30px auto minmax(64px, 1fr) auto auto 30px;
   align-items: center;
   gap: 9px;
-  margin: 10px 7px 0;
+  margin: 10px 0 0;
   padding: 5px 10px;
-  border: 2px solid var(--scenario-graphite);
-  background:
-    linear-gradient(
-      90deg,
-      rgb(59 130 246 / 10%) 0 calc(var(--scenario-progress) * 100%),
-      #fff calc(var(--scenario-progress) * 100%) 100%
-    );
-  box-shadow: 6px 6px 0 rgb(63 63 65 / 12%);
-  transform: skewX(-7deg);
-}
-
-.scenario-canvas__rail > * {
-  transform: skewX(7deg);
-}
-
-.scenario-canvas__rail::before {
-  position: absolute;
-  top: -2px;
-  bottom: -2px;
-  left: calc(var(--scenario-progress) * 100%);
-  width: 2px;
-  background: var(--scenario-coral);
-  content: "";
-  pointer-events: none;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
+  background: #fff;
 }
 
 .scenario-canvas__transport {
   display: inline-flex;
-  width: 30px;
-  height: 30px;
+  width: 27px;
+  height: 27px;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--scenario-graphite);
+  border: 1.5px solid #14181f;
+  border-radius: 6px;
+  background: #fff;
+  color: #14181f;
   font-family: Arial, Helvetica, sans-serif;
-  font-size: 15px;
-  font-weight: 900;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
   cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
 }
 
 .scenario-canvas__transport:hover:not(:disabled) {
+  border-color: var(--scenario-blue);
   background: #eff6ff;
-  color: #1d4ed8;
 }
 
 .scenario-canvas__transport:disabled {
+  border-color: #d1d5db;
   color: #9ca3af;
-  cursor: wait;
+  cursor: default;
+}
+
+.scenario-canvas__transport svg {
+  width: 13px;
+  height: 13px;
 }
 
 .scenario-canvas__time,
@@ -219,34 +208,40 @@
 
 .scenario-canvas__scrubber::-webkit-slider-runnable-track {
   height: 4px;
-  border: 1px solid var(--scenario-graphite);
-  background: #e5e7eb;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--scenario-blue) 0 calc(var(--scenario-progress) * 100%),
+    #e5e7eb calc(var(--scenario-progress) * 100%) 100%
+  );
 }
 
 .scenario-canvas__scrubber::-moz-range-track {
   height: 4px;
-  border: 1px solid var(--scenario-graphite);
-  background: #e5e7eb;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--scenario-blue) 0 calc(var(--scenario-progress) * 100%),
+    #e5e7eb calc(var(--scenario-progress) * 100%) 100%
+  );
 }
 
 .scenario-canvas__scrubber::-webkit-slider-thumb {
-  width: 9px;
-  height: 18px;
-  margin-top: -8px;
-  border: 2px solid var(--scenario-graphite);
-  border-radius: 0;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border: 1.5px solid #14181f;
+  border-radius: 50%;
   appearance: none;
-  background: var(--scenario-gold);
-  box-shadow: 2px 2px 0 var(--scenario-graphite);
+  background: #fff;
 }
 
 .scenario-canvas__scrubber::-moz-range-thumb {
-  width: 7px;
-  height: 16px;
-  border: 2px solid var(--scenario-graphite);
-  border-radius: 0;
-  background: var(--scenario-gold);
-  box-shadow: 2px 2px 0 var(--scenario-graphite);
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid #14181f;
+  border-radius: 50%;
+  background: #fff;
 }
 
 .scenario-canvas button:focus-visible,
@@ -331,9 +326,9 @@
   grid-template-columns: auto 1fr;
   gap: 4px 10px;
   padding: 10px 12px;
-  border: 2px solid #3f3f41;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
   background: #fff;
-  box-shadow: 6px 6px 0 rgb(63 63 65 / 14%);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 9px;
   text-transform: uppercase;
@@ -403,10 +398,9 @@
 
 .scenario-qa__scenario-button[aria-pressed="true"],
 .scenario-qa__rate-button[aria-pressed="true"] {
-  border-color: #3f3f41;
-  background: #3f3f41;
+  border-color: #14181f;
+  background: #14181f;
   color: #fff;
-  box-shadow: 3px 3px 0 #f8c84a;
 }
 
 .scenario-qa__fixture-copy {
@@ -439,28 +433,25 @@
   box-shadow: none;
 }
 
-/* The boost meter is a sibling below the viewport in normal layout, so a
-   full-bleed capture grid pushes it past 100dvh where `overflow: hidden` eats
-   it — build 1 authored `boost_meter: true` and captured no meter at all,
-   advertising Boost while showing none of its UI. In capture mode it becomes
-   an in-frame overlay so an addon a scenario switches on is actually visible.
-   `position: relative` on the canvas gives it a containing block. */
+/* Capture keeps the live game's full-width bottom meter, because trailer
+   footage has to look like the product: the live arena docks a horizontal
+   meter under the field, and shrinking it into a side badge would advertise
+   a HUD players do not have. (Build 1 authored `boost_meter: true` and
+   captured no meter at all, because the meter used to sit below the viewport
+   where a full-bleed capture grid pushed it past 100dvh and `overflow:
+   hidden` ate it. It is inside the frame now, so only the axis differs.) */
 .scenario-capture .scenario-canvas {
   position: relative;
 }
 
 .scenario-capture .scenario-canvas__boost {
-  position: absolute;
-  z-index: 3;
+  top: auto;
   right: 0;
   bottom: 2.6%;
   left: 0;
-  /* The live game runs the meter the full width of the arena
-     (.scenario-canvas__boost is `calc(100% - 20px)` in normal layout), so keep
-     it wide here too rather than shrinking it into a badge. */
   width: calc(100% - 40px);
+  height: auto;
   margin: 0 auto;
-  pointer-events: none;
 }
 
 @keyframes scenario-loader-spin {
@@ -479,16 +470,9 @@
 
 @media (max-width: 600px) {
   .scenario-canvas__rail {
-    grid-template-columns: 30px auto minmax(34px, 1fr) auto 30px;
+    grid-template-columns: 27px auto minmax(34px, 1fr) auto 27px;
     gap: 5px;
-    margin-right: 5px;
-    margin-left: 5px;
     padding: 4px 6px;
-    transform: skewX(-4deg);
-  }
-
-  .scenario-canvas__rail > * {
-    transform: skewX(4deg);
   }
 
   .scenario-canvas__rate {

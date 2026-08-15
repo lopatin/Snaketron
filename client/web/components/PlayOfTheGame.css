@@ -1,8 +1,10 @@
+/* The replay band keeps exactly two pieces of broadcast styling — the title
+   plate and the lower third — because they read as a sports replay caption.
+   Everything else (controls, sponsor slot, poster) uses the same quiet
+   black-on-white chrome as the rest of the results card. */
 .potg-band {
   --potg-ink: #20232a;
   --potg-blue: #3b82f6;
-  --potg-coral: #f6707b;
-  --potg-gold: #f8c84a;
   position: relative;
   width: 100%;
   overflow: hidden;
@@ -18,27 +20,12 @@
   box-shadow: none;
 }
 
-.potg-broadcast {
-  position: absolute;
-  top: 0;
-  right: 0;
-  left: 0;
-  z-index: 3;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  pointer-events: none;
-}
-
-.potg-kicker,
-.potg-live-bug {
+.potg-kicker {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
   padding: 0 8px;
   background: var(--potg-ink);
-  box-shadow: 4px 4px 0 rgb(32 35 42 / 22%);
   color: #fff;
   font-family: "Arial Black", Impact, sans-serif;
   font-size: 8px;
@@ -50,31 +37,96 @@
   transform: skewX(-7deg);
 }
 
-.potg-kicker i {
-  width: 6px;
-  height: 6px;
-  margin-right: 6px;
-  background: var(--potg-gold);
-  box-shadow: 7px 0 0 var(--potg-coral);
+/* The title plate doubles as the intro card: it opens blown up at the centre
+   of the band and travels to this resting spot. Keeping the rest position as
+   the element's real layout position means the journey ends by simply
+   dropping the inline transform. */
+.potg-kicker.is-title {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  z-index: 4;
+  pointer-events: none;
 }
 
-.potg-live-bug {
-  min-height: 20px;
-  background: var(--potg-coral);
-  box-shadow: 3px 3px 0 rgb(32 35 42 / 28%);
-  font-size: 7px;
+.potg-band[data-intro="travelling"] .potg-kicker.is-title {
+  transition: transform 620ms cubic-bezier(0.22, 0.61, 0.24, 1);
+}
+
+/* The arena holds back until the title has started moving, so the reveal is
+   the title clearing the frame rather than two things competing for the eye. */
+.potg-band[data-intro="title"] .potg-canvas,
+.potg-band[data-intro="title"] .potg-lower-third,
+.potg-band[data-intro="title"] .potg-replay {
+  opacity: 0;
+}
+
+.potg-band[data-intro="travelling"] .potg-canvas,
+.potg-band[data-intro="travelling"] .potg-lower-third,
+.potg-band[data-intro="travelling"] .potg-replay {
+  animation: potg-intro-fade-in 520ms ease both;
+}
+
+@keyframes potg-intro-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Matches the results card's own close control, deliberately: it is the same
+   kind of thing (a small floating affordance over a panel) and inventing a
+   second visual language for it is what made this band feel foreign. */
+.potg-replay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+  display: flex;
+  width: 27px;
+  height: 27px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1.5px solid #14181f;
+  border-radius: 6px;
+  background: #fff;
+  color: #14181f;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.potg-replay svg {
+  width: 14px;
+  height: 14px;
+}
+
+.potg-replay:hover:not(:disabled) {
+  border-color: var(--potg-blue);
+  background: #eff6ff;
+}
+
+.potg-replay:disabled {
+  border-color: #d1d5db;
+  color: #9ca3af;
+  cursor: default;
+}
+
+.potg-replay:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 2px;
 }
 
 .potg-lower-third {
   position: absolute;
-  right: 10px;
+  /* Stops short of the right edge so a long reason can never run under the
+     Boost rail standing in that corner. */
+  right: 48px;
   bottom: 10px;
   left: 10px;
   z-index: 3;
   display: flex;
   min-width: 0;
   align-items: stretch;
-  filter: drop-shadow(5px 5px 0 rgb(32 35 42 / 24%));
+  gap: 6px;
   pointer-events: none;
 }
 
@@ -101,16 +153,12 @@
   white-space: nowrap;
 }
 
-.potg-star__skin {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  flex: 0 0 12px;
+.potg-star__rank {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 19px;
   margin-right: 8px;
-  border: 2px solid var(--potg-skin-outline, #20232a);
-  background: var(--potg-skin-fill, #3b82f6);
-  box-shadow: 2px 2px 0 rgb(255 255 255 / 42%);
-  transform: rotate(45deg);
+  transform: skewX(7deg);
 }
 
 .potg-star__name {
@@ -133,47 +181,74 @@
   white-space: nowrap;
 }
 
-.potg-replay-overlay {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  z-index: 5;
-  display: inline-flex;
-  min-height: 42px;
+/* Collapsed: one short chip instead of a band across the whole frame, so the
+   caption stops standing between the viewer and the snakes. */
+.potg-lower-third.is-collapsed {
+  right: auto;
   align-items: center;
-  gap: 8px;
-  padding: 0 16px;
-  border: 2px solid #fff;
-  border-radius: 0;
-  background: var(--potg-ink);
-  box-shadow: 6px 6px 0 var(--potg-coral);
+}
+
+.potg-summary {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border-radius: 5px;
+  background: rgb(32 35 42 / 88%);
   color: #fff;
-  font-family: "Arial Black", Impact, sans-serif;
   font-size: 9px;
-  font-style: italic;
-  font-weight: 950;
-  letter-spacing: 0.09em;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+  line-height: 22px;
   text-transform: uppercase;
-  cursor: pointer;
-  transform: translate(-50%, -50%) skewX(-7deg);
+  white-space: nowrap;
 }
 
-.potg-replay-overlay span {
-  color: var(--potg-gold);
-  font-family: Arial, Helvetica, sans-serif;
-  font-size: 20px;
+.potg-summary .potg-star__rank {
+  width: 15px;
+  height: 15px;
+  flex-basis: 15px;
+  margin-right: 0;
+  transform: none;
+}
+
+.potg-summary__reason {
+  min-width: 0;
+  overflow: hidden;
+  color: rgb(255 255 255 / 62%);
+  text-overflow: ellipsis;
+}
+
+.potg-lower-third__toggle {
+  display: flex;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  align-self: center;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1.5px solid #14181f;
+  border-radius: 6px;
+  background: #fff;
+  color: #14181f;
+  font-size: 10px;
   line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background-color 140ms ease, border-color 140ms ease;
 }
 
-.potg-replay-overlay:hover,
-.potg-replay-overlay:focus-visible {
-  background: #111827;
-  box-shadow: 6px 6px 0 var(--potg-gold);
+.potg-lower-third__toggle:hover {
+  border-color: var(--potg-blue);
+  background: #eff6ff;
 }
 
-.potg-replay-overlay:focus-visible {
-  outline: 3px solid rgb(59 130 246 / 60%);
-  outline-offset: 4px;
+.potg-lower-third__toggle:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 2px;
 }
 
 .potg-band.is-loading,
@@ -278,7 +353,6 @@
   top: 10px;
   left: 12px;
   border: 1px solid rgb(255 255 255 / 52%);
-  box-shadow: 4px 4px 0 var(--potg-coral);
 }
 
 .potg-poster__logo {
@@ -307,7 +381,7 @@
 .potg-poster__caption strong {
   display: flex;
   align-items: center;
-  color: var(--potg-gold);
+  color: #fff;
   font-family: "Arial Black", Impact, sans-serif;
   font-size: clamp(14px, 4vw, 23px);
   font-style: italic;
@@ -316,12 +390,12 @@
   text-transform: uppercase;
 }
 
-.potg-poster__caption .potg-star__skin {
-  width: 14px;
-  height: 14px;
-  flex-basis: 14px;
+.potg-poster__caption .potg-star__rank {
+  width: 22px;
+  height: 22px;
+  flex-basis: 22px;
   margin-right: 10px;
-  box-shadow: 2px 2px 0 var(--potg-coral);
+  transform: none;
 }
 
 .potg-poster__caption span,
@@ -340,8 +414,6 @@
 
 .potg-sponsor {
   --potg-ink: #20232a;
-  --potg-coral: #f6707b;
-  --potg-gold: #f8c84a;
   position: relative;
   display: grid;
   min-height: 94px;
@@ -377,37 +449,17 @@
   position: absolute;
   inset: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 4px;
   color: var(--potg-ink);
 }
 
-.potg-sponsor__mark {
-  display: grid;
-  width: 36px;
-  height: 36px;
-  place-items: center;
-  border: 2px solid var(--potg-ink);
-  background: var(--potg-gold);
-  box-shadow: 4px 4px 0 var(--potg-coral);
-  font-family: "Arial Black", Impact, sans-serif;
-  font-size: 10px;
-  font-style: italic;
-}
-
-.potg-sponsor__fallback > span:last-child {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
 .potg-sponsor__fallback strong {
-  font-family: "Arial Black", Impact, sans-serif;
-  font-size: 11px;
-  font-style: italic;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
 }
 
 .potg-sponsor__fallback small {
@@ -423,12 +475,7 @@
 }
 
 @media (max-width: 420px) {
-  .potg-broadcast {
-    padding: 7px 8px;
-  }
-
-  .potg-kicker,
-  .potg-live-bug {
+  .potg-kicker {
     min-height: 18px;
     padding: 0 6px;
     font-size: 6.5px;
@@ -450,15 +497,20 @@
     font-size: 10px;
   }
 
+  .potg-star__rank {
+    width: 15px;
+    height: 15px;
+    flex-basis: 15px;
+    margin-right: 6px;
+  }
+
   .potg-reason {
     font-size: 6.5px;
   }
 
-  .potg-replay-overlay {
-    min-height: 35px;
-    padding: 0 11px;
-    box-shadow: 4px 4px 0 var(--potg-coral);
-    font-size: 7px;
+  .potg-replay {
+    width: 24px;
+    height: 24px;
   }
 
   .potg-sponsor {
@@ -470,6 +522,21 @@
   .potg-skeleton__arena::after {
     display: none;
     animation: none;
+  }
+
+  /* Autoplay (and therefore the intro) never runs under reduced motion, but
+     pin the resting state anyway so a mid-flight preference change cannot
+     leave the title parked at the centre of the band. */
+  .potg-kicker.is-title {
+    transition: none;
+    transform: none !important;
+  }
+
+  .potg-band[data-intro] .potg-canvas,
+  .potg-band[data-intro] .potg-lower-third,
+  .potg-band[data-intro] .potg-replay {
+    animation: none;
+    opacity: 1;
   }
 }
 

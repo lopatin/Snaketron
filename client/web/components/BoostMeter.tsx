@@ -15,10 +15,20 @@ export interface BoostMeterInteraction {
   onPointerRelease: React.PointerEventHandler<HTMLButtonElement>;
 }
 
+export type BoostMeterOrientation = 'horizontal' | 'vertical';
+
 interface BoostMeterBaseProps {
   hud: BoostHudView;
   isVisible?: boolean;
   location?: string;
+  /**
+   * The live arena docks the meter under the field, so it reads horizontally
+   * and its top edge is open into the arena border. A replay is framed 21:9
+   * and cannot spare the vertical band, so it stands the same meter on its
+   * right edge as a closed rectangle. Only the fill axis differs in markup;
+   * everything else is CSS.
+   */
+  orientation?: BoostMeterOrientation;
 }
 
 export type BoostMeterProps = BoostMeterBaseProps & (
@@ -42,14 +52,17 @@ const BoostMeter: React.FC<BoostMeterProps> = (props) => {
     hud,
     isVisible = true,
     location = 'arena-bottom',
+    orientation = 'horizontal',
   } = props;
   const interaction = props.mode === 'display' ? null : props.interaction;
+  const vertical = orientation === 'vertical';
 
   return (
     <div
-      className={`game-boost-hud${isVisible ? ' is-visible' : ''}${hud.active ? ' is-active' : ''}${hud.ready ? ' is-ready' : ''}`}
+      className={`game-boost-hud${isVisible ? ' is-visible' : ''}${hud.active ? ' is-active' : ''}${hud.ready ? ' is-ready' : ''}${vertical ? ' is-vertical' : ''}`}
       data-testid="boost-hud"
       data-location={location}
+      data-orientation={orientation}
       data-ready={hud.ready ? 'true' : 'false'}
     >
       <span
@@ -63,7 +76,11 @@ const BoostMeter: React.FC<BoostMeterProps> = (props) => {
       >
         <span
           className="game-boost-meter__fill"
-          style={{ transform: `scaleX(${hud.fillRatio})` }}
+          style={{
+            transform: vertical
+              ? `scaleY(${hud.fillRatio})`
+              : `scaleX(${hud.fillRatio})`,
+          }}
         />
       </span>
       <button
