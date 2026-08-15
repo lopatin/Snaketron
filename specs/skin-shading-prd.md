@@ -435,10 +435,15 @@ identical op stream.
 
 The consequences run through the whole plan:
 
-- **`client/src/skin/goldens/classic.trace` was never re-blessed.** Every one of
-  its original 10,664 lines survives, in order, through all ten stages. It is
-  still the trace recorded from the renderer that existed before the skin system
-  did, and it still runs natively in CI.
+- **No line of `client/src/skin/goldens/classic.trace` ever changed.** It was
+  re-recorded twice, in S1 and S3, and both times purely to *append* blocks for
+  three new fixture poses captured from the **unchanged** painter — an
+  additive-only gate, checked by confirming the previous file was still an
+  exact in-order subsequence of the new one. It went from 10,663 lines to
+  14,725 that way. From S4 onward — through body space, the layer model, the
+  flip, and the deletion of `paint_body` — it was not regenerated at all, and
+  every line recorded from the renderer that existed before the skin system
+  still passes byte for byte.
 - **The S6 flip provably changed nothing** — no tolerance, no eyeballing, no
   diff image. `paint_body` was deleted in S9 and the trace did not move.
 - **The wasm + Playwright job is still a hard prerequisite**, exactly as section
@@ -485,9 +490,17 @@ head). Frame strips, spans, three-slice, fit modes and placement are all built.
 
 | Budget | Result |
 | --- | --- |
-| Frame time, 8 snakes, 6 distinct skins, all boosting | **p50 0.1 ms, p95 0.3 ms, max 1.4 ms** against an 8 ms gate |
+| Frame time, 8 snakes, 6 distinct skins, all boosting | **p50 0.1 ms, p95 0.3 ms, max 1.4 ms** on a development Mac — see the caveat below |
 | Per-snake ops | 60-86, unchanged from the stroke painter (`skin::perf`) |
-| Per-frame allocation | 268 per 8-snake frame, **unchanged and still not zero** |
+| Per-frame allocation | 253 per 8-snake frame (16,488 bytes), **still not the zero this section budgets** |
+
+Two caveats on that table. The frame-time gate in section 11 is written "on the
+agreed low-end target", and no such target has ever been named or measured; the
+number above is from one run of the manual `skinPerfSmoke` harness on a
+developer machine, and nothing asserts it in CI. Treat it as evidence of
+headroom, not as a gate that has been met. The allocation figure moved from 268
+to 253 when the document skins and ember moved onto the compositor, and the test
+enforces a ceiling of 320 rather than pinning the exact count.
 
 The allocation gate is the one section 11 target not met. The cost is the head
 ramp's per-cell `rgba(...)` string and the white head overlay's — both preserved

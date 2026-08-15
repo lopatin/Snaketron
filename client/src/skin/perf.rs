@@ -277,10 +277,11 @@ mod tests {
     /// makes it worse.
     #[test]
     fn perf_frame_allocation_census_is_pinned_to_todays_cost() {
-        // Measured: 268 allocations / 17,680 bytes for the eight-snake frame,
-        // about 34 allocations per snake. The ceiling carries ~20% headroom so
-        // an unrelated `format!` on an error path does not fail the build,
-        // while a new per-cell allocation does.
+        // Measured: 253 allocations / 16,488 bytes for the eight-snake frame,
+        // about 32 allocations per snake. (It was 268 before the document
+        // skins and ember moved onto the compositor.) The ceiling carries
+        // headroom so an unrelated `format!` on an error path does not fail
+        // the build, while a new per-cell allocation does.
         const FRAME_ALLOCATION_CEILING: usize = 320;
 
         // Warm anything lazily initialised (the document skins compile on
