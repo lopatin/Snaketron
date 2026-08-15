@@ -6,6 +6,7 @@ import {
   getTickerPollIntervalMs,
   getTickerPlayPreferences,
 } from '../../utils/newsTicker.ts';
+import type { NewsTickerPlayAction } from '../../utils/newsTicker.ts';
 
 test('repeats a short ticker group enough to cover the viewport after one copy scrolls away', () => {
   const copies = getTickerGroupCopies(260, 704);
@@ -28,7 +29,7 @@ test('bounds server-directed ticker polling and handles an invalid value', () =>
 test('maps every ticker play action to one exact lobby configuration', () => {
   assert.deepEqual(getTickerPlayPreferences('playSolo'), {
     selectedModes: ['solo'],
-    competitive: false,
+    competitive: true,
   });
   assert.deepEqual(getTickerPlayPreferences('playRankedSolo'), {
     selectedModes: ['solo'],
@@ -36,15 +37,15 @@ test('maps every ticker play action to one exact lobby configuration', () => {
   });
   assert.deepEqual(getTickerPlayPreferences('playDuel'), {
     selectedModes: ['duel'],
-    competitive: false,
+    competitive: true,
   });
   assert.deepEqual(getTickerPlayPreferences('playTwoVsTwo'), {
     selectedModes: ['2v2'],
-    competitive: false,
+    competitive: true,
   });
   assert.deepEqual(getTickerPlayPreferences('playFfa'), {
     selectedModes: ['ffa'],
-    competitive: false,
+    competitive: true,
   });
   assert.deepEqual(getTickerPlayPreferences('playRankedDuel'), {
     selectedModes: ['duel'],
@@ -58,4 +59,27 @@ test('maps every ticker play action to one exact lobby configuration', () => {
     selectedModes: ['ffa'],
     competitive: true,
   });
+});
+
+/**
+ * Every ticker CTA drops the player into ranked, so the casual half of the
+ * action set must not survive as a quick-match shortcut: the queue named by
+ * the headline only ever selects the mode.
+ */
+test('a casual ticker action queues the same competitive lobby as its ranked twin', () => {
+  const pairs: Array<[NewsTickerPlayAction, NewsTickerPlayAction]> = [
+    ['playSolo', 'playRankedSolo'],
+    ['playDuel', 'playRankedDuel'],
+    ['playTwoVsTwo', 'playRankedTwoVsTwo'],
+    ['playFfa', 'playRankedFfa'],
+  ];
+
+  for (const [casual, ranked] of pairs) {
+    assert.deepEqual(
+      getTickerPlayPreferences(casual),
+      getTickerPlayPreferences(ranked),
+      `${casual} must queue the same lobby as ${ranked}`,
+    );
+    assert.equal(getTickerPlayPreferences(casual).competitive, true);
+  }
 });

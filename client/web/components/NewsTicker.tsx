@@ -18,12 +18,14 @@ interface TickerItemContentProps {
   item: NewsTickerItem;
   isVisualCopy?: boolean;
   onPlay?: (action: NewsTickerPlayAction) => void;
+  isPlayDisabled?: boolean;
 }
 
 const TickerItemContent: React.FC<TickerItemContentProps> = ({
   item,
   isVisualCopy = false,
   onPlay,
+  isPlayDisabled = false,
 }) => {
   const copy = <span className="news-ticker-copy">{item.text}</span>;
   const tabIndex = isVisualCopy ? -1 : undefined;
@@ -47,6 +49,7 @@ const TickerItemContent: React.FC<TickerItemContentProps> = ({
           type="button"
           className="news-ticker-link"
           onClick={() => onPlay(action)}
+          disabled={isPlayDisabled}
           tabIndex={tabIndex}
         >
           <span className="news-ticker-cta">{cta.label}</span>
@@ -61,6 +64,7 @@ interface TickerGroupProps {
   groupRef?: React.Ref<HTMLDivElement>;
   copyIndex: number;
   onPlay?: (action: NewsTickerPlayAction) => void;
+  isPlayDisabled?: boolean;
 }
 
 const TickerGroup: React.FC<TickerGroupProps> = ({
@@ -68,6 +72,7 @@ const TickerGroup: React.FC<TickerGroupProps> = ({
   groupRef,
   copyIndex,
   onPlay,
+  isPlayDisabled,
 }) => (
   <div ref={groupRef} className="news-ticker-group">
     {items.map((item, index) => (
@@ -81,6 +86,7 @@ const TickerGroup: React.FC<TickerGroupProps> = ({
           item={item}
           isVisualCopy
           onPlay={onPlay}
+          isPlayDisabled={isPlayDisabled}
         />
       </span>
     ))}
@@ -88,7 +94,19 @@ const TickerGroup: React.FC<TickerGroupProps> = ({
 );
 
 interface NewsTickerProps {
+  /**
+   * Runs the CTA's play action. It starts matchmaking, so it is a real
+   * commitment rather than a selection.
+   */
   onPlay?: (action: NewsTickerPlayAction) => void;
+  /**
+   * Silences the play CTAs while the lobby is already starting or queued.
+   *
+   * The controls stay mounted and merely disabled: dropping them would resize
+   * every ticker group the instant a player clicked one, reflowing the marquee
+   * and forcing a re-measure right under their cursor.
+   */
+  isPlayDisabled?: boolean;
 }
 
 /**
@@ -96,7 +114,10 @@ interface NewsTickerProps {
  * its static list is the sole accessible copy and deliberately is not live, so
  * polling never interrupts a player who is navigating the start form.
  */
-export const NewsTicker: React.FC<NewsTickerProps> = ({ onPlay }) => {
+export const NewsTicker: React.FC<NewsTickerProps> = ({
+  onPlay,
+  isPlayDisabled = false,
+}) => {
   const [items, setItems] = useState<NewsTickerItem[]>([]);
   const [durationSeconds, setDurationSeconds] = useState(
     DEFAULT_TICKER_DURATION_SECONDS,
@@ -232,7 +253,11 @@ export const NewsTicker: React.FC<NewsTickerProps> = ({ onPlay }) => {
       <ul className="visually-hidden news-ticker-accessible">
         {items.map((item, index) => (
           <li key={`accessible-${item.id}-${index}`}>
-            <TickerItemContent item={item} onPlay={onPlay} />
+            <TickerItemContent
+              item={item}
+              onPlay={onPlay}
+              isPlayDisabled={isPlayDisabled}
+            />
           </li>
         ))}
       </ul>
@@ -246,6 +271,7 @@ export const NewsTicker: React.FC<NewsTickerProps> = ({ onPlay }) => {
               copyIndex={copyIndex}
               groupRef={copyIndex === 0 ? firstGroupRef : undefined}
               onPlay={onPlay}
+              isPlayDisabled={isPlayDisabled}
             />
           ))}
         </div>

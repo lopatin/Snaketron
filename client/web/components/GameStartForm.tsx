@@ -224,6 +224,9 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   const isFormValid = selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3;
   const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading;
+  // Unlike the Start button this ignores the nickname: a ticker CTA is still
+  // useful without one, because it applies the selection and asks for the name.
+  const isTickerPlayDisabled = !canEdit || isLoading;
   const startButtonActivating = isLobbyQueued || isLoading;
   const startButtonLabel = isLobbyQueued
     ? 'Finding Match...'
@@ -246,8 +249,17 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     }
   }, [startButtonDisabled]);
 
+  /**
+   * A ticker CTA is a shortcut through the whole form: it replaces the current
+   * selection with the competitive queue for that mode and immediately starts
+   * matchmaking, rather than leaving the player to press Start themselves.
+   *
+   * Preferences are published before starting so the lobby and the visible
+   * chips agree even if the start attempt fails partway (session creation,
+   * socket handshake, and lobby creation all precede the queue command).
+   */
   const handleTickerPlay = (action: NewsTickerPlayAction) => {
-    if (!canEdit || isLoading) {
+    if (isTickerPlayDisabled) {
       return;
     }
 
@@ -255,6 +267,21 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     setSelectedModes(new Set(preferences.selectedModes));
     setIsCompetitive(preferences.competitive);
     onPreferencesChange?.(preferences);
+
+    const trimmedNickname = nickname.trim();
+    if (trimmedNickname.length < 3) {
+      // The shortcut skips the form, not its one requirement. Apply the
+      // selection anyway and hand over the field that is still owed, which is
+      // exactly the state the Start button's own guard would leave behind.
+      nicknameInputRef.current?.focus();
+      return;
+    }
+
+    onStartGame(
+      preferences.selectedModes,
+      trimmedNickname,
+      preferences.competitive,
+    );
   };
 
   return (
@@ -266,7 +293,8 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
           Competitive multiplayer Snake
         </p>
         <NewsTicker
-          onPlay={canEdit && !isLoading ? handleTickerPlay : undefined}
+          onPlay={handleTickerPlay}
+          isPlayDisabled={isTickerPlayDisabled}
         />
       </div>
 
