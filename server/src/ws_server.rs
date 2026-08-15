@@ -2383,6 +2383,58 @@ async fn notify_durable_active_game_after_auth(
     Ok(())
 }
 
+/// Publish a readiness confirmation once the game provably exists.
+///
+/// A hint-driven client can confirm readiness milliseconds after the
+/// matchmaking commit — before the outbox scanner has delivered `GameCreated`
+/// into the partition command stream. Publishing immediately would let the
+/// confirmation precede `GameCreated` in that stream and be quarantined as
+/// targeting an inactive game. The fenced recovery envelope is written by the
+/// same incorporation that creates the actor, so its existence is durable
+/// proof the confirmation can no longer outrun creation. The wait fails open
+/// at its deadline: a confirmation the executor cannot attribute costs the
+/// player nothing worse than waiting out the readiness deadline.
+async fn publish_player_ready_after_game_exists(
+    game_bus: Arc<GameBus>,
+    cluster_namespace: ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+) {
+    let partition_id = game_id % PARTITION_COUNT;
+    let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
+    loop {
+        match game_bus.get_recovery(&cluster_namespace, game_id).await {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(game_id, user_id, %error, "Failed to check game existence before readiness");
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                game_id,
+                user_id, "Publishing readiness without game-existence proof after bounded wait"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
+    match game_bus
+        .publish_player_ready_unless_completed(&cluster_namespace, partition_id, game_id, &event)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(game_id, user_id, "Readiness arrived after the game completed");
+        }
+        Err(error) => {
+            warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
+        }
+    }
+}
+
 fn recovery_bridge_snapshot(envelope: &RecoveryEnvelopeV2, user_id: u32) -> GameEventMessage {
     // Despite its historical name, `next_event_stream_sequence` is the last
     // sequence already emitted and checkpointed. The actor increments it
@@ -4502,31 +4554,16 @@ async fn process_ws_message(
                                 "Discarding untrusted game id on a readiness confirmation"
                             );
                         }
-                        let partition_id = game_id % PARTITION_COUNT;
-                        let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
-                        // A dropped confirmation costs the player nothing worse
-                        // than waiting out the readiness deadline, so unlike a
-                        // gameplay command this must not tear down the socket.
-                        match game_bus
-                            .publish_player_ready_unless_completed(
-                                cluster_namespace,
-                                partition_id,
-                                game_id,
-                                &event,
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                debug!(
-                                    game_id,
-                                    user_id, "Readiness arrived after the game completed"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
-                            }
-                        }
+                        // Runs detached: the game-existence wait below must not
+                        // stall this connection's message loop, and a dropped
+                        // confirmation costs the player nothing worse than
+                        // waiting out the readiness deadline.
+                        tokio::spawn(publish_player_ready_after_game_exists(
+                            game_bus.clone(),
+                            cluster_namespace.clone(),
+                            game_id,
+                            user_id,
+                        ));
                     } else {
                         warn!(
                             user_id = metadata.user_id,
