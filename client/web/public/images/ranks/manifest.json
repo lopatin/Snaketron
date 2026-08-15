@@ -1,0 +1,78 @@
+{
+  "note": "Rasters for surfaces that cannot inline SVG (share cards, embeds). The web client renders these badges as inline SVG via RankIcon.",
+  "sizes": {
+    "16": [
+      1,
+      2,
+      3
+    ],
+    "24": [
+      1,
+      2,
+      3
+    ],
+    "46": [
+      1,
+      2,
+      3
+    ],
+    "64": [
+      1,
+      2,
+      3
+    ],
+    "128": [
+      1
+    ],
+    "256": [
+      1
+    ]
+  },
+  "icons": {
+    "bronze": {
+      "divisions": [
+        1,
+        2,
+        3
+      ]
+    },
+    "silver": {
+      "divisions": [
+        1,
+        2,
+        3
+      ]
+    },
+    "gold": {
+      "divisions": [
+        1,
+        2,
+        3
+      ]
+    },
+    "platinum": {
+      "divisions": [
+        1,
+        2,
+        3
+      ]
+    },
+    "diamond": {
+      "divisions": [
+        1,
+        2,
+        3
+      ]
+    },
+    "grandmaster": {
+      "divisions": [
+        1,
+        2,
+        3
+      ]
+    },
+    "unranked": {
+      "divisions": []
+    }
+  }
+}

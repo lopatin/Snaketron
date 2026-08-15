@@ -27,12 +27,13 @@ use crate::{
     db::{Database, ServerRegistration},
     matchmaking::{run_game_created_outbox_loop, run_matchmaking_loop},
     redis_keys::RedisKeys,
-    replication::ReplicationManager,
+    replication::GameEventRouter,
     ws_server::JwtVerifier,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::ads::AdsConfig;
 use common::{BoostConfig, MATCH_READY_WINDOW_MS, NORMAL_SNAKE_SPEED_MILLI};
 
 const ECS_METADATA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,6 +222,8 @@ pub struct GameServerConfig {
     /// exercised, but startup omits a fixed grace sleep and shutdown uses
     /// bounded cancellation instead of production traffic/lease handoff.
     pub test_mode: bool,
+    /// Deployment advertisement capability ceiling and SDK routing, resolved once at startup.
+    pub ads_config: AdsConfig,
 }
 
 /// A complete game server instance with all components
@@ -240,7 +243,7 @@ pub struct GameServer {
     /// Optional replay listener
     // replay_listener: Option<Arc<ReplayListener>>,
     /// Replication manager for game state
-    replication_manager: Arc<ReplicationManager>,
+    event_router: Arc<GameEventRouter>,
     /// Shared health/drain state.
     lifecycle: TaskLifecycle,
     /// Any critical task exiting before cancellation is process-fatal.
@@ -389,6 +392,7 @@ impl GameServer {
             player_idle_config,
             match_ready_window_ms,
             test_mode,
+            ads_config,
         } = config;
         let runtime_mode = ServerRuntimeMode::from_test_mode(test_mode);
 
@@ -645,45 +649,45 @@ impl GameServer {
             }
         }));
 
-        // Start replication manager for all partitions BEFORE game executors
-        info!("Starting replication manager for game state replication");
-        let replication_partitions: Vec<u32> = (0..PARTITION_COUNT).collect();
-        let replication_manager = Arc::new(
-            ReplicationManager::new(
-                replication_partitions,
+        // Start the event router for all partitions BEFORE game executors
+        info!("Starting stateless game event router");
+        let router_partitions: Vec<u32> = (0..PARTITION_COUNT).collect();
+        let event_router = Arc::new(
+            GameEventRouter::new(
+                router_partitions,
                 cancellation_token.clone(),
                 game_bus.clone(),
             )
             .await
-            .context("Failed to create replication manager")?,
+            .context("Failed to create game event router")?,
         );
 
-        // Keep replica readiness truthful while workers anchor asynchronously.
+        // Keep reader readiness truthful while workers anchor asynchronously.
         // A task launched during a Valkey outage stays live/unready and the
         // workers retry locally; an actually terminated reader remains fatal.
-        let replication_monitor = replication_manager.clone();
-        let replication_lifecycle = lifecycle.clone();
-        let replication_token = cancellation_token.clone();
-        let replication_fatal_tx = fatal_tx.clone();
+        let router_monitor = event_router.clone();
+        let router_lifecycle = lifecycle.clone();
+        let router_token = cancellation_token.clone();
+        let router_fatal_tx = fatal_tx.clone();
         handles.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             loop {
                 tokio::select! {
-                    _ = replication_token.cancelled() => break,
+                    _ = router_token.cancelled() => break,
                     _ = interval.tick() => {
-                        let ready = replication_monitor.is_ready().await;
-                        replication_lifecycle.mark_replicas_ready(ready);
-                        if replication_monitor.has_failed_worker() {
+                        let ready = router_monitor.is_ready().await;
+                        router_lifecycle.mark_event_readers_ready(ready);
+                        if router_monitor.has_failed_worker() {
                             // A cancellation can complete every worker while
                             // this monitor is suspended inside `is_ready()`.
                             // Recheck after that await so normal shutdown is
                             // not misclassified as a critical worker failure.
-                            if replication_token.is_cancelled() {
+                            if router_token.is_cancelled() {
                                 break;
                             }
-                            replication_lifecycle.mark_critical_failure();
-                            let _ = replication_fatal_tx.send(anyhow::anyhow!(
-                                "a partition replication worker exited unexpectedly"
+                            router_lifecycle.mark_critical_failure();
+                            let _ = router_fatal_tx.send(anyhow::anyhow!(
+                                "a partition event reader exited unexpectedly"
                             ));
                             break;
                         }
@@ -791,7 +795,7 @@ impl GameServer {
         }));
 
         // Note: HTTP server will be started separately in main.rs
-        // This is because it needs both the replication manager and JWT verifier
+        // This is because it needs both the event router and JWT verifier
         info!("HTTP server will be started externally at {}", http_addr);
 
         // Production startup preserves the existing grace period before
@@ -814,7 +818,7 @@ impl GameServer {
             pubsub_manager.clone(),
             game_bus.clone(),
             matchmaking_manager.clone(),
-            replication_manager.clone(),
+            event_router.clone(),
             cancellation_token.clone(),
             server_id,
             region.clone(),
@@ -822,6 +826,7 @@ impl GameServer {
             lobby_manager.clone(),
             lifecycle.clone(),
             cluster_namespace.clone(),
+            Arc::new(ads_config),
         )
         .await?;
 
@@ -856,7 +861,7 @@ impl GameServer {
             cancellation_token,
             handles,
             // replay_listener,
-            replication_manager,
+            event_router,
             lifecycle,
             fatal_rx,
             fatal_tx,
@@ -876,9 +881,9 @@ impl GameServer {
         &self.cancellation_token
     }
 
-    /// Get the replication manager
-    pub fn replication_manager(&self) -> &Arc<ReplicationManager> {
-        &self.replication_manager
+    /// Get the game event router
+    pub fn event_router(&self) -> &Arc<GameEventRouter> {
+        &self.event_router
     }
 
     pub fn lifecycle(&self) -> &TaskLifecycle {
@@ -1125,13 +1130,14 @@ pub async fn start_test_server_with_grpc(
     jwt_verifier: Arc<dyn JwtVerifier>,
     enable_grpc: bool,
 ) -> Result<GameServer> {
-    start_test_server_with_grpc_and_mode(
+    start_test_server_with_grpc_options(
         db,
         jwt_manager,
         jwt_verifier,
         enable_grpc,
         true,
         MATCH_READY_WINDOW_MS,
+        AdsConfig::default(),
     )
     .await
 }
@@ -1145,9 +1151,56 @@ pub async fn start_test_server_with_grpc_and_mode(
     db: Arc<dyn Database>,
     jwt_manager: JwtManager,
     jwt_verifier: Arc<dyn JwtVerifier>,
+    enable_grpc: bool,
+    test_mode: bool,
+    match_ready_window_ms: i64,
+) -> Result<GameServer> {
+    start_test_server_with_grpc_options(
+        db,
+        jwt_manager,
+        jwt_verifier,
+        enable_grpc,
+        test_mode,
+        match_ready_window_ms,
+        AdsConfig::default(),
+    )
+    .await
+}
+
+/// Helper function to start a test server with explicit deployment ad capabilities.
+/// Production reads these capabilities from the environment once at startup; tests
+/// inject it directly so process-global environment variables cannot race.
+pub async fn start_test_server_with_grpc_and_ads(
+    db: Arc<dyn Database>,
+    jwt_manager: JwtManager,
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    enable_grpc: bool,
+    ads_config: AdsConfig,
+) -> Result<GameServer> {
+    start_test_server_with_grpc_options(
+        db,
+        jwt_manager,
+        jwt_verifier,
+        enable_grpc,
+        true,
+        MATCH_READY_WINDOW_MS,
+        ads_config,
+    )
+    .await
+}
+
+/// Start test wiring with explicit lifecycle, readiness, and ad configuration.
+/// Narrower public helpers delegate here so integration environments that need
+/// more than one override do not fall back to process-global configuration.
+#[doc(hidden)]
+pub async fn start_test_server_with_grpc_options(
+    db: Arc<dyn Database>,
+    jwt_manager: JwtManager,
+    jwt_verifier: Arc<dyn JwtVerifier>,
     _enable_grpc: bool,
     test_mode: bool,
     match_ready_window_ms: i64,
+    ads_config: AdsConfig,
 ) -> Result<GameServer> {
     // Get available ports
     let http_port = get_available_port();
@@ -1191,6 +1244,7 @@ pub async fn start_test_server_with_grpc_and_mode(
         player_idle_config: PlayerIdleConfig::default(),
         match_ready_window_ms,
         test_mode,
+        ads_config,
     };
 
     let game_server = GameServer::start(config).await?;

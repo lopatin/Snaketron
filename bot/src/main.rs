@@ -8,6 +8,7 @@ use common::{
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
+use server::ads::AdBreakResolution;
 use server::lifecycle::WS_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
 use server::ws_server::WSMessage;
 use std::pin::Pin;
@@ -373,6 +374,7 @@ where
         WSMessage::Authenticate {
             token: token.to_owned(),
             protocol_version: CLIENT_PROTOCOL_VERSION,
+            distribution: None,
         },
     )
     .await?;
@@ -458,7 +460,8 @@ where
 fn is_benign_setup_message(message: &WSMessage) -> bool {
     matches!(
         message,
-        WSMessage::UserCountUpdate { .. }
+        WSMessage::AdConfiguration(_)
+            | WSMessage::UserCountUpdate { .. }
             | WSMessage::LobbyUpdate { .. }
             | WSMessage::LobbyChatHistory { .. }
             | WSMessage::Pong { .. }
@@ -510,6 +513,20 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     match ws_msg {
+        WSMessage::LobbyUpdate {
+            state,
+            ad_break: Some(ad_break),
+            ..
+        } if state == "ad_break" => {
+            send_ws(
+                ws_writer,
+                WSMessage::AdBreakResolved {
+                    break_id: ad_break.id,
+                    resolution: AdBreakResolution::Unavailable,
+                },
+            )
+            .await?;
+        }
         WSMessage::JoinGame(id) => {
             info!("Bot {} matched to game {}", idx + 1, id);
             *game_id = Some(id);
@@ -1194,6 +1211,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    distribution: None,
                 } if token == "test-token"
             ));
             send_ws(

@@ -3,11 +3,11 @@ import type { RankTier } from '../types';
 import {
   formatRankLabel,
   getRankFromMMR,
-  getRankImage,
   rankBandIndexForMmr,
   rankBandProgress,
   RANK_BANDS,
 } from '../utils/rank';
+import RankIcon from './RankIcon';
 import {
   countDurationMs,
   type MatchRatingState,
@@ -196,7 +196,7 @@ const RatingReveal: React.FC<RatingRevealProps> = ({ state }) => {
         // Keyed on the band so crossing a division remounts the badge and
         // replays its stamp-in — the promotion is visible mid-sweep.
         <div className="rating-reveal-medallion" key={bandIndex} aria-hidden="true">
-          <img src={getRankImage(rank.tier)} alt="" draggable={false} />
+          <RankIcon tier={rank.tier} division={rank.division} />
         </div>
       )}
 

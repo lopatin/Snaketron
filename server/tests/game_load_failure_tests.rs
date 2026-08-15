@@ -61,24 +61,35 @@ async fn publish_snapshot_for_test(
     Ok(())
 }
 
-async fn wait_for_replica(env: &TestEnvironment, server_index: usize, game_id: u32) -> Result<()> {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if env
-                .server(server_index)
-                .expect("test gateway should be running")
-                .replication_manager()
-                .get_game_state_when_ready(game_id)
-                .await
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .context("gateway did not consume the live snapshot")
+/// Write the fenced recovery envelope exactly as an executor checkpoint
+/// would. Stateless gateways authorize live joins from this envelope and use
+/// it as the join bridge snapshot, so a test that fabricates a live game must
+/// fabricate its envelope too.
+async fn write_recovery_envelope_for_test(
+    redis: &mut redis::aio::MultiplexedConnection,
+    game_id: u32,
+    state: &GameState,
+) -> Result<()> {
+    let namespace = ClusterNamespace::new("test-region")?;
+    let recovery = RecoveryEnvelopeV2::new(
+        game_id,
+        game_id % PARTITION_COUNT,
+        state.clone(),
+        "0-0".to_string(),
+        ResolvedCommandState::default(),
+        0,
+        0,
+        chrono::Utc::now().timestamp_millis(),
+        "gateway-routing-test".to_string(),
+    );
+    let _: () = redis
+        .set_ex(
+            namespace.recovery(game_id),
+            serde_json::to_vec(&recovery)?,
+            300,
+        )
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -212,9 +223,12 @@ async fn joining_a_durably_saved_completed_game_returns_its_final_snapshot() -> 
     assert_eq!(loaded_state.scores, final_state.scores);
     assert_eq!(replayed_outcome_sessions, 0);
     assert_eq!(terminal_rejection_reason, None);
-    assert!(
-        nonterminal_bridge_snapshots >= 1,
-        "the stale recovery envelope should be observed before the durable terminal fallback"
+    // The durable terminal record is consulted BEFORE the stale non-terminal
+    // envelope may bridge, so the client goes straight to the final state and
+    // never sees a stale active frame flash first.
+    assert_eq!(
+        nonterminal_bridge_snapshots, 0,
+        "a stale recovery envelope must not be bridged over a durable terminal state"
     );
 
     client.disconnect().await?;
@@ -385,27 +399,11 @@ async fn live_game_join_is_authorized_before_enabling_game_chat() -> Result<()> 
     let mut publisher = redis_client.get_multiplexed_async_connection().await?;
     let partition_id = game_id % PARTITION_COUNT;
 
-    // Replica reader startup is asynchronous (subscriptions anchor at the stream tail, so
-    // earlier entries are invisible). Republish until this server's replica proves the live
-    // state is available to the same authorization path used by JoinGame.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            publish_snapshot_for_test(&mut publisher, partition_id, game_id, &live_state).await?;
-            if env
-                .server(0)
-                .expect("test server should be running")
-                .replication_manager()
-                .get_game_state_when_ready(game_id)
-                .await
-                .is_some()
-            {
-                return Ok::<_, anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .context("live game did not reach the replication cache")??;
+    // Stateless gateways authorize live joins from the fenced recovery
+    // envelope, so this fabricated live game gets one exactly as an executor
+    // checkpoint would have written it.
+    write_recovery_envelope_for_test(&mut publisher, game_id, &live_state).await?;
+    publish_snapshot_for_test(&mut publisher, partition_id, game_id, &live_state).await?;
 
     let mut redis = redis_client.get_multiplexed_async_connection().await?;
     let chat_history_key = RedisKeys::game_chat_history_key(game_id);
@@ -473,10 +471,12 @@ async fn initial_join_waits_for_the_live_replica_after_executor_snapshot_storage
     client.authenticate(player_user_id).await?;
     client.join_game(game_id).await?;
 
-    // The server sees the executor-stored Redis snapshot first and enters its bounded
-    // readiness wait. Publishing shortly afterward models the replica consuming the initial
-    // snapshot a moment after the game was created.
+    // The server sees the executor-stored Redis snapshot first and enters its
+    // bounded authorization wait, polling for the fenced recovery envelope.
+    // Writing it shortly afterward models the executor checkpointing the game
+    // a moment after creation.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    write_recovery_envelope_for_test(&mut redis, game_id, &live_state).await?;
     publish_snapshot_for_test(&mut redis, game_id % PARTITION_COUNT, game_id, &live_state).await?;
 
     let loaded_state = receive_snapshot(&mut client).await?;
@@ -523,22 +523,13 @@ async fn newly_ready_cold_gateway_waits_for_delayed_live_snapshot_within_authori
     let partition_id = game_id % PARTITION_COUNT;
 
     // Establish an active game before the replacement gateway starts. Its
-    // stream reader anchors at the tail, so this original snapshot must not
-    // warm the new gateway's local replica.
+    // stream reader anchors at the tail, so this original snapshot entry is
+    // invisible to the new gateway — and stateless gateways retain no state
+    // for it anyway. Withholding the recovery envelope makes the game
+    // unauthoritative until the delayed write below.
     publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
-    wait_for_replica(&env, 0, game_id).await?;
 
     let (cold_gateway_index, _) = env.add_server().await?;
-    assert!(
-        env.server(cold_gateway_index)
-            .expect("cold gateway should be running")
-            .replication_manager()
-            .get_game_state_when_ready(game_id)
-            .await
-            .is_none(),
-        "newly ready gateway unexpectedly inherited another task's in-memory replica"
-    );
-
     let cold_gateway_addr = env
         .ws_addr(cold_gateway_index)
         .expect("cold gateway should be running");
@@ -548,14 +539,14 @@ async fn newly_ready_cold_gateway_waits_for_delayed_live_snapshot_within_authori
     let joined_at = Instant::now();
     client.join_game(game_id).await?;
     tokio::time::sleep(Duration::from_millis(350)).await;
-    publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
+    write_recovery_envelope_for_test(&mut redis, game_id, &live_state).await?;
 
     let loaded_state = receive_snapshot_without_join_failure(&mut client, game_id).await?;
     let elapsed = joined_at.elapsed();
     assert_eq!(loaded_state.start_ms, live_state.start_ms);
     assert!(
         elapsed >= Duration::from_millis(350),
-        "join did not exercise delayed replica warming: {elapsed:?}"
+        "join did not exercise delayed authoritative-state warming: {elapsed:?}"
     );
     assert!(
         elapsed < Duration::from_secs(6),
@@ -586,19 +577,8 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
     let mut redis = redis_client.get_multiplexed_async_connection().await?;
     let partition_id = game_id % PARTITION_COUNT;
     publish_snapshot_for_test(&mut redis, partition_id, game_id, &live_state).await?;
-    wait_for_replica(&env, 0, game_id).await?;
 
     let (cold_gateway_index, _) = env.add_server().await?;
-    assert!(
-        env.server(cold_gateway_index)
-            .expect("cold gateway should be running")
-            .replication_manager()
-            .get_game_state_when_ready(game_id)
-            .await
-            .is_none(),
-        "newly ready gateway unexpectedly consumed the pre-start snapshot"
-    );
-
     let cold_gateway_addr = env
         .ws_addr(cold_gateway_index)
         .expect("cold gateway should be running");
@@ -677,39 +657,16 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
         retried_state.status
     );
 
-    timeout(Duration::from_secs(3), async {
-        loop {
-            match client.receive_message().await? {
-                WSMessage::CommandOutcomesComplete {
-                    game_id: barrier_game_id,
-                    ..
-                } if barrier_game_id == game_id => return Ok::<_, anyhow::Error>(()),
-                WSMessage::GameLoadFailed {
-                    game_id: failed_game_id,
-                    reason,
-                } if failed_game_id == game_id => {
-                    return Err(anyhow::anyhow!(
-                        "same-socket retry failed before its outcome barrier: {reason}"
-                    ));
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .context("same-socket retry did not receive its command-outcome barrier")??;
-
-    // Receiving the retry snapshot and outcome barrier is not enough: the
-    // retried JoinGame must have installed a live subscription on the same
-    // socket. A subsequent state delta proves that the connection did not
-    // remain in a one-shot recovery path.
-    let delta_stream_seq = env
-        .server(cold_gateway_index)
-        .expect("cold gateway should be running")
-        .replication_manager()
-        .get_stream_seq(game_id)
-        .await
-        .saturating_add(1);
+    // Receiving the retry snapshot is not enough: the retried JoinGame must
+    // have installed a live subscription on the same socket, and the
+    // command-outcome barrier — a make-before-break promotion signal — is
+    // deliberately withheld until the first live event proves the stream
+    // flows behind the recovery bridge. Publish a delta to provide that
+    // proof (a real game's TickHash heartbeat does this within a second);
+    // the barrier must then follow it. The retry anchored on the test
+    // envelope's zero watermark, so the next contiguous transport sequence
+    // is exactly one.
+    let delta_stream_seq = 1;
     let delta_score = 424_242;
     let delta = GameEventMessage {
         game_id,
@@ -761,6 +718,28 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
     })
     .await
     .context("same-socket retry did not receive a subsequent live delta")??;
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::CommandOutcomesComplete {
+                    game_id: barrier_game_id,
+                    ..
+                } if barrier_game_id == game_id => return Ok::<_, anyhow::Error>(()),
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "same-socket retry failed before its outcome barrier: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("same-socket retry did not receive its command-outcome barrier")??;
 
     client.disconnect().await?;
     env.shutdown().await?;

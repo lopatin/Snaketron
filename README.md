@@ -8,17 +8,18 @@
   <a href="https://snaketron.io"><b>▶ Play now at snaketron.io</b></a>
 </p>
 
-What if Snake was an E-Sport? Snaketron is a competitive online multiplayer Snake game. The core engine and the auto scalable game server architecture is open source and written in Rust and is available in this repository.
+SnakeTron is a competitive online multiplayer Snake game — real-time matches, ranked seasons, and no mercy! The game engine and the auto-scaling server architecture behind [snaketron.io](https://snaketron.io) are written in Rust and open-sourced in this repository.
 
 ## Features
 
 - **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
 - **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with server-moderated chat and invite links
-- **Combos**: every food pickup refills a two-second chain; consecutive food is worth—and physically grows the snake by—`+1`, `+1`, `+2`, then `+3` per pickup
-- **Boost**: hold-to-boost speed bursts fueled by collectible Boost pads (unlimited fuel in Solo)
+- **Combos**: every food pickup restarts a two-second timer; keep the chain alive and successive pickups are worth +1, +1, +2, and then +3 each, in both points and snake length
+- **Boost**: hold-to-boost speed bursts fueled by Boost pads scattered around the arena (Solo gives you an unlimited tank to practice with)
 - **Accounts**: register/login with JWT auth, or play instantly as a guest
 - **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP
-- **Smooth multiplayer**: the game engine is shared between server and client, enabling client-side prediction with server authority
+- **Server-controlled ads**: provider-neutral banner placements and a lobby-wide pre-match video barrier, disabled by default
+- **Netcode**: the game engine is shared between server and client, enabling client-side prediction with server authority
 
 ## Architecture
 
@@ -31,11 +32,13 @@ What if Snake was an E-Sport? Snaketron is a competitive online multiplayer Snak
 
 ## Quick Start
 
+Prerequisites: Rust (stable), [wasm-pack](https://rustwasm.github.io/wasm-pack/), Node.js, and Docker.
+
 ### Using Docker (Recommended)
 
-#### For Development (with hot reloading):
+#### Development (hot reloading)
 ```bash
-# Start LocalStack (DynamoDB), Valkey (Redis), and the server with auto-reload on code changes
+# Start LocalStack (DynamoDB), Redis (Valkey), and the server with auto-reload on code changes
 ./dev.sh
 
 # In another terminal, build and start the client
@@ -46,11 +49,13 @@ npm install
 npm start
 ```
 
-#### For Production-like environment:
+#### Production-like
 ```bash
-# Start LocalStack (DynamoDB), Valkey (Redis), and the server (full rebuild each time)
+# Start LocalStack (DynamoDB), Redis (Valkey), and the server (full rebuild each time)
 docker-compose up --build
 ```
+
+This starts only the backend stack — build and start the client in another terminal with the same commands as in development.
 
 The game will be available at:
 - Frontend: http://localhost:3000 (webpack dev server)
@@ -108,7 +113,7 @@ npm run type-check  # TypeScript type check
 
 ### Code Quality
 
-CI requires formatting and a warning-free clippy pass on every PR (mirrored as a deploy gate):
+PRs are welcome. CI requires clean formatting and a warning-free clippy pass on every PR (mirrored as a deploy gate):
 
 ```bash
 cargo fmt --all -- --check
@@ -122,6 +127,81 @@ TypeScript types for everything crossing the WebSocket are generated from the Ru
 ```bash
 ./scripts/gen-types.sh
 ```
+
+### Advertisement Configuration
+
+See [the advertising design](docs/advertising-design.md) for the authority and
+lobby-state diagrams plus desktop, mobile, fallback, and admin screenshots.
+
+Advertisement capability is resolved by the server at startup and sent to each
+browser session. The browser reports which distribution build it is running
+(`web`, `crazygames`, or `itch`); the server maps that distribution to its
+configured provider and placements. Client build flags only make an SDK adapter
+available. Live pre-match authorization, distribution targeting, game-count
+eligibility, and frequency are stored in the versioned DynamoDB runtime config
+managed at `/admin`. Invalid deployment values fail server startup.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SNAKETRON_ADS_ENABLED` | `false` | Deployment capability kill switch. When false, every placement is disabled regardless of runtime policy. |
+| `SNAKETRON_ADS_<DISTRIBUTION>_PROVIDER` | `none` | Adapter key for `WEB`, `CRAZYGAMES`, or `ITCH`. A `none` distribution stays ad-free even when the global switch is on. |
+| `SNAKETRON_ADS_<DISTRIBUTION>_BOTTOM_BANNER_ENABLED` | distribution enabled | Show the horizontal bottom placement for that distribution. |
+| `SNAKETRON_ADS_<DISTRIBUTION>_SIDE_BANNERS_ENABLED` | distribution enabled | Show desktop side placements for that distribution; mobile clients omit them. |
+| `SNAKETRON_ADS_<DISTRIBUTION>_PRE_MATCH_VIDEO_ENABLED` | distribution enabled | Let that distribution receive video during a lobby-wide break. |
+| `SNAKETRON_AD_BREAK_TIMEOUT_SECONDS` | `120` | Server safety deadline for the lobby barrier; valid range is 5–300 seconds. Providers skip submission unless enough lifecycle budget remains. |
+| `SNAKETRON_MATCHMAKING_QUEUE_LEASE_ENFORCEMENT` | `true` | Reject and reap queued generations after five minutes without a member heartbeat. Set this to `false` only during the first phase of an upgrade from a pre-v8 fleet. |
+
+For one server that serves the website, CrazyGames, and itch.io simultaneously:
+
+```bash
+SNAKETRON_ADS_ENABLED=true \
+SNAKETRON_ADS_WEB_PROVIDER=none \
+SNAKETRON_ADS_CRAZYGAMES_PROVIDER=crazygames \
+SNAKETRON_ADS_ITCH_PROVIDER=none \
+cargo run --bin server
+```
+
+Once a website H5 adapter is registered, set
+`SNAKETRON_ADS_WEB_PROVIDER` to its adapter key. itch.io can remain `none`
+without disabling ads for the other distributions. Placement switches may be
+set independently for each distribution after the global switch is on. The
+old scalar `SNAKETRON_ADS_PROVIDER` is intentionally unsupported because a
+shared server cannot route one provider correctly to every build.
+
+Pre-match video remains disabled until an administrator enables the runtime
+advertising master switch and the intended `web`, `crazygames`, or `itch`
+distribution toggles. That same record owns the 0–10,000 minimum-games
+threshold and the 1–1,440 minute per-user interval. Every lobby member must
+meet the game threshold; every targeted member must clear the durable interval
+or the whole lobby skips the break. Provider IDs and the break timeout remain
+deployment capabilities and cannot be enabled from the admin page.
+
+Distribution reporting is part of gameplay protocol v9. Older authentication
+payloads remain accepted, but receive a disabled ad configuration because the
+server cannot safely infer a build from an account or token. Keep the global
+switch off during a v9 client rollout; enable it only after the intended web
+and portal builds are reporting their distribution.
+
+Roll this protocol out in two phases. For an upgrade from a pre-v8 fleet, first
+deploy the protocol v9 binary to every gateway, matcher, and completion executor with
+`SNAKETRON_ADS_ENABLED=false` and
+`SNAKETRON_MATCHMAKING_QUEUE_LEASE_ENFORCEMENT=false`. New tasks still write
+and refresh queue leases, while mixed-fleet matchers continue accepting legacy
+queue records. Pause new matchmaking admissions for the cutover, let the queue
+drain to zero, and drain every old task and connection; a pre-v8 admission
+retry cannot observe the v8 cancellation fence. Then set queue-lease
+enforcement to `true` and optionally enable ads in the second configuration
+rollout. Fresh deployments should retain the `true` default.
+Older binaries cannot participate in the v8 lobby fence or completion counter;
+the disabled-by-default first phase makes any rollout-window undercount
+conservative (players skip ads longer) rather than exposing a newcomer.
+`gamesPlayed` has an explicit v8 baseline: existing rows without the attribute
+are treated as zero, and completions whose legacy idempotency effect already
+won during the mixed-fleet phase are not replayed. After every completion
+executor is on the new binary, each new completion advances the durable counter exactly
+once. This intentionally requires historical players to complete the configured
+number of post-rollout games before becoming eligible; no historical totals are
+guessed or backfilled.
 
 ### Game Replays
 
@@ -137,9 +217,12 @@ cargo run --bin snaketron -- replays/
 
 ### CrazyGames Build
 
-`CRAZYGAMES_BUILD=true npm run build:prod` (in `client/web`) produces a relative-path HTML5 bundle that loads the CrazyGames v3 SDK before the game bundle and omits third-party analytics. Ads and CrazyGames cloud-data storage stay off unless `CRAZYGAMES_ADS_ENABLED=true` / `CRAZYGAMES_DATA_ENABLED=true` are also set at build time. See [CRAZYGAMES.md](CRAZYGAMES.md) for portal settings and the QA checklist.
+`CRAZYGAMES_BUILD=true npm run build:prod` (in `client/web`) produces a relative-path HTML5 bundle that loads the CrazyGames v3 SDK before the game bundle and omits third-party analytics. The build makes the CrazyGames ad adapter available; the server-side advertisement configuration above decides at runtime whether it is used. CrazyGames cloud-data storage stays off unless `CRAZYGAMES_DATA_ENABLED=true` is explicitly set at build time. See [CRAZYGAMES.md](CRAZYGAMES.md) for portal settings and the QA checklist.
 
-### Run a coordinated autoscaling load test
+### Autoscaling Load Tests
+
+Point a coordinated fleet of AI players at a cluster and make it sweat:
+
 ```bash
 cargo run --release -p loadtest -- \
   --target https://snaketron.io \
@@ -149,7 +232,7 @@ cargo run --release -p loadtest -- \
   --queue-mode competitive
 ```
 
-The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-party multiplayer lobbies; plays with the shared Rust/WASM game engine and AI; ramps to 256 maintained sessions by default; and writes an HTML/JSON report with per-failure details. See [loadtest/README.md](loadtest/README.md) for profiles, safety controls, and report semantics.
+The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-party multiplayer lobbies; plays real games using the shared Rust game engine and AI; ramps to 256 maintained sessions by default; and writes an HTML/JSON report with per-failure details. See [loadtest/README.md](loadtest/README.md) for profiles, safety controls, and report semantics.
 
 ### Project Structure
 
@@ -157,14 +240,14 @@ The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-pa
 - `server/` - Game server: WebSocket sessions, matchmaking, game executors, persistence
 - `client/` - WebAssembly client module and the React/TypeScript web app (`client/web/`)
 - `bot/` - CLI that runs one or more AI bots against a live server over WebSocket
-- `macros/` - Proc-macro crate (`serde_wasm_bindgen` attribute for Rust-to-WASM bindings)
-- `terminal/` - Terminal-based game viewer and replay player
+- `macros/` - Proc-macro crate defining a `serde_wasm_bindgen` attribute (not currently used by other crates)
+- `terminal/` - Terminal-based replay player for `.replay` captures
 - `loadtest/` - Coordinated AI load generator and aggregate reporting
 - `replays/` - Sample `.replay` game captures for the terminal viewer
 - `scripts/` - Development helpers (type generation, DynamoDB init, test dependencies)
 - `specs/` - Design documents and PRDs (matchmaking, Boost, autoscaling resilience, ...)
-- `tla_specs/` - TLA+ specifications (checked with `tla2tools.jar` at the repo root)
-- `docs/` - Screenshots and assets referenced from pull-request descriptions
+- `tla_specs/` - TLA+ specifications (model-check them with `tla2tools.jar` at the repo root)
+- `docs/` - Screenshots, pull-request assets, and assorted design notes
 
 ### Further Documentation
 
@@ -178,4 +261,4 @@ See [server/docker-readme.md](server/docker-readme.md) for detailed Docker and A
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

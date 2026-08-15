@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { LobbyMember, User } from '../types';
 import type { AccountModalView } from './AccountModal';
 import {
+  AdminIcon,
   FullscreenEnterIcon,
   FullscreenExitIcon,
   HistoryIcon,
@@ -213,21 +214,64 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
           )}
           {isCrazyGamesBuild ? (
             currentUser?.authSource === 'crazygames' ? (
-              <div
-                className="home-account-action flex items-center gap-2"
-                aria-label={`Playing as ${currentUser.username} through CrazyGames; progress saves automatically`}
-                title="CrazyGames account linked · progress saves automatically"
-              >
-                {currentUser.avatarUrl && (
-                  <img
-                    src={currentUser.avatarUrl}
-                    alt=""
-                    className="h-7 w-7 rounded-full border border-black/20 object-cover"
-                    referrerPolicy="no-referrer"
-                  />
+              <>
+                <button
+                  ref={accountTriggerRef}
+                  id="crazygames-account-menu-trigger"
+                  type="button"
+                  className={`home-account-action home-account-trigger flex items-center gap-2 ${isAccountOpen ? 'is-open' : ''}`}
+                  onClick={() => {
+                    setIsSocialOpen(false);
+                    setIsAccountOpen((current) => !current);
+                  }}
+                  aria-label={`Playing as ${currentUser.username} through CrazyGames; progress saves automatically`}
+                  aria-expanded={isAccountOpen}
+                  aria-haspopup="menu"
+                  aria-controls="crazygames-account-menu"
+                  title="CrazyGames account linked · progress saves automatically"
+                >
+                  {currentUser.avatarUrl && (
+                    <img
+                      src={currentUser.avatarUrl}
+                      alt=""
+                      className="h-7 w-7 rounded-full border border-black/20 object-cover"
+                      referrerPolicy="no-referrer"
+                    />
+                  )}
+                  <span className="home-account-username">{currentUser.username}</span>
+                  <svg viewBox="0 0 12 8" aria-hidden="true">
+                    <path d="M1 1.5 6 6.5l5-5" />
+                  </svg>
+                </button>
+
+                {isAccountOpen && (
+                  <div
+                    id="crazygames-account-menu"
+                    className="home-social-panel home-account-panel"
+                    role="menu"
+                    aria-labelledby="crazygames-account-menu-trigger"
+                  >
+                    <div className="home-social-actions home-account-actions">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => openAccountModal('profile')}
+                      >
+                        <span>Profile</span>
+                        <UserIcon className="home-social-action-icon" />
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => openAccountModal('history')}
+                      >
+                        <span>History</span>
+                        <HistoryIcon className="home-social-action-icon" />
+                      </button>
+                    </div>
+                  </div>
                 )}
-                <span className="home-account-username">{currentUser.username}</span>
-              </div>
+              </>
             ) : (
               <button
                 type="button"
@@ -284,6 +328,16 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
                       <span>History</span>
                       <HistoryIcon className="home-social-action-icon" />
                     </button>
+                    {currentUser.isAdmin && (
+                      <Link
+                        to="/admin"
+                        role="menuitem"
+                        onClick={closeAccountMenu}
+                      >
+                        <span>Admin</span>
+                        <AdminIcon className="home-social-action-icon" />
+                      </Link>
+                    )}
                     <button
                       type="button"
                       role="menuitem"

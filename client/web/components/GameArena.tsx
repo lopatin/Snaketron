@@ -744,10 +744,9 @@ export default function GameArena() {
     }
 
     if (playedThisPageSession) {
-      // Match completion is the game's only natural commercial break. Direct
-      // navigation/reconnect to an old result never earns an ad request.
+      // Match completion ends provider gameplay. Advertisement policy is
+      // server-owned and, when eligible, starts on the next queue request.
       crazyGames.gameplayStop();
-      void crazyGames.requestAd('midgame');
     }
   }, [committedState, gameId, gameState, isGameComplete, user?.id]);
 

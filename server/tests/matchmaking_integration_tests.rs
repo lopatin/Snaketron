@@ -82,10 +82,18 @@ async fn backdate_queued_lobby(
     lobby.queued_at = observed_at.saturating_sub(age_ms);
     let updated_json = serde_json::to_string(&lobby)?;
 
+    // A queued generation is pinned by three things that must agree: the ZSET
+    // members, the queue identity, and the liveness lease. The matchmaking
+    // sampler reaps any lobby whose lease does not hold the exact member it
+    // sampled, so the lease has to move onto the rewritten member here or the
+    // backdated generation is discarded before it can ever be matched.
     let script = redis::Script::new(
         r#"
         if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
-        for i = 2, #KEYS, 2 do
+        local lease = redis.call('GET', KEYS[2])
+        if not lease then return -6 end
+        if lease ~= ARGV[1] then return -7 end
+        for i = 3, #KEYS, 2 do
             local queue_score = redis.call('ZSCORE', KEYS[i], ARGV[1])
             if not queue_score then return -2 end
             if tonumber(queue_score) ~= tonumber(ARGV[5]) then return -4 end
@@ -93,18 +101,27 @@ async fn backdate_queued_lobby(
             if not mmr_score then return -3 end
             if tonumber(mmr_score) ~= tonumber(ARGV[4]) then return -5 end
         end
-        for i = 2, #KEYS, 2 do
+        for i = 3, #KEYS, 2 do
             redis.call('ZREM', KEYS[i], ARGV[1])
             redis.call('ZREM', KEYS[i + 1], ARGV[1])
             redis.call('ZADD', KEYS[i], ARGV[3], ARGV[2])
             redis.call('ZADD', KEYS[i + 1], ARGV[4], ARGV[2])
         end
         redis.call('SET', KEYS[1], ARGV[2])
+        -- Preserve whatever admission put on the lease; only the member it
+        -- pins changes, so the generation keeps its real expiry.
+        local lease_ttl = redis.call('PTTL', KEYS[2])
+        if lease_ttl > 0 then
+            redis.call('SET', KEYS[2], ARGV[2], 'PX', lease_ttl)
+        else
+            redis.call('SET', KEYS[2], ARGV[2])
+        end
         return 1
         "#,
     );
     let mut invocation = script.prepare_invoke();
     invocation.key(&identity_key);
+    invocation.key(RedisKeys::matchmaking_lobby_queue_lease(lobby_code));
     for game_type in &lobby.game_types {
         invocation
             .key(RedisKeys::matchmaking_lobby_queue_for_pool(
@@ -126,9 +143,19 @@ async fn backdate_queued_lobby(
         .arg(original_queued_at)
         .invoke_async(redis_conn)
         .await?;
+    let reason = match outcome {
+        -1 => "queue identity no longer holds the observed member",
+        -2 => "lobby was missing from a game-type queue",
+        -3 => "lobby was missing from an MMR index",
+        -4 => "queue score did not match the admitted queued_at",
+        -5 => "MMR score did not match the admitted average",
+        -6 => "queue liveness lease was absent",
+        -7 => "queue liveness lease pinned a different member",
+        _ => "unknown failure",
+    };
     ensure!(
         outcome == 1,
-        "failed to backdate lobby {lobby_code}: atomic update returned {outcome}"
+        "failed to backdate lobby {lobby_code}: {reason} (code {outcome})"
     );
     Ok(())
 }

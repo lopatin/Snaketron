@@ -1,5 +1,5 @@
 use ::common::{GameEvent, GameState, GameStatus, GameType, QueueMode, TeamId};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, PushInfo};
@@ -60,7 +60,10 @@ fn make_lobby_member<S: Into<String>>(user_id: u32, username: S) -> LobbyMember 
     LobbyMember {
         user_id,
         username: username.into(),
-        ts: Utc::now().timestamp_millis() as f64,
+        ts: Utc::now().timestamp_millis().saturating_add(30_000) as f64,
+        supports_ad_break: true,
+        can_show_video_ad: false,
+        distribution: None,
     }
 }
 
@@ -106,7 +109,7 @@ async fn lobby_state(lobby_code: &str) -> Result<Option<String>> {
 }
 
 #[tokio::test]
-async fn repeated_and_concurrent_lobby_admission_keeps_one_queue_identity() -> Result<()> {
+async fn concurrent_lobby_admission_keeps_the_first_queue_identity() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     seed_lobby_metadata(&["REPEAT1"]).await?;
@@ -135,18 +138,43 @@ async fn repeated_and_concurrent_lobby_admission_keeps_one_queue_identity() -> R
             91,
         )
     );
-    left_result?;
-    right_result?;
+    let concurrent_results = [left_result, right_result];
+    assert_eq!(
+        concurrent_results
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one immutable queue generation must win"
+    );
+    let concurrent_rejection = concurrent_results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("one distinct queue generation must be rejected");
+    assert_eq!(
+        concurrent_rejection
+            .downcast_ref::<server::matchmaking_manager::LobbyAdmissionRejected>()
+            .map(|error| error.detail.as_str()),
+        Some("queue-entry-changed")
+    );
 
-    left.add_lobby_to_queue(
-        "REPEAT1",
-        members,
-        1_000,
-        vec![game_type.clone()],
-        queue_mode.clone(),
-        91,
-    )
-    .await?;
+    let repeated_rejection = left
+        .add_lobby_to_queue(
+            "REPEAT1",
+            members,
+            1_000,
+            vec![game_type.clone()],
+            queue_mode.clone(),
+            91,
+        )
+        .await
+        .expect_err("a new token must not replace the admitted queue generation");
+    assert_eq!(
+        repeated_rejection
+            .downcast_ref::<server::matchmaking_manager::LobbyAdmissionRejected>()
+            .map(|error| error.detail.as_str()),
+        Some("queue-entry-changed")
+    );
 
     let mut redis = Client::open(test_redis_url())?
         .get_multiplexed_async_connection()
@@ -171,6 +199,143 @@ async fn repeated_and_concurrent_lobby_admission_keeps_one_queue_identity() -> R
         format!("REPEAT1:{}", queued_lobby.queue_token)
     );
     assert_eq!(lobby_state("REPEAT1").await?.as_deref(), Some("queued"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_queue_lease_is_filtered_and_exact_generation_is_reaped() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    seed_lobby_metadata(&["EXPIRE1"]).await?;
+
+    let mut manager = create_test_matchmaking_manager().await?;
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = QueueMode::Quickmatch;
+    manager
+        .add_lobby_to_queue(
+            "EXPIRE1",
+            vec![make_lobby_member(97, "expiring-player")],
+            1_000,
+            vec![game_type.clone()],
+            queue_mode.clone(),
+            97,
+        )
+        .await?;
+
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let identity_key = RedisKeys::matchmaking_lobby_queue_identity("EXPIRE1");
+    let lease_key = RedisKeys::matchmaking_lobby_queue_lease("EXPIRE1");
+    let identity: String = redis.get(&identity_key).await?;
+    let queued_identity: server::matchmaking_manager::QueuedLobby =
+        serde_json::from_str(&identity)?;
+    let outcome_key = RedisKeys::matchmaking_lobby_queue_outcome("EXPIRE1");
+    let lease: String = redis.get(&lease_key).await?;
+    let lease_ttl_ms: i64 = redis.pttl(&lease_key).await?;
+    assert_eq!(lease, identity);
+    assert!(lease_ttl_ms > 0 && lease_ttl_ms <= 5 * 60 * 1_000);
+    assert_eq!(
+        redis.get::<_, String>(&outcome_key).await?,
+        format!("admitted:{}", queued_identity.queue_token)
+    );
+
+    let _: usize = redis.del(&lease_key).await?;
+    assert!(
+        manager
+            .get_queued_lobbies(&game_type, &queue_mode)
+            .await?
+            .is_empty(),
+        "an expired queue generation must never reach matchmaking"
+    );
+
+    let queue_key = RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode);
+    let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+    assert_eq!(redis.zcard::<_, usize>(&queue_key).await?, 0);
+    assert_eq!(redis.zcard::<_, usize>(&mmr_key).await?, 0);
+    assert!(!redis.exists::<_, bool>(&identity_key).await?);
+    assert_eq!(
+        redis.get::<_, String>(&outcome_key).await?,
+        format!("expired:{}", queued_identity.queue_token)
+    );
+    assert!(redis.pttl::<_, i64>(&outcome_key).await? > 0);
+    assert!(
+        !redis
+            .exists::<_, bool>(RedisKeys::matchmaking_user_queue_identity(97))
+            .await?
+    );
+    assert_eq!(lobby_state("EXPIRE1").await?.as_deref(), Some("waiting"));
+    assert!(
+        redis
+            .pttl::<_, i64>(RedisKeys::lobby_metadata("EXPIRE1"))
+            .await?
+            > 0
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_index_member_cannot_hide_or_delete_the_live_queue_generation() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    seed_lobby_metadata(&["STALE1"]).await?;
+
+    let mut manager = create_test_matchmaking_manager().await?;
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = QueueMode::Quickmatch;
+    manager
+        .add_lobby_to_queue(
+            "STALE1",
+            vec![make_lobby_member(98, "live-player")],
+            1_000,
+            vec![game_type.clone()],
+            queue_mode.clone(),
+            98,
+        )
+        .await?;
+
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let identity_key = RedisKeys::matchmaking_lobby_queue_identity("STALE1");
+    let lease_key = RedisKeys::matchmaking_lobby_queue_lease("STALE1");
+    let live_json: String = redis.get(&identity_key).await?;
+    let mut stale_lobby: server::matchmaking_manager::QueuedLobby =
+        serde_json::from_str(&live_json)?;
+    stale_lobby.queue_token = "00000000-0000-0000-0000-000000000001".to_owned();
+    stale_lobby.queued_at = stale_lobby.queued_at.saturating_sub(1_000);
+    let stale_json = serde_json::to_string(&stale_lobby)?;
+    let queue_key = RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode);
+    let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+    let _: usize = redis
+        .zadd(&queue_key, &stale_json, stale_lobby.queued_at)
+        .await?;
+    let _: usize = redis
+        .zadd(&mmr_key, &stale_json, stale_lobby.avg_mmr)
+        .await?;
+
+    let sampled = manager.get_queued_lobbies(&game_type, &queue_mode).await?;
+    assert_eq!(sampled.len(), 1);
+    assert_eq!(
+        sampled[0].queue_token,
+        serde_json::from_str::<server::matchmaking_manager::QueuedLobby>(&live_json)?.queue_token
+    );
+    assert_eq!(redis.get::<_, String>(&identity_key).await?, live_json);
+    assert_eq!(redis.get::<_, String>(&lease_key).await?, live_json);
+    assert!(
+        redis
+            .zscore::<_, _, Option<f64>>(&queue_key, &stale_json)
+            .await?
+            .is_none()
+    );
+    assert!(
+        redis
+            .zscore::<_, _, Option<f64>>(&mmr_key, &stale_json)
+            .await?
+            .is_none()
+    );
 
     Ok(())
 }
@@ -228,6 +393,7 @@ async fn matchmaking_pools_use_separate_queues_and_revalidate_metadata() -> Resu
             queue_mode.clone(),
             102,
             MatchmakingPool::Stress,
+            None,
         )
         .await?;
 
@@ -553,6 +719,40 @@ async fn cancellation_compare_deletes_only_the_observed_queue_identity() -> Resu
         .await?;
     assert!(user_queue_identity_exists);
 
+    // A newer writer may add fields this binary does not understand. The
+    // exact Redis identity must survive parsing so by-code cancellation can
+    // still compare-delete that forward-compatible record.
+    let identity_key = RedisKeys::matchmaking_lobby_queue_identity("CANCEL1");
+    let original_json: String = redis.get(&identity_key).await?;
+    let mut future_value: serde_json::Value = serde_json::from_str(&original_json)?;
+    future_value
+        .as_object_mut()
+        .expect("queued lobby must be a JSON object")
+        .insert(
+            "futureQueueMetadata".to_owned(),
+            serde_json::json!({"schema": 9}),
+        );
+    let future_json = serde_json::to_string(&future_value)?;
+    let _: () = redis.set(&identity_key, &future_json).await?;
+    let _: () = redis
+        .set(
+            RedisKeys::matchmaking_lobby_queue_lease("CANCEL1"),
+            &future_json,
+        )
+        .await?;
+    for game_type in &game_types {
+        let queue_key = RedisKeys::matchmaking_lobby_queue(game_type, &queue_mode);
+        let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, &queue_mode);
+        let _: usize = redis.zrem(&queue_key, &original_json).await?;
+        let _: usize = redis.zrem(&mmr_key, &original_json).await?;
+        let _: usize = redis
+            .zadd(&queue_key, &future_json, still_admitted.queued_at)
+            .await?;
+        let _: usize = redis
+            .zadd(&mmr_key, &future_json, still_admitted.avg_mmr)
+            .await?;
+    }
+
     assert!(
         manager
             .remove_lobby_from_all_queues_by_code("CANCEL1")
@@ -603,7 +803,7 @@ async fn cancellation_compare_deletes_only_the_observed_queue_identity() -> Resu
 }
 
 #[tokio::test]
-async fn ambiguous_admission_and_cancellation_retries_converge_from_fresh_callers() -> Result<()> {
+async fn fresh_queue_operations_cannot_replace_or_resurrect_an_observed_generation() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
     seed_lobby_metadata(&["RESPONSE1"]).await?;
@@ -627,23 +827,25 @@ async fn ambiguous_admission_and_cancellation_retries_converge_from_fresh_caller
         .get_queued_lobby_by_code("RESPONSE1")
         .await?
         .expect("first admission must commit one identity");
-    drop(first_caller); // Model loss of the successful script response/caller.
+    drop(first_caller);
 
     let mut retrying_caller = create_test_matchmaking_manager().await?;
-    retrying_caller
+    let replacement = retrying_caller
         .add_lobby_to_queue(
             "RESPONSE1",
-            members,
+            members.clone(),
             1_000,
             vec![game_type.clone()],
             queue_mode.clone(),
             95,
         )
-        .await?;
+        .await
+        .expect_err("a fresh operation token must not impersonate an ambiguous retry");
+    assert!(replacement.to_string().contains("queue-entry-changed"));
     let retried_identity = retrying_caller
         .get_queued_lobby_by_code("RESPONSE1")
         .await?
-        .expect("admission retry must recover the committed identity");
+        .expect("the first immutable identity must remain admitted");
     assert_eq!(retried_identity.queue_token, first_identity.queue_token);
     assert_eq!(lobby_state("RESPONSE1").await?.as_deref(), Some("queued"));
 
@@ -652,6 +854,11 @@ async fn ambiguous_admission_and_cancellation_retries_converge_from_fresh_caller
         .await?;
     let queue_key = RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode);
     let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+    let first_outcome_key = RedisKeys::matchmaking_lobby_queue_outcome("RESPONSE1");
+    assert_eq!(
+        redis.get::<_, String>(&first_outcome_key).await?,
+        format!("admitted:{}", first_identity.queue_token)
+    );
     assert_eq!(redis.zcard::<_, usize>(&queue_key).await?, 1);
     assert_eq!(redis.zcard::<_, usize>(&mmr_key).await?, 1);
 
@@ -659,6 +866,10 @@ async fn ambiguous_admission_and_cancellation_retries_converge_from_fresh_caller
         retrying_caller
             .remove_lobby_from_all_queues_by_code("RESPONSE1")
             .await?
+    );
+    assert_eq!(
+        redis.get::<_, String>(&first_outcome_key).await?,
+        format!("cancelled:{}", first_identity.queue_token)
     );
     drop(retrying_caller); // Model loss of the successful cancellation response.
 
@@ -681,6 +892,17 @@ async fn ambiguous_admission_and_cancellation_retries_converge_from_fresh_caller
             .exists::<_, bool>(RedisKeys::matchmaking_user_queue_identity(95))
             .await?
     );
+
+    // A genuinely new operation remains possible. Its distinct token cannot
+    // be confused with the terminal tombstone for the cancelled request.
+    cancellation_retry
+        .add_lobby_to_queue("RESPONSE1", members, 1_000, vec![game_type], queue_mode, 95)
+        .await?;
+    let next_identity = cancellation_retry
+        .get_queued_lobby_by_code("RESPONSE1")
+        .await?
+        .expect("new operation should admit after cancellation");
+    assert_ne!(next_identity.queue_token, first_identity.queue_token);
 
     Ok(())
 }
@@ -1090,6 +1312,247 @@ async fn concurrent_atomic_claims_commit_exactly_one_match() -> Result<()> {
 }
 
 #[tokio::test]
+async fn atomic_match_commit_repairs_mapping_wal_after_sources_are_reaped() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    seed_lobby_metadata(&["REPAIR1", "REPAIR2"]).await?;
+
+    let mut manager = create_test_matchmaking_manager().await?;
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = QueueMode::Quickmatch;
+    for (code, user_id) in [("REPAIR1", 151_u32), ("REPAIR2", 152_u32)] {
+        manager
+            .add_lobby_to_queue(
+                code,
+                vec![make_lobby_member(user_id, format!("repair-{user_id}"))],
+                1_000,
+                vec![game_type.clone()],
+                queue_mode.clone(),
+                user_id,
+            )
+            .await?;
+    }
+    let lobbies = manager.get_queued_lobbies(&game_type, &queue_mode).await?;
+    assert_eq!(lobbies.len(), 2);
+
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    for user_id in [151_u32, 152_u32] {
+        let _: usize = redis
+            .hset(
+                RedisKeys::matchmaking_user_status(user_id),
+                "status",
+                "queued",
+            )
+            .await?;
+    }
+
+    let game_id = 1_000_000_051;
+    let game_id_string = game_id.to_string();
+    let (active_match, payload) = committed_match_fixture(game_id, &[151, 152])?;
+
+    // Simulate the only recoverable partial-write shape: the atomic mapping
+    // MSET (the destination WAL/lock) is durable, then the exact queue sources
+    // are reaped before the same commit operation retries.
+    let queue_key = RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode);
+    let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    for lobby in &lobbies {
+        let member_json = serde_json::to_string(lobby)?;
+        pipe.set(
+            RedisKeys::matchmaking_lobby_active_game(&lobby.lobby_code),
+            &game_id_string,
+        )
+        .set(
+            RedisKeys::matchmaking_lobby_queue_outcome(&lobby.lobby_code),
+            format!("expired:{}", lobby.queue_token),
+        )
+        .del(RedisKeys::matchmaking_lobby_queue_identity(
+            &lobby.lobby_code,
+        ))
+        .del(RedisKeys::matchmaking_lobby_queue_lease(&lobby.lobby_code))
+        .hset(
+            RedisKeys::lobby_metadata(&lobby.lobby_code),
+            "state",
+            "waiting",
+        )
+        .zrem(&queue_key, &member_json)
+        .zrem(&mmr_key, &member_json);
+        for member in &lobby.members {
+            pipe.set(
+                RedisKeys::matchmaking_user_active_game(member.user_id),
+                &game_id_string,
+            )
+            .del(RedisKeys::matchmaking_user_queue_identity(member.user_id));
+        }
+    }
+    let _: () = pipe.query_async(&mut redis).await?;
+
+    let outcome = manager
+        .commit_match(
+            game_id,
+            game_id % server::game_executor::PARTITION_COUNT,
+            &game_type,
+            &queue_mode,
+            &active_match,
+            &payload,
+            &lobbies,
+        )
+        .await?;
+    assert_eq!(outcome, MatchCommitOutcome::AlreadyCommitted);
+
+    let stored_match: Option<String> = redis
+        .hget(RedisKeys::matchmaking_active_matches(), &game_id_string)
+        .await?;
+    assert_eq!(
+        stored_match.as_deref(),
+        Some(serde_json::to_string(&active_match)?.as_str())
+    );
+    let outbox_payload: Option<String> = redis
+        .hget(
+            RedisKeys::matchmaking_game_created_outbox(),
+            &game_id_string,
+        )
+        .await?;
+    assert!(outbox_payload.is_some());
+    assert!(
+        redis
+            .zscore::<_, _, Option<i64>>(
+                RedisKeys::matchmaking_game_created_outbox_age(),
+                &game_id_string,
+            )
+            .await?
+            .is_some()
+    );
+    assert_eq!(redis.zcard::<_, usize>(&queue_key).await?, 0);
+    assert_eq!(redis.zcard::<_, usize>(&mmr_key).await?, 0);
+
+    for lobby in &lobbies {
+        let outcome: String = redis
+            .get(RedisKeys::matchmaking_lobby_queue_outcome(
+                &lobby.lobby_code,
+            ))
+            .await?;
+        assert_eq!(outcome, format!("matched:{}", lobby.queue_token));
+        assert_eq!(
+            lobby_state(&lobby.lobby_code).await?.as_deref(),
+            Some("matched")
+        );
+        for member in &lobby.members {
+            let pending: String = redis
+                .get(RedisKeys::matchmaking_lobby_user_pending_game(
+                    &lobby.lobby_code,
+                    member.user_id,
+                ))
+                .await?;
+            assert_eq!(pending, game_id_string);
+            assert!(
+                !redis
+                    .exists(RedisKeys::matchmaking_user_status(member.user_id))
+                    .await?
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn forward_compatible_queue_identity_remains_an_exact_commit_claim() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    setup_test_redis().await?;
+    seed_lobby_metadata(&["FUTURE1", "FUTURE2"]).await?;
+
+    let mut manager = create_test_matchmaking_manager().await?;
+    let game_type = GameType::FreeForAll { max_players: 2 };
+    let queue_mode = QueueMode::Quickmatch;
+    for (code, user_id) in [("FUTURE1", 161_u32), ("FUTURE2", 162_u32)] {
+        manager
+            .add_lobby_to_queue(
+                code,
+                vec![make_lobby_member(user_id, format!("future-{user_id}"))],
+                1_000,
+                vec![game_type.clone()],
+                queue_mode.clone(),
+                user_id,
+            )
+            .await?;
+    }
+
+    let mut redis = Client::open(test_redis_url())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let queue_key = RedisKeys::matchmaking_lobby_queue(&game_type, &queue_mode);
+    let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(&game_type, &queue_mode);
+    for code in ["FUTURE1", "FUTURE2"] {
+        let identity_key = RedisKeys::matchmaking_lobby_queue_identity(code);
+        let original_json: String = redis.get(&identity_key).await?;
+        let parsed: server::matchmaking_manager::QueuedLobby =
+            serde_json::from_str(&original_json)?;
+        let mut future_value: serde_json::Value = serde_json::from_str(&original_json)?;
+        future_value
+            .as_object_mut()
+            .expect("queued lobby must be a JSON object")
+            .insert(
+                "futureQueueMetadata".to_owned(),
+                serde_json::json!({"schema": 9}),
+            );
+        let future_json = serde_json::to_string(&future_value)?;
+
+        let _: usize = redis.zrem(&queue_key, &original_json).await?;
+        let _: usize = redis.zrem(&mmr_key, &original_json).await?;
+        let _: usize = redis
+            .zadd(&queue_key, &future_json, parsed.queued_at)
+            .await?;
+        let _: usize = redis.zadd(&mmr_key, &future_json, parsed.avg_mmr).await?;
+        let _: () = redis.set(&identity_key, &future_json).await?;
+        let _: () = redis
+            .set(RedisKeys::matchmaking_lobby_queue_lease(code), &future_json)
+            .await?;
+    }
+    for user_id in [161_u32, 162_u32] {
+        let _: usize = redis
+            .hset(
+                RedisKeys::matchmaking_user_status(user_id),
+                "status",
+                "queued",
+            )
+            .await?;
+    }
+
+    let lobbies = manager.get_queued_lobbies(&game_type, &queue_mode).await?;
+    assert_eq!(lobbies.len(), 2);
+    let game_id = 1_000_000_061;
+    let (active_match, payload) = committed_match_fixture(game_id, &[161, 162])?;
+    let outcome = manager
+        .commit_match(
+            game_id,
+            game_id % server::game_executor::PARTITION_COUNT,
+            &game_type,
+            &queue_mode,
+            &active_match,
+            &payload,
+            &lobbies,
+        )
+        .await?;
+    assert!(matches!(outcome, MatchCommitOutcome::Committed { .. }));
+    assert_eq!(redis.zcard::<_, usize>(&queue_key).await?, 0);
+    assert_eq!(redis.zcard::<_, usize>(&mmr_key).await?, 0);
+    assert_eq!(
+        manager.get_lobby_active_game("FUTURE1").await?,
+        Some(game_id)
+    );
+    assert_eq!(
+        manager.get_lobby_active_game("FUTURE2").await?,
+        Some(game_id)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn atomic_claim_conflict_writes_nothing() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     setup_test_redis().await?;
@@ -1231,7 +1694,8 @@ async fn retired_socket_cleanup_preserves_replacement_lobby_and_active_mapping()
     let old_transport = old_members[0].clone();
 
     // Restore the same lobby through a replacement transport before retiring
-    // the old one, as the planned make-before-break client does.
+    // the old one. Redis atomically swaps the per-user presence generation,
+    // bounding roster size while the retired socket still has a local handle.
     let mut replacement = TestClient::connect(&server_addr).await?;
     replacement.authenticate(user_id).await?;
     replacement
@@ -1253,13 +1717,10 @@ async fn retired_socket_cleanup_preserves_replacement_lobby_and_active_mapping()
     })
     .await??;
 
-    let overlapping_members: Vec<String> = redis.zrange(&members_key, 0, -1).await?;
-    assert_eq!(overlapping_members.len(), 2);
-    let replacement_transport = overlapping_members
-        .iter()
-        .find(|member| **member != old_transport)
-        .expect("replacement websocket must have its own presence generation")
-        .clone();
+    let replacement_members: Vec<String> = redis.zrange(&members_key, 0, -1).await?;
+    assert_eq!(replacement_members.len(), 1);
+    let replacement_transport = replacement_members[0].clone();
+    assert_ne!(replacement_transport, old_transport);
 
     // Durable active context is independent of either transport generation.
     let game_id = 42_101_u32;
@@ -1443,7 +1904,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             }
         }
     })
-    .await??;
+    .await
+    .context("host did not receive LobbyCreated")??;
 
     let mut follower = TestClient::connect(&server_addr).await?;
     follower.authenticate(follower_user_id).await?;
@@ -1464,7 +1926,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             }
         }
     })
-    .await??;
+    .await
+    .context("follower did not receive JoinedLobby")??;
 
     let mut baseline = [host_user_id as u32, follower_user_id as u32];
     baseline.sort_unstable();
@@ -1484,7 +1947,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             ),
         )
     })
-    .await??;
+    .await
+    .context("sockets did not converge on the baseline lobby roster")??;
 
     // Phase 1: mutate the authoritative roster without publishing anything.
     // Both sockets must converge from the periodic durable read alone.
@@ -1522,7 +1986,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             ),
         )
     })
-    .await??;
+    .await
+    .context("sockets did not converge on the durable roster after the stale hint")??;
 
     // Phase 2: inject a stale roster through the real Redis Pub/Sub path. Its
     // removed sentinel member must never reach either socket; the durable read
@@ -1546,6 +2011,7 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
         host_user_id,
         state: "waiting".to_owned(),
         preferences: LobbyPreferences::default(),
+        ad_break: None,
     };
     let stale_hint = serde_json::json!({
         "LobbyUpdate": {
@@ -1919,7 +2385,8 @@ async fn create_lobby_and_queue_with_code(
             }
         }
     })
-    .await??;
+    .await
+    .context("host did not receive LobbyCreated")??;
 
     // Other clients join the lobby using the captured lobby_code
     if clients.len() > 1 {
@@ -1939,7 +2406,8 @@ async fn create_lobby_and_queue_with_code(
                     }
                 }
             })
-            .await??;
+            .await
+            .context("member did not receive JoinedLobby")??;
         }
     }
 
@@ -2003,7 +2471,8 @@ async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result
                 }
             }
         })
-        .await??;
+        .await
+        .context("client did not receive its JoinGame push and game snapshot")??;
 
         if let Some(expected_game_id) = game_id {
             assert_eq!(
@@ -2115,6 +2584,7 @@ async fn age_single_queued_lobby(
     let queue_key = RedisKeys::matchmaking_lobby_queue(game_type, queue_mode);
     let mmr_key = RedisKeys::matchmaking_lobby_mmr_index(game_type, queue_mode);
     let identity_key = RedisKeys::matchmaking_lobby_queue_identity(&lobby.lobby_code);
+    let lease_key = RedisKeys::matchmaking_lobby_queue_lease(&lobby.lobby_code);
 
     let mut pipe = redis::pipe();
     pipe.atomic()
@@ -2122,7 +2592,8 @@ async fn age_single_queued_lobby(
         .zrem(&mmr_key, &original_json)
         .zadd(&queue_key, &updated_json, new_queued_at)
         .zadd(&mmr_key, &updated_json, aged_lobby.avg_mmr)
-        .set(&identity_key, &updated_json);
+        .set(&identity_key, &updated_json)
+        .pset_ex(&lease_key, &updated_json, 5 * 60 * 1_000);
     let _: () = pipe.query_async(&mut redis_conn).await?;
 
     Ok(())

@@ -2,9 +2,12 @@ use super::mock_jwt::MockJwtVerifier;
 use anyhow::{Context, Result};
 use futures_util::future::join_all;
 use server::{
+    ads::AdsConfig,
     api::jwt::JwtManager,
     db::{Database, dynamodb::DynamoDatabase},
-    game_server::{GameServer, start_test_server_with_grpc_and_mode},
+    game_server::{
+        GameServer, start_test_server_with_grpc_and_mode, start_test_server_with_grpc_options,
+    },
     ws_server::JwtVerifier,
 };
 use std::sync::Arc;
@@ -125,6 +128,30 @@ impl TestEnvironment {
             .await
     }
 
+    /// Add a server with an explicit runtime advertisement policy. Keeping the
+    /// policy injectable avoids mutating process-global environment variables
+    /// in integration tests that already share one serialized dependency set.
+    pub async fn add_server_with_ads_config(
+        &mut self,
+        ads_config: AdsConfig,
+    ) -> Result<(usize, u64)> {
+        let jwt_manager = JwtManager::new("test_secret_key_for_testing");
+        let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
+        let server = start_test_server_with_grpc_options(
+            self.db(),
+            jwt_manager,
+            jwt_verifier,
+            false,
+            true,
+            self.match_ready_window_ms,
+            ads_config,
+        )
+        .await
+        .context("Failed to start server")?;
+
+        Ok(self.push_server(server))
+    }
+
     pub async fn add_server_with_jwt_verifier(
         &mut self,
         jwt_manager: JwtManager,
@@ -153,6 +180,10 @@ impl TestEnvironment {
         .await
         .context("Failed to start server")?;
 
+        Ok(self.push_server(server))
+    }
+
+    fn push_server(&mut self, server: GameServer) -> (usize, u64) {
         let index = self.servers.len();
         let server_id = server.id();
         info!(
@@ -172,7 +203,7 @@ impl TestEnvironment {
         }
 
         self.servers.push(server);
-        Ok((index, server_id))
+        (index, server_id)
     }
 
     // Add a server with custom JWT verifier

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::create_table::{CreateTableError, CreateTableOutput};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, ConditionCheck,
     CreateGlobalSecondaryIndexAction, Delete, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
@@ -10,6 +11,7 @@ use aws_sdk_dynamodb::types::{
     TableStatus, TimeToLiveSpecification, TimeToLiveStatus, TransactWriteItem, Update,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, time::Duration};
@@ -19,7 +21,8 @@ use tracing::{debug, info, warn};
 use super::models::*;
 use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
-    CompletionEffect, CompletionRecordV1, EffectApplyResult, canonical_json_bytes,
+    CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
+    canonical_json_bytes, match_history_summary,
 };
 use crate::season::{Season, get_season_at};
 
@@ -37,6 +40,73 @@ const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
 const GUEST_UPGRADE_MAX_ATTEMPTS: usize = 8;
 const CRAZYGAMES_IDENTITY_MAX_ATTEMPTS: usize = 8;
 const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
+const HISTORY_PAGE_DEFAULT_LIMIT: usize = 20;
+const HISTORY_PAGE_MAX_LIMIT: usize = 50;
+const PAGE_CURSOR_MAX_BYTES: usize = 2_048;
+const HISTORY_GSI_PARTITION: &str = "MATCH_HISTORY";
+const RUNTIME_CONFIG_PK: &str = "CONFIG#RUNTIME";
+const RUNTIME_CONFIG_CURRENT_SK: &str = "CURRENT";
+const RUNTIME_CONFIG_SCHEMA_VERSION_V1: u16 = 1;
+const MAX_PRE_MATCH_AD_BREAK_USERS: usize = 4;
+const MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES: usize = 36;
+
+const fn runtime_config_schema_version_v1() -> u16 {
+    RUNTIME_CONFIG_SCHEMA_VERSION_V1
+}
+
+const fn default_ad_interval_minutes_v1() -> u16 {
+    10
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RuntimeAdsConfigV1 {
+    // Kept only to decode schema-v1 rows. It must never authorize a pre-match
+    // ad when the record is upconverted.
+    post_match_enabled: bool,
+    minimum_interval_minutes: u16,
+}
+
+impl Default for RuntimeAdsConfigV1 {
+    fn default() -> Self {
+        Self {
+            post_match_enabled: false,
+            minimum_interval_minutes: default_ad_interval_minutes_v1(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RuntimeConfigV1 {
+    announcement: RuntimeAnnouncementConfig,
+    ads: RuntimeAdsConfigV1,
+    history: RuntimeHistoryConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeConfigRecordV1 {
+    #[serde(default = "runtime_config_schema_version_v1")]
+    schema_version: u16,
+    version: u64,
+    config: RuntimeConfigV1,
+    updated_by: Option<RuntimeConfigActor>,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DynamoPageCursor {
+    version: u8,
+    scope: String,
+    pk: String,
+    sk: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gsi2pk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gsi2sk: Option<String>,
+}
 const RECENT_COMPLETED_GAMES_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
@@ -775,6 +845,174 @@ impl DynamoDatabase {
         Self::extract_i64(item, "ttl").is_some_and(|ttl| ttl <= now_epoch_seconds)
     }
 
+    fn bounded_page_limit(limit: usize) -> usize {
+        if limit == 0 {
+            HISTORY_PAGE_DEFAULT_LIMIT
+        } else {
+            limit.min(HISTORY_PAGE_MAX_LIMIT)
+        }
+    }
+
+    fn history_sort_key(ended_at_ms: i64, game_id: u32) -> Result<String> {
+        let ended_at_ms = u64::try_from(ended_at_ms)
+            .context("Match history timestamps must be non-negative epoch milliseconds")?;
+        Ok(format!("HISTORY#{ended_at_ms:020}#GAME#{game_id:010}"))
+    }
+
+    fn retention_ttl_seconds(ended_at_ms: i64, retention_days: u16) -> Result<i64> {
+        if ended_at_ms < 0 {
+            return Err(anyhow!(
+                "Retention timestamps must be non-negative epoch milliseconds"
+            ));
+        }
+        let expiry_ms = ended_at_ms.saturating_add(
+            i64::from(retention_days).saturating_mul(SECONDS_PER_DAY.saturating_mul(1_000)),
+        );
+        // DynamoDB TTL is second-granular. Round up so the millisecond-level
+        // snapshot availability field never outlives the stored snapshot.
+        Ok(expiry_ms.saturating_add(999) / 1_000)
+    }
+
+    fn encode_page_cursor(scope: &str, item: &HashMap<String, AttributeValue>) -> Result<String> {
+        let cursor = DynamoPageCursor {
+            version: 1,
+            scope: scope.to_string(),
+            pk: Self::extract_string(item, "pk")
+                .ok_or_else(|| anyhow!("history item is missing pk"))?,
+            sk: Self::extract_string(item, "sk")
+                .ok_or_else(|| anyhow!("history item is missing sk"))?,
+            gsi2pk: Self::extract_string(item, "gsi2pk"),
+            gsi2sk: Self::extract_string(item, "gsi2sk"),
+        };
+        Ok(hex::encode(
+            serde_json::to_vec(&cursor).context("Failed to serialize page cursor")?,
+        ))
+    }
+
+    fn decode_page_cursor(
+        raw: &str,
+        expected_scope: &str,
+        cursor_name: &str,
+    ) -> Result<DynamoPageCursor> {
+        let invalid = |detail: &str| anyhow!("invalid {cursor_name} cursor: {detail}");
+        if raw.is_empty() || raw.len() > PAGE_CURSOR_MAX_BYTES {
+            return Err(invalid("token length is invalid"));
+        }
+        let bytes = hex::decode(raw).map_err(|_| invalid("token encoding is invalid"))?;
+        let cursor: DynamoPageCursor =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("token payload is invalid"))?;
+        if cursor.version != 1 || cursor.scope != expected_scope {
+            return Err(invalid("token scope is invalid"));
+        }
+        Ok(cursor)
+    }
+
+    fn cursor_key(cursor: &DynamoPageCursor) -> HashMap<String, AttributeValue> {
+        let mut key = HashMap::from([
+            ("pk".to_string(), Self::av_s(&cursor.pk)),
+            ("sk".to_string(), Self::av_s(&cursor.sk)),
+        ]);
+        if let Some(gsi2pk) = &cursor.gsi2pk {
+            key.insert("gsi2pk".to_string(), Self::av_s(gsi2pk));
+        }
+        if let Some(gsi2sk) = &cursor.gsi2sk {
+            key.insert("gsi2sk".to_string(), Self::av_s(gsi2sk));
+        }
+        key
+    }
+
+    fn history_summary_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<MatchHistorySummary> {
+        let summary = Self::extract_string(item, "summaryJson")
+            .ok_or_else(|| anyhow!("match history row is missing summaryJson"))?;
+        let value: JsonValue = serde_json::from_str(&summary)
+            .context("Match history row contains invalid summaryJson")?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(JsonValue::as_u64)
+            .and_then(|version| u16::try_from(version).ok())
+            .ok_or_else(|| anyhow!("match history row has an invalid schemaVersion"))?;
+        match schema_version {
+            // Keep this dispatch explicit so a future schema can be upconverted
+            // without changing or rewriting retained immutable version-1 rows.
+            MATCH_HISTORY_SCHEMA_VERSION => serde_json::from_value(value)
+                .context("Match history row contains an invalid version-1 summary"),
+            version => Err(anyhow!(
+                "match history row uses unsupported schemaVersion {version}"
+            )),
+        }
+    }
+
+    fn runtime_config_record_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<RuntimeConfigRecord> {
+        let record = Self::extract_string(item, "recordJson")
+            .ok_or_else(|| anyhow!("runtime config row is missing recordJson"))?;
+        let value: JsonValue =
+            serde_json::from_str(&record).context("Runtime config row is corrupt")?;
+        let schema_version = match value.get("schemaVersion") {
+            Some(value) => value
+                .as_u64()
+                .and_then(|version| u16::try_from(version).ok())
+                .ok_or_else(|| anyhow!("runtime config row has an invalid schemaVersion"))?,
+            // Records written before schemaVersion was persisted have the v1
+            // shape and must follow the same safe upconversion path.
+            None => RUNTIME_CONFIG_SCHEMA_VERSION_V1,
+        };
+        let record = match schema_version {
+            RUNTIME_CONFIG_SCHEMA_VERSION_V1 => {
+                let legacy: RuntimeConfigRecordV1 = serde_json::from_value(value)
+                    .context("Runtime config row contains an invalid version-1 record")?;
+                if legacy.schema_version != RUNTIME_CONFIG_SCHEMA_VERSION_V1 {
+                    return Err(anyhow!(
+                        "runtime config row uses unsupported schemaVersion {}",
+                        legacy.schema_version
+                    ));
+                }
+                let RuntimeConfigV1 {
+                    announcement,
+                    ads: legacy_ads,
+                    history,
+                } = legacy.config;
+                let RuntimeAdsConfigV1 {
+                    post_match_enabled: _,
+                    minimum_interval_minutes,
+                } = legacy_ads;
+                // The interval has equivalent cooldown meaning. The old
+                // post-match switch intentionally does not enable any new
+                // pre-match policy or distribution.
+                let ads = RuntimeAdsConfig {
+                    minimum_interval_minutes,
+                    ..RuntimeAdsConfig::default()
+                };
+                RuntimeConfigRecord {
+                    schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+                    version: legacy.version,
+                    config: RuntimeConfig {
+                        announcement,
+                        ads,
+                        history,
+                    },
+                    updated_by: legacy.updated_by,
+                    updated_at_ms: legacy.updated_at_ms,
+                }
+            }
+            RUNTIME_CONFIG_SCHEMA_VERSION => serde_json::from_value(value)
+                .context("Runtime config row contains an invalid version-2 record")?,
+            version => {
+                return Err(anyhow!(
+                    "runtime config row uses unsupported schemaVersion {version}"
+                ));
+            }
+        };
+        record
+            .config
+            .validate()
+            .map_err(|error| anyhow!("runtime config row is invalid: {error}"))?;
+        Ok(record)
+    }
+
     /// Resolve source privacy before completion persistence. A new runtime
     /// match can use its server-owned state as the fallback. Existing metadata
     /// must explicitly attest public visibility; an already-completed legacy
@@ -1152,6 +1390,62 @@ impl DynamoDatabase {
             leader: Self::unique_public_high_score_leader(&ordered_head),
             coverage: NewsLeaderboardCoverage::OrderedGlobalIndex,
         })
+    }
+
+    fn validate_pre_match_ad_break_claim(
+        break_id: &str,
+        user_ids: &[u32],
+        now_ms: i64,
+        minimum_interval_ms: i64,
+        policy_version: u64,
+    ) -> Result<i64> {
+        if break_id.is_empty()
+            || break_id.len() > MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES
+            || break_id.chars().any(char::is_control)
+        {
+            return Err(anyhow!(
+                "pre-match ad break ID must be 1 to {MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES} bytes and contain no control characters"
+            ));
+        }
+        if user_ids.is_empty() || user_ids.len() > MAX_PRE_MATCH_AD_BREAK_USERS {
+            return Err(anyhow!(
+                "pre-match ad break must target between 1 and {MAX_PRE_MATCH_AD_BREAK_USERS} users"
+            ));
+        }
+        for (index, user_id) in user_ids.iter().enumerate() {
+            if *user_id == 0 || *user_id > i32::MAX as u32 {
+                return Err(anyhow!("pre-match ad break contains an invalid user ID"));
+            }
+            if user_ids[..index].contains(user_id) {
+                return Err(anyhow!("pre-match ad break contains a duplicate user ID"));
+            }
+        }
+        if now_ms < 0 {
+            return Err(anyhow!("pre-match ad break timestamp must not be negative"));
+        }
+        if minimum_interval_ms <= 0 {
+            return Err(anyhow!(
+                "pre-match ad break minimum interval must be positive"
+            ));
+        }
+        if policy_version == 0 {
+            return Err(anyhow!(
+                "pre-match ad break policy version must be positive"
+            ));
+        }
+        now_ms
+            .checked_sub(minimum_interval_ms)
+            .ok_or_else(|| anyhow!("pre-match ad break cooldown cutoff overflow"))
+    }
+
+    fn transaction_cancellation_is_conditional(error: &TransactWriteItemsError) -> bool {
+        match error {
+            TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
+                .cancellation_reasons()
+                .iter()
+                .any(|reason| reason.code() == Some("ConditionalCheckFailed")),
+            _ => false,
+        }
     }
 
     fn runtime_game_identity(game_id: i32, game_state: &common::GameState) -> String {
@@ -1622,6 +1916,7 @@ impl DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
@@ -2079,6 +2374,7 @@ impl Database for DynamoDatabase {
         username_item.insert("rankedMmr".to_string(), Self::av_n(1000));
         username_item.insert("casualMmr".to_string(), Self::av_n(1000));
         username_item.insert("xp".to_string(), Self::av_n(0));
+        username_item.insert("gamesPlayed".to_string(), Self::av_n(0));
 
         // This will fail if username already exists
         self.client
@@ -2103,6 +2399,7 @@ impl Database for DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
@@ -2123,6 +2420,7 @@ impl Database for DynamoDatabase {
             ranked_mmr: 1000,
             casual_mmr: 1000,
             xp: 0,
+            games_played: 0,
             created_at: now,
             is_guest: false,
             guest_token: None,
@@ -2160,6 +2458,7 @@ impl Database for DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(true));
         item.insert("isStressTest".to_string(), Self::av_bool(is_stress_test));
@@ -2186,6 +2485,7 @@ impl Database for DynamoDatabase {
             ranked_mmr: 1000,
             casual_mmr: 1000,
             xp: 0,
+            games_played: 0,
             created_at: now,
             is_guest: true,
             guest_token: Some(guest_token.to_string()),
@@ -2228,6 +2528,7 @@ impl Database for DynamoDatabase {
             username_item.insert("rankedMmr".to_string(), Self::av_n(guest.ranked_mmr));
             username_item.insert("casualMmr".to_string(), Self::av_n(guest.casual_mmr));
             username_item.insert("xp".to_string(), Self::av_n(guest.xp));
+            username_item.insert("gamesPlayed".to_string(), Self::av_n(guest.games_played));
 
             let username_put = Put::builder()
                 .table_name(self.usernames_table())
@@ -2259,7 +2560,9 @@ impl Database for DynamoDatabase {
                     "(attribute_not_exists(isStressTest) OR isStressTest=:not_stress) AND ",
                     "username=:old_username AND passwordHash=:old_password_hash AND ",
                     "mmr=:mmr AND rankedMmr=:ranked_mmr AND ",
-                    "casualMmr=:casual_mmr AND xp=:xp"
+                    "casualMmr=:casual_mmr AND xp=:xp AND ",
+                    "(gamesPlayed=:games_played OR ",
+                    "(attribute_not_exists(gamesPlayed) AND :games_played=:zero))"
                 ))
                 .expression_attribute_values(":username", Self::av_s(username))
                 .expression_attribute_values(":password_hash", Self::av_s(password_hash))
@@ -2272,6 +2575,8 @@ impl Database for DynamoDatabase {
                 .expression_attribute_values(":ranked_mmr", Self::av_n(guest.ranked_mmr))
                 .expression_attribute_values(":casual_mmr", Self::av_n(guest.casual_mmr))
                 .expression_attribute_values(":xp", Self::av_n(guest.xp))
+                .expression_attribute_values(":games_played", Self::av_n(guest.games_played))
+                .expression_attribute_values(":zero", Self::av_n(0))
                 .build()
                 .context("Failed to build in-place guest account upgrade")?;
 
@@ -2359,6 +2664,7 @@ impl Database for DynamoDatabase {
                     ranked_mmr: Self::extract_number(&item, "rankedMmr").unwrap_or(1000),
                     casual_mmr: Self::extract_number(&item, "casualMmr").unwrap_or(1000),
                     xp: Self::extract_number(&item, "xp").unwrap_or(0),
+                    games_played: Self::extract_number(&item, "gamesPlayed").unwrap_or(0),
                     created_at: Self::extract_string(&item, "createdAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
@@ -3126,6 +3432,402 @@ impl Database for DynamoDatabase {
         Ok(())
     }
 
+    async fn get_match_history(
+        &self,
+        user_id: i32,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        let limit = Self::bounded_page_limit(limit);
+        let target = limit.saturating_add(1);
+        let scope = format!("history:user:{user_id}");
+        let expected_pk = format!("USER#{user_id}");
+        let mut exclusive_start_key = match cursor {
+            Some(raw) => {
+                let cursor = Self::decode_page_cursor(raw, &scope, "history")?;
+                if cursor.pk != expected_pk
+                    || !cursor.sk.starts_with("HISTORY#")
+                    || cursor.gsi2pk.is_some()
+                    || cursor.gsi2sk.is_some()
+                {
+                    return Err(anyhow!("invalid history cursor: token key is invalid"));
+                }
+                Some(Self::cursor_key(&cursor))
+            }
+            None => None,
+        };
+        let now = Utc::now().timestamp();
+        let mut rows: Vec<(MatchHistorySummary, HashMap<String, AttributeValue>)> = Vec::new();
+
+        while rows.len() < target {
+            let remaining = target.saturating_sub(rows.len()).max(1);
+            let mut query = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .key_condition_expression("pk=:pk AND begins_with(sk, :history)")
+                .filter_expression("#ttl > :now")
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":pk", Self::av_s(&expected_pk))
+                .expression_attribute_values(":history", Self::av_s("HISTORY#"))
+                .expression_attribute_values(":now", Self::av_n(now))
+                .projection_expression("pk, sk, summaryJson, #ttl")
+                .consistent_read(true)
+                .scan_index_forward(false)
+                .limit(i32::try_from(remaining).unwrap_or(i32::MAX));
+            if let Some(key) = exclusive_start_key.take() {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let response = query
+                .send()
+                .await
+                .context("Failed to query player match history")?;
+            for item in response.items.unwrap_or_default() {
+                if !Self::item_is_expired(&item, now) {
+                    match Self::history_summary_from_item(&item) {
+                        Ok(summary) => rows.push((summary, item)),
+                        Err(error) => warn!(
+                            ?error,
+                            pk = ?Self::extract_string(&item, "pk"),
+                            sk = ?Self::extract_string(&item, "sk"),
+                            "skipping unreadable player match history row"
+                        ),
+                    }
+                }
+            }
+            exclusive_start_key = response.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+
+        let next_cursor = if rows.len() > limit {
+            Some(Self::encode_page_cursor(&scope, &rows[limit - 1].1)?)
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok(MatchHistoryPage {
+            entries: rows.into_iter().map(|(summary, _)| summary).collect(),
+            next_cursor,
+        })
+    }
+
+    async fn get_admin_match_history(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        let limit = Self::bounded_page_limit(limit);
+        let target = limit.saturating_add(1);
+        let scope = "history:admin";
+        let mut exclusive_start_key = match cursor {
+            Some(raw) => {
+                let cursor = Self::decode_page_cursor(raw, scope, "history")?;
+                if !cursor.pk.starts_with("GAME#")
+                    || cursor.sk != "HISTORY"
+                    || cursor.gsi2pk.as_deref() != Some(HISTORY_GSI_PARTITION)
+                    || !cursor
+                        .gsi2sk
+                        .as_deref()
+                        .is_some_and(|key| key.starts_with("HISTORY#"))
+                {
+                    return Err(anyhow!("invalid history cursor: token key is invalid"));
+                }
+                Some(Self::cursor_key(&cursor))
+            }
+            None => None,
+        };
+        let now = Utc::now().timestamp();
+        let mut rows: Vec<(MatchHistorySummary, HashMap<String, AttributeValue>)> = Vec::new();
+
+        while rows.len() < target {
+            let remaining = target.saturating_sub(rows.len()).max(1);
+            let mut query = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI2")
+                .key_condition_expression("gsi2pk=:pk")
+                .filter_expression("#ttl > :now")
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":pk", Self::av_s(HISTORY_GSI_PARTITION))
+                .expression_attribute_values(":now", Self::av_n(now))
+                .projection_expression("pk, sk, gsi2pk, gsi2sk, summaryJson, #ttl")
+                .scan_index_forward(false)
+                .limit(i32::try_from(remaining).unwrap_or(i32::MAX));
+            if let Some(key) = exclusive_start_key.take() {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let response = query
+                .send()
+                .await
+                .context("Failed to query administrative match history")?;
+            for item in response.items.unwrap_or_default() {
+                if !Self::item_is_expired(&item, now) {
+                    match Self::history_summary_from_item(&item) {
+                        Ok(summary) => rows.push((summary, item)),
+                        Err(error) => warn!(
+                            ?error,
+                            pk = ?Self::extract_string(&item, "pk"),
+                            sk = ?Self::extract_string(&item, "sk"),
+                            "skipping unreadable administrative match history row"
+                        ),
+                    }
+                }
+            }
+            exclusive_start_key = response.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+
+        let next_cursor = if rows.len() > limit {
+            Some(Self::encode_page_cursor(scope, &rows[limit - 1].1)?)
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok(MatchHistoryPage {
+            entries: rows.into_iter().map(|(summary, _)| summary).collect(),
+            next_cursor,
+        })
+    }
+
+    async fn get_runtime_config(&self) -> Result<RuntimeConfigRecord> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(RUNTIME_CONFIG_PK))
+            .key("sk", Self::av_s(RUNTIME_CONFIG_CURRENT_SK))
+            .consistent_read(true)
+            .projection_expression("recordJson")
+            .send()
+            .await
+            .context("Failed to read runtime config")?;
+        match response.item {
+            Some(item) => Self::runtime_config_record_from_item(&item),
+            None => Ok(RuntimeConfigRecord::default()),
+        }
+    }
+
+    async fn update_runtime_config(
+        &self,
+        expected_version: u64,
+        config: &RuntimeConfig,
+        actor: &RuntimeConfigActor,
+    ) -> Result<RuntimeConfigRecord> {
+        config
+            .validate()
+            .map_err(|error| anyhow!("invalid runtime config: {error}"))?;
+        let version = expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("runtime config version overflow"))?;
+        let record = RuntimeConfigRecord {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            version,
+            config: config.clone(),
+            updated_by: Some(actor.clone()),
+            updated_at_ms: Utc::now().timestamp_millis(),
+        };
+        let record_json =
+            serde_json::to_string(&record).context("Failed to serialize runtime config record")?;
+        let config_json =
+            serde_json::to_string(config).context("Failed to serialize runtime config")?;
+
+        let mut current = Put::builder()
+            .table_name(self.main_table())
+            .item("pk", Self::av_s(RUNTIME_CONFIG_PK))
+            .item("sk", Self::av_s(RUNTIME_CONFIG_CURRENT_SK))
+            .item("version", Self::av_n(version))
+            .item("configJson", Self::av_s(&config_json))
+            .item("recordJson", Self::av_s(&record_json))
+            .item("updatedAtMs", Self::av_n(record.updated_at_ms))
+            .item("updatedByUserId", Self::av_n(actor.user_id))
+            .item("updatedByUsername", Self::av_s(&actor.username));
+        if expected_version == 0 {
+            current = current
+                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
+        } else {
+            current = current
+                .condition_expression("#version=:expected")
+                .expression_attribute_names("#version", "version")
+                .expression_attribute_values(":expected", Self::av_n(expected_version));
+        }
+        let current = current
+            .build()
+            .context("Failed to build runtime config update")?;
+
+        let audit = Put::builder()
+            .table_name(self.main_table())
+            .item("pk", Self::av_s(RUNTIME_CONFIG_PK))
+            .item("sk", Self::av_s(format!("AUDIT#{version:020}")))
+            .item("version", Self::av_n(version))
+            .item("configJson", Self::av_s(config_json))
+            .item("recordJson", Self::av_s(record_json))
+            .item("updatedAtMs", Self::av_n(record.updated_at_ms))
+            .item("updatedByUserId", Self::av_n(actor.user_id))
+            .item("updatedByUsername", Self::av_s(&actor.username))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build runtime config audit write")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(current).build())
+            .transact_items(TransactWriteItem::builder().put(audit).build())
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(record),
+            Err(error) => {
+                if let Ok(observed) = self.get_runtime_config().await {
+                    // DynamoDB may commit a transaction even when the client
+                    // loses the response. Treat that exact durable record as
+                    // success so retry semantics remain idempotent.
+                    if observed == record {
+                        return Ok(observed);
+                    }
+                    if observed.version != expected_version {
+                        return Err(anyhow!(
+                            "runtime config version conflict: expected {}, current {}",
+                            expected_version,
+                            observed.version
+                        ));
+                    }
+                }
+                Err(error).context("Failed to atomically update runtime config")
+            }
+        }
+    }
+
+    async fn get_runtime_config_audit(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<RuntimeConfigAuditPage> {
+        let limit = Self::bounded_page_limit(limit);
+        let target = limit.saturating_add(1);
+        let scope = "config-audit";
+        let mut exclusive_start_key = match cursor {
+            Some(raw) => {
+                let cursor = Self::decode_page_cursor(raw, scope, "config audit")?;
+                if cursor.pk != RUNTIME_CONFIG_PK
+                    || !cursor.sk.starts_with("AUDIT#")
+                    || cursor.gsi2pk.is_some()
+                    || cursor.gsi2sk.is_some()
+                {
+                    return Err(anyhow!("invalid config audit cursor: token key is invalid"));
+                }
+                Some(Self::cursor_key(&cursor))
+            }
+            None => None,
+        };
+        let mut rows: Vec<(RuntimeConfigRecord, HashMap<String, AttributeValue>)> = Vec::new();
+        while rows.len() < target {
+            let remaining = target.saturating_sub(rows.len()).max(1);
+            let mut query = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .key_condition_expression("pk=:pk AND begins_with(sk, :audit)")
+                .expression_attribute_values(":pk", Self::av_s(RUNTIME_CONFIG_PK))
+                .expression_attribute_values(":audit", Self::av_s("AUDIT#"))
+                .projection_expression("pk, sk, recordJson")
+                .consistent_read(true)
+                .scan_index_forward(false)
+                .limit(i32::try_from(remaining).unwrap_or(i32::MAX));
+            if let Some(key) = exclusive_start_key.take() {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let response = query
+                .send()
+                .await
+                .context("Failed to query runtime config audit")?;
+            for item in response.items.unwrap_or_default() {
+                rows.push((Self::runtime_config_record_from_item(&item)?, item));
+            }
+            exclusive_start_key = response.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+
+        let next_cursor = if rows.len() > limit {
+            Some(Self::encode_page_cursor(scope, &rows[limit - 1].1)?)
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok(RuntimeConfigAuditPage {
+            entries: rows.into_iter().map(|(record, _)| record).collect(),
+            next_cursor,
+        })
+    }
+
+    async fn try_claim_pre_match_ad_break(
+        &self,
+        break_id: &str,
+        user_ids: &[u32],
+        now_ms: i64,
+        minimum_interval_ms: i64,
+        policy_version: u64,
+    ) -> Result<bool> {
+        let cutoff_ms = Self::validate_pre_match_ad_break_claim(
+            break_id,
+            user_ids,
+            now_ms,
+            minimum_interval_ms,
+            policy_version,
+        )?;
+        let mut updates = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            let update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("AD#PRE_MATCH"))
+                .update_expression(concat!(
+                    "SET #last_break_at=:now, #break_id=:break_id, ",
+                    "#policy_version=:policy_version"
+                ))
+                .condition_expression(concat!(
+                    "attribute_not_exists(#last_break_at) OR ",
+                    "#last_break_at<=:cutoff OR #break_id=:break_id"
+                ))
+                .expression_attribute_names("#last_break_at", "lastBreakAtMs")
+                .expression_attribute_names("#break_id", "breakId")
+                .expression_attribute_names("#policy_version", "policyVersion")
+                .expression_attribute_values(":now", Self::av_n(now_ms))
+                .expression_attribute_values(":cutoff", Self::av_n(cutoff_ms))
+                .expression_attribute_values(":break_id", Self::av_s(break_id))
+                .expression_attribute_values(":policy_version", Self::av_n(policy_version))
+                .build()
+                .context("Failed to build pre-match ad-break cooldown claim")?;
+            updates.push(TransactWriteItem::builder().update(update).build());
+        }
+
+        match self
+            .client
+            .transact_write_items()
+            .client_request_token(break_id)
+            .set_transact_items(Some(updates))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("Failed to claim pre-match ad-break cooldown"),
+        }
+    }
+
     async fn apply_completion_effect(
         &self,
         completion: &CompletionRecordV1,
@@ -3151,14 +3853,30 @@ impl Database for DynamoDatabase {
                     let created_at =
                         DateTime::<Utc>::from_timestamp_millis(completion.final_state.start_ms)
                             .unwrap_or(ended_at);
-                    let retention_days = Self::completed_game_retention_days(
-                        std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV)
-                            .ok()
-                            .as_deref(),
-                    );
-                    let ttl = ended_at
-                        .timestamp()
-                        .saturating_add(retention_days.saturating_mul(SECONDS_PER_DAY));
+                    let history_config = match self.get_runtime_config().await {
+                        Ok(runtime_config) => runtime_config.config.history,
+                        Err(error) => {
+                            warn!(
+                                ?error,
+                                "failed to read runtime config for completed game; using default history retention"
+                            );
+                            RuntimeHistoryConfig::default()
+                        }
+                    };
+                    let snapshot_ttl = Self::retention_ttl_seconds(
+                        completion.ended_at_ms,
+                        history_config.snapshot_retention_days,
+                    )?;
+                    let summary_ttl = Self::retention_ttl_seconds(
+                        completion.ended_at_ms,
+                        history_config.summary_retention_days,
+                    )?;
+                    let summary =
+                        match_history_summary(completion, history_config.snapshot_retention_days)?;
+                    let summary_json = serde_json::to_string(&summary)
+                        .context("Failed to serialize immutable match history summary")?;
+                    let history_sk =
+                        Self::history_sort_key(completion.ended_at_ms, completion.game_id)?;
                     let state_json = serde_json::to_string(&completion.final_state)
                         .context("Failed to serialize immutable final game state")?;
                     let game_type_json =
@@ -3252,7 +3970,7 @@ impl Database for DynamoDatabase {
                             Self::av_s(completion.revision.to_string()),
                         )
                         .expression_attribute_values(":news_eligible", Self::av_bool(news_eligible))
-                        .expression_attribute_values(":ttl", Self::av_n(ttl));
+                        .expression_attribute_values(":ttl", Self::av_n(snapshot_ttl));
                     if let Some(game_code) = &completion.final_state.game_code {
                         update =
                             update.expression_attribute_values(":game_code", Self::av_s(game_code));
@@ -3260,7 +3978,7 @@ impl Database for DynamoDatabase {
                     if let Some(season) = completion.season {
                         update = update.expression_attribute_values(":season", Self::av_n(season));
                     }
-                    vec![
+                    let mut mutations = vec![
                         TransactWriteItem::builder()
                             .update(
                                 update
@@ -3268,7 +3986,70 @@ impl Database for DynamoDatabase {
                                     .context("Failed to build completed-game update")?,
                             )
                             .build(),
-                    ]
+                    ];
+
+                    let canonical_history = Put::builder()
+                        .table_name(self.main_table())
+                        .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+                        .item("sk", Self::av_s("HISTORY"))
+                        .item("gsi2pk", Self::av_s(HISTORY_GSI_PARTITION))
+                        .item("gsi2sk", Self::av_s(&history_sk))
+                        .item("gameId", Self::av_n(completion.game_id))
+                        .item("endedAtMs", Self::av_n(completion.ended_at_ms))
+                        .item("summaryJson", Self::av_s(&summary_json))
+                        .item(
+                            "completionRevision",
+                            Self::av_s(completion.revision.to_string()),
+                        )
+                        .item("ttl", Self::av_n(summary_ttl))
+                        .condition_expression(
+                            "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                        )
+                        .build()
+                        .context("Failed to build canonical match history write")?;
+                    mutations.push(TransactWriteItem::builder().put(canonical_history).build());
+
+                    if !completion.final_state.is_stress_test {
+                        for player in &summary.players {
+                            let user_history = Put::builder()
+                                .table_name(self.main_table())
+                                .item("pk", Self::av_s(format!("USER#{}", player.user_id)))
+                                .item("sk", Self::av_s(&history_sk))
+                                .item("gameId", Self::av_n(completion.game_id))
+                                .item("endedAtMs", Self::av_n(completion.ended_at_ms))
+                                .item("summaryJson", Self::av_s(&summary_json))
+                                .item(
+                                    "completionRevision",
+                                    Self::av_s(completion.revision.to_string()),
+                                )
+                                .item("ttl", Self::av_n(summary_ttl))
+                                .condition_expression(
+                                    "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                                )
+                                .build()
+                                .context("Failed to build player match history write")?;
+                            mutations.push(TransactWriteItem::builder().put(user_history).build());
+                        }
+                    }
+
+                    // This durable v8+ completion counter is the advertisement
+                    // eligibility source of truth. Keeping it in this replay-safe
+                    // transaction makes each newly claimed completion count once.
+                    for user_id in completion.final_state.players.keys() {
+                        let progress_update = Update::builder()
+                            .table_name(self.main_table())
+                            .key("pk", Self::av_s(format!("USER#{user_id}")))
+                            .key("sk", Self::av_s("META"))
+                            .update_expression("ADD gamesPlayed :one")
+                            .condition_expression("attribute_exists(pk) AND attribute_exists(sk)")
+                            .expression_attribute_values(":one", Self::av_n(1))
+                            .build()
+                            .context("Failed to build games-played update")?;
+                        mutations
+                            .push(TransactWriteItem::builder().update(progress_update).build());
+                    }
+                    debug_assert!(mutations.len() + 2 <= 100);
+                    mutations
                 }
                 CompletionEffect::AddXp {
                     user_id, amount, ..
@@ -4785,6 +5566,95 @@ mod tests {
     }
 
     #[test]
+    fn history_sort_keys_order_epoch_millis_then_padded_game_id() {
+        let first = DynamoDatabase::history_sort_key(1_000, 99).unwrap();
+        let same_millisecond_later_game = DynamoDatabase::history_sort_key(1_000, 100).unwrap();
+        let later_millisecond = DynamoDatabase::history_sort_key(1_001, 1).unwrap();
+
+        assert_eq!(first, "HISTORY#00000000000000001000#GAME#0000000099");
+        assert!(first < same_millisecond_later_game);
+        assert!(same_millisecond_later_game < later_millisecond);
+    }
+
+    #[test]
+    fn history_cursor_is_opaque_and_scope_bound() {
+        let item = HashMap::from([
+            ("pk".to_string(), DynamoDatabase::av_s("USER#7")),
+            (
+                "sk".to_string(),
+                DynamoDatabase::av_s("HISTORY#00000000000000001000#GAME#0000000001"),
+            ),
+        ]);
+        let encoded = DynamoDatabase::encode_page_cursor("history:user:7", &item).unwrap();
+        assert!(!encoded.contains("USER#7"));
+        let decoded =
+            DynamoDatabase::decode_page_cursor(&encoded, "history:user:7", "history").unwrap();
+        assert_eq!(decoded.pk, "USER#7");
+        assert!(DynamoDatabase::decode_page_cursor(&encoded, "history:user:8", "history").is_err());
+    }
+
+    #[test]
+    fn history_summary_reader_dispatches_by_schema_version() {
+        let mut item = HashMap::from([(
+            "summaryJson".to_string(),
+            DynamoDatabase::av_s(
+                serde_json::json!({
+                    "schemaVersion": MATCH_HISTORY_SCHEMA_VERSION,
+                    "gameId": 42,
+                    "startedAtMs": 1_000,
+                    "endedAtMs": 2_000,
+                    "durationMs": 1_000,
+                    "mode": "duel",
+                    "modeLabel": "Duel",
+                    "queueMode": "competitive",
+                    "isPrivate": false,
+                    "isStressTest": false,
+                    "completedByInactivity": false,
+                    "players": [],
+                    "winnerUserIds": [],
+                    "snapshotAvailableUntilMs": 3_000
+                })
+                .to_string(),
+            ),
+        )]);
+
+        assert_eq!(
+            DynamoDatabase::history_summary_from_item(&item)
+                .unwrap()
+                .game_id,
+            42
+        );
+
+        item.insert(
+            "summaryJson".to_string(),
+            DynamoDatabase::av_s(r#"{"schemaVersion":2}"#),
+        );
+        assert!(
+            DynamoDatabase::history_summary_from_item(&item)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schemaVersion 2")
+        );
+    }
+
+    #[test]
+    fn runtime_config_reader_rejects_future_schema_versions() {
+        let mut value = serde_json::to_value(RuntimeConfigRecord::default()).unwrap();
+        value["schemaVersion"] = serde_json::json!(RUNTIME_CONFIG_SCHEMA_VERSION + 1);
+        let item = HashMap::from([(
+            "recordJson".to_string(),
+            DynamoDatabase::av_s(value.to_string()),
+        )]);
+
+        assert!(
+            DynamoDatabase::runtime_config_record_from_item(&item)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schemaVersion")
+        );
+    }
+
+    #[test]
     fn completed_game_news_provenance_requires_explicit_public_terminal_row() {
         let mut public = HashMap::new();
         public.insert("status".to_string(), DynamoDatabase::av_s("complete"));
@@ -5147,6 +6017,118 @@ mod tests {
         assert!(!DynamoDatabase::high_score_matches_sort_key(
             &high_score_item("top", 2_000, true),
             &out_of_range
+        ));
+    }
+
+    #[test]
+    fn runtime_config_reader_safely_upconverts_version_one() {
+        let item = HashMap::from([(
+            "recordJson".to_string(),
+            DynamoDatabase::av_s(
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "version": 17,
+                    "config": {
+                        "announcement": {
+                            "enabled": true,
+                            "message": "Maintenance soon"
+                        },
+                        "ads": {
+                            "postMatchEnabled": true,
+                            "minimumIntervalMinutes": 22
+                        },
+                        "history": {
+                            "snapshotRetentionDays": 45,
+                            "summaryRetentionDays": 400
+                        }
+                    },
+                    "updatedBy": {
+                        "userId": 7,
+                        "username": "operator"
+                    },
+                    "updatedAtMs": 123456
+                })
+                .to_string(),
+            ),
+        )]);
+
+        let record = DynamoDatabase::runtime_config_record_from_item(&item).unwrap();
+
+        assert_eq!(record.schema_version, RUNTIME_CONFIG_SCHEMA_VERSION);
+        assert_eq!(record.version, 17);
+        assert!(record.config.announcement.enabled);
+        assert_eq!(record.config.announcement.message, "Maintenance soon");
+        assert_eq!(record.config.history.snapshot_retention_days, 45);
+        assert_eq!(record.config.history.summary_retention_days, 400);
+        assert_eq!(record.config.ads.minimum_interval_minutes, 22);
+        assert_eq!(record.config.ads.minimum_games_played, 1);
+        assert!(!record.config.ads.enabled);
+        assert!(!record.config.ads.distributions.web.enabled);
+        assert!(!record.config.ads.distributions.crazygames.enabled);
+        assert!(!record.config.ads.distributions.itch.enabled);
+        assert_eq!(record.updated_by.unwrap().username, "operator");
+        assert_eq!(record.updated_at_ms, 123456);
+    }
+
+    #[test]
+    fn pre_match_ad_break_claim_validation_is_strict() {
+        assert_eq!(
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "12345678-1234-1234-1234-123456789012",
+                &[1, 2, 3, 4],
+                100_000,
+                60_000,
+                9,
+            )
+            .unwrap(),
+            40_000
+        );
+
+        for invalid in [
+            DynamoDatabase::validate_pre_match_ad_break_claim("", &[1], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "12345678-1234-1234-1234-1234567890123",
+                &[1],
+                100,
+                10,
+                1,
+            ),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "break",
+                &[1, 2, 3, 4, 5],
+                100,
+                10,
+                1,
+            ),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1, 1], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[0], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], -1, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], 100, 0, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], 100, 10, 0),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[test]
+    fn only_conditional_transaction_cancellation_is_an_ineligible_claim() {
+        use aws_sdk_dynamodb::types::CancellationReason;
+        use aws_sdk_dynamodb::types::error::TransactionCanceledException;
+
+        let cancelled = |code: &str| {
+            TransactWriteItemsError::TransactionCanceledException(
+                TransactionCanceledException::builder()
+                    .cancellation_reasons(CancellationReason::builder().code(code).build())
+                    .build(),
+            )
+        };
+
+        assert!(DynamoDatabase::transaction_cancellation_is_conditional(
+            &cancelled("ConditionalCheckFailed")
+        ));
+        assert!(!DynamoDatabase::transaction_cancellation_is_conditional(
+            &cancelled("TransactionConflict")
         ));
     }
 

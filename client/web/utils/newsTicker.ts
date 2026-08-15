@@ -1,5 +1,5 @@
 import type { NewsTickerCtaAction } from '../types/generated';
-import type { LobbyPreferences } from '../types';
+import type { LobbyGameMode, LobbyPreferences } from '../types';
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 const MIN_POLL_INTERVAL_MS = 30_000;
@@ -10,29 +10,46 @@ export type NewsTickerPlayAction = Exclude<
   'viewLeaderboards'
 >;
 
-/** Translate a server-authored play CTA into one exact lobby configuration. */
-export const getTickerPlayPreferences = (
-  action: NewsTickerPlayAction,
-): LobbyPreferences => {
+/**
+ * The mode half of a play CTA. The casual and ranked forms of an action name
+ * the same mode; only the queue the headline described differs, and a CTA does
+ * not replay that queue.
+ *
+ * Deliberately exhaustive with no `default`, so a new server-side action fails
+ * the type check here instead of silently falling through to a wrong mode.
+ */
+const getTickerPlayMode = (action: NewsTickerPlayAction): LobbyGameMode => {
   switch (action) {
     case 'playSolo':
-      return { selectedModes: ['solo'], competitive: false };
     case 'playRankedSolo':
-      return { selectedModes: ['solo'], competitive: true };
+      return 'solo';
     case 'playDuel':
-      return { selectedModes: ['duel'], competitive: false };
-    case 'playTwoVsTwo':
-      return { selectedModes: ['2v2'], competitive: false };
-    case 'playFfa':
-      return { selectedModes: ['ffa'], competitive: false };
     case 'playRankedDuel':
-      return { selectedModes: ['duel'], competitive: true };
+      return 'duel';
+    case 'playTwoVsTwo':
     case 'playRankedTwoVsTwo':
-      return { selectedModes: ['2v2'], competitive: true };
+      return '2v2';
+    case 'playFfa':
     case 'playRankedFfa':
-      return { selectedModes: ['ffa'], competitive: true };
+      return 'ffa';
   }
 };
+
+/**
+ * Translate a server-authored play CTA into one exact lobby configuration.
+ *
+ * Every play CTA is a one-click entry into ranked, so only the mode is read
+ * off the action: a headline about a casual game still invites the player into
+ * the competitive queue for that mode. The server keeps authoring the
+ * casual/ranked halves of the action set because its own copy is written from
+ * the observed cohort — the client is what decides where the link lands.
+ */
+export const getTickerPlayPreferences = (
+  action: NewsTickerPlayAction,
+): LobbyPreferences => ({
+  selectedModes: [getTickerPlayMode(action)],
+  competitive: true,
+});
 
 export const getTickerPollIntervalMs = (
   refreshAfterSeconds: number,

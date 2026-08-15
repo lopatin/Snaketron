@@ -171,7 +171,15 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
         .get_user_by_username(&user.username)
         .await?
         .expect("registered-user mirror remains present");
-    assert_eq!((persisted_user.xp, persisted_user.ranked_mmr), (15, 1_025));
+    assert_eq!(
+        (
+            persisted_user.xp,
+            persisted_user.ranked_mmr,
+            persisted_user.games_played,
+        ),
+        (15, 1_025, 1),
+        "replaying every effect must count the completed game exactly once"
+    );
     assert_eq!((mirrored_user.xp, mirrored_user.ranked_mmr), (15, 1_025));
 
     let ranking = db
@@ -251,12 +259,14 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
     let raced_results = [left?, right?];
     assert!(raced_results.contains(&EffectApplyResult::Applied));
     assert!(raced_results.contains(&EffectApplyResult::AlreadyApplied));
+    let raced_user = db
+        .get_user_by_id(user.id)
+        .await?
+        .expect("user remains present");
     assert_eq!(
-        db.get_user_by_id(user.id)
-            .await?
-            .expect("user remains present")
-            .xp,
-        20
+        (raced_user.xp, raced_user.games_played),
+        (20, 2),
+        "a second distinct game counts once while its raced reward stays idempotent"
     );
     assert_eq!(
         db.get_user_by_username(&user.username)
@@ -311,13 +321,11 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
         ],
     );
     apply_all_effects(&db, &guest_record).await?;
-    assert_eq!(
-        db.get_user_by_id(guest.id)
-            .await?
-            .expect("guest remains present")
-            .xp,
-        7
-    );
+    let persisted_guest = db
+        .get_user_by_id(guest.id)
+        .await?
+        .expect("guest remains present");
+    assert_eq!((persisted_guest.xp, persisted_guest.games_played), (7, 1));
 
     // Two games for one user may concurrently move the same sorted ranking
     // row. Conditional delete/put plus bounded re-read retries must preserve
@@ -371,6 +379,10 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
         .await?
         .expect("ranking mirror remains present");
     assert_eq!(ranked_main.ranked_mmr, 1_025);
+    assert_eq!(
+        ranked_main.games_played, 2,
+        "two distinct concurrently persisted games must each count once"
+    );
     assert_eq!(ranked_mirror.ranked_mmr, 1_025);
     let concurrent_ranking = db
         .get_user_ranking(
@@ -419,6 +431,14 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
             .await?
             .iter()
             .all(|(_, result)| *result == EffectApplyResult::AlreadyApplied)
+    );
+    assert_eq!(
+        db.get_user_by_id(ranking_user.id)
+            .await?
+            .expect("ranking user remains present after replay")
+            .games_played,
+        2,
+        "replaying both concurrent completions must not increment the lifetime count"
     );
 
     // Materialization captures high-score payloads before the authoritative
@@ -496,6 +516,16 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
         .collect();
     assert_eq!(game_scores.len(), 2);
     assert!(game_scores.iter().all(|entry| entry.score == 777));
+    for user in [&high_user_a, &high_user_b] {
+        assert_eq!(
+            db.get_user_by_id(user.id)
+                .await?
+                .expect("high-score user remains present")
+                .games_played,
+            1,
+            "serialization and effect replay must count each player once"
+        );
+    }
 
     Ok(())
 }

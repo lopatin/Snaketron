@@ -10,6 +10,7 @@ import {
   LobbyState,
   User,
   MatchmakingStatus,
+  ClientAdsConfig,
 } from '../types';
 import {
   OutboundMessage,
@@ -57,6 +58,11 @@ import {
   replacementReadyForPromotion,
 } from '../services/websocketLifecycle';
 import { subscribeGameStorage } from '../services/gameStorage';
+import {
+  DISABLED_AD_CONFIGURATION,
+  normalizeAdConfiguration,
+  normalizeLobbyAdBreak,
+} from '../services/ads/config';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -124,7 +130,7 @@ export const lobbyStorageKeyForIdentity = (
 };
 const MAX_CHAT_HISTORY = 200;
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
-const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
+const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'ad_break', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
 // RFC close codes in the 1001-2999 range are reserved for the protocol and
 // servers; browsers reject them when passed to WebSocket.close(). Preserve
@@ -319,6 +325,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
   const [lobbyRestorationComplete, setLobbyRestorationComplete] = useState(false);
   const [serverCapabilities, setServerCapabilities] = useState<ReadonlySet<string>>(new Set());
+  const [adConfiguration, setAdConfiguration] = useState<ClientAdsConfig>(() => ({
+    ...DISABLED_AD_CONFIGURATION,
+    banners: { ...DISABLED_AD_CONFIGURATION.banners },
+    video: { ...DISABLED_AD_CONFIGURATION.video },
+  }));
   const currentLobbyRef = useRef<Lobby | null>(null);
   const desiredLobbyPreferencesRef = useRef<LobbyPreferences | null>(storedPreferences);
   const ws = useRef<WebSocket | null>(null);
@@ -628,6 +639,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     console.log('WebSocket message received:', redactChatPayloadForLogging(rawMessage));
+    if (rawMessage?.AdConfiguration) {
+      setAdConfiguration(normalizeAdConfiguration(rawMessage.AdConfiguration));
+    }
     const gameId = Number(rawMessage?.GameEvent?.game_id);
     if (Number.isSafeInteger(gameId)) {
       const nextWatermark = advanceCandidateGameWatermark(
@@ -1451,6 +1465,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       setIsConnected(false);
       setAuthHandshakeState(false);
       setServerCapabilities(new Set());
+      setAdConfiguration(normalizeAdConfiguration(null));
       lastAuthTokenRef.current = null;
       clockSync.reset();
       syncRequestTimes.current.clear();
@@ -1636,6 +1651,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     setAuthHandshakeState(false);
     lastAuthTokenRef.current = null;
     setServerCapabilities(new Set());
+    setAdConfiguration(normalizeAdConfiguration(null));
     plannedHandoffStartedAtRef.current = null;
     recoveryStartedAtRef.current = null;
     usableGapStartedAtRef.current = null;
@@ -2313,20 +2329,39 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
       };
 
-      const handleSuccess = (lobbyId: number | null, hostUserId?: number) => {
+      const handleSuccess = (
+        lobbyId: number | null,
+        hostUserId?: number,
+        authoritativeUpdate?: any,
+      ) => {
         if (settled) {
           return;
         }
         settled = true;
+        const rawState = typeof authoritativeUpdate?.state === 'string'
+          ? authoritativeUpdate.state.trim().toLowerCase()
+          : '';
+        const state: LobbyState = VALID_LOBBY_STATES.includes(rawState as LobbyState)
+          ? rawState as LobbyState
+          : 'waiting';
         const joinedLobby: Lobby = {
           id: lobbyId,
           code: normalizedCode,
           hostUserId: hostUserId ?? 0, // Will be refined by future LobbyUpdate messages
           region: '', // Will be set by LobbyUpdate
-          state: 'waiting',
+          state,
+          adBreak: state === 'ad_break'
+            ? normalizeLobbyAdBreak(authoritativeUpdate?.ad_break)
+            : null,
         };
         currentLobbyRef.current = joinedLobby;
         setCurrentLobby(joinedLobby);
+        if (Array.isArray(authoritativeUpdate?.members)) {
+          setLobbyMembers(authoritativeUpdate.members);
+        }
+        if (authoritativeUpdate?.preferences) {
+          setLobbyPreferences(normalizeLobbyPreferences(authoritativeUpdate.preferences));
+        }
         // console.log('setLobbyPreferences', DEFAULT_LOBBY_PREFERENCES);
         // setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
         persistLobby({ id: lobbyId, code: normalizedCode });
@@ -2398,7 +2433,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         const lobbyId = typeof lobby_id === 'number' && Number.isFinite(lobby_id)
           ? lobby_id
           : null;
-        handleSuccess(lobbyId, host_user_id);
+        handleSuccess(lobbyId, host_user_id, message.data);
       });
 
       // Timeout after 5 seconds
@@ -2710,6 +2745,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       const lobbyState: LobbyState = VALID_LOBBY_STATES.includes(rawState as LobbyState)
         ? (rawState as LobbyState)
         : 'waiting';
+      const adBreak = lobbyState === 'ad_break'
+        ? normalizeLobbyAdBreak(payload.ad_break)
+        : null;
 
       const normalizedPreferences = normalizeLobbyPreferences(payload.preferences);
       // console.log('setLobbyPreferences', normalizedPreferences);
@@ -2735,6 +2773,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           ...previous,
           hostUserId,
           state: lobbyState,
+          adBreak,
         };
         currentLobbyRef.current = updatedLobby;
         return updatedLobby;
@@ -3056,6 +3095,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     connectToRegion,
     currentRegionUrl,
     latencyMs,
+    adConfiguration,
     lobbyRestorationComplete,
     currentLobby,
     lobbyMembers,

@@ -26,6 +26,9 @@ pub struct User {
     pub ranked_mmr: i32,
     pub casual_mmr: i32,
     pub xp: i32,
+    /// Lifetime completed matches across modes, regions, and seasons.
+    #[serde(default)]
+    pub games_played: i32,
     pub created_at: DateTime<Utc>,
     pub is_guest: bool,
     pub guest_token: Option<String>,
@@ -201,6 +204,8 @@ pub struct LobbyMetadata {
     pub state: String, // waiting | queued | matched
     #[serde(default)]
     pub matchmaking_pool: crate::matchmaking_pool::MatchmakingPool,
+    #[serde(default)]
+    pub ad_break: Option<crate::ads::LobbyAdBreak>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +264,278 @@ pub struct NewsHighScoreSnapshot {
     pub coverage: NewsLeaderboardCoverage,
 }
 
+/// A player-shaped projection of an immutable completed match. History rows
+/// intentionally contain only result data; the substantially larger final
+/// `GameState` remains on the completed-game item for bounded snapshot reloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct MatchHistoryPlayer {
+    pub user_id: u32,
+    pub username: String,
+    pub team_id: Option<u8>,
+    pub score: u32,
+    pub team_score: Option<u32>,
+    pub xp_gained: u32,
+    pub mmr_delta: Option<i32>,
+    pub outcome: String,
+}
+
+/// Compact, versioned match result shared by the player History modal and the
+/// administrative history view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct MatchHistorySummary {
+    pub schema_version: u16,
+    pub game_id: u32,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub started_at_ms: i64,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub ended_at_ms: i64,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub duration_ms: u64,
+    pub mode: String,
+    pub mode_label: String,
+    pub queue_mode: String,
+    pub is_private: bool,
+    pub is_stress_test: bool,
+    pub completed_by_inactivity: bool,
+    pub players: Vec<MatchHistoryPlayer>,
+    pub winner_user_ids: Vec<u32>,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub snapshot_available_until_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct MatchHistoryPage {
+    pub entries: Vec<MatchHistorySummary>,
+    pub next_cursor: Option<String>,
+}
+
+impl MatchHistoryPage {
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_cursor: None,
+        }
+    }
+}
+
+pub const RUNTIME_CONFIG_SCHEMA_VERSION: u16 = 2;
+
+const fn runtime_config_schema_version() -> u16 {
+    RUNTIME_CONFIG_SCHEMA_VERSION
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeAnnouncementConfig {
+    pub enabled: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeDistributionAdsConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeAdsDistributionsConfig {
+    pub web: RuntimeDistributionAdsConfig,
+    pub crazygames: RuntimeDistributionAdsConfig,
+    pub itch: RuntimeDistributionAdsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeAdsConfig {
+    pub enabled: bool,
+    pub minimum_games_played: u32,
+    pub minimum_interval_minutes: u16,
+    pub distributions: RuntimeAdsDistributionsConfig,
+}
+
+impl Default for RuntimeAdsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            minimum_games_played: 1,
+            minimum_interval_minutes: 10,
+            distributions: RuntimeAdsDistributionsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeHistoryConfig {
+    pub snapshot_retention_days: u16,
+    pub summary_retention_days: u16,
+}
+
+impl Default for RuntimeHistoryConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_retention_days: 30,
+            summary_retention_days: 365,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeConfig {
+    pub announcement: RuntimeAnnouncementConfig,
+    pub ads: RuntimeAdsConfig,
+    pub history: RuntimeHistoryConfig,
+}
+
+impl RuntimeConfig {
+    pub const MAX_ANNOUNCEMENT_CHARACTERS: usize = 280;
+    pub const MAX_AD_MINIMUM_GAMES_PLAYED: u32 = 10_000;
+    pub const MAX_AD_INTERVAL_MINUTES: u16 = 24 * 60;
+    pub const MAX_HISTORY_RETENTION_DAYS: u16 = 3650;
+
+    pub fn validate(&self) -> Result<(), String> {
+        let message = self.announcement.message.trim();
+        if self.announcement.enabled && message.is_empty() {
+            return Err("announcement message is required when the announcement is enabled".into());
+        }
+        if self.announcement.message.chars().count() > Self::MAX_ANNOUNCEMENT_CHARACTERS {
+            return Err(format!(
+                "announcement message must be at most {} characters",
+                Self::MAX_ANNOUNCEMENT_CHARACTERS
+            ));
+        }
+        if self.announcement.message.chars().any(char::is_control) {
+            return Err("announcement message must not contain control characters".into());
+        }
+        if self.ads.minimum_games_played > Self::MAX_AD_MINIMUM_GAMES_PLAYED {
+            return Err(format!(
+                "minimum games played must be at most {}",
+                Self::MAX_AD_MINIMUM_GAMES_PLAYED
+            ));
+        }
+        if !(1..=Self::MAX_AD_INTERVAL_MINUTES).contains(&self.ads.minimum_interval_minutes) {
+            return Err(format!(
+                "minimum ad interval must be between 1 and {} minutes",
+                Self::MAX_AD_INTERVAL_MINUTES
+            ));
+        }
+        if !(1..=Self::MAX_HISTORY_RETENTION_DAYS).contains(&self.history.snapshot_retention_days) {
+            return Err(format!(
+                "snapshot retention must be between 1 and {} days",
+                Self::MAX_HISTORY_RETENTION_DAYS
+            ));
+        }
+        if !(1..=Self::MAX_HISTORY_RETENTION_DAYS).contains(&self.history.summary_retention_days) {
+            return Err(format!(
+                "summary retention must be between 1 and {} days",
+                Self::MAX_HISTORY_RETENTION_DAYS
+            ));
+        }
+        if self.history.summary_retention_days < self.history.snapshot_retention_days {
+            return Err("summary retention must be at least snapshot retention".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeConfigActor {
+    pub user_id: i32,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeConfigRecord {
+    #[serde(default = "runtime_config_schema_version")]
+    pub schema_version: u16,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub version: u64,
+    pub config: RuntimeConfig,
+    pub updated_by: Option<RuntimeConfigActor>,
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub updated_at_ms: i64,
+}
+
+/// Public, read-only projection of runtime settings. Administrative metadata
+/// and internal retention policy are deliberately omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct PublicRuntimeConfig {
+    #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
+    pub version: u64,
+    pub announcement: RuntimeAnnouncementConfig,
+}
+
+impl From<&RuntimeConfigRecord> for PublicRuntimeConfig {
+    fn from(record: &RuntimeConfigRecord) -> Self {
+        Self {
+            version: record.version,
+            announcement: record.config.announcement.clone(),
+        }
+    }
+}
+
+impl Default for RuntimeConfigRecord {
+    fn default() -> Self {
+        Self {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            version: 0,
+            config: RuntimeConfig::default(),
+            updated_by: None,
+            updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct RuntimeConfigAuditPage {
+    pub entries: Vec<RuntimeConfigRecord>,
+    pub next_cursor: Option<String>,
+}
+
+impl RuntimeConfigAuditPage {
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_cursor: None,
+        }
+    }
+}
+
 // DynamoDB specific models for single table design
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamoItem {
@@ -276,4 +553,106 @@ pub struct DynamoItem {
     pub ttl: Option<i64>,
     #[serde(flatten)]
     pub data: JsonValue,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_defaults_are_safe_and_valid() {
+        let config = RuntimeConfig::default();
+        assert_eq!(RUNTIME_CONFIG_SCHEMA_VERSION, 2);
+        assert!(!config.announcement.enabled);
+        assert!(config.announcement.message.is_empty());
+        assert!(!config.ads.enabled);
+        assert_eq!(config.ads.minimum_games_played, 1);
+        assert_eq!(config.ads.minimum_interval_minutes, 10);
+        assert!(!config.ads.distributions.web.enabled);
+        assert!(!config.ads.distributions.crazygames.enabled);
+        assert!(!config.ads.distributions.itch.enabled);
+        assert_eq!(config.history.snapshot_retention_days, 30);
+        assert_eq!(config.history.summary_retention_days, 365);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_retention_and_announcement() {
+        let mut config = RuntimeConfig::default();
+        config.announcement.enabled = true;
+        assert!(config.validate().is_err());
+
+        config.announcement.message = "Maintenance soon".to_string();
+        config.history.snapshot_retention_days = 366;
+        config.history.summary_retention_days = 365;
+        assert!(config.validate().is_err());
+
+        config.history.snapshot_retention_days = 30;
+        config.ads.minimum_games_played = RuntimeConfig::MAX_AD_MINIMUM_GAMES_PLAYED + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn public_runtime_config_omits_admin_metadata_and_retention() {
+        let record = RuntimeConfigRecord {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            version: 3,
+            config: RuntimeConfig::default(),
+            updated_by: Some(RuntimeConfigActor {
+                user_id: 7,
+                username: "operator".to_string(),
+            }),
+            updated_at_ms: 123,
+        };
+        let value = serde_json::to_value(PublicRuntimeConfig::from(&record)).unwrap();
+        assert_eq!(value["version"], 3);
+        assert!(value.get("announcement").is_some());
+        assert!(value.get("ads").is_none());
+        assert!(value.get("history").is_none());
+        assert!(value.get("updatedBy").is_none());
+        assert!(value.get("updatedAtMs").is_none());
+    }
+
+    #[test]
+    fn persisted_runtime_config_tolerates_missing_and_unknown_fields() {
+        let config: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "ads": {
+                "enabled": true,
+                "minimumGamesPlayed": 4,
+                "distributions": {
+                    "web": { "enabled": true },
+                    "crazygames": { "enabled": false },
+                    "itch": { "enabled": false }
+                },
+                "futureAdSetting": "ignored"
+            },
+            "futureSection": {
+                "enabled": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(config.announcement, RuntimeAnnouncementConfig::default());
+        assert!(config.ads.enabled);
+        assert_eq!(config.ads.minimum_games_played, 4);
+        assert_eq!(config.ads.minimum_interval_minutes, 10);
+        assert!(config.ads.distributions.web.enabled);
+        assert!(!config.ads.distributions.crazygames.enabled);
+        assert!(!config.ads.distributions.itch.enabled);
+        assert_eq!(config.history, RuntimeHistoryConfig::default());
+    }
+
+    #[test]
+    fn legacy_runtime_config_record_defaults_schema_version() {
+        let record: RuntimeConfigRecord = serde_json::from_value(serde_json::json!({
+            "version": 4,
+            "config": {},
+            "updatedBy": null,
+            "updatedAtMs": 123
+        }))
+        .unwrap();
+
+        assert_eq!(record.schema_version, RUNTIME_CONFIG_SCHEMA_VERSION);
+        assert_eq!(record.config, RuntimeConfig::default());
+    }
 }

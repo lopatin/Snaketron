@@ -18,7 +18,6 @@ const withInviteSdk = async (
   environment: 'local' | 'crazygames' | 'disabled' = 'local',
 ) => {
   const previousBuild = process.env.CRAZYGAMES_BUILD;
-  const previousAds = process.env.CRAZYGAMES_ADS_ENABLED;
   const previousData = process.env.CRAZYGAMES_DATA_ENABLED;
   const hadWindow = 'window' in globalThis;
   const previousWindow = (globalThis as any).window;
@@ -26,7 +25,6 @@ const withInviteSdk = async (
   let userTokenCalls = 0;
 
   process.env.CRAZYGAMES_BUILD = 'true';
-  process.env.CRAZYGAMES_ADS_ENABLED = 'false';
   process.env.CRAZYGAMES_DATA_ENABLED = 'false';
 
   const sdk = {
@@ -104,7 +102,6 @@ const withInviteSdk = async (
       delete (globalThis as any).window;
     }
     process.env.CRAZYGAMES_BUILD = previousBuild;
-    process.env.CRAZYGAMES_ADS_ENABLED = previousAds;
     process.env.CRAZYGAMES_DATA_ENABLED = previousData;
   }
 };
@@ -230,20 +227,19 @@ test('a warm addJoinRoomListener event publishes each accepted room invitation',
   });
 });
 
-test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', async () => {
+test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', async (t) => {
   const previousBuild = process.env.CRAZYGAMES_BUILD;
-  const previousAds = process.env.CRAZYGAMES_ADS_ENABLED;
   const previousData = process.env.CRAZYGAMES_DATA_ENABLED;
   const hadWindow = 'window' in globalThis;
   const previousWindow = (globalThis as any).window;
 
   process.env.CRAZYGAMES_BUILD = 'true';
-  process.env.CRAZYGAMES_ADS_ENABLED = 'true';
   process.env.CRAZYGAMES_DATA_ENABLED = 'true';
 
   let settingsListener = (_settings: any) => {};
   let joinListener = (_params: Record<string, string>) => {};
   let authListener = (_user: any) => {};
+  let adCallbacks: any = null;
   const calls: string[] = [];
   const roomUpdates: any[] = [];
   const data = new Map<string, string>();
@@ -260,8 +256,7 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
       hasAdblock: async () => false,
       requestAd: (_type: string, callbacks: any) => {
         calls.push('adRequested');
-        callbacks.adStarted();
-        callbacks.adFinished();
+        adCallbacks = callbacks;
       },
     },
     banner: {
@@ -324,6 +319,7 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     // security-critical token call, so SDK User-module calls never overlap.
     assert.equal(service.getSnapshot().portalUser, null);
     assert.equal(service.getSnapshot().inviteSequence, 1);
+    assert.equal(service.getSnapshot().adSdkAvailable, true);
 
     settingsListener({ disableChat: true, muteAudio: true });
     assert.deepEqual(service.getSnapshot().settings, { disableChat: true, muteAudio: true });
@@ -341,7 +337,22 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
     service.loadingStart();
     service.loadingStop();
     service.gameplayStart();
-    assert.deepEqual(await service.requestAd('midgame'), { status: 'finished' });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let adSettled = false;
+    const adResult = service.requestAd('midgame').then((result: unknown) => {
+      adSettled = true;
+      return result;
+    });
+    assert.ok(adCallbacks);
+    assert.equal(service.getSnapshot().adState, 'requesting');
+    t.mock.timers.tick(100_000);
+    await Promise.resolve();
+    assert.equal(adSettled, false, 'local timers must not finish a submitted SDK request');
+    adCallbacks.adStarted();
+    assert.equal(service.getSnapshot().adState, 'playing');
+    adCallbacks.adFinished();
+    assert.deepEqual(await adResult, { status: 'finished' });
+    assert.equal(service.getSnapshot().adState, 'idle');
     assert.deepEqual(
       calls.filter((call) => ['loadingStart', 'loadingStop', 'gameplayStart', 'gameplayStop', 'adRequested'].includes(call)),
       ['loadingStart', 'loadingStop', 'gameplayStart', 'adRequested', 'gameplayStop'],
@@ -365,7 +376,6 @@ test('an enabled v3 adapter bridges settings, data, rooms, identity, and ads', a
       delete (globalThis as any).window;
     }
     process.env.CRAZYGAMES_BUILD = previousBuild;
-    process.env.CRAZYGAMES_ADS_ENABLED = previousAds;
     process.env.CRAZYGAMES_DATA_ENABLED = previousData;
   }
 });

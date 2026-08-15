@@ -39,7 +39,6 @@ const COMBO_REMAINING_WINDOW_BUCKETS_MS: &[f64] = &[
 
 struct OtelMetrics {
     fenced_write_rejections: Counter<u64>,
-    recovery_fingerprint_divergences: Counter<u64>,
     planned_drain_failures: Counter<u64>,
     command_claims: Counter<u64>,
     command_acks: Counter<u64>,
@@ -378,11 +377,6 @@ impl OtelMetrics {
                 "snaketron.fenced_write_rejections",
                 "Rejected writes from stale executor owners",
             ),
-            recovery_fingerprint_divergences: counter(
-                &meter,
-                "snaketron.recovery_fingerprint_divergences",
-                "Recovered states that diverged from their deterministic fingerprint",
-            ),
             planned_drain_failures: counter(
                 &meter,
                 "snaketron.planned_drain_failures",
@@ -720,10 +714,6 @@ macro_rules! counter_recorder {
 }
 
 counter_recorder!(record_fenced_write_rejection, fenced_write_rejections);
-counter_recorder!(
-    record_recovery_fingerprint_divergence,
-    recovery_fingerprint_divergences
-);
 counter_recorder!(record_planned_drain_failure, planned_drain_failures);
 counter_recorder!(record_command_claims, command_claims);
 counter_recorder!(record_command_acks, command_acks);
