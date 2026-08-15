@@ -23,18 +23,17 @@ export const RANK_BANDS: RankBand[] = [
   { min: 1200, max: 1300, tier: 'gold', division: 1 },
   { min: 1300, max: 1400, tier: 'gold', division: 2 },
   { min: 1400, max: 1500, tier: 'gold', division: 3 },
-  { min: 1500, max: 1600, tier: 'platinum', division: 1 },
-  { min: 1600, max: 1700, tier: 'platinum', division: 2 },
-  { min: 1700, max: 1800, tier: 'platinum', division: 3 },
-  { min: 1800, max: 1900, tier: 'platinum', division: 4 },
-  { min: 1900, max: 2000, tier: 'diamond', division: 1 },
-  { min: 2000, max: 2100, tier: 'diamond', division: 2 },
-  { min: 2100, max: 2200, tier: 'diamond', division: 3 },
-  { min: 2200, max: 2300, tier: 'diamond', division: 4 },
+  // Elite tiers carry three divisions each; the tier boundaries
+  // (1500/1900/2300) are unchanged, the bands inside are re-sliced.
+  { min: 1500, max: 1633, tier: 'platinum', division: 1 },
+  { min: 1633, max: 1766, tier: 'platinum', division: 2 },
+  { min: 1766, max: 1900, tier: 'platinum', division: 3 },
+  { min: 1900, max: 2033, tier: 'diamond', division: 1 },
+  { min: 2033, max: 2166, tier: 'diamond', division: 2 },
+  { min: 2166, max: 2300, tier: 'diamond', division: 3 },
   { min: 2300, max: 2400, tier: 'grandmaster', division: 1 },
   { min: 2400, max: 2500, tier: 'grandmaster', division: 2 },
-  { min: 2500, max: 2600, tier: 'grandmaster', division: 3 },
-  { min: 2600, tier: 'grandmaster', division: 4 },
+  { min: 2500, tier: 'grandmaster', division: 3 },
 ];
 
 export const rankBandIndexForMmr = (mmr: number): number => {
@@ -64,17 +63,11 @@ const TIER_LABELS: Record<RankTier, string> = {
   grandmaster: 'Grand Master',
 };
 
-const DIVISION_LABELS = ['I', 'II', 'III', 'IV'];
+const DIVISION_LABELS = ['I', 'II', 'III'];
 
 export const formatRankLabel = (rank: Rank): string => {
   const divisionLabel = DIVISION_LABELS[rank.division - 1] ?? '';
   return `${TIER_LABELS[rank.tier]} ${divisionLabel}`.trim();
-};
-
-export const getRankImage = (tier: RankTier | 'unranked'): string => {
-  if (tier === 'unranked') return 'images/unranked.png';
-  const imageTier = tier === 'master' ? 'grandmaster' : tier;
-  return `images/${imageTier}.png`;
 };
 
 /**

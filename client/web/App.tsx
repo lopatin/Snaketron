@@ -36,10 +36,13 @@ const AdminPage = !IS_EMBEDDED_BUILD
   ? React.lazy(() => import('./components/AdminPage'))
   : null;
 
-// Design-review harness for the post-match rating reveal. Only reachable —
-// and only bundled — outside production builds.
+// Design-review harnesses (post-match rating reveal, rank badges). Only
+// reachable — and only bundled — outside production builds.
 const RatingRevealQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/RatingRevealQA'))
+  : null;
+const RankIconsQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/RankIconsQA'))
   : null;
 
 function AppContent() {
@@ -205,6 +208,16 @@ function AppContent() {
             element={
               <React.Suspense fallback={null}>
                 <RatingRevealQA />
+              </React.Suspense>
+            }
+          />
+        )}
+        {RankIconsQA && (
+          <Route
+            path="/qa/rank-icons"
+            element={
+              <React.Suspense fallback={null}>
+                <RankIconsQA />
               </React.Suspense>
             }
           />

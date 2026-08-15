@@ -3,6 +3,8 @@ import { User } from '../types';
 import { api } from '../services/api';
 import { LobbyModal } from './LobbyModal';
 import { MatchHistoryList } from './MatchHistoryList';
+import RankIcon from './RankIcon';
+import { formatRankLabel, getRankFromMMR } from '../utils/rank';
 
 export type AccountModalView = 'profile' | 'history';
 
@@ -25,6 +27,7 @@ export const AccountModal: React.FC<AccountModalProps> = ({ view, user, onClose 
   }
 
   const isHistory = view === 'history';
+  const rank = user.mmr != null ? getRankFromMMR(user.mmr) : null;
 
   return (
     <LobbyModal
@@ -56,8 +59,27 @@ export const AccountModal: React.FC<AccountModalProps> = ({ view, user, onClose 
             <dd>#{user.id}</dd>
           </div>
           <div>
-            <dt>Rating</dt>
-            <dd>{user.mmr?.toLocaleString() ?? '—'}</dd>
+            <dt>Rank</dt>
+            <dd className="account-profile-rank">
+              {rank ? (
+                <>
+                  <RankIcon
+                    tier={rank.tier}
+                    division={rank.division}
+                    label={formatRankLabel(rank)}
+                  />
+                  <span>
+                    {formatRankLabel(rank)}
+                    <em>{user.mmr?.toLocaleString()} MMR</em>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <RankIcon tier="unranked" label="Unranked" />
+                  <span>Unranked</span>
+                </>
+              )}
+            </dd>
           </div>
         </dl>
       )}
