@@ -114,6 +114,31 @@ class Voicing:
     lead_gain: float = 0.34
 
 
+# The tune. Scale degrees into the sounding chord's tones, as
+# (bar_in_phrase, sixteenth, tone_index, octave). Eight bars, so it spans two
+# full trips round the progression and does not feel like a two-bar loop.
+#
+# It is stated three times at rising density: hinted in the build (sparse, an
+# octave down, filtered), full in the drop, and answered by a counter-melody.
+# A trailer tune nobody hears until 18 s is not a tune, it is a payoff.
+MELODY = [
+    (0, 0, 0, 5), (0, 6, 2, 4), (0, 10, 1, 5),
+    (1, 0, 1, 5), (1, 4, 0, 5), (1, 10, 2, 4),
+    (2, 0, 2, 4), (2, 6, 1, 5), (2, 12, 0, 5),
+    (3, 0, 0, 5), (3, 8, 2, 5), (3, 12, 1, 5),
+    (4, 0, 1, 5), (4, 6, 0, 5), (4, 10, 2, 5),
+    (5, 0, 2, 5), (5, 4, 1, 5), (5, 10, 0, 5),
+    (6, 0, 0, 5), (6, 6, 2, 4), (6, 12, 1, 5),
+    (7, 0, 1, 5), (7, 8, 0, 5),
+]
+
+# The answer: lower, sparser, lands in the gaps the melody leaves.
+COUNTER = [
+    (0, 12, 0, 4), (1, 12, 2, 3), (2, 10, 1, 4), (3, 4, 0, 4),
+    (4, 12, 2, 4), (5, 12, 0, 4), (6, 10, 2, 3), (7, 4, 1, 4),
+]
+
+
 def kick_times(cfg: Voicing) -> list[float]:
     """4-on-the-floor from the demolition cut, out for the breakdown, back on
     the drop, out again at the fadewhite."""
@@ -222,9 +247,30 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
             mix.add(hc, t, vel * (1.25 if t >= T_DROP else 1.0))
         t += interval
 
+    # Shaker on the 16ths from build C: fills the space between the hats and
+    # is what makes the second half feel like it is moving faster without any
+    # tempo change.
+    shaker = kit.hat(decay=0.018, tone=12_000)
+    t = 10.0
+    while t < T_FADEWHITE:
+        if not (T_BREAK <= t < T_DROP):
+            on_beat = (t % BEAT) < 1e-6
+            mix.add(shaker, t, 0.045 if on_beat else 0.070)
+        t += STEP
+
     # Crashes on the structural moments.
     for t, g in [(2.0, 0.32), (T_KILL_1, 0.38), (T_DROP, 0.55), (T_FADEWHITE, 0.30)]:
         mix.add(cr, t, g)
+
+    # Tom fills across the last half-bar into each section change. A section
+    # that simply starts is a section the ear does not notice arriving.
+    toms = [kit.tom(f) for f in (196.0, 165.0, 131.0, 110.0)]
+    for target in (7.0, 13.0, T_BREAK):
+        for i in range(4):
+            ft = target - BEAT + i * (BEAT / 4)
+            if ft < 2.0:
+                continue
+            mix.add(toms[i], ft, 0.30 + 0.06 * i)
 
     # Breakdown snare roll: accelerating 16ths -> 32nds into the drop.
     t = T_BREAK + BEAT
@@ -243,14 +289,26 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
             t += BEAT
             continue
         ch = chord_at(t)
-        f = note(f'{ROOTS[ch]}{cfg.bass_octave}')
+        beat_in_bar = int(round((t % BAR) / BEAT)) % 4
+        # Octave jump on the last beat of each bar: the line moves instead of
+        # hammering the root, which is the difference between a bassline and a
+        # pedal tone.
+        octv = cfg.bass_octave + (1 if beat_in_bar == 3 else 0)
+        f = note(f'{ROOTS[ch]}{octv}')
+        fifth = note(f'{CHORD_TONES[ch][2]}{cfg.bass_octave}')
         if cfg.bass_style == 'sub':
             bass.add(kit.sub(f, BEAT * 0.92), t, 1.0)
+            if beat_in_bar == 2 and t >= T_DROP:
+                bass.add(kit.sub(fifth, BEAT * 0.42), t + BEAT / 2, 0.55)
         elif cfg.bass_style == 'reese':
             bass.add(kit.reese(f, BEAT * 0.92), t, 0.8)
-        else:  # pluck: offbeat 8ths, French house
+            if beat_in_bar in (1, 3):
+                bass.add(kit.reese(fifth, BEAT * 0.30), t + BEAT * 0.75, 0.4)
+        else:  # pluck: offbeat 16ths, French house
             bass.add(kit.pluck_bass(f, BEAT * 0.42), t, 0.9)
-            bass.add(kit.pluck_bass(f, BEAT * 0.42), t + BEAT / 2, 0.75)
+            bass.add(kit.pluck_bass(f, BEAT * 0.30), t + BEAT * 0.5, 0.72)
+            if beat_in_bar in (1, 3):
+                bass.add(kit.pluck_bass(fifth, BEAT * 0.26), t + BEAT * 0.75, 0.5)
         t += BEAT
     # Sub under the drop gets an octave-down reinforcement.
     t = T_DROP
@@ -338,23 +396,28 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
     chord_buf = sweep_ladder(chords.out(), chord_cut, resonance=0.30, drive=1.4)
     chord_buf = apply(room(size=0.42, wet=0.20), chord_buf)
 
-    # --- lead (drop only) --------------------------------------------------
+    # --- lead --------------------------------------------------------------
     lead = Mix(DURATION)
     if cfg.lead_style != 'none':
-        melody = [
-            # (bar offset from drop, step, scale degree index into chord tones, octave)
-            (0, 0, 0, 5), (0, 6, 2, 4), (0, 10, 1, 5),
-            (1, 0, 1, 5), (1, 4, 0, 5), (1, 10, 2, 4),
-            (2, 0, 2, 4), (2, 6, 1, 5), (2, 12, 0, 5),
-            (3, 0, 0, 5), (3, 8, 2, 5),
+        # Three statements: a hint under the gameplay build (quiet, an octave
+        # down), the full tune on the drop, and the counter-melody answering it.
+        statements = [
+            (10.0, MELODY, -1, 0.30, 4),   # build C: hint
+            (13.0, MELODY, -1, 0.42, 4),   # peak A: louder hint
+            (T_DROP, MELODY, 0, 1.00, 8),  # the drop: full
+            (T_DROP, COUNTER, 0, 0.55, 8),  # the answer
         ]
-        for cycle in range(2):
-            for bar_off, step, tone_i, octv in melody:
-                t = T_DROP + (cycle * 4 + bar_off) * BAR + step * STEP
-                if t >= T_FADEWHITE:
+        for origin, phrase, oct_shift, vel, bars in statements:
+            for bar_off, step, tone_i, octv in phrase:
+                if bar_off >= bars:
+                    continue
+                t = origin + bar_off * BAR + step * STEP
+                if t >= T_FADEWHITE or t < origin:
+                    continue
+                if T_BREAK <= t < T_DROP:
                     continue
                 ch = chord_at(t)
-                f = note(f'{CHORD_TONES[ch][tone_i]}{octv}')
+                f = note(f'{CHORD_TONES[ch][tone_i]}{octv + oct_shift}')
                 length = STEP * 5
                 if cfg.lead_style == 'square':
                     raw = square(f, int(length * SR))
@@ -372,7 +435,7 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
                 else:
                     v = supersaw(f, int(length * SR), voices=7, detune_cents=20)
                 env = perc_env(v.shape[1], 0, curve=2.2)
-                lead.add(v * env, t, 1.0)
+                lead.add(v * env, t, vel)
     lead_buf = apply(Pedalboard([
         LadderFilter(mode=LadderFilter.Mode.LPF12, cutoff_hz=6500, resonance=0.25, drive=1.5),
         Chorus(rate_hz=0.6, depth=0.25, mix=0.3),

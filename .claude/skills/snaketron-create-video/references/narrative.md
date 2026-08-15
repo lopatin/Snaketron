@@ -191,7 +191,36 @@ same second.
   wall at the edge of frame reads as broken AI. Give it a turn command, or
   start it where its exit falls outside the camera rect.
 
-## 9. Slow motion needs frame rate, and rarely earns its place
+## 9. Music: check what reaches the file, not what you rendered
+
+Two defects lived in the mix chain rather than in any bed, and both were
+inaudible as *bugs* — they just made the music sound wrong:
+
+- **`sidechaincompress` ends its output when its KEY input ends.** The SFX bus
+  finished at 11.5 s of a 30.1 s film, so the bed was digital silence for the
+  entire second half. The key now gets its own `apad`ded copy of the bus.
+- **The duck was ~20 dB.** `threshold=0.025:ratio=8` does not make room for an
+  effect, it deletes the music under it. A few dB is what "duck" means; the
+  release has to finish inside a beat or the bed never comes back.
+
+So: diff the finished file's envelope against the bed you handed the renderer.
+Anything more than a few dB apart is the pipeline, not the composition.
+
+```bash
+ffmpeg -i trailer.mp4 -map 0:a rendered.wav   # then compare envelopes
+```
+
+Two composition rules that came out of the same pass:
+
+- **Author section dynamics.** The first bed sat at one RMS from the first kick
+  to the last — 4 dB of range across the whole record, which is what "not
+  exciting" is in numbers. A trailer bed wants 15+ dB, and the master bus has
+  to be gentle enough to let it through.
+- **State the tune early.** A melody that first appears at the drop is a payoff
+  with nothing to pay off. Hint it, quieter and an octave down, under the
+  gameplay.
+
+## 10. Slow motion needs frame rate, and rarely earns its place
 
 Cell-stepped snake motion does not slow down gracefully: the engine moves a
 snake a whole cell at a time, so at 0.25× you see four discrete steps a second
@@ -204,7 +233,7 @@ and the shot reads as dropped frames.
   cell-stepped. `compile_edl.py` enforces the VFPS half of that; the judgement
   is yours.
 
-## 10. Motion has one vocabulary
+## 11. Motion has one vocabulary
 
 A cut looks designed when every move belongs to the same family.
 
@@ -231,7 +260,7 @@ A cut looks designed when every move belongs to the same family.
   fault. Never apply a vignette or grain — they darken a paper-ground frame and
   fail the polarity gate.
 
-## 11. Cut on the beat, and let the tool do the arithmetic
+## 12. Cut on the beat, and let the tool do the arithmetic
 
 Beat-snapped cuts are a hard constraint, and every length change shifts every
 downstream cut. Do not solve it by hand:
@@ -244,7 +273,7 @@ python3 scripts/fit_beats.py assets/launch-trailer/launch-trailer.edl.json \
 It nudges each shot's `out` to the nearest beat and reports what it changed.
 Run it after any retiming, before rendering.
 
-## 12. Length comes from content, not from holding frames
+## 13. Length comes from content, not from holding frames
 
 If a cut is under its target length, extend the *scenarios* (more run ticks,
 another beat of action) or add a shot. Do not hold a finished animation on

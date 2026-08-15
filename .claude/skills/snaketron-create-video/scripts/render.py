@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-RENDERER_VERSION = 8
+RENDERER_VERSION = 9
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 # Brand ground truth (see references/brand.md). SnakeTron is a light product:
@@ -692,10 +692,29 @@ def _assemble(
             f"atrim=duration={float(compiled['duration']):.6f},asetpts=PTS-STARTPTS,volume={float(music.get('volume', 0.7)):.6f}[music]"
         )
         if sfx_bus and music.get("duck_under", "sfx") == "sfx":
+            # `sidechaincompress` ends its OUTPUT when its key input ends, so
+            # the music was cut to digital silence from the last SFX onward —
+            # in the launch trailer that killed the bed at 11.5s of 30.1s.
+            # The key gets its own padded copy of the bus; the audible copy is
+            # left alone so the SFX themselves are unchanged.
+            filters.append(f"[{sfx_bus}]asplit=2[sfxaud][sfxkeyraw]")
             filters.append(
-                f"[music][{sfx_bus}]sidechaincompress=threshold=0.025:ratio=8:attack=5:release=250[ducked]"
+                f"[sfxkeyraw]apad=whole_dur={float(compiled['duration']):.6f}[sfxkey]"
             )
-            mix_labels += ["ducked", sfx_bus]
+            # Threshold 0.025 with ratio 8 is ~20 dB of gain reduction — the
+            # bed disappeared under every hit rather than making room for it.
+            # These values duck by a few dB, which is what "make room" means,
+            # and release inside a beat at 120 BPM so the music comes back
+            # before the next bar.
+            duck = music.get("duck", {})
+            filters.append(
+                f"[music][sfxkey]sidechaincompress="
+                f"threshold={float(duck.get('threshold', 0.10)):.4f}:"
+                f"ratio={float(duck.get('ratio', 3.0)):.2f}:"
+                f"attack={float(duck.get('attack_ms', 12)):.1f}:"
+                f"release={float(duck.get('release_ms', 260)):.1f}[ducked]"
+            )
+            mix_labels += ["ducked", "sfxaud"]
         else:
             mix_labels.append("music")
             if sfx_bus:
