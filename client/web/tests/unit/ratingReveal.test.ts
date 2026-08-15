@@ -109,33 +109,31 @@ test('post-match rating progress is limited to competitive ladder matches', () =
 
 test('snapshots require a persisted MMR value', () => {
   assert.equal(
-    snapshotFromResponse({ rank: null, mmr: null, wins: null, losses: null, winRate: null }),
+    snapshotFromResponse({ mmr: null, wins: null, losses: null, winRate: null }),
     null,
   );
   assert.deepEqual(
-    snapshotFromResponse({ rank: 12, mmr: 1480, wins: 9, losses: 4, winRate: 69.2 }),
-    { mmr: 1480, wins: 9, losses: 4, position: 12 },
+    snapshotFromResponse({ mmr: 1480, wins: 9, losses: 4, winRate: 69.2 }),
+    { mmr: 1480, wins: 9, losses: 4 },
   );
 });
 
 test('settlement fires on any persisted counter moving', () => {
-  const baseline: RatingSnapshot = { mmr: 1480, wins: 9, losses: 4, position: 12 };
+  const baseline: RatingSnapshot = { mmr: 1480, wins: 9, losses: 4 };
 
   assert.equal(ratingHasSettled(baseline, null), false);
   assert.equal(ratingHasSettled(baseline, { ...baseline }), false);
   assert.equal(ratingHasSettled(baseline, { ...baseline, mmr: 1495 }), true);
   assert.equal(ratingHasSettled(baseline, { ...baseline, wins: 10 }), true);
   assert.equal(ratingHasSettled(baseline, { ...baseline, losses: 5 }), true);
-  // Leaderboard position shifting alone is other players moving, not us.
-  assert.equal(ratingHasSettled(baseline, { ...baseline, position: 11 }), false);
   // First rated match: the row appearing at all is the signal.
   assert.equal(ratingHasSettled(null, { ...baseline }), true);
   assert.equal(ratingHasSettled(null, null), false);
 });
 
 test('a competitive reveal carries delta, movement, and meter positions', () => {
-  const before: RatingSnapshot = { mmr: 1190, wins: 9, losses: 4, position: 20 };
-  const after: RatingSnapshot = { mmr: 1215, wins: 10, losses: 4, position: 16 };
+  const before: RatingSnapshot = { mmr: 1190, wins: 9, losses: 4 };
+  const after: RatingSnapshot = { mmr: 1215, wins: 10, losses: 4 };
 
   const reveal = buildRatingReveal('Competitive', 'duel', before, after);
   assert.equal(reveal.delta, 25);
@@ -148,7 +146,7 @@ test('a competitive reveal carries delta, movement, and meter positions', () => 
 });
 
 test('a first rated match has no delta and no movement to announce', () => {
-  const after: RatingSnapshot = { mmr: 1020, wins: 1, losses: 0, position: 44 };
+  const after: RatingSnapshot = { mmr: 1020, wins: 1, losses: 0 };
   const reveal = buildRatingReveal('Competitive', 'ffa', null, after);
 
   assert.equal(reveal.before, null);
@@ -159,8 +157,8 @@ test('a first rated match has no delta and no movement to announce', () => {
 });
 
 test('quickmatch reveals never announce division movement', () => {
-  const before: RatingSnapshot = { mmr: 1190, wins: 3, losses: 1, position: null };
-  const after: RatingSnapshot = { mmr: 1240, wins: 4, losses: 1, position: null };
+  const before: RatingSnapshot = { mmr: 1190, wins: 3, losses: 1 };
+  const after: RatingSnapshot = { mmr: 1240, wins: 4, losses: 1 };
 
   const reveal = buildRatingReveal('Quickmatch', '2v2', before, after);
   assert.equal(reveal.delta, 50);

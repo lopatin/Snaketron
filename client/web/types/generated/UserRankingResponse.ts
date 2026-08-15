@@ -2,5 +2,9 @@
 
 /**
  * User ranking response
+ *
+ * Deliberately carries no ladder position. Deriving one meant reading the
+ * whole ranking partition per request, and this endpoint is polled after
+ * every rated match — see [`get_my_ranking`].
  */
-export type UserRankingResponse = { rank: number | null, mmr: number | null, wins: number | null, losses: number | null, winRate: number | null, };
+export type UserRankingResponse = { mmr: number | null, wins: number | null, losses: number | null, winRate: number | null, };
