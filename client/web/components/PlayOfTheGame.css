@@ -8,16 +8,29 @@
   position: relative;
   width: 100%;
   overflow: hidden;
-  /* Rules on both edges, and the negative margin swallows the rating panel's
-     own hairline so the two do not stack into a double line. Without this the
-     replay's pale arena ran straight into the rating panel's pale background
-     and the two read as one tall block. */
+  /* The negative margin swallows the rating panel's own hairline so the two
+     rules do not stack into a double line. */
   margin-top: -1px;
-  border-top: 2px solid var(--potg-ink);
-  border-bottom: 2px solid var(--potg-ink);
+  border-top: 1px solid #14181f;
+  border-bottom: 1px solid #14181f;
   background: #eef2f7;
   color: #fff;
   isolation: isolate;
+}
+
+/* Reads as a recess in the card rather than a slab bolted onto it: a hairline
+   on each edge plus a short shadow falling inward from both. It has to ride
+   above the arena — an inset shadow on the band itself paints under its own
+   children, so the canvas would cover it. */
+.potg-band::after {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  box-shadow:
+    inset 0 3px 0 rgb(0 0 0 / 20%),
+    inset 0 -2px 0 rgb(0 0 0 / 20%);
+  content: "";
+  pointer-events: none;
 }
 
 .potg-canvas .scenario-canvas__viewport {
@@ -48,8 +61,11 @@
    resting corner while the cover clears the arena. Each duration here mirrors
    a constant in PlayOfTheGame.tsx.
    --------------------------------------------------------------------------- */
+/* Sharp off the mark, long settle — the panel is most of the way in before
+   the eye catches up, which is what makes the arrival feel like a snap rather
+   than a drawer being pulled. */
 .potg-band {
-  animation: potg-band-in 380ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation: potg-band-in 480ms cubic-bezier(0.1, 0.86, 0.18, 1) both;
 }
 
 @keyframes potg-band-in {
@@ -86,19 +102,25 @@
   transition: none;
 }
 
+/* The card's own headline voice — the same italic 950 uppercase as VICTORY
+   and the star plate — with VICTORY's stepped shadow inverted to white, so
+   dark type still separates from the pale arena behind the veil. */
 .potg-title {
   position: absolute;
   top: 50%;
   left: 50%;
   z-index: 5;
-  color: var(--potg-ink);
+  color: #14181f;
   font-family: "Arial Black", Impact, sans-serif;
-  font-size: clamp(13px, 3.1vw, 24px);
+  font-size: clamp(15px, 3.6vw, 28px);
   font-style: italic;
   font-weight: 950;
-  letter-spacing: 0.06em;
+  letter-spacing: -0.03em;
   line-height: 1;
   text-align: center;
+  text-shadow:
+    2px 2px 0 rgb(255 255 255 / 92%),
+    4px 4px 0 rgb(255 255 255 / 62%);
   text-transform: uppercase;
   white-space: nowrap;
   opacity: 0;
@@ -222,6 +244,11 @@
   letter-spacing: 0.045em;
   line-height: 1;
   pointer-events: auto;
+  /* The same stepped shadow VICTORY wears, so the two headline plates in the
+     card are recognisably the same object at different sizes. */
+  text-shadow:
+    2px 2px 0 rgb(20 24 31 / 50%),
+    4px 4px 0 rgb(20 24 31 / 50%);
   text-transform: uppercase;
   white-space: nowrap;
   transform: skewX(-7deg);
@@ -249,18 +276,18 @@
   bottom: calc(100% + 8px);
   left: 0;
   padding: 6px 9px;
-  border-radius: 5px;
   background: rgb(20 24 31 / 82%);
   color: #fff;
   font-family: Arial, Helvetica, sans-serif;
-  font-size: 9px;
+  font-size: 11px;
   font-style: normal;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  line-height: 1;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1.2;
   opacity: 0;
   pointer-events: none;
-  text-transform: uppercase;
+  /* The plate around it is uppercase; this is prose, so it opts out. */
+  text-transform: none;
   transform: skewX(7deg) translateY(3px);
   transition: opacity 140ms ease, transform 140ms ease;
   white-space: nowrap;

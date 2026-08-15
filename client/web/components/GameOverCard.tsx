@@ -13,6 +13,13 @@ import GameOverJewel from './GameOverJewel';
 import PlayOfTheGame from './PlayOfTheGame';
 import RatingReveal from './RatingReveal';
 
+/**
+ * Longest the replay will wait on the rating sweep before mounting anyway.
+ * Comfortably past a normal sweep; it only ever fires when the animation has
+ * stalled (a throttled background tab being the usual reason).
+ */
+const RATING_SETTLE_CEILING_MS = 6000;
+
 const FOCUSABLE_SELECTOR = [
   'a[href]',
   'button:not([disabled])',
@@ -111,6 +118,16 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
       autoplayGameIdRef.current = null;
     }
   }, [open]);
+
+  // The replay waits for the rating sweep, and the sweep runs on rAF — which a
+  // background tab throttles to a stop. Without a ceiling, a card opened out of
+  // view would come back with no replay on it at all, so treat the sweep as
+  // finished once it has had more than enough time.
+  useEffect(() => {
+    if (!open || ratingSettled) return undefined;
+    const timer = window.setTimeout(() => setRatingSettled(true), RATING_SETTLE_CEILING_MS);
+    return () => window.clearTimeout(timer);
+  }, [open, ratingSettled]);
 
   const handleRatingSettled = useCallback(() => setRatingSettled(true), []);
   const handleHighlightAutoplayStarted = useCallback((playedGameId: number) => {
