@@ -9,7 +9,6 @@ import { RegionSelector } from './RegionSelector';
 import { InviteFriendsModal } from './InviteFriendsModal';
 import JoinGameModal from './JoinGameModal';
 import { ConnectionStatusRack } from './ConnectionStatusRack';
-import { ScenarioSpotlight } from './ScenarioSpotlight';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
@@ -239,23 +238,20 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
         />
 
         <main className="home-main">
-          <div className="home-play-layout">
-            <div className="home-center-stack">
-              <GameStartForm
-                onStartGame={handleStartGame}
-                currentUsername={user?.username}
-                isLoading={isLoading}
-                isAuthenticated={user !== null && !user.isGuest}
-                isLobbyQueued={isLobbyQueued}
-                lobbyPreferences={lobbyPreferences}
-                onPreferencesChange={updateLobbyPreferences}
-                onSignInClick={onOpenAuth}
-                errorMessage={startError}
-                playersOnline={playersOnline}
-              />
-              <SocialFooter />
-            </div>
-            <ScenarioSpotlight />
+          <div className="home-center-stack">
+            <GameStartForm
+              onStartGame={handleStartGame}
+              currentUsername={user?.username}
+              isLoading={isLoading}
+              isAuthenticated={user !== null && !user.isGuest}
+              isLobbyQueued={isLobbyQueued}
+              lobbyPreferences={lobbyPreferences}
+              onPreferencesChange={updateLobbyPreferences}
+              onSignInClick={onOpenAuth}
+              errorMessage={startError}
+              playersOnline={playersOnline}
+            />
+            <SocialFooter />
           </div>
         </main>
 

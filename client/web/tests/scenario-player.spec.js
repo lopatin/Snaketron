@@ -168,15 +168,3 @@ test('reduced motion poses the poster until the viewer explicitly plays', async 
   await page.getByRole('button', { name: 'Play replay animation' }).click();
   await expect(canvas).toHaveAttribute('data-motion', 'explicit');
 });
-
-test('the home play surface embeds a replay without waiting for app transport', async ({ page }) => {
-  await page.goto('/');
-
-  const spotlight = page.getByTestId('scenario-marketing');
-  await expect(spotlight).toBeVisible();
-  await expect(spotlight.getByTestId('scenario-canvas-surface')).toHaveAttribute(
-    'data-ready',
-    'true',
-  );
-  await expect(spotlight).toContainText('Real engine');
-});
