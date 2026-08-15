@@ -1,5 +1,5 @@
 use ::common::{GameEvent, GameState, GameStatus, GameType, QueueMode, TeamId};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
 use redis::{AsyncCommands, Client, PushInfo};
@@ -1443,7 +1443,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             }
         }
     })
-    .await??;
+    .await
+    .context("host did not receive LobbyCreated")??;
 
     let mut follower = TestClient::connect(&server_addr).await?;
     follower.authenticate(follower_user_id).await?;
@@ -1464,7 +1465,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             }
         }
     })
-    .await??;
+    .await
+    .context("follower did not receive JoinedLobby")??;
 
     let mut baseline = [host_user_id as u32, follower_user_id as u32];
     baseline.sort_unstable();
@@ -1484,7 +1486,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             ),
         )
     })
-    .await??;
+    .await
+    .context("sockets did not converge on the baseline lobby roster")??;
 
     // Phase 1: mutate the authoritative roster without publishing anything.
     // Both sockets must converge from the periodic durable read alone.
@@ -1522,7 +1525,8 @@ async fn lobby_sockets_reconcile_durable_roster_and_ignore_stale_pubsub_payload(
             ),
         )
     })
-    .await??;
+    .await
+    .context("sockets did not converge on the durable roster after the stale hint")??;
 
     // Phase 2: inject a stale roster through the real Redis Pub/Sub path. Its
     // removed sentinel member must never reach either socket; the durable read
@@ -1919,7 +1923,8 @@ async fn create_lobby_and_queue_with_code(
             }
         }
     })
-    .await??;
+    .await
+    .context("host did not receive LobbyCreated")??;
 
     // Other clients join the lobby using the captured lobby_code
     if clients.len() > 1 {
@@ -1939,7 +1944,8 @@ async fn create_lobby_and_queue_with_code(
                     }
                 }
             })
-            .await??;
+            .await
+            .context("member did not receive JoinedLobby")??;
         }
     }
 
@@ -2003,7 +2009,8 @@ async fn wait_for_all_clients_to_join_game(clients: &mut [TestClient]) -> Result
                 }
             }
         })
-        .await??;
+        .await
+        .context("client did not receive its JoinGame push and game snapshot")??;
 
         if let Some(expected_game_id) = game_id {
             assert_eq!(

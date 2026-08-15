@@ -32,7 +32,7 @@ use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::redis_keys::RedisKeys;
 use crate::region_cache::RegionCache;
-use crate::replication::ReplicationManager;
+use crate::replication::GameEventRouter;
 use crate::user_cache::UserCache;
 use crate::ws_server::{JwtVerifier, handle_websocket};
 
@@ -149,7 +149,7 @@ pub struct HttpServerState {
     pub matchmaking_manager:
         Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
     /// Replication manager for game state
-    pub replication_manager: Arc<ReplicationManager>,
+    pub event_router: Arc<GameEventRouter>,
     /// Cancellation token for graceful shutdown
     pub cancellation_token: tokio_util::sync::CancellationToken,
     /// Active WebSocket connection count
@@ -183,7 +183,7 @@ pub async fn install_http_application(
     pubsub_manager: Arc<crate::pubsub_manager::PubSubManager>,
     game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<tokio::sync::Mutex<crate::matchmaking_manager::MatchmakingManager>>,
-    replication_manager: Arc<ReplicationManager>,
+    event_router: Arc<GameEventRouter>,
     cancellation_token: tokio_util::sync::CancellationToken,
     server_id: u64,
     region: String,
@@ -205,7 +205,7 @@ pub async fn install_http_application(
         pubsub_manager,
         game_bus,
         matchmaking_manager,
-        replication_manager,
+        event_router,
         cancellation_token: cancellation_token.clone(),
         connection_count: connection_count.clone(),
         server_id,
@@ -470,7 +470,7 @@ async fn websocket_handler(
                 state.pubsub_manager,
                 state.game_bus,
                 state.matchmaking_manager,
-                state.replication_manager,
+                state.event_router,
                 state.cancellation_token,
                 state.lobby_manager,
                 state.region,
@@ -725,7 +725,7 @@ mod deferred_http_tests {
         assert_eq!(warming.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert!(!task.is_finished());
 
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         lifecycle.mark_assignment_ready(true);
         lifecycle.mark_membership_ready(true);
         lifecycle.mark_redis_success_now();

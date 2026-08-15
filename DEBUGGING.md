@@ -13,8 +13,12 @@ The authoritative game runs in a server-side executor
 ([game_executor.rs](server/src/game_executor.rs)) that advances a shared
 `GameEngine` by wall clock and publishes every event over the Redis Streams
 game bus ([game_bus.rs](server/src/game_bus.rs)).
-WebSocket servers hold replicas ([replication.rs](server/src/replication.rs))
-that apply those events and forward them to clients. The client runs the same
+WebSocket servers are stateless event routers
+([replication.rs](server/src/replication.rs)): they forward per-game events to
+locally subscribed sockets without reconstructing any game state — each
+socket's subscription tracks `stream_seq` continuity, suppresses deltas while
+"cold," and re-anchors on every authoritative `Snapshot` (joins first-frame
+from the fenced Redis recovery envelope). The client runs the same
 engine compiled to WASM: its **committed** state advances only when server
 events arrive; its **predicted** state (what the player sees) is rebuilt from
 committed and free-runs ahead on the local clock, bounded by a prediction cap.
@@ -43,6 +47,11 @@ committed hash + server timestamp. This one small message does three jobs:
 
 - **Divergence detection** — the client recomputes its own committed hash at
   that tick and compares. Two consecutive mismatches ⇒ automatic resync.
+  (Since the 2026-08 move to stateless gateway routing, this client-side check
+  is the *only* production fingerprint verifier: gateways no longer
+  reconstruct state, so `TickHash` heartbeats must always be forwarded
+  end-to-end, and desync visibility comes from the resync-request counters and
+  auto-uploaded client traces.)
 - **Liveness** — it arrives even when nothing is happening in the game, so
   "no message for 3 s" now reliably means the stream is dead, and the client
   shows a reconnect banner instead of simulating a ghost game.
@@ -52,9 +61,9 @@ committed hash + server timestamp. This one small message does three jobs:
 ### 3. Transport sequencing (`GameEventMessage.stream_seq`)
 
 The executor stamps every published message with a per-game, strictly
-monotonic sequence number. Every consumer (replica, client engine) checks
-contiguity: a gap means messages were lost and triggers an automatic snapshot
-resync instead of silent divergence. Duplicates and stale messages are
+monotonic sequence number. Every consumer (gateway subscription, client
+engine) checks contiguity: a gap means messages were lost and triggers an
+automatic snapshot resync instead of silent divergence. Duplicates and stale messages are
 skipped instead of double-applied. The Streams bus itself doesn't drop, so
 gaps can only come from the hops past it (broadcast fan-out lag, the
 WebSocket leg) or trim-horizon loss after a long outage — the counters
@@ -167,7 +176,12 @@ Fourteen distinct defects have been confirmed — the first thirteen by a
 multi-agent audit (each verified by an independent 3-lens panel against the
 code), the fourteenth from the enemy-snake respawn-desync report. The fixes
 landed together with this infrastructure; the chaos suite and the replay
-harness lock each one in:
+harness lock each one in. (Rows referencing replica state application predate
+the 2026-08 stateless-gateway change: gateways no longer apply events to local
+state, so those specific mechanisms were retired, while the properties they
+protected — subscribe-before-read, gap suppression until a fresh snapshot,
+Lagged surfacing as a client resync — live on in the per-subscription
+continuity rules of [replication.rs](server/src/replication.rs).)
 
 | Defect | Fix |
 |---|---|

@@ -17,7 +17,6 @@ use crate::recovery::{
 };
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
-use crate::replication::GameStateReader;
 use crate::user_cache::UserCache;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -754,7 +753,7 @@ pub async fn handle_websocket(
     pubsub_manager: Arc<PubSubManager>,
     game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
+    event_router: Arc<crate::replication::GameEventRouter>,
     cancellation_token: CancellationToken,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
     region: String,
@@ -773,7 +772,7 @@ pub async fn handle_websocket(
         matchmaking_manager,
         jwt_verifier,
         cancellation_token,
-        replication_manager,
+        event_router,
         redis,
         redis_url,
         lobby_manager,
@@ -834,7 +833,7 @@ async fn handle_websocket_connection(
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
+    event_router: Arc<crate::replication::GameEventRouter>,
     redis: RedisConnection,
     redis_url: String,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
@@ -1051,7 +1050,7 @@ async fn handle_websocket_connection(
                                             )
                                             .await;
                                             let ws_tx_clone = ws_tx.clone();
-                                            let replication_manager_clone = replication_manager.clone();
+                                            let event_router_clone = event_router.clone();
                                             let db_clone = db.clone();
                                             let game_bus_clone = game_bus.clone();
                                             let cluster_namespace_clone = cluster_namespace.clone();
@@ -1060,7 +1059,7 @@ async fn handle_websocket_connection(
                                                     resync_game_id,
                                                     user_id,
                                                     ws_tx_clone,
-                                                    replication_manager_clone,
+                                                    event_router_clone,
                                                     db_clone,
                                                     game_bus_clone,
                                                     cluster_namespace_clone,
@@ -1118,7 +1117,7 @@ async fn handle_websocket_connection(
                                         &ws_tx,
                                         &game_bus,
                                         &matchmaking_manager,
-                                        &replication_manager,
+                                        &event_router,
                                         &redis,
                                         &redis_url,
                                         &lobby_manager,
@@ -1127,6 +1126,7 @@ async fn handle_websocket_connection(
                                         &lifecycle,
                                         socket_generation,
                                         &cluster_namespace,
+                                        &cancellation_token,
                                     ).await {
                                         Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby
@@ -1161,7 +1161,7 @@ async fn handle_websocket_connection(
                                                     }
 
                                                     let ws_tx_clone = ws_tx.clone();
-                                                    let replication_manager_clone = replication_manager.clone();
+                                                    let event_router_clone = event_router.clone();
                                                     let db_clone = db.clone();
                                                     let game_bus_clone = game_bus.clone();
                                                     let cluster_namespace_clone = cluster_namespace.clone();
@@ -1171,7 +1171,7 @@ async fn handle_websocket_connection(
                                                             game_id,
                                                             user_id,
                                                             ws_tx_clone,
-                                                            replication_manager_clone,
+                                                            event_router_clone,
                                                             db_clone,
                                                             game_bus_clone,
                                                             cluster_namespace_clone,
@@ -1787,7 +1787,7 @@ type CommandOutcomeReplay =
 enum GameSubscriptionInput {
     SocketClosed,
     CommandOutcomes(Option<ResolvedCommandState>),
-    Event(Result<GameEventMessage, broadcast::error::RecvError>),
+    Update(Option<crate::replication::SubscriptionUpdate>),
 }
 
 fn start_command_outcome_replay(
@@ -1812,7 +1812,7 @@ async fn wait_for_command_outcome_replay(
 
 async fn next_game_subscription_input(
     ws_tx: &mpsc::Sender<Message>,
-    rx: &mut crate::replication::FilteredEventReceiver,
+    subscription: &mut crate::replication::GameEventSubscription,
     replay: &mut Option<CommandOutcomeReplay>,
 ) -> GameSubscriptionInput {
     tokio::select! {
@@ -1820,7 +1820,7 @@ async fn next_game_subscription_input(
         outcomes = wait_for_command_outcome_replay(replay) => {
             GameSubscriptionInput::CommandOutcomes(outcomes)
         }
-        event = rx.recv() => GameSubscriptionInput::Event(event),
+        update = subscription.next() => GameSubscriptionInput::Update(update),
     }
 }
 
@@ -1837,7 +1837,7 @@ enum GameJoinAuthorizationError {
 impl std::fmt::Display for GameJoinAuthorizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Warming => formatter.write_str("game replica is warming"),
+            Self::Warming => formatter.write_str("game stream is warming"),
             Self::Denied(reason) => formatter.write_str(reason),
         }
     }
@@ -1934,48 +1934,37 @@ async fn has_durable_recovery_failure(
 }
 
 /// A targeted snapshot request can be missed while no executor owns the
-/// partition. Keep requesting this game through the bounded takeover window.
-async fn wait_for_live_game_after_snapshot_request(
+/// partition, and a just-committed match has no recovery envelope until its
+/// `GameCreated` is consumed and checkpointed. Keep requesting the game and
+/// polling the fenced envelope through the bounded takeover window; the
+/// envelope is the only authoritative state a gateway can read directly.
+async fn wait_for_authoritative_state_after_snapshot_request(
     game_id: u32,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
 ) -> Option<GameState> {
     let partition_id = game_id % PARTITION_COUNT;
     let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
-    let mut next_snapshot_request_at = tokio::time::Instant::now();
-    let mut check_recovery = true;
 
     loop {
-        if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
-            return Some(game_state);
+        // The router coalesces to one publish per game per 500 ms across
+        // every caller on this gateway.
+        if let Err(error) = event_router.request_game_snapshot(game_id).await {
+            warn!(game_id, partition_id, %error, "Failed to request cold-join snapshot");
         }
+
+        match game_bus.get_recovery(cluster_namespace, game_id).await {
+            Ok(Some(envelope)) => return Some(envelope.game_state),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(game_id, %error, "Failed to load recovery during cold-join warm-up");
+            }
+        }
+
         if tokio::time::Instant::now() >= deadline {
             return None;
         }
-
-        let now = tokio::time::Instant::now();
-        if now >= next_snapshot_request_at {
-            next_snapshot_request_at = now + Duration::from_millis(500);
-            match replication_manager.request_game_snapshot(game_id).await {
-                Ok(()) => check_recovery = true,
-                Err(error) => {
-                    warn!(game_id, partition_id, %error, "Failed to request cold-join snapshots");
-                }
-            }
-        }
-
-        if check_recovery {
-            match game_bus.get_recovery(cluster_namespace, game_id).await {
-                Ok(Some(envelope)) => return Some(envelope.game_state),
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(game_id, %error, "Failed to load recovery during cold-join warm-up");
-                }
-            }
-            check_recovery = false;
-        }
-
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -2013,18 +2002,36 @@ fn command_outcomes_for_user(
         .collect()
 }
 
+/// Returns whether the durable `ActiveMatch` roster records this user as a
+/// participant (player or lobby-split spectator). The roster is written
+/// atomically at match commit, so it authorizes matchmade joins without any
+/// game-state read. Legacy and custom games have no roster and fall through
+/// to the recovery envelope.
+fn active_match_records_user(active_match: Option<&ActiveMatch>, user_id: u32) -> bool {
+    active_match.is_some_and(|active_match| {
+        active_match
+            .players
+            .iter()
+            .chain(active_match.spectators.iter())
+            .any(|player| player.user_id == user_id)
+    })
+}
+
 /// Resolve and authorize a JoinGame request before it changes connection state.
 ///
-/// Live games are authoritative in replication memory. Completed games may instead live in the
-/// short Redis reload cache or DynamoDB. Returning success means the requested user was present in
-/// the canonical state from one of those sources; callers may then enable game events and chat.
+/// Gateways hold no game state, so authorization comes from durable sources
+/// only: the `ActiveMatch` roster for matchmade games, the fenced recovery
+/// envelope for anything live, and the short Redis reload cache or DynamoDB
+/// for completed games. Returning success means the requested user was present
+/// in one of those canonical sources; callers may then enable game events and
+/// chat.
 #[allow(clippy::too_many_arguments)]
 async fn authorize_game_join_inner(
     game_id: u32,
     user_id: u32,
     matchmaking_pool: MatchmakingPool,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
@@ -2037,16 +2044,8 @@ async fn authorize_game_join_inner(
         })?;
     validate_game_matchmaking_pool(matchmaking_pool, active_match.as_ref())?;
 
-    if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
-        if game_state_records_user(&game_state, user_id) {
-            return Ok(());
-        }
-
-        warn!(
-            "Denied live game {} join to user {}: user is not a recorded participant",
-            game_id, user_id
-        );
-        return Err(game_join_denied("This game is unavailable"));
+    if active_match_records_user(active_match.as_ref(), user_id) {
+        return Ok(());
     }
 
     if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
@@ -2055,11 +2054,10 @@ async fn authorize_game_join_inner(
         ));
     }
 
-    // During executor failover the authoritative recovery envelope can be
-    // available before this gateway's replica has consumed the takeover
-    // snapshot. It is sufficient for participant authorization; the event
-    // subscription below still waits for a fresh replica or uses this same
-    // recovery snapshot as its bridge.
+    // The fenced recovery envelope is the authoritative participant record
+    // for live games without a roster (legacy/custom), and for any user the
+    // roster does not list. The event subscription later uses this same
+    // envelope as its bridge snapshot.
     match game_bus.get_recovery(cluster_namespace, game_id).await {
         Ok(Some(envelope)) => {
             if game_state_records_user(&envelope.game_state, user_id) {
@@ -2077,7 +2075,7 @@ async fn authorize_game_join_inner(
         }
     }
 
-    let cached_active_state = match replication_manager.get_stored_snapshot(game_id).await {
+    let cached_active_state = match event_router.get_stored_snapshot(game_id).await {
         Ok(Some(game_state)) if matches!(game_state.status, GameStatus::Complete { .. }) => {
             if game_state_records_user(&game_state, user_id) {
                 return Ok(());
@@ -2148,10 +2146,11 @@ async fn authorize_game_join_inner(
 
     // Repeat the request while waiting: a request written during the lease gap
     // is intentionally not relied upon. This also covers the short interval
-    // after atomic matchmaking commit but before GameCreated is consumed.
-    if let Some(live_game_state) = wait_for_live_game_after_snapshot_request(
+    // after atomic matchmaking commit but before GameCreated is consumed and
+    // its initial envelope checkpointed.
+    if let Some(live_game_state) = wait_for_authoritative_state_after_snapshot_request(
         game_id,
-        replication_manager,
+        event_router,
         game_bus,
         cluster_namespace,
     )
@@ -2261,7 +2260,7 @@ async fn authorize_game_join(
     user_id: u32,
     matchmaking_pool: MatchmakingPool,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
@@ -2273,7 +2272,7 @@ async fn authorize_game_join(
             user_id,
             matchmaking_pool,
             matchmaking_manager,
-            replication_manager,
+            event_router,
             game_bus,
             cluster_namespace,
             db,
@@ -2304,7 +2303,7 @@ async fn notify_durable_active_game_after_auth(
     matchmaking_pool: MatchmakingPool,
     ws_tx: &mpsc::Sender<Message>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
@@ -2337,7 +2336,7 @@ async fn notify_durable_active_game_after_auth(
         user_id,
         matchmaking_pool,
         matchmaking_manager,
-        replication_manager,
+        event_router,
         game_bus,
         cluster_namespace,
         db,
@@ -2385,6 +2384,78 @@ async fn notify_durable_active_game_after_auth(
     Ok(())
 }
 
+/// Publish a readiness confirmation once the game provably exists.
+///
+/// A hint-driven client can confirm readiness milliseconds after the
+/// matchmaking commit — before the outbox scanner has delivered `GameCreated`
+/// into the partition command stream. Publishing immediately would let the
+/// confirmation precede `GameCreated` in that stream and be quarantined as
+/// targeting an inactive game. The fenced recovery envelope is written by the
+/// same incorporation that creates the actor, so its existence is durable
+/// proof the confirmation can no longer outrun creation. The wait fails open
+/// at its deadline: a confirmation the executor cannot attribute costs the
+/// player nothing worse than waiting out the readiness deadline.
+///
+/// The wait deliberately outlives its socket — a player who confirms and
+/// immediately reconnects has still confirmed — but not its server: it is
+/// bound to the task cancellation token so shutdown cannot be raced by a
+/// publish on a retiring gateway's connections. Abandoning is safe because a
+/// drained client re-joins elsewhere and re-confirms well inside
+/// `MATCH_READY_WINDOW_MS`.
+async fn publish_player_ready_after_game_exists(
+    game_bus: Arc<GameBus>,
+    cluster_namespace: ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+    cancellation_token: CancellationToken,
+) {
+    let partition_id = game_id % PARTITION_COUNT;
+    let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
+    loop {
+        let recovery = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return,
+            recovery = game_bus.get_recovery(&cluster_namespace, game_id) => recovery,
+        };
+        match recovery {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(game_id, user_id, %error, "Failed to check game existence before readiness");
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                game_id,
+                user_id, "Publishing readiness without game-existence proof after bounded wait"
+            );
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
+    match game_bus
+        .publish_player_ready_unless_completed(&cluster_namespace, partition_id, game_id, &event)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                game_id,
+                user_id, "Readiness arrived after the game completed"
+            );
+        }
+        Err(error) => {
+            warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
+        }
+    }
+}
+
 fn recovery_bridge_snapshot(envelope: &RecoveryEnvelopeV2, user_id: u32) -> GameEventMessage {
     // Despite its historical name, `next_event_stream_sequence` is the last
     // sequence already emitted and checkpointed. The actor increments it
@@ -2413,30 +2484,255 @@ async fn send_recovery_bridge_snapshot(
     ws_tx.send(Message::Text(json.into())).await.is_ok()
 }
 
-async fn send_recovery_bridge_if_available(
+/// Load the game's durable terminal state, if one exists. Absence, failure,
+/// malformed data, or a non-terminal record all return `None`: none of those
+/// prove anything about a live game, so callers fall back to normal warm-up.
+async fn load_durable_terminal_state(db: &Arc<dyn Database>, game_id: u32) -> Option<GameState> {
+    let database_game_id = i32::try_from(game_id).ok()?;
+    match db.get_game_by_id(database_game_id).await {
+        Ok(Some(game)) => {
+            let game_state_json = game.game_state?;
+            match serde_json::from_value::<GameState>(game_state_json) {
+                Ok(game_state) if matches!(game_state.status, GameStatus::Complete { .. }) => {
+                    Some(game_state)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(game_id, %error, "Ignoring malformed durable game state during warm-up");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            warn!(game_id, %error, "Durable game lookup failed during warm-up");
+            None
+        }
+    }
+}
+
+/// How the join warm-up anchored the socket's first authoritative frame.
+enum FirstFrame {
+    /// A frame was sent; enter the forwarding loop. `live_proven` is false
+    /// when the frame was the recovery-envelope bridge: the command-outcome
+    /// replay (whose `CommandOutcomesComplete` barrier is a make-before-break
+    /// promotion signal) must then wait for the first live event, so a
+    /// candidate socket never retires the old usable socket for a bridge that
+    /// might have no subsequent event stream.
+    Anchored { live_proven: bool },
+    /// The game is durably complete and was fully served; end the task.
+    Served,
+    /// No authoritative frame arrived in the bounded window; the client was
+    /// told to retry (or that the game failed) and the task ends.
+    Unavailable,
+}
+
+/// Produce the socket's first authoritative frame and anchor the subscription.
+///
+/// Order of preference: the durable terminal snapshot (completed reload), the
+/// fenced recovery-envelope bridge (bounded staleness of one checkpoint
+/// interval, anchors contiguous live deltas immediately), then a live
+/// `Snapshot` arriving through the already-registered subscription. If none
+/// arrives inside the bounded window, fall back to the database for terminal
+/// state, else tell the client to retry with `GameWarming`.
+#[allow(clippy::too_many_arguments)]
+async fn anchor_first_frame(
     game_id: u32,
     user_id: u32,
     ws_tx: &mpsc::Sender<Message>,
+    subscription: &mut crate::replication::GameEventSubscription,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
-) -> bool {
+) -> FirstFrame {
+    // Completed games have no live event flow to wait for; serve the durable
+    // terminal snapshot immediately.
+    match event_router.get_stored_snapshot(game_id).await {
+        Ok(Some(game_state))
+            if matches!(game_state.status, GameStatus::Complete { .. })
+                && game_state_records_user(&game_state, user_id) =>
+        {
+            send_completed_game_snapshot(
+                ws_tx,
+                game_bus,
+                cluster_namespace,
+                game_id,
+                user_id,
+                &game_state,
+                "stored Redis snapshot",
+            )
+            .await;
+            return FirstFrame::Served;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
+        }
+    }
+
+    // Bridge from the fenced recovery envelope: an immediate first frame with
+    // a trusted watermark. Contiguous live deltas then forward without any
+    // extra snapshot; a lost event in between surfaces as a gap and re-anchors
+    // through the targeted-request path.
     match game_bus.get_recovery(cluster_namespace, game_id).await {
         Ok(Some(envelope))
             if !matches!(envelope.game_state.status, GameStatus::Complete { .. })
                 && game_state_records_user(&envelope.game_state, user_id) =>
         {
-            // Bridge the replica warm-up window immediately from the fenced
-            // recovery envelope, then attach to the live replica. Deliberately
-            // withhold CommandOutcomesComplete until that live subscription
-            // exists: a planned replacement socket treats the barrier as its
-            // promotion signal and must not retire the old usable socket for a
-            // bridge that might have no subsequent event stream.
-            send_recovery_bridge_snapshot(ws_tx, &envelope, user_id).await
+            // Completion persistence can win the race with cleanup of the
+            // preceding active Redis state. The durable terminal record is
+            // the authority for a completed game, so a non-terminal envelope
+            // may bridge only after that record is confirmed absent or
+            // non-terminal — otherwise the client would be stranded on a
+            // stale active frame with no live stream behind it.
+            if let Some(terminal_state) = load_durable_terminal_state(db, game_id).await {
+                send_completed_game_snapshot(
+                    ws_tx,
+                    game_bus,
+                    cluster_namespace,
+                    game_id,
+                    user_id,
+                    &terminal_state,
+                    "database snapshot",
+                )
+                .await;
+                return FirstFrame::Served;
+            }
+            if !send_recovery_bridge_snapshot(ws_tx, &envelope, user_id).await {
+                return FirstFrame::Unavailable;
+            }
+            subscription.anchor(envelope.next_event_stream_sequence);
+            return FirstFrame::Anchored { live_proven: false };
         }
-        Ok(_) => false,
+        Ok(_) => {}
         Err(error) => {
-            warn!(game_id, user_id, %error, "Failed to load recovery during replica warm-up");
-            false
+            warn!(game_id, user_id, %error, "Failed to load recovery during warm-up");
+        }
+    }
+
+    // No envelope yet (creation race or ownership gap). Request a targeted
+    // snapshot and wait for the live stream to anchor us; the subscription
+    // re-paces the request internally while cold.
+    if let Err(error) = event_router.request_game_snapshot(game_id).await {
+        warn!(game_id, %error, "Failed to request warm-up snapshot");
+    }
+    let warmup = tokio::time::timeout(COLD_JOIN_WARMUP_TIMEOUT, async {
+        loop {
+            match subscription.next().await {
+                Some(crate::replication::SubscriptionUpdate::Event(event_msg)) => {
+                    if matches!(event_msg.event, GameEvent::Snapshot { .. }) {
+                        break Some(event_msg);
+                    }
+                    // A zero-seq terminal rejection still reaches the player
+                    // during warm-up; nothing else passes while cold.
+                    let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
+                    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        break None;
+                    }
+                }
+                Some(crate::replication::SubscriptionUpdate::WentCold) => {}
+                None => break None,
+            }
+        }
+    })
+    .await;
+
+    if let Ok(Some(mut snapshot_event)) = warmup {
+        snapshot_event.user_id = Some(user_id);
+        let terminal = matches!(
+            &snapshot_event.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
+        );
+        let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
+        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            return FirstFrame::Unavailable;
+        }
+        if terminal {
+            if send_command_outcomes(
+                ws_tx,
+                game_bus,
+                cluster_namespace,
+                game_id,
+                user_id,
+                Some(TERMINAL_COMMAND_REJECTION_REASON),
+            )
+            .await
+            {
+                info!(game_id, "Warm-up reached terminal state directly");
+            }
+            return FirstFrame::Served;
+        }
+        return FirstFrame::Anchored { live_proven: true };
+    }
+
+    // Nothing live arrived. Durably completed games remain readable from the
+    // database after their Redis grace period.
+    let Ok(database_game_id) = i32::try_from(game_id) else {
+        warn!("Game ID {} is outside the durable database range", game_id);
+        send_game_load_failed(ws_tx, game_id, "This game was not found or has expired").await;
+        return FirstFrame::Unavailable;
+    };
+    match db.get_game_by_id(database_game_id).await {
+        Ok(Some(game)) => {
+            if let Some(game_state_json) = game.game_state {
+                match serde_json::from_value::<GameState>(game_state_json) {
+                    Ok(game_state) if matches!(game_state.status, GameStatus::Complete { .. }) => {
+                        send_completed_game_snapshot(
+                            ws_tx,
+                            game_bus,
+                            cluster_namespace,
+                            game_id,
+                            user_id,
+                            &game_state,
+                            "database snapshot",
+                        )
+                        .await;
+                        return FirstFrame::Served;
+                    }
+                    Ok(_) => {
+                        info!(
+                            game_id,
+                            "Durable game is non-terminal with no live stream; returning retryable warm-up"
+                        );
+                        send_game_warming(ws_tx, game_id).await;
+                        return FirstFrame::Unavailable;
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize game state from database: {}", e);
+                        send_game_load_failed(
+                            ws_tx,
+                            game_id,
+                            "The saved game data could not be loaded",
+                        )
+                        .await;
+                        return FirstFrame::Unavailable;
+                    }
+                }
+            }
+            info!(
+                game_id,
+                "Durable game has no terminal state and no live stream; returning retryable warm-up"
+            );
+            send_game_warming(ws_tx, game_id).await;
+            FirstFrame::Unavailable
+        }
+        Ok(None) => {
+            // Authorization already proved this game from durable evidence.
+            // Missing completion persistence here is therefore a failover
+            // race, not definitive proof that it expired.
+            info!(
+                game_id,
+                "Authorized game is not yet durable and has no live stream; returning retryable warm-up"
+            );
+            send_game_warming(ws_tx, game_id).await;
+            FirstFrame::Unavailable
+        }
+        Err(e) => {
+            error!("Failed to fetch game {} from database: {}", game_id, e);
+            send_game_warming(ws_tx, game_id).await;
+            FirstFrame::Unavailable
         }
     }
 }
@@ -2446,7 +2742,7 @@ async fn subscribe_to_game_events(
     game_id: u32,
     user_id: u32,
     ws_tx: mpsc::Sender<Message>,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
+    event_router: Arc<crate::replication::GameEventRouter>,
     db: Arc<dyn Database>,
     game_bus: Arc<GameBus>,
     cluster_namespace: ClusterNamespace,
@@ -2456,272 +2752,47 @@ async fn subscribe_to_game_events(
         game_id, user_id
     );
 
-    let mut initial_subscription = replication_manager.subscribe_to_game(game_id).await;
-    if initial_subscription.is_err() {
-        let partition_id = game_id % PARTITION_COUNT;
-        if let Err(error) = replication_manager.request_game_snapshot(game_id).await {
-            warn!(game_id, partition_id, %error, "Failed to request subscription snapshots");
-        }
-        let mut next_snapshot_request_at = tokio::time::Instant::now() + Duration::from_millis(500);
+    // Register the receiver BEFORE any snapshot work: a broadcast receiver
+    // only sees messages sent after it exists, so subscribing first
+    // guarantees no event between first frame and subscription can be
+    // missed; the subscription's continuity rules drop the overlap instead.
+    let mut subscription = event_router.subscribe_to_game(game_id).await;
 
-        let mut recovery_bridge_sent = send_recovery_bridge_if_available(
-            game_id,
-            user_id,
-            &ws_tx,
-            &game_bus,
-            &cluster_namespace,
-        )
-        .await;
-
-        // Completed games intentionally leave replication memory. Avoid
-        // spending the takeover wait on a game that already has its terminal
-        // Redis snapshot.
-        match replication_manager.get_stored_snapshot(game_id).await {
-            Ok(Some(game_state))
-                if matches!(game_state.status, GameStatus::Complete { .. })
-                    && game_state_records_user(&game_state, user_id) =>
-            {
-                send_completed_game_snapshot(
-                    &ws_tx,
-                    &game_bus,
-                    &cluster_namespace,
-                    game_id,
-                    user_id,
-                    &game_state,
-                    "stored Redis snapshot",
-                )
-                .await;
-                return;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
-            }
-        }
-
-        // Reissue requests throughout the lease gap. A request appended before
-        // the new owner anchors its request reader is not a correctness signal.
-        let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
-        while initial_subscription.is_err() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            initial_subscription = replication_manager.subscribe_to_game(game_id).await;
-            if initial_subscription.is_ok() {
-                break;
-            }
-
-            let now = tokio::time::Instant::now();
-            if now >= next_snapshot_request_at {
-                next_snapshot_request_at = now + Duration::from_millis(500);
-                match replication_manager.request_game_snapshot(game_id).await {
-                    Ok(()) if !recovery_bridge_sent => {
-                        recovery_bridge_sent = send_recovery_bridge_if_available(
-                            game_id,
-                            user_id,
-                            &ws_tx,
-                            &game_bus,
-                            &cluster_namespace,
-                        )
-                        .await;
-                    }
-                    Ok(()) => {}
-                    Err(error) => {
-                        warn!(game_id, partition_id, %error, "Failed to retry subscription snapshots");
-                    }
-                }
-            }
-        }
-    }
-
-    let (game_state, stream_watermark, mut rx) = match initial_subscription {
-        Ok(result) => result,
-        Err(e) => {
-            // Durably completed games are eventually evicted from replication memory. Their
-            // final snapshot remains in Redis briefly, so check that grace-period cache before
-            // the durable database fallback.
-            info!(
-                "Failed to subscribe to game {} from memory, checking stored snapshot: {}",
-                game_id, e
-            );
-
-            match replication_manager.get_stored_snapshot(game_id).await {
-                Ok(Some(game_state))
-                    if matches!(game_state.status, GameStatus::Complete { .. }) =>
-                {
-                    send_completed_game_snapshot(
-                        &ws_tx,
-                        &game_bus,
-                        &cluster_namespace,
-                        game_id,
-                        user_id,
-                        &game_state,
-                        "stored Redis snapshot",
-                    )
-                    .await;
-                    return;
-                }
-                Ok(Some(_)) => {
-                    // During a rolling deploy or a failed terminal cache write, Redis can still
-                    // contain the preceding active snapshot. Prefer the durable completed record
-                    // instead of stranding the client on a stale, non-terminal frame with no live
-                    // subscription.
-                    debug!(
-                        "Ignoring non-complete stored Redis snapshot for game {}, checking database",
-                        game_id
-                    );
-                }
-                Ok(None) => {
-                    debug!("No stored Redis snapshot found for game {}", game_id);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load stored Redis snapshot for game {}, checking database: {}",
-                        game_id, e
-                    );
-                }
-            }
-
-            let Ok(database_game_id) = i32::try_from(game_id) else {
-                warn!("Game ID {} is outside the durable database range", game_id);
-                send_game_load_failed(&ws_tx, game_id, "This game was not found or has expired")
-                    .await;
-                return;
-            };
-
-            match db.get_game_by_id(database_game_id).await {
-                Ok(Some(game)) => {
-                    if let Some(game_state_json) = game.game_state {
-                        match serde_json::from_value::<GameState>(game_state_json) {
-                            Ok(game_state)
-                                if matches!(game_state.status, GameStatus::Complete { .. }) =>
-                            {
-                                send_completed_game_snapshot(
-                                    &ws_tx,
-                                    &game_bus,
-                                    &cluster_namespace,
-                                    game_id,
-                                    user_id,
-                                    &game_state,
-                                    "database snapshot",
-                                )
-                                .await;
-
-                                // Return early - we can't subscribe to future events without memory state
-                                return;
-                            }
-                            Ok(_) => {
-                                info!(
-                                    game_id,
-                                    "Durable game is non-terminal while its replica is unavailable; returning retryable warm-up"
-                                );
-                                send_game_warming(&ws_tx, game_id).await;
-                                return;
-                            }
-                            Err(e) => {
-                                error!("Failed to deserialize game state from database: {}", e);
-                                send_game_load_failed(
-                                    &ws_tx,
-                                    game_id,
-                                    "The saved game data could not be loaded",
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        info!(
-                            game_id,
-                            "Durable game has no terminal state while its replica is unavailable; returning retryable warm-up"
-                        );
-                        send_game_warming(&ws_tx, game_id).await;
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    // Authorization already proved this game from live/recovery
-                    // state. Missing completion persistence here is therefore a
-                    // failover race, not definitive evidence that it expired.
-                    info!(
-                        game_id,
-                        "Authorized game is not yet durable while its replica is unavailable; returning retryable warm-up"
-                    );
-                    send_game_warming(&ws_tx, game_id).await;
-                    return;
-                }
-                Err(e) => {
-                    error!("Failed to fetch game {} from database: {}", game_id, e);
-                    send_game_warming(&ws_tx, game_id).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    if matches!(game_state.status, GameStatus::Complete { .. }) {
-        send_completed_game_snapshot(
-            &ws_tx,
-            &game_bus,
-            &cluster_namespace,
-            game_id,
-            user_id,
-            &game_state,
-            "replication cache",
-        )
-        .await;
-        return;
-    }
-
-    // Send the snapshot, stamped with the replica's transport watermark so
-    // the client's gap detection starts from the right point.
-    let snapshot_event = GameEventMessage {
+    let anchor_result = anchor_first_frame(
         game_id,
-        tick: game_state.tick,
-        sequence: 0,
-        stream_seq: stream_watermark,
-        user_id: Some(user_id),
-        event: GameEvent::Snapshot {
-            game_state: game_state.clone(),
-        },
+        user_id,
+        &ws_tx,
+        &mut subscription,
+        &event_router,
+        &db,
+        &game_bus,
+        &cluster_namespace,
+    )
+    .await;
+    let mut live_proven = match anchor_result {
+        FirstFrame::Anchored { live_proven } => live_proven,
+        FirstFrame::Served | FirstFrame::Unavailable => return,
     };
-    let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
-    if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
-        match e {
-            mpsc::error::TrySendError::Full(msg) => {
-                warn!(
-                    "WebSocket send channel full (capacity 1024) for game {}, blocking send",
-                    game_id
-                );
-                if ws_tx.send(msg).await.is_err() {
-                    error!(
-                        "WebSocket send channel closed for game {}, stopping event subscription",
-                        game_id
-                    );
-                    return;
-                }
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                debug!(
-                    "WebSocket send channel closed for game {}, stopping event subscription",
-                    game_id
-                );
-                return;
-            }
-        }
-    }
 
     // Loading recovery outcomes can take several bounded Redis attempts. Keep
     // that I/O concurrent with the live broadcast receiver so a fresh
     // snapshot never stalls CommandScheduled delivery. The replay result still
     // returns through this one forwarding loop, which preserves socket order.
-    let mut command_outcome_replay = Some(start_command_outcome_replay(
-        game_bus.clone(),
-        cluster_namespace.clone(),
-        game_id,
-        user_id,
-    ));
+    // A bridge-anchored socket starts the replay only once the first live
+    // event proves the stream flows (see `FirstFrame::Anchored`).
+    let mut command_outcome_replay = live_proven.then(|| {
+        start_command_outcome_replay(
+            game_bus.clone(),
+            cluster_namespace.clone(),
+            game_id,
+            user_id,
+        )
+    });
 
     loop {
         let input =
-            next_game_subscription_input(&ws_tx, &mut rx, &mut command_outcome_replay).await;
+            next_game_subscription_input(&ws_tx, &mut subscription, &mut command_outcome_replay)
+                .await;
         let event_msg = match input {
             GameSubscriptionInput::SocketClosed => {
                 debug!(
@@ -2745,117 +2816,34 @@ async fn subscribe_to_game_events(
                 }
                 continue;
             }
-            GameSubscriptionInput::Event(Ok(event_msg)) => event_msg,
-            GameSubscriptionInput::Event(Err(
-                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
+            GameSubscriptionInput::Update(Some(crate::replication::SubscriptionUpdate::Event(
+                event_msg,
+            ))) => event_msg,
+            GameSubscriptionInput::Update(Some(
+                crate::replication::SubscriptionUpdate::WentCold,
             )) => {
-                // Any barrier for the old snapshot is now stale. Dropping the
-                // in-flight future cancels its Redis read; only the replay
-                // paired with the replacement snapshot may emit a barrier.
+                // The subscription lost continuity (gap or broadcast lag) and
+                // already paced a targeted snapshot request; nothing is
+                // forwarded until the fresh snapshot re-anchors the client.
+                // Any barrier for the previous snapshot is now stale, and
+                // dropping the in-flight future cancels its Redis read; only
+                // the replay paired with the replacement snapshot may emit a
+                // barrier.
                 drop(command_outcome_replay.take());
-
-                // This connection fell behind the broadcast and lost events.
-                // Recover by sending a fresh snapshot (with its watermark) so
-                // the client re-anchors instead of silently diverging.
-                warn!(
-                    "Event forwarder for game {} (user {}) lagged, {} events lost; resyncing client with fresh snapshot",
-                    game_id, user_id, skipped
-                );
-                match replication_manager.subscribe_to_game(game_id).await {
-                    Ok((state, watermark, new_rx)) => {
-                        rx = new_rx;
-                        let terminal = matches!(state.status, GameStatus::Complete { .. });
-                        let resync = GameEventMessage {
-                            game_id,
-                            tick: state.tick,
-                            sequence: 0,
-                            stream_seq: watermark,
-                            user_id: Some(user_id),
-                            event: GameEvent::Snapshot { game_state: state },
-                        };
-                        let json = serde_json::to_string(&WSMessage::GameEvent(resync)).unwrap();
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                            debug!(
-                                "WebSocket send channel closed for game {} during lag resync",
-                                game_id
-                            );
-                            return;
-                        }
-                        if terminal {
-                            if !send_command_outcomes(
-                                &ws_tx,
-                                &game_bus,
-                                &cluster_namespace,
-                                game_id,
-                                user_id,
-                                Some(TERMINAL_COMMAND_REJECTION_REASON),
-                            )
-                            .await
-                            {
-                                return;
-                            }
-                            info!(
-                                game_id,
-                                "Lag resync reached terminal state after durable outcome replay"
-                            );
-                            return;
-                        }
-                        command_outcome_replay = Some(start_command_outcome_replay(
-                            game_bus.clone(),
-                            cluster_namespace.clone(),
-                            game_id,
-                            user_id,
-                        ));
-                        continue;
-                    }
-                    Err(e) => {
-                        // Game likely completed and was evicted mid-lag.
-                        error!(
-                            "Failed to resubscribe to game {} after lag: {}; ending subscription",
-                            game_id, e
-                        );
-                        return;
-                    }
-                }
+                continue;
             }
-            GameSubscriptionInput::Event(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+            GameSubscriptionInput::Update(None) => {
                 drop(command_outcome_replay.take());
-                // Broadcaster dropped. If the game is still live in the
-                // replica, hand the client one last authoritative snapshot so
-                // it can at least resync via RequestResync; either way, log
-                // loudly — a silent exit here is how ghost games are born.
-                if let Some(state) = replication_manager.get_game_state(game_id).await {
-                    let terminal = matches!(state.status, GameStatus::Complete { .. });
-                    error!(
-                        "Event broadcaster closed for live game {} (user {}); sending final snapshot",
-                        game_id, user_id
-                    );
-                    let final_snapshot = GameEventMessage {
-                        game_id,
-                        tick: state.tick,
-                        sequence: 0,
-                        stream_seq: replication_manager.get_stream_seq(game_id).await,
-                        user_id: Some(user_id),
-                        event: GameEvent::Snapshot { game_state: state },
-                    };
-                    let json =
-                        serde_json::to_string(&WSMessage::GameEvent(final_snapshot)).unwrap();
-                    let _ = ws_tx.send(Message::Text(json.into())).await;
-                    let _ = send_command_outcomes(
-                        &ws_tx,
-                        &game_bus,
-                        &cluster_namespace,
-                        game_id,
-                        user_id,
-                        terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
-                    )
-                    .await;
-                } else {
-                    info!(
-                        "Event broadcaster closed for game {} (game evicted); ending subscription",
-                        game_id
-                    );
-                }
+                // The game's channel is gone. Terminal teardown always
+                // delivers the terminal snapshot first (handled below), so
+                // reaching this arm means the reader worker failed — which is
+                // task-fatal — or the terminal frame raced this receiver.
+                // Log loudly; the client's liveness watchdog and
+                // RequestResync path recover the session.
+                warn!(
+                    game_id,
+                    user_id, "Game event channel closed; ending subscription"
+                );
                 return;
             }
         };
@@ -2927,7 +2915,12 @@ async fn subscribe_to_game_events(
             break;
         }
 
-        if is_snapshot {
+        if is_snapshot || !live_proven {
+            // Every snapshot restarts the replay so its barrier pairs with
+            // the newest frontier. The first live event after a bridge anchor
+            // also starts it: live delivery is now proven, so the
+            // make-before-break promotion signal may flow.
+            live_proven = true;
             command_outcome_replay = Some(start_command_outcome_replay(
                 game_bus.clone(),
                 cluster_namespace.clone(),
@@ -3645,7 +3638,7 @@ async fn authenticate_ws_connection(
     ws_tx: &mpsc::Sender<Message>,
     game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     websocket_id: &str,
     lifecycle: &TaskLifecycle,
     socket_generation: u64,
@@ -3721,7 +3714,7 @@ async fn authenticate_ws_connection(
                     metadata.matchmaking_pool,
                     ws_tx,
                     matchmaking_manager,
-                    replication_manager,
+                    event_router,
                     game_bus,
                     cluster_namespace,
                     db,
@@ -3752,7 +3745,7 @@ async fn process_ws_message(
     ws_tx: &mpsc::Sender<Message>,
     game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     redis: &RedisConnection,
     _redis_url: &str,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
@@ -3761,6 +3754,7 @@ async fn process_ws_message(
     lifecycle: &TaskLifecycle,
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
+    cancellation_token: &CancellationToken,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -3823,7 +3817,7 @@ async fn process_ws_message(
                         ws_tx,
                         game_bus,
                         matchmaking_manager,
-                        replication_manager,
+                        event_router,
                         websocket_id,
                         lifecycle,
                         socket_generation,
@@ -3843,7 +3837,7 @@ async fn process_ws_message(
                         ws_tx,
                         game_bus,
                         matchmaking_manager,
-                        replication_manager,
+                        event_router,
                         websocket_id,
                         lifecycle,
                         socket_generation,
@@ -4071,7 +4065,7 @@ async fn process_ws_message(
                         user_id,
                         metadata.matchmaking_pool,
                         matchmaking_manager,
-                        replication_manager,
+                        event_router,
                         game_bus,
                         cluster_namespace,
                         db,
@@ -4628,31 +4622,17 @@ async fn process_ws_message(
                                 "Discarding untrusted game id on a readiness confirmation"
                             );
                         }
-                        let partition_id = game_id % PARTITION_COUNT;
-                        let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
-                        // A dropped confirmation costs the player nothing worse
-                        // than waiting out the readiness deadline, so unlike a
-                        // gameplay command this must not tear down the socket.
-                        match game_bus
-                            .publish_player_ready_unless_completed(
-                                cluster_namespace,
-                                partition_id,
-                                game_id,
-                                &event,
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                debug!(
-                                    game_id,
-                                    user_id, "Readiness arrived after the game completed"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
-                            }
-                        }
+                        // Runs detached: the game-existence wait below must not
+                        // stall this connection's message loop, and a dropped
+                        // confirmation costs the player nothing worse than
+                        // waiting out the readiness deadline.
+                        tokio::spawn(publish_player_ready_after_game_exists(
+                            game_bus.clone(),
+                            cluster_namespace.clone(),
+                            game_id,
+                            user_id,
+                            cancellation_token.clone(),
+                        ));
                     } else {
                         warn!(
                             user_id = metadata.user_id,
@@ -5465,7 +5445,8 @@ mod lifecycle_protocol_tests {
     async fn pending_outcome_replay_does_not_block_live_game_events() {
         let (ws_tx, _ws_rx) = mpsc::channel(2);
         let (events_tx, events_rx) = broadcast::channel(2);
-        let mut events = crate::replication::FilteredEventReceiver::new(events_rx, 0, 42);
+        let mut events = crate::replication::GameEventSubscription::for_test(events_rx, 42);
+        events.anchor(4);
         let (release_tx, release_rx) = oneshot::channel();
         let mut replay: Option<CommandOutcomeReplay> = Some(Box::pin(async move {
             release_rx.await.expect("test replay release was dropped");
@@ -5484,7 +5465,7 @@ mod lifecycle_protocol_tests {
         };
         events_tx
             .send(live_event)
-            .expect("filtered receiver should remain subscribed");
+            .expect("subscription should remain attached");
 
         let input = timeout(
             Duration::from_secs(1),
@@ -5494,8 +5475,9 @@ mod lifecycle_protocol_tests {
         .expect("a pending Redis replay blocked a ready live event");
         assert!(matches!(
             input,
-            GameSubscriptionInput::Event(Ok(event))
-                if event.game_id == 42 && event.stream_seq == 5
+            GameSubscriptionInput::Update(Some(crate::replication::SubscriptionUpdate::Event(
+                event
+            ))) if event.game_id == 42 && event.stream_seq == 5
         ));
 
         release_tx.send(()).expect("replay future disappeared");
