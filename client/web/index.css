@@ -4640,14 +4640,19 @@ body {
   margin-bottom: 32px;
 }
 
+/* The ticker sits centred in the run between the wordmark and the start form
+   instead of tucked under the tagline. The two gaps still sum to the 65px the
+   lockup always reserved, so the distance from logo to input is unchanged —
+   only where the ticker sits inside it moves. The lower gap is mostly the
+   form's own 32px of padding, which is why this margin is so small. */
 .home-brand-lockup:has(.news-ticker) {
-  margin-bottom: 18px;
+  margin-bottom: 0.5px;
 }
 
 .news-ticker {
   position: relative;
   width: min(44rem, calc(100vw - 36px));
-  margin-top: 15px;
+  margin-top: 32.5px;
 }
 
 .news-ticker.is-empty {
@@ -5472,13 +5477,16 @@ a.home-social-icon:hover {
     margin-bottom: 32px;
   }
 
+  /* Same centring at the mobile size. Here the form's 32px of padding is
+     already wider than half the run, so the lockup gives a little back to
+     keep the total — and therefore the logo-to-input distance — identical. */
   .home-brand-lockup:has(.news-ticker) {
-    margin-bottom: 10px;
+    margin-bottom: -5.5px;
   }
 
   .news-ticker {
     width: calc(100vw - 20px);
-    margin-top: 11px;
+    margin-top: 26.5px;
   }
 
   .news-ticker-viewport {

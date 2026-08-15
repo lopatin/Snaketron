@@ -23,6 +23,7 @@ services:
       - ./common:/usr/src/app/common:delegated
       - ./macros:/usr/src/app/macros:delegated
       - ./client:/usr/src/app/client:delegated
+      - ./skin-schema:/usr/src/app/skin-schema:delegated
       - ./terminal:/usr/src/app/terminal:delegated
       - ./bot:/usr/src/app/bot:delegated
       - ./loadtest:/usr/src/app/loadtest:delegated
