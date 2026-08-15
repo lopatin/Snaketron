@@ -63,12 +63,19 @@ Two authoring rules the measurements enforce:
    from the first kick to the last — 4 dB of range across the whole record,
    which is what "not exciting" means in numbers. `SECTION_GAIN` in `song.py`
    authors the curve; the master chain is deliberately gentle so it survives.
-2. **A pitched effect must agree with the chord it lands on.** The goal
+2. **A phrase must fit the room it has, and cadence.** The drop's melody was
+   8 bars but only 4.25 fit before the end slate, so the tune was cut off
+   mid-sentence — and its last sounding note was the *third* of the chord,
+   high. A hanging third reads as unrewarded anticipation no matter how good
+   the build was. Check what the last note actually is, and land it on the
+   tonic. `retime_outro()` trades drop length for ending room so the two can
+   be compared by ear rather than argued about.
+3. **A pitched effect must agree with the chord it lands on.** The goal
    flourish was A–C–E over a bar of G major: no shared tones and a semitone
    between its C and the chord's B. It read as "too loud" and trimming it 6 dB
    changed nothing, because loudness was never the problem — the ear picks a
    clashing note out of a mix at any level. `sfx.bank()` now takes the chord,
    and `song.chord_at()` says what it is at a given second.
-3. **Sidechain release is tempo-tied.** At 120 BPM the beat gap is 500 ms; a
+4. **Sidechain release is tempo-tied.** At 120 BPM the beat gap is 500 ms; a
    240 ms release leaves half of every beat static and the groove stops
    breathing.
