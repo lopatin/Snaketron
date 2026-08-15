@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { GameState, QueueMode } from '../types';
+import type { GameState, QueueMode, Rank } from '../types';
 import { buildMatchPresentation } from '../utils/gamePresentation';
 import type { MatchRatingState } from '../utils/ratingReveal';
 import type { MatchHighlightState } from '../utils/highlightPresentation';
@@ -22,6 +22,7 @@ export interface GameHudShellProps {
   queueMode?: QueueMode;
   rating?: MatchRatingState;
   highlight: MatchHighlightState;
+  starRank?: Rank | null;
   onMenu: () => void;
   onPlayAgain: () => void;
   playAgainDisabled?: boolean;
@@ -36,6 +37,7 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
   queueMode,
   rating,
   highlight,
+  starRank = null,
   onMenu,
   onPlayAgain,
   playAgainDisabled = false,
@@ -115,6 +117,7 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
         presentation={presentation}
         rating={rating}
         highlight={highlight}
+        starRank={starRank}
         onDismiss={() => setScoreCardOpen(false)}
         onMenu={onMenu}
         onPlayAgain={onPlayAgain}

@@ -24,8 +24,8 @@ test('valid PotG is network-free, legible at 560px, and starts inside the quickm
   expect(box.width).toBeGreaterThanOrEqual(556);
   expect(box.width).toBeLessThanOrEqual(560);
   await expect(band.locator('.potg-star__name')).toHaveText('BANKER');
-  await expect(band.locator('.potg-reason')).toHaveText('Goal run — 15 points');
-  expect(await band.locator('.potg-star__name, .potg-reason').evaluateAll((nodes) => (
+  await expect(band.locator('.potg-star__reason')).toHaveText('Goal run — 15 points');
+  expect(await band.locator('.potg-star__name').evaluateAll((nodes) => (
     nodes.every((node) => node.scrollWidth <= node.clientWidth)
   ))).toBe(true);
   expect(apiOrSocketRequests(requests)).toEqual([]);
@@ -46,28 +46,25 @@ test('the star wears a rank badge only when this client knows their rank', async
   await expect(ranked.locator('.potg-star__rank')).toBeVisible();
 });
 
-test('the lower third collapses to a one-line summary and back', async ({ page }) => {
+test('the achievement is a popover on the star plate, not a second plate', async ({ page }) => {
   await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
   const band = page.getByTestId('play-of-the-game');
   await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await expect(band).toHaveAttribute('data-intro', 'done', { timeout: 6_000 });
 
-  const lowerThird = band.getByTestId('potg-lower-third');
-  const toggle = band.getByTestId('potg-lower-third-toggle');
-  const expanded = await lowerThird.boundingBox();
+  // Only the star's plate occupies the arena; the reason is hidden until asked for.
+  const reason = band.locator('.potg-star__reason');
+  await expect(reason).toHaveCSS('opacity', '0');
 
-  await toggle.click();
-  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
-  await expect(band.locator('.potg-summary')).toBeVisible();
-  await expect(band.locator('.potg-star')).toHaveCount(0);
+  await band.getByTestId('potg-star').hover();
+  await expect(reason).toHaveCSS('opacity', '1');
+  await expect(reason).toHaveText('Goal run — 15 points');
 
-  // The point of collapsing is to stop covering the arena.
-  const collapsed = await lowerThird.boundingBox();
-  expect(collapsed.width).toBeLessThan(expanded.width);
-  expect(collapsed.height).toBeLessThanOrEqual(expanded.height);
-
-  await toggle.click();
-  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
-  await expect(band.locator('.potg-star')).toBeVisible();
+  // Keyboard users get the same detail.
+  await page.mouse.move(0, 0);
+  await expect(reason).toHaveCSS('opacity', '0');
+  await band.getByTestId('potg-star').focus();
+  await expect(reason).toHaveCSS('opacity', '1');
 });
 
 test('ready PotG lower third remains readable at the 375px mobile target', async ({ page }) => {
@@ -79,11 +76,11 @@ test('ready PotG lower third remains readable at the 375px mobile target', async
   await band.scrollIntoViewIfNeeded();
   await expect(band.locator('.potg-lower-third')).toBeVisible();
   await expect(band.locator('.potg-star__name')).toHaveText('BANKER');
-  await expect(band.locator('.potg-reason')).toHaveText('Goal run — 15 points');
+  await expect(band.locator('.potg-star__reason')).toHaveText('Goal run — 15 points');
 
   const metrics = await band.evaluate((element) => {
     const star = element.querySelector('.potg-star__name');
-    const reason = element.querySelector('.potg-reason');
+    const reason = element.querySelector('.potg-star__reason');
     const rect = element.getBoundingClientRect();
     return {
       width: rect.width,

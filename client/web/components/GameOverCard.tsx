@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useInputSurface } from '../hooks/useInputSurface';
 import type { MatchPresentation } from '../utils/gamePresentation';
+import type { Rank } from '../types';
 import {
   formatPerMinuteRate,
   getPlayAgainShortcutAction,
@@ -27,6 +28,8 @@ export interface GameOverCardProps {
   presentation: MatchPresentation;
   rating?: MatchRatingState;
   highlight?: MatchHighlightState;
+  /** Ladder rank of whoever earned the highlight; see `useStarRank`. */
+  starRank?: Rank | null;
   onDismiss: () => void;
   onMenu: () => void;
   onPlayAgain: () => void;
@@ -69,6 +72,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
   presentation,
   rating,
   highlight,
+  starRank = null,
   onDismiss,
   onMenu,
   onPlayAgain,
@@ -209,16 +213,6 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
     ? `${presentation.sides[0]?.score ?? 0}–${presentation.sides[1]?.score ?? 0}`
     : current?.score.toString() ?? presentation.soloScore.toString();
 
-  // A highlight clip carries the star's name but not their ladder standing,
-  // and the only rank this client can read is the local player's own. Badge
-  // the caption when the star is that player; otherwise leave it off rather
-  // than assert a rank we have not been told.
-  const starRank = rating?.phase === 'ready' &&
-    highlight?.phase === 'ready' &&
-    current?.userId != null &&
-    highlight.clip.star_user_id === current.userId
-    ? rating.reveal.toRank
-    : null;
 
   return (
     <div
@@ -268,7 +262,12 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
 
         {rating && <RatingReveal state={rating} onSettled={handleRatingSettled} />}
 
-        {highlight && (
+        {/* One thing at a time: the rating panel owns the card until its sweep
+            finishes, and only then does the replay mount and slide in. Mounting
+            both at once put two animations on screen competing for attention
+            and made the card land at its full height before either had
+            anything to show. */}
+        {highlight && ratingSettled && (
           <PlayOfTheGame
             highlight={highlight}
             starRank={starRank}

@@ -344,6 +344,10 @@ pub async fn install_http_application(
     let leaderboard_state = LeaderboardState { db: db.clone() };
     let leaderboard_routes = Router::new()
         .route("/api/leaderboard", get(leaderboard::get_leaderboard))
+        .route(
+            "/api/leaderboard/users/{user_id}",
+            get(leaderboard::get_user_ranking_by_id),
+        )
         .route("/api/seasons", get(leaderboard::list_seasons))
         .with_state(leaderboard_state.clone());
 

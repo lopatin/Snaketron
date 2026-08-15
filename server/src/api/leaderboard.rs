@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use chrono::Utc;
@@ -424,6 +424,33 @@ pub async fn get_my_ranking(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    read_user_ranking(&state, auth_user.user_id, query).await
+}
+
+/// Read any player's ranking in one region.
+///
+/// Standing is already public — `/api/leaderboard` publishes the same MMR
+/// alongside the username, and the post-match card shows an opponent's badge
+/// next to their name. This endpoint exists so a surface that knows a user id
+/// but is not that user (the Play of the Game caption naming whoever earned
+/// it) can render a real badge instead of guessing or omitting one.
+///
+/// It is deliberately anonymous and carries no identity beyond the requested
+/// id: no username, no session, no counters the leaderboard does not already
+/// expose.
+pub async fn get_user_ranking_by_id(
+    State(state): State<LeaderboardState>,
+    Path(user_id): Path<i32>,
+    Query(query): Query<LeaderboardQuery>,
+) -> Result<Json<UserRankingResponse>, StatusCode> {
+    read_user_ranking(&state, user_id, query).await
+}
+
+async fn read_user_ranking(
+    state: &LeaderboardState,
+    user_id: i32,
+    query: LeaderboardQuery,
+) -> Result<Json<UserRankingResponse>, StatusCode> {
     // Parse queue mode
     let queue_mode = match query.queue_mode.to_lowercase().as_str() {
         "quickmatch" | "casual" => QueueMode::Quickmatch,
@@ -453,7 +480,7 @@ pub async fn get_my_ranking(
     // One keyed read of this region's partition, and nothing else.
     let ranking = match state
         .db
-        .get_user_ranking(auth_user.user_id, &queue_mode, &game_type, &region, season)
+        .get_user_ranking(user_id, &queue_mode, &game_type, &region, season)
         .await
     {
         Ok(Some(entry)) => {
@@ -485,7 +512,7 @@ pub async fn get_my_ranking(
             // back between page loads. A failure status lets the client keep
             // showing the rank it already had.
             error!(
-                user_id = auth_user.user_id,
+                user_id,
                 "Failed to read user ranking: {error:?}"
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);

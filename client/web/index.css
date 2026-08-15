@@ -910,7 +910,11 @@ button.game-scoreboard-brand {
 .game-over-card {
   position: relative;
   width: min(560px, 100%);
-  max-height: min(680px, calc(100dvh - 40px));
+  /* The replay band added a 21:9 block above the fold, which pushed Play
+     again and Main menu below it at 680px. The card is a results summary
+     with two calls to action — it should use the viewport it has rather than
+     hide its own buttons. */
+  max-height: calc(100dvh - 32px);
   overflow: auto;
   border: 1px solid rgb(63 63 65 / 52%);
   border-radius: 7px;

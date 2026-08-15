@@ -342,6 +342,32 @@ class API {
     return this.request<UserRankingResponse>(`/api/leaderboard/me?${params.toString()}`);
   }
 
+  /**
+   * Any player's ranking in one region. Standing is already public — the
+   * leaderboard publishes the same MMR next to the username — so this needs
+   * no auth. It exists for surfaces that know a user id but are not that
+   * user, such as the Play of the Game caption naming whoever earned it.
+   */
+  async getUserRanking(
+    userId: number,
+    queueMode: 'quickmatch' | 'competitive',
+    gameType: 'solo' | 'duel' | '2v2' | 'ffa',
+    season?: number,
+    region?: string
+  ): Promise<UserRankingResponse> {
+    const params = new URLSearchParams({
+      queue_mode: queueMode,
+      game_type: gameType,
+    });
+
+    if (season !== undefined) params.append('season', season.toString());
+    if (region) params.append('region', region);
+
+    return this.request<UserRankingResponse>(
+      `/api/leaderboard/users/${userId}?${params.toString()}`
+    );
+  }
+
   async getMatchHistory(cursor?: string | null, limit = 12): Promise<MatchHistoryPage> {
     const params = new URLSearchParams({ limit: limit.toString() });
     if (cursor) params.set('cursor', cursor);

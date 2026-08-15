@@ -26,14 +26,22 @@ import './PlayOfTheGame.css';
 
 const VISIBLE_THRESHOLD = 0.62;
 
-/** How long the title holds at centre before it travels to its corner. */
-const INTRO_TITLE_HOLD_MS = 850;
-/** The journey itself. Kept in lockstep with the CSS transition duration. */
-const INTRO_TRAVEL_MS = 620;
-/** Height the title is blown up to at centre, relative to its resting size. */
-const INTRO_TITLE_SCALE = 3.1;
+/**
+ * The mount sequence, in order: the band slides in behind a cover carrying
+ * "PLAY OF THE GAME"; the title fades out; the star's plate arrives large in
+ * the same spot; it holds, then travels to its resting corner while the cover
+ * fades off the arena; playback starts.
+ *
+ * Each duration below is mirrored by a CSS transition of the same length.
+ */
+const INTRO_TITLE_HOLD_MS = 900;
+const INTRO_TITLE_OUT_MS = 220;
+const INTRO_STAR_HOLD_MS = 900;
+const INTRO_TRAVEL_MS = 560;
+/** Height the star plate is blown up to at centre, relative to its rest size. */
+const INTRO_STAR_SCALE = 1.85;
 
-type IntroPhase = 'idle' | 'title' | 'travelling' | 'done';
+type IntroPhase = 'idle' | 'title' | 'star' | 'travelling' | 'done';
 
 interface SponsorSlotProps {
   reason: 'absent' | 'incompatible' | 'network';
@@ -125,11 +133,10 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
 }) => {
   const playerRef = useRef<ScenarioCanvasHandle>(null);
   const bandRef = useRef<HTMLElement>(null);
-  const kickerRef = useRef<HTMLSpanElement>(null);
+  const starRef = useRef<HTMLSpanElement>(null);
   const autoplayStartedRef = useRef(false);
   const suspendedByGateRef = useRef(false);
   const [introPhase, setIntroPhase] = useState<IntroPhase>('idle');
-  const [lowerThirdOpen, setLowerThirdOpen] = useState(true);
   const [playerReady, setPlayerReady] = useState(false);
   const [substantiallyVisible, setSubstantiallyVisible] = useState(false);
   const [documentVisible, setDocumentVisible] = useState(() => !document.hidden);
@@ -203,9 +210,7 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
     ) {
       autoplayStartedRef.current = true;
       onAutoplayStarted(clip.game_id);
-      // The title card runs first and starts playback when it lands. Reduced
-      // motion never reaches this branch (canAutoplayHighlight gates on it),
-      // so the intro cannot strand a viewer who asked for no animation.
+      // The intro runs first and starts playback when it lands.
       setIntroPhase('title');
     }
   }, [
@@ -225,20 +230,20 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
     void playerRef.current?.pause().catch(() => undefined);
   }, []);
 
-  // Park the title at the centre of the band, scaled up, before the browser
-  // paints the frame that reveals it. Measuring both boxes (rather than
-  // hard-coding a translation) keeps the landing exact at any band size, and
-  // the resting position stays the element's real layout position so nothing
-  // has to be un-transformed afterwards.
+  // Park the star plate at the centre of the band, scaled up, before the
+  // browser paints the frame that reveals it. Measuring both boxes rather
+  // than hard-coding a translation keeps the landing exact at any band size,
+  // and the resting position stays the element's real layout position, so the
+  // journey ends by simply dropping the inline transform.
   useLayoutEffect(() => {
-    if (introPhase !== 'title') return;
-    const kicker = kickerRef.current;
+    if (introPhase !== 'star') return;
+    const star = starRef.current;
     const band = bandRef.current;
-    if (!kicker || !band) {
+    if (!star || !band) {
       setIntroPhase('done');
       return;
     }
-    const from = kicker.getBoundingClientRect();
+    const from = star.getBoundingClientRect();
     const into = band.getBoundingClientRect();
     if (from.width === 0 || into.width === 0) {
       setIntroPhase('done');
@@ -246,21 +251,45 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
     }
     const dx = (into.left + into.width / 2) - (from.left + from.width / 2);
     const dy = (into.top + into.height / 2) - (from.top + from.height / 2);
-    kicker.style.transform =
-      `translate(${dx.toFixed(2)}px, ${dy.toFixed(2)}px) scale(${INTRO_TITLE_SCALE})`;
+    // The plate's skew is part of its identity, so it travels skewed. Keeping
+    // the same three functions in the same order at both ends of the journey
+    // lets the browser interpolate them componentwise instead of decomposing
+    // to a matrix.
+    star.style.transform =
+      `translate(${dx.toFixed(2)}px, ${dy.toFixed(2)}px) scale(${INTRO_STAR_SCALE}) skewX(-7deg)`;
   }, [introPhase]);
+
+  // Reduced motion never reaches the autoplay gate, so without this the cover
+  // would sit over the arena forever waiting for an intro that cannot start.
+  // Skipping to the settled state hands the viewer the player's own poster
+  // and its explicit play control.
+  useEffect(() => {
+    if (!motionAllowed && introPhase === 'idle') setIntroPhase('done');
+  }, [introPhase, motionAllowed]);
 
   useEffect(() => {
     if (introPhase !== 'title') return undefined;
-    const timer = window.setTimeout(() => setIntroPhase('travelling'), INTRO_TITLE_HOLD_MS);
+    const timer = window.setTimeout(
+      () => setIntroPhase('star'),
+      INTRO_TITLE_HOLD_MS + INTRO_TITLE_OUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [introPhase]);
+
+  useEffect(() => {
+    if (introPhase !== 'star') return undefined;
+    const timer = window.setTimeout(() => setIntroPhase('travelling'), INTRO_STAR_HOLD_MS);
     return () => window.clearTimeout(timer);
   }, [introPhase]);
 
   useEffect(() => {
     if (introPhase !== 'travelling') return undefined;
-    // Releasing the inline transform lets the CSS transition carry it home.
-    if (kickerRef.current) kickerRef.current.style.transform = '';
+    const star = starRef.current;
+    if (star) star.style.transform = 'translate(0px, 0px) scale(1) skewX(-7deg)';
     const timer = window.setTimeout(() => {
+      // Hand the plate back to the stylesheet once it has landed, so nothing
+      // inline survives into the settled state.
+      if (star) star.style.transform = '';
       setIntroPhase('done');
       setPlaybackStatus('playing');
       void playerRef.current?.play().catch(() => setRenderFailed(true));
@@ -318,7 +347,7 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
   }
 
   const complete = playbackStatus === 'complete';
-  const introRunning = introPhase === 'title' || introPhase === 'travelling';
+  const introRunning = introPhase !== 'idle' && introPhase !== 'done';
 
   return (
     <section
@@ -343,9 +372,10 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
         onError={() => setRenderFailed(true)}
       />
 
-      <span ref={kickerRef} className="potg-kicker is-title" aria-hidden="true">
-        Play of the game
-      </span>
+      {/* Holds the arena back until the star plate has arrived, so the intro
+          is one thing at a time rather than a title competing with motion. */}
+      <div className="potg-cover" aria-hidden="true" />
+      <span className="potg-title" aria-hidden="true">Play of the game</span>
 
       <button
         type="button"
@@ -358,37 +388,20 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
         <ReplayIcon />
       </button>
 
-      <div
-        className={`potg-lower-third${lowerThirdOpen ? '' : ' is-collapsed'}`}
-        data-testid="potg-lower-third"
-      >
-        {lowerThirdOpen ? (
-          <>
-            <span className="potg-star">
-              {starBadge}
-              <span className="potg-star__name">{clip.star_name}</span>
-            </span>
-            <span className="potg-reason">{reason}</span>
-          </>
-        ) : (
-          <span className="potg-summary">
-            {starBadge}
-            <span className="potg-star__name">{clip.star_name}</span>
-            <span className="potg-summary__reason">{reason}</span>
-          </span>
-        )}
-        <button
-          type="button"
-          className="potg-lower-third__toggle"
-          onClick={() => setLowerThirdOpen((open) => !open)}
-          aria-expanded={lowerThirdOpen}
-          aria-label={lowerThirdOpen
-            ? 'Minimise the play of the game caption'
-            : 'Expand the play of the game caption'}
-          data-testid="potg-lower-third-toggle"
+      <div className="potg-lower-third" data-testid="potg-lower-third">
+        {/* The reason is a hover/focus popover rather than a second permanent
+            plate: it is the detail, and a band of two plates across the
+            bottom of a 21:9 frame sits exactly where the snakes are. */}
+        <span
+          ref={starRef}
+          className="potg-star"
+          tabIndex={0}
+          data-testid="potg-star"
         >
-          <span aria-hidden="true">{lowerThirdOpen ? '▾' : '▴'}</span>
-        </button>
+          {starBadge}
+          <span className="potg-star__name">{clip.star_name}</span>
+          <span className="potg-star__reason" role="tooltip">{reason}</span>
+        </span>
       </div>
     </section>
   );
@@ -397,11 +410,9 @@ const HighlightReplay: React.FC<HighlightReplayProps> = ({
 export interface PlayOfTheGameProps {
   highlight: MatchHighlightState;
   /**
-   * The star's ladder rank, when this client can actually know it — today
-   * that means the star is the local player and their post-match rating has
-   * landed. A clip carries no rank for other players, and an invented badge
-   * would be a false claim about someone's standing, so the caption simply
-   * drops the badge rather than guessing.
+   * The star's ladder rank, resolved by `useStarRank`. Null when the read
+   * failed or the player has no row this season — the caption drops the badge
+   * rather than advertising a rank nobody confirmed.
    */
   starRank?: Rank | null;
   ratingSettled: boolean;

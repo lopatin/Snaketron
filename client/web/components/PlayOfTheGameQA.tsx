@@ -64,14 +64,13 @@ const highlightForState = (state: QaState): MatchHighlightState => {
 };
 
 /**
- * The 'ranked' fixture is the only one that supplies a rating, because the
- * star's badge can only be drawn when this client knows the star's rank —
- * which today means the star is the local player and their post-match rating
- * has landed. The fixture clip's star_user_id is the local player, so this
- * state is what exercises the badge; every other state deliberately renders
- * the caption without one.
+ * The 'ranked' fixture is the only one that supplies a rating and a star rank.
+ * In the product both arrive independently — the rating from the local
+ * player's own ladder read, the star's rank from `useStarRank` — so the lab
+ * keeps a state with neither (the badge is simply absent) and one with both,
+ * which is also the state that exercises rating-then-replay sequencing.
  */
-const rankedRating: MatchRatingState = {
+const rankedRating: Extract<MatchRatingState, { phase: 'ready' }> = {
   phase: 'ready',
   reveal: buildRatingReveal(
     'Competitive',
@@ -223,6 +222,7 @@ const PlayOfTheGameQA: React.FC = () => {
         presentation={presentation}
         highlight={highlight}
         rating={state === 'ranked' ? rankedRating : undefined}
+        starRank={state === 'ranked' ? rankedRating.reveal.toRank : null}
         onDismiss={() => undefined}
         onMenu={() => undefined}
         onPlayAgain={() => undefined}

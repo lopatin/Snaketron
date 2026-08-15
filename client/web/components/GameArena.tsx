@@ -72,6 +72,7 @@ import { useInputSurface } from '../hooks/useInputSurface';
 import { useFullscreen } from '../hooks/useFullscreen';
 import { useMatchRating } from '../hooks/useMatchRating';
 import { useHighlight } from '../hooks/useHighlight';
+import { useStarRank } from '../hooks/useStarRank';
 import './GameArena.css';
 
 /**
@@ -359,6 +360,12 @@ export default function GameArena() {
     user?.id,
   );
   const matchHighlight = useHighlight(gameId, isGameComplete);
+  const starRank = useStarRank(
+    matchHighlight.phase === 'ready' ? matchHighlight.clip.star_user_id : undefined,
+    committedState ?? gameState,
+    user?.id,
+    matchRating.phase === 'ready' ? matchRating.reveal.toRank : null,
+  );
   const isTouchSurface = inputSurface === 'touch';
   const fullscreen = useFullscreen();
   // The touch d-pad reads its gates through this ref so a tap consults the
@@ -1716,6 +1723,7 @@ export default function GameArena() {
           queueMode={queueMode}
           rating={matchRating}
           highlight={matchHighlight}
+          starRank={starRank}
           onMenu={handleBackToMenu}
           onPlayAgain={handlePlayAgain}
           playAgainDisabled={isLobbyQueued}
