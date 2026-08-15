@@ -63,8 +63,13 @@
    --------------------------------------------------------------------------- */
 /* Sharp off the mark, long settle — the panel is most of the way in before
    the eye catches up, which is what makes the arrival feel like a snap rather
-   than a drawer being pulled. */
-.potg-band {
+   than a drawer being pulled.
+
+   The sponsor slot shares it. Whichever of the two fills this space, it
+   arrives the same way: appearing without the move reads as the card
+   mis-laying itself out rather than as something being presented. */
+.potg-band,
+.potg-sponsor {
   animation: potg-band-in 480ms cubic-bezier(0.1, 0.86, 0.18, 1) both;
 }
 
@@ -304,85 +309,8 @@
   outline-offset: 3px;
 }
 
-.potg-band.is-loading,
 .potg-band.is-poster {
   aspect-ratio: 21 / 9;
-}
-
-.potg-band.is-loading {
-  display: grid;
-  place-items: center;
-  background: #e8edf4;
-}
-
-.potg-band.is-loading > .potg-kicker {
-  position: absolute;
-  top: 10px;
-  left: 12px;
-}
-
-.potg-skeleton__arena {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  background:
-    linear-gradient(90deg, transparent 49.8%, rgb(63 63 65 / 9%) 50%, transparent 50.2%),
-    linear-gradient(0deg, transparent 49.8%, rgb(63 63 65 / 9%) 50%, transparent 50.2%),
-    #eef2f7;
-}
-
-.potg-skeleton__arena::after {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -38%;
-  width: 30%;
-  animation: potg-skeleton-scan 1150ms ease-in-out infinite;
-  background: rgb(255 255 255 / 68%);
-  content: "";
-  transform: skewX(-18deg);
-}
-
-.potg-skeleton__arena i {
-  position: absolute;
-  width: 15%;
-  height: 7px;
-  background: #cbd5e1;
-  box-shadow: 4px 4px 0 rgb(63 63 65 / 12%);
-}
-
-.potg-skeleton__arena i:nth-child(1) {
-  top: 34%;
-  left: 19%;
-  transform: rotate(90deg);
-}
-
-.potg-skeleton__arena i:nth-child(2) {
-  top: 51%;
-  left: 41%;
-}
-
-.potg-skeleton__arena i:nth-child(3) {
-  right: 18%;
-  bottom: 26%;
-  transform: rotate(-90deg);
-}
-
-.potg-skeleton__caption {
-  position: absolute;
-  right: 12px;
-  bottom: 12px;
-  z-index: 2;
-  color: rgb(63 63 65 / 60%);
-  font-size: 8px;
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
-
-@keyframes potg-skeleton-scan {
-  to { left: 112%; }
 }
 
 .potg-band.is-poster {
@@ -564,11 +492,6 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .potg-skeleton__arena::after {
-    display: none;
-    animation: none;
-  }
-
   /* Autoplay (and therefore the intro) never runs under reduced motion, but
      pin the resting state anyway so a mid-flight preference change cannot
      leave the title parked at the centre of the band. */

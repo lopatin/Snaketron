@@ -211,9 +211,15 @@ test('modal playback sustains at least 30fps under Chrome 4x CPU throttle', asyn
   expect(fps).toBeGreaterThanOrEqual(30);
 });
 
-test('pending and unavailable URL states expose the skeleton and sponsor degradation', async ({ page }) => {
+test('the panel stays closed while pending, and both fills arrive by animating', async ({ page }) => {
+  // Nothing is reserved while the server is still cutting: the panel has to
+  // be closed for its arrival to be an opening rather than a content swap.
   await page.goto('/qa/play-of-the-game?state=pending&chrome=0');
-  await expect(page.getByTestId('potg-loading')).toBeVisible();
+  const card = page.getByTestId('game-over-card');
+  await expect(card).toBeVisible();
+  await expect(page.getByTestId('play-of-the-game')).toHaveCount(0);
+  await expect(page.getByTestId('potg-sponsor')).toHaveCount(0);
+  await expect(page.locator('.potg-band, .potg-sponsor')).toHaveCount(0);
 
   await page.goto('/qa/play-of-the-game?state=unavailable&chrome=0');
   await expect(page.getByTestId('potg-sponsor')).toHaveAttribute(
@@ -221,6 +227,36 @@ test('pending and unavailable URL states expose the skeleton and sponsor degrada
     'absent',
   );
   await expect(page.getByTestId('potg-sponsor')).toContainText('Sponsored');
+
+  // The sponsor slot fills the same space, so it makes the same entrance —
+  // otherwise it reads as the card jumping rather than presenting something.
+  const entrance = await page.getByTestId('potg-sponsor').evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      name: style.animationName,
+      duration: style.animationDuration,
+      easing: style.animationTimingFunction,
+    };
+  });
+  const replayEntrance = await page.evaluate(async () => {
+    const response = { name: null, duration: null, easing: null };
+    const probe = document.createElement('div');
+    probe.className = 'potg-band';
+    document.body.append(probe);
+    const style = getComputedStyle(probe);
+    response.name = style.animationName;
+    response.duration = style.animationDuration;
+    response.easing = style.animationTimingFunction;
+    probe.remove();
+    return response;
+  });
+  expect(entrance).toEqual(replayEntrance);
+
+  // ...but it keeps its own quiet border rather than the replay's recess.
+  const inset = await page.getByTestId('potg-sponsor').evaluate((el) => (
+    getComputedStyle(el, '::after').boxShadow
+  ));
+  expect(inset === 'none' || inset === '').toBe(true);
 
   await page.goto('/qa/play-of-the-game?state=incompatible&chrome=0');
   await expect(page.getByTestId('potg-sponsor')).toHaveAttribute(

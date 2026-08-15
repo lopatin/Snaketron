@@ -102,20 +102,6 @@ const SponsorSlot: React.FC<SponsorSlotProps> = ({ reason }) => {
   );
 };
 
-const HighlightSkeleton: React.FC = () => (
-  <section
-    className="potg-band is-loading"
-    aria-label="Play of the game loading"
-    data-testid="potg-loading"
-  >
-    <span className="potg-kicker">Play of the game</span>
-    <div className="potg-skeleton__arena" aria-hidden="true">
-      <i /><i /><i />
-    </div>
-    <span className="potg-skeleton__caption">Cutting the replay…</span>
-  </section>
-);
-
 interface HighlightReplayProps {
   clip: HighlightClip;
   starRank: Rank | null;
@@ -427,8 +413,12 @@ const PlayOfTheGame: React.FC<PlayOfTheGameProps> = ({
   autoplayAllowed,
   onAutoplayStarted,
 }) => {
+  // Nothing at all while the server is still cutting. A placeholder panel
+  // sitting open under the rating asks the viewer to watch an empty box, and
+  // it spends the slide-in that makes the replay's arrival read as deliberate
+  // — the panel has to be closed for there to be an opening.
   if (highlight.phase === 'idle' || highlight.phase === 'pending') {
-    return <HighlightSkeleton />;
+    return null;
   }
   if (highlight.phase === 'unavailable') {
     return <SponsorSlot reason={highlight.reason} />;
