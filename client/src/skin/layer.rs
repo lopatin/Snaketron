@@ -190,6 +190,13 @@ pub enum Source {
     /// recordable, which means stripes, dashes and travelling bands are
     /// checkable natively like the rest of the system.
     ///
+    /// One tile layer is a single band: a repeat along `s` at one place across
+    /// the body. Patterns that alternate in **both** axes — a checkerboard is
+    /// the obvious one — are two of these, offset against each other by
+    /// `t_center` and `phase_cells`. Building them from bands rather than from
+    /// a dedicated two-dimensional source keeps the emission loop unchanged and
+    /// keeps the cost legible: a skin author can count the rectangles.
+    ///
     /// Bitmap tiling is a different feature and lives on [`Source::Image`] as
     /// [`Fit::Tile`].
     Tiled {
@@ -200,6 +207,19 @@ pub enum Source {
         duty: f64,
         /// Half-width across the body, `0..0.5`.
         half_width: f64,
+        /// Where the band sits across the body, `-0.5..0.5`. `0.0` is the
+        /// centreline, which is what a single band wants; a checkerboard's two
+        /// rows sit either side of it.
+        ///
+        /// `|t_center| + half_width` may not exceed `0.5`: a body layer that
+        /// reached past the silhouette could paint over the Boost band, and
+        /// keeping the bound declarative is what lets `validate_layers` catch
+        /// it at registration instead of a pixel validator catching it never.
+        t_center: f64,
+        /// Offset of the first repeat along the body, in cells. Tiles are
+        /// otherwise pinned to absolute multiples of `period_cells` from the
+        /// head, so without this two bands can only ever be in phase.
+        phase_cells: f64,
         /// Optional alpha, evaluated once per emitted tile at its centre in
         /// body space. `None` is fully opaque.
         alpha: Option<std::sync::Arc<skin_schema::expr::Expr>>,

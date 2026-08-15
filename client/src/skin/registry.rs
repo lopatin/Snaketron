@@ -4,6 +4,7 @@
 //! newer build, a corrupted preference, a hand-edited request — falls back to
 //! the classic look and logs once. Cosmetics must not be able to break a frame.
 
+use crate::skin::checker::{CheckerSkin, FAMILY};
 use crate::skin::doc::ParamSkin;
 use crate::skin::ember::EmberSkin;
 use crate::skin::{ClassicSkin, SnakeSkin};
@@ -43,6 +44,10 @@ fn document_skins() -> &'static [ParamSkin] {
 pub struct SkinRegistry {
     classic: ClassicSkin,
     ember: EmberSkin,
+    /// The checkerboard family. One implementation, three boards — kept as an
+    /// array rather than three fields because that is what it is, and because
+    /// adding a fourth board should not mean touching this struct.
+    checkers: [CheckerSkin; 3],
 }
 
 impl Default for SkinRegistry {
@@ -56,6 +61,7 @@ impl SkinRegistry {
         Self {
             classic: ClassicSkin,
             ember: EmberSkin,
+            checkers: FAMILY,
         }
     }
 
@@ -63,6 +69,7 @@ impl SkinRegistry {
     pub fn entries(&self) -> Vec<&dyn SnakeSkin> {
         let mut entries: Vec<&dyn SnakeSkin> = vec![&self.classic, &self.ember];
         entries.extend(document_skins().iter().map(|skin| skin as &dyn SnakeSkin));
+        entries.extend(self.checkers.iter().map(|skin| skin as &dyn SnakeSkin));
         entries
     }
 
@@ -110,6 +117,9 @@ mod tests {
             "tidewave@1",
             "voltage@1",
             "lantern@1",
+            "gambit@1",
+            "harlequin@1",
+            "pitlane@1",
         ];
         let mut sorted_client = client.clone();
         sorted_client.sort_unstable();

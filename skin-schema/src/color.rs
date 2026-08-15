@@ -56,8 +56,8 @@ impl Rgb {
         0.2126 * linear(self.r) + 0.7152 * linear(self.g) + 0.0722 * linear(self.b)
     }
 
-    /// Hue in degrees and chroma, via OKLab.
-    pub fn oklch_hue_chroma(self) -> (f64, f64) {
+    /// Perceptual lightness and the two opponent-colour axes, in OKLab.
+    pub fn oklab(self) -> (f64, f64, f64) {
         fn linear(value: f64) -> f64 {
             if value <= 0.04045 {
                 value / 12.92
@@ -71,12 +71,35 @@ impl Rgb {
         let m = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
         let s = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();
 
-        let a = 1.977_998_495_1 * l - 2.428_592_205 * m + 0.450_593_709_9 * s;
-        let bb = 0.025_904_037_1 * l + 0.782_771_766_2 * m - 0.808_675_766 * s;
-
-        let hue = bb.atan2(a).to_degrees().rem_euclid(360.0);
-        (hue, (a * a + bb * bb).sqrt())
+        (
+            0.210_454_255_3 * l + 0.793_617_785 * m - 0.004_072_046_8 * s,
+            1.977_998_495_1 * l - 2.428_592_205 * m + 0.450_593_709_9 * s,
+            0.025_904_037_1 * l + 0.782_771_766_2 * m - 0.808_675_766 * s,
+        )
     }
+
+    /// Hue in degrees and chroma, via OKLab.
+    pub fn oklch_hue_chroma(self) -> (f64, f64) {
+        let (_, a, b) = self.oklab();
+        let hue = b.atan2(a).to_degrees().rem_euclid(360.0);
+        (hue, (a * a + b * b).sqrt())
+    }
+}
+
+/// How different two colours look, as a straight-line distance in OKLab.
+///
+/// Contrast ratio answers "can I read text on this", and it is the wrong
+/// question for two colours side by side: it sees only lightness, so it calls a
+/// violet and a cyan of the same lightness identical. A patterned skin needs the
+/// other question — "are these two squares telling me apart" — and that is what
+/// a perceptual distance measures.
+///
+/// For scale: about 0.02 is the threshold of visibility, and 0.08 is a
+/// difference nobody would miss.
+pub fn perceptual_distance(first: Rgb, second: Rgb) -> f64 {
+    let (l1, a1, b1) = first.oklab();
+    let (l2, a2, b2) = second.oklab();
+    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
 }
 
 /// Contrast ratio between two colours, WCAG style.
@@ -169,6 +192,27 @@ mod tests {
                 "{hue} would be legal for both sides"
             );
         }
+    }
+
+    /// The case that motivates having a second measure at all: two colours a
+    /// contrast ratio calls nearly identical, which nobody would confuse.
+    #[test]
+    fn perceptual_distance_sees_hue_where_contrast_sees_nothing() {
+        let violet = Rgb::parse("#a288ef").expect("valid hex");
+        let cyan = Rgb::parse("#72e0ea").expect("valid hex");
+        assert!(
+            contrast_ratio(violet, cyan) < 2.0,
+            "these two are close in lightness; that is the point"
+        );
+        assert!(
+            perceptual_distance(violet, cyan) > 0.08,
+            "...and obviously different colours all the same"
+        );
+
+        let white = Rgb::parse("#ffffff").expect("valid hex");
+        assert_eq!(perceptual_distance(white, white), 0.0);
+        let black = Rgb::parse("#000000").expect("valid hex");
+        assert!(perceptual_distance(white, black) > 0.9);
     }
 
     #[test]
