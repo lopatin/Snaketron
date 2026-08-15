@@ -1275,6 +1275,14 @@ pub struct GameState {
     pub event_sequence: u64,
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
+    /// Which skin each player is wearing, by user_id.
+    ///
+    /// Purely cosmetic, and deliberately kept beside `usernames` rather than on
+    /// `Snake`: everything on a snake is fingerprinted, and a skin must never
+    /// be able to make two clients disagree about the game. Absent entries — and
+    /// every state written before skins existed — render as the classic look.
+    #[serde(default)]
+    pub skins: HashMap<u32, String>,
     // Spectators by user_id (do not have snakes/players)
     #[serde(serialize_with = "sorted_hash_set::serialize")]
     pub spectators: HashSet<u32>,
@@ -1522,6 +1530,7 @@ impl GameState {
             start_ms,
             event_sequence: 0,
             usernames: HashMap::new(),
+            skins: HashMap::new(),
             spectators: HashSet::new(),
             scores: HashMap::new(),
             food_pickups: HashMap::new(),
@@ -2691,6 +2700,23 @@ impl GameState {
 
     pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
         self.add_player_with_team(user_id, username, None)
+    }
+
+    /// Record which skin a player is wearing.
+    ///
+    /// The caller is responsible for having checked the id against the
+    /// catalogue — this is cosmetic state, and an unknown id renders as the
+    /// classic look rather than failing, so the engine does not need to guard
+    /// it. Passing `None` clears any previous choice.
+    pub fn set_player_skin(&mut self, user_id: u32, skin_ref: Option<String>) {
+        match skin_ref {
+            Some(skin_ref) => {
+                self.skins.insert(user_id, skin_ref);
+            }
+            None => {
+                self.skins.remove(&user_id);
+            }
+        }
     }
 
     /// Arm the pre-match readiness gate. Called once at match creation, before

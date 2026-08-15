@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "aurora@1",
+  "name": "Aurora",
+  "palette": {
+    "friendly": [
+      { "fill": "#5ad2e0", "outline": "#2e8fa0" },
+      { "fill": "#38b6d6", "outline": "#1d7690" }
+    ],
+    "enemy": [
+      { "fill": "#ff7a59", "outline": "#b8452c" },
+      { "fill": "#f2564e", "outline": "#a32f2e" }
+    ],
+    "free_for_all": [
+      { "fill": "#5ad2e0", "outline": "#2e8fa0" },
+      { "fill": "#ff7a59", "outline": "#b8452c" },
+      { "fill": "#7d8fa8", "outline": "#4a586b" },
+      { "fill": "#f5c04a", "outline": "#a3781f" }
+    ]
+  },
+  "head": {
+    "core_ratio": 0.36,
+    "core_color": "#10203a",
+    "gradient": {
+      "length_cells": 12.0,
+      "max_opacity": 0.34,
+      "color": "#eafcff"
+    }
+  },
+  "outline": {
+    "extra_px": 2.0,
+    "boost_band": { "color": "#fff200", "extra_px": 6.0 }
+  },
+  "animation": {
+    "period_ms": 2600.0,
+    "tracks": [
+      { "target": "body_lightness", "amplitude": 0.07, "phase": 0.0 },
+      { "target": "gradient_opacity", "amplitude": 0.06, "phase": 0.25 }
+    ]
+  }
+}

@@ -74,7 +74,37 @@ export interface ScoreEffectActivation {
   tick: number;
   origin: Position;
   startedAtMs: number;
+  /**
+   * The scorer's celebration dressing, captured when the cue was seen. Held on
+   * the activation rather than looked up while drawing so a celebration in
+   * flight keeps the colours it started with.
+   */
+  celebration: CelebrationTheme;
 }
+
+/**
+ * How a goal celebration looks, supplied by the *scoring* player's skin.
+ *
+ * Celebration is the surface everyone watching sees, so it is attributed to
+ * whoever earned it. `effect` names a first-party renderer — a skin chooses
+ * which effect plays and what colour it is, never what code runs.
+ */
+export interface CelebrationTheme {
+  effect: string;
+  friendly_accent: string;
+  enemy_accent: string;
+  readout_friendly: string;
+  readout_enemy: string;
+}
+
+/** The dressing every client can always draw. */
+export const CLASSIC_CELEBRATION_THEME: CelebrationTheme = {
+  effect: DEFAULT_SCORE_EFFECT_ID,
+  friendly_accent: '#5299bb',
+  enemy_accent: '#d45454',
+  readout_friendly: '#2b6f8c',
+  readout_enemy: '#a83232',
+};
 
 export interface ScoreEffectRuntime {
   active: ScoreEffectActivation[];
@@ -88,6 +118,8 @@ export interface PredictedGoalCue {
   snake_id: number;
   position: Position;
   points: number;
+  /** Resolved from the scorer's skin by the Rust side. */
+  celebration?: CelebrationTheme;
 }
 
 export interface PredictedScoreVisualState {
@@ -289,6 +321,9 @@ export const syncPredictedScoreEffects = (
       tick: cue.tick,
       origin: { ...cue.position },
       startedAtMs: nowMs - elapsedMs,
+      // A cue from an older client, or one whose scorer wore an unknown skin,
+      // arrives without dressing and gets the classic look.
+      celebration: cue.celebration ?? CLASSIC_CELEBRATION_THEME,
     });
     started += 1;
   }
@@ -594,9 +629,12 @@ export const sampleScoreReadout = (
 export const getScoreEffectTeamColor = (
   teamId: number,
   localTeamId: number | null,
+  celebration: CelebrationTheme = CLASSIC_CELEBRATION_THEME,
 ): string => {
-  const isBlue = localTeamId === null ? teamId === 0 : teamId === localTeamId;
-  return isBlue ? '#5299bb' : '#d45454';
+  // Whether this goal reads as "ours" is the viewer's question; what the two
+  // sides look like is the scorer's skin's answer.
+  const isFriendly = localTeamId === null ? teamId === 0 : teamId === localTeamId;
+  return isFriendly ? celebration.friendly_accent : celebration.enemy_accent;
 };
 
 /**
@@ -607,9 +645,12 @@ export const getScoreEffectTeamColor = (
 export const getScoreReadoutColor = (
   teamId: number,
   localTeamId: number | null,
+  celebration: CelebrationTheme = CLASSIC_CELEBRATION_THEME,
 ): string => {
-  const isBlue = localTeamId === null ? teamId === 0 : teamId === localTeamId;
-  return isBlue ? '#2b6f8c' : '#a83232';
+  const isFriendly = localTeamId === null ? teamId === 0 : teamId === localTeamId;
+  return isFriendly
+    ? celebration.readout_friendly
+    : celebration.readout_enemy;
 };
 
 export const goalImpactWaveRenderer: ScoreEffectRenderer = {
@@ -624,6 +665,7 @@ export const goalImpactWaveRenderer: ScoreEffectRenderer = {
     const teamColor = getScoreEffectTeamColor(
       activation.teamId,
       frame.localTeamId,
+      activation.celebration,
     );
     const cells = sampleScoreWaveCells(activation, frame);
 
@@ -670,6 +712,7 @@ export const goalImpactWaveRenderer: ScoreEffectRenderer = {
       context.fillStyle = getScoreReadoutColor(
         activation.teamId,
         frame.localTeamId,
+        activation.celebration,
       );
       context.fillText(readout.text, 0, 0);
     } finally {

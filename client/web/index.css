@@ -5954,3 +5954,131 @@ a.home-social-icon:hover {
     max-width: 84px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Skin contact sheet (/qa/skins, development only).
+   Plain and dense on purpose: it is a place to look at snakes, not a page.
+   --------------------------------------------------------------------------- */
+.skins-qa {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+  background: #ffffff;
+}
+
+.skins-qa h1 {
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.skins-qa h2 {
+  margin: 28px 0 4px;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #475569;
+}
+
+.skins-qa-note {
+  margin: 0 0 12px;
+  color: #64748b;
+  font-size: 0.85rem;
+  max-width: 60ch;
+}
+
+.skins-qa-catalog {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skins-qa-catalog button {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.skins-qa-catalog button.is-selected {
+  border-color: #3c8dde;
+  box-shadow: inset 0 0 0 1px #3c8dde;
+}
+
+.skins-qa-catalog small {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.skins-qa-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.skins-qa-tile {
+  margin: 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.skins-qa-tile canvas {
+  display: block;
+}
+
+.skins-qa-tile figcaption {
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  color: #64748b;
+  border-top: 1px solid #f1f5f9;
+}
+
+.skins-qa-swatches {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.skins-qa-swatches li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+}
+
+.skins-qa-chip {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid;
+  display: inline-block;
+}
+
+.skins-qa-controls {
+  margin-bottom: 12px;
+}
+
+.skins-qa-controls button {
+  padding: 6px 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.skins-qa-controls button[aria-pressed='true'] {
+  border-color: #3c8dde;
+  color: #1d4ed8;
+}

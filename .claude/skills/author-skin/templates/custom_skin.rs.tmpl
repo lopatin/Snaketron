@@ -1,0 +1,180 @@
+//! <NAME> — a first-party skin that needs more than a document can say.
+//!
+//! Say here, in one sentence, what specifically forced Rust. If you cannot,
+//! this should be a document.
+//!
+//! The body comes from the shared layer stack every skin uses, so this file is
+//! only ever about the part that is different. `client/src/skin/ember.rs` is
+//! the worked example: it takes the same stack and adds one head layer whose
+//! radius is a baked scalar track.
+
+use crate::skin::classic::document_layers;
+use crate::skin::composite::{
+    BaseThemeOwned, CelebrationThemeOwned, CompositeConfig, CompositeSkin, Frame, Swatch,
+};
+// These are for the custom layer you are about to write; until you uncomment
+// the example below, the compiler will call them unused, and it is right.
+use crate::skin::layer::{ColorSlot, DiscPaint, Layer, LayerKind, LayerTransform, Region};
+use crate::skin::space::ClipShape;
+use crate::skin::{
+    BaseTheme, CelebrationTheme, PaintCtx, SkinColors, SkinIdentity, SkinMetrics, SnakePose,
+    SnakeSkin,
+};
+use wasm_bindgen::prelude::*;
+
+/// `(fill, outline, accent)` per role. Friendly must read cool, hostile warm —
+/// the conformance suite checks this for Rust skins too. `accent` is the third
+/// per-role colour, for whatever this skin's signature element is; if it has
+/// none, repeat the fill.
+const FRIENDLY: [(&str, &str, &str); 2] = [
+    ("#70bfe3", "#5299bb", "#333333"),
+    ("#3c8dde", "#286eae", "#333333"),
+];
+const HOSTILE: [(&str, &str, &str); 2] = [
+    ("#ff6b6b", "#b84444", "#333333"),
+    ("#e34e5b", "#a92f3a", "#333333"),
+];
+const NEUTRAL_A: (&str, &str, &str) = ("#556270", "#353c47", "#111111");
+const NEUTRAL_B: (&str, &str, &str) = ("#f7b731", "#a87d1f", "#333333");
+
+const OUTLINE_EXTRA: f64 = 2.0;
+const BOOST_COLOR: &str = "#fff200";
+const BOOST_EXTRA: f64 = 6.0;
+const HEAD_CORE_RATIO: f64 = 0.38;
+const RAMP_CELLS: f64 = 10.0;
+const RAMP_OPACITY: f64 = 0.3;
+/// One turn of this skin's animation. Irrelevant if every frame is identical.
+const PERIOD_MS: f64 = 2_000.0;
+
+pub struct <NAME>Skin;
+
+/// The baked ring: one [`Frame`] per animation step, resolved at registration.
+///
+/// A still skin needs exactly one frame and can ignore `step` entirely — that
+/// is cheaper and makes `reduced_motion` correct for free.
+fn frames() -> Vec<Frame> {
+    let swatch = |(fill, outline, accent): (&str, &str, &str)| Swatch {
+        fill: fill.to_string(),
+        outline: outline.to_string(),
+        label: crate::render::roster_label_ink(fill).to_string(),
+        swatch: fill.to_string(),
+        accent: accent.to_string(),
+    };
+
+    (0..skin_schema::ANIMATION_STEPS)
+        .map(|step| {
+            let turns = step as f64 / skin_schema::ANIMATION_STEPS as f64;
+            Frame {
+                friendly: [swatch(FRIENDLY[0]), swatch(FRIENDLY[1])],
+                enemy: [swatch(HOSTILE[0]), swatch(HOSTILE[1])],
+                free_for_all: [
+                    swatch(FRIENDLY[0]),
+                    swatch(HOSTILE[0]),
+                    swatch(NEUTRAL_A),
+                    swatch(NEUTRAL_B),
+                ],
+                ramp_opacity: RAMP_OPACITY,
+                wave_phase_turns: 0.0,
+                time_turns: turns,
+                layer_opacity: Vec::new(),
+                // Per-step scalars, e.g. an animated radius. Index them from a
+                // layer's `radius_track`.
+                scalars: Vec::new(),
+                literals: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn composite() -> CompositeSkin {
+    // Start from the shared stack — contour, body ribbon, head ramp, head cap,
+    // highlight, core — then change only what this skin needs.
+    let layers: Vec<Layer> = document_layers(
+        BOOST_EXTRA,
+        OUTLINE_EXTRA,
+        (255, 255, 255),
+        RAMP_CELLS,
+        HEAD_CORE_RATIO,
+    );
+
+    // Your custom layer goes here. It must:
+    //  - declare a Region, so the frame's rules apply to it,
+    //  - keep its op sequence identical at every step (vary arguments only),
+    //  - stay inside metrics().overhang_px, which only contour layers raise.
+    //
+    // let _example = Layer {
+    //     id: "signature",
+    //     region: Region::Head,
+    //     clip: ClipShape::Silhouette,
+    //     kind: LayerKind::HeadDisc {
+    //         paint: DiscPaint::Slot(ColorSlot::Accent),
+    //         radius_ratio: HEAD_CORE_RATIO,
+    //         radius_track: None,
+    //     },
+    //     transform: LayerTransform::default(),
+    //     boost_only: false,
+    //     omit_on_single_cell: false,
+    //     opacity_track: None,
+    // };
+
+    CompositeSkin::new(
+        "<id>@1",
+        "<Name>",
+        layers,
+        frames(),
+        PERIOD_MS,
+        CompositeConfig {
+            boost_color: BOOST_COLOR.to_string(),
+            head_core_color: FRIENDLY[0].2.to_string(),
+            head_core_ratio: HEAD_CORE_RATIO,
+            head_core_is_dark: true,
+            wave: None,
+        },
+        // Optional. `None` if this skin does not dress the arena.
+        None::<BaseThemeOwned>,
+        None::<CelebrationThemeOwned>,
+    )
+    // Registration-time validation: a stack that could break the regioned
+    // frame is rejected here rather than painting something wrong later.
+    .expect("the <NAME> layer stack satisfies the regioned frame")
+}
+
+fn engine() -> &'static CompositeSkin {
+    static ENGINE: std::sync::OnceLock<CompositeSkin> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(composite)
+}
+
+impl SnakeSkin for <NAME>Skin {
+    fn id(&self) -> &str {
+        engine().id()
+    }
+
+    fn name(&self) -> &str {
+        engine().name()
+    }
+
+    fn colors(&self, identity: &SkinIdentity) -> SkinColors<'_> {
+        engine().colors(identity)
+    }
+
+    fn metrics(&self, boost_active: bool) -> SkinMetrics {
+        engine().metrics(boost_active)
+    }
+
+    fn paint_alive(
+        &self,
+        ctx: &mut PaintCtx,
+        pose: &SnakePose,
+        identity: &SkinIdentity,
+    ) -> Result<(), JsValue> {
+        engine().paint_alive(ctx, pose, identity)
+    }
+
+    fn base_theme(&self) -> Option<BaseTheme<'_>> {
+        engine().base_theme()
+    }
+
+    fn celebration_theme(&self) -> Option<CelebrationTheme<'_>> {
+        engine().celebration_theme()
+    }
+}

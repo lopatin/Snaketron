@@ -14,8 +14,10 @@
 //!   activation or turn is detected before it mutates geometry.
 //! - `event_sequence`: client and server count locally-generated events
 //!   differently by design.
-//! - `usernames`, `spectators`, `game_code`, `host_user_id`, `start_ms`:
-//!   cosmetic or static; not gameplay state.
+//! - `usernames`, `skins`, `spectators`, `game_code`, `host_user_id`,
+//!   `start_ms`: cosmetic or static; not gameplay state. Skins in particular
+//!   must stay out: a player changing how their snake looks can never be
+//!   allowed to make two clients disagree about the game.
 //! - `readiness` and `simulation_epoch_ms`: the pre-match readiness gate.
 //!   Both resolve before tick 1, so hashing them would compare states across
 //!   the window where a `PlayerReady` event is legitimately still in flight
@@ -341,6 +343,34 @@ fn direction_tag(direction: &crate::Direction) -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Cosmetics must be invisible to sync. If a skin choice could change the
+    /// fingerprint, two players wearing different skins would look like a
+    /// desync — and the chaos suite would be right to fail the build.
+    #[test]
+    fn a_players_skin_choice_never_changes_the_fingerprint() {
+        let mut plain = test_state();
+        plain
+            .add_player(7, Some("player".to_string()))
+            .expect("a player joins at tick 0");
+        let baseline = plain.sync_hash();
+
+        let mut dressed = plain.clone();
+        dressed.set_player_skin(7, Some("aurora@1".to_string()));
+        assert_ne!(dressed.skins, plain.skins, "the choice was recorded");
+        assert_eq!(
+            dressed.sync_hash(),
+            baseline,
+            "a skin changed the sync fingerprint"
+        );
+
+        // ...including an id no build has ever heard of.
+        dressed.set_player_skin(7, Some("from-the-future@99".to_string()));
+        assert_eq!(dressed.sync_hash(), baseline);
+
+        dressed.set_player_skin(7, None);
+        assert_eq!(dressed.sync_hash(), baseline);
+    }
     use crate::{
         CommandId, Direction, GameCommand, GameCommandMessage, GameState, GameType, Position,
         QueueMode,

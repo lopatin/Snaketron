@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "id": "tidewave@1",
+  "name": "Tidewave",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#5cc9d6",
+        "outline": "#2b8290"
+      },
+      {
+        "fill": "#3fb0c8",
+        "outline": "#1c6c80"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#ff9878",
+        "outline": "#bd5a3d"
+      },
+      {
+        "fill": "#f5735c",
+        "outline": "#a8412f"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#5cc9d6",
+        "outline": "#2b8290"
+      },
+      {
+        "fill": "#ff9878",
+        "outline": "#bd5a3d"
+      },
+      {
+        "fill": "#9aa7b5",
+        "outline": "#5b6672"
+      },
+      {
+        "fill": "#f2c85c",
+        "outline": "#a3821f"
+      }
+    ]
+  },
+  "head": {
+    "core_ratio": 0.36,
+    "core_color": "#0c2630",
+    "gradient": {
+      "length_cells": 26.0,
+      "max_opacity": 0.24,
+      "color": "#f2fdff"
+    }
+  },
+  "outline": {
+    "extra_px": 2.0,
+    "boost_band": {
+      "color": "#fff200",
+      "extra_px": 6.0
+    }
+  },
+  "animation": {
+    "period_ms": 3200.0,
+    "wave": {
+      "cells_per_crest": 11.0,
+      "amplitude": 0.15,
+      "crests_per_cycle": 1.0
+    }
+  }
+}

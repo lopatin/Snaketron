@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { getWasm, initWasm } from '../wasm';
 import {
+  CLASSIC_CELEBRATION_THEME,
   DEFAULT_SCORE_EFFECT_ID,
   goalImpactWaveRenderer,
 } from '../utils/scoreEffects';
@@ -128,6 +129,8 @@ const TutorialSceneCanvas: React.FC<TutorialSceneCanvasProps> = ({
                 {
                   eventId: `tutorial:${scene}:score`,
                   effectId: DEFAULT_SCORE_EFFECT_ID,
+                  // Tutorials always teach the canonical look.
+                  celebration: CLASSIC_CELEBRATION_THEME,
                   teamId: scoreEffect.teamId,
                   snakeId: scoreEffect.snakeId,
                   points: scoreEffect.points,

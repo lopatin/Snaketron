@@ -2485,6 +2485,7 @@ impl Database for DynamoDatabase {
             crazygames_user_id: None,
             profile_picture_url: None,
             profile_iat: None,
+            selected_skin: None,
         })
     }
 
@@ -2549,6 +2550,7 @@ impl Database for DynamoDatabase {
             crazygames_user_id: None,
             profile_picture_url: None,
             profile_iat: None,
+            selected_skin: None,
         })
     }
 
@@ -2730,6 +2732,7 @@ impl Database for DynamoDatabase {
                     crazygames_user_id: Self::extract_string(&item, "crazyGamesUserId"),
                     profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
                     profile_iat: Self::extract_i64(&item, "profileIat"),
+                    selected_skin: Self::extract_string(&item, "selectedSkin"),
                 };
                 Ok(Some(user))
             }

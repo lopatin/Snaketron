@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "voltage@1",
+  "name": "Voltage",
+  "palette": {
+    "friendly": [
+      { "fill": "#7fd4f5", "outline": "#2f7fa8" },
+      { "fill": "#63b8ef", "outline": "#22638f" }
+    ],
+    "enemy": [
+      { "fill": "#ffa25c", "outline": "#c25e21" },
+      { "fill": "#ff7d55", "outline": "#ad4622" }
+    ],
+    "free_for_all": [
+      { "fill": "#7fd4f5", "outline": "#2f7fa8" },
+      { "fill": "#ffa25c", "outline": "#c25e21" },
+      { "fill": "#a4adb8", "outline": "#5f6874" },
+      { "fill": "#f7d84f", "outline": "#a68a1c" }
+    ]
+  },
+  "head": {
+    "core_ratio": 0.34,
+    "core_color": "#0a1d2e",
+    "gradient": { "length_cells": 8.0, "max_opacity": 0.22, "color": "#ffffff" }
+  },
+  "outline": {
+    "extra_px": 2.0,
+    "boost_band": { "color": "#fff200", "extra_px": 6.0 }
+  },
+  "animation": {
+    "period_ms": 900.0,
+    "tracks": [
+      { "target": "outline_lightness", "amplitude": 0.14, "phase": 0.0 }
+    ],
+    "wave": { "cells_per_crest": 3.5, "amplitude": 0.2, "crests_per_cycle": 3.0 }
+  }
+}
