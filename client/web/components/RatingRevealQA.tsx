@@ -88,6 +88,21 @@ const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | nu
     },
   },
   {
+    // The elite tiers were re-sliced from four divisions to three, so their
+    // internal boundaries are the ones that moved; this crosses one.
+    id: 'elite-division-up',
+    label: 'Win · Platinum I → II',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1620, 18, 11, 44),
+        snapshot(1650, 19, 11, 39),
+      ),
+    },
+  },
+  {
     id: 'draw',
     label: 'Draw · ±0',
     state: {

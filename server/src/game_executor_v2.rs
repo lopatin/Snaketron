@@ -3522,7 +3522,7 @@ mod tests {
     };
     use crate::redis_keys::RedisKeys;
     use crate::redis_utils::RedisConnection;
-    use crate::replication::{GameStateReader, ReplicationManager};
+    use crate::replication::{GameEventRouter, SubscriptionUpdate};
     use common::{
         CommandId, Direction, GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameCommand,
         GameRecordingV1, GameState, GameType, Position, QueueMode, ReplayVisibility,
@@ -8389,7 +8389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_snapshot_request_hydrates_replica_before_matching_readiness_barrier()
+    async fn executor_snapshot_request_reaches_subscribers_before_matching_readiness_barrier()
     -> Result<()> {
         tokio::time::timeout(Duration::from_secs(15), async {
             let mut harness = CrashBoundaryHarness::new_with_redis_url(
@@ -8399,13 +8399,14 @@ mod tests {
             .await?;
             harness.defer_game_start().await?;
             let event_stream = RedisKeys::stream_events(harness.partition);
-            let replica_cancel = CancellationToken::new();
-            let replica_manager = ReplicationManager::new(
+            let router_cancel = CancellationToken::new();
+            let event_router = GameEventRouter::new(
                 vec![harness.partition],
-                replica_cancel.clone(),
+                router_cancel.clone(),
                 harness.bus.clone(),
             )
             .await?;
+            let mut subscription = event_router.subscribe_to_game(harness.game_id).await;
             let request_stream = RedisKeys::stream_snapshot_requests(harness.partition);
             let completion_id = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -8425,18 +8426,11 @@ mod tests {
                 }
             })
             .await
-            .context("replica did not publish its readiness snapshot request")??;
+            .context("router did not publish its readiness barrier request")??;
 
             assert!(
-                replica_manager
-                    .get_game_state(harness.game_id)
-                    .await
-                    .is_none(),
-                "replica replayed the pre-subscription activation snapshot"
-            );
-            assert!(
-                !replica_manager.is_ready().await,
-                "replica became ready before the requested snapshot was published"
+                !event_router.is_ready().await,
+                "router became ready before the requested snapshot was published"
             );
 
             let executor_cancel = CancellationToken::new();
@@ -8448,41 +8442,41 @@ mod tests {
                 Arc::new(UnusedDatabase::default()),
                 RecoveryConfig {
                     // Leave a deterministic window in which the executor's
-                    // activation snapshot has hydrated the replica, but the
-                    // readiness request still awaits an ordinary checkpoint.
+                    // activation snapshot has reached local subscribers, but
+                    // the readiness request still awaits an ordinary
+                    // checkpoint.
                     checkpoint_interval: Duration::from_secs(5),
                     ..RecoveryConfig::default()
                 },
                 executor_cancel,
             );
             tokio::time::timeout(Duration::from_secs(4), async {
-                while replica_manager
-                    .get_game_state(harness.game_id)
-                    .await
-                    .is_none()
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                loop {
+                    match subscription.next().await {
+                        Some(SubscriptionUpdate::Event(event))
+                            if matches!(event.event, GameEvent::Snapshot { .. }) =>
+                        {
+                            break Result::<()>::Ok(());
+                        }
+                        Some(_) => {}
+                        None => anyhow::bail!("subscription closed before activation snapshot"),
+                    }
                 }
             })
             .await
-            .context("executor activation snapshot did not hydrate the real replica")?;
+            .context("executor activation snapshot did not reach the subscription")??;
             assert!(
-                !replica_manager.is_ready().await,
+                !event_router.is_ready().await,
                 "activation snapshot bypassed the matching readiness barrier"
             );
 
             tokio::time::timeout(Duration::from_secs(6), async {
-                while !replica_manager.is_ready().await {
+                while !event_router.is_ready().await {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .context("replica did not become ready after its matching snapshot barrier")?;
-            let replicated = replica_manager
-                .get_game_state(harness.game_id)
-                .await
-                .context("matching barrier arrived before the requested snapshot was applied")?;
-            assert!(matches!(replicated.status, GameStatus::Started { .. }));
+            .context("router did not become ready after its matching barrier")?;
 
             let entries: redis::streams::StreamRangeReply =
                 harness.raw.xrange_all(&event_stream).await?;
@@ -8518,8 +8512,9 @@ mod tests {
                 "matching readiness barrier preceded its requested snapshot"
             );
 
-            replica_cancel.cancel();
-            replica_manager.wait().await?;
+            drop(subscription);
+            router_cancel.cancel();
+            event_router.wait().await?;
             executor.handoff().await?;
             executor_task
                 .await

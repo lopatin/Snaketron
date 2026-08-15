@@ -49,7 +49,6 @@ const MATCHMAKING_QUEUE_COUNT: usize = crate::matchmaking_manager::MATCHMAKING_G
 #[derive(Default)]
 struct Counters {
     fenced_write_rejections: AtomicU64,
-    recovery_fingerprint_divergences: AtomicU64,
     planned_drain_failures: AtomicU64,
     command_claims: AtomicU64,
     command_acks: AtomicU64,
@@ -140,10 +139,6 @@ macro_rules! counter_fn {
 }
 
 counter_fn!(record_fenced_write_rejection, fenced_write_rejections);
-counter_fn!(
-    record_recovery_fingerprint_divergence,
-    recovery_fingerprint_divergences
-);
 counter_fn!(record_planned_drain_failure, planned_drain_failures);
 counter_fn!(record_command_claims, command_claims);
 counter_fn!(record_command_acks, command_acks);
@@ -599,7 +594,6 @@ pub fn record_redis_request(latency: Duration, failed: bool) {
 #[derive(Default)]
 struct CounterSnapshot {
     fenced_write_rejections: u64,
-    recovery_fingerprint_divergences: u64,
     planned_drain_failures: u64,
     command_claims: u64,
     command_acks: u64,
@@ -678,9 +672,6 @@ fn take_counter_snapshot() -> CounterSnapshot {
     let counters = counters();
     CounterSnapshot {
         fenced_write_rejections: counters.fenced_write_rejections.swap(0, Ordering::Relaxed),
-        recovery_fingerprint_divergences: counters
-            .recovery_fingerprint_divergences
-            .swap(0, Ordering::Relaxed),
         planned_drain_failures: counters.planned_drain_failures.swap(0, Ordering::Relaxed),
         command_claims: counters.command_claims.swap(0, Ordering::Relaxed),
         command_acks: counters.command_acks.swap(0, Ordering::Relaxed),
@@ -1602,11 +1593,6 @@ fn emf_document(
         (
             "FencedWriteRejections",
             counters.fenced_write_rejections,
-            "Count",
-        ),
-        (
-            "RecoveryFingerprintDivergences",
-            counters.recovery_fingerprint_divergences,
             "Count",
         ),
         (

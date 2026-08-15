@@ -13,7 +13,13 @@ const PHASE_STOPPING: u8 = 3;
 /// WebSocket. Keep these stable: clients use them to decide whether a planned
 /// make-before-break handoff is supported.
 ///
-/// Version 9 adds deterministic death causes to `SnakeDied` events.
+/// Version 10 is the same kind of collision as version 7 above, and is
+/// resolved the same way. Two branches each shipped a wire change and each
+/// independently claimed 9; git merged the constants silently, so 9 would
+/// have named two mutually unintelligible protocols. Version 10 carries
+/// both: deterministic death causes on `SnakeDied` events, and the
+/// server-coordinated, provider-neutral lobby ad-break barrier with runtime
+/// advertisement configuration and per-session distribution routing.
 ///
 /// Version 8 adds authoritative combo configuration/state and enriched food
 /// events so clients can predict growth and render the same food value.
@@ -25,7 +31,7 @@ const PHASE_STOPPING: u8 = 3;
 /// fail to understand half the messages it receives. This must stay in lockstep
 /// with `GAMEPLAY_PROTOCOL_VERSION` in client/web/constants.ts; the bot and
 /// loadtest clients import this constant directly so they cannot drift at all.
-pub const WS_PROTOCOL_VERSION: u16 = 9;
+pub const WS_PROTOCOL_VERSION: u16 = 10;
 pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "explicit-auth-v1",
     "planned-drain-v1",
@@ -35,6 +41,7 @@ pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "command-outcome-barrier-v1",
     "terminal-command-cutoff-v1",
     "stress-matchmaking-pool-v1",
+    "ad-break-v1",
 ];
 
 /// A planned task-removal notification. The absolute deadline avoids clients
@@ -57,7 +64,7 @@ struct TaskLifecycleInner {
     task_boot_id: String,
     phase: AtomicU8,
     listener_bound: AtomicBool,
-    replicas_ready: AtomicBool,
+    event_readers_ready: AtomicBool,
     membership_ready: AtomicBool,
     assignment_ready: AtomicBool,
     critical_failure: AtomicBool,
@@ -78,7 +85,7 @@ impl TaskLifecycle {
                 task_boot_id: task_boot_id.into(),
                 phase: AtomicU8::new(PHASE_STARTING),
                 listener_bound: AtomicBool::new(false),
-                replicas_ready: AtomicBool::new(false),
+                event_readers_ready: AtomicBool::new(false),
                 membership_ready: AtomicBool::new(false),
                 assignment_ready: AtomicBool::new(false),
                 critical_failure: AtomicBool::new(false),
@@ -119,8 +126,10 @@ impl TaskLifecycle {
         self.inner.listener_bound.load(Ordering::Acquire)
     }
 
-    pub fn mark_replicas_ready(&self, ready: bool) {
-        self.inner.replicas_ready.store(ready, Ordering::Release);
+    pub fn mark_event_readers_ready(&self, ready: bool) {
+        self.inner
+            .event_readers_ready
+            .store(ready, Ordering::Release);
     }
 
     pub fn mark_membership_ready(&self, ready: bool) {
@@ -237,10 +246,10 @@ impl TaskLifecycle {
     /// Local prerequisites for publishing this task as executor-placement
     /// eligible. Membership freshness itself is deliberately excluded: the
     /// heartbeat publishes ACTIVE only after these predicates converge, then
-    /// that successful write supplies the final readiness bit. Gateway replica
-    /// hydration is deliberately excluded too: executors must be able to start
-    /// and answer the snapshot barrier that makes a first/replacement gateway
-    /// ready.
+    /// that successful write supplies the final readiness bit. Gateway
+    /// event-reader readiness is deliberately excluded too: executors must be
+    /// able to start and answer the reader barrier that makes a
+    /// first/replacement gateway ready.
     pub fn is_assignment_eligible(&self) -> bool {
         if self.inner.phase.load(Ordering::Acquire) != PHASE_ACTIVE
             || !self.inner.listener_bound.load(Ordering::Acquire)
@@ -259,7 +268,8 @@ impl TaskLifecycle {
     }
 
     pub fn is_ready(&self) -> bool {
-        if !self.is_assignment_eligible() || !self.inner.replicas_ready.load(Ordering::Acquire) {
+        if !self.is_assignment_eligible() || !self.inner.event_readers_ready.load(Ordering::Acquire)
+        {
             return false;
         }
         self.inner.membership_ready.load(Ordering::Acquire)
@@ -282,20 +292,20 @@ mod tests {
         assert!(!lifecycle.is_ready());
 
         lifecycle.mark_listener_bound();
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         lifecycle.mark_assignment_ready(true);
         lifecycle.mark_membership_ready(true);
         lifecycle.mark_redis_success_now();
         lifecycle.activate();
         assert!(lifecycle.is_ready());
 
-        lifecycle.mark_replicas_ready(false);
+        lifecycle.mark_event_readers_ready(false);
         assert!(lifecycle.is_assignment_eligible());
         assert!(!lifecycle.is_ready());
     }
 
     #[test]
-    fn executor_eligibility_does_not_wait_for_gateway_replica_hydration() {
+    fn executor_eligibility_does_not_wait_for_gateway_event_readers() {
         let lifecycle = TaskLifecycle::new("boot-a");
         lifecycle.mark_listener_bound();
         lifecycle.mark_assignment_ready(true);
@@ -307,7 +317,7 @@ mod tests {
 
         lifecycle.mark_membership_ready(true);
         assert!(!lifecycle.is_ready());
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         assert!(lifecycle.is_ready());
     }
 
@@ -315,7 +325,7 @@ mod tests {
     fn readiness_always_requires_cluster_workers() {
         let lifecycle = TaskLifecycle::new("boot-a");
         lifecycle.mark_listener_bound();
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         lifecycle.mark_redis_success_now();
         lifecycle.activate();
         assert!(!lifecycle.is_ready());
@@ -329,7 +339,7 @@ mod tests {
     fn draining_is_immediately_unready_and_broadcasts_once() {
         let lifecycle = TaskLifecycle::new("boot-a");
         lifecycle.mark_listener_bound();
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         lifecycle.mark_redis_success_now();
         lifecycle.activate();
         let mut drain_rx = lifecycle.subscribe_to_drain();

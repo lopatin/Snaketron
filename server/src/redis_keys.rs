@@ -90,6 +90,27 @@ impl RedisKeys {
         )
     }
 
+    /// Exact queued generation liveness lease, refreshed only by an active
+    /// member heartbeat and compared against the immutable queue identity.
+    pub fn matchmaking_lobby_queue_lease(lobby_code: &str) -> String {
+        format!(
+            "matchmaking:{{{}}}:lobby:{}:queue-lease",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Short-lived terminal outcome for one immutable queue operation. This
+    /// prevents an ambiguous admission retry from resurrecting a generation
+    /// after cancellation, expiry, or match commit removed its identity.
+    pub fn matchmaking_lobby_queue_outcome(lobby_code: &str) -> String {
+        format!(
+            "matchmaking:{{{}}}:lobby:{}:queue-outcome",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
     /// Exact lobby admission currently reserving a user for matchmaking.
     pub fn matchmaking_user_queue_identity(user_id: u32) -> String {
         format!(
@@ -235,6 +256,36 @@ impl RedisKeys {
     pub fn lobby_metadata(lobby_code: &str) -> String {
         format!(
             "lobby:{{{}}}:{}:metadata",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Short-lived membership write reservations. This key deliberately
+    /// shares the matchmaking hash slot with lobby metadata so admission can
+    /// inspect it atomically without scanning metadata fields.
+    pub fn lobby_membership_reservations(lobby_code: &str) -> String {
+        format!(
+            "lobby:{{{}}}:{}:membership-reservations",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Short-lived idempotency result for one membership finalizer token.
+    pub fn lobby_membership_finalization_outcome(lobby_code: &str, token: &str) -> String {
+        format!(
+            "lobby:{{{}}}:{}:membership-outcome:{}",
+            Self::MATCHMAKING_TAG,
+            lobby_code,
+            token
+        )
+    }
+
+    /// Short ownership lease for expensive ad-break finalization work.
+    pub fn lobby_ad_break_finalization_claim(lobby_code: &str) -> String {
+        format!(
+            "lobby:{{{}}}:{}:ad-break-finalization",
             Self::MATCHMAKING_TAG,
             lobby_code
         )
@@ -533,8 +584,13 @@ mod tests {
             RedisKeys::matchmaking_lobby_active_game("ABC"),
             RedisKeys::matchmaking_lobby_user_pending_game("ABC", 1),
             RedisKeys::matchmaking_lobby_queue_identity("ABC"),
+            RedisKeys::matchmaking_lobby_queue_lease("ABC"),
+            RedisKeys::matchmaking_lobby_queue_outcome("ABC"),
             RedisKeys::matchmaking_lobby_notification_channel("ABC"),
             RedisKeys::lobby_metadata("ABC"),
+            RedisKeys::lobby_membership_reservations("ABC"),
+            RedisKeys::lobby_membership_finalization_outcome("ABC", "token"),
+            RedisKeys::lobby_ad_break_finalization_claim("ABC"),
         ]);
 
         let mut tags = std::collections::BTreeSet::new();

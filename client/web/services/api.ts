@@ -6,6 +6,12 @@ import {
   LeaderboardResponse,
   SeasonsResponse,
   UserRankingResponse,
+  MatchHistoryPage,
+  PublicRuntimeConfig,
+  RuntimeConfig,
+  RuntimeConfigAuditPage,
+  RuntimeConfigRecord,
+  UpdateRuntimeConfigRequest,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
@@ -69,6 +75,10 @@ export type GameHighlightResponse =
   | { status: 'pending' }
   | { status: 'ready'; play_of_the_game: HighlightClip }
   | { status: 'unavailable' };
+export interface AdminHistoryFilters {
+  cursor?: string | null;
+  limit?: number;
+}
 
 // Portal sessions are intentionally isolated from first-party username/
 // password sessions. This key stores only Snaketron's internal JWT; the
@@ -270,8 +280,8 @@ class API {
     }
   }
 
-  async getCurrentUser(): Promise<UserInfo> {
-    return this.request<UserInfo>('/api/auth/me');
+  async getCurrentUser(): Promise<UserInfo & { isAdmin?: boolean }> {
+    return this.request<UserInfo & { isAdmin?: boolean }>('/api/auth/me');
   }
 
   async getNewsTicker(): Promise<NewsTickerResponse> {
@@ -330,6 +340,46 @@ class API {
     if (region) params.append('region', region);
 
     return this.request<UserRankingResponse>(`/api/leaderboard/me?${params.toString()}`);
+  }
+
+  async getMatchHistory(cursor?: string | null, limit = 12): Promise<MatchHistoryPage> {
+    const params = new URLSearchParams({ limit: limit.toString() });
+    if (cursor) params.set('cursor', cursor);
+    return this.request<MatchHistoryPage>(`/api/history?${params.toString()}`);
+  }
+
+  async getAdminMatchHistory(filters: AdminHistoryFilters = {}): Promise<MatchHistoryPage> {
+    const params = new URLSearchParams({ limit: String(filters.limit ?? 25) });
+    if (filters.cursor) params.set('cursor', filters.cursor);
+    return this.request<MatchHistoryPage>(`/api/admin/history?${params.toString()}`);
+  }
+
+  async getRuntimeConfig(): Promise<PublicRuntimeConfig> {
+    return this.request<PublicRuntimeConfig>('/api/config');
+  }
+
+  async getAdminRuntimeConfig(): Promise<RuntimeConfigRecord> {
+    return this.request<RuntimeConfigRecord>('/api/admin/config');
+  }
+
+  async updateAdminRuntimeConfig(
+    config: RuntimeConfig,
+    expectedVersion: number,
+  ): Promise<RuntimeConfigRecord> {
+    const request: UpdateRuntimeConfigRequest = { config, expectedVersion };
+    return this.request<RuntimeConfigRecord>('/api/admin/config', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getAdminRuntimeConfigAudit(
+    cursor?: string | null,
+    limit = 20,
+  ): Promise<RuntimeConfigAuditPage> {
+    const params = new URLSearchParams({ limit: limit.toString() });
+    if (cursor) params.set('cursor', cursor);
+    return this.request<RuntimeConfigAuditPage>(`/api/admin/config/audit?${params.toString()}`);
   }
 }
 

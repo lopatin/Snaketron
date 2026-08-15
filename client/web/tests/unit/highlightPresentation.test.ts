@@ -19,7 +19,7 @@ const eligibleAutoplayGate = {
 
 const clipFixture = (): HighlightClip => ({
   clip_format_version: 1,
-  gameplay_version: 9,
+  gameplay_version: 10,
   game_id: 7,
   star_user_id: 11,
   star_snake_id: 0,
@@ -61,7 +61,7 @@ const clipFixture = (): HighlightClip => ({
 test('highlight compatibility rejects deploy skew and malformed windows', () => {
   const clip = clipFixture();
   assert.equal(isCompatibleHighlightClip(clip), true);
-  assert.equal(isCompatibleHighlightClip({ ...clip, gameplay_version: 8 }), false);
+  assert.equal(isCompatibleHighlightClip({ ...clip, gameplay_version: 9 }), false);
   assert.equal(isCompatibleHighlightClip({
     ...clip,
     window: { ...clip.window, focus_tick: 191 },

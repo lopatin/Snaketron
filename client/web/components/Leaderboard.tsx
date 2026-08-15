@@ -226,17 +226,24 @@ const LeaderboardContent: React.FC<{
         <div className="leaderboard-mode-summary flex items-start gap-4">
           {isSoloMode ? (
             <SoloTrophyIcon
-              className="w-16 h-16 flex-shrink-0 text-black-70"
-              label="Solo trophy"
+              className="w-16 h-16 flex-shrink-0"
+              label="Classic Snake high scores"
             />
           ) : (
-            <RankIcon
-              {...(rank
-                ? { tier: rank.tier, division: rank.division }
-                : { tier: 'unranked' as const })}
-              className="w-16 h-16 flex-shrink-0"
-              label={rankTier}
-            />
+            rank ? (
+              <RankIcon
+                tier={rank.tier}
+                division={rank.division}
+                label={rankLabel}
+                className="w-16 h-16 flex-shrink-0"
+              />
+            ) : (
+              <RankIcon
+                tier="unranked"
+                label={rankLabel}
+                className="w-16 h-16 flex-shrink-0"
+              />
+            )
           )}
           <div className="flex flex-col gap-1">
             <div className="text-xs font-bold uppercase tracking-wider text-gray-500 px-1">
@@ -452,8 +459,8 @@ const LeaderboardContent: React.FC<{
                       <RankIcon
                         tier={entryRank.tier}
                         division={entryRank.division}
-                        className="w-6 h-6 flex-shrink-0"
                         label={`${entryRankLabel} icon`}
+                        className="w-6 h-6 flex-shrink-0"
                       />
                       <span className="truncate">{entry.username}</span>
                     </div>

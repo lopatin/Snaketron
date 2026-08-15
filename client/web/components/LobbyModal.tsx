@@ -17,6 +17,7 @@ interface LobbyModalProps {
   children: React.ReactNode;
   initialFocusRef?: React.RefObject<HTMLElement | null>;
   isDismissDisabled?: boolean;
+  size?: 'default' | 'wide';
 }
 
 /**
@@ -31,6 +32,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
   children,
   initialFocusRef,
   isDismissDisabled = false,
+  size = 'default',
 }) => {
   const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -54,7 +56,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
 
     const focusInitialControl = window.requestAnimationFrame(() => {
       const requestedTarget = initialFocusRef?.current;
-      const preferredTarget = requestedTarget?.matches(FOCUSABLE_SELECTOR)
+      const preferredTarget = requestedTarget?.isConnected
         ? requestedTarget
         : null;
       const fallbackTarget = dialogRef.current?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
@@ -123,7 +125,7 @@ export const LobbyModal: React.FC<LobbyModalProps> = ({
     <div className="lobby-modal-backdrop" onMouseDown={handleBackdropMouseDown}>
       <div
         ref={dialogRef}
-        className="lobby-modal"
+        className={`lobby-modal${size === 'wide' ? ' is-wide' : ''}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

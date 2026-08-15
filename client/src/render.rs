@@ -3134,10 +3134,17 @@ mod tests {
         // 1x rendering is untouched.
         for layer in ACTIVE_SNAKE_OUTLINE_LAYERS {
             assert_eq!(layer.extra(ARENA_MAX_CELL_PX), layer.base_extra);
-            assert_eq!(layer.extra(8.0), layer.base_extra, "1x rendering is untouched");
+            assert_eq!(
+                layer.extra(8.0),
+                layer.base_extra,
+                "1x rendering is untouched"
+            );
         }
         assert_eq!(snake_mask_extra(true, ARENA_MAX_CELL_PX), BOOST_MASK_EXTRA);
-        assert_eq!(snake_mask_extra(false, ARENA_MAX_CELL_PX), ORDINARY_MASK_EXTRA);
+        assert_eq!(
+            snake_mask_extra(false, ARENA_MAX_CELL_PX),
+            ORDINARY_MASK_EXTRA
+        );
 
         // Four times the cell gives four times the rim.
         let big = 4.0 * ARENA_MAX_CELL_PX;
@@ -3162,7 +3169,10 @@ mod tests {
                 large.font_px / 60.0 >= small.font_px / 15.0 - 1e-9,
                 "{digits}-digit label lost ground against the body at 4x"
             );
-            assert!(large.font_px >= 40.0, "{digits}-digit label still tiny at 4x");
+            assert!(
+                large.font_px >= 40.0,
+                "{digits}-digit label still tiny at 4x"
+            );
         }
     }
 

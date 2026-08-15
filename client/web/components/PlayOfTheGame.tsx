@@ -6,6 +6,7 @@ import React, {
   useState,
 } from 'react';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { useAdsOptional } from '../contexts/AdsContext';
 import { crazyGames } from '../services/crazyGames';
 import type { HighlightClip } from '../types';
 import { resolveSnakeSkinColors } from '../utils/snakeSkin';
@@ -28,7 +29,12 @@ interface SponsorSlotProps {
 }
 
 const SponsorSlot: React.FC<SponsorSlotProps> = ({ reason }) => {
-  const { adsEnabled, available, adState } = useCrazyGames();
+  const { available, adState } = useCrazyGames();
+  // Ad enablement is server-owned policy, not a build flag: it arrives through
+  // AdsProvider. Outside that provider (the QA harness) policy is unknown, and
+  // a slot that cannot confirm policy must not request inventory.
+  const ads = useAdsOptional();
+  const bannerAllowed = Boolean(ads?.config.enabled && ads.capabilities.banners);
   const reactId = useId();
   const containerIdRef = useRef(`potg-sponsor-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`);
   const attemptedRef = useRef(false);
@@ -36,7 +42,7 @@ const SponsorSlot: React.FC<SponsorSlotProps> = ({ reason }) => {
   const containerId = containerIdRef.current;
 
   useEffect(() => {
-    if (!adsEnabled || !available || adState !== 'idle' || attemptedRef.current) {
+    if (!bannerAllowed || !available || adState !== 'idle' || attemptedRef.current) {
       return undefined;
     }
     let active = true;
@@ -46,15 +52,15 @@ const SponsorSlot: React.FC<SponsorSlotProps> = ({ reason }) => {
     const timer = window.setTimeout(() => {
       if (!active || crazyGames.getSnapshot().adState !== 'idle') return;
       attemptedRef.current = true;
-      void crazyGames.requestResponsiveBanner(containerId).then((shown) => {
-        if (active) setBannerLive(shown);
+      void crazyGames.requestResponsiveBanner(containerId).then((result) => {
+        if (active) setBannerLive(result.status === 'filled');
       });
     }, 0);
     return () => {
       active = false;
       window.clearTimeout(timer);
     };
-  }, [adState, adsEnabled, available, containerId]);
+  }, [adState, available, bannerAllowed, containerId]);
 
   useEffect(() => () => crazyGames.clearBanner(containerId), [containerId]);
 

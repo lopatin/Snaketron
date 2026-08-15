@@ -1425,7 +1425,7 @@ mod tests {
         )?;
         let lifecycle = LocalTaskLifecycle::new(format!("warming-{salt}"));
         lifecycle.mark_listener_bound();
-        lifecycle.mark_replicas_ready(false);
+        lifecycle.mark_event_readers_ready(false);
         lifecycle.mark_assignment_ready(true);
         lifecycle.mark_redis_success_now();
         lifecycle.activate();
@@ -1466,7 +1466,7 @@ mod tests {
             "executor membership must not bypass gateway replica readiness"
         );
 
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         tokio::time::timeout(Duration::from_secs(3), async {
             while !lifecycle.is_ready() {
                 lifecycle.mark_redis_success_now();
@@ -1517,7 +1517,7 @@ mod tests {
         )?;
         let lifecycle = LocalTaskLifecycle::new(format!("outage-{salt}"));
         lifecycle.mark_listener_bound();
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         lifecycle.mark_assignment_ready(true);
         lifecycle.mark_redis_success_now();
         lifecycle.activate();
@@ -1591,7 +1591,7 @@ mod tests {
         // Losing gateway replica hydration withdraws public HTTP readiness, but
         // must not remove executor placement: doing so would remove the owner
         // that can answer the replica's recovery snapshot request.
-        lifecycle.mark_replicas_ready(false);
+        lifecycle.mark_event_readers_ready(false);
         tokio::time::sleep(Duration::from_millis(250)).await;
         let members = store
             .list_live(chrono::Utc::now().timestamp_millis())
@@ -1602,7 +1602,7 @@ mod tests {
         assert_eq!(worker_state.load(Ordering::Acquire), STATE_ACTIVE);
         assert!(!lifecycle.is_ready());
 
-        lifecycle.mark_replicas_ready(true);
+        lifecycle.mark_event_readers_ready(true);
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 lifecycle.mark_redis_success_now();
@@ -1726,7 +1726,7 @@ mod tests {
         let lifecycle_b = LocalTaskLifecycle::new(format!("shared-outage-b-{salt}"));
         for lifecycle in [&lifecycle_a, &lifecycle_b] {
             lifecycle.mark_listener_bound();
-            lifecycle.mark_replicas_ready(true);
+            lifecycle.mark_event_readers_ready(true);
             lifecycle.mark_assignment_ready(true);
             lifecycle.mark_redis_success_now();
             lifecycle.activate();
