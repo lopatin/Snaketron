@@ -30,6 +30,12 @@ module.exports = {
   },
   resolve: {
     extensions: ['.ts', '.tsx', '.js', '.jsx'],
+    // Resolve the checked-in/generated package beside this worktree directly.
+    // A shared node_modules directory may contain a file: symlink into another
+    // checkout, which would otherwise let stale WASM silently back the UI.
+    alias: {
+      'wasm-snaketron': path.resolve(__dirname, '../pkg'),
+    },
   },
   module: {
     rules: [
@@ -56,7 +62,21 @@ module.exports = {
     new CopyWebpackPlugin({
       patterns: [
         'SnaketronLogo.png',
-        { from: 'public/images', to: 'images' }
+        { from: 'public/images', to: 'images' },
+        {
+          from: path.resolve(
+            __dirname,
+            '../../.claude/skills/snaketron-create-video/assets/fonts/Inter-Variable.ttf',
+          ),
+          to: 'capture-fonts/Inter-Variable.ttf',
+        },
+        {
+          from: path.resolve(
+            __dirname,
+            '../../.claude/skills/snaketron-create-video/assets/fonts/BarlowCondensed-ExtraBoldItalic.ttf',
+          ),
+          to: 'capture-fonts/BarlowCondensed-ExtraBoldItalic.ttf',
+        },
       ]
     }),
     new HtmlWebpackPlugin({

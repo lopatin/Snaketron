@@ -1513,6 +1513,8 @@ mod tests {
             game_mode: "matchmaking".to_string(),
             is_private,
             game_code: None,
+            replay_object: None,
+            play_of_the_game: None,
             news_eligible,
         }
     }

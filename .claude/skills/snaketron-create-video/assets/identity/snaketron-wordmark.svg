@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="480" viewBox="0 0 1600 480" role="img" aria-labelledby="title">
+  <title id="title">SnakeTron</title>
+  <rect width="1600" height="480" fill="#3F3F41"/>
+  <path d="M120 90H1480" stroke="#3B82F6" stroke-width="12"/>
+  <path d="M190 390H1410" stroke="#EF4444" stroke-width="12"/>
+  <g transform="skewX(-9)">
+    <text x="800" y="305" fill="#FFFFFF" stroke="#3F3F41" stroke-width="5" paint-order="stroke" text-anchor="middle" font-family="Barlow Condensed, Arial Narrow, sans-serif" font-size="230" font-weight="800" font-style="italic" letter-spacing="8">SNAKETRON</text>
+  </g>
+  <path d="M1170 330h210v26h-210z" fill="#F8C84A"/>
+</svg>

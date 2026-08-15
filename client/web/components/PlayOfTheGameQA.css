@@ -1,0 +1,74 @@
+.potg-qa {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: #edf1f6;
+}
+
+.potg-qa::before {
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(90deg, transparent 0 39px, rgb(63 63 65 / 5%) 39px 40px),
+    repeating-linear-gradient(0deg, transparent 0 39px, rgb(63 63 65 / 5%) 39px 40px);
+  content: "";
+  pointer-events: none;
+}
+
+.potg-qa__controls {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  z-index: 200;
+  display: flex;
+  max-width: calc(100vw - 20px);
+  align-items: center;
+  gap: 5px;
+  padding: 6px;
+  overflow-x: auto;
+  border: 2px solid #20232a;
+  background: #fff;
+  box-shadow: 5px 5px 0 rgb(32 35 42 / 18%);
+  white-space: nowrap;
+}
+
+.potg-qa__controls strong {
+  padding: 0 7px;
+  color: #20232a;
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 8px;
+  font-style: italic;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.potg-qa__controls button {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid #20232a;
+  border-radius: 0;
+  background: #fff;
+  color: #20232a;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.potg-qa__controls button[aria-pressed="true"] {
+  background: #20232a;
+  color: #fff;
+}
+
+.potg-qa__controls button:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 52%);
+  outline-offset: 2px;
+}
+
+@media (max-width: 600px) {
+  .potg-qa__controls {
+    right: 8px;
+    left: 8px;
+  }
+}

@@ -10,7 +10,10 @@ use crate::mmr_persistence::calculate_mmr_effect_specs;
 use crate::season::{Season, get_region, get_season_at};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use common::{GameState, GameStatus, GameType, QueueMode};
+use common::{
+    GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameRecordingV1, GameState, GameStatus,
+    GameType, HIGHLIGHT_CLIP_FORMAT_VERSION, HighlightClip, QueueMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -64,6 +67,26 @@ pub struct CompletionRecordV1 {
     /// news because their cohort is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub season: Option<Season>,
+    /// Materialized recovery-safe source uploaded to private object storage by
+    /// PersistGame. New immutable Redis records leave this empty; the bounded
+    /// blocking materializer fills it process-locally. It also remains the
+    /// compatibility source for older inline completion records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<GameRecordingV1>,
+    /// Process-local canonical bytes produced by the bounded PersistGame
+    /// materializer. This is deliberately absent from the immutable Redis
+    /// schema; it prevents Dynamo/S3 persistence from serializing a huge
+    /// recording again on an async runtime worker.
+    #[serde(skip, default)]
+    pub recording_canonical_bytes: Option<Vec<u8>>,
+    /// Compact reference to the retained lease-fenced replay journal. New
+    /// completions always use it so the actor never assembles a full archive;
+    /// PersistGame materializes and uploads it after progression effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_journal: Option<crate::recovery::ReplayJournalReferenceV1>,
+    /// Server-selected canonical clip delivered identically to every viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_of_the_game: Option<HighlightClip>,
     pub final_state: GameState,
     pub effects: Vec<CompletionEffect>,
 }
@@ -77,9 +100,9 @@ impl CompletionRecordV1 {
         self.effects.iter().find(|effect| effect.id() == effect_id)
     }
 
-    /// Validate the durable record independently of any in-process executor
-    /// state. Callers must do this before committing the record, and the
-    /// database repeats the check before applying an effect.
+    /// Validate the immutable completion envelope without re-simulating its
+    /// potentially long replay artifacts. This method is intentionally cheap:
+    /// every effect and effect-marker retry calls it.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != COMPLETION_SCHEMA_VERSION {
             return Err(anyhow!(
@@ -115,6 +138,70 @@ impl CompletionRecordV1 {
                 "completion record {} for game {} is not terminal",
                 self.revision,
                 self.game_id
+            ));
+        }
+        if let Some(recording) = &self.recording {
+            if recording.format_version != GAME_RECORDING_FORMAT_VERSION
+                || recording.gameplay_version != GAMEPLAY_REPLAY_VERSION
+                || recording.anchors.is_empty()
+            {
+                return Err(anyhow!("completion recording format is incompatible"));
+            }
+            if recording.game_id != self.game_id {
+                return Err(anyhow!("completion recording targets a different game"));
+            }
+            if recording.end_tick != self.final_state.tick
+                || recording.end_sync_hash != self.final_state.sync_hash()
+            {
+                return Err(anyhow!("completion recording does not match final state"));
+            }
+        }
+        if self.recording.is_some() && self.recording_journal.is_some() {
+            return Err(anyhow!(
+                "completion cannot contain both inline and journal replay sources"
+            ));
+        }
+        if self.recording_canonical_bytes.is_some() && self.recording.is_none() {
+            return Err(anyhow!(
+                "completion canonical replay bytes require a materialized recording"
+            ));
+        }
+        if let Some(recording_journal) = &self.recording_journal {
+            recording_journal.validate()?;
+            if recording_journal.game_id != self.game_id {
+                return Err(anyhow!(
+                    "completion replay journal targets a different game"
+                ));
+            }
+            if recording_journal
+                .end_tick
+                .is_some_and(|end_tick| end_tick != self.final_state.tick)
+                || recording_journal
+                    .end_sync_hash
+                    .is_some_and(|end_hash| end_hash != self.final_state.sync_hash())
+            {
+                return Err(anyhow!(
+                    "completion replay journal does not match final-state metadata"
+                ));
+            }
+        }
+        if let Some(clip) = &self.play_of_the_game {
+            if clip.clip_format_version != HIGHLIGHT_CLIP_FORMAT_VERSION
+                || clip.gameplay_version != GAMEPLAY_REPLAY_VERSION
+            {
+                return Err(anyhow!("completion highlight format is incompatible"));
+            }
+            if clip.game_id != self.game_id {
+                return Err(anyhow!("completion highlight targets a different game"));
+            }
+        }
+        if self.final_state.is_stress_test
+            && (self.recording.is_some()
+                || self.recording_journal.is_some()
+                || self.play_of_the_game.is_some())
+        {
+            return Err(anyhow!(
+                "stress-test completion must not contain replay artifacts"
             ));
         }
 
@@ -262,6 +349,24 @@ impl CompletionRecordV1 {
                     "completion has an incomplete MMR effect set for user {user_id}"
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Compatibility/full artifact validation for callers that already own an
+    /// inline recording. New actors commit only a journal reference; its full
+    /// archive is verified by PersistGame's bounded blocking materializer.
+    pub fn validate_replay_artifacts(&self) -> Result<()> {
+        self.validate()?;
+        if let Some(recording) = &self.recording {
+            recording.validate()?;
+            recording.verify_end_hash()?;
+        }
+        if let Some(recording_journal) = &self.recording_journal {
+            recording_journal.validate()?;
+        }
+        if let Some(clip) = &self.play_of_the_game {
+            clip.replay_and_verify()?;
         }
         Ok(())
     }
@@ -497,9 +602,8 @@ pub async fn materialize_completion(
     }
 
     let season = season_for_completion_timestamp(ended_at_ms)?;
-    let mut effects = vec![CompletionEffect::PersistGame {
-        id: "game".to_string(),
-    }];
+    let mut effects = Vec::new();
+    let mut post_persist_effects = Vec::new();
 
     let mut player_ids: Vec<u32> = final_state.players.keys().copied().collect();
     player_ids.sort_unstable();
@@ -525,7 +629,9 @@ pub async fn materialize_completion(
                     .players
                     .get(&user_id)
                     .expect("player id collected from same state");
-                effects.push(CompletionEffect::InsertHighScore {
+                // High-score publication reads the completed game row for
+                // privacy/news provenance, so keep it after PersistGame.
+                post_persist_effects.push(CompletionEffect::InsertHighScore {
                     id: format!("high_score:{user_id}"),
                     user_id,
                     username: username_for(&final_state, user_id),
@@ -565,6 +671,15 @@ pub async fn materialize_completion(
         }
     }
 
+    // Player progression is applied first. Replay upload is retried as part
+    // of PersistGame, but an S3 outage must not hold earned XP/MMR hostage.
+    // Solo high scores stay after persistence because their public provenance
+    // depends on the completed game row.
+    effects.push(CompletionEffect::PersistGame {
+        id: "game".to_string(),
+    });
+    effects.extend(post_persist_effects);
+
     let record = CompletionRecordV1 {
         schema_version: COMPLETION_SCHEMA_VERSION,
         game_id,
@@ -573,6 +688,10 @@ pub async fn materialize_completion(
         ended_at_ms,
         server_id,
         season: Some(season),
+        recording: None,
+        recording_canonical_bytes: None,
+        recording_journal: None,
+        play_of_the_game: None,
         final_state,
         effects,
     };
@@ -614,7 +733,7 @@ pub async fn apply_all_effects(
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use common::{GameStatus, GameType, QueueMode};
+    use common::{DeathCause, GameStatus, GameType, Position, QueueMode, SnakeCrash};
 
     #[test]
     fn effect_ids_are_stable_and_unique() {
@@ -673,6 +792,51 @@ mod tests {
     }
 
     #[test]
+    fn pre_attribution_completion_record_deserializes_with_unknown_crash_cause() {
+        let mut state = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.recent_crashes.push(SnakeCrash {
+            tick: 3,
+            snake_id: 0,
+            position: Position { x: 0, y: 5 },
+            cause: DeathCause::OutOfBounds,
+        });
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let record = CompletionRecordV1 {
+            schema_version: COMPLETION_SCHEMA_VERSION,
+            game_id: 17,
+            partition_id: 7,
+            revision: Uuid::new_v4(),
+            ended_at_ms: 10,
+            server_id: 1,
+            season: None,
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
+            final_state: state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+
+        let mut legacy = serde_json::to_value(record).expect("serialize completion");
+        legacy["final_state"]["recent_crashes"][0]
+            .as_object_mut()
+            .expect("crash object")
+            .remove("cause");
+
+        let restored: CompletionRecordV1 =
+            serde_json::from_value(legacy).expect("deserialize pre-attribution completion");
+        assert_eq!(
+            restored.final_state.recent_crashes[0].cause,
+            DeathCause::Unknown
+        );
+        restored
+            .validate()
+            .expect("legacy completion remains valid");
+    }
+
+    #[test]
     fn stress_completion_rejects_player_progression_effects() {
         let mut state = GameState::new(
             60,
@@ -699,6 +863,10 @@ mod tests {
             ended_at_ms: 10,
             server_id: 1,
             season: Some(0),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: state,
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };

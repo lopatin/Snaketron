@@ -15,6 +15,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
+/// Version 11 introduces deterministic death causes in events and recovery
+/// state. Mixed executors must not publish incompatible `SnakeDied` shapes.
+///
 /// Version 10 introduces combo-aware food events and state. Mixed executors
 /// would disagree about growth, score, and the event wire shape, so they must
 /// not co-own partitions during a rolling deploy.
@@ -33,7 +36,7 @@ pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
 /// with every player's idle clock reset to tick zero. The version gate refuses
 /// incompatible envelopes and keeps mixed-version executors from co-owning
 /// partitions during a rolling deploy.
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 10;
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 11;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);
@@ -177,6 +180,10 @@ impl ClusterNamespace {
 
     pub fn recovery(&self, game_id: u32) -> String {
         RedisKeys::cluster_recovery(&self.region, game_id)
+    }
+
+    pub fn replay_journal(&self, game_id: u32) -> String {
+        RedisKeys::cluster_replay_journal(&self.region, game_id)
     }
 
     pub fn planned_handoff_watermark(&self, game_id: u32) -> String {

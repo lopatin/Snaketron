@@ -44,6 +44,10 @@ fn completion_record(
         ended_at_ms,
         server_id: 42,
         season: Some(1),
+        recording: None,
+        recording_canonical_bytes: None,
+        recording_journal: None,
+        play_of_the_game: None,
         final_state,
         effects,
     }
@@ -190,8 +194,8 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
     );
     assert_eq!(ranking.mmr, 1_025);
 
-    // The per-game revision anchor protects every effect, even if a caller
-    // attempts another revision before/without applying PersistGame.
+    // The per-game revision anchor protects every effect even when progression
+    // is intentionally allowed to run before replay-backed PersistGame.
     let mut conflicting_completion = record.clone();
     conflicting_completion.revision = Uuid::new_v4();
     assert!(
@@ -228,18 +232,24 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
             },
         ],
     );
-    assert!(
+    assert_eq!(
         db.apply_completion_effect(&raced_record, &raced_record.effects[1])
-            .await
-            .is_err(),
-        "rewards must not commit before PersistGame proves the game identity"
+            .await?,
+        EffectApplyResult::Applied,
+        "earned progression must not wait for replay-backed PersistGame"
     );
     assert_eq!(
         db.get_user_by_id(user.id)
             .await?
             .expect("user remains present")
             .xp,
-        15
+        20
+    );
+    assert!(
+        db.apply_completion_effect(&raced_record, &raced_record.effects[2])
+            .await
+            .is_err(),
+        "public high scores still require the completed game row"
     );
     db.apply_completion_effect(&raced_record, &raced_record.effects[0])
         .await?;
@@ -249,8 +259,11 @@ async fn durable_completion_effects_survive_replay_and_concurrency() -> Result<(
         db.apply_completion_effect(&raced_record, raced_effect),
     );
     let raced_results = [left?, right?];
-    assert!(raced_results.contains(&EffectApplyResult::Applied));
-    assert!(raced_results.contains(&EffectApplyResult::AlreadyApplied));
+    assert!(
+        raced_results
+            .iter()
+            .all(|result| *result == EffectApplyResult::AlreadyApplied)
+    );
     assert_eq!(
         db.get_user_by_id(user.id)
             .await?

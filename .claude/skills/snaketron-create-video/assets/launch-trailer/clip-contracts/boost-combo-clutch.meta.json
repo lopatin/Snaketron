@@ -1,0 +1,8 @@
+{
+  "scenario_id": "boost-combo-clutch",
+  "seed": 991,
+  "capture_vfps": 120,
+  "encoded_fps": 60,
+  "duration": 5.0,
+  "anchors": { "boost": 0.8, "combo": 2.3 }
+}

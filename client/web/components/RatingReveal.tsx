@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { RankTier } from '../types';
 import {
   formatRankLabel,
@@ -118,12 +118,26 @@ const ChevronsGlyph: React.FC<{ direction: 'up' | 'down' }> = ({ direction }) =>
 
 export interface RatingRevealProps {
   state: MatchRatingState;
+  /** Fires once after the odometer and any rank movement have landed. */
+  onSettled?: () => void;
 }
 
-const RatingReveal: React.FC<RatingRevealProps> = ({ state }) => {
+const RatingReveal: React.FC<RatingRevealProps> = ({ state, onSettled }) => {
   const reducedMotion = usePrefersReducedMotion();
   const reveal = state.phase === 'ready' ? state.reveal : null;
   const { displayMmr, stage } = useAnimatedMmr(reveal, reducedMotion);
+  const announcedRevealRef = useRef<RatingRevealModel | null>(null);
+
+  useEffect(() => {
+    if (state.phase !== 'ready') {
+      announcedRevealRef.current = null;
+      return;
+    }
+    if (stage === 'settled' && announcedRevealRef.current !== state.reveal) {
+      announcedRevealRef.current = state.reveal;
+      onSettled?.();
+    }
+  }, [onSettled, stage, state]);
 
   if (state.phase === 'idle' || state.phase === 'unavailable') {
     return null;

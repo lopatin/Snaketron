@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "path": "fonts/BarlowCondensed-ExtraBoldItalic.ttf",
+      "name": "Barlow Condensed ExtraBold Italic",
+      "author": "Jeremy Tribby",
+      "license": "SIL Open Font License 1.1",
+      "source": "https://github.com/google/fonts/tree/main/ofl/barlowcondensed"
+    },
+    {
+      "path": "fonts/Inter-Variable.ttf",
+      "name": "Inter",
+      "author": "Rasmus Andersson",
+      "license": "SIL Open Font License 1.1",
+      "source": "https://github.com/google/fonts/tree/main/ofl/inter"
+    },
+    {
+      "path": "identity/snaketron-wordmark.svg",
+      "name": "SnakeTron trailer wordmark",
+      "author": "SnakeTron project",
+      "license": "Project-owned original",
+      "source": "Generated for this repository"
+    },
+    {
+      "path": "lut/snaketron-identity.cube",
+      "name": "SnakeTron identity LUT",
+      "author": "SnakeTron project",
+      "license": "Project-owned original",
+      "source": "Generated for this repository"
+    },
+    {
+      "path": "sfx/impact.wav",
+      "name": "Impact",
+      "author": "SnakeTron project",
+      "license": "CC0-1.0",
+      "source": "Procedurally synthesized for this repository"
+    },
+    {
+      "path": "sfx/boost.wav",
+      "name": "Boost rise",
+      "author": "SnakeTron project",
+      "license": "CC0-1.0",
+      "source": "Procedurally synthesized for this repository"
+    },
+    {
+      "path": "sfx/bank.wav",
+      "name": "Bank confirmation",
+      "author": "SnakeTron project",
+      "license": "CC0-1.0",
+      "source": "Procedurally synthesized for this repository"
+    },
+    {
+      "path": "sfx/whoosh.wav",
+      "name": "Transition whoosh",
+      "author": "SnakeTron project",
+      "license": "CC0-1.0",
+      "source": "Procedurally synthesized for this repository"
+    },
+    {
+      "path": "launch-trailer/launch-bed.m4a",
+      "name": "Launch trailer synth bed",
+      "author": "SnakeTron project",
+      "license": "CC0-1.0",
+      "source": "Procedurally synthesized for this repository"
+    },
+    {
+      "path": "cards/rank-up.html",
+      "name": "Rank-up capture fixture",
+      "author": "SnakeTron project",
+      "license": "Project-owned original",
+      "source": "Generated for this repository"
+    },
+    {
+      "path": "cards/leaderboard.html",
+      "name": "Leaderboard capture fixture",
+      "author": "SnakeTron project",
+      "license": "Project-owned original",
+      "source": "Generated for this repository"
+    }
+  ]
+}

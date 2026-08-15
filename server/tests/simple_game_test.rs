@@ -358,7 +358,7 @@ async fn test_simple_game() -> Result<()> {
             continue;
         };
         match &event.event {
-            GameEvent::SnakeDied { snake_id } => {
+            GameEvent::SnakeDied { snake_id, .. } => {
                 if *snake_id == snake1_id && snake1_death_tick.is_none() {
                     println!(
                         "Snake 1 (id={}) died at tick {}! Initial direction was {:?}",

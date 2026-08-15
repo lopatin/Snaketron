@@ -1,0 +1,4 @@
+interface:
+  display_name: "SnakeTron Video Director"
+  short_description: "Capture and edit frame-exact SnakeTron trailers"
+  default_prompt: "Use $snaketron-create-video to turn these SnakeTron scenarios into a polished trailer."

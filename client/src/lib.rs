@@ -1,4 +1,5 @@
 mod render;
+mod scenario;
 mod tutorial;
 
 use common::{
@@ -356,9 +357,8 @@ impl GameClient {
     }
 
     /// Render the engine's current predicted state directly to a canvas — no
-    /// JSON round-trip. `draw_celebration` is invoked after the field and pickups
-    /// but before snakes, so JavaScript-owned cosmetic effects can share this
-    /// canvas without covering gameplay actors.
+    /// JSON round-trip. `draw_celebration` runs behind snakes; `draw_post_snakes`
+    /// runs above the completed arena frame for impacts such as explosions.
     #[wasm_bindgen(js_name = render)]
     pub fn render(
         &self,
@@ -367,6 +367,7 @@ impl GameClient {
         rotation: f64,
         local_user_id: Option<u32>,
         draw_celebration: &js_sys::Function,
+        draw_post_snakes: &js_sys::Function,
     ) -> Result<(), JsValue> {
         render::render_game_state(
             self.render_state(),
@@ -375,6 +376,7 @@ impl GameClient {
             local_user_id,
             rotation as i32,
             draw_celebration,
+            draw_post_snakes,
         )
     }
 }

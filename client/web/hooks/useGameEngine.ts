@@ -22,13 +22,14 @@ interface UseGameEngineReturn {
   connectionStale: boolean;
   sendCommand: (command: Command) => boolean;
   processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
-  /** Render predicted state, injecting score effects between field and snakes. */
+  /** Render predicted state with cosmetic layers below and above the snakes. */
   renderTo: (
     canvas: HTMLCanvasElement,
     cellSize: number,
     rotation: number,
     localUserId: number | undefined,
     drawCelebration: () => void,
+    drawPostSnakes: () => void,
   ) => void;
   /** Read compact crash and goal history from the same predicted state used by renderTo. */
   readPredictedVisualState: () => {
@@ -324,6 +325,7 @@ export const useGameEngine = ({
       rotation: number,
       localUserId: number | undefined,
       drawCelebration: () => void,
+      drawPostSnakes: () => void,
     ) => {
       engineRef.current?.render(
         canvas,
@@ -331,6 +333,7 @@ export const useGameEngine = ({
         rotation,
         localUserId,
         drawCelebration,
+        drawPostSnakes,
       );
     },
     [],

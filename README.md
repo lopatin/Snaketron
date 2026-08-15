@@ -125,10 +125,28 @@ TypeScript types for everything crossing the WebSocket are generated from the Ru
 
 ### Game Replays
 
-The repo includes replay-recording infrastructure (`server/src/replay/`) and sample `.replay` captures in `replays/`, though recording is not currently wired into the running server. Play the samples back in the terminal viewer:
+The terminal viewer can still play the sample `.replay` captures in `replays/`:
 
 ```bash
 cargo run --bin snaketron -- replays/
+```
+
+Production matches now also create a versioned deterministic `GameRecordingV1`.
+The completion outbox uploads its canonical gzip to private S3, stores verified
+replay metadata plus the server-selected Play of the Game in DynamoDB, and
+serves public reads through a bounded Valkey/ElastiCache cache-aside layer.
+Large recordings are stored as content-addressed manifests plus chunks and are
+served through bounded HTTP byte ranges. Synthetic stress/bot matches are
+server-attested and deliberately excluded; `SNAKETRON_TEST_MODE` also disables
+recording for the entire test process.
+See `server/README.md` for storage variables, public endpoints, and the
+LocalStack integration test.
+
+The bot CLI must present the server's configured stress key so test users do
+not contaminate production replay storage:
+
+```bash
+cargo run -p bot -- --stress-test-key "$SNAKETRON_STRESS_TEST_KEY" --bots 4 --games 10
 ```
 
 ### itch.io Build

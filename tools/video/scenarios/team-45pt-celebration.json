@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "id": "team-45pt-celebration",
+  "world": {
+    "game_type": { "TeamMatch": { "per_team": 1 } },
+    "queue_mode": "Competitive",
+    "rng_seed": null,
+    "overrides": { "player_idle_timeout_ms": 600000 }
+  },
+  "pose": {
+    "snakes": [
+      {
+        "user_id": 1,
+        "name": "VAULT RUNNER",
+        "team_id": 0,
+        "body": [{ "x": 16, "y": 20 }, { "x": 20, "y": 20 }],
+        "direction": "Left",
+        "food": 45,
+        "boost_charge_ms": 3000
+      },
+      {
+        "user_id": 2,
+        "name": "DEFENDER",
+        "team_id": 1,
+        "body": [{ "x": 45, "y": 10 }, { "x": 49, "y": 10 }],
+        "direction": "Left",
+        "is_alive": false
+      }
+    ],
+    "food": [],
+    "team_scores": [[0, 0], [1, 0]],
+    "start_tick": 0
+  },
+  "commands": [],
+  "run_ticks": 100,
+  "presentation": {
+    "camera": { "Follow": { "snake_id": 0 } },
+    "default_time_scale": 1.0,
+    "star_snake_id": 0,
+    "addons": { "combo_callout": false, "boost_meter": true }
+  },
+  "expect": []
+}

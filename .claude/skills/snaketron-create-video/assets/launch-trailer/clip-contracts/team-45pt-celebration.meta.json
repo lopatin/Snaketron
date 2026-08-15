@@ -1,0 +1,8 @@
+{
+  "scenario_id": "team-45pt-celebration",
+  "seed": 4545,
+  "capture_vfps": 120,
+  "encoded_fps": 60,
+  "duration": 5.0,
+  "anchors": { "bank": 2.5, "celebration": 3.0 }
+}

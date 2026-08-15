@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import type { GameState, QueueMode } from '../types';
 import { buildMatchPresentation } from '../utils/gamePresentation';
 import type { MatchRatingState } from '../utils/ratingReveal';
+import type { MatchHighlightState } from '../utils/highlightPresentation';
 import GameOverCard from './GameOverCard';
 import MatchRosterBand from './MatchRosterBand';
 import Scoreboard from './Scoreboard';
@@ -14,6 +15,7 @@ export interface GameHudShellProps {
   currentUserId?: number;
   queueMode?: QueueMode;
   rating?: MatchRatingState;
+  highlight: MatchHighlightState;
   onMenu: () => void;
   onPlayAgain: () => void;
   playAgainDisabled?: boolean;
@@ -27,6 +29,7 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
   currentUserId,
   queueMode,
   rating,
+  highlight,
   onMenu,
   onPlayAgain,
   playAgainDisabled = false,
@@ -93,8 +96,10 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
 
       <GameOverCard
         open={scoreCardOpen && presentation.isComplete}
+        gameId={matchKey}
         presentation={presentation}
         rating={rating}
+        highlight={highlight}
         onDismiss={() => setScoreCardOpen(false)}
         onMenu={onMenu}
         onPlayAgain={onPlayAgain}

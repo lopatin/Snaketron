@@ -189,6 +189,12 @@ pub enum GameEvent {
     },
     SnakeDied {
         snake_id: u32,
+        /// The collision or scoring transition that ended this life. Older
+        /// durable snapshots/events predate attribution and deserialize as
+        /// `Unknown`; current authoritative simulation always emits a
+        /// concrete cause.
+        #[serde(default)]
+        cause: DeathCause,
     },
     /// Authoritative inactivity removal. This is one atomic replicated state
     /// transition so clients learn both why the player left and that their
@@ -305,6 +311,30 @@ pub enum GameEvent {
     },
 }
 
+/// Deterministic attribution for a snake death. This records information the
+/// collision pass already knows; it does not change collision semantics.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub enum DeathCause {
+    /// Compatibility value for stored artifacts written before attribution
+    /// was added. New simulation never emits this variant.
+    #[default]
+    Unknown,
+    Wall,
+    OutOfBounds,
+    EnemyBase,
+    SelfCollision,
+    SnakeBody {
+        killer_snake_id: u32,
+    },
+    HeadToHead {
+        other_snake_id: u32,
+    },
+    /// Team-mode banking intentionally resets and respawns the scoring snake.
+    Banked,
+}
+
 fn default_food_eaten_points() -> u32 {
     1
 }
@@ -324,6 +354,8 @@ pub struct SnakeCrash {
     pub tick: u32,
     pub snake_id: u32,
     pub position: Position,
+    #[serde(default)]
+    pub cause: DeathCause,
 }
 
 /// Keep cosmetic crash history slightly longer than the web animation. This
@@ -1251,6 +1283,16 @@ pub struct GameState {
     pub recent_crashes: Vec<SnakeCrash>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_goals: Vec<TeamGoal>,
+    /// Most recent death transition for each snake. Unlike `recent_crashes`,
+    /// this match-history field survives respawns and animation-cue expiry so
+    /// post-match presentation can explain what happened. Banking is retained
+    /// as `Banked` (and deliberately hidden by the UI) rather than exposing a
+    /// previous life as though it were the latest one.
+    ///
+    /// This is presentation history, not simulation state, and is therefore
+    /// intentionally excluded from `sync_hash`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_death_causes: HashMap<u32, DeathCause>,
     pub game_type: GameType,
     pub queue_mode: QueueMode,
     /// Server-attested synthetic game marker. Stress games exercise the full
@@ -1510,6 +1552,7 @@ impl GameState {
             arena,
             recent_crashes: Vec::new(),
             recent_goals: Vec::new(),
+            last_death_causes: HashMap::new(),
             game_type: game_type.clone(),
             queue_mode,
             is_stress_test: false,
@@ -1744,6 +1787,31 @@ impl GameState {
             if *snake_id as usize >= self.arena.snakes.len() {
                 return Err(anyhow::anyhow!(
                     "food pickup count references missing snake {snake_id}"
+                ));
+            }
+        }
+        for (snake_id, cause) in &self.last_death_causes {
+            if *snake_id as usize >= self.arena.snakes.len() {
+                return Err(anyhow::anyhow!(
+                    "last death cause references missing snake {snake_id}"
+                ));
+            }
+            let attributed_snake_id = match cause {
+                DeathCause::SnakeBody { killer_snake_id } => Some(*killer_snake_id),
+                DeathCause::HeadToHead { other_snake_id } => Some(*other_snake_id),
+                DeathCause::Unknown
+                | DeathCause::Wall
+                | DeathCause::OutOfBounds
+                | DeathCause::EnemyBase
+                | DeathCause::SelfCollision
+                | DeathCause::Banked => None,
+            };
+            if attributed_snake_id
+                .is_some_and(|attributed| attributed as usize >= self.arena.snakes.len())
+            {
+                return Err(anyhow::anyhow!(
+                    "last death cause for snake {snake_id} references missing attributed snake {}",
+                    attributed_snake_id.unwrap()
                 ));
             }
         }
@@ -2052,10 +2120,27 @@ impl GameState {
         match event {
             GameEvent::Snapshot { game_state } => game_state.validate_boost_invariants(),
             GameEvent::SnakeTurned { snake_id, .. }
-            | GameEvent::SnakeDied { snake_id }
             | GameEvent::ScoreUpdated { snake_id, .. }
             | GameEvent::SnakeRespawned { snake_id, .. } => {
                 require_snake(*snake_id)?;
+                Ok(())
+            }
+            GameEvent::SnakeDied { snake_id, cause } => {
+                require_snake(*snake_id)?;
+                match cause {
+                    DeathCause::SnakeBody { killer_snake_id } => {
+                        require_snake(*killer_snake_id)?;
+                    }
+                    DeathCause::HeadToHead { other_snake_id } => {
+                        require_snake(*other_snake_id)?;
+                    }
+                    DeathCause::Unknown
+                    | DeathCause::Wall
+                    | DeathCause::OutOfBounds
+                    | DeathCause::EnemyBase
+                    | DeathCause::SelfCollision
+                    | DeathCause::Banked => {}
+                }
                 Ok(())
             }
             GameEvent::FoodEaten {
@@ -3183,7 +3268,7 @@ impl GameState {
         }
 
         // Check for collisions
-        let mut crashed_snakes: HashMap<u32, Position> = HashMap::new();
+        let mut crashed_snakes: HashMap<u32, (Position, DeathCause)> = HashMap::new();
         let width = self.arena.width as i16;
         let height = self.arena.height as i16;
         'main_snake_loop: for (snake_id, snake) in self.iter_snakes() {
@@ -3191,7 +3276,7 @@ impl GameState {
             if snake.is_alive && movers.contains(&snake_id) {
                 // Check for wall collisions in team games
                 if self.arena.is_wall_position(head) {
-                    crashed_snakes.insert(snake_id, *head);
+                    crashed_snakes.insert(snake_id, (*head, DeathCause::Wall));
                     continue 'main_snake_loop;
                 }
 
@@ -3199,13 +3284,13 @@ impl GameState {
                 if let Some(team_id) = snake.team_id
                     && self.arena.is_in_enemy_base(head, team_id)
                 {
-                    crashed_snakes.insert(snake_id, *head);
+                    crashed_snakes.insert(snake_id, (*head, DeathCause::EnemyBase));
                     continue 'main_snake_loop;
                 }
 
                 // If not within bounds
                 if !(head.x >= 0 && head.x < width && head.y >= 0 && head.y < height) {
-                    crashed_snakes.insert(snake_id, *head);
+                    crashed_snakes.insert(snake_id, (*head, DeathCause::OutOfBounds));
                     continue 'main_snake_loop;
                 }
 
@@ -3213,7 +3298,25 @@ impl GameState {
                 for (other_snake_id, other_snake) in self.iter_snakes() {
                     let is_self = snake_id == other_snake_id;
                     if other_snake.is_alive && other_snake.contains_point(head, is_self) {
-                        crashed_snakes.insert(snake_id, *head);
+                        let cause = if is_self {
+                            DeathCause::SelfCollision
+                        } else if other_snake.is_head(head)
+                            || (movers.contains(&other_snake_id)
+                                && old_snakes[snake_id as usize].head()? == other_snake.head()?
+                                && old_snakes[other_snake_id as usize].head()? == head)
+                        {
+                            // Equal destination cells and simultaneous head
+                            // swaps are both head-to-head collisions. The
+                            // latter appears as a body intersection after both
+                            // snakes move, so compare their pre-move heads to
+                            // avoid misattributing the trade as two body kills.
+                            DeathCause::HeadToHead { other_snake_id }
+                        } else {
+                            DeathCause::SnakeBody {
+                                killer_snake_id: other_snake_id,
+                            }
+                        };
+                        crashed_snakes.insert(snake_id, (*head, cause));
                         continue 'main_snake_loop;
                     }
                 }
@@ -3225,9 +3328,10 @@ impl GameState {
         // differs between processes (native server vs WASM client), and
         // respawn events consume RNG / emit events whose order must be
         // identical on both sides.
-        let mut crashed_snakes: Vec<(u32, Position)> = crashed_snakes.into_iter().collect();
+        let mut crashed_snakes: Vec<(u32, (Position, DeathCause))> =
+            crashed_snakes.into_iter().collect();
         crashed_snakes.sort_unstable_by_key(|(snake_id, _)| *snake_id);
-        for (snake_id, attempted_head) in crashed_snakes {
+        for (snake_id, (attempted_head, cause)) in crashed_snakes {
             self.arena.snakes[snake_id as usize] = old_snakes[snake_id as usize].clone();
             let crash_position = Position {
                 x: attempted_head.x.clamp(0, width.saturating_sub(1)),
@@ -3237,8 +3341,9 @@ impl GameState {
                 tick: self.tick.saturating_add(1),
                 snake_id,
                 position: crash_position,
+                cause: cause.clone(),
             });
-            self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
+            self.apply_event(GameEvent::SnakeDied { snake_id, cause }, Some(&mut out));
 
             if let GameType::TeamMatch { .. } = &self.game_type
                 && let Some(event) = self.respawn_event_for_snake(snake_id)
@@ -3480,7 +3585,13 @@ impl GameState {
                 }
 
                 for snake_id in respawns {
-                    self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
+                    self.apply_event(
+                        GameEvent::SnakeDied {
+                            snake_id,
+                            cause: DeathCause::Banked,
+                        },
+                        Some(&mut out),
+                    );
                     if let Some(event) = self.respawn_event_for_snake(snake_id) {
                         self.apply_event(event, Some(&mut out));
                     }
@@ -3750,7 +3861,8 @@ impl GameState {
                 }
             }
 
-            GameEvent::SnakeDied { snake_id } => {
+            GameEvent::SnakeDied { snake_id, cause } => {
+                self.last_death_causes.insert(snake_id, cause);
                 // A dead snake holds nothing — the invariants require a cleared
                 // meter. An unlimited tank is refilled by the *respawn*, which
                 // is where a new life actually begins.
@@ -4209,6 +4321,21 @@ mod tests {
         }
     }
 
+    fn assert_death_cause(events: &[(u64, GameEvent)], snake_id: u32, expected: DeathCause) {
+        let actual = events.iter().find_map(|(_, event)| match event {
+            GameEvent::SnakeDied {
+                snake_id: dead_snake_id,
+                cause,
+            } if *dead_snake_id == snake_id => Some(cause.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            actual,
+            Some(expected),
+            "missing or incorrectly attributed death for snake {snake_id}"
+        );
+    }
+
     #[test]
     fn snake_collides_with_itself_after_turning() {
         let mut game = GameState::new(
@@ -4245,9 +4372,10 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 })),
+                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0, .. })),
             "expected snake to die after colliding with itself"
         );
+        assert_death_cause(&events, 0, DeathCause::SelfCollision);
         assert!(!game.arena.snakes[0].is_alive);
     }
 
@@ -4283,8 +4411,9 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 }))
+                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0, .. }))
         );
+        assert_death_cause(&events, 0, DeathCause::OutOfBounds);
         assert_eq!(game.arena.snakes[0].body[0], Position { x: 0, y: 5 });
         assert_eq!(
             game.recent_crashes,
@@ -4292,6 +4421,7 @@ mod tests {
                 tick: crash_tick,
                 snake_id: 0,
                 position: Position { x: 0, y: 5 },
+                cause: DeathCause::OutOfBounds,
             }]
         );
 
@@ -4323,6 +4453,131 @@ mod tests {
 
         let restored: GameState = serde_json::from_value(json).expect("deserialize old snapshot");
         assert!(restored.recent_crashes.is_empty());
+    }
+
+    #[test]
+    fn legacy_death_events_and_crash_cues_default_to_unknown_cause() {
+        let event: GameEvent = serde_json::from_value(serde_json::json!({
+            "SnakeDied": { "snake_id": 7 }
+        }))
+        .expect("deserialize legacy death event");
+        assert!(matches!(
+            event,
+            GameEvent::SnakeDied {
+                snake_id: 7,
+                cause: DeathCause::Unknown,
+            }
+        ));
+
+        let crash: SnakeCrash = serde_json::from_value(serde_json::json!({
+            "tick": 9,
+            "snake_id": 7,
+            "position": { "x": 3, "y": 4 }
+        }))
+        .expect("deserialize legacy crash cue");
+        assert_eq!(crash.cause, DeathCause::Unknown);
+    }
+
+    #[test]
+    fn legacy_states_default_to_empty_last_death_history() {
+        let state = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let mut json = serde_json::to_value(state).expect("serialize current state");
+        json.as_object_mut()
+            .expect("state object")
+            .remove("last_death_causes");
+
+        let restored: GameState =
+            serde_json::from_value(json).expect("deserialize pre-attribution state");
+        assert!(restored.last_death_causes.is_empty());
+    }
+
+    #[test]
+    fn last_death_history_survives_respawn_and_banked_replaces_the_previous_life() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        let victim_id = game.add_player(1, Some("Victim".into())).unwrap().snake_id;
+        let killer_id = game.add_player(2, Some("Killer".into())).unwrap().snake_id;
+        let body_cause = DeathCause::SnakeBody {
+            killer_snake_id: killer_id,
+        };
+
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id: victim_id,
+                cause: body_cause.clone(),
+            },
+            None,
+        );
+        game.apply_event(
+            GameEvent::SnakeRespawned {
+                snake_id: victim_id,
+                position: Position { x: 20, y: 20 },
+                direction: Direction::Right,
+            },
+            None,
+        );
+        assert_eq!(game.last_death_causes.get(&victim_id), Some(&body_cause));
+
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id: victim_id,
+                cause: DeathCause::Banked,
+            },
+            None,
+        );
+        assert_eq!(
+            game.last_death_causes.get(&victim_id),
+            Some(&DeathCause::Banked),
+            "the latest scoring reset must not expose an earlier life as the latest death"
+        );
+
+        let restored: GameState =
+            serde_json::from_value(serde_json::to_value(&game).expect("serialize death history"))
+                .expect("deserialize death history");
+        assert_eq!(restored.last_death_causes, game.last_death_causes);
+    }
+
+    #[test]
+    fn last_death_history_is_validated_but_excluded_from_the_sync_hash() {
+        let mut baseline = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 2 },
+            QueueMode::Quickmatch,
+            Some(11),
+            0,
+        );
+        baseline.add_player(1, Some("One".into())).unwrap();
+        baseline.add_player(2, Some("Two".into())).unwrap();
+        let mut with_history = baseline.clone();
+        with_history
+            .last_death_causes
+            .insert(0, DeathCause::SnakeBody { killer_snake_id: 1 });
+
+        with_history
+            .validate_boost_invariants()
+            .expect("valid attribution history");
+        assert_eq!(baseline.sync_hash(), with_history.sync_hash());
+
+        with_history.last_death_causes.insert(
+            0,
+            DeathCause::SnakeBody {
+                killer_snake_id: 99,
+            },
+        );
+        assert!(
+            with_history
+                .validate_boost_invariants()
+                .unwrap_err()
+                .to_string()
+                .contains("missing attributed snake")
+        );
     }
 
     fn clockwise(direction: Direction) -> Direction {
@@ -4946,11 +5201,12 @@ mod tests {
 
         let reset_without_crash = events
             .iter()
-            .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 }));
+            .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0, .. }));
         assert!(
             reset_without_crash && game.recent_crashes.is_empty(),
             "banking food should reset the snake without recording a collision"
         );
+        assert_death_cause(&events, 0, DeathCause::Banked);
 
         let score = game
             .team_scores
@@ -5411,6 +5667,7 @@ mod tests {
         game.apply_event(
             GameEvent::SnakeDied {
                 snake_id: player.snake_id,
+                cause: DeathCause::Unknown,
             },
             None,
         );
@@ -5597,10 +5854,11 @@ mod tests {
 
         assert!(
             events.iter().any(|(_, event)| {
-                matches!(event, GameEvent::SnakeDied { snake_id } if *snake_id == 0)
+                matches!(event, GameEvent::SnakeDied { snake_id, .. } if *snake_id == 0)
             }),
             "snake should die when entering enemy base"
         );
+        assert_death_cause(&events, 0, DeathCause::EnemyBase);
 
         assert!(
             game.arena.snakes[0].is_alive,
@@ -7041,7 +7299,13 @@ mod tests {
         game.tick_forward(true).expect("latch the held control");
         assert!(game.arena.snakes[snake_id as usize].boost.intent);
 
-        game.apply_event(GameEvent::SnakeDied { snake_id }, None);
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id,
+                cause: DeathCause::Unknown,
+            },
+            None,
+        );
         let respawn = game
             .respawn_event_for_snake(snake_id)
             .expect("respawn event");
@@ -7176,11 +7440,11 @@ mod tests {
         let events = game.tick_forward(true).expect("unequal-speed collision");
         assert!(events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == fast_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == fast_id
         )));
         assert!(!events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == stationary_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == stationary_id
         )));
         assert!(game.arena.snakes[stationary_id as usize].is_alive);
         assert_eq!(
@@ -7214,12 +7478,22 @@ mod tests {
                 .expect("stationary segment collision");
             assert!(events.iter().any(|(_, event)| matches!(
                 event,
-                GameEvent::SnakeDied { snake_id } if *snake_id == fast_id
+                GameEvent::SnakeDied { snake_id, .. } if *snake_id == fast_id
             )));
             assert!(!events.iter().any(|(_, event)| matches!(
                 event,
-                GameEvent::SnakeDied { snake_id } if *snake_id == stationary_id
+                GameEvent::SnakeDied { snake_id, .. } if *snake_id == stationary_id
             )));
+            let expected = if target_y == 15 {
+                DeathCause::HeadToHead {
+                    other_snake_id: stationary_id,
+                }
+            } else {
+                DeathCause::SnakeBody {
+                    killer_snake_id: stationary_id,
+                }
+            };
+            assert_death_cause(&events, fast_id, expected);
         }
     }
 
@@ -7244,11 +7518,12 @@ mod tests {
             normal.movement_credit = 50_000;
 
             let events = game.tick_forward(true).expect("simultaneous collision");
-            for snake_id in [fast_id, normal_id] {
+            for (snake_id, other_snake_id) in [(fast_id, normal_id), (normal_id, fast_id)] {
                 assert!(events.iter().any(|(_, event)| matches!(
                     event,
-                    GameEvent::SnakeDied { snake_id: dead_id } if *dead_id == snake_id
+                    GameEvent::SnakeDied { snake_id: dead_id, .. } if *dead_id == snake_id
                 )));
+                assert_death_cause(&events, snake_id, DeathCause::HeadToHead { other_snake_id });
             }
         }
     }
@@ -7340,8 +7615,9 @@ mod tests {
             .expect("boosted wall collision");
         assert!(wall_events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == wall_snake_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == wall_snake_id
         )));
+        assert_death_cause(&wall_events, wall_snake_id, DeathCause::Wall);
         // Death drains fuel and stops Boost, but the player is still holding
         // the control, so their latched intent survives into the next life.
         assert_eq!(
@@ -7365,8 +7641,9 @@ mod tests {
             .expect("boosted enemy-base collision");
         assert!(enemy_events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == enemy_snake_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == enemy_snake_id
         )));
+        assert_death_cause(&enemy_events, enemy_snake_id, DeathCause::EnemyBase);
 
         // Returning carried food through one's own open goal scores, then the
         // ordinary scoring respawn clears Boost and movement phase.
@@ -7416,7 +7693,13 @@ mod tests {
         });
         assert!(game.has_scheduled_commands(50));
 
-        game.apply_event(GameEvent::SnakeDied { snake_id }, None);
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id,
+                cause: DeathCause::Unknown,
+            },
+            None,
+        );
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(!snake.is_alive);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
@@ -7720,6 +8003,7 @@ mod tests {
         game.apply_event(
             GameEvent::SnakeDied {
                 snake_id: eliminated_snake_id,
+                cause: DeathCause::Unknown,
             },
             None,
         );

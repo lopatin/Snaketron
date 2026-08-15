@@ -360,6 +360,17 @@ impl RedisKeys {
         )
     }
 
+    /// Append-only replay cells covered by the adjacent recovery checkpoint.
+    /// The partition hash tag is deliberately identical to recovery, lease,
+    /// and command keys so one fenced Lua transaction can advance all of them.
+    pub fn cluster_replay_journal(region: &str, game_id: u32) -> String {
+        let partition = Self::game_partition(game_id);
+        format!(
+            "snaketron:{}:cluster:{region}:game:{game_id}:replay-journal:v1",
+            Self::executor_tag(partition)
+        )
+    }
+
     /// Highest event watermark published by an incumbent immediately before a
     /// cooperative handoff. The successor uses it only until its first
     /// checkpoint makes the merged watermark authoritative.
@@ -534,6 +545,7 @@ mod tests {
                 RedisKeys::cluster_partition_lease("use1", partition),
                 RedisKeys::cluster_active_games("use1", partition),
                 RedisKeys::cluster_recovery("use1", game_id),
+                RedisKeys::cluster_replay_journal("use1", game_id),
                 RedisKeys::cluster_planned_handoff_watermark("use1", game_id),
                 RedisKeys::cluster_recovery_failure("use1", game_id),
                 RedisKeys::cluster_command_quarantine("use1", partition),

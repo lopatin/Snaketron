@@ -3,7 +3,13 @@ use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
 /// Transform coordinates based on rotation angle
-fn transform_coords(x: f64, y: f64, width: f64, height: f64, rotation: i32) -> (f64, f64) {
+pub(crate) fn transform_coords(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation: i32,
+) -> (f64, f64) {
     match rotation {
         90 => (height - y - 1.0, x),
         180 => (width - x - 1.0, height - y - 1.0),
@@ -13,7 +19,7 @@ fn transform_coords(x: f64, y: f64, width: f64, height: f64, rotation: i32) -> (
 }
 
 /// Get effective dimensions based on rotation (swap width/height for 90/270)
-fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
+pub(crate) fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
     match rotation {
         90 | 270 => (height, width),
         _ => (width, height),
@@ -282,8 +288,27 @@ fn nos_pressure_plate_dimensions(
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn scenario_capture_fonts_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+        .and_then(|element| element.get_attribute("data-scenario-capture"))
+        .as_deref()
+        == Some("true")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scenario_capture_fonts_enabled() -> bool {
+    false
+}
+
 fn nos_wordmark_font(size: f64) -> String {
-    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    if scenario_capture_fonts_enabled() {
+        format!("italic 800 {size}px \"Snaketron Capture Black\", sans-serif")
+    } else {
+        format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    }
 }
 
 /// Paint one faceted Pressure Plate NOS bottle in a local vector coordinate
@@ -1462,7 +1487,11 @@ fn carried_food_label_layout(
 /// Deliberately not shared with `nos_wordmark_font`: the pickup wordmark and
 /// the gameplay readout should be free to diverge.
 fn carried_food_label_font(size: f64) -> String {
-    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    if scenario_capture_fonts_enabled() {
+        format!("italic 800 {size}px \"Snaketron Capture Black\", sans-serif")
+    } else {
+        format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    }
 }
 
 /// One queued readout: where it goes, what it says, and how it is inked.
@@ -1516,7 +1545,11 @@ fn food_value_label_layout(cell_size: f64, characters: usize) -> FoodValueLabelL
 }
 
 fn food_value_label_font(size: f64) -> String {
-    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    if scenario_capture_fonts_enabled() {
+        format!("italic 800 {size}px \"Snaketron Capture Black\", sans-serif")
+    } else {
+        format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    }
 }
 
 fn combo_food_label_text(value: u32) -> String {
@@ -1540,6 +1573,39 @@ fn combo_food_label_value(
     (value > 1).then_some(value)
 }
 
+/// Temporarily expose the canvas' public, un-translated coordinate system to a
+/// JavaScript cosmetic layer, then restore the renderer's one-pixel field
+/// translation. Each callback is isolated so a failed effect cannot suppress
+/// the authoritative arena frame.
+fn call_canvas_effect(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    canvas: &web_sys::HtmlCanvasElement,
+    cell_size: f64,
+    padding: f64,
+    callback: &js_sys::Function,
+    error_message: &str,
+) -> Result<(), JsValue> {
+    ctx.restore();
+    ctx.save();
+    let callback_result = callback.call2(
+        &JsValue::NULL,
+        canvas.as_ref(),
+        &JsValue::from_f64(cell_size),
+    );
+    ctx.restore();
+    if let Err(error) = callback_result {
+        web_sys::console::error_2(&JsValue::from_str(error_message), &error);
+    }
+
+    // Defense in depth if a callback changed canvas state outside its own
+    // save/restore pair before throwing.
+    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
+    ctx.set_global_alpha(1.0);
+    ctx.save();
+    ctx.translate(padding, padding)?;
+    Ok(())
+}
+
 /// Renders a typed game state to a canvas element.
 ///
 /// This is the core renderer: it reads the engine's own `GameState` directly
@@ -1554,6 +1620,7 @@ pub fn render_game_state(
     local_user_id: Option<u32>,
     rotation_int: i32,
     draw_celebration: &js_sys::Function,
+    draw_post_snakes: &js_sys::Function,
 ) -> Result<(), JsValue> {
     let context = canvas
         .get_context("2d")
@@ -1843,7 +1910,11 @@ pub fn render_game_state(
                                     font_size: f64|
          -> Result<(), JsValue> {
             let size = font_size.min(compute_font_size(text, box_w, box_h));
-            ctx.set_font(&format!("900 {}px Impact, 'Arial Black', sans-serif", size));
+            ctx.set_font(&if scenario_capture_fonts_enabled() {
+                format!("italic 800 {size}px 'Snaketron Capture Black', sans-serif")
+            } else {
+                format!("900 {size}px Impact, 'Arial Black', sans-serif")
+            });
             ctx.set_line_width(size * 0.35);
             ctx.set_stroke_style_str(bg_color);
             ctx.stroke_text(text, center_x, center_y)?;
@@ -2117,30 +2188,17 @@ pub fn render_game_state(
     // coordinate system so the callback can use the same 1px-padded positions
     // it used when effects were painted after the complete Rust frame. Restore
     // our field transform afterwards before drawing snakes and walls.
-    ctx.restore();
-    ctx.save();
     // Canvas and cell size are supplied for focused renderers such as the
-    // tutorial crop. Existing live callbacks intentionally ignore arguments.
-    let celebration_result = draw_celebration.call2(
-        &JsValue::NULL,
-        canvas.as_ref(),
-        &JsValue::from_f64(cell_size),
-    );
-    ctx.restore();
-    if let Err(error) = celebration_result {
-        // A cosmetic renderer must never suppress gameplay. The web-side
-        // renderer also isolates each swappable effect in `finally` blocks;
-        // this callback-level save/restore and the explicit resets below are
-        // defense in depth for any error that still crosses the WASM boundary.
-        web_sys::console::error_2(
-            &JsValue::from_str("Score celebration callback failed"),
-            &error,
-        );
-    }
-    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
-    ctx.set_global_alpha(1.0);
-    ctx.save();
-    ctx.translate(padding, padding)?;
+    // tutorial and scenario crops. Existing live callbacks may intentionally
+    // ignore the arguments.
+    call_canvas_effect(
+        &ctx,
+        canvas,
+        cell_size,
+        padding,
+        draw_celebration,
+        "Score celebration callback failed",
+    )?;
 
     // Draw snakes (both alive and dead)
     let snakes = &arena.snakes;
@@ -2728,6 +2786,19 @@ pub fn render_game_state(
     ctx.set_fill_style_str("#333");
     ctx.set_font("16px monospace");
     ctx.fill_text(&format!("Tick: {}", state.tick), 10.0, canvas_height + 20.0)?;
+
+    // Crash explosions and other impact treatments intentionally sit above
+    // every snake, wall, and carried-food label. Focused renderers invoke this
+    // on their full-arena scratch canvas before cropping, so the existing
+    // full-arena coordinate math remains valid.
+    call_canvas_effect(
+        &ctx,
+        canvas,
+        cell_size,
+        padding,
+        draw_post_snakes,
+        "Post-snakes callback failed",
+    )?;
 
     // Restore the canvas state (remove padding translation)
     ctx.restore();

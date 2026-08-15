@@ -22,11 +22,24 @@ import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
 import { CrazyGamesAdOverlay, CrazyGamesBridge } from './components/CrazyGamesBridge';
 import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
+import {
+  isPlayOfTheGameQaRoute,
+  isScenarioCaptureMode,
+  isScenarioPlayerQaRoute,
+} from './utils/scenarioCaptureMode';
 
 // Design-review harness for the post-match rating reveal. Only reachable —
 // and only bundled — outside production builds.
 const RatingRevealQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/RatingRevealQA'))
+  : null;
+
+const ScenarioPlayerQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/ScenarioPlayerQA'))
+  : null;
+
+const PlayOfTheGameQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/PlayOfTheGameQA'))
   : null;
 
 function AppContent() {
@@ -196,21 +209,41 @@ const Router = process.env.ITCH_BUILD === 'true' || process.env.CRAZYGAMES_BUILD
   : BrowserRouter;
 
 function App() {
+  const captureMode = isScenarioCaptureMode();
+  const scenarioQaMode = isScenarioPlayerQaRoute();
+  const potgQaMode = isPlayOfTheGameQaRoute();
+
   return (
     <Router>
-      <CrazyGamesProvider>
-        <AuthProvider>
-          <UIProvider>
-            <LatencyProvider>
-              <WebSocketProvider>
-                <CrazyGamesBridge />
-                <AppContent />
-                <CrazyGamesAdOverlay />
-              </WebSocketProvider>
-            </LatencyProvider>
-          </UIProvider>
-        </AuthProvider>
-      </CrazyGamesProvider>
+      {scenarioQaMode && ScenarioPlayerQA ? (
+        <React.Suspense
+          fallback={captureMode
+            ? <main className="scenario-capture" aria-busy="true" />
+            : null}
+        >
+          <ScenarioPlayerQA captureMode={captureMode} />
+        </React.Suspense>
+      ) : potgQaMode && PlayOfTheGameQA ? (
+        <CrazyGamesProvider>
+          <React.Suspense fallback={null}>
+            <PlayOfTheGameQA />
+          </React.Suspense>
+        </CrazyGamesProvider>
+      ) : (
+        <CrazyGamesProvider>
+          <AuthProvider>
+            <UIProvider>
+              <LatencyProvider>
+                <WebSocketProvider>
+                  <CrazyGamesBridge />
+                  <AppContent />
+                  <CrazyGamesAdOverlay />
+                </WebSocketProvider>
+              </LatencyProvider>
+            </UIProvider>
+          </AuthProvider>
+        </CrazyGamesProvider>
+      )}
     </Router>
   );
 }

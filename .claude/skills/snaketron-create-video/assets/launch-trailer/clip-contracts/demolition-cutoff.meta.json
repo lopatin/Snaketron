@@ -1,0 +1,8 @@
+{
+  "scenario_id": "demolition-cutoff",
+  "seed": 7717,
+  "capture_vfps": 240,
+  "encoded_fps": 60,
+  "duration": 4.0,
+  "anchors": { "kill": 2.0 }
+}

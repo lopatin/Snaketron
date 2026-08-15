@@ -1,0 +1,205 @@
+const { test, expect } = require('@playwright/test');
+
+const apiOrSocketRequests = (requests) => requests.filter((url) => (
+  /\/api\//.test(url) || /^wss?:/.test(url)
+));
+
+test('valid PotG is network-free, legible at 560px, and starts inside the quickmatch budget', async ({ page }) => {
+  await page.setViewportSize({ width: 600, height: 900 });
+  const requests = [];
+  page.on('request', (request) => requests.push(request.url()));
+  const openedAt = Date.now();
+
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+
+  const band = page.getByTestId('play-of-the-game');
+  const canvas = band.getByTestId('scenario-canvas-surface');
+  await expect(canvas).toHaveAttribute('data-ready', 'true');
+  await band.scrollIntoViewIfNeeded();
+  await expect(band).toHaveAttribute('data-playback', 'playing', { timeout: 4_000 });
+  expect(Date.now() - openedAt).toBeLessThan(4_000);
+
+  const box = await band.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box.width).toBeGreaterThanOrEqual(556);
+  expect(box.width).toBeLessThanOrEqual(560);
+  await expect(band.locator('.potg-star__name')).toHaveText('BANKER');
+  await expect(band.locator('.potg-reason')).toHaveText('Goal run — 15 points');
+  await expect(band.locator('.potg-star__skin')).toBeVisible();
+  expect(await band.locator('.potg-star__name, .potg-reason').evaluateAll((nodes) => (
+    nodes.every((node) => node.scrollWidth <= node.clientWidth)
+  ))).toBe(true);
+  expect(apiOrSocketRequests(requests)).toEqual([]);
+});
+
+test('ready PotG lower third remains readable at the 375px mobile target', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+
+  const band = page.getByTestId('play-of-the-game');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await band.scrollIntoViewIfNeeded();
+  await expect(band.locator('.potg-lower-third')).toBeVisible();
+  await expect(band.locator('.potg-star__name')).toHaveText('BANKER');
+  await expect(band.locator('.potg-reason')).toHaveText('Goal run — 15 points');
+
+  const metrics = await band.evaluate((element) => {
+    const star = element.querySelector('.potg-star__name');
+    const reason = element.querySelector('.potg-reason');
+    const rect = element.getBoundingClientRect();
+    return {
+      width: rect.width,
+      starFits: star.scrollWidth <= star.clientWidth,
+      reasonFits: reason.scrollWidth <= reason.clientWidth,
+      starFont: Number.parseFloat(getComputedStyle(star).fontSize),
+      reasonFont: Number.parseFloat(getComputedStyle(reason).fontSize),
+    };
+  });
+  expect(metrics.width).toBeGreaterThanOrEqual(355);
+  expect(metrics.width).toBeLessThanOrEqual(360);
+  expect(metrics.starFits).toBe(true);
+  expect(metrics.reasonFits).toBe(true);
+  expect(metrics.starFont).toBeGreaterThanOrEqual(10);
+  expect(metrics.reasonFont).toBeGreaterThanOrEqual(6.5);
+});
+
+test('one-shot autoplay remains paused until IntersectionObserver reports the band visible', async ({ page }) => {
+  await page.addInitScript(() => {
+    const observers = [];
+    window.IntersectionObserver = class IntersectionObserverStub {
+      constructor(callback) {
+        this.callback = callback;
+        this.target = null;
+        observers.push(this);
+      }
+
+      observe(target) {
+        this.target = target;
+        this.callback([{ target, isIntersecting: false, intersectionRatio: 0 }], this);
+      }
+
+      unobserve() {}
+
+      disconnect() {}
+
+      takeRecords() { return []; }
+    };
+    window.__setPotgIntersection = (ratio) => {
+      for (const observer of observers) {
+        observer.callback([{
+          target: observer.target,
+          isIntersecting: ratio > 0,
+          intersectionRatio: ratio,
+        }], observer);
+      }
+    };
+  });
+
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+  const band = page.getByTestId('play-of-the-game');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await expect(band).toHaveAttribute('data-playback', 'paused');
+  await page.waitForTimeout(600);
+  await expect(band).toHaveAttribute('data-playback', 'paused');
+
+  await page.evaluate(() => window.__setPotgIntersection(1));
+  await expect(band).toHaveAttribute('data-playback', 'playing');
+});
+
+test('the terminal frame freezes with a Watch again control and replay restarts', async ({ page }) => {
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+
+  const band = page.getByTestId('play-of-the-game');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await band.scrollIntoViewIfNeeded();
+  await expect(band).toHaveAttribute('data-playback', 'playing');
+  await expect(band).toHaveAttribute('data-playback', 'complete', { timeout: 15_000 });
+
+  const replay = page.getByTestId('potg-replay');
+  await expect(replay).toBeVisible();
+  await expect(replay).toHaveText(/Watch again/);
+  await replay.click();
+  await expect(band).toHaveAttribute('data-playback', 'playing');
+});
+
+test('reduced-motion starts on the focus poster and animates only after explicit play', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+
+  const band = page.getByTestId('play-of-the-game');
+  const scenario = band.getByTestId('scenario-canvas');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await band.scrollIntoViewIfNeeded();
+  await expect(scenario).toHaveAttribute('data-motion', 'reduced');
+  await expect(band).toHaveAttribute('data-playback', 'paused');
+
+  await scenario.getByRole('button', { name: 'Play replay animation' }).click();
+  await expect(scenario).toHaveAttribute('data-motion', 'explicit');
+  await expect(band).toHaveAttribute('data-playback', 'playing');
+});
+
+test('a sprite decode failure reaches PotG onError and collapses to the poster', async ({ page }) => {
+  await page.route('**/*crash-explosion.png', (route) => route.abort('failed'));
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+
+  await expect(page.getByTestId('potg-render-fallback')).toBeVisible();
+  await expect(page.getByTestId('scenario-canvas')).toHaveCount(0);
+});
+
+test('modal playback sustains at least 30fps under Chrome 4x CPU throttle', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Chrome CPU throttling requires a CDP session');
+  const session = await page.context().newCDPSession(page);
+  await session.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+  await page.goto('/qa/play-of-the-game?state=ready&chrome=0');
+
+  const band = page.getByTestId('play-of-the-game');
+  await expect(band.getByTestId('scenario-canvas-surface')).toHaveAttribute('data-ready', 'true');
+  await band.scrollIntoViewIfNeeded();
+  await expect(band).toHaveAttribute('data-playback', 'playing');
+
+  const fps = await page.evaluate(() => new Promise((resolve) => {
+    const startedAt = performance.now();
+    let frames = 0;
+    const sample = (now) => {
+      frames += 1;
+      if (now - startedAt >= 2_000) {
+        resolve((frames - 1) * 1_000 / (now - startedAt));
+        return;
+      }
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  }));
+  expect(fps).toBeGreaterThanOrEqual(30);
+});
+
+test('pending and unavailable URL states expose the skeleton and sponsor degradation', async ({ page }) => {
+  await page.goto('/qa/play-of-the-game?state=pending&chrome=0');
+  await expect(page.getByTestId('potg-loading')).toBeVisible();
+
+  await page.goto('/qa/play-of-the-game?state=unavailable&chrome=0');
+  await expect(page.getByTestId('potg-sponsor')).toHaveAttribute(
+    'data-unavailable-reason',
+    'absent',
+  );
+  await expect(page.getByTestId('potg-sponsor')).toContainText('Sponsored');
+
+  await page.goto('/qa/play-of-the-game?state=incompatible&chrome=0');
+  await expect(page.getByTestId('potg-sponsor')).toHaveAttribute(
+    'data-unavailable-reason',
+    'incompatible',
+  );
+});
+
+for (const malformedState of ['malformed-anchor', 'bad-end-hash']) {
+  test(`${malformedState} collapses to the branded poster with replay hidden`, async ({ page }) => {
+    await page.goto(`/qa/play-of-the-game?state=${malformedState}&chrome=0`);
+
+    const poster = page.getByTestId('potg-render-fallback');
+    await expect(poster).toBeVisible();
+    await expect(poster).toContainText('BANKER');
+    await expect(poster).toContainText('Replay renderer unavailable');
+    await expect(page.getByTestId('potg-replay')).toHaveCount(0);
+    await expect(page.getByTestId('scenario-canvas')).toHaveCount(0);
+  });
+}

@@ -1,4 +1,4 @@
-import type { GameState, QueueMode } from '../types';
+import type { DeathCause, GameState, QueueMode } from '../types';
 import type { SnakeSkinInputs } from './snakeSkin';
 
 export const GAME_SHELL_COLORS = {
@@ -30,6 +30,11 @@ export interface MatchPlayerPresentation {
   xpGained: number;
   actionCount: number;
   isWinner: boolean;
+  /**
+   * Durable explanation of this player's latest death. `null` means there is
+   * no death to surface (including banking and legacy/unknown history).
+   */
+  deathAttribution: string | null;
   /**
    * Pre-match readiness. `null` once the gate has resolved (and for matches
    * that never had one), which is what distinguishes "not ready yet" from
@@ -182,6 +187,43 @@ const modeDetails = (gameState: GameState, queueMode: QueueMode) => {
   return { label: 'Custom FFA', isSolo: false, isTeam: false };
 };
 
+/**
+ * Turns durable simulation attribution into the compact line rendered below
+ * a player's name on the final standings. Team matches respawn, so player-
+ * caused deaths are demolitions; field modes end a life and use eliminated.
+ */
+export const buildDeathAttribution = (
+  cause: DeathCause | undefined,
+  isRespawningTeamPlay: boolean,
+  resolveSnakeName: (snakeId: number) => string,
+): string | null => {
+  if (!cause || cause === 'Unknown' || cause === 'Banked') {
+    return null;
+  }
+
+  const action = isRespawningTeamPlay ? 'Demolished' : 'Eliminated';
+
+  if (typeof cause === 'object') {
+    const attributedSnakeId = 'SnakeBody' in cause
+      ? cause.SnakeBody.killer_snake_id
+      : cause.HeadToHead.other_snake_id;
+    return `${action} by ${resolveSnakeName(attributedSnakeId)}`;
+  }
+
+  switch (cause) {
+    case 'Wall':
+      return `${action} by wall`;
+    case 'OutOfBounds':
+      return `${action} by boundary`;
+    case 'EnemyBase':
+      return `${action} by enemy base`;
+    case 'SelfCollision':
+      return `${action} by yourself`;
+  }
+
+  return null;
+};
+
 export const buildMatchPresentation = (
   gameState: GameState,
   currentUserId?: number,
@@ -199,6 +241,13 @@ export const buildMatchPresentation = (
   const currentSnakeId = currentUserId === undefined
     ? null
     : gameState.players?.[currentUserId]?.snake_id ?? null;
+  const resolveSnakeName = (snakeId: number): string => {
+    const userId = playerBySnake.get(snakeId) ?? null;
+    if (userId !== null && userId === currentUserId) {
+      return 'You';
+    }
+    return (userId === null ? null : gameState.usernames?.[userId]) ?? `Player ${snakeId + 1}`;
+  };
   const currentTeamId = currentSnakeId === null
     ? null
     : gameState.arena.snakes[currentSnakeId]?.team_id ?? null;
@@ -247,9 +296,7 @@ export const buildMatchPresentation = (
     return {
       snakeId,
       userId,
-      name: isCurrentPlayer
-        ? 'You'
-        : (userId === null ? null : gameState.usernames?.[userId]) ?? `Player ${snakeId + 1}`,
+      name: resolveSnakeName(snakeId),
       isCurrentPlayer,
       isAlive: snake.is_alive,
       isIdleKicked,
@@ -261,6 +308,11 @@ export const buildMatchPresentation = (
       xpGained: userId === null ? 0 : valueAt(gameState.player_xp, userId),
       actionCount: userId === null ? 0 : valueAt(gameState.player_action_counts, userId),
       isWinner,
+      deathAttribution: buildDeathAttribution(
+        gameState.last_death_causes?.[snakeId],
+        mode.isTeam,
+        resolveSnakeName,
+      ),
       isReady: readyUserIds === null || userId === null
         ? null
         : readyUserIds.has(userId),

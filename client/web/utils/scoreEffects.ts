@@ -659,7 +659,10 @@ export const goalImpactWaveRenderer: ScoreEffectRenderer = {
       context.scale(readout.scale, readout.scale);
       context.textAlign = 'center';
       context.textBaseline = 'middle';
-      context.font = `italic 900 ${readout.fontSize}px Impact, 'Arial Black', sans-serif`;
+      context.font = typeof document !== 'undefined' &&
+        document.documentElement.dataset.scenarioCapture === 'true'
+        ? `italic 800 ${readout.fontSize}px 'Snaketron Capture Black', sans-serif`
+        : `italic 900 ${readout.fontSize}px Impact, 'Arial Black', sans-serif`;
       // A white halo keeps the readout legible over tinted end zones and the
       // fading cell wave without dimming the team colour.
       context.lineWidth = Math.max(2, readout.fontSize * 0.18);

@@ -465,6 +465,10 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
             ended_at_ms: now,
             server_id: 1,
             season: Some(0),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: final_state.clone(),
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };
@@ -1333,6 +1337,10 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             ended_at_ms: now,
             server_id: 42,
             season: Some(1),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: final_state.clone(),
             effects: vec![
                 CompletionEffect::PersistGame { id: "game".into() },

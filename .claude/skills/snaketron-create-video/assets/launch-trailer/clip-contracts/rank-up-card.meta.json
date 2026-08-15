@@ -1,0 +1,7 @@
+{
+  "fixture": "assets/cards/rank-up.html",
+  "capture_vfps": 60,
+  "encoded_fps": 60,
+  "duration": 4.0,
+  "anchors": { "reveal": 0.85, "settle": 1.4 }
+}

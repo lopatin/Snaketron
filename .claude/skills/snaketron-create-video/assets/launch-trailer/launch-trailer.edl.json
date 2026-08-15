@@ -1,0 +1,89 @@
+{
+  "output": { "w": 1920, "h": 1080, "fps": 60 },
+  "music": {
+    "src": "launch-bed.m4a",
+    "manifest": "launch-bed.beats.json",
+    "beat_snap": true,
+    "beat_snap_max_s": 0.05,
+    "duck_under": "sfx",
+    "volume": 0.68
+  },
+  "timeline": [
+    {
+      "title": {
+        "text": "SNAKETRON",
+        "subtitle": "OWN THE GRID",
+        "style": "logo",
+        "duration": 2.3
+      }
+    },
+    { "transition": "fadeblack", "duration": 0.3 },
+    {
+      "clip": "demolition-cutoff",
+      "in": 0.0,
+      "out": 4.0,
+      "speed": [
+        { "until": "meta:kill-0.4", "rate": 1.0 },
+        { "until": "meta:kill+0.6", "rate": 0.25 },
+        { "rate": 1.0 }
+      ],
+      "effects": [
+        { "t": "shake", "at": "meta:kill", "dur": 0.35, "amp": 12, "decay": 3 },
+        { "t": "rgb_split", "at": "meta:kill", "dur": 0.25, "px": 6 },
+        { "t": "glow", "at": "meta:kill", "dur": 0.3, "amount": 1.2 }
+      ],
+      "text": { "value": "DEMOLITIONS!", "at": "meta:kill+0.15", "dur": 0.8, "style": "impact" },
+      "sfx": [{ "src": "../sfx/impact.wav", "at": "meta:kill", "volume": 1.0 }]
+    },
+    { "transition": "pixelize", "duration": 0.5 },
+    {
+      "clip": "team-45pt-celebration",
+      "in": 0.0,
+      "out": 5.0,
+      "speed": [
+        { "until": "meta:bank-0.5", "rate": 1.0 },
+        { "until": "meta:bank+0.7", "rate": 0.5 },
+        { "rate": 1.0 }
+      ],
+      "effects": [
+        { "t": "glow", "at": "meta:bank", "dur": 0.8, "amount": 0.8 },
+        { "t": "vignette", "at": "meta:bank", "dur": 1.2 }
+      ],
+      "text": { "value": "TEAM MATCHES!", "at": "meta:bank+0.1", "dur": 1.0, "style": "impact" },
+      "sfx": [{ "src": "../sfx/bank.wav", "at": "meta:bank", "volume": 0.9 }]
+    },
+    { "transition": "slices", "duration": 0.2 },
+    {
+      "clip": "boost-combo-clutch",
+      "in": 0.0,
+      "out": 5.0,
+      "speed": [
+        { "until": "meta:combo-0.4", "rate": 1.0 },
+        { "until": "meta:combo+0.5", "rate": 0.5 },
+        { "rate": 1.0 }
+      ],
+      "effects": [
+        { "t": "punch_in", "at": "meta:combo", "dur": 0.3, "zoom": 1.18 },
+        { "t": "grain", "at": "meta:boost", "dur": 1.8, "strength": 5 }
+      ],
+      "text": { "value": "BOOST! COMBOS!", "at": "meta:combo+0.1", "dur": 0.9, "style": "impact" },
+      "sfx": [
+        { "src": "../sfx/boost.wav", "at": "meta:boost", "volume": 0.75 },
+        { "src": "../sfx/impact.wav", "at": "meta:combo", "volume": 0.7 }
+      ]
+    },
+    { "transition": "wipe_right", "duration": 0.4 },
+    { "clip": "rank-up-card", "in": 0.0, "out": 4.0 },
+    { "transition": "dissolve", "duration": 0.5 },
+    { "clip": "leaderboard-card", "in": 0.0, "out": 4.0 },
+    { "transition": "fadeblack", "duration": 0.5 },
+    {
+      "title": {
+        "text": "PLAY FREE",
+        "subtitle": "OWN THE GRID",
+        "style": "impact",
+        "duration": 4.0
+      }
+    }
+  ]
+}

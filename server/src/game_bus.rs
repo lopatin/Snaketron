@@ -35,6 +35,7 @@ use crate::game_executor::{PARTITION_COUNT, StreamEvent};
 use crate::partition_lease::PartitionLeaseGuard;
 use crate::recovery::{
     CommandDecisionV1, RECOVERY_FAILURE_SCHEMA_VERSION, RecoveryEnvelopeV2, RecoveryFailureV1,
+    ReplayJournalDelta,
 };
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::{RedisClient, RedisConnection};
@@ -45,13 +46,87 @@ use redis::streams::{
     StreamAutoClaimReply, StreamId, StreamMaxlen, StreamReadOptions, StreamReadReply,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const COMPLETION_REPLAY_MATERIALIZER_CONCURRENCY: usize = 2;
+static COMPLETION_REPLAY_MATERIALIZER_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(COMPLETION_REPLAY_MATERIALIZER_CONCURRENCY)));
+
+/// Run required replay reconstruction away from Tokio's async workers while
+/// bounding aggregate CPU/memory pressure. If the awaiting task is cancelled,
+/// Tokio safely detaches the already-started job and its owned permit remains
+/// held until the closure exits.
+async fn run_bounded_replay_materializer<T, F>(slots: Arc<Semaphore>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let permit = slots
+        .acquire_owned()
+        .await
+        .context("completion replay materializer gate closed")?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .context("completion replay materializer task failed")?
+}
+
+fn decode_replay_journal(payloads: HashMap<String, Vec<u8>>) -> Result<Vec<ReplayJournalDelta>> {
+    let mut deltas = Vec::with_capacity(payloads.len());
+    for (field, payload) in payloads {
+        let cursor = field
+            .parse::<u64>()
+            .with_context(|| format!("replay journal field {field:?} is not a cursor"))?;
+        if cursor == 0 || cursor.to_string() != field {
+            anyhow::bail!("replay journal field {field:?} is not canonical");
+        }
+        let delta: ReplayJournalDelta = serde_json::from_slice(&payload)
+            .with_context(|| format!("malformed replay journal cell {cursor}"))?;
+        if delta.cursor() != cursor {
+            anyhow::bail!(
+                "replay journal field {cursor} contains cursor {}",
+                delta.cursor()
+            );
+        }
+        deltas.push(delta);
+    }
+    Ok(deltas)
+}
+
+fn split_replay_journal_at_cursor(
+    mut deltas: Vec<ReplayJournalDelta>,
+    cursor: u64,
+) -> Result<(Vec<ReplayJournalDelta>, Vec<ReplayJournalDelta>)> {
+    deltas.sort_by_key(ReplayJournalDelta::cursor);
+    for (index, delta) in deltas.iter().enumerate() {
+        let expected = index as u64 + 1;
+        if delta.cursor() != expected {
+            anyhow::bail!(
+                "replay journal cursor gap: expected {expected}, found {}",
+                delta.cursor()
+            );
+        }
+    }
+    let covered_len = usize::try_from(cursor).context("replay journal cursor exceeds platform")?;
+    if deltas.len() < covered_len {
+        anyhow::bail!(
+            "replay journal is behind checkpoint cursor {cursor}: found {} cells",
+            deltas.len()
+        );
+    }
+    let ahead = deltas.split_off(covered_len);
+    Ok((deltas, ahead))
+}
 
 /// Snapshot request message for a partition
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -134,6 +209,10 @@ const SNAPREQ_MAXLEN: usize = 64;
 /// Poison entries are operational evidence, not an unbounded correctness log.
 /// Valid commands receive a durable terminal outcome instead of quarantine.
 const COMMAND_QUARANTINE_MAXLEN: usize = 8192;
+/// Serverless Redis requests and immutable retry records need a hard, shared
+/// envelope ceiling. Full recordings above 1 MiB are represented by a compact
+/// manifest reference before reaching this boundary.
+const MAX_COMPLETION_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
 /// How long one XREAD parks before returning empty. Purely a liveness /
 /// cancellation checkpoint — delivery latency does not depend on it.
@@ -989,21 +1068,54 @@ impl GameBus {
             .into());
         }
 
+        let replay_journal: Vec<(String, Vec<u8>)> = envelope
+            .replay_recording
+            .pending_journal()
+            .iter()
+            .map(|delta| {
+                Ok((
+                    delta.cursor().to_string(),
+                    crate::completion::canonical_json_bytes(delta)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
         let recovery_payload = serde_json::to_vec(envelope)?;
         let snapshot_payload = serde_json::to_vec(&envelope.game_state)?;
         let script = redis::Script::new(
             r#"
             if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
-            local journal_type = redis.call('TYPE', KEYS[6])
-            if type(journal_type) == 'table' then journal_type = journal_type.ok end
-            if journal_type ~= 'none' and journal_type ~= 'hash' then return -2 end
+            local decision_type = redis.call('TYPE', KEYS[6])
+            if type(decision_type) == 'table' then decision_type = decision_type.ok end
+            if decision_type ~= 'none' and decision_type ~= 'hash' then return -2 end
+            local replay_type = redis.call('TYPE', KEYS[8])
+            if type(replay_type) == 'table' then replay_type = replay_type.ok end
+            if replay_type ~= 'none' and replay_type ~= 'hash' then return -3 end
+
+            local covered_count = tonumber(ARGV[7])
+            local replay_count = tonumber(ARGV[8])
+            local replay_start = 10 + covered_count
+            for i = 0, replay_count - 1 do
+                local field = ARGV[replay_start + i * 2]
+                local value = ARGV[replay_start + i * 2 + 1]
+                local current = redis.call('HGET', KEYS[8], field)
+                if current and current ~= value then return -4 end
+            end
+            for i = 0, replay_count - 1 do
+                local field = ARGV[replay_start + i * 2]
+                local value = ARGV[replay_start + i * 2 + 1]
+                redis.call('HSET', KEYS[8], field, value)
+            end
+            if redis.call('HLEN', KEYS[8]) ~= tonumber(ARGV[9]) then return -5 end
+            if redis.call('EXISTS', KEYS[8]) == 1 then
+                redis.call('PEXPIRE', KEYS[8], ARGV[3])
+            end
             redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
             redis.call('SET', KEYS[3], ARGV[4], 'PX', ARGV[3])
             redis.call('SADD', KEYS[4], ARGV[5])
             redis.call('DEL', KEYS[7])
-            if #ARGV == 6 then return 0 end
+            if covered_count == 0 then return 0 end
             local ids = {}
-            for i = 7, #ARGV do ids[#ids + 1] = ARGV[i] end
+            for i = 0, covered_count - 1 do ids[#ids + 1] = ARGV[10 + i] end
             local acked = redis.call('XACK', KEYS[5], ARGV[6], unpack(ids))
             redis.call('HDEL', KEYS[6], unpack(ids))
             return acked
@@ -1022,14 +1134,21 @@ impl GameBus {
                     .namespace()
                     .planned_handoff_watermark(envelope.game_id),
             )
+            .key(guard.namespace().replay_journal(envelope.game_id))
             .arg(guard.encoded_token())
             .arg(recovery_payload)
             .arg(retention.as_millis() as u64)
             .arg(snapshot_payload)
             .arg(envelope.game_id)
-            .arg(guard.namespace().command_group(guard.partition()));
+            .arg(guard.namespace().command_group(guard.partition()))
+            .arg(covered_stream_ids.len())
+            .arg(replay_journal.len())
+            .arg(envelope.replay_recording.journal_cursor());
         for id in covered_stream_ids {
             invocation.arg(id);
+        }
+        for (cursor, payload) in replay_journal {
+            invocation.arg(cursor).arg(payload);
         }
         let mut redis = self.checkpoint_redis.clone();
         let acked: i64 = tokio::time::timeout(
@@ -1045,6 +1164,9 @@ impl GameBus {
                 anyhow::bail!("stale partition lease rejected checkpoint/ACK");
             }
             -2 => anyhow::bail!("checkpoint/ACK found a command journal with wrong type"),
+            -3 => anyhow::bail!("checkpoint/ACK found a replay journal with wrong type"),
+            -4 => anyhow::bail!("checkpoint/ACK found a conflicting replay journal cursor"),
+            -5 => anyhow::bail!("checkpoint/ACK found incomplete replay journal history"),
             _ => {}
         }
         crate::resilience_metrics::record_command_acks(acked as u64);
@@ -1079,8 +1201,12 @@ impl GameBus {
                redis.call('EXISTS', KEYS[3]) ~= 1 then
                 return -2
             end
+            local replay_type = redis.call('TYPE', KEYS[4])
+            if type(replay_type) == 'table' then replay_type = replay_type.ok end
+            if replay_type ~= 'none' and replay_type ~= 'hash' then return -3 end
             redis.call('PEXPIRE', KEYS[2], ARGV[2])
             redis.call('PEXPIRE', KEYS[3], ARGV[2])
+            if replay_type == 'hash' then redis.call('PEXPIRE', KEYS[4], ARGV[2]) end
             return 1
             "#,
         );
@@ -1089,6 +1215,7 @@ impl GameBus {
             .key(guard.lease_key())
             .key(guard.namespace().recovery(game_id))
             .key(RedisKeys::game_snapshot(game_id))
+            .key(guard.namespace().replay_journal(game_id))
             .arg(guard.encoded_token())
             .arg(retention_ms);
         let operation = invocation.invoke_async(&mut redis);
@@ -1102,6 +1229,7 @@ impl GameBus {
                 anyhow::bail!("stale partition lease rejected recovery TTL refresh")
             }
             -2 => anyhow::bail!("recovery TTL refresh found a missing durable checkpoint key"),
+            -3 => anyhow::bail!("recovery TTL refresh found a replay journal with wrong type"),
             other => anyhow::bail!("unknown recovery TTL refresh result {other}"),
         }
     }
@@ -1355,6 +1483,59 @@ impl GameBus {
         Ok(event_id)
     }
 
+    async fn trim_replay_journal_ahead_fenced(
+        &self,
+        guard: &PartitionLeaseGuard,
+        game_id: u32,
+        ahead: &[ReplayJournalDelta],
+        retention_ms: u64,
+    ) -> Result<()> {
+        if ahead.is_empty() {
+            return Ok(());
+        }
+        let mut redis = self.partition_connection(guard.partition())?;
+        let operation = async {
+            let script = redis::Script::new(
+                r#"
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+                local journal_type = redis.call('TYPE', KEYS[2])
+                if type(journal_type) == 'table' then journal_type = journal_type.ok end
+                if journal_type ~= 'hash' then return -2 end
+                local fields = {}
+                for i = 3, #ARGV do fields[#fields + 1] = ARGV[i] end
+                local removed = redis.call('HDEL', KEYS[2], unpack(fields))
+                redis.call('PEXPIRE', KEYS[2], ARGV[2])
+                return removed
+                "#,
+            );
+            let mut invocation = script.prepare_invoke();
+            invocation
+                .key(guard.lease_key())
+                .key(guard.namespace().replay_journal(game_id))
+                .arg(guard.encoded_token())
+                .arg(retention_ms);
+            for delta in ahead {
+                invocation.arg(delta.cursor().to_string());
+            }
+            invocation.invoke_async(&mut redis).await
+        };
+        let removed: i64 = tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+            .await
+            .context("fenced replay journal reconciliation timed out")??;
+        match removed {
+            -1 => {
+                crate::resilience_metrics::record_fenced_write_rejection(1);
+                anyhow::bail!("stale partition lease rejected replay journal reconciliation")
+            }
+            -2 => anyhow::bail!("replay journal reconciliation found a missing/wrong-type key"),
+            value if value as usize == ahead.len() => Ok(()),
+            value => anyhow::bail!(
+                "replay journal reconciliation removed {value} of {} cells",
+                ahead.len()
+            ),
+        }
+    }
+
     pub async fn load_partition_recovery_fenced(
         &self,
         guard: &PartitionLeaseGuard,
@@ -1385,6 +1566,21 @@ impl GameBus {
             .context("failed to batch-load partition recovery envelopes")?;
         if payloads.len() != game_ids.len() {
             anyhow::bail!("partition recovery batch returned an unexpected result count");
+        }
+        // A wrong-type/corrupt journal must quarantine only its own game, not
+        // abort recovery of every healthy game in the partition. The lease is
+        // already held by this successor, so no actor can advance a journal
+        // between the envelope batch above and these reads; the fenced marker
+        // read below rechecks that authority before any actor is constructed.
+        let mut replay_journals = Vec::with_capacity(game_ids.len());
+        for game_id in &game_ids {
+            let loaded: redis::RedisResult<HashMap<String, Vec<u8>>> =
+                redis.hgetall(namespace.replay_journal(*game_id)).await;
+            replay_journals.push(
+                loaded
+                    .map_err(anyhow::Error::from)
+                    .with_context(|| format!("failed to load replay journal for game {game_id}")),
+            );
         }
 
         // Marker corruption must degrade to ordinary crash recovery, not make
@@ -1463,12 +1659,18 @@ impl GameBus {
             .collect();
 
         let mut envelopes = Vec::with_capacity(game_ids.len());
-        for ((game_id, payload), planned_handoff_event_stream_watermark) in game_ids
-            .into_iter()
-            .zip(payloads)
-            .zip(planned_handoff_event_stream_watermarks)
+        for (((game_id, payload), replay_journal), planned_handoff_event_stream_watermark) in
+            game_ids
+                .into_iter()
+                .zip(payloads)
+                .zip(replay_journals)
+                .zip(planned_handoff_event_stream_watermarks)
         {
-            let parsed = (|| -> Result<RecoveryEnvelopeV2> {
+            let parsed = (|| -> Result<(
+                RecoveryEnvelopeV2,
+                Vec<ReplayJournalDelta>,
+                Vec<ReplayJournalDelta>,
+            )> {
                 let payload = payload.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "active game {game_id} in partition {partition} has no recovery envelope"
@@ -1480,9 +1682,33 @@ impl GameBus {
                 if envelope.game_id != game_id || envelope.partition_id != partition {
                     anyhow::bail!("recovery envelope/index identity mismatch for game {game_id}");
                 }
-                Ok(envelope)
+                let deltas = decode_replay_journal(replay_journal?)?;
+                let (covered, ahead) = split_replay_journal_at_cursor(
+                    deltas,
+                    envelope.replay_recording.journal_cursor(),
+                )?;
+                Ok((envelope, covered, ahead))
             })();
-            match parsed {
+            let recovered = match parsed {
+                Ok((mut envelope, covered, ahead)) => {
+                    if !ahead.is_empty() {
+                        self.trim_replay_journal_ahead_fenced(guard, game_id, &ahead, retention_ms)
+                            .await?;
+                        warn!(
+                            partition,
+                            game_id,
+                            trimmed_cells = ahead.len(),
+                            "Trimmed replay journal cells ahead of the authoritative checkpoint"
+                        );
+                    }
+                    envelope
+                        .replay_recording
+                        .hydrate_journal(covered, &envelope.game_state)
+                        .map(|()| envelope)
+                }
+                Err(error) => Err(error),
+            };
+            match recovered {
                 Ok(mut envelope) => {
                     envelope.planned_handoff_event_stream_watermark =
                         planned_handoff_event_stream_watermark;
@@ -1534,12 +1760,14 @@ impl GameBus {
                     redis.call('SET', KEYS[3], ARGV[3], 'PX', ARGV[4])
                 end
                 redis.call('SREM', KEYS[2], ARGV[2])
+                redis.call('DEL', KEYS[4])
                 return 1
                 "#,
             )
             .key(guard.lease_key())
             .key(guard.namespace().active_games(guard.partition()))
             .key(guard.namespace().recovery_failure(game_id))
+            .key(guard.namespace().replay_journal(game_id))
             .arg(guard.encoded_token())
             .arg(game_id)
             .arg(&failure_payload)
@@ -1586,18 +1814,37 @@ impl GameBus {
         game_id: u32,
     ) -> Result<Option<RecoveryEnvelopeV2>> {
         let mut redis = self.recovery_connection(game_id % PARTITION_COUNT)?;
-        let payload: Option<Vec<u8>> = redis
+        // MULTI/EXEC keeps the checkpoint cursor and its append-only cells on
+        // one Redis snapshot even when this diagnostic read races a live actor.
+        let (payload, replay_journal): (Option<Vec<u8>>, HashMap<String, Vec<u8>>) = redis::pipe()
+            .atomic()
             .get(namespace.recovery(game_id))
+            .hgetall(namespace.replay_journal(game_id))
+            .query_async(&mut redis)
             .await
-            .context("failed to load game recovery envelope")?;
+            .context("failed to load game recovery envelope and replay journal")?;
         payload
             .map(|payload| {
-                let envelope: RecoveryEnvelopeV2 =
+                let mut envelope: RecoveryEnvelopeV2 =
                     serde_json::from_slice(&payload).context("malformed game recovery envelope")?;
                 envelope.validate()?;
                 if envelope.game_id != game_id {
                     anyhow::bail!("recovery envelope game identity mismatch");
                 }
+                if envelope.game_state.is_complete() && replay_journal.is_empty() {
+                    // Terminal recovery is diagnostic only: the active index
+                    // was removed atomically, and inline/PersistGame ownership
+                    // may already have retired the mutable journal.
+                    return Ok(envelope);
+                }
+                let deltas = decode_replay_journal(replay_journal)?;
+                let (covered, _) = split_replay_journal_at_cursor(
+                    deltas,
+                    envelope.replay_recording.journal_cursor(),
+                )?;
+                envelope
+                    .replay_recording
+                    .hydrate_journal(covered, &envelope.game_state)?;
                 Ok(envelope)
             })
             .transpose()
@@ -1757,7 +2004,43 @@ impl GameBus {
         if retention_ms == 0 {
             anyhow::bail!("completion checkpoint retention must be non-zero");
         }
+        let retain_replay_journal = record.recording_journal.is_some();
+        let persist_game_effect_id = record
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                crate::completion::CompletionEffect::PersistGame { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .context("completion has no PersistGame effect")?;
+        if let Some(reference) = &record.recording_journal
+            && reference.journal_cursor != envelope.replay_recording.journal_cursor()
+        {
+            anyhow::bail!("completion replay reference does not match its checkpoint cursor");
+        }
+        let replay_journal: Vec<(String, Vec<u8>)> = if retain_replay_journal {
+            envelope
+                .replay_recording
+                .pending_journal()
+                .iter()
+                .map(|delta| {
+                    Ok((
+                        delta.cursor().to_string(),
+                        crate::completion::canonical_json_bytes(delta)?,
+                    ))
+                })
+                .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
         let record_payload = crate::completion::canonical_json_bytes(record)?;
+        if record_payload.len() > MAX_COMPLETION_RECORD_BYTES {
+            anyhow::bail!(
+                "completion payload is {} bytes, exceeding the {} byte immutable-record limit; replay history was not dropped",
+                record_payload.len(),
+                MAX_COMPLETION_RECORD_BYTES
+            );
+        }
         let recovery_payload = serde_json::to_vec(envelope)?;
         let snapshot_payload = serde_json::to_vec(&envelope.game_state)?;
         let terminal_status_payload = serde_json::to_vec(&StreamEvent::StatusUpdated {
@@ -1808,12 +2091,39 @@ impl GameBus {
                not require_type(KEYS[7], 'stream') or
                not require_type(KEYS[8], 'string') or
                not require_type(KEYS[9], 'stream') or
-               not require_type(KEYS[10], 'hash') then
+               not require_type(KEYS[10], 'hash') or
+               not require_type(KEYS[12], 'hash') or
+               not require_type(KEYS[13], 'set') then
                 return -3
             end
 
             local notified = redis.call('GET', KEYS[8])
             if notified and notified ~= ARGV[11] then return -2 end
+
+            local covered_count = tonumber(ARGV[12])
+            local replay_count = tonumber(ARGV[13])
+            local replay_start = 17 + covered_count
+            local replay_done = ARGV[14] == '1'
+                and redis.call('SISMEMBER', KEYS[13], ARGV[15]) == 1
+            if created == 0 and ARGV[14] == '1'
+                and key_type(KEYS[12]) == 'none' and not replay_done then
+                return -6
+            end
+            if not replay_done then
+                for i = 0, replay_count - 1 do
+                    local field = ARGV[replay_start + i * 2]
+                    local value = ARGV[replay_start + i * 2 + 1]
+                    local existing = redis.call('HGET', KEYS[12], field)
+                    if existing and existing ~= value then return -5 end
+                end
+                for i = 0, replay_count - 1 do
+                    redis.call(
+                        'HSET', KEYS[12], ARGV[replay_start + i * 2],
+                        ARGV[replay_start + i * 2 + 1]
+                    )
+                end
+                if redis.call('HLEN', KEYS[12]) ~= tonumber(ARGV[16]) then return -7 end
+            end
 
             if created == 1 then redis.call('SET', KEYS[2], ARGV[2]) end
             redis.call('SET', KEYS[3], ARGV[3], 'PX', ARGV[4])
@@ -1821,6 +2131,12 @@ impl GameBus {
             redis.call('SREM', KEYS[5], ARGV[6])
             redis.call('SADD', KEYS[6], ARGV[6])
             redis.call('DEL', KEYS[11])
+            if ARGV[14] == '1' and not replay_done then
+                redis.call('PEXPIRE', KEYS[12], ARGV[4])
+            elseif ARGV[14] ~= '1' then
+                -- Inline completion payload owns the full replay immediately.
+                redis.call('DEL', KEYS[12])
+            end
 
             if not notified then
                 redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[10], '*', 'data', ARGV[9])
@@ -1832,9 +2148,9 @@ impl GameBus {
             -- back earlier commands after a runtime error; acknowledging last
             -- preserves the recoverable completion trigger when Serverless
             -- rejects an operation or another command fails.
-            if #ARGV >= 12 then
+            if covered_count > 0 then
                 local ids = {}
-                for i = 12, #ARGV do ids[#ids + 1] = ARGV[i] end
+                for i = 0, covered_count - 1 do ids[#ids + 1] = ARGV[17 + i] end
                 redis.call('XACK', KEYS[7], ARGV[7], unpack(ids))
                 redis.call('HDEL', KEYS[10], unpack(ids))
             end
@@ -1858,6 +2174,8 @@ impl GameBus {
             .key(RedisKeys::stream_events(guard.partition()))
             .key(guard.namespace().command_decisions(guard.partition()))
             .key(guard.namespace().planned_handoff_watermark(record.game_id))
+            .key(guard.namespace().replay_journal(record.game_id))
+            .key(guard.namespace().completion_effects_done(record.game_id))
             .arg(guard.encoded_token())
             .arg(record_payload)
             .arg(recovery_payload)
@@ -1868,10 +2186,18 @@ impl GameBus {
             .arg(terminal_status_payload)
             .arg(terminal_snapshot_payload)
             .arg(EVENTS_MAXLEN)
-            .arg(record.revision.to_string());
+            .arg(record.revision.to_string())
+            .arg(covered_stream_ids.len())
+            .arg(replay_journal.len())
+            .arg(if retain_replay_journal { 1 } else { 0 })
+            .arg(persist_game_effect_id)
+            .arg(envelope.replay_recording.journal_cursor());
         for id in covered_stream_ids {
             crate::recovery::validate_stream_id(id)?;
             invocation.arg(id);
+        }
+        for (cursor, payload) in replay_journal {
+            invocation.arg(cursor).arg(payload);
         }
         let mut redis = self.checkpoint_redis.clone();
         let result: i32 = tokio::time::timeout(
@@ -1890,6 +2216,9 @@ impl GameBus {
             -2 => anyhow::bail!("immutable completion conflicts with existing record"),
             -3 => anyhow::bail!("completion commit found a Redis key with the wrong type"),
             -4 => anyhow::bail!("completion commit found malformed durable JSON"),
+            -5 => anyhow::bail!("completion commit found a conflicting replay journal cursor"),
+            -6 => anyhow::bail!("completion commit found a missing pending replay journal"),
+            -7 => anyhow::bail!("completion commit found incomplete replay journal history"),
             other => anyhow::bail!("unknown completion commit result {other}"),
         }
     }
@@ -1913,6 +2242,11 @@ impl GameBus {
         if cleanup_grace_ms == 0 {
             anyhow::bail!("completion cleanup grace must be non-zero");
         }
+        let retires_replay_journal = record.recording_journal.is_some()
+            && matches!(
+                record.effect(effect_id),
+                Some(crate::completion::CompletionEffect::PersistGame { .. })
+            );
         let mut redis = self.partition_connection(guard.partition())?;
         let operation = async {
             let script = redis::Script::new(
@@ -1930,11 +2264,13 @@ impl GameBus {
                not require_type(KEYS[2], 'set') or
                not require_type(KEYS[3], 'set') or
                not require_type(KEYS[4], 'string') or
-               not require_type(KEYS[5], 'string') then return -3 end
+               not require_type(KEYS[5], 'string') or
+               not require_type(KEYS[6], 'hash') then return -3 end
             if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
             if not redis.call('GET', KEYS[4]) then return -2 end
             if redis.call('GET', KEYS[5]) ~= ARGV[5] then return -2 end
             local added = redis.call('SADD', KEYS[2], ARGV[2])
+            if ARGV[7] == '1' then redis.call('DEL', KEYS[6]) end
             if redis.call('SCARD', KEYS[2]) == tonumber(ARGV[3]) then
                 redis.call('SREM', KEYS[3], ARGV[4])
                 redis.call('PEXPIRE', KEYS[2], ARGV[6])
@@ -1954,12 +2290,14 @@ impl GameBus {
                         .namespace()
                         .completion_terminal_notified(record.game_id),
                 )
+                .key(guard.namespace().replay_journal(record.game_id))
                 .arg(guard.encoded_token())
                 .arg(effect_id)
                 .arg(record.effects.len())
                 .arg(record.game_id)
                 .arg(record.revision.to_string())
                 .arg(cleanup_grace_ms)
+                .arg(if retires_replay_journal { 1 } else { 0 })
                 .invoke_async(&mut redis)
                 .await
         };
@@ -1976,6 +2314,172 @@ impl GameBus {
             _ => {}
         }
         Ok(result == 1)
+    }
+
+    pub async fn load_completion_effects_done(
+        &self,
+        namespace: &ClusterNamespace,
+        partition: u32,
+        game_id: u32,
+    ) -> Result<std::collections::HashSet<String>> {
+        if game_id % PARTITION_COUNT != partition {
+            anyhow::bail!("completion effect marker belongs to a different partition");
+        }
+        let mut redis = self.recovery_connection(partition)?;
+        redis
+            .smembers(namespace.completion_effects_done(game_id))
+            .await
+            .context("failed to load completion effect markers")
+    }
+
+    /// Hydrate a completion recording from its retained append-only journal
+    /// for the PersistGame outbox effect. The same fenced operation
+    /// extends the journal TTL, so an S3 outage cannot age out the only full
+    /// replay source while the immutable completion remains pending.
+    pub async fn materialize_completion_replay_journal(
+        &self,
+        guard: &PartitionLeaseGuard,
+        record: &crate::completion::CompletionRecordV1,
+        retention: Duration,
+    ) -> Result<crate::completion::CompletionRecordV1> {
+        record.validate()?;
+        let Some(reference) = &record.recording_journal else {
+            return Ok(record.clone());
+        };
+        if record.partition_id != guard.partition()
+            || record.game_id % PARTITION_COUNT != guard.partition()
+        {
+            anyhow::bail!("completion replay journal belongs to a different partition");
+        }
+        let retention_ms = u64::try_from(retention.as_millis())
+            .context("completion replay journal retention exceeds Redis range")?;
+        if retention_ms == 0 {
+            anyhow::bail!("completion replay journal retention must be non-zero");
+        }
+
+        let mut redis = self.partition_connection(guard.partition())?;
+        let operation = async {
+            redis::Script::new(
+                r#"
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] then return {-1, {}} end
+                local journal_type = redis.call('TYPE', KEYS[2])
+                if type(journal_type) == 'table' then journal_type = journal_type.ok end
+                if journal_type ~= 'hash' then return {-2, {}} end
+                local entries = redis.call('HGETALL', KEYS[2])
+                redis.call('PEXPIRE', KEYS[2], ARGV[2])
+                return {1, entries}
+                "#,
+            )
+            .key(guard.lease_key())
+            .key(guard.namespace().replay_journal(record.game_id))
+            .arg(guard.encoded_token())
+            .arg(retention_ms)
+            .invoke_async(&mut redis)
+            .await
+        };
+        let (result, flat_entries): (i32, Vec<Vec<u8>>) =
+            tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+                .await
+                .context("fenced completion replay journal load timed out")??;
+        match result {
+            1 => {}
+            -1 => {
+                crate::resilience_metrics::record_fenced_write_rejection(1);
+                anyhow::bail!("stale partition lease rejected completion replay journal load")
+            }
+            -2 => anyhow::bail!("completion replay journal is missing or has the wrong type"),
+            other => anyhow::bail!("unknown completion replay journal load result {other}"),
+        }
+        let reference = reference.clone();
+        let final_state = record.final_state.clone();
+        let game_id = record.game_id;
+        let (recording, recording_bytes) = run_bounded_replay_materializer(
+            Arc::clone(&COMPLETION_REPLAY_MATERIALIZER_SLOTS),
+            move || {
+                if flat_entries.len() % 2 != 0 {
+                    anyhow::bail!("completion replay journal returned malformed hash entries");
+                }
+                let mut payloads = HashMap::with_capacity(flat_entries.len() / 2);
+                for pair in flat_entries.chunks_exact(2) {
+                    let field = String::from_utf8(pair[0].clone())
+                        .context("completion replay journal field is not UTF-8")?;
+                    payloads.insert(field, pair[1].clone());
+                }
+                let deltas = decode_replay_journal(payloads)?;
+                let recorder = crate::recovery::ReplayRecordingState::hydrate_reference(
+                    &reference,
+                    deltas,
+                    &final_state,
+                )?;
+                let recording = recorder
+                    .finish(game_id, &final_state)?
+                    .context("completion replay journal did not assemble a recording")?;
+                let recording_bytes = crate::completion::canonical_json_bytes(&recording)?;
+                if let (Some(expected_bytes), Some(expected_sha256)) =
+                    (reference.recording_bytes, &reference.recording_sha256)
+                    && (recording_bytes.len() as u64 != expected_bytes
+                        || hex::encode(Sha256::digest(&recording_bytes)) != *expected_sha256)
+                {
+                    anyhow::bail!("completion replay journal does not match its legacy digest");
+                }
+                Ok((recording, recording_bytes))
+            },
+        )
+        .await?;
+
+        let mut materialized = record.clone();
+        materialized.recording_journal = None;
+        materialized.recording = Some(recording);
+        materialized.recording_canonical_bytes = Some(recording_bytes);
+        materialized.validate()?;
+        Ok(materialized)
+    }
+
+    pub async fn refresh_completion_replay_journal_ttl_fenced(
+        &self,
+        guard: &PartitionLeaseGuard,
+        game_id: u32,
+        retention: Duration,
+    ) -> Result<()> {
+        if game_id % PARTITION_COUNT != guard.partition() {
+            anyhow::bail!("completion replay journal belongs to a different partition");
+        }
+        let retention_ms = u64::try_from(retention.as_millis())
+            .context("completion replay journal retention exceeds Redis range")?;
+        if retention_ms == 0 {
+            anyhow::bail!("completion replay journal retention must be non-zero");
+        }
+        let mut redis = self.partition_connection(guard.partition())?;
+        let operation = async {
+            redis::Script::new(
+                r#"
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+                local journal_type = redis.call('TYPE', KEYS[2])
+                if type(journal_type) == 'table' then journal_type = journal_type.ok end
+                if journal_type ~= 'hash' then return -2 end
+                redis.call('PEXPIRE', KEYS[2], ARGV[2])
+                return 1
+                "#,
+            )
+            .key(guard.lease_key())
+            .key(guard.namespace().replay_journal(game_id))
+            .arg(guard.encoded_token())
+            .arg(retention_ms)
+            .invoke_async(&mut redis)
+            .await
+        };
+        let result: i32 = tokio::time::timeout(FENCED_OPERATION_TIMEOUT, operation)
+            .await
+            .context("fenced completion replay journal TTL refresh timed out")??;
+        match result {
+            1 => Ok(()),
+            -1 => {
+                crate::resilience_metrics::record_fenced_write_rejection(1);
+                anyhow::bail!("stale partition lease rejected completion replay journal refresh")
+            }
+            -2 => anyhow::bail!("completion replay journal is missing or has the wrong type"),
+            other => anyhow::bail!("unknown completion replay journal refresh result {other}"),
+        }
     }
 
     pub async fn list_pending_completion_ids(
@@ -2899,6 +3403,72 @@ mod tests {
         GameStatus, GameType, QueueMode,
     };
     use redis::AsyncCommands;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_materializer_pool_bounds_concurrent_blocking_work() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let slots = Arc::new(Semaphore::new(1));
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(AtomicUsize::new(0));
+            let first_entered = Arc::new(tokio::sync::Notify::new());
+
+            let first = {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let release = Arc::clone(&release);
+                let first_entered = Arc::clone(&first_entered);
+                let slots = Arc::clone(&slots);
+                tokio::spawn(async move {
+                    run_bounded_replay_materializer(slots, move || {
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(count, Ordering::SeqCst);
+                        first_entered.notify_one();
+                        while release.load(Ordering::SeqCst) == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(1u8)
+                    })
+                    .await
+                })
+            };
+            first_entered.notified().await;
+
+            let second_entered = Arc::new(AtomicUsize::new(0));
+            let second = {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let second_entered = Arc::clone(&second_entered);
+                let slots = Arc::clone(&slots);
+                tokio::spawn(async move {
+                    run_bounded_replay_materializer(slots, move || {
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(count, Ordering::SeqCst);
+                        second_entered.store(1, Ordering::SeqCst);
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(2u8)
+                    })
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(second_entered.load(Ordering::SeqCst), 0);
+
+            release.store(1, Ordering::SeqCst);
+            assert_eq!(first.await.context("first materializer task panicked")??, 1);
+            assert_eq!(
+                second
+                    .await
+                    .context("second materializer task panicked")??,
+                2
+            );
+            assert_eq!(max_active.load(Ordering::SeqCst), 1);
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
 
     #[test]
     fn stream_id_ordering() {

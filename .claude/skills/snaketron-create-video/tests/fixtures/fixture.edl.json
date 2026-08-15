@@ -1,0 +1,37 @@
+{
+  "output": { "w": 320, "h": 180, "fps": 30 },
+  "music": {
+    "src": "fixture.wav",
+    "manifest": "beats.json",
+    "beat_snap": true,
+    "beat_snap_max_s": 0.05,
+    "duck_under": "sfx"
+  },
+  "timeline": [
+    {
+      "title": {
+        "text": "SNAKETRON",
+        "subtitle": "FRAME EXACT",
+        "style": "logo",
+        "duration": 0.5
+      }
+    },
+    { "transition": "fadeblack", "duration": 0.1 },
+    {
+      "clip": "fixture",
+      "in": 0.0,
+      "out": 2.0,
+      "speed": [
+        { "until": "meta:kill-0.2", "rate": 1.0 },
+        { "until": "meta:kill+0.2", "rate": 0.5 },
+        { "rate": 1.0 }
+      ],
+      "effects": [
+        { "t": "shake", "at": "meta:kill", "dur": 0.2, "amp": 4, "decay": 4 },
+        { "t": "rgb_split", "at": "meta:kill", "dur": 0.15, "px": 2 }
+      ],
+      "text": { "value": "DEMOLISHED!", "at": "meta:kill", "dur": 0.35, "style": "impact" },
+      "sfx": [{ "src": "../../assets/sfx/impact.wav", "at": "meta:kill" }]
+    }
+  ]
+}

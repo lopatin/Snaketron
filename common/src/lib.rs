@@ -4,7 +4,9 @@ mod constants;
 mod fingerprint;
 mod game_engine;
 mod game_state;
+pub mod highlight;
 pub mod replay;
+pub mod scenario;
 mod snake;
 pub mod trace;
 
@@ -15,6 +17,8 @@ pub use constants::*;
 pub use fingerprint::SyncHasher;
 pub use game_engine::*;
 pub use game_state::*;
+pub use highlight::*;
+pub use scenario::*;
 pub use snake::*;
 pub use util::PseudoRandom;
 

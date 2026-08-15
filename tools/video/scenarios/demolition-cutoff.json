@@ -1,0 +1,44 @@
+{
+  "format_version": 1,
+  "id": "demolition-cutoff",
+  "world": {
+    "game_type": { "FreeForAll": { "max_players": 2 } },
+    "queue_mode": "Quickmatch",
+    "rng_seed": null,
+    "overrides": { "player_idle_timeout_ms": 600000 }
+  },
+  "pose": {
+    "snakes": [
+      {
+        "user_id": 1,
+        "name": "GRID CUTTER",
+        "body": [{ "x": 20, "y": 15 }, { "x": 20, "y": 35 }],
+        "direction": "Up",
+        "boost_charge_ms": 3000
+      },
+      {
+        "user_id": 2,
+        "name": "RIVAL",
+        "body": [{ "x": 14, "y": 25 }, { "x": 10, "y": 25 }],
+        "direction": "Right"
+      }
+    ],
+    "food": [],
+    "start_tick": 0
+  },
+  "commands": [
+    { "at_tick": 2, "user_id": 1, "command": { "Turn": "Right" } },
+    { "at_tick": 34, "user_id": 1, "command": { "Turn": "Down" } },
+    { "at_tick": 58, "user_id": 1, "command": { "Turn": "Left" } }
+  ],
+  "run_ticks": 80,
+  "presentation": {
+    "camera": { "Follow": { "snake_id": 0 } },
+    "default_time_scale": 1.0,
+    "star_snake_id": 0,
+    "addons": { "combo_callout": false, "boost_meter": true }
+  },
+  "expect": [
+    { "SnakeDead": { "snake_id": 1, "at_tick": 12 } }
+  ]
+}

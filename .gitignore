@@ -12,6 +12,9 @@ replays/
 # Sync flight-recorder traces (see DEBUGGING.md)
 traces/
 loadtest-reports/
+.video-cache/
+__pycache__/
+*.pyc
 
 # Machine-readable staging certification bundles.
 test-results/autoscaling-*/

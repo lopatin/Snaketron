@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SnakeTron Leaderboard Capture Fixture</title>
+  <style>
+    @font-face { font-family: Barlow; src: url("../fonts/BarlowCondensed-ExtraBoldItalic.ttf"); font-weight: 800; font-style: italic; }
+    @font-face { font-family: Inter; src: url("../fonts/Inter-Variable.ttf"); }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #3f3f41; }
+    body { display: grid; place-items: center; color: #fff; font-family: Inter, sans-serif; }
+    .wrap { width: min(76vw, 1300px); transform: skewX(-3deg); }
+    header { display: flex; align-items: end; justify-content: space-between; border-bottom: 8px solid #3b82f6; padding: 0 18px 22px; }
+    h1 { margin: 0; font: 800 italic clamp(88px, 8vw, 148px)/.85 Barlow, sans-serif; text-transform: uppercase; text-shadow: 8px 8px #202024; }
+    header span { color: #f8c84a; font: 800 italic 32px Barlow, sans-serif; letter-spacing: .12em; }
+    ol { list-style: none; margin: 28px 0 0; padding: 0; display: grid; gap: 14px; }
+    li { display: grid; grid-template-columns: 100px 1fr 200px; align-items: center; min-height: 94px; padding: 14px 28px; background: #29292c; border-left: 7px solid #67676c; box-shadow: 8px 8px #1d1d20; opacity: var(--opacity, 0); transform: translateX(var(--x, 60px)); }
+    li:nth-child(1) { border-color: #f8c84a; background: #3b82f622; }
+    li:nth-child(2) { border-color: #f6707b; }
+    .place { color: #f8c84a; font: 800 italic 52px Barlow, sans-serif; }
+    .name { font: 800 italic 44px Barlow, sans-serif; text-transform: uppercase; }
+    .score { text-align: right; color: #fff; font: 800 italic 42px Barlow, sans-serif; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header><h1>Global leaders</h1><span>SEASON 01</span></header>
+    <ol id="leaders">
+      <li><span class="place">01</span><span class="name">GridRider</span><span class="score">2,184</span></li>
+      <li><span class="place">02</span><span class="name" id="player">SnakeByte</span><span class="score" id="score">2,132</span></li>
+      <li><span class="place">03</span><span class="name">ApexLoop</span><span class="score">2,087</span></li>
+      <li><span class="place">04</span><span class="name">NeonFang</span><span class="score">2,041</span></li>
+    </ol>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    if (params.has("player")) document.getElementById("player").textContent = params.get("player");
+    if (params.has("score")) document.getElementById("score").textContent = params.get("score");
+    let elapsed = 0;
+    const rows = [...document.querySelectorAll("li")];
+    const render = () => rows.forEach((row, i) => {
+      const p = Math.max(0, Math.min(1, (elapsed - i * 110) / 520));
+      const eased = 1 - Math.pow(1 - p, 3);
+      row.style.setProperty("--opacity", String(eased));
+      row.style.setProperty("--x", `${60 * (1 - eased)}px`);
+    });
+    render();
+    const api = {
+      ready: async () => { await document.fonts.ready; render(); },
+      durationMs: () => 4000,
+      stepMs: async (ms) => { elapsed += Number(ms); render(); },
+      renderedTick: () => Math.round(elapsed),
+      cueTrack: () => ({ anchors: { rows: 0.85, crown: 1.5 }, duration: 4, capture_vfps: 60, encoded_fps: 60 })
+    };
+    window.__SNAKETRON_CAPTURE__ = api;
+    window.__snaketronCapture = api;
+  </script>
+</body>
+</html>

@@ -5,10 +5,11 @@ export const DEFAULT_TICK_INTERVAL_MS = 100;
 export const EXECUTOR_POLL_INTERVAL_MS = 10;
 export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // Gameplay protocol version. Predictive simulation requires an exact match:
-// protocol 8 changes scoring and physical growth, so continuing with a stale
-// engine would produce permanent body-geometry divergence.
+// protocol 9 adds deterministic death attribution to SnakeDied events, while
+// protocol 8 changed scoring and physical growth. A stale client would either
+// misread the event shape or permanently diverge in body geometry.
 // Tracks WS_PROTOCOL_VERSION in server/src/lifecycle.rs.
-export const GAMEPLAY_PROTOCOL_VERSION = 8;
+export const GAMEPLAY_PROTOCOL_VERSION = 9;
 export const isGameplayProtocolCompatible = (serverVersion: unknown): boolean =>
   Number(serverVersion) === GAMEPLAY_PROTOCOL_VERSION;
 export const GAMEPLAY_UPDATE_REQUIRED_PREFIX = 'Gameplay update required';

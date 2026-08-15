@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "source": "fixture.wav",
+  "source_sha256": "fixture",
+  "backend": "fixture",
+  "sample_rate": 48000,
+  "duration": 4.0,
+  "bpm": 120.0,
+  "beats": [0.0, 0.4, 0.9, 1.4, 1.9, 2.4, 2.9, 3.4, 3.9]
+}

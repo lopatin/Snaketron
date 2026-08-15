@@ -36,6 +36,9 @@ const COMBO_REMAINING_WINDOW_BUCKETS_MS: &[f64] = &[
     0.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1_000.0, 1_200.0,
     1_400.0, 1_600.0, 1_800.0, 2_000.0,
 ];
+const POTG_RING_EVICTED_SECONDS_BUCKETS: &[f64] = &[
+    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_200.0, 1_800.0, 3_600.0,
+];
 
 struct OtelMetrics {
     fenced_write_rejections: Counter<u64>,
@@ -99,6 +102,8 @@ struct OtelMetrics {
     games_completed: Counter<u64>,
     game_duration: Histogram<u64>,
     completed_game_players: Counter<u64>,
+    potg_ring_truncated: Counter<u64>,
+    potg_ring_evicted_seconds: Histogram<u64>,
     redis_requests: Counter<u64>,
     redis_errors: Counter<u64>,
     redis_request_latency: Histogram<u64>,
@@ -690,6 +695,18 @@ impl OtelMetrics {
                 "snaketron.completed_game_players",
                 "Players included in completed games",
             ),
+            potg_ring_truncated: counter(
+                &meter,
+                "snaketron.potg_ring_truncated",
+                "Completed games whose bounded Play-of-the-Game selection ring evicted history",
+            ),
+            potg_ring_evicted_seconds: histogram_with_unit(
+                &meter,
+                "snaketron.ring_evicted_seconds",
+                "Whole-match seconds unavailable to Play-of-the-Game selection after oldest-first eviction",
+                "s",
+                POTG_RING_EVICTED_SECONDS_BUCKETS,
+            ),
             redis_requests: counter(
                 &meter,
                 "snaketron.redis_requests",
@@ -987,6 +1004,14 @@ pub(crate) fn record_game_completed(duration_ms: u64, players: u64) {
     metrics.game_duration.record(duration_ms, &[]);
 }
 
+pub(crate) fn record_potg_ring_truncated(evicted_seconds: u64) {
+    let metrics = metrics();
+    metrics.potg_ring_truncated.add(1, &[]);
+    metrics
+        .potg_ring_evicted_seconds
+        .record(evicted_seconds, &[]);
+}
+
 pub(crate) fn record_redis_request(latency_ms: u64, failed: bool) {
     let metrics = metrics();
     metrics.redis_requests.add(1, &[]);
@@ -1086,6 +1111,8 @@ mod tests {
         instruments.game_actor_advance_duration.record(730, &[]);
         instruments.game_actor_batch_quanta.record(3, &[]);
         instruments.game_actor_lag.record(50, &[]);
+        instruments.potg_ring_truncated.add(1, &[]);
+        instruments.potg_ring_evicted_seconds.record(17, &[]);
         update_gauges(&GaugeSnapshot {
             live_tasks: 3,
             active_websockets: 7,
@@ -1145,6 +1172,7 @@ mod tests {
         for (name, unit) in [
             ("snaketron.game_actor.advance_duration", "us"),
             ("snaketron.game_actor.batch_quanta", "1"),
+            ("snaketron.ring_evicted_seconds", "s"),
         ] {
             let exported_histogram = metric(name);
             assert_eq!(exported_histogram.unit(), unit);

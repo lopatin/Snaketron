@@ -155,6 +155,14 @@ pub struct Game {
     pub game_mode: String,
     pub is_private: bool,
     pub game_code: Option<String>,
+    /// Durable object-store reference for the complete replay recording.
+    /// Legacy games and completions produced before replay capture omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_object: Option<crate::replay_store::ReplayObjectMetadata>,
+    /// Canonical server-selected Play-of-the-Game clip. A completed game may
+    /// legitimately omit it when no candidate clears the scoring threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_of_the_game: Option<common::HighlightClip>,
     /// Internal proof that completion persistence verified this result as a
     /// public source. Legacy rows without proof fail closed for news.
     #[serde(default, skip_serializing)]

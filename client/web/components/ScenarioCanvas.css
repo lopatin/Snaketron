@@ -1,0 +1,606 @@
+.scenario-canvas {
+  --scenario-paper: #fff;
+  --scenario-graphite: #3f3f41;
+  --scenario-blue: #3b82f6;
+  --scenario-red: #ef4444;
+  --scenario-coral: #f6707b;
+  --scenario-gold: #f8c84a;
+  --scenario-rule: #d1d5db;
+  width: 100%;
+  color: var(--scenario-graphite);
+  font-family: Arial, Helvetica, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-scenario-capture="true"] .scenario-canvas {
+  font-family: "Snaketron Capture Sans", Arial, sans-serif;
+}
+
+html[data-scenario-capture="true"] .scenario-canvas .game-combo-callout__burst,
+html[data-scenario-capture="true"] .scenario-canvas .scenario-canvas__message {
+  font-family: "Snaketron Capture Black", "Arial Black", Impact, sans-serif;
+  font-style: italic;
+  font-weight: 800;
+}
+
+.scenario-canvas__viewport {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  border: 2px solid var(--scenario-graphite);
+  background: var(--scenario-paper);
+  box-shadow: 8px 8px 0 rgb(63 63 65 / 16%);
+}
+
+.scenario-canvas__surface {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #fff;
+}
+
+.scenario-canvas__message {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  background: rgb(255 255 255 / 88%);
+  color: var(--scenario-graphite);
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.scenario-canvas__message.is-error {
+  flex-direction: column;
+  padding: 24px;
+  color: #991b1b;
+  text-align: center;
+}
+
+.scenario-canvas__message.is-error span {
+  max-width: 34rem;
+  color: #6b7280;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.5;
+  text-transform: none;
+}
+
+.scenario-canvas__loader {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgb(63 63 65 / 20%);
+  border-top-color: var(--scenario-blue);
+  border-radius: 50%;
+  animation: scenario-loader-spin 700ms linear infinite;
+}
+
+.scenario-canvas__poster-play {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 2px solid var(--scenario-graphite);
+  border-radius: 0;
+  background: #fff;
+  box-shadow: 4px 4px 0 var(--scenario-graphite);
+  color: var(--scenario-graphite);
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.scenario-canvas__poster-play:hover {
+  background: #eff6ff;
+}
+
+.scenario-canvas__boost {
+  width: calc(100% - 20px);
+  margin: 0 auto;
+}
+
+.scenario-canvas__boost .game-boost-hud {
+  width: 100%;
+  margin: -2px 0 0;
+  opacity: 1;
+  transform: none;
+}
+
+/* The one broadcast flourish: a deliberately slanted timecode/playhead rail.
+   Every other surface stays square and quiet so this reads as the replay's
+   identity rather than generic dashboard chrome. */
+.scenario-canvas__rail {
+  position: relative;
+  display: grid;
+  min-height: 46px;
+  grid-template-columns: 34px auto minmax(64px, 1fr) auto auto 34px;
+  align-items: center;
+  gap: 9px;
+  margin: 10px 7px 0;
+  padding: 5px 10px;
+  border: 2px solid var(--scenario-graphite);
+  background:
+    linear-gradient(
+      90deg,
+      rgb(59 130 246 / 10%) 0 calc(var(--scenario-progress) * 100%),
+      #fff calc(var(--scenario-progress) * 100%) 100%
+    );
+  box-shadow: 6px 6px 0 rgb(63 63 65 / 12%);
+  transform: skewX(-7deg);
+}
+
+.scenario-canvas__rail > * {
+  transform: skewX(7deg);
+}
+
+.scenario-canvas__rail::before {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  left: calc(var(--scenario-progress) * 100%);
+  width: 2px;
+  background: var(--scenario-coral);
+  content: "";
+  pointer-events: none;
+}
+
+.scenario-canvas__transport {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--scenario-graphite);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 15px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.scenario-canvas__transport:hover:not(:disabled) {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.scenario-canvas__transport:disabled {
+  color: #9ca3af;
+  cursor: wait;
+}
+
+.scenario-canvas__time,
+.scenario-canvas__rate {
+  position: relative;
+  z-index: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.035em;
+  white-space: nowrap;
+}
+
+.scenario-canvas__time.is-duration {
+  color: #6b7280;
+}
+
+.scenario-canvas__rate {
+  min-width: 32px;
+  color: #1d4ed8;
+  text-align: right;
+}
+
+.scenario-canvas__scrubber {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.scenario-canvas__scrubber::-webkit-slider-runnable-track {
+  height: 4px;
+  border: 1px solid var(--scenario-graphite);
+  background: #e5e7eb;
+}
+
+.scenario-canvas__scrubber::-moz-range-track {
+  height: 4px;
+  border: 1px solid var(--scenario-graphite);
+  background: #e5e7eb;
+}
+
+.scenario-canvas__scrubber::-webkit-slider-thumb {
+  width: 9px;
+  height: 18px;
+  margin-top: -8px;
+  border: 2px solid var(--scenario-graphite);
+  border-radius: 0;
+  appearance: none;
+  background: var(--scenario-gold);
+  box-shadow: 2px 2px 0 var(--scenario-graphite);
+}
+
+.scenario-canvas__scrubber::-moz-range-thumb {
+  width: 7px;
+  height: 16px;
+  border: 2px solid var(--scenario-graphite);
+  border-radius: 0;
+  background: var(--scenario-gold);
+  box-shadow: 2px 2px 0 var(--scenario-graphite);
+}
+
+.scenario-canvas button:focus-visible,
+.scenario-canvas input:focus-visible,
+.scenario-qa button:focus-visible,
+.scenario-qa select:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 44%);
+  outline-offset: 3px;
+}
+
+/* QA replay lab --------------------------------------------------------- */
+.scenario-qa {
+  position: relative;
+  z-index: 50;
+  box-sizing: border-box;
+  min-height: 100svh;
+  padding: clamp(86px, 10vh, 120px) clamp(18px, 5vw, 72px) 64px;
+  background:
+    linear-gradient(rgb(255 255 255 / 96%), rgb(255 255 255 / 96%)),
+    repeating-linear-gradient(90deg, transparent 0 39px, rgb(63 63 65 / 5%) 39px 40px);
+  color: #3f3f41;
+}
+
+.scenario-qa__shell {
+  width: min(100%, 72rem);
+  margin: 0 auto;
+}
+
+.scenario-qa__masthead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 24px;
+  margin-bottom: 24px;
+  padding-bottom: 18px;
+  border-bottom: 2px solid #3f3f41;
+}
+
+.scenario-qa__eyebrow,
+.scenario-marketing__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: #ef4444;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.scenario-qa__eyebrow::before,
+.scenario-marketing__eyebrow::before {
+  width: 20px;
+  height: 3px;
+  background: currentColor;
+  content: "";
+}
+
+.scenario-qa h1 {
+  margin: 0;
+  color: #3f3f41;
+  font-family: Impact, "Arial Black", Arial, sans-serif;
+  font-size: clamp(34px, 6vw, 72px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.025em;
+  line-height: 0.88;
+  text-transform: uppercase;
+}
+
+.scenario-qa__intro {
+  max-width: 36rem;
+  margin: 12px 0 0;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.scenario-qa__status {
+  display: grid;
+  min-width: 138px;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 2px solid #3f3f41;
+  background: #fff;
+  box-shadow: 6px 6px 0 rgb(63 63 65 / 14%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.scenario-qa__status strong {
+  color: #3b82f6;
+}
+
+.scenario-qa__deck {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 13rem;
+  align-items: start;
+  gap: 24px;
+}
+
+.scenario-qa__sidecar {
+  display: grid;
+  gap: 16px;
+}
+
+.scenario-qa__control-group {
+  padding-top: 12px;
+  border-top: 2px solid #3f3f41;
+}
+
+.scenario-qa__control-label {
+  display: block;
+  margin-bottom: 8px;
+  color: #6b7280;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.scenario-qa__scenario-list,
+.scenario-qa__rate-list {
+  display: grid;
+  gap: 6px;
+}
+
+.scenario-qa__rate-list {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.scenario-qa__scenario-button,
+.scenario-qa__rate-button {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 2px solid #d1d5db;
+  border-radius: 0;
+  background: #fff;
+  color: #3f3f41;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1.15;
+  text-align: left;
+  cursor: pointer;
+}
+
+.scenario-qa__rate-button {
+  padding: 7px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-align: center;
+}
+
+.scenario-qa__scenario-button[aria-pressed="true"],
+.scenario-qa__rate-button[aria-pressed="true"] {
+  border-color: #3f3f41;
+  background: #3f3f41;
+  color: #fff;
+  box-shadow: 3px 3px 0 #f8c84a;
+}
+
+.scenario-qa__fixture-copy {
+  margin: 0;
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.scenario-capture {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  width: 100vw;
+  height: 100dvh;
+  place-items: stretch;
+  overflow: hidden;
+  background: #fff;
+}
+
+.scenario-capture .scenario-canvas,
+.scenario-capture .scenario-canvas__viewport {
+  width: 100%;
+  height: 100%;
+}
+
+.scenario-capture .scenario-canvas__viewport {
+  border: 0;
+  box-shadow: none;
+}
+
+/* Home marketing embed ------------------------------------------------- */
+.home-play-layout {
+  display: grid;
+  width: min(100%, 66rem);
+  grid-template-columns: minmax(23rem, 28rem) minmax(25rem, 34rem);
+  align-items: center;
+  justify-content: center;
+  gap: clamp(36px, 6vw, 76px);
+}
+
+.scenario-marketing {
+  position: relative;
+  width: 100%;
+  padding: 18px 18px 20px;
+  border: 2px solid #3f3f41;
+  background: rgb(255 255 255 / 95%);
+  box-shadow: 8px 8px 0 rgb(63 63 65 / 18%);
+}
+
+.scenario-marketing::after {
+  position: absolute;
+  top: -2px;
+  right: 22px;
+  width: 54px;
+  height: 4px;
+  background: #f6707b;
+  content: "";
+}
+
+.scenario-marketing__header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 13px;
+}
+
+.scenario-marketing__header h2 {
+  margin: 0;
+  color: #3f3f41;
+  font-family: Impact, "Arial Black", Arial, sans-serif;
+  font-size: clamp(22px, 3vw, 34px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.015em;
+  line-height: 0.9;
+  text-transform: uppercase;
+}
+
+.scenario-marketing__tag {
+  padding: 4px 6px;
+  border: 1px solid #3f3f41;
+  color: #3f3f41;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.scenario-marketing__copy {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  margin: 17px 0 0;
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.scenario-marketing__copy strong {
+  color: #3b82f6;
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 9px;
+  font-style: italic;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+@keyframes scenario-loader-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 920px) {
+  .home-play-layout {
+    width: 100%;
+    grid-template-columns: minmax(0, 28rem);
+    gap: 40px;
+  }
+
+  .scenario-marketing {
+    box-sizing: border-box;
+  }
+
+  .scenario-qa__deck {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-qa__sidecar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .scenario-canvas__rail {
+    grid-template-columns: 30px auto minmax(34px, 1fr) auto 30px;
+    gap: 5px;
+    margin-right: 5px;
+    margin-left: 5px;
+    padding: 4px 6px;
+    transform: skewX(-4deg);
+  }
+
+  .scenario-canvas__rail > * {
+    transform: skewX(4deg);
+  }
+
+  .scenario-canvas__rate {
+    display: none;
+  }
+
+  .scenario-canvas__time {
+    font-size: 8px;
+  }
+
+  .scenario-qa {
+    padding: 90px 10px 38px;
+  }
+
+  .scenario-qa__masthead {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-qa__status {
+    width: fit-content;
+  }
+
+  .scenario-qa__sidecar {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-marketing {
+    padding: 14px 12px 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scenario-canvas *,
+  .scenario-qa *,
+  .scenario-marketing * {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .scenario-canvas__loader {
+    animation: none;
+  }
+}

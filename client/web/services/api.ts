@@ -9,6 +9,7 @@ import {
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
+import type { HighlightClip } from '../types/generated';
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -63,6 +64,11 @@ export interface CrazyGamesExchangeResponse {
   user: CrazyGamesExchangeUser;
   preferences: CrazyGamesPreferences;
 }
+
+export type GameHighlightResponse =
+  | { status: 'pending' }
+  | { status: 'ready'; play_of_the_game: HighlightClip }
+  | { status: 'unavailable' };
 
 // Portal sessions are intentionally isolated from first-party username/
 // password sessions. This key stores only Snaketron's internal JWT; the
@@ -270,6 +276,18 @@ class API {
 
   async getNewsTicker(): Promise<NewsTickerResponse> {
     return this.request<NewsTickerResponse>('/api/news');
+  }
+
+  /** Public-by-design replay metadata. A bearer is still attached when one is
+   * available, including tab-scoped CrazyGames sessions. */
+  async getGameHighlight(
+    gameId: string,
+    signal?: AbortSignal,
+  ): Promise<GameHighlightResponse> {
+    return this.request<GameHighlightResponse>(
+      `/api/games/${encodeURIComponent(gameId)}/highlight`,
+      { signal },
+    );
   }
 
   async getLeaderboard(
