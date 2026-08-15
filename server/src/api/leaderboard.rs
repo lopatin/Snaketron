@@ -5,7 +5,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tracing::{error, info, warn};
 
 use crate::api::middleware::AuthUser;
@@ -37,12 +37,24 @@ pub struct LeaderboardQuery {
 pub struct LeaderboardEntryResponse {
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub rank: usize,
+    /// The account behind the row. Display names are not unique — guests are
+    /// exempt from the username index — so this is the only way a client can
+    /// tell which row is the signed-in player's. The board and
+    /// [`get_my_ranking`] answer questions about different regions, so their
+    /// rank numbers must never be compared to find that row. Account IDs are
+    /// already visible to every client through lobby and gameplay messages.
+    #[serde(rename = "userId")]
+    pub user_id: i32,
     pub username: String,
     pub mmr: i32,
     pub wins: i32,
     pub losses: i32,
     #[serde(rename = "winRate")]
     pub win_rate: f64,
+    /// Whether the account is a guest, so a name-alike can be told apart from
+    /// a registered account of the same name.
+    #[serde(rename = "isGuest")]
+    pub is_guest: bool,
 }
 
 /// High score entry response format for frontend (for solo mode)
@@ -52,11 +64,18 @@ pub struct LeaderboardEntryResponse {
 pub struct HighScoreEntryResponse {
     #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
     pub rank: usize,
+    /// See [`LeaderboardEntryResponse::user_id`].
+    #[serde(rename = "userId")]
+    pub user_id: i32,
     pub username: String,
     pub score: i32,
     pub timestamp: String,
     #[serde(rename = "gameId")]
     pub game_id: String,
+    /// See [`LeaderboardEntryResponse::is_guest`]. High-score names are
+    /// historical snapshots, so this reflects the account today.
+    #[serde(rename = "isGuest")]
+    pub is_guest: bool,
 }
 
 /// Leaderboard response (supports both ranking and high score entries)
@@ -99,13 +118,21 @@ pub struct LeaderboardState {
     pub db: Arc<dyn Database>,
 }
 
-/// Get leaderboard rankings
+/// Get leaderboard rankings.
+///
 /// Query parameters:
 /// - queue_mode: "quickmatch" or "competitive"
 /// - game_type: "solo", "duel", "2v2", "ffa"
 /// - season: optional, defaults to current season
 /// - limit: optional, defaults to 25, max 100
 /// - offset: optional, defaults to 0
+/// - region: optional; **omitting it returns the true global ladder across
+///   every region**, which is what the Global selection asks for.
+///
+/// The absent-region case deliberately means something different here than in
+/// [`get_my_ranking`], which is always about one region. Do not "fix" the two
+/// into agreement: a player's own badge is regional by design, while this
+/// board spans regions.
 pub async fn get_leaderboard(
     State(state): State<LeaderboardState>,
     Query(query): Query<LeaderboardQuery>,
@@ -193,14 +220,26 @@ pub async fn get_leaderboard(
 
         // Preserve the established constant-read path. Names in score rows are
         // historical snapshots; current verified profile data is used for
-        // active account/lobby identity without amplifying public reads.
+        // active account/lobby identity without amplifying public reads. The
+        // one addition is a single batched guest-status read for the page.
+        let high_scores: Vec<_> = high_scores.into_iter().take(limit).collect();
+        let guest_flags = guest_flags_for(
+            &state,
+            &high_scores
+                .iter()
+                .map(|entry| entry.user_id)
+                .collect::<Vec<_>>(),
+        )
+        .await;
+
         let response_entries: Vec<LeaderboardEntry> = high_scores
             .into_iter()
-            .take(limit)
             .enumerate()
             .map(|(idx, entry)| {
                 LeaderboardEntry::HighScore(HighScoreEntryResponse {
                     rank: offset + idx + 1,
+                    user_id: entry.user_id,
+                    is_guest: guest_flags.get(&entry.user_id).copied().unwrap_or(false),
                     username: entry.username,
                     score: entry.score,
                     timestamp: entry.timestamp.to_rfc3339(),
@@ -257,9 +296,18 @@ pub async fn get_leaderboard(
     let has_more = entries.len() > limit;
 
     // Transform entries to response format
+    let entries: Vec<_> = entries.into_iter().take(limit).collect();
+    let guest_flags = guest_flags_for(
+        &state,
+        &entries
+            .iter()
+            .map(|entry| entry.user_id)
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
     let response_entries: Vec<LeaderboardEntry> = entries
         .into_iter()
-        .take(limit) // Take only the requested limit
         .enumerate()
         .map(|(idx, entry)| {
             let total_games = entry.wins + entry.losses;
@@ -271,6 +319,8 @@ pub async fn get_leaderboard(
 
             LeaderboardEntry::Ranking(LeaderboardEntryResponse {
                 rank: offset + idx + 1,
+                user_id: entry.user_id,
+                is_guest: guest_flags.get(&entry.user_id).copied().unwrap_or(false),
                 username: entry.username,
                 mmr: entry.mmr,
                 wins: entry.wins,
@@ -287,6 +337,25 @@ pub async fn get_leaderboard(
         game_type: query.game_type,
         has_more,
     })
+}
+
+/// Guest status for the accounts on one rendered page.
+///
+/// A failed lookup must not take the board down with it, so an unreadable
+/// batch degrades to an unlabelled page: the marker is a disambiguation aid,
+/// not part of the standings.
+async fn guest_flags_for(state: &LeaderboardState, user_ids: &[i32]) -> HashMap<i32, bool> {
+    if user_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    match state.db.get_users_are_guests(user_ids).await {
+        Ok(flags) => flags,
+        Err(error) => {
+            warn!("Failed to read guest status for leaderboard page: {error:?}");
+            HashMap::new()
+        }
+    }
 }
 
 /// List every season that has begun, newest first.
@@ -317,12 +386,29 @@ pub struct UserRankingResponse {
     pub win_rate: Option<f64>,
 }
 
-/// Get current user's ranking
+/// Get the current user's ranking in one region.
+///
 /// Query parameters: queue_mode, game_type, season (optional), region (optional)
 ///
 /// This is a hot endpoint: the post-match rating reveal polls it up to eight
 /// times per player per rated match, on top of leaderboard page loads. It must
 /// stay a single keyed read of one ranking partition.
+///
+/// **It is also deliberately regional, including when the client is showing
+/// the Global board.** Rankings are stored per region — a player owns one row
+/// per region they have played a ranked game in — and a player's own standing
+/// is reported for a single one of them:
+///
+/// 1. the region the client passes, which the web client sets to the region
+///    its websocket is connected to while Global is selected, so the badge
+///    reflects where the player is actually playing; failing that,
+/// 2. the region of whichever server answers this request.
+///
+/// [`get_leaderboard`] answers a different question and is *not* symmetric
+/// with this one: with no region it returns the true global ladder across all
+/// regions. A player can therefore see a Global board where their own row
+/// carries a rating earned in another region while this badge shows their
+/// rating in the region they are connected to. That is intended.
 pub async fn get_my_ranking(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<LeaderboardState>,
@@ -358,10 +444,13 @@ pub async fn get_my_ranking(
     let season = query.season.unwrap_or_else(get_current_season);
 
     // Matchmaking exposes logical IDs such as `use1`, while the established
-    // ranking keyspace uses physical IDs such as `us-east-1`.
+    // ranking keyspace uses physical IDs such as `us-east-1`. An absent region
+    // is not "global" here: it resolves to this server's own region, which is
+    // the documented fallback for a client with no live websocket. Unlike
+    // `get_leaderboard`, this endpoint never spans regions.
     let region = get_ranking_region(query.region.as_deref());
 
-    // Get user's ranking from database
+    // One keyed read of this region's partition, and nothing else.
     let ranking = match state
         .db
         .get_user_ranking(auth_user.user_id, &queue_mode, &game_type, &region, season)
@@ -382,14 +471,24 @@ pub async fn get_my_ranking(
                 win_rate,
             }
         }
-        Ok(None) | Err(_) => {
-            // User has no ranking yet
-            UserRankingResponse {
-                mmr: None,
-                wins: None,
-                losses: None,
-                win_rate: None,
-            }
+        // The player has no row in this region. This is the only empty answer:
+        // a read that *failed* is not evidence of an absent ranking.
+        Ok(None) => UserRankingResponse {
+            mmr: None,
+            wins: None,
+            losses: None,
+            win_rate: None,
+        },
+        Err(error) => {
+            // Reporting a throttled or timed-out read as an empty ranking is
+            // what made an established player's badge flip to Unranked and
+            // back between page loads. A failure status lets the client keep
+            // showing the rank it already had.
+            error!(
+                user_id = auth_user.user_id,
+                "Failed to read user ranking: {error:?}"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 
