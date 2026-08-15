@@ -244,11 +244,11 @@
   letter-spacing: 0.045em;
   line-height: 1;
   pointer-events: auto;
-  /* The same stepped shadow VICTORY wears, so the two headline plates in the
-     card are recognisably the same object at different sizes. */
+  /* VICTORY's stepped shadow, pulled a pixel tighter and much lighter: at
+     plate size the full-strength version reads as a second, blurred word. */
   text-shadow:
-    2px 2px 0 rgb(20 24 31 / 50%),
-    4px 4px 0 rgb(20 24 31 / 50%);
+    1px 1px 0 rgb(20 24 31 / 10%),
+    3px 3px 0 rgb(20 24 31 / 10%);
   text-transform: uppercase;
   white-space: nowrap;
   transform: skewX(-7deg);
