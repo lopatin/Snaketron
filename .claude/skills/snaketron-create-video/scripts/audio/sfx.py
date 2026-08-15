@@ -18,7 +18,14 @@ from pedalboard import (
 import kit
 from dsp import SR, apply, as_stereo, note, perc_env, saw, sine, supersaw, sweep_ladder
 
-_rng = np.random.default_rng(0x5EED)
+_SEED = 0x5EED
+_rng = np.random.default_rng(_SEED)
+
+
+def reset_rng() -> None:
+    """See kit.reset_rng."""
+    global _rng
+    _rng = np.random.default_rng(_SEED)
 
 
 def impact(length=1.1) -> np.ndarray:
@@ -115,15 +122,10 @@ def stamp(length=0.5) -> np.ndarray:
     return out / (np.max(np.abs(out)) + 1e-9) * 0.8
 
 
-# The launch trailer's bank cue lands at 6.10 s, on the G of the Am-F-C-G
-# progression. If that cue moves, or another film uses a different bed, this
-# has to move with it: see `song.chord_at()`.
-BANK_CHORD = ('G', 'B', 'D')
-
 SET = {
     'impact.wav': impact,
     'boost.wav': boost,
-    'bank.wav': lambda: bank(chord=BANK_CHORD),
+    'bank.wav': bank,
     'whoosh.wav': card_push,
     'stamp.wav': stamp,
 }
@@ -131,6 +133,7 @@ SET = {
 
 def write_all(dest: str) -> None:
     import os
+    reset_rng()
     os.makedirs(dest, exist_ok=True)
     for name, fn in SET.items():
         x = fn()

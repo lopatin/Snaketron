@@ -59,22 +59,6 @@ T_PROMOTION = 17.26
 T_DROP = 18.0
 T_LADDER = 18.5
 T_FADEWHITE = 26.5
-# The button: the final tonic hit. Everything cuts for an eighth before it so
-# the landing reads as an arrival rather than a stop.
-T_BUTTON = 26.5
-GAP = 0.20
-
-
-def retime_outro(fadewhite: float) -> None:
-    """Move where the drop ends and the cadence lands.
-
-    The ending's room comes out of the drop: the film is a fixed 30.1 s, so
-    every second the outro gains, the drop loses. This exists so that trade can
-    be heard rather than argued about.
-    """
-    global T_FADEWHITE, T_BUTTON
-    T_FADEWHITE = fadewhite
-    T_BUTTON = fadewhite
 
 # Am  F  C  G, one bar each, looping.
 PROGRESSION = ['Am', 'F', 'C', 'G']
@@ -192,7 +176,7 @@ SECTION_GAIN = [
     (16.0, 0.38),   # BREAKDOWN - the floor drops out
     (17.26, 0.52),  # promotion swells
     (18.0, 1.00),   # THE DROP
-    (26.5, 1.00),   # the button, then decay
+    (26.5, 0.86),   # outro
 ]
 
 
@@ -220,6 +204,9 @@ def section_envelope(n: int, sr=SR) -> np.ndarray:
 
 
 def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
+    # Rewind every noise source, so build() is a pure function of its
+    # arguments rather than of how many times it has been called.
+    kit.reset_rng()
     rng = np.random.default_rng(seed)
     mix = Mix(DURATION)
     n_total = mix.n
@@ -412,38 +399,6 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
     chord_buf = sweep_ladder(chords.out(), chord_cut, resonance=0.30, drive=1.4)
     chord_buf = apply(room(size=0.42, wet=0.20), chord_buf)
 
-    # --- the cadence -------------------------------------------------------
-    # The drop's phrase is 8 bars but only 4.25 fit before the end slate, so
-    # the tune was being cut off mid-sentence on A5 over F — the third of the
-    # chord, high and hanging, which is the "unrewarded anticipation". These
-    # replace the truncated bar with a descent onto the tonic, and put a
-    # weighted tonic hit under it.
-    cadence = Mix(DURATION)
-    # Descending run into the button: A5 -> E5 -> C5 -> A4.
-    for step, nm, vel in [(0, 'A5', 0.9), (2, 'E5', 0.8), (4, 'C5', 0.85)]:
-        ct = 26.0 + step * STEP
-        v = supersaw(note(nm), int(STEP * 3.2 * SR), voices=7, detune_cents=18)
-        cadence.add(v * perc_env(v.shape[1], 0, curve=2.6), ct, vel)
-    # The arrival: tonic, low, wide, and held.
-    hold = DURATION - T_BUTTON
-    for nm, gain in [('A2', 0.85), ('A3', 0.70), ('C4', 0.45), ('E4', 0.45), ('A4', 0.55)]:
-        v = supersaw(note(nm), int(hold * SR), voices=7, detune_cents=20)
-        env = np.ones(v.shape[1])
-        env[:int(0.012 * SR)] = np.linspace(0, 1, int(0.012 * SR))
-        env *= np.exp(-np.linspace(0, 2.6, v.shape[1]))
-        cadence.add(v * env, T_BUTTON, gain * 0.5)
-    # Sub and kick give the arrival its weight — without them it is a chord
-    # change, not a landing.
-    cadence.add(kit.sub(note('A1'), 2.2), T_BUTTON, 0.85)
-    cadence.add(kit.sub(note('A0'), 1.4), T_BUTTON, 0.35)
-    mix.add(kit.kick(punch=1.25), T_BUTTON, 1.05)
-    # A low tag after the button: the head of the tune, an octave down, so the
-    # decay has something to say instead of only fading.
-    for tag_t, nm in [(T_BUTTON + BEAT * 2, 'A3'), (T_BUTTON + BEAT * 3.5, 'E3')]:
-        v = supersaw(note(nm), int(1.6 * SR), voices=5, detune_cents=14)
-        cadence.add(v * perc_env(v.shape[1], 0, curve=2.0), tag_t, 0.32)
-    cadence_buf = apply(room(size=0.55, wet=0.28), cadence.out())
-
     # --- lead --------------------------------------------------------------
     lead = Mix(DURATION)
     if cfg.lead_style != 'none':
@@ -460,8 +415,7 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
                 if bar_off >= bars:
                     continue
                 t = origin + bar_off * BAR + step * STEP
-                # The cadence owns the last half bar.
-                if t >= 26.0 or t < origin:
+                if t >= T_FADEWHITE or t < origin:
                     continue
                 if T_BREAK <= t < T_DROP:
                     continue
@@ -562,20 +516,12 @@ def build(cfg: Voicing, seed: int = 7) -> np.ndarray:
     mix.add(lead_buf * pump, 0.0, cfg.lead_gain)
     mix.add(fx.out(), 0.0, 1.0)
 
-    mix.add(cadence_buf, 0.0, 1.0)
     out = mix.out() * section_envelope(n_total)
-    # Cut everything for an eighth before the button. A landing needs a breath
-    # in front of it or it is just the next bar.
-    g0, g1 = int((T_BUTTON - GAP) * SR), int(T_BUTTON * SR)
-    out[:, g0:g1] *= np.linspace(1.0, 0.06, g1 - g0) ** 1.5
 
     # Outro: everything decays under the held end slate rather than stopping.
     tail_start = int(T_FADEWHITE * SR)
     tail = np.ones(n_total)
-    # Decay from the button rather than from the fadewhite, and gently: the
-    # end slate is held to the last frame, so the chord should still be
-    # sounding there.
-    tail[tail_start:] = np.linspace(1.0, 0.42, n_total - tail_start) ** 0.9
+    tail[tail_start:] = np.linspace(1.0, 0.55, n_total - tail_start) ** 1.1
     out = out * tail
 
     # Gentle glue only. A hard bus compressor here would undo the section

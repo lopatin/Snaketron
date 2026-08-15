@@ -54,7 +54,14 @@ spectrogram does not show:
   effect's sustained level to sit within ~1 dB of the bed and let only its
   transient above; ~+5 dB of sustained level is what "the effects are much
   louder than the music" sounds like.
-- `pump.py` — the sidechain recovery ramp **between** kicks. Measuring at the
+- `pump.py` — the sidechain recovery ramp **between** kicks.
+
+`song.build()` is a pure function of its arguments. It was not: every
+noise-based voice draws from one module-level generator, so a second call in
+the same process produced different drums. That is deterministic per *process*,
+which is not the same thing, and it hid from a check that shelled out for each
+run. `kit.reset_rng()` at the top of `build()` is what makes an A/B of one note
+actually differ by one note. Measuring at the
   kick catches the kick's own energy and reads as the opposite of ducking.
 
 Two authoring rules the measurements enforce:
@@ -63,13 +70,13 @@ Two authoring rules the measurements enforce:
    from the first kick to the last — 4 dB of range across the whole record,
    which is what "not exciting" means in numbers. `SECTION_GAIN` in `song.py`
    authors the curve; the master chain is deliberately gentle so it survives.
-2. **A phrase must fit the room it has, and cadence.** The drop's melody was
-   8 bars but only 4.25 fit before the end slate, so the tune was cut off
-   mid-sentence — and its last sounding note was the *third* of the chord,
-   high. A hanging third reads as unrewarded anticipation no matter how good
-   the build was. Check what the last note actually is, and land it on the
-   tonic. `retime_outro()` trades drop length for ending room so the two can
-   be compared by ear rather than argued about.
+2. **Fix an ending with the smallest change that works.** The last note the
+   tune plays is A5 over an F chord — the third, high, which reads as a
+   question rather than an answer. The fix is that note, not a new section: a
+   cadence, a gap and a weighted tonic button were all built, and all were
+   worse, because they added complexity the rest of the track does not have.
+   Match the density of what is already there. Check what the final note
+   actually is before designing anything.
 3. **A pitched effect must agree with the chord it lands on.** The goal
    flourish was A–C–E over a bar of G major: no shared tones and a semitone
    between its C and the chord's B. It read as "too loud" and trimming it 6 dB

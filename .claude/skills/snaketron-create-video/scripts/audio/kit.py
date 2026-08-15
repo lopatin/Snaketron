@@ -13,7 +13,20 @@ from pedalboard import Distortion, HighpassFilter, LowpassFilter, Pedalboard, Re
 
 from dsp import SR, apply, as_stereo, perc_env, saw, sine, square
 
-_rng = np.random.default_rng(0xC0FFEE)
+_SEED = 0xC0FFEE
+_rng = np.random.default_rng(_SEED)
+
+
+def reset_rng() -> None:
+    """Rewind the noise source.
+
+    Every noise-based voice here draws from one module-level generator, so a
+    second `song.build()` in the same process got different drums from the
+    first — the output was deterministic per *process*, which is not the same
+    as deterministic, and hid itself from a check that shelled out each time.
+    """
+    global _rng
+    _rng = np.random.default_rng(_SEED)
 
 
 def kick(sr=SR, punch=1.0, length=0.42, f_start=118.0, f_end=44.0,
