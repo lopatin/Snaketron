@@ -148,6 +148,8 @@ async fn main() -> Result<()> {
         redis_url: redis_url.clone(),
         boost_config,
         player_idle_config,
+        match_ready_window_ms: common::MATCH_READY_WINDOW_MS,
+        test_mode: false,
     };
 
     let mut game_server = GameServer::start(config).await?;

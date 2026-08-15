@@ -33,10 +33,28 @@ use crate::{
 use serde::Deserialize;
 use std::path::PathBuf;
 
-use common::{BoostConfig, NORMAL_SNAKE_SPEED_MILLI};
+use common::{BoostConfig, MATCH_READY_WINDOW_MS, NORMAL_SNAKE_SPEED_MILLI};
 
 const ECS_METADATA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const TEST_SERVER_ABORT_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 pub const BOOST_SPEED_MULTIPLIER_ENV: &str = "SNAKETRON_BOOST_SPEED_MULTIPLIER";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerRuntimeMode {
+    Production,
+    Test,
+}
+
+impl ServerRuntimeMode {
+    const fn from_test_mode(test_mode: bool) -> Self {
+        if test_mode {
+            Self::Test
+        } else {
+            Self::Production
+        }
+    }
+}
 
 /// Resolve the human-facing Boost multiplier into the integer simulation
 /// representation. Milli-speed keeps fractional values deterministic across
@@ -197,6 +215,12 @@ pub struct GameServerConfig {
     pub boost_config: BoostConfig,
     /// Inactivity phases resolved once at startup and snapshotted per match.
     pub player_idle_config: PlayerIdleConfig,
+    /// Maximum time a new match waits for every player to confirm readiness.
+    pub match_ready_window_ms: i64,
+    /// Enables integration-test lifecycle behavior: readiness is still fully
+    /// exercised, but startup omits a fixed grace sleep and shutdown uses
+    /// bounded cancellation instead of production traffic/lease handoff.
+    pub test_mode: bool,
 }
 
 /// A complete game server instance with all components
@@ -225,8 +249,108 @@ pub struct GameServer {
     fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
     /// Test servers skip the load-balancer convergence delay.
     route_withdrawal_delay: Duration,
+    /// Integration-test servers use cancellation teardown rather than waiting
+    /// for the production assignment-handoff protocol. A one-node test
+    /// cluster has no surviving coordinator that can move its partitions, so
+    /// the production drain would otherwise wait for every lease to expire.
+    runtime_mode: ServerRuntimeMode,
     /// Membership, assignment, and partition-executor manager.
     executor_cluster: ExecutorClusterHandle,
+}
+
+async fn join_test_service_tasks(
+    handles: Vec<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let mut pending: FuturesUnordered<_> = handles.into_iter().collect();
+    let mut shutdown_error = None;
+    let join_result = tokio::time::timeout_at(deadline, async {
+        while let Some(result) = pending.next().await {
+            if let Err(error) = result
+                && shutdown_error.is_none()
+            {
+                shutdown_error = Some(
+                    anyhow::Error::new(error).context("Test service task failed during shutdown"),
+                );
+            }
+        }
+    })
+    .await;
+
+    if join_result.is_err() {
+        warn!("Test service shutdown deadline elapsed; aborting leftovers");
+        for handle in pending.iter() {
+            handle.abort();
+        }
+
+        // `abort` only schedules cancellation. Reap every handle to prove its
+        // future has actually been dropped before the next test can flush and
+        // reuse the shared Redis database, while retaining a small secondary
+        // bound for cancellation-hostile tasks. Cancellation errors caused by
+        // the abort are represented by the primary timeout; panics observed
+        // while reaping remain the more specific failure.
+        let reap_result = tokio::time::timeout(TEST_SERVER_ABORT_REAP_TIMEOUT, async {
+            while let Some(result) = pending.next().await {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                    && shutdown_error.is_none()
+                {
+                    shutdown_error = Some(
+                        anyhow::Error::new(error)
+                            .context("Test service task failed while aborting timed-out shutdown"),
+                    );
+                }
+            }
+        })
+        .await;
+        if reap_result.is_err() {
+            shutdown_error = Some(match shutdown_error.take() {
+                Some(error) => error.context(
+                    "Timed out reaping aborted test service tasks after the shutdown deadline",
+                ),
+                None => anyhow::anyhow!(
+                    "Timed out reaping aborted test service tasks after the shutdown deadline"
+                ),
+            });
+        }
+        if shutdown_error.is_none() {
+            shutdown_error = Some(anyhow::anyhow!("Test service shutdown deadline elapsed"));
+        }
+    }
+
+    match shutdown_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn append_queued_fatal_errors(
+    fatal_rx: &mut mpsc::UnboundedReceiver<anyhow::Error>,
+    fatal_error: &mut Option<anyhow::Error>,
+) {
+    while let Ok(error) = fatal_rx.try_recv() {
+        *fatal_error = Some(match fatal_error.take() {
+            None => error,
+            Some(primary) => primary.context(format!(
+                "Additional critical service task failure: {error:#}"
+            )),
+        });
+    }
+}
+
+fn finish_test_shutdown(
+    fatal_error: Option<anyhow::Error>,
+    shutdown_result: Result<()>,
+) -> Result<()> {
+    match (fatal_error, shutdown_result) {
+        (Some(fatal), Ok(())) => {
+            Err(fatal.context("Critical service task failed before test shutdown completed"))
+        }
+        (Some(fatal), Err(shutdown)) => Err(fatal.context(format!(
+            "Critical service task failed; test teardown also failed: {shutdown:#}"
+        ))),
+        (None, result) => result,
+    }
 }
 
 impl GameServer {
@@ -263,8 +387,15 @@ impl GameServer {
             redis_url,
             boost_config,
             player_idle_config,
+            match_ready_window_ms,
+            test_mode,
         } = config;
+        let runtime_mode = ServerRuntimeMode::from_test_mode(test_mode);
 
+        anyhow::ensure!(
+            match_ready_window_ms > 0,
+            "match readiness window must be positive"
+        );
         boost_config
             .validate()
             .context("Invalid Boost configuration supplied to game server")?;
@@ -451,10 +582,11 @@ impl GameServer {
         lobby_manager.start_lobby_update_forwarder();
 
         // Create the matchmaking manager
-        let matchmaking = MatchmakingManager::new_with_gameplay_config(
+        let matchmaking = MatchmakingManager::new_with_gameplay_config_and_ready_window(
             redis.clone(),
             boost_config,
             player_idle_config,
+            match_ready_window_ms,
         )
         .context("Failed to create matchmaking manager")?;
         let outbox_matchmaking = matchmaking.clone();
@@ -542,6 +674,13 @@ impl GameServer {
                         let ready = replication_monitor.is_ready().await;
                         replication_lifecycle.mark_replicas_ready(ready);
                         if replication_monitor.has_failed_worker() {
+                            // A cancellation can complete every worker while
+                            // this monitor is suspended inside `is_ready()`.
+                            // Recheck after that await so normal shutdown is
+                            // not misclassified as a critical worker failure.
+                            if replication_token.is_cancelled() {
+                                break;
+                            }
                             replication_lifecycle.mark_critical_failure();
                             let _ = replication_fatal_tx.send(anyhow::anyhow!(
                                 "a partition replication worker exited unexpectedly"
@@ -655,8 +794,13 @@ impl GameServer {
         // This is because it needs both the replication manager and JWT verifier
         info!("HTTP server will be started externally at {}", http_addr);
 
-        // Wait a moment for all services to start
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Production startup preserves the existing grace period before
+        // exposing application routes. Test callers have the stronger
+        // lifecycle readiness wait in `start_test_server_with_grpc`, so an
+        // unconditional sleep here only lengthens every integration test.
+        if runtime_mode == ServerRuntimeMode::Production {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
 
         // Atomically expose API/WebSocket routes on the listener that has
         // served liveness throughout Redis bootstrap.
@@ -693,7 +837,7 @@ impl GameServer {
             "Game server {} listener and critical workers started", server_id
         );
 
-        let route_withdrawal_delay = if region == "test-region" {
+        let route_withdrawal_delay = if runtime_mode == ServerRuntimeMode::Test {
             Duration::ZERO
         } else {
             Duration::from_millis(
@@ -717,6 +861,7 @@ impl GameServer {
             fatal_rx,
             fatal_tx,
             route_withdrawal_delay,
+            runtime_mode,
             executor_cluster,
         })
     }
@@ -747,6 +892,10 @@ impl GameServer {
 
     /// Shutdown the server gracefully
     pub async fn shutdown(mut self) -> Result<()> {
+        if self.runtime_mode == ServerRuntimeMode::Test {
+            return self.shutdown_test_server().await;
+        }
+
         info!(
             "Starting graceful shutdown of game server {}",
             self.server_id
@@ -779,8 +928,10 @@ impl GameServer {
         let mut executor_drain =
             tokio::spawn(async move { executor_cluster.drain(executor_handoff_deadline).await });
         info!("Updating server status to 'draining'");
-        match tokio::time::timeout(
-            Duration::from_secs(2),
+        let status_deadline =
+            (tokio::time::Instant::now() + Duration::from_secs(2)).min(shutdown_deadline);
+        match tokio::time::timeout_at(
+            status_deadline,
             self.db
                 .update_server_status(self.server_id as i32, "draining"),
         )
@@ -908,6 +1059,53 @@ impl GameServer {
         info!("Game server {} shut down gracefully", self.server_id);
         Ok(())
     }
+
+    /// Tear down an integration-test server without performing a production
+    /// planned handoff. Tests isolate and flush their Redis state between
+    /// environments, and a typical test has no second executor coordinator to
+    /// accept ownership. Cancellation is therefore both the truthful failure
+    /// model and dramatically faster than waiting for partition lease expiry.
+    async fn shutdown_test_server(mut self) -> Result<()> {
+        info!("Stopping test game server {}", self.server_id);
+
+        let deadline = tokio::time::Instant::now() + TEST_SERVER_SHUTDOWN_TIMEOUT;
+        let deadline_unix_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(TEST_SERVER_SHUTDOWN_TIMEOUT.as_millis() as i64);
+
+        // Critical-worker wrappers report through `fatal_tx` and intentionally
+        // return `()` so the process supervisor can own the failure decision.
+        // Capture anything already queued before cancellation changes their
+        // exit classification, then drain once more after every wrapper joins.
+        let mut fatal_error = None;
+        append_queued_fatal_errors(&mut self.fatal_rx, &mut fatal_error);
+
+        // Make every observer see a terminal lifecycle before cancellation so
+        // expected task exits cannot be reported as critical failures.
+        self.lifecycle.begin_draining(deadline_unix_ms);
+        self.lifecycle.begin_stopping();
+        self.executor_cluster.begin_draining();
+        self.cancellation_token.cancel();
+
+        let shutdown_result =
+            join_test_service_tasks(self.handles.drain(..).collect(), deadline).await;
+        append_queued_fatal_errors(&mut self.fatal_rx, &mut fatal_error);
+
+        // Status is only an operational hint. Keep the test path best-effort
+        // and within the same bounded deadline so a dependency outage cannot
+        // turn teardown into the slowest part of the suite.
+        if tokio::time::Instant::now() < deadline {
+            let _ = tokio::time::timeout_at(
+                deadline,
+                self.db
+                    .update_server_status(self.server_id as i32, "offline"),
+            )
+            .await;
+        }
+
+        info!("Test game server {} stopped", self.server_id);
+        finish_test_shutdown(fatal_error, shutdown_result)
+    }
 }
 
 /// Helper function to start a game server for testing
@@ -925,7 +1123,31 @@ pub async fn start_test_server_with_grpc(
     db: Arc<dyn Database>,
     jwt_manager: JwtManager,
     jwt_verifier: Arc<dyn JwtVerifier>,
+    enable_grpc: bool,
+) -> Result<GameServer> {
+    start_test_server_with_grpc_and_mode(
+        db,
+        jwt_manager,
+        jwt_verifier,
+        enable_grpc,
+        true,
+        MATCH_READY_WINDOW_MS,
+    )
+    .await
+}
+
+/// Start the integration-test server wiring with an explicit lifecycle mode.
+/// Most tests use cancellation teardown; the production-mode shutdown
+/// regression test opts into the real planned-handoff branch with a short
+/// process-local deadline.
+#[doc(hidden)]
+pub async fn start_test_server_with_grpc_and_mode(
+    db: Arc<dyn Database>,
+    jwt_manager: JwtManager,
+    jwt_verifier: Arc<dyn JwtVerifier>,
     _enable_grpc: bool,
+    test_mode: bool,
+    match_ready_window_ms: i64,
 ) -> Result<GameServer> {
     // Get available ports
     let http_port = get_available_port();
@@ -967,6 +1189,8 @@ pub async fn start_test_server_with_grpc(
         redis_url: redis_url.clone(),
         boost_config: BoostConfig::default(),
         player_idle_config: PlayerIdleConfig::default(),
+        match_ready_window_ms,
+        test_mode,
     };
 
     let game_server = GameServer::start(config).await?;
@@ -1047,10 +1271,34 @@ pub async fn run_heartbeat_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_client_drain_after_executor_handoff, ecs_task_id_from_arn, resolve_boost_config,
+        ServerRuntimeMode, announce_client_drain_after_executor_handoff,
+        append_queued_fatal_errors, ecs_task_id_from_arn, finish_test_shutdown,
+        join_test_service_tasks, resolve_boost_config,
     };
     use crate::lifecycle::TaskLifecycle;
     use common::DEFAULT_BOOST_SPEED_MILLI;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn runtime_mode_keeps_production_off_the_test_shutdown_path() {
+        assert_eq!(
+            ServerRuntimeMode::from_test_mode(false),
+            ServerRuntimeMode::Production
+        );
+        assert_eq!(
+            ServerRuntimeMode::from_test_mode(true),
+            ServerRuntimeMode::Test
+        );
+    }
 
     #[test]
     fn boost_multiplier_config_supports_fractional_values_and_defaults() {
@@ -1118,5 +1366,77 @@ mod tests {
             &lifecycle, true, 5678
         ));
         assert_eq!(drain_rx.try_recv().unwrap().deadline_unix_ms, 5678);
+    }
+
+    #[tokio::test]
+    async fn test_service_join_propagates_task_panics() {
+        let task = tokio::spawn(async { panic!("synthetic service failure") });
+        let error = join_test_service_tasks(
+            vec![task],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("panicked service task must fail test shutdown");
+
+        assert!(
+            format!("{error:#}").contains("Test service task failed during shutdown"),
+            "unexpected shutdown error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_test_service_is_aborted_and_reaped() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("service task started");
+
+        let started = tokio::time::Instant::now();
+        let error = join_test_service_tasks(
+            vec![task],
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("hung service task must time out shutdown");
+
+        assert!(
+            format!("{error:#}").contains("Test service shutdown deadline elapsed"),
+            "unexpected shutdown error: {error:#}"
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "shutdown returned before the aborted service future was dropped"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "aborting and reaping a pending task was not bounded"
+        );
+    }
+
+    #[test]
+    fn queued_critical_worker_failure_makes_test_shutdown_fail() {
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut fatal_error = None;
+
+        // The first drain represents the check immediately before test
+        // cancellation. A worker can report in the small interval before its
+        // wrapper joins, so the second drain must observe that queued failure.
+        append_queued_fatal_errors(&mut fatal_rx, &mut fatal_error);
+        fatal_tx
+            .send(anyhow::anyhow!("synthetic critical worker failure"))
+            .expect("fatal receiver remains alive");
+        append_queued_fatal_errors(&mut fatal_rx, &mut fatal_error);
+
+        let error = finish_test_shutdown(fatal_error, Ok(()))
+            .expect_err("queued critical failure must make test teardown fail");
+        assert!(
+            format!("{error:#}").contains("synthetic critical worker failure"),
+            "fatal worker cause was lost: {error:#}"
+        );
     }
 }
