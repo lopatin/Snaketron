@@ -3,4 +3,13 @@
 /**
  * High score entry response format for frontend (for solo mode)
  */
-export type HighScoreEntryResponse = { rank: number, username: string, score: number, timestamp: string, gameId: string, };
+export type HighScoreEntryResponse = { rank: number,
+/**
+ * See [`LeaderboardEntryResponse::user_id`].
+ */
+userId: number, username: string, score: number, timestamp: string, gameId: string,
+/**
+ * See [`LeaderboardEntryResponse::is_guest`]. High-score names are
+ * historical snapshots, so this reflects the account today.
+ */
+isGuest: boolean, };

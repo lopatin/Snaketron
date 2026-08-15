@@ -106,6 +106,12 @@ pub trait Database: Send + Sync {
     ) -> Result<i32>; // Returns new MMR
     async fn get_user_mmrs(&self, user_ids: &[i32]) -> Result<HashMap<i32, (i32, i32)>>; // Returns (ranked_mmr, casual_mmr) for each user
 
+    /// Guest status for a batch of accounts, for callers rendering rosters of
+    /// public names. Display names are not unique across guests, so a name
+    /// alone cannot identify an account; only the ID can. IDs with no account
+    /// are absent from the map rather than defaulted.
+    async fn get_users_are_guests(&self, user_ids: &[i32]) -> Result<HashMap<i32, bool>>;
+
     // Ranking/leaderboard operations
     async fn upsert_ranking(
         &self,
