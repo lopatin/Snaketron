@@ -212,6 +212,13 @@ pub enum ScenarioCamera {
         deadzone: f32,
         #[serde(default = "default_camera_ease")]
         ease: f32,
+        /// Horizontal field of view in grid cells. `None` uses the player's
+        /// default. Authored per scenario because framing is a staging
+        /// decision, not a module constant: a shot staged on the vertical axis
+        /// needs a tighter window than one staged across the arena, and the
+        /// derived height (`width / aspect`) shrinks as output gets wider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width_cells: Option<f32>,
     },
     Track {
         keyframes: Vec<ScenarioCameraKeyframe>,
@@ -878,6 +885,7 @@ mod tests {
                     snake_id: 0,
                     deadzone: default_camera_deadzone(),
                     ease: default_camera_ease(),
+                    width_cells: None,
                 },
                 star_snake_id: Some(0),
                 ..Default::default()

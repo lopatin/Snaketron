@@ -24,8 +24,15 @@ EFFECTS = {
     "lut",
     "letterbox",
 }
+# Transition vocabulary. The smooth* and circle* families are eased rather
+# than linear, which is what a cut between two paper-ground shots wants — a
+# straight wipe reads mechanical. `fadewhite` replaces `fadeblack` on a light
+# product: flashing to black punches a hole in the value polarity the brand
+# gate enforces. Keep a trailer to two or three of these so the cut reads as
+# one visual language (see references/motion.md).
 TRANSITIONS = {
     "fadeblack": "fadeblack",
+    "fadewhite": "fadewhite",
     "dissolve": "dissolve",
     "pixelize": "pixelize",
     "slices": "hlslice",
@@ -33,6 +40,13 @@ TRANSITIONS = {
     "wipe_right": "wiperight",
     "wipe_up": "wipeup",
     "wipe_down": "wipedown",
+    "smooth_left": "smoothleft",
+    "smooth_right": "smoothright",
+    "smooth_up": "smoothup",
+    "smooth_down": "smoothdown",
+    "circle_open": "circleopen",
+    "circle_close": "circleclose",
+    "zoom_in": "zoomin",
 }
 ANCHOR_RE = re.compile(
     r"^meta:(?P<name>[A-Za-z0-9_.:\-]+?)(?P<offset>[+-](?:\d+(?:\.\d*)?|\.\d+))?$"
@@ -344,29 +358,40 @@ def _compile_clip(
             effect["src_resolved"] = str(_resolve_path(src, edl_dir))
         effects.append(effect)
 
-    text = None
-    if "text" in entry:
-        raw_text = entry["text"]
+    # A shot may carry several captions ("BOOST!" then "COMBOS!"), each with
+    # its own anchor and dwell. `text` stays supported as the single-caption
+    # spelling; both compile to the same `texts` list.
+    raw_texts = entry.get("texts")
+    if raw_texts is None:
+        raw_texts = [entry["text"]] if "text" in entry else []
+    if not isinstance(raw_texts, list):
+        raise EdlError(f"{field}.texts must be an array")
+
+    texts: list[dict[str, Any]] = []
+    for text_index, raw_text in enumerate(raw_texts):
+        label = f"{field}.texts[{text_index}]"
         if not isinstance(raw_text, dict) or not isinstance(raw_text.get("value"), str):
-            raise EdlError(f"{field}.text.value must be a string")
-        text = dict(raw_text)
+            raise EdlError(f"{label}.value must be a string")
+        item = dict(raw_text)
         text_at_source = resolve_source_time(
-            raw_text.get("at", source_in), anchors, f"{field}.text.at"
+            raw_text.get("at", source_in), anchors, f"{label}.at"
         )
         duration_source = _number(
             raw_text.get("dur", min(1.5, source_out - text_at_source)),
-            f"{field}.text.dur",
+            f"{label}.dur",
             positive=True,
         )
-        text["at_source"] = text_at_source
-        text["at_local"] = map_source_to_output(text_at_source, speed)
-        text["dur_output"] = max(
+        item["at_source"] = text_at_source
+        item["at_local"] = map_source_to_output(text_at_source, speed)
+        item["dur_output"] = max(
             1 / output["fps"],
             map_source_to_output(
                 min(text_at_source + duration_source, source_out), speed
             )
-            - text["at_local"],
+            - item["at_local"],
         )
+        texts.append(item)
+    text = texts[0] if texts else None
 
     sfx: list[dict[str, Any]] = []
     raw_sfx = entry.get("sfx", [])
@@ -403,6 +428,7 @@ def _compile_clip(
         "tail_adjust": 0.0,
         "effects": effects,
         "text": text,
+        "texts": texts,
         "sfx": sfx,
     }
     segment["filters"] = {"video": _effect_filters(effects, output["w"], output["h"])}
@@ -587,8 +613,8 @@ def compile_edl(edl_path: Path, clips_dir: Path | None = None) -> dict[str, Any]
         segment["global_end"] = start + segment["output_duration"]
         for effect in segment["effects"]:
             effect["at_global"] = start + effect["at_local"]
-        if segment.get("text"):
-            segment["text"]["at_global"] = start + segment["text"]["at_local"]
+        for item in segment.get("texts", []):
+            item["at_global"] = start + item["at_local"]
         for sfx in segment["sfx"]:
             sfx["at_global"] = start + sfx["at_local"]
         cursor = segment["global_end"]

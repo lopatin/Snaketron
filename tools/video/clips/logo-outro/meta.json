@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scenario_id": "logo-outro",
+  "fixture_id": "logo-outro",
+  "source_kind": "fixture-card",
+  "source_file": "http://127.0.0.1:3000/qa/trailer-card?card=logo-outro&ms=4000",
+  "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_params": {},
+  "capture_vfps": 60,
+  "encoded_fps": 60,
+  "width": 1920,
+  "height": 1080,
+  "duration": 4,
+  "duration_ms": 4000,
+  "frame_count": 240,
+  "capture_path": "contract-screenshot",
+  "deterministic_scope": "same-machine-software-raster",
+  "rendered_tick": 4000,
+  "anchors": {
+    "logo": 0.2
+  },
+  "cue_track": {
+    "anchors": {
+      "logo": 0.2
+    },
+    "duration": 3,
+    "capture_vfps": 60,
+    "encoded_fps": 60
+  },
+  "cue_timeline": [
+    {
+      "type": "logo",
+      "at_master_seconds": 0.2
+    }
+  ],
+  "master_sha256": "2c6dc9f4fa03dfae616159c07fb19761701d854955b58f286a9c0281fba8d7c5",
+  "master_file": "master.mkv"
+}

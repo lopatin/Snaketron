@@ -2,11 +2,18 @@
   "format_version": 1,
   "id": "boost-combo-clutch",
   "world": {
-    "game_type": "Solo",
+    "game_type": {
+      "FreeForAll": {
+        "max_players": 2
+      }
+    },
     "queue_mode": "Quickmatch",
     "rng_seed": null,
     "overrides": {
-      "combo": { "window_ms": 2000, "max_food_value": 3 },
+      "combo": {
+        "window_ms": 2000,
+        "max_food_value": 3
+      },
       "player_idle_timeout_ms": 600000
     }
   },
@@ -15,35 +22,84 @@
       {
         "user_id": 1,
         "name": "CLUTCH PILOT",
-        "body": [{ "x": 10, "y": 20 }, { "x": 7, "y": 20 }],
-        "direction": "Right"
+        "body": [
+          {
+            "x": 4,
+            "y": 16
+          },
+          {
+            "x": 1,
+            "y": 16
+          }
+        ],
+        "direction": "Right",
+        "boost_charge_ms": 1500
       }
     ],
     "food": [
-      { "x": 19, "y": 20 },
-      { "x": 20, "y": 20 },
-      { "x": 21, "y": 20 },
-      { "x": 22, "y": 20 },
-      { "x": 23, "y": 20 },
-      { "x": 24, "y": 20 },
-      { "x": 25, "y": 20 },
-      { "x": 26, "y": 20 }
+      {
+        "x": 16,
+        "y": 16
+      },
+      {
+        "x": 19,
+        "y": 16
+      },
+      {
+        "x": 34,
+        "y": 28
+      },
+      {
+        "x": 9,
+        "y": 25
+      },
+      {
+        "x": 22,
+        "y": 33
+      },
+      {
+        "x": 30,
+        "y": 9
+      },
+      {
+        "x": 13,
+        "y": 6
+      },
+      {
+        "x": 37,
+        "y": 20
+      }
     ],
     "start_tick": 0
   },
   "commands": [
-    { "at_tick": 16, "user_id": 1, "command": "ActivateBoost" },
-    { "at_tick": 28, "user_id": 1, "command": { "Turn": "Down" } },
-    { "at_tick": 46, "user_id": 1, "command": { "Turn": "Left" } },
-    { "at_tick": 64, "user_id": 1, "command": { "Turn": "Up" } },
-    { "at_tick": 82, "user_id": 1, "command": { "Turn": "Right" } }
+    {
+      "at_tick": 0,
+      "user_id": 1,
+      "command": "ActivateBoost"
+    },
+    {
+      "at_tick": 40,
+      "user_id": 1,
+      "command": {
+        "Turn": "Down"
+      }
+    }
   ],
-  "run_ticks": 100,
+  "run_ticks": 70,
   "presentation": {
-    "camera": { "Follow": { "snake_id": 0 } },
+    "camera": {
+      "Follow": {
+        "snake_id": 0,
+        "width_cells": 18.0
+      }
+    },
     "default_time_scale": 1.0,
     "star_snake_id": 0,
-    "addons": { "combo_callout": true, "boost_meter": true }
+    "addons": {
+      "combo_callout": true,
+      "boost_meter": true
+    }
   },
   "expect": []
 }

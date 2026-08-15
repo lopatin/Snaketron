@@ -9,25 +9,58 @@ Follow this workflow. Keep source timing in structured JSON; never hand-author a
 
 1. Turn the brief into a 30–45 second shot list with one idea per shot and an explicit payoff.
    Start from `assets/launch-trailer/brief.md` and `launch-trailer.edl.json` for the launch sequence.
+   Read [references/narrative.md](references/narrative.md) first — it covers captions, hook, energy, and motion vocabulary, and every rule in it comes from a defect that shipped.
+   **Then stage each gameplay shot so the payoff is actually on camera** — see "Shot composition" below. This is the step that is easiest to skip and most expensive to get wrong: a shot whose advertised moment happens off-frame passes every automated check in this skill.
 2. Reuse `tools/video/clips/<slug>/master.mkv` plus `meta.json` when its scenario, seed, and `capture_vfps` fit. Otherwise run `node scripts/capture.mjs ...`. Capture slow motion at the VFPS required by the intended rate.
-   For rank-up and leaderboard hero shots, serve and capture the deterministic fixtures described in [references/fixture-cards.md](references/fixture-cards.md).
+   For non-gameplay frames (logo slates, rank up, rankings) capture the **real app components** from the dev-only `/qa/trailer-card` route, so the video shows the product's own animation rather than a drawn replica:
 
    ```bash
-   node scripts/capture_card.mjs --card rank-up --out tools/video/clips/rank-up-card --capture-vfps 60
-   node scripts/capture_card.mjs --card leaderboard --out tools/video/clips/leaderboard-card --capture-vfps 60
+   # dev server must be running (npm start on :3000)
+   node scripts/capture_card.mjs --url "http://127.0.0.1:3000/qa/trailer-card?card=rank-up&ms=6000" \
+     --out tools/video/clips/rank-up --capture-vfps 60 --duration-ms 6000 --virtual-time
    ```
+
+   Cards: `logo-intro`, `logo-outro`, `rank-up`, `rankings`. Add new ones in
+   `client/web/components/TrailerCardQA.tsx` — they must be a pure function of
+   `elapsedMs` and expose the capture contract. The standalone HTML fixtures in
+   `assets/cards/` remain only as a no-dev-server fallback ([references/fixture-cards.md](references/fixture-cards.md)).
 3. Author an EDL using [references/edl.md](references/edl.md). Place effects, text, and SFX against `meta:` cues in source-master seconds. Use [references/brand.md](references/brand.md) for visual and audio direction.
-4. Extract a music grid, compile, and preview:
+4. Extract a music grid, fit the cuts to it, compile, and preview:
 
    ```bash
    python3 scripts/beats.py music.wav -o music.beats.json
+   python3 scripts/fit_beats.py trailer.edl.json --clips-dir tools/video/clips
    python3 scripts/compile_edl.py trailer.edl.json --clips-dir tools/video/clips -o trailer.compiled.json
    python3 scripts/render.py trailer.compiled.json --profile preview -o trailer-preview.mp4
    python3 scripts/review.py trailer-preview.mp4 --compiled trailer.compiled.json --strip review.jpg
    ```
 
+   `fit_beats.py` exists because changing any shot's length moves every later
+   cut; never hand-solve the beat grid.
+
 5. Inspect the frame strip and preview. Revise the EDL, not generated filter syntax. Preserve event timing and narrative clarity before adding more effects.
 6. Render the approved master with `--profile final`; run `review.py --strict --fps 60`; complete its manual checklist.
+
+## Shot composition
+
+A gameplay capture is a staged shot, not a recording of whatever the camera happened to hold.
+
+- **The payoff must be on camera.** Every participant in the advertised event — for an elimination, *both* the killer and the victim — is inside the camera rect through the whole beat. `Follow` tracks one snake's head, so an event that happens away from that head can be entirely off-frame. Stage the kill within ~2 cells of the star's head: have the star cross the victim's path just ahead of it so the victim strikes the body right behind the head. The native guard `cargo test -p client trailer_payoffs` asserts this for every checked-in trailer scenario and prints the offending cell and camera rect when it fails.
+- **Set the field of view explicitly.** `presentation.camera.Follow.width_cells` is the horizontal window in grid cells (default 26). Height is derived as `width / aspect`, so at 16:9 a 26-cell window is only 14.6 cells tall — stage vertical action tighter (18–20 cells) or it falls out of frame top and bottom.
+- **Give the frame scale references.** A scenario with `rng_seed: null` and an empty `pose.food` has *no food at all* — pose food explicitly. Keep a wall, team zone, or opponent in view. Target ≥ 15% non-background ink; build 1 shipped 6.5%.
+- **Check the HUD survives capture.** Addons that render as siblings below the arena viewport (the boost meter) are clipped by capture mode's full-bleed layout. If a shot advertises Boost, confirm the meter is actually in frame.
+- **Keep the subject large.** At the focus frame the subject's bounding box should span ≥ ⅓ of frame width. `punch_in` is a centre crop and cannot reframe a bad plate — fix framing at capture time.
+
+## Narrative and energy
+
+Full detail in [references/narrative.md](references/narrative.md); the rules that most often get skipped:
+
+- **Every scene has a caption.** Alternate a `quiet` setup line with an `impact` payoff line anchored to the moment it names. A scene with no caption is a scene the viewer cannot read in time.
+- **Hook inside 5 seconds** — keep the intro slate short and land the biggest moment by ~4s.
+- **Never cut a static screenshot into a moving video.** Capture the real component animating (`/qa/trailer-card`), and give every non-gameplay card the drifting dot field so it stays alive.
+- **Default to 1.0× speed.** Cell-stepped snake motion reads as dropped frames in slow motion; only slow footage captured at matching high VFPS.
+- **One motion vocabulary** — two or three transitions, non-linear easing throughout, effects as brief accents. No vignette or grain on a paper ground.
+- **Captions sit in the band at ~0.655–0.75 frame height, left-aligned**, clear of the boost meter (bottom 12%), the centre score readout, and the top combo callout.
 
 Enforce these guardrails:
 
@@ -39,6 +72,7 @@ Enforce these guardrails:
 - Prefer user-provided licensed music, then documented CC0/original assets. Record every asset in `assets/LICENSES.json`.
 - Mix at 48 kHz, duck music beneath SFX, and apply `loudnorm=I=-14:TP=-1.5` last.
 - Use only named effects and transitions. Read [references/ffmpeg-recipes.md](references/ffmpeg-recipes.md) when extending the vocabulary.
+- Length comes from more content, never from holding a finished animation on screen — the duplicate-frame check will fail it, and it kills the energy anyway.
 - Keep Remotion optional; verify its current commercial license before using it for a team of four or more.
 
 Use `--dry-run` on `render.py` to inspect commands without rendering. Reuse `.video-cache/segments`; invalidate only segments whose source, timing, effects, font, or output contract changed.

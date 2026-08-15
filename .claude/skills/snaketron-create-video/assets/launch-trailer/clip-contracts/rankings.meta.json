@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scenario_id": "rankings",
+  "fixture_id": "rankings",
+  "source_kind": "fixture-card",
+  "source_file": "http://127.0.0.1:3000/qa/trailer-card?card=rankings",
+  "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_params": {},
+  "capture_vfps": 60,
+  "encoded_fps": 60,
+  "width": 1920,
+  "height": 1080,
+  "duration": 6,
+  "duration_ms": 6000,
+  "frame_count": 360,
+  "capture_path": "contract-screenshot",
+  "deterministic_scope": "same-machine-software-raster",
+  "rendered_tick": 6000,
+  "anchors": {
+    "icons": 0.5
+  },
+  "cue_track": {
+    "anchors": {
+      "icons": 0.5
+    },
+    "duration": 5,
+    "capture_vfps": 60,
+    "encoded_fps": 60
+  },
+  "cue_timeline": [
+    {
+      "type": "icons",
+      "at_master_seconds": 0.5
+    }
+  ],
+  "master_sha256": "f610f9f726dfeb1b963ad9cb44cfe2cd15e12420384340d4ae186ad100b8fe99",
+  "master_file": "master.mkv"
+}

@@ -42,6 +42,7 @@ import {
   scenarioViewerElapsedMs,
 } from '../utils/scenarioPlayback';
 import { loadScenarioSprite } from '../utils/scenarioAssets';
+import { isScenarioCaptureMode } from '../utils/scenarioCaptureMode';
 import { initWasm } from '../wasm';
 import BoostMeter from './BoostMeter';
 import ComboCallout from './ComboCallout';
@@ -478,7 +479,15 @@ const ScenarioCanvas = forwardRef<ScenarioCanvasHandle, ScenarioCanvasProps>(({
       if (bounds.width <= 0 || bounds.height <= 0) {
         return false;
       }
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      // Interactive embeds cap DPR at 2 to bound cost. Capture deliberately
+      // does not: it renders a small CSS viewport at a high deviceScaleFactor
+      // so the arena keeps the game's real cell size (≤15 CSS px) while the
+      // frame still lands at 1080p. Capping here would force the renderer to
+      // zoom instead, which is what threw the food/grid out of proportion with
+      // the DOM addons.
+      const pixelRatio = isScenarioCaptureMode()
+        ? window.devicePixelRatio || 1
+        : Math.min(window.devicePixelRatio || 1, 2);
       const width = Math.max(1, Math.round(bounds.width * pixelRatio));
       const height = Math.max(1, Math.round(bounds.height * pixelRatio));
       if (canvas.width !== width) {

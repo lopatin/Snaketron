@@ -261,7 +261,14 @@ export const getCrashExplosionRenderState = (
     arenaHeight,
     rotation,
   );
-  const baseSize = clamp(cellSize * 7.5, 72, 120);
+  // The blast is sized in cells (7.5 across) so it stays proportional to the
+  // snakes it destroys. The lower bound keeps it readable when the arena is
+  // drawn small — a crowded 60x40 board on a laptop — but there is deliberately
+  // no upper bound: capping it made the explosion shrink relative to everything
+  // else at large cell sizes, which is exactly what a high-DPI capture uses.
+  // At the game's own 15px cell this is 112.5px, identical to the old clamp,
+  // so live gameplay is unchanged.
+  const baseSize = Math.max(72, cellSize * 7.5);
   const swell = reducedMotion ? 1 : 0.96 + easeOutCubic(progress) * 0.08;
   const fadeProgress = clamp((progress - 0.8) / 0.2, 0, 1);
   const drawSize = baseSize * swell;

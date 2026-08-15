@@ -16,7 +16,17 @@ import {
 const requireFromWeb = createRequire(new URL('../../client/web/package.json', import.meta.url));
 const { chromium } = requireFromWeb('@playwright/test');
 
-const VIEWPORT = { width: 1920, height: 1080 };
+// Lay the page out as a real browser and reach 1080p with deviceScaleFactor
+// rather than by zooming the arena. The game caps its cell size at 15 CSS px
+// (client/web/components/GameArena.tsx:679), so a 640x360 CSS viewport at DSF 3
+// renders 1920x1080 device pixels with the arena, boost meter and callouts in
+// exactly the proportions the product shows on a large monitor.
+const VIEWPORT = { width: 480, height: 270 };
+const DEVICE_SCALE_FACTOR = 4;
+const OUTPUT_SIZE = {
+  width: VIEWPORT.width * DEVICE_SCALE_FACTOR,
+  height: VIEWPORT.height * DEVICE_SCALE_FACTOR,
+};
 const DEFAULT_URL = 'http://127.0.0.1:3000';
 const STARTUP_FRAME_INTERVAL_MS = 1000 / 60;
 const CAPTURE_FRAME_TIME_BASE_MS = 1_000_000;
@@ -336,7 +346,7 @@ async function main() {
   try {
     const context = await browser.newContext({
       viewport: VIEWPORT,
-      deviceScaleFactor: 1,
+      deviceScaleFactor: DEVICE_SCALE_FACTOR,
       colorScheme: 'dark',
       reducedMotion: 'no-preference',
     });
@@ -530,8 +540,8 @@ async function main() {
       source_sha256: captureSource.sourceSha256,
       capture_vfps: options.captureVfps,
       encoded_fps: options.captureVfps,
-      width: VIEWPORT.width,
-      height: VIEWPORT.height,
+      width: OUTPUT_SIZE.width,
+      height: OUTPUT_SIZE.height,
       duration: durationMs / 1000,
       duration_ms: durationMs,
       scenario_duration_ms: initial.durationMs,

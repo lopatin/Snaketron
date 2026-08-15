@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "scenario_id": "leaderboard-card",
+  "fixture_id": "leaderboard-card",
+  "source_kind": "fixture-card",
+  "source_file": "leaderboard.html",
+  "source_sha256": "9afb9b3fb89b486b5f009da658e6c83820299de290bdcf7ada9066b74409b506",
+  "source_params": {},
+  "capture_vfps": 60,
+  "encoded_fps": 60,
+  "width": 1920,
+  "height": 1080,
+  "duration": 6,
+  "duration_ms": 6000,
+  "frame_count": 360,
+  "capture_path": "contract-screenshot",
+  "deterministic_scope": "same-machine-software-raster",
+  "rendered_tick": 6000,
+  "anchors": {
+    "crown": 1.5,
+    "rows": 0.85
+  },
+  "cue_track": {
+    "anchors": {
+      "rows": 0.85,
+      "crown": 1.5
+    },
+    "duration": 4,
+    "capture_vfps": 60,
+    "encoded_fps": 60
+  },
+  "cue_timeline": [
+    {
+      "type": "crown",
+      "at_master_seconds": 1.5
+    },
+    {
+      "type": "rows",
+      "at_master_seconds": 0.85
+    }
+  ],
+  "master_sha256": "97b6906729f413afe143cb241fa7c056cb1b77c858281302c080e59b7fce6495",
+  "master_file": "master.mkv"
+}

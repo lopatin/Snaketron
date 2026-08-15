@@ -12,16 +12,13 @@
   font-variant-numeric: tabular-nums;
 }
 
-html[data-scenario-capture="true"] .scenario-canvas {
-  font-family: "Snaketron Capture Sans", Arial, sans-serif;
-}
-
-html[data-scenario-capture="true"] .scenario-canvas .game-combo-callout__burst,
-html[data-scenario-capture="true"] .scenario-canvas .scenario-canvas__message {
-  font-family: "Snaketron Capture Black", "Arial Black", Impact, sans-serif;
-  font-style: italic;
-  font-weight: 800;
-}
+/* Capture mode deliberately does NOT override typography. Substituting a
+   different family (build 1 used Barlow Condensed) makes the footage
+   typographically not the product — the brand-fidelity requirement (PRD P3.5)
+   allows pinning a metric-compatible substitute for determinism, not a
+   different face. Docker capture images resolve Arial/Arial Black through
+   tools/video/fonts-local.conf; macOS resolves the real faces. Each host is
+   internally deterministic, which is what reproducible capture requires. */
 
 .scenario-canvas__viewport {
   position: relative;
@@ -442,6 +439,30 @@ html[data-scenario-capture="true"] .scenario-canvas .scenario-canvas__message {
 .scenario-capture .scenario-canvas__viewport {
   border: 0;
   box-shadow: none;
+}
+
+/* The boost meter is a sibling below the viewport in normal layout, so a
+   full-bleed capture grid pushes it past 100dvh where `overflow: hidden` eats
+   it — build 1 authored `boost_meter: true` and captured no meter at all,
+   advertising Boost while showing none of its UI. In capture mode it becomes
+   an in-frame overlay so an addon a scenario switches on is actually visible.
+   `position: relative` on the canvas gives it a containing block. */
+.scenario-capture .scenario-canvas {
+  position: relative;
+}
+
+.scenario-capture .scenario-canvas__boost {
+  position: absolute;
+  z-index: 3;
+  right: 0;
+  bottom: 2.6%;
+  left: 0;
+  /* The live game runs the meter the full width of the arena
+     (.scenario-canvas__boost is `calc(100% - 20px)` in normal layout), so keep
+     it wide here too rather than shrinking it into a badge. */
+  width: calc(100% - 40px);
+  margin: 0 auto;
+  pointer-events: none;
 }
 
 /* Home marketing embed ------------------------------------------------- */

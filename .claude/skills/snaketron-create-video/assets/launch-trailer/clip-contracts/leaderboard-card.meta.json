@@ -1,7 +1,0 @@
-{
-  "fixture": "assets/cards/leaderboard.html",
-  "capture_vfps": 60,
-  "encoded_fps": 60,
-  "duration": 4.0,
-  "anchors": { "rows": 0.85, "crown": 1.5 }
-}

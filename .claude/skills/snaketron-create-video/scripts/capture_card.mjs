@@ -21,7 +21,7 @@ const CARD_ALIASES = new Map([
 function usage(message) {
   if (message) process.stderr.write(`${message}\n\n`);
   process.stderr.write(
-    "Usage: node scripts/capture_card.mjs --card <rank-up|leaderboard> --out <clip-dir> " +
+    "Usage: node scripts/capture_card.mjs (--card <rank-up|leaderboard> | --url <route>) --out <clip-dir> " +
       "[--capture-vfps 60] [--duration-ms 4000] [--width 1920] [--height 1080] " +
       "[--param key=value] [--headless-shell PATH] [--virtual-time]\n",
   );
@@ -47,10 +47,11 @@ function parseArgs(argv) {
     if (key === "param") params.push(value);
     else values[key] = value;
   }
-  if (!values.card) usage("--card is required");
   if (!values.out) usage("--out is required");
-  const cardFile = CARD_ALIASES.get(values.card);
-  if (!cardFile) usage("--card must be rank-up or leaderboard");
+  const routeUrl = values.url ?? null;
+  if (!values.card && !routeUrl) usage("--card or --url is required");
+  const cardFile = values.card ? CARD_ALIASES.get(values.card) : null;
+  if (values.card && !cardFile) usage("--card must be rank-up or leaderboard");
   const captureVfps = Number(values["capture-vfps"] ?? 60);
   const width = Number(values.width ?? 1920);
   const height = Number(values.height ?? 1080);
@@ -71,8 +72,15 @@ function parseArgs(argv) {
     query.append(item.slice(0, separator), item.slice(separator + 1));
   }
   return {
-    fixtureId: values.card.startsWith("rank") ? "rank-up-card" : "leaderboard-card",
-    cardPath: resolve(SKILL_DIR, "assets", "cards", cardFile),
+    fixtureId:
+      values.id ??
+      (routeUrl
+        ? new URL(routeUrl).searchParams.get("card") ?? "route-card"
+        : values.card.startsWith("rank")
+          ? "rank-up-card"
+          : "leaderboard-card"),
+    routeUrl,
+    cardPath: cardFile ? resolve(SKILL_DIR, "assets", "cards", cardFile) : null,
     outDir: resolve(values.out),
     captureVfps,
     durationMs,
@@ -102,6 +110,9 @@ function sha256(parts) {
 }
 
 async function sourceDigest(cardPath, query) {
+  // A route-backed card has no single source file; its identity is the URL.
+  // The app bundle behind it is covered by the dev server, not this digest.
+  if (cardPath === null) return sha256([Buffer.from(query.toString())]);
   const fontDir = resolve(SKILL_DIR, "assets", "fonts");
   return sha256(
     await Promise.all([
@@ -235,13 +246,20 @@ async function main() {
     page.on("pageerror", (error) => {
       process.stderr.write(`browser page error: ${error.stack ?? error.message}\n`);
     });
+    const routeOrigin = options.routeUrl ? new URL(options.routeUrl).origin : null;
     await page.route("**/*", async (route) => {
-      const protocol = new URL(route.request().url()).protocol;
-      if (["file:", "data:", "blob:"].includes(protocol)) await route.continue();
+      const url = new URL(route.request().url());
+      const allowed = ["file:", "data:", "blob:"].includes(url.protocol) ||
+        (routeOrigin !== null && url.origin === routeOrigin);
+      if (allowed) await route.continue();
       else await route.abort("blockedbyclient");
     });
-    const target = pathToFileURL(options.cardPath);
-    target.search = options.query.toString();
+    const target = options.routeUrl
+      ? new URL(options.routeUrl)
+      : pathToFileURL(options.cardPath);
+    if (options.query.toString()) {
+      for (const [key, value] of options.query) target.searchParams.set(key, value);
+    }
     await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await page.waitForFunction(() => Boolean(window.__SNAKETRON_CAPTURE__), null, {
       timeout: 30_000,
@@ -307,7 +325,7 @@ async function main() {
       scenario_id: options.fixtureId,
       fixture_id: options.fixtureId,
       source_kind: "fixture-card",
-      source_file: basename(options.cardPath),
+      source_file: options.cardPath ? basename(options.cardPath) : options.routeUrl,
       source_sha256: await sourceDigest(options.cardPath, options.query),
       source_params: Object.fromEntries(options.query),
       capture_vfps: options.captureVfps,

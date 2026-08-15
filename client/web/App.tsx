@@ -30,6 +30,11 @@ import {
 
 // Design-review harness for the post-match rating reveal. Only reachable —
 // and only bundled — outside production builds.
+const TrailerCardQA =
+  process.env.NODE_ENV !== 'production'
+    ? React.lazy(() => import('./components/TrailerCardQA'))
+    : null;
+
 const RatingRevealQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/RatingRevealQA'))
   : null;
@@ -177,6 +182,16 @@ function AppContent() {
             </ProtectedRoute>
           }
         />
+        {TrailerCardQA && (
+          <Route
+            path="/qa/trailer-card"
+            element={
+              <React.Suspense fallback={null}>
+                <TrailerCardQA />
+              </React.Suspense>
+            }
+          />
+        )}
         {RatingRevealQA && (
           <Route
             path="/qa/rating-reveal"

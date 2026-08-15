@@ -46,28 +46,18 @@ export const installScenarioCaptureNetworkStubs = (): void => {
   window.__SNAKETRON_CAPTURE_NETWORK_STUBS__ = true;
   document.documentElement.dataset.scenarioCapture = 'true';
 
-  // Canvas text otherwise resolves to CoreText Arial on macOS and a
-  // fontconfig substitute in Docker. Register capture-only author fonts under
-  // the names already used by the production renderer, then include their
-  // explicit load promise in ScenarioCanvas.ready(). Dynamic FontFace entries
-  // exist only in this capture document, so normal gameplay typography is not
-  // changed.
-  const captureFonts = [
-    new FontFace(
-      'Snaketron Capture Sans',
-      'url("/capture-fonts/Inter-Variable.ttf")',
-      { style: 'normal', weight: '100 900' },
-    ),
-    new FontFace(
-      'Snaketron Capture Black',
-      'url("/capture-fonts/BarlowCondensed-ExtraBoldItalic.ttf")',
-      { style: 'italic', weight: '800' },
-    ),
-  ];
-  captureFonts.forEach((font) => document.fonts.add(font));
-  window.__SNAKETRON_CAPTURE_FONTS_READY__ = Promise.all(
-    captureFonts.map((font) => font.load()),
-  ).then(() => undefined);
+  // Typography is deliberately NOT overridden here. Build 1 registered Barlow
+  // Condensed / Inter under capture-only names for cross-host determinism,
+  // which made the captured footage typographically not the product — the
+  // trailer advertised a game that renders in Arial Black while showing a
+  // condensed italic face the app never loads. Brand fidelity (PRD P3.5)
+  // permits a metric-compatible substitute, not a different family: Docker
+  // capture images pin Liberation Sans for Arial/Arial Black through
+  // tools/video/fonts-local.conf, and macOS resolves the real faces. Each host
+  // stays internally deterministic, which is what reproducible capture needs.
+  window.__SNAKETRON_CAPTURE_FONTS_READY__ = document.fonts.ready.then(
+    () => undefined,
+  );
 
   const nativeFetch = window.fetch.bind(window);
   window.fetch = (async (input, init) => {

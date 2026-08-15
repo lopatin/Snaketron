@@ -1,10 +1,27 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="480" viewBox="0 0 1600 480" role="img" aria-labelledby="title">
   <title id="title">SnakeTron</title>
-  <rect width="1600" height="480" fill="#3F3F41"/>
-  <path d="M120 90H1480" stroke="#3B82F6" stroke-width="12"/>
-  <path d="M190 390H1410" stroke="#EF4444" stroke-width="12"/>
-  <g transform="skewX(-9)">
-    <text x="800" y="305" fill="#FFFFFF" stroke="#3F3F41" stroke-width="5" paint-order="stroke" text-anchor="middle" font-family="Barlow Condensed, Arial Narrow, sans-serif" font-size="230" font-weight="800" font-style="italic" letter-spacing="8">SNAKETRON</text>
+  <!--
+    Paper ground with the arena's grid-dot motif (render.rs:1583, 1718).
+    Logotype is BOLD ITALIC per the checked-in design contract
+    (client/web/CLAUDE.md:7-9: "the logo is a stylized SNAKETRON in bold,
+    italics"), set in the app's own Arial Black stack. The skew IS the italic —
+    it is a logotype treatment, not the panel-construction skew that
+    references/brand.md forbids on cards.
+  -->
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="12" cy="12" r="1" fill="#d1d5db"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="480" fill="#ffffff"/>
+  <rect width="1600" height="480" fill="url(#grid)"/>
+  <!-- Energy rule, matched to the logotype's slant. -->
+  <path d="M186 116H1446" stroke="#3b82f6" stroke-width="8" transform="skewX(-10)" transform-origin="800 240"/>
+  <g transform="skewX(-10)" transform-origin="800 240">
+    <text x="800" y="312" fill="#14181f" text-anchor="middle"
+          font-family="Arial Black, Arial, sans-serif" font-size="196"
+          font-weight="900" font-style="italic" letter-spacing="2">SNAKETRON</text>
   </g>
-  <path d="M1170 330h210v26h-210z" fill="#F8C84A"/>
+  <!-- NOS orange signature accent (render.rs:80) — the boost-canister colour. -->
+  <path d="M690 360h220v10H690z" fill="#ff641e" transform="skewX(-10)" transform-origin="800 240"/>
 </svg>

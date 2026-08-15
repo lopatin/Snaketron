@@ -15,9 +15,68 @@ from pathlib import Path
 from typing import Any
 
 
-RENDERER_VERSION = 1
+RENDERER_VERSION = 6
 SKILL_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_FONT = SKILL_DIR / "assets" / "fonts" / "BarlowCondensed-ExtraBoldItalic.ttf"
+
+# Brand ground truth (see references/brand.md). SnakeTron is a light product:
+# the arena clears to #ffffff (client/src/render.rs:1583) and every panel sits
+# on paper. Graphite is ink and rule, never a fill.
+PAPER = "#FFFFFF"
+INK = "#14181f"
+GAME_BLUE = "#3b82f6"
+GAME_MUTED = "#667085"
+
+# Display type is the app's own stack — Arial Black on the canvas
+# (client/src/render.rs:286,1465,1519). Docker capture images pin a
+# metric-compatible substitute via tools/video/fonts-local.conf; we resolve the
+# same family here rather than shipping a font the product does not use.
+_FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/Supplemental/Arial Black.ttf"),
+    Path("/Library/Fonts/Arial Black.ttf"),
+    Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+)
+
+
+def _resolve_display_font() -> Path:
+    for candidate in _FONT_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    raise RenderError(
+        "no Arial Black (or metric-compatible Liberation Sans Bold) font found; "
+        "install it in the capture image — see tools/video/fonts-local.conf"
+    )
+
+
+# Caption band. The arena's boost meter occupies roughly the bottom 12% of a
+# gameplay frame, and the game's own score/combo callouts land centre and top —
+# so trailer captions sit left, in the band between, with clear air around them.
+CAPTION_SIZE_FRAC = 0.072
+CAPTION_BASE_Y_FRAC = 0.655
+CAPTION_STACK_Y_FRAC = 0.092
+
+
+def _segment_texts(segment: dict[str, Any]) -> list[dict[str, Any]]:
+    """Captions for a segment, tolerating the single-caption spelling."""
+    texts = segment.get("texts")
+    if texts:
+        return texts
+    single = segment.get("text")
+    return [single] if single else []
+
+
+def _caption_y_frac(item: dict[str, Any]) -> float:
+    """Vertical position for a caption, as a fraction of frame height.
+
+    `line` stacks captions that share the screen (BOOST! above COMBOS!) so a
+    second caption never lands on top of the first.
+    """
+    line = int(item.get("line", 0))
+    return CAPTION_BASE_Y_FRAC + line * CAPTION_STACK_Y_FRAC
+
+
+PRODUCT_LOGO = SKILL_DIR.parents[2] / "client" / "web" / "SnaketronLogo.png"
+DEFAULT_FONT = _resolve_display_font()
 
 
 class RenderError(RuntimeError):
@@ -70,10 +129,14 @@ def _drawtext(
         rendered_text = (
             text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
         )
+    # Type sits on paper or on gameplay, both light. A thin white halo is the
+    # app's own treatment for labels over the arena (render.rs:2071-2072); the
+    # 8px hard offset shadow that shipped in build 1 is broadcast-package
+    # styling that appears nowhere in the product.
     result = (
         f"drawtext=fontfile='{font}':text='{rendered_text}':"
-        f"fontsize={size}:fontcolor={color}:borderw=2:bordercolor=#3F3F41:"
-        f"shadowx=8:shadowy=8:shadowcolor=black@0.8:x='{x}':y='{y}'"
+        f"fontsize={size}:fontcolor={color}:borderw=3:bordercolor={PAPER}:"
+        f"x='{x}':y='{y}'"
     )
     if enable:
         result += f":enable='{enable}'"
@@ -147,37 +210,46 @@ def _segment_filter(
             chain_input = "[speed]"
         chain = [
             f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos",
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#3F3F41",
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color={PAPER}",
             "setsar=1",
         ]
         chain.extend(segment.get("filters", {}).get("video", []))
-        text = segment.get("text")
-        if text and use_drawtext:
-            start = float(text["at_local"])
-            end = start + float(text["dur_output"])
-            style = text.get("style", "impact")
-            color = "#F8C84A" if style == "impact" else "white"
-            chain.append(
-                _drawtext(
-                    text["value"].upper(),
-                    font,
-                    max(48, round(height * 0.085)),
-                    color,
-                    y="h*0.74-text_h/2",
-                    enable=f"between(t\\,{start:.6f}\\,{end:.6f})",
+        texts = _segment_texts(segment)
+        if texts and use_drawtext:
+            for item in texts:
+                start = float(item["at_local"])
+                end = start + float(item["dur_output"])
+                style = item.get("style", "impact")
+                # Gold on a white arena is illegible; the app stamps its own
+                # on-field labels as ink with a paper halo (render.rs:2071-2072).
+                color = INK if style == "impact" else GAME_MUTED
+                chain.append(
+                    _drawtext(
+                        item["value"].upper(),
+                        font,
+                        max(48, round(height * CAPTION_SIZE_FRAC)),
+                        color,
+                        x="w*0.055",
+                        y=f"h*{_caption_y_frac(item):.4f}",
+                        enable=f"between(t\\,{start:.6f}\\,{end:.6f})",
+                    )
                 )
-            )
-        if text and not use_drawtext:
+        if texts and not use_drawtext:
             if raster_callout_input is None:
                 raise RenderError("raster text overlay input is missing")
-            filters.append(f"{chain_input}{','.join(chain)}[pretext]")
-            start = float(text["at_local"])
-            end = start + float(text["dur_output"])
-            filters.append(
-                f"[{raster_callout_input}:v]format=rgba[callout];"
-                f"[pretext][callout]overlay=0:0:enable='between(t,{start:.6f},{end:.6f})'[texted]"
-            )
-            chain_input = "[texted]"
+            filters.append(f"{chain_input}{','.join(chain)}[pretext0]")
+            # Each caption is its own rasterized PNG so it can carry its own
+            # timing window; they overlay in sequence onto the plate.
+            for offset, item in enumerate(texts):
+                start = float(item["at_local"])
+                end = start + float(item["dur_output"])
+                source = f"[{raster_callout_input + offset}:v]"
+                filters.append(
+                    f"{source}format=rgba[callout{offset}];"
+                    f"[pretext{offset}][callout{offset}]overlay=0:0:"
+                    f"enable='between(t,{start:.6f},{end:.6f})'[pretext{offset + 1}]"
+                )
+            chain_input = f"[pretext{len(texts)}]"
             chain = []
         tail = _tail_filter(segment)
         if tail:
@@ -186,20 +258,21 @@ def _segment_filter(
         filters.append(f"{chain_input}{','.join(chain)}[vout]")
     elif segment["kind"] == "title":
         title = segment["title"]
-        style = title.get("style", "logo")
-        primary = "#FFFFFF" if style == "logo" else "#F8C84A"
         chain = ["format=gbrp"]
         if use_drawtext:
             chain.extend(
                 [
-                    "drawbox=x=w*0.12:y=h*0.30:w=w*0.76:h=4:color=#3B82F6:t=fill",
-                    "drawbox=x=w*0.18:y=h*0.70:w=w*0.64:h=4:color=#EF4444:t=fill",
                     _drawtext(
                         title["text"].upper(),
                         font,
                         max(72, round(height * 0.17)),
-                        primary,
+                        INK,
                     ),
+                    # One blue underline bar, mirroring the app's active-nav
+                    # treatment. Build 1's blue-above/red-below pair was a
+                    # sports-broadcast device with no product referent.
+                    "drawbox=x=w*0.38:y=h*0.60:w=w*0.24:h=3:"
+                    f"color={GAME_BLUE}:t=fill",
                 ]
             )
         subtitle = title.get("subtitle")
@@ -209,8 +282,8 @@ def _segment_filter(
                     subtitle.upper(),
                     font,
                     max(30, round(height * 0.045)),
-                    "#F8C84A",
-                    y="h*0.68",
+                    GAME_MUTED,
+                    y="h*0.66",
                 )
             )
         tail = _tail_filter(segment)
@@ -239,7 +312,11 @@ def _ffmpeg_has_filter(ffmpeg: str, name: str) -> bool:
 
 
 def _rasterize_text(
-    segment: dict[str, Any], output: dict[str, int], font: Path, target: Path
+    segment: dict[str, Any],
+    output: dict[str, int],
+    font: Path,
+    target: Path,
+    caption_index: int = 0,
 ) -> Path:
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
@@ -249,79 +326,102 @@ def _rasterize_text(
         ) from exc
     width, height = output["w"], output["h"]
     if segment["kind"] == "title":
-        background = segment["title"].get("background", "#3F3F41")
+        background = segment["title"].get("background", PAPER)
         image = Image.new("RGB", (width, height), background)
     else:
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
 
-    def centered(text: str, size: int, y: int, color: str) -> None:
-        current_size = size
-        while current_size > 24:
-            face = ImageFont.truetype(str(font), current_size)
-            box = draw.textbbox((0, 0), text, font=face, stroke_width=2)
-            if box[2] - box[0] <= width * 0.84:
-                break
+    def centered(
+        text: str,
+        size: int,
+        y: int,
+        color: str,
+        *,
+        halo: bool = False,
+        x_frac: float | None = None,
+    ) -> None:
+        """Draw centred type.
+
+        `halo` adds the paper outline the game itself uses for labels that sit
+        over the arena (render.rs:2071-2072). On a paper card there is nothing
+        to separate from, so type is drawn solid — and never with the hard
+        offset shadow build 1 applied everywhere, which is broadcast styling
+        the product does not use.
+        """
+        stroke = 4 if halo else 0
+        current_size = max(8, size)
+        face = ImageFont.truetype(str(font), current_size)
+        box = draw.textbbox((0, 0), text, font=face, stroke_width=stroke)
+        while current_size > 24 and box[2] - box[0] > width * 0.84:
             current_size -= 4
+            face = ImageFont.truetype(str(font), current_size)
+            box = draw.textbbox((0, 0), text, font=face, stroke_width=stroke)
         text_width = box[2] - box[0]
-        x = round((width - text_width) / 2)
-        draw.text(
-            (x + 8, y + 8),
-            text,
-            font=face,
-            fill="#101014" if image.mode == "RGB" else (16, 16, 20, 210),
-            stroke_width=2,
-            stroke_fill="#101014",
+        x = (
+            round(width * x_frac)
+            if x_frac is not None
+            else round((width - text_width) / 2)
         )
         draw.text(
             (x, y),
             text,
             font=face,
             fill=color,
-            stroke_width=2,
-            stroke_fill="#3F3F41",
+            stroke_width=stroke,
+            stroke_fill=PAPER if halo else None,
         )
 
     if segment["kind"] == "title":
+        # The product already has a wordmark (client/web/SnaketronLogo.png,
+        # used in five components) — bold italic per the checked-in design
+        # contract in client/web/CLAUDE.md. Use it rather than setting type:
+        # a drawn approximation is exactly the look-alike this repo refuses to
+        # draw anywhere else.
+        logo_bottom = round(height * 0.52)
+        if PRODUCT_LOGO.exists():
+            logo = Image.open(PRODUCT_LOGO).convert("RGBA")
+            target_w = round(width * 0.46)
+            target_h = max(1, round(logo.height * target_w / logo.width))
+            logo = logo.resize((target_w, target_h), Image.LANCZOS)
+            logo_x = round((width - target_w) / 2)
+            logo_y = round(height * 0.40) - target_h // 2
+            image.paste(logo, (logo_x, logo_y), logo)
+            logo_bottom = logo_y + target_h
+        else:
+            centered(
+                segment["title"]["text"].upper(),
+                max(72, round(height * 0.17)),
+                round(height * 0.36),
+                INK,
+            )
+        rule_y = logo_bottom + round(height * 0.045)
         draw.rectangle(
             (
-                round(width * 0.12),
-                round(height * 0.30),
-                round(width * 0.88),
-                round(height * 0.30) + 4,
+                round(width * 0.44),
+                rule_y,
+                round(width * 0.56),
+                rule_y + 3,
             ),
-            fill="#3B82F6",
-        )
-        draw.rectangle(
-            (
-                round(width * 0.18),
-                round(height * 0.70),
-                round(width * 0.82),
-                round(height * 0.70) + 4,
-            ),
-            fill="#EF4444",
-        )
-        style = segment["title"].get("style", "logo")
-        centered(
-            segment["title"]["text"].upper(),
-            max(72, round(height * 0.17)),
-            round(height * 0.40),
-            "#FFFFFF" if style == "logo" else "#F8C84A",
+            fill=GAME_BLUE,
         )
         subtitle = segment["title"].get("subtitle")
         if isinstance(subtitle, str) and subtitle:
             centered(
-                subtitle.upper(),
-                max(30, round(height * 0.045)),
-                round(height * 0.65),
-                "#F8C84A",
+                " ".join(subtitle.upper()),
+                max(22, round(height * 0.028)),
+                rule_y + round(height * 0.045),
+                GAME_MUTED,
             )
     else:
+        item = _segment_texts(segment)[caption_index]
         centered(
-            segment["text"]["value"].upper(),
-            max(48, round(height * 0.085)),
-            round(height * 0.70),
-            "#F8C84A" if segment["text"].get("style") == "impact" else "#FFFFFF",
+            item["value"].upper(),
+            max(48, round(height * CAPTION_SIZE_FRAC)),
+            round(height * _caption_y_frac(item)),
+            INK if item.get("style") == "impact" else GAME_MUTED,
+            halo=True,
+            x_frac=0.055,
         )
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target)
@@ -341,28 +441,32 @@ def _render_segment(
     duration = float(segment["output_duration"])
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     raster_path = target.with_suffix(".text.png")
-    has_raster_callout = False
-    if (
-        not dry_run
-        and not use_drawtext
-        and (segment["kind"] == "title" or segment.get("text"))
-    ):
-        _rasterize_text(segment, output, font, raster_path)
+    segment_texts = _segment_texts(segment)
+    caption_rasters: list[Path] = []
+    if segment["kind"] == "clip" and not use_drawtext:
+        caption_rasters = [
+            target.with_suffix(f".text{index}.png")
+            for index in range(len(segment_texts))
+        ]
+    if not dry_run and not use_drawtext:
+        if segment["kind"] == "title":
+            _rasterize_text(segment, output, font, raster_path)
+        for index, path in enumerate(caption_rasters):
+            _rasterize_text(segment, output, font, path, caption_index=index)
     if segment["kind"] == "clip":
         command += ["-i", segment["master"]]
-        if segment.get("text") and not use_drawtext:
+        for path in caption_rasters:
             command += [
                 "-loop",
                 "1",
                 "-framerate",
                 str(output["fps"]),
                 "-i",
-                str(raster_path),
+                str(path),
             ]
-            has_raster_callout = True
     else:
         if use_drawtext:
-            color = segment["title"].get("background", "#3F3F41")
+            color = segment["title"].get("background", PAPER)
             command += [
                 "-f",
                 "lavfi",
@@ -378,7 +482,7 @@ def _render_segment(
                 "-i",
                 str(raster_path),
             ]
-    audio_input = 2 if has_raster_callout else 1
+    audio_input = 1 + len(caption_rasters)
     command += [
         "-f",
         "lavfi",
@@ -392,7 +496,7 @@ def _render_segment(
         output,
         font,
         use_drawtext=use_drawtext,
-        raster_callout_input=1 if has_raster_callout else None,
+        raster_callout_input=1 if caption_rasters else None,
     )
     command += [
         "-filter_complex",
@@ -530,7 +634,7 @@ def _assemble(
     if profile == "preview":
         width, height, crf, preset = 640, 360, 28, "veryfast"
         video_filters = [
-            f"scale={width}:{height}:flags=lanczos:out_color_matrix=bt709",
+            f"scale={width}:{height}:flags=lanczos:out_color_matrix=bt709:out_primaries=bt709:out_transfer=bt709:out_range=tv",
             "format=yuv420p",
         ]
         if use_drawtext:
@@ -549,7 +653,7 @@ def _assemble(
         width, height = compiled["output"]["w"], compiled["output"]["h"]
         crf, preset = 18, "slow"
         video_filters = [
-            f"scale={width}:{height}:flags=lanczos:out_color_matrix=bt709",
+            f"scale={width}:{height}:flags=lanczos:out_color_matrix=bt709:out_primaries=bt709:out_transfer=bt709:out_range=tv",
             "format=yuv420p",
         ]
     filters.append(f"[{current_v}]{','.join(video_filters)}[vout]")

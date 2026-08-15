@@ -2,43 +2,145 @@
   "format_version": 1,
   "id": "demolition-cutoff",
   "world": {
-    "game_type": { "FreeForAll": { "max_players": 2 } },
+    "game_type": {
+      "FreeForAll": {
+        "max_players": 2
+      }
+    },
     "queue_mode": "Quickmatch",
     "rng_seed": null,
-    "overrides": { "player_idle_timeout_ms": 600000 }
+    "overrides": {
+      "player_idle_timeout_ms": 600000
+    }
   },
   "pose": {
     "snakes": [
       {
         "user_id": 1,
         "name": "GRID CUTTER",
-        "body": [{ "x": 20, "y": 15 }, { "x": 20, "y": 35 }],
+        "body": [
+          {
+            "x": 20,
+            "y": 31
+          },
+          {
+            "x": 20,
+            "y": 36
+          }
+        ],
         "direction": "Up",
         "boost_charge_ms": 3000
       },
       {
         "user_id": 2,
         "name": "RIVAL",
-        "body": [{ "x": 14, "y": 25 }, { "x": 10, "y": 25 }],
+        "body": [
+          {
+            "x": 12,
+            "y": 20
+          },
+          {
+            "x": 7,
+            "y": 20
+          }
+        ],
         "direction": "Right"
       }
     ],
-    "food": [],
+    "food": [
+      {
+        "x": 16,
+        "y": 17
+      },
+      {
+        "x": 24,
+        "y": 22
+      },
+      {
+        "x": 18,
+        "y": 24
+      },
+      {
+        "x": 26,
+        "y": 16
+      },
+      {
+        "x": 15,
+        "y": 14
+      },
+      {
+        "x": 23,
+        "y": 13
+      },
+      {
+        "x": 13,
+        "y": 23
+      },
+      {
+        "x": 27,
+        "y": 25
+      },
+      {
+        "x": 17,
+        "y": 27
+      },
+      {
+        "x": 25,
+        "y": 28
+      },
+      {
+        "x": 14,
+        "y": 18
+      },
+      {
+        "x": 22,
+        "y": 26
+      }
+    ],
     "start_tick": 0
   },
   "commands": [
-    { "at_tick": 2, "user_id": 1, "command": { "Turn": "Right" } },
-    { "at_tick": 34, "user_id": 1, "command": { "Turn": "Down" } },
-    { "at_tick": 58, "user_id": 1, "command": { "Turn": "Left" } }
+    {
+      "at_tick": 0,
+      "user_id": 1,
+      "command": "ActivateBoost"
+    },
+    {
+      "at_tick": 30,
+      "user_id": 1,
+      "command": {
+        "Turn": "Right"
+      }
+    },
+    {
+      "at_tick": 52,
+      "user_id": 1,
+      "command": {
+        "Turn": "Down"
+      }
+    }
   ],
   "run_ticks": 80,
   "presentation": {
-    "camera": { "Follow": { "snake_id": 0 } },
+    "camera": {
+      "Follow": {
+        "snake_id": 0,
+        "width_cells": 18.0
+      }
+    },
     "default_time_scale": 1.0,
     "star_snake_id": 0,
-    "addons": { "combo_callout": false, "boost_meter": true }
+    "addons": {
+      "combo_callout": false,
+      "boost_meter": true
+    }
   },
   "expect": [
-    { "SnakeDead": { "snake_id": 1, "at_tick": 12 } }
+    {
+      "SnakeDead": {
+        "snake_id": 1,
+        "at_tick": 16
+      }
+    }
   ]
 }

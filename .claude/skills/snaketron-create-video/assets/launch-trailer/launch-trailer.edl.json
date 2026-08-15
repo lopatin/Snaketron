@@ -1,89 +1,269 @@
 {
-  "output": { "w": 1920, "h": 1080, "fps": 60 },
-  "music": {
-    "src": "launch-bed.m4a",
-    "manifest": "launch-bed.beats.json",
-    "beat_snap": true,
-    "beat_snap_max_s": 0.05,
-    "duck_under": "sfx",
-    "volume": 0.68
-  },
-  "timeline": [
+ "output": {
+  "w": 1920,
+  "h": 1080,
+  "fps": 60
+ },
+ "music": {
+  "src": "launch-bed.m4a",
+  "manifest": "launch-bed.beats.json",
+  "beat_snap": true,
+  "beat_snap_max_s": 0.05,
+  "duck_under": "sfx",
+  "volume": 0.68
+ },
+ "timeline": [
+  {
+   "clip": "logo-intro",
+   "in": 0.0,
+   "out": 3.4,
+   "effects": [
     {
-      "title": {
-        "text": "SNAKETRON",
-        "subtitle": "OWN THE GRID",
-        "style": "logo",
-        "duration": 2.3
-      }
-    },
-    { "transition": "fadeblack", "duration": 0.3 },
-    {
-      "clip": "demolition-cutoff",
-      "in": 0.0,
-      "out": 4.0,
-      "speed": [
-        { "until": "meta:kill-0.4", "rate": 1.0 },
-        { "until": "meta:kill+0.6", "rate": 0.25 },
-        { "rate": 1.0 }
-      ],
-      "effects": [
-        { "t": "shake", "at": "meta:kill", "dur": 0.35, "amp": 12, "decay": 3 },
-        { "t": "rgb_split", "at": "meta:kill", "dur": 0.25, "px": 6 },
-        { "t": "glow", "at": "meta:kill", "dur": 0.3, "amount": 1.2 }
-      ],
-      "text": { "value": "DEMOLITIONS!", "at": "meta:kill+0.15", "dur": 0.8, "style": "impact" },
-      "sfx": [{ "src": "../sfx/impact.wav", "at": "meta:kill", "volume": 1.0 }]
-    },
-    { "transition": "pixelize", "duration": 0.5 },
-    {
-      "clip": "team-45pt-celebration",
-      "in": 0.0,
-      "out": 5.0,
-      "speed": [
-        { "until": "meta:bank-0.5", "rate": 1.0 },
-        { "until": "meta:bank+0.7", "rate": 0.5 },
-        { "rate": 1.0 }
-      ],
-      "effects": [
-        { "t": "glow", "at": "meta:bank", "dur": 0.8, "amount": 0.8 },
-        { "t": "vignette", "at": "meta:bank", "dur": 1.2 }
-      ],
-      "text": { "value": "TEAM MATCHES!", "at": "meta:bank+0.1", "dur": 1.0, "style": "impact" },
-      "sfx": [{ "src": "../sfx/bank.wav", "at": "meta:bank", "volume": 0.9 }]
-    },
-    { "transition": "slices", "duration": 0.2 },
-    {
-      "clip": "boost-combo-clutch",
-      "in": 0.0,
-      "out": 5.0,
-      "speed": [
-        { "until": "meta:combo-0.4", "rate": 1.0 },
-        { "until": "meta:combo+0.5", "rate": 0.5 },
-        { "rate": 1.0 }
-      ],
-      "effects": [
-        { "t": "punch_in", "at": "meta:combo", "dur": 0.3, "zoom": 1.18 },
-        { "t": "grain", "at": "meta:boost", "dur": 1.8, "strength": 5 }
-      ],
-      "text": { "value": "BOOST! COMBOS!", "at": "meta:combo+0.1", "dur": 0.9, "style": "impact" },
-      "sfx": [
-        { "src": "../sfx/boost.wav", "at": "meta:boost", "volume": 0.75 },
-        { "src": "../sfx/impact.wav", "at": "meta:combo", "volume": 0.7 }
-      ]
-    },
-    { "transition": "wipe_right", "duration": 0.4 },
-    { "clip": "rank-up-card", "in": 0.0, "out": 4.0 },
-    { "transition": "dissolve", "duration": 0.5 },
-    { "clip": "leaderboard-card", "in": 0.0, "out": 4.0 },
-    { "transition": "fadeblack", "duration": 0.5 },
-    {
-      "title": {
-        "text": "PLAY FREE",
-        "subtitle": "OWN THE GRID",
-        "style": "impact",
-        "duration": 4.0
-      }
+     "t": "punch_in",
+     "at": 0.0,
+     "dur": 3.5,
+     "zoom": 1.05
     }
-  ]
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "demolition-cutoff",
+   "in": 0.0,
+   "out": 3.9,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "shake",
+     "at": "meta:kill",
+     "dur": 0.35,
+     "amp": 8,
+     "decay": 3
+    },
+    {
+     "t": "rgb_split",
+     "at": "meta:kill",
+     "dur": 0.12,
+     "px": 2
+    },
+    {
+     "t": "punch_in",
+     "at": "meta:kill",
+     "dur": 0.5,
+     "zoom": 1.12
+    }
+   ],
+   "texts": [
+    {
+     "value": "Cut them off.",
+     "at": 0.15,
+     "dur": 1.6,
+     "style": "quiet"
+    },
+    {
+     "value": "DEMOLITIONS!",
+     "at": "meta:kill+0.05",
+     "dur": 1.5,
+     "style": "impact"
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/impact.wav",
+     "at": "meta:kill",
+     "volume": 1.0
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "team-45pt-celebration",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "glow",
+     "at": "meta:bank",
+     "dur": 0.8,
+     "amount": 0.45
+    }
+   ],
+   "texts": [
+    {
+     "value": "Carry the points home.",
+     "at": 0.2,
+     "dur": 1.7,
+     "style": "quiet"
+    },
+    {
+     "value": "TEAM MATCHES!",
+     "at": "meta:bank+0.05",
+     "dur": 1.4,
+     "style": "impact"
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/bank.wav",
+     "at": "meta:bank",
+     "volume": 0.9
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "ffa-four-snakes",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "texts": [
+    {
+     "value": "Four snakes, one arena.",
+     "at": 0.15,
+     "dur": 1.5,
+     "style": "quiet"
+    },
+    {
+     "value": "FREE FOR ALL!",
+     "at": 1.5,
+     "dur": 1.4,
+     "style": "impact"
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "boost-combo-clutch",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "punch_in",
+     "at": "meta:combo",
+     "dur": 0.4,
+     "zoom": 1.1
+    }
+   ],
+   "texts": [
+    {
+     "value": "BOOST!",
+     "at": 0.3,
+     "dur": 1.5,
+     "style": "impact",
+     "line": 0
+    },
+    {
+     "value": "COMBOS!",
+     "at": "meta:combo-0.2",
+     "dur": 1.6,
+     "style": "impact",
+     "line": 1
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/boost.wav",
+     "at": 0.35,
+     "volume": 0.9
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "rank-up",
+   "in": 0.0,
+   "out": 5.4,
+   "effects": [
+    {
+     "t": "punch_in",
+     "at": 0.0,
+     "dur": 5.5,
+     "zoom": 1.05
+    }
+   ],
+   "texts": [
+    {
+     "value": "RANK UP!",
+     "at": 0.5,
+     "dur": 2.4,
+     "style": "impact"
+    }
+   ]
+  },
+  {
+   "transition": "circle_open",
+   "duration": 0.4
+  },
+  {
+   "clip": "rankings",
+   "in": 0.0,
+   "out": 5.9,
+   "effects": [
+    {
+     "t": "punch_in",
+     "at": 0.0,
+     "dur": 5.5,
+     "zoom": 1.05
+    }
+   ],
+   "texts": [
+    {
+     "value": "Global multiplayer and Classic Snake rankings!",
+     "at": 0.4,
+     "dur": 2.6,
+     "style": "impact"
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "logo-outro",
+   "in": 0.0,
+   "out": 4.0,
+   "texts": [
+    {
+     "value": "Play free.",
+     "at": 0.3,
+     "dur": 1.8,
+     "style": "quiet"
+    }
+   ]
+  }
+ ]
 }

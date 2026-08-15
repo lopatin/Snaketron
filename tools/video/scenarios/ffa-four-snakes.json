@@ -1,0 +1,169 @@
+{
+  "format_version": 1,
+  "id": "ffa-four-snakes",
+  "world": {
+    "game_type": {
+      "FreeForAll": {
+        "max_players": 4
+      }
+    },
+    "queue_mode": "Quickmatch",
+    "rng_seed": null,
+    "overrides": {
+      "player_idle_timeout_ms": 600000
+    }
+  },
+  "pose": {
+    "snakes": [
+      {
+        "user_id": 1,
+        "name": "YOU",
+        "body": [
+          {
+            "x": 12,
+            "y": 20
+          },
+          {
+            "x": 7,
+            "y": 20
+          }
+        ],
+        "direction": "Right",
+        "boost_charge_ms": 3000
+      },
+      {
+        "user_id": 2,
+        "name": "VIPER",
+        "body": [
+          {
+            "x": 28,
+            "y": 14
+          },
+          {
+            "x": 33,
+            "y": 14
+          }
+        ],
+        "direction": "Left"
+      },
+      {
+        "user_id": 3,
+        "name": "COBRA",
+        "body": [
+          {
+            "x": 28,
+            "y": 26
+          },
+          {
+            "x": 33,
+            "y": 26
+          }
+        ],
+        "direction": "Left"
+      },
+      {
+        "user_id": 4,
+        "name": "MAMBA",
+        "body": [
+          {
+            "x": 20,
+            "y": 32
+          },
+          {
+            "x": 20,
+            "y": 37
+          }
+        ],
+        "direction": "Up"
+      }
+    ],
+    "food": [
+      {
+        "x": 17,
+        "y": 20
+      },
+      {
+        "x": 22,
+        "y": 20
+      },
+      {
+        "x": 27,
+        "y": 20
+      },
+      {
+        "x": 33,
+        "y": 24
+      },
+      {
+        "x": 33,
+        "y": 29
+      },
+      {
+        "x": 15,
+        "y": 27
+      },
+      {
+        "x": 30,
+        "y": 15
+      },
+      {
+        "x": 11,
+        "y": 12
+      },
+      {
+        "x": 26,
+        "y": 31
+      },
+      {
+        "x": 19,
+        "y": 10
+      },
+      {
+        "x": 35,
+        "y": 20
+      },
+      {
+        "x": 24,
+        "y": 34
+      }
+    ],
+    "start_tick": 0
+  },
+  "commands": [
+    {
+      "at_tick": 6,
+      "user_id": 1,
+      "command": "ActivateBoost"
+    },
+    {
+      "at_tick": 30,
+      "user_id": 1,
+      "command": {
+        "Turn": "Down"
+      }
+    },
+    {
+      "at_tick": 44,
+      "user_id": 1,
+      "command": {
+        "Turn": "Left"
+      }
+    }
+  ],
+  "run_ticks": 70,
+  "presentation": {
+    "camera": {
+      "Follow": {
+        "snake_id": 0,
+        "width_cells": 18.0
+      }
+    },
+    "default_time_scale": 1.0,
+    "star_snake_id": 0,
+    "addons": {
+      "combo_callout": false,
+      "boost_meter": true
+    }
+  },
+  "expect": []
+}

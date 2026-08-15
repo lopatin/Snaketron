@@ -18,6 +18,17 @@ use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
 
 const FOLLOW_CAMERA_WIDTH_CELLS: f64 = 26.0;
 
+/// Largest cell size the live game ever draws, in CSS pixels.
+///
+/// `GameArena` starts at 15 and only ever shrinks to fit the viewport
+/// (`client/web/components/GameArena.tsx:679`), so 15 is the game's true
+/// visual scale on any monitor. A scenario that zooms past it renders food,
+/// grid dots and snakes far larger than the DOM addons beside them — the
+/// canvas scales with the camera while the boost meter and callouts stay in
+/// CSS pixels — and the shot stops looking like the product. Capture reaches
+/// 1080p with `deviceScaleFactor`, not by zooming the arena.
+const MAX_CELL_SIZE_CSS_PX: f64 = 15.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 struct CameraRect {
     x: f64,
@@ -544,6 +555,9 @@ impl ScenarioCore {
                 snake_id: clip.presentation.follow_snake_id,
                 deadzone: 0.2,
                 ease: 0.16,
+                // Play of the Game keeps the player default; the band's
+                // framing is tuned in §5.5, not per clip.
+                width_cells: None,
             },
             default_time_scale: 1.0,
             star_snake_id: Some(clip.star_snake_id),
@@ -716,9 +730,14 @@ impl ScenarioCore {
                 snake_id,
                 deadzone,
                 ease,
+                width_cells,
             } => {
                 let aspect = (target_width / target_height).max(f64::EPSILON);
-                let mut width = FOLLOW_CAMERA_WIDTH_CELLS.min(arena_width);
+                let requested = width_cells
+                    .map(f64::from)
+                    .filter(|w| w.is_finite() && *w > 0.0)
+                    .unwrap_or(FOLLOW_CAMERA_WIDTH_CELLS);
+                let mut width = requested.min(arena_width);
                 let mut height = width / aspect;
                 if height > arena_height {
                     height = arena_height;
@@ -813,10 +832,33 @@ fn render_scenario_frame(
         return Ok(());
     }
 
-    let camera = core.camera_rect(elapsed_ms, target_width, target_height);
-    let cell_size = (target_width / camera.width).min(target_height / camera.height);
+    let mut camera = core.camera_rect(elapsed_ms, target_width, target_height);
+    let mut cell_size = (target_width / camera.width).min(target_height / camera.height);
     if !cell_size.is_finite() || cell_size <= 0.0 {
         return Ok(());
+    }
+
+    // Never draw the arena larger than the live game does. `target` is sized in
+    // device pixels while the DOM addons beside it lay out in CSS pixels, so a
+    // camera tight enough to exceed the game's own 15px cell blows the food,
+    // grid and snakes up out of proportion with the boost meter and callouts.
+    // When the requested window would do that, widen the window about its
+    // centre instead of scaling up — the shot gets more arena, not a zoom.
+    let client_width = f64::from(target.client_width());
+    let device_pixel_ratio = if client_width > 0.0 {
+        target_width / client_width
+    } else {
+        1.0
+    };
+    let max_cell_size = MAX_CELL_SIZE_CSS_PX * device_pixel_ratio;
+    if max_cell_size.is_finite() && max_cell_size > 0.0 && cell_size > max_cell_size {
+        let center_x = camera.x + camera.width / 2.0;
+        let center_y = camera.y + camera.height / 2.0;
+        cell_size = max_cell_size;
+        camera.width = target_width / cell_size;
+        camera.height = target_height / cell_size;
+        camera.x = center_x - camera.width / 2.0;
+        camera.y = center_y - camera.height / 2.0;
     }
 
     let state = core.state();
@@ -1048,6 +1090,7 @@ mod tests {
                     snake_id: 0,
                     deadzone: 0.2,
                     ease: 0.16,
+                    width_cells: None,
                 },
                 star_snake_id: Some(0),
                 addons: ScenarioAddons {
@@ -1059,6 +1102,80 @@ mod tests {
             expect: Vec::new(),
         })
         .unwrap()
+    }
+
+    /// Every advertised payoff must be inside the camera at the frame it
+    /// happens (PRD P3.6). This is the check that build 1 lacked: its
+    /// "DEMOLITIONS!" hero shot ran a Follow camera on the killer's head while
+    /// the victim died 3 cells below the bottom edge, so the kill appeared in
+    /// no frame of the 7-second shot — and every mechanical QC gate still
+    /// passed, because the capture only recorded the star's head.
+    #[test]
+    fn trailer_payoffs_are_inside_the_camera_at_1920x1080() {
+        const CAPTURE_W: f64 = 1920.0;
+        const CAPTURE_H: f64 = 1080.0;
+
+        let fixtures = [
+            (
+                "demolition-cutoff",
+                include_str!("../../tools/video/scenarios/demolition-cutoff.json"),
+            ),
+            (
+                "team-45pt-celebration",
+                include_str!("../../tools/video/scenarios/team-45pt-celebration.json"),
+            ),
+            (
+                "boost-combo-clutch",
+                include_str!("../../tools/video/scenarios/boost-combo-clutch.json"),
+            ),
+        ];
+
+        for (name, json) in fixtures {
+            let script = common::ScenarioScript::from_json(json).unwrap();
+            let run = script.clone().load().unwrap().run().unwrap();
+            let tick_ms = run.final_state.properties.tick_duration_ms;
+
+            // Deaths are the payoff whose participants are easiest to pin
+            // down: the victim must be visible, not merely the camera subject.
+            let deaths: Vec<(u32, u32)> = run
+                .events
+                .iter()
+                .filter_map(|(tick, _, event)| match event {
+                    common::GameEvent::SnakeDied { snake_id, .. } => Some((*tick, *snake_id)),
+                    _ => None,
+                })
+                .collect();
+
+            for (tick, victim_id) in deaths {
+                let mut player = ScenarioCore::from_json(json).unwrap();
+                player.seek_elapsed(tick * tick_ms).unwrap();
+                let rect = player.camera_rect(tick * tick_ms, CAPTURE_W, CAPTURE_H);
+
+                let victim = player
+                    .state()
+                    .arena
+                    .snakes
+                    .get(victim_id as usize)
+                    .unwrap_or_else(|| panic!("{name}: victim {victim_id} missing at tick {tick}"));
+                let head = *victim.head().unwrap();
+                let (x, y) = (f64::from(head.x), f64::from(head.y));
+
+                assert!(
+                    x >= rect.x
+                        && x <= rect.x + rect.width
+                        && y >= rect.y
+                        && y <= rect.y + rect.height,
+                    "{name}: the payoff is off camera — victim {victim_id} died at cell \
+                     ({x}, {y}) on tick {tick}, but the camera rect is \
+                     x[{:.2}, {:.2}] y[{:.2}, {:.2}]. Restage the shot or tighten \
+                     `presentation.camera.Follow.width_cells`.",
+                    rect.x,
+                    rect.x + rect.width,
+                    rect.y,
+                    rect.y + rect.height,
+                );
+            }
+        }
     }
 
     #[test]
