@@ -2463,6 +2463,33 @@ async fn send_recovery_bridge_snapshot(
     ws_tx.send(Message::Text(json.into())).await.is_ok()
 }
 
+/// Load the game's durable terminal state, if one exists. Absence, failure,
+/// malformed data, or a non-terminal record all return `None`: none of those
+/// prove anything about a live game, so callers fall back to normal warm-up.
+async fn load_durable_terminal_state(db: &Arc<dyn Database>, game_id: u32) -> Option<GameState> {
+    let database_game_id = i32::try_from(game_id).ok()?;
+    match db.get_game_by_id(database_game_id).await {
+        Ok(Some(game)) => {
+            let game_state_json = game.game_state?;
+            match serde_json::from_value::<GameState>(game_state_json) {
+                Ok(game_state) if matches!(game_state.status, GameStatus::Complete { .. }) => {
+                    Some(game_state)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(game_id, %error, "Ignoring malformed durable game state during warm-up");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            warn!(game_id, %error, "Durable game lookup failed during warm-up");
+            None
+        }
+    }
+}
+
 /// How the join warm-up anchored the socket's first authoritative frame.
 enum FirstFrame {
     /// A frame was sent; enter the forwarding loop. `live_proven` is false
@@ -2532,6 +2559,25 @@ async fn anchor_first_frame(
             if !matches!(envelope.game_state.status, GameStatus::Complete { .. })
                 && game_state_records_user(&envelope.game_state, user_id) =>
         {
+            // Completion persistence can win the race with cleanup of the
+            // preceding active Redis state. The durable terminal record is
+            // the authority for a completed game, so a non-terminal envelope
+            // may bridge only after that record is confirmed absent or
+            // non-terminal — otherwise the client would be stranded on a
+            // stale active frame with no live stream behind it.
+            if let Some(terminal_state) = load_durable_terminal_state(db, game_id).await {
+                send_completed_game_snapshot(
+                    ws_tx,
+                    game_bus,
+                    cluster_namespace,
+                    game_id,
+                    user_id,
+                    &terminal_state,
+                    "database snapshot",
+                )
+                .await;
+                return FirstFrame::Served;
+            }
             if !send_recovery_bridge_snapshot(ws_tx, &envelope, user_id).await {
                 return FirstFrame::Unavailable;
             }

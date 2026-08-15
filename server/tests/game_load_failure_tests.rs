@@ -223,9 +223,12 @@ async fn joining_a_durably_saved_completed_game_returns_its_final_snapshot() -> 
     assert_eq!(loaded_state.scores, final_state.scores);
     assert_eq!(replayed_outcome_sessions, 0);
     assert_eq!(terminal_rejection_reason, None);
-    assert!(
-        nonterminal_bridge_snapshots >= 1,
-        "the stale recovery envelope should be observed before the durable terminal fallback"
+    // The durable terminal record is consulted BEFORE the stale non-terminal
+    // envelope may bridge, so the client goes straight to the final state and
+    // never sees a stale active frame flash first.
+    assert_eq!(
+        nonterminal_bridge_snapshots, 0,
+        "a stale recovery envelope must not be bridged over a durable terminal state"
     );
 
     client.disconnect().await?;
@@ -654,32 +657,13 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
         retried_state.status
     );
 
-    timeout(Duration::from_secs(3), async {
-        loop {
-            match client.receive_message().await? {
-                WSMessage::CommandOutcomesComplete {
-                    game_id: barrier_game_id,
-                    ..
-                } if barrier_game_id == game_id => return Ok::<_, anyhow::Error>(()),
-                WSMessage::GameLoadFailed {
-                    game_id: failed_game_id,
-                    reason,
-                } if failed_game_id == game_id => {
-                    return Err(anyhow::anyhow!(
-                        "same-socket retry failed before its outcome barrier: {reason}"
-                    ));
-                }
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .context("same-socket retry did not receive its command-outcome barrier")??;
-
-    // Receiving the retry snapshot and outcome barrier is not enough: the
-    // retried JoinGame must have installed a live subscription on the same
-    // socket. A subsequent state delta proves that the connection did not
-    // remain in a one-shot recovery path. The retry anchored on the test
+    // Receiving the retry snapshot is not enough: the retried JoinGame must
+    // have installed a live subscription on the same socket, and the
+    // command-outcome barrier — a make-before-break promotion signal — is
+    // deliberately withheld until the first live event proves the stream
+    // flows behind the recovery bridge. Publish a delta to provide that
+    // proof (a real game's TickHash heartbeat does this within a second);
+    // the barrier must then follow it. The retry anchored on the test
     // envelope's zero watermark, so the next contiguous transport sequence
     // is exactly one.
     let delta_stream_seq = 1;
@@ -734,6 +718,28 @@ async fn newly_ready_cold_gateway_returns_retryable_warming_when_replica_is_with
     })
     .await
     .context("same-socket retry did not receive a subsequent live delta")??;
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match client.receive_message().await? {
+                WSMessage::CommandOutcomesComplete {
+                    game_id: barrier_game_id,
+                    ..
+                } if barrier_game_id == game_id => return Ok::<_, anyhow::Error>(()),
+                WSMessage::GameLoadFailed {
+                    game_id: failed_game_id,
+                    reason,
+                } if failed_game_id == game_id => {
+                    return Err(anyhow::anyhow!(
+                        "same-socket retry failed before its outcome barrier: {reason}"
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .context("same-socket retry did not receive its command-outcome barrier")??;
 
     client.disconnect().await?;
     env.shutdown().await?;
