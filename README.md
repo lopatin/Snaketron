@@ -8,7 +8,7 @@
   <a href="https://snaketron.io"><b>▶ Play now at snaketron.io</b></a>
 </p>
 
-What if Snake were an esport? SnakeTron is a competitive online multiplayer Snake game — real-time matches, ranked seasons, and no mercy for a mistimed turn. The game engine and the auto-scaling server architecture behind it are written in Rust and open-sourced in this repository.
+SnakeTron is a competitive online multiplayer Snake game — real-time matches, ranked seasons, and no mercy for a mistimed turn. The game engine and the auto-scaling server architecture behind [snaketron.io](https://snaketron.io) are written in Rust and open-sourced in this repository.
 
 ## Features
 
