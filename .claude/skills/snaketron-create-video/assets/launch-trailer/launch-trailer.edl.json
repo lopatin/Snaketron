@@ -5,12 +5,18 @@
   "fps": 60
  },
  "music": {
-  "src": "launch-bed.m4a",
+  "src": "launch-bed.wav",
   "manifest": "launch-bed.beats.json",
   "beat_snap": true,
   "beat_snap_max_s": 0.05,
   "duck_under": "sfx",
-  "volume": 0.68
+  "volume": 1.0,
+  "duck": {
+   "threshold": 0.18,
+   "ratio": 2.0,
+   "attack_ms": 14,
+   "release_ms": 240
+  }
  },
  "timeline": [
   {
@@ -65,7 +71,7 @@
     {
      "src": "../sfx/impact.wav",
      "at": "meta:kill",
-     "volume": 1.0
+     "volume": 0.46
     }
    ]
   },
@@ -102,7 +108,7 @@
     {
      "src": "../sfx/bank.wav",
      "at": "meta:bank",
-     "volume": 0.9
+     "volume": 0.55
     }
    ]
   },
@@ -146,7 +152,7 @@
     {
      "src": "../sfx/impact.wav",
      "at": "meta:kill",
-     "volume": 0.8
+     "volume": 0.46
     }
    ]
   },
@@ -191,7 +197,7 @@
     {
      "src": "../sfx/boost.wav",
      "at": 0.35,
-     "volume": 0.9
+     "volume": 0.7
     }
    ]
   },

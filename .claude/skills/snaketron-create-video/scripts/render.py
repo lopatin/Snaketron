@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -603,6 +604,41 @@ def _input_audio_filter(index: int, label: str) -> str:
     return f"[{index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[{label}]"
 
 
+# Parameters only; callers prefix `loudnorm=`.
+LOUDNORM_TARGET = "I=-14:TP=-1.5:LRA=11"
+
+
+def _measured_loudnorm(ffmpeg: str, source: Path) -> str:
+    """Measure a rendered mix and pin the values for a linear second pass.
+
+    Single-pass `loudnorm` rides gain dynamically, which flattens exactly the
+    section-to-section contrast a trailer bed is built out of: a bed authored
+    with 18 dB of range came back measuring an LRA of 3 LU. Supplying the
+    measured values lets `linear=true` apply one constant gain instead, so the
+    arrangement's own dynamics reach the listener.
+
+    Falls back to the single-pass target if measurement fails for any reason —
+    a slightly over-compressed master beats no master.
+    """
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostats", "-i", str(source), "-af",
+         f"loudnorm={LOUDNORM_TARGET}:print_format=json", "-f", "null", "-"],
+        capture_output=True, text=True, check=False,
+    )
+    match = re.search(r"\{[^{}]*input_i[^{}]*\}", probe.stderr, re.S)
+    if not match:
+        return LOUDNORM_TARGET
+    try:
+        m = json.loads(match.group(0))
+        return (
+            f"{LOUDNORM_TARGET}:measured_I={m['input_i']}:measured_TP={m['input_tp']}"
+            f":measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}"
+            f":offset={m['target_offset']}:linear=true"
+        )
+    except (json.JSONDecodeError, KeyError):
+        return LOUDNORM_TARGET
+
+
 def _assemble(
     ffmpeg: str,
     compiled: dict[str, Any],
@@ -613,6 +649,8 @@ def _assemble(
     dry_run: bool,
     commands: list[list[str]],
     use_drawtext: bool,
+    loudnorm: str = LOUDNORM_TARGET,
+    measure_only: bool = False,
 ) -> None:
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for path in cached:
@@ -723,7 +761,7 @@ def _assemble(
         mix_labels.append(sfx_bus)
     filters.append(
         f"{''.join(f'[{label}]' for label in mix_labels)}amix=inputs={len(mix_labels)}:"
-        "duration=longest:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]"
+        f"duration=longest:normalize=0,loudnorm={loudnorm},aresample=48000[aout]"
     )
 
     if profile == "preview":
@@ -829,6 +867,17 @@ def render(
                 use_drawtext,
             )
         cached.append(target)
+    # Two-pass loudness. The first pass renders to a scratch file purely to
+    # measure it; the second applies the measured values linearly, so the
+    # arrangement's own section dynamics survive normalization.
+    loudnorm = LOUDNORM_TARGET
+    if profile == "final" and not dry_run:
+        scratch = destination.with_suffix(".loudness-probe.mkv")
+        _assemble(ffmpeg, compiled, cached, scratch, profile, font, dry_run,
+                  commands, use_drawtext, loudnorm=LOUDNORM_TARGET)
+        loudnorm = _measured_loudnorm(ffmpeg, scratch)
+        scratch.unlink(missing_ok=True)
+
     _assemble(
         ffmpeg,
         compiled,
@@ -839,6 +888,7 @@ def render(
         dry_run,
         commands,
         use_drawtext,
+        loudnorm=loudnorm,
     )
     return {
         "output": str(destination.resolve()),
