@@ -57,7 +57,7 @@ A gameplay capture is a staged shot, not a recording of whatever the camera happ
 
 Full detail in [references/narrative.md](references/narrative.md); the rules that most often get skipped:
 
-- **Every scene has exactly one caption**, an `impact` line anchored to the payoff it names. Do not add a setup line before it — pre-captions over-share and double the reading load. The only `quiet` caption is a closing call to action.
+- **One caption per beat, anchored to the payoff it names.** Do not add a setup line before it — pre-captions over-share and double the reading load. A scene with two beats puts them on opposite `side`s of the band (`"side": "left"|"right"`), staggered in and leaving together on the cut; never stacked in one corner, never merged into one phrase.
 - **Hook inside 5 seconds** — keep the intro slate short and land the biggest moment by ~4s.
 - **Never cut a static screenshot into a moving video.** Capture the real component animating (`/qa/trailer-card`), and give every non-gameplay card the drifting dot field so it stays alive.
 - **Prove the card animated before you cut it.** Mounting the real component is not enough: the component must take its time from the harness clock (`RatingReveal`'s `clockMs`), and the capture context must not request `reducedMotion: "reduce"`, which makes well-behaved components render their settled state. Tile the card's own master and check the values change. `splice_duplicate_frames` will not catch this — the flow field underneath is still drifting.
@@ -66,7 +66,7 @@ Full detail in [references/narrative.md](references/narrative.md); the rules tha
 - **One transform per entrance, and animate the call to action inside the card.** A translate plus a scale reads as a diagonal float; burnt-in `texts` cannot move at all.
 - **Default to 1.0× speed.** Cell-stepped snake motion reads as dropped frames in slow motion; only slow footage captured at matching high VFPS.
 - **One motion vocabulary** — two or three transitions, non-linear easing throughout, effects as brief accents. No vignette or grain on a paper ground.
-- **Captions sit in the band at ~0.655–0.75 frame height, left-aligned**, clear of the boost meter (bottom 12%), the centre score readout, and the top combo callout.
+- **Captions sit in the band at ~0.655–0.75 frame height**, inset 5.5% from the `side` they are anchored to, clear of the boost meter (bottom 12%), the centre score readout, and the top combo callout.
 
 Enforce these guardrails:
 

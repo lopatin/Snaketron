@@ -17,14 +17,7 @@
    "clip": "logo-intro",
    "in": 0.0,
    "out": 2.4,
-   "effects": [
-    {
-     "t": "push_in",
-     "at": 0.0,
-     "dur": 2.4,
-     "zoom": 1.07
-    }
-   ]
+   "effects": []
   },
   {
    "transition": "smooth_left",
@@ -180,10 +173,18 @@
    ],
    "texts": [
     {
-     "value": "BOOST COMBOS!",
-     "at": "meta:combo-0.2",
-     "dur": 1.8,
-     "style": "impact"
+     "value": "BOOST!",
+     "at": 0.3,
+     "dur": 3.1,
+     "style": "impact",
+     "side": "left"
+    },
+    {
+     "value": "COMBOS!",
+     "at": "meta:combo-0.1",
+     "dur": 2.5,
+     "style": "impact",
+     "side": "right"
     }
    ],
    "sfx": [

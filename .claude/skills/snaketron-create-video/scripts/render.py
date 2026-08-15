@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-RENDERER_VERSION = 6
+RENDERER_VERSION = 7
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 # Brand ground truth (see references/brand.md). SnakeTron is a light product:
@@ -50,10 +50,12 @@ def _resolve_display_font() -> Path:
 
 # Caption band. The arena's boost meter occupies roughly the bottom 12% of a
 # gameplay frame, and the game's own score/combo callouts land centre and top —
-# so trailer captions sit left, in the band between, with clear air around them.
+# so trailer captions sit in the band between, with clear air around them.
 CAPTION_SIZE_FRAC = 0.072
 CAPTION_BASE_Y_FRAC = 0.655
 CAPTION_STACK_Y_FRAC = 0.092
+# Inset from whichever edge a caption is anchored to.
+CAPTION_MARGIN_FRAC = 0.055
 
 
 def _segment_texts(segment: dict[str, Any]) -> list[dict[str, Any]]:
@@ -68,11 +70,25 @@ def _segment_texts(segment: dict[str, Any]) -> list[dict[str, Any]]:
 def _caption_y_frac(item: dict[str, Any]) -> float:
     """Vertical position for a caption, as a fraction of frame height.
 
-    `line` stacks captions that share the screen (BOOST! above COMBOS!) so a
-    second caption never lands on top of the first.
+    `line` stacks captions that share the screen so a second caption never
+    lands on top of the first. Two captions on the same line must sit on
+    opposite `side`s.
     """
     line = int(item.get("line", 0))
     return CAPTION_BASE_Y_FRAC + line * CAPTION_STACK_Y_FRAC
+
+
+def _caption_side(item: dict[str, Any]) -> str:
+    """Which edge a caption is anchored to: `left` (default) or `right`.
+
+    Two captions can then share the band on the same line and land on opposite
+    sides of the arena, which reads as two beats rather than as one stacked
+    block of copy.
+    """
+    side = str(item.get("side", "left")).lower()
+    if side not in ("left", "right"):
+        raise RenderError(f"caption side must be 'left' or 'right', got {side!r}")
+    return side
 
 
 PRODUCT_LOGO = SKILL_DIR.parents[2] / "client" / "web" / "SnaketronLogo.png"
@@ -229,7 +245,11 @@ def _segment_filter(
                         font,
                         max(48, round(height * CAPTION_SIZE_FRAC)),
                         color,
-                        x="w*0.055",
+                        x=(
+                            f"w*{1 - CAPTION_MARGIN_FRAC:.4f}-tw"
+                            if _caption_side(item) == "right"
+                            else f"w*{CAPTION_MARGIN_FRAC:.4f}"
+                        ),
                         y=f"h*{_caption_y_frac(item):.4f}",
                         enable=f"between(t\\,{start:.6f}\\,{end:.6f})",
                     )
@@ -340,6 +360,7 @@ def _rasterize_text(
         *,
         halo: bool = False,
         x_frac: float | None = None,
+        align_right: bool = False,
     ) -> None:
         """Draw centred type.
 
@@ -358,11 +379,13 @@ def _rasterize_text(
             face = ImageFont.truetype(str(font), current_size)
             box = draw.textbbox((0, 0), text, font=face, stroke_width=stroke)
         text_width = box[2] - box[0]
-        x = (
-            round(width * x_frac)
-            if x_frac is not None
-            else round((width - text_width) / 2)
-        )
+        if x_frac is None:
+            x = round((width - text_width) / 2)
+        elif align_right:
+            # `x_frac` is the inset from the edge the caption is anchored to.
+            x = round(width * (1 - x_frac)) - text_width
+        else:
+            x = round(width * x_frac)
         draw.text(
             (x, y),
             text,
@@ -421,7 +444,8 @@ def _rasterize_text(
             round(height * _caption_y_frac(item)),
             INK if item.get("style") == "impact" else GAME_MUTED,
             halo=True,
-            x_frac=0.055,
+            x_frac=CAPTION_MARGIN_FRAC,
+            align_right=_caption_side(item) == "right",
         )
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target)

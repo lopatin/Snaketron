@@ -44,6 +44,7 @@ Author JSON, not JSONC. Compile it before rendering.
 - Interpret `rate` as output speed relative to gameplay. A rate of `0.25` makes one source second occupy four output seconds.
 - Let transitions overlap adjacent output segments. Place a transition object only between two visual entries.
 - Snap the start of each incoming segment to a manifest beat when it is within `beat_snap_max_s`. The compiler records the exact tail adjustment and global transition offset.
+- Place each caption with `side` (`left` default, or `right`) and `line`; two captions sharing a line must take opposite sides.
 - Supply `capture_vfps`, `encoded_fps`, `duration`, and named cues in clip metadata. Put cues in `anchors`, `markers`, `events`, `timeline`, `cues`, or `cue_track`.
 
 ## Vocabulary

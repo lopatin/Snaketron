@@ -27,30 +27,31 @@ it has cut away.
   screen should be the liveliest. Animate it inside the end-slate card
   (`trailer-card__cta`) so it can arrive on its own beat.
 
-## 2. One shot, one idea — merge before you stack
+## 2. Two beats sit side by side, never stacked
 
-A scene that seems to need two captions almost always needs one caption and a
-tighter idea. A shot showing a boosted snake chaining pickups shipped as
-
-```jsonc
-"texts": [
-  {"value": "BOOST!",   "at": 0.3,              "dur": 1.5, "style": "impact", "line": 0},
-  {"value": "COMBOS!",  "at": "meta:combo-0.2", "dur": 1.6, "style": "impact", "line": 1}
-]
-```
-
-and read as two labels competing for a three-second window. It is one idea:
+A scene with two things to name gets two captions on opposite sides of the
+band — not two lines of copy in the same corner, and not one merged phrase.
 
 ```jsonc
 "texts": [
-  {"value": "BOOST COMBOS!", "at": "meta:combo-0.2", "dur": 1.8, "style": "impact"}
+  {"value": "BOOST!",   "at": 0.3,              "dur": 3.1, "style": "impact", "side": "left"},
+  {"value": "COMBOS!",  "at": "meta:combo-0.1", "dur": 2.5, "style": "impact", "side": "right"}
 ]
 ```
 
-`texts` remains an array and `line` still stacks entries clear of one another,
-for the genuine two-beat scene. Treat reaching for it as a signal to re-cut the
-shot first. Whatever survives is anchored to the moment it describes —
-`meta:combo`, not a guessed timestamp.
+- **`side` is `left` (default) or `right`**, an inset from that edge. Two
+  captions on the same `line` must take opposite sides.
+- **Stagger the entrances, share the exit.** The second lands shortly after
+  the first, and both run to the cut — so they leave with the shot rather than
+  blinking out while it is still playing. Set each `dur` so `at + dur` equals
+  the clip's `out`.
+- **`line` still exists** for the rare third caption, but a stacked pair reads
+  as a block of copy dumped in one corner; that is what the side split fixes.
+- Anchor each to the moment it describes — `meta:combo`, not a guessed
+  timestamp.
+
+Merging two beats into one phrase ("BOOST COMBOS!") is the other failure mode:
+it names neither moment and lands on neither.
 
 ## 3. Captions live in a band, clear of the game's own UI
 
