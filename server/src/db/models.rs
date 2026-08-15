@@ -39,6 +39,13 @@ pub struct User {
     pub profile_picture_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_iat: Option<i64>,
+    /// The skin this player has chosen, if any.
+    ///
+    /// Cosmetic and always optional: an absent or unrecognised value renders
+    /// as the classic look, so nothing downstream has to handle a missing one
+    /// as an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_skin: Option<String>,
 }
 
 /// The verified, server-side view of a CrazyGames identity.  None of these

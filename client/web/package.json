@@ -19,7 +19,8 @@
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
     "test:headed": "playwright test --headed",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test:skins": "playwright test --config playwright.skins.config.js"
   },
   "repository": {
     "type": "git",

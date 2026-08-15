@@ -14,7 +14,16 @@ export type GameState = { tick: number, status: GameStatus, arena: Arena, recent
  * Server-attested synthetic game marker. Stress games exercise the full
  * runtime but must not produce player progression or leaderboard effects.
  */
-is_stress_test: boolean, properties: GameProperties, players: { [key in number]?: Player }, game_code: string | null, host_user_id: number | null, start_ms: number, event_sequence: number, usernames: { [key in number]?: string }, spectators: Array<number>, scores: { [key in number]?: number },
+is_stress_test: boolean, properties: GameProperties, players: { [key in number]?: Player }, game_code: string | null, host_user_id: number | null, start_ms: number, event_sequence: number, usernames: { [key in number]?: string },
+/**
+ * Which skin each player is wearing, by user_id.
+ *
+ * Purely cosmetic, and deliberately kept beside `usernames` rather than on
+ * `Snake`: everything on a snake is fingerprinted, and a skin must never
+ * be able to make two clients disagree about the game. Absent entries — and
+ * every state written before skins existed — render as the classic look.
+ */
+skins: { [key in number]?: string }, spectators: Array<number>, scores: { [key in number]?: number },
 /**
  * Cumulative successful pellet pickups by snake. Unlike `scores`, this is
  * unweighted by combo value and is therefore the progression/XP basis.

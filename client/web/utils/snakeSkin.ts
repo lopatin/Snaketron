@@ -16,12 +16,23 @@ export interface SnakeSkinInputs {
   is_team_game: boolean;
   local_snake_id: number | null;
   local_team_id: number | null;
+  /**
+   * Which skin this player wears. Omitted means the classic look, which is
+   * what keeps every caller that predates skins working unchanged.
+   */
+  skin_ref?: string;
 }
 
 export interface SnakeSkinColors {
   fill: string;
   outline: string;
   label: string;
+  /**
+   * One flat colour for surfaces that show a swatch rather than a snake.
+   * Present even for gradient or animated skins, so a CSS pill never has to
+   * understand how a skin paints.
+   */
+  swatch: string;
 }
 
 /**

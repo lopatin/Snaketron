@@ -1,0 +1,127 @@
+//! <NAME> — a first-party skin that needs more than a document can say.
+//!
+//! Say here, in one sentence, what specifically forced Rust. If you cannot,
+//! this should be a document.
+
+use crate::skin::body::{BodyStyle, paint_body};
+use crate::skin::{
+    BaseTheme, CelebrationTheme, PaintCtx, SkinColors, SkinIdentity, SkinMetrics, SnakePose,
+    SnakeRole, SnakeSkin,
+};
+use wasm_bindgen::prelude::*;
+
+/// `(fill, outline, core)` per role. Friendly must read cool, hostile warm —
+/// the conformance suite checks this for Rust skins too.
+const FRIENDLY: [(&str, &str, &str); 2] = [
+    ("#70bfe3", "#5299bb", "#333333"),
+    ("#3c8dde", "#286eae", "#333333"),
+];
+const HOSTILE: [(&str, &str, &str); 2] = [
+    ("#ff6b6b", "#b84444", "#333333"),
+    ("#e34e5b", "#a92f3a", "#333333"),
+];
+const NEUTRAL_A: (&str, &str, &str) = ("#556270", "#353c47", "#111111");
+const NEUTRAL_B: (&str, &str, &str) = ("#f7b731", "#a87d1f", "#333333");
+
+const OUTLINE_EXTRA: f64 = 2.0;
+const BOOST_COLOR: &str = "#fff200";
+const BOOST_EXTRA: f64 = 6.0;
+const HEAD_CORE_RATIO: f64 = 0.38;
+
+pub struct <NAME>Skin;
+
+fn palette(identity: &SkinIdentity) -> (&'static str, &'static str, &'static str) {
+    let shade = (identity.shade_slot % 2) as usize;
+    match identity.role {
+        SnakeRole::Own | SnakeRole::Teammate => FRIENDLY[shade],
+        SnakeRole::Enemy => HOSTILE[shade],
+        SnakeRole::SpectatedTeam(0) => FRIENDLY[shade],
+        SnakeRole::SpectatedTeam(_) => HOSTILE[shade],
+        SnakeRole::FreeForAll { palette_slot } => match palette_slot {
+            0 => FRIENDLY[0],
+            1 => HOSTILE[0],
+            2 => NEUTRAL_A,
+            _ => NEUTRAL_B,
+        },
+    }
+}
+
+fn body_style(identity: &SkinIdentity) -> BodyStyle<'static> {
+    let (fill, outline, core) = palette(identity);
+    BodyStyle {
+        fill,
+        outline,
+        outline_extra: OUTLINE_EXTRA,
+        boost_color: BOOST_COLOR,
+        boost_extra: BOOST_EXTRA,
+        head_core_ratio: HEAD_CORE_RATIO,
+        head_core_color: core,
+        gradient_cells: 10.0,
+        gradient_max_opacity: 0.3,
+        gradient_rgb: (255, 255, 255),
+    }
+}
+
+impl SnakeSkin for <NAME>Skin {
+    fn id(&self) -> &str {
+        "<id>@1"
+    }
+
+    fn name(&self) -> &str {
+        "<Name>"
+    }
+
+    fn colors(&self, identity: &SkinIdentity) -> SkinColors<'_> {
+        let (fill, outline, _) = palette(identity);
+        SkinColors {
+            fill,
+            outline,
+            label: crate::render::roster_label_ink(fill),
+            swatch: fill,
+        }
+    }
+
+    fn metrics(&self, boost_active: bool) -> SkinMetrics {
+        SkinMetrics {
+            // Report what you actually paint. The renderer sizes the occlusion
+            // mask and the roster row from this, and conformance checks it.
+            overhang_px: body_style(&SkinIdentity {
+                role: SnakeRole::Own,
+                shade_slot: 0,
+            })
+            .overhang_px(boost_active),
+            head_core_radius_ratio: HEAD_CORE_RATIO,
+            head_core_is_dark: true,
+        }
+    }
+
+    fn paint_alive(
+        &self,
+        ctx: &mut PaintCtx,
+        pose: &SnakePose,
+        identity: &SkinIdentity,
+    ) -> Result<(), JsValue> {
+        paint_body(
+            ctx,
+            pose.cells,
+            pose.cell_size,
+            pose.boost_active,
+            &body_style(identity),
+        )?;
+
+        // Your custom pass here. It must:
+        //  - stay inside metrics().overhang_px,
+        //  - issue the same ops at every pose.anim_ms (vary arguments only),
+        //  - hold still when pose.reduced_motion is set.
+        Ok(())
+    }
+
+    // Optional. Delete if this skin does not dress the arena.
+    fn base_theme(&self) -> Option<BaseTheme<'_>> {
+        None
+    }
+
+    fn celebration_theme(&self) -> Option<CelebrationTheme<'_>> {
+        None
+    }
+}

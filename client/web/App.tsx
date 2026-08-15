@@ -25,6 +25,13 @@ import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
 
 // Design-review harness for the post-match rating reveal. Only reachable —
 // and only bundled — outside production builds.
+const SkinsQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/SkinsQA'))
+  : null;
+const SkinParityQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/SkinParityQA'))
+  : null;
+
 const RatingRevealQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/RatingRevealQA'))
   : null;
@@ -170,6 +177,26 @@ function AppContent() {
             element={
               <React.Suspense fallback={null}>
                 <RatingRevealQA />
+              </React.Suspense>
+            }
+          />
+        )}
+        {SkinsQA && (
+          <Route
+            path="/qa/skins"
+            element={
+              <React.Suspense fallback={null}>
+                <SkinsQA />
+              </React.Suspense>
+            }
+          />
+        )}
+        {SkinParityQA && (
+          <Route
+            path="/qa/skin-parity"
+            element={
+              <React.Suspense fallback={null}>
+                <SkinParityQA />
               </React.Suspense>
             }
           />
