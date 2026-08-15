@@ -116,6 +116,11 @@ enum Continuity {
 }
 
 /// What [`GameEventSubscription::next`] hands the forwarding loop.
+///
+/// This value is consumed immediately by the caller's `match` and never
+/// stored. Boxing the event would add a heap allocation to every live game
+/// event only to reduce stack padding on the cold `WentCold` arm.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SubscriptionUpdate {
     /// Forward this event to the socket.

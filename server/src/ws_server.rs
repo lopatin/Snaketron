@@ -2427,7 +2427,10 @@ async fn publish_player_ready_after_game_exists(
     {
         Ok(true) => {}
         Ok(false) => {
-            debug!(game_id, user_id, "Readiness arrived after the game completed");
+            debug!(
+                game_id,
+                user_id, "Readiness arrived after the game completed"
+            );
         }
         Err(error) => {
             warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
