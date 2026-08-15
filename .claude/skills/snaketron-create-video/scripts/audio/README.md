@@ -24,6 +24,45 @@ Measured on the originals, not asserted:
 | `boost.wav` | one narrow 250 Hz–1 kHz band, nothing above 1 kHz. This file *was* the "weird whooshing" |
 | `whoosh.wav` | RMS −25.9 dB — broadband but simply too quiet to hear under music |
 
+## The sound
+
+House and French touch, in the Tron Legacy / *Random Access Memories* / Prydz
+register. That genre is almost entirely synthesis, which is why procedural
+generation wins here rather than merely coping: a TR-909 kick *is* a
+pitch-enveloped sine, a supersaw *is* seven detuned saws, and a filter sweep on
+that stack is the whole signature. Nothing here imitates a recording.
+
+Four variations ship, selectable with `--variation`. All share one arrangement
+and differ in voicing:
+
+| | character |
+|---|---|
+| `grid` | Tron Legacy. Dark, minor, arp-driven, heaviest sub. **This is the shipped bed.** |
+| `discovery` | *Random Access Memories*. Filtered stabs on the offbeat, plucked bass, swung 16ths. |
+| `opus` | Prydz. Hypnotic 16ths, longest filter opening, biggest sustained drop. |
+| `robot` | The talkbox. Formant bank on vowels so the lead "speaks" the melody. |
+
+What actually makes it sound like the genre, in rough order of importance:
+
+1. **The sidechain pump.** Release must be tempo-tied — at 120 BPM the beat gap
+   is 500 ms, and a 240 ms release leaves half of every beat static. The
+   envelope should still be recovering when the next kick lands.
+2. **The filter sweep is the arrangement.** A resonant ladder closed in the
+   intro and opening through the builds does more structural work than adding
+   parts. `pedalboard`'s `LadderFilter` has the resonance and saturation a
+   plain Butterworth does not.
+3. **Band-limited oscillators.** A naive ramp or `sign(sin)` folds harmonics
+   back down the spectrum; that aliasing is the single most reliable way to
+   make a synth sound cheap. Everything here sums only harmonics under Nyquist.
+4. **Detune with random start phase.** Aligned phases at t=0 give an ugly
+   impulse instead of a swell.
+5. **Section dynamics.** See the README rules below — this is what separates a
+   well-synthesized track from an exciting one.
+
+A talkbox without a voice to modulate is a bank of three resonant band-passes
+parked on vowel formants (`dsp.formant_bank`), gliding between vowels per note.
+Vowels *are* formant positions, so it gets most of the way there.
+
 ## Layout
 
 | file | what |

@@ -93,8 +93,19 @@ The cards in `assets/cards/` are the fallback path for capture without a dev ser
 
 - Transitions: short slice/wipe/`pixelize` on cuts; `fadeblack` reserved for chapter breaks. On a paper ground prefer `fadewhite` for chapter breaks.
 - Cut on musical beats. Land eliminations with one dry impact plus a brief RGB split and a decaying shake.
-- Boosts get a rising whoosh; banks get a bright confirmation chime.
-- Audio: `-14 LUFS` integrated, `-1.5 dBTP`, duck music beneath SFX rather than raising SFX gain.
+- Boosts get a rising whoosh; banks get a bright confirmation chime. Anything
+  *pitched* must be in the key of the bed and agree with the chord it lands on
+  — `sfx.bank()` takes the chord, `song.chord_at()` says what it is. A clashing
+  note is picked out by the ear at any level and reads as "too loud" when the
+  problem is not loudness.
+- Audio: `-14 LUFS` integrated, `-1.5 dBTP`. Duck music beneath SFX rather than
+  raising SFX gain — but a *few* dB, releasing inside a beat. The shipped
+  default was ~20 dB, which deletes the bed under every hit instead of making
+  room for it.
+- The bed itself is generated: `scripts/audio/`, deterministic and CC0. Its
+  language is what the game's own is — snapped to a grid, dry, nothing that
+  drifts or blooms — carried by a house/French-touch kit rather than the
+  drone the first build shipped.
 - **Grade:** `assets/lut/snaketron-identity.cube` is identity by default. Do not use a LUT that darkens or warms footage away from the arena's neutral white — the value-polarity gate measures exactly this.
 
 ## If you want a bespoke identity anyway

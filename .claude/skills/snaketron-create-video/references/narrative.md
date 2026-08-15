@@ -157,10 +157,18 @@ as a different game's art:
 | Boost band, flat 6 px | the glow all but gone at the moment it matters |
 | Carried-food numeral, capped at 14 px | a UI label pasted onto the snake |
 
-The fix belongs in the renderer, not the capture: `body_detail_scale` in
-`client/src/render.rs` quotes every body weight at the 15 px cell the arena
-caps at and scales it above that. 1× rendering is unchanged and high-DPI
+The fix belongs in the renderer, not the capture. It now lives at the skin
+compositor's choke point: a skin document quotes its contour in 1× pixels and
+`SnakePose.detail_scale` multiplies it, so **every** skin is correct at any
+zoom rather than just classic. 1× rendering is unchanged and high-DPI
 *displays* get the same repair for free — this was never only a trailer bug.
+
+Two failed attempts are worth knowing about, because both looked right:
+inferring the scale from `cell_size` cannot work. The roster glyph sizes its
+cell to fill a row and legitimately reaches ~28 px at 1×, which is *larger*
+than anything the arena draws — cell size does not distinguish a big glyph
+from a zoomed one, so the caller has to say which it is. The skin golden
+traces caught both attempts, which is exactly what they are for.
 
 When a shot looks subtly wrong at 1080p and you cannot name why, crop a frame
 1:1 and measure it against the body:
@@ -210,15 +218,54 @@ Anything more than a few dB apart is the pipeline, not the composition.
 ffmpeg -i trailer.mp4 -map 0:a rendered.wav   # then compare envelopes
 ```
 
-Two composition rules that came out of the same pass:
+### Composition
 
 - **Author section dynamics.** The first bed sat at one RMS from the first kick
   to the last — 4 dB of range across the whole record, which is what "not
   exciting" is in numbers. A trailer bed wants 15+ dB, and the master bus has
-  to be gentle enough to let it through.
+  to be gentle enough to let it through. Two-pass `loudnorm` (measure, then
+  apply with `linear=true`) so normalization cannot ride it back down.
 - **State the tune early.** A melody that first appears at the drop is a payoff
   with nothing to pay off. Hint it, quieter and an octave down, under the
   gameplay.
+- **Land the drop just *before* the cut it belongs to.** Half a second is
+  enough. The music then causes the reveal instead of reacting to it, and the
+  edit feels scored rather than accompanied.
+- **Check what the last note actually is.** A phrase that does not fit the room
+  gets truncated mid-sentence, and a final note on the *third* of the chord —
+  high — reads as a question nobody answered. That is what "it builds well then
+  fizzles" means. `retime_outro()` trades drop length for ending room; the
+  film's length is fixed, so every second the ending gains, the drop loses.
+- **Fix an ending with the smallest change that works.** A cadence, a silent
+  gap and a weighted tonic button were all built for this and all were worse
+  than moving one note, because they added a complexity the rest of the track
+  does not have. Match the density of what is already there.
+
+### "The effects are too loud" is usually not level
+
+Measure before reaching for a fader, and measure the way the ear works:
+
+- **K-weighted, not flat RMS** (`scripts/audio/loudness.py`). Flat RMS
+  underweights 1–6 kHz, exactly where a bright effect lives.
+- **Compare the effect's *sustained* level to the bed, not its peak**
+  (`scripts/audio/balance.py`). About +5 dB sustained is what "much louder than
+  the music" sounds like; the transient may sit +10 dB above and should, because
+  that crack is what makes an impact land.
+- **A pitched effect must agree with the chord under it.** The goal flourish was
+  reported as too loud twice. It measured 0.5 dB *below* the bed: it was an
+  A-minor arpeggio over a bar of G major, no shared tones, its C a semitone
+  against the chord's B. The ear picks a clashing note out of a mix at any
+  level, and a 6 dB trim changed nothing. `sfx.bank()` takes the chord;
+  `song.chord_at()` says what it is at a given second.
+
+### Determinism is per-call, not per-process
+
+`song.build()` draws from module-level noise generators. Before they were
+rewound at the top of every call, a second build in the same process produced
+different drums from the first — and a check that shelled out for each run
+could not see it. An A/B of a single note was showing 61% of samples differing
+and a peak delta of 1.78. If you are comparing two renders, prove the control
+first: render the same input twice and diff it.
 
 ## 10. Slow motion needs frame rate, and rarely earns its place
 
