@@ -8,17 +8,17 @@
   <a href="https://snaketron.io"><b>▶ Play now at snaketron.io</b></a>
 </p>
 
-What if Snake was an E-Sport? Snaketron is a competitive online multiplayer Snake game. The core engine and the auto scalable game server architecture is open source and written in Rust and is available in this repository.
+SnakeTron is a competitive online multiplayer Snake game — real-time matches, ranked seasons, and no mercy! The game engine and the auto-scaling server architecture behind [snaketron.io](https://snaketron.io) are written in Rust and open-sourced in this repository.
 
 ## Features
 
 - **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
 - **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with server-moderated chat and invite links
-- **Combos**: every food pickup refills a two-second chain; consecutive food is worth—and physically grows the snake by—`+1`, `+1`, `+2`, then `+3` per pickup
-- **Boost**: hold-to-boost speed bursts fueled by collectible Boost pads (unlimited fuel in Solo)
+- **Combos**: every food pickup restarts a two-second timer; keep the chain alive and successive pickups are worth +1, +1, +2, and then +3 each, in both points and snake length
+- **Boost**: hold-to-boost speed bursts fueled by Boost pads scattered around the arena (Solo gives you an unlimited tank to practice with)
 - **Accounts**: register/login with JWT auth, or play instantly as a guest
 - **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP
-- **Smooth multiplayer**: the game engine is shared between server and client, enabling client-side prediction with server authority
+- **Netcode**: the game engine is shared between server and client, enabling client-side prediction with server authority
 
 ## Architecture
 
@@ -31,11 +31,13 @@ What if Snake was an E-Sport? Snaketron is a competitive online multiplayer Snak
 
 ## Quick Start
 
+Prerequisites: Rust (stable), [wasm-pack](https://rustwasm.github.io/wasm-pack/), Node.js, and Docker.
+
 ### Using Docker (Recommended)
 
-#### For Development (with hot reloading):
+#### Development (hot reloading)
 ```bash
-# Start LocalStack (DynamoDB), Valkey (Redis), and the server with auto-reload on code changes
+# Start LocalStack (DynamoDB), Redis (Valkey), and the server with auto-reload on code changes
 ./dev.sh
 
 # In another terminal, build and start the client
@@ -46,11 +48,13 @@ npm install
 npm start
 ```
 
-#### For Production-like environment:
+#### Production-like
 ```bash
-# Start LocalStack (DynamoDB), Valkey (Redis), and the server (full rebuild each time)
+# Start LocalStack (DynamoDB), Redis (Valkey), and the server (full rebuild each time)
 docker-compose up --build
 ```
+
+This starts only the backend stack — build and start the client in another terminal with the same commands as in development.
 
 The game will be available at:
 - Frontend: http://localhost:3000 (webpack dev server)
@@ -108,7 +112,7 @@ npm run type-check  # TypeScript type check
 
 ### Code Quality
 
-CI requires formatting and a warning-free clippy pass on every PR (mirrored as a deploy gate):
+PRs are welcome. CI requires clean formatting and a warning-free clippy pass on every PR (mirrored as a deploy gate):
 
 ```bash
 cargo fmt --all -- --check
@@ -139,7 +143,10 @@ cargo run --bin snaketron -- replays/
 
 `CRAZYGAMES_BUILD=true npm run build:prod` (in `client/web`) produces a relative-path HTML5 bundle that loads the CrazyGames v3 SDK before the game bundle and omits third-party analytics. Ads and CrazyGames cloud-data storage stay off unless `CRAZYGAMES_ADS_ENABLED=true` / `CRAZYGAMES_DATA_ENABLED=true` are also set at build time. See [CRAZYGAMES.md](CRAZYGAMES.md) for portal settings and the QA checklist.
 
-### Run a coordinated autoscaling load test
+### Autoscaling Load Tests
+
+Point a coordinated fleet of AI players at a cluster and make it sweat:
+
 ```bash
 cargo run --release -p loadtest -- \
   --target https://snaketron.io \
@@ -149,7 +156,7 @@ cargo run --release -p loadtest -- \
   --queue-mode competitive
 ```
 
-The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-party multiplayer lobbies; plays with the shared Rust/WASM game engine and AI; ramps to 256 maintained sessions by default; and writes an HTML/JSON report with per-failure details. See [loadtest/README.md](loadtest/README.md) for profiles, safety controls, and report semantics.
+The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-party multiplayer lobbies; plays real games using the shared Rust game engine and AI; ramps to 256 maintained sessions by default; and writes an HTML/JSON report with per-failure details. See [loadtest/README.md](loadtest/README.md) for profiles, safety controls, and report semantics.
 
 ### Project Structure
 
@@ -157,14 +164,14 @@ The load runner supports Solo, Duel, 2v2, and FFA; creates deterministic full-pa
 - `server/` - Game server: WebSocket sessions, matchmaking, game executors, persistence
 - `client/` - WebAssembly client module and the React/TypeScript web app (`client/web/`)
 - `bot/` - CLI that runs one or more AI bots against a live server over WebSocket
-- `macros/` - Proc-macro crate (`serde_wasm_bindgen` attribute for Rust-to-WASM bindings)
-- `terminal/` - Terminal-based game viewer and replay player
+- `macros/` - Proc-macro crate defining a `serde_wasm_bindgen` attribute (not currently used by other crates)
+- `terminal/` - Terminal-based replay player for `.replay` captures
 - `loadtest/` - Coordinated AI load generator and aggregate reporting
 - `replays/` - Sample `.replay` game captures for the terminal viewer
 - `scripts/` - Development helpers (type generation, DynamoDB init, test dependencies)
 - `specs/` - Design documents and PRDs (matchmaking, Boost, autoscaling resilience, ...)
-- `tla_specs/` - TLA+ specifications (checked with `tla2tools.jar` at the repo root)
-- `docs/` - Screenshots and assets referenced from pull-request descriptions
+- `tla_specs/` - TLA+ specifications (model-check them with `tla2tools.jar` at the repo root)
+- `docs/` - Screenshots, pull-request assets, and assorted design notes
 
 ### Further Documentation
 
@@ -178,4 +185,4 @@ See [server/docker-readme.md](server/docker-readme.md) for detailed Docker and A
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
