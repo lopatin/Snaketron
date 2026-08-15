@@ -758,9 +758,9 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
     let mut env = TestEnvironment::new("test_silver_gold_10s").await?;
     env.add_server().await?;
 
-    // Create silver and gold users (300 MMR difference)
-    env.create_user_with_mmr(600).await?; // Silver
-    env.create_user_with_mmr(900).await?; // Gold
+    // Create 600 and 900 users (300 MMR difference)
+    env.create_user_with_mmr(600).await?;
+    env.create_user_with_mmr(900).await?;
 
     let server_addr = env.ws_addr(0).expect("Server should exist");
 
@@ -772,7 +772,7 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
     client1.create_lobby().await?;
     client2.create_lobby().await?;
 
-    println!("Testing: Silver (600) vs Gold (900) - 300 MMR difference");
+    println!("Testing: 600 vs 900 - 300 MMR difference");
 
     let start_time = std::time::Instant::now();
 
@@ -804,17 +804,17 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
     // Should match after approximately 10 seconds (allow 8-14 second range)
     assert!(
         match_time.as_secs() >= 8,
-        "Silver vs Gold should wait ~10s before matching, matched too quickly at {:?}",
+        "600 vs 900 should wait ~10s before matching, matched too quickly at {:?}",
         match_time
     );
     assert!(
         match_time.as_secs() <= 14,
-        "Silver vs Gold should match by ~10s, took too long at {:?}",
+        "600 vs 900 should match by ~10s, took too long at {:?}",
         match_time
     );
 
     println!(
-        "✓ Silver vs Gold matched in {:?} (expected: ~10s)",
+        "✓ 600 vs 900 matched in {:?} (expected: ~10s)",
         match_time
     );
 
@@ -838,9 +838,9 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
     let mut env = TestEnvironment::new("test_silver_diamond_30s").await?;
     env.add_server().await?;
 
-    // Create silver and diamond users (900 MMR difference)
-    env.create_user_with_mmr(600).await?; // Silver
-    env.create_user_with_mmr(1500).await?; // Diamond
+    // 900 MMR apart (matchmaking keys on the gap, not on any tier)
+    env.create_user_with_mmr(600).await?;
+    env.create_user_with_mmr(1500).await?;
 
     let server_addr = env.ws_addr(0).expect("Server should exist");
 
@@ -852,7 +852,7 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
     client1.create_lobby().await?;
     client2.create_lobby().await?;
 
-    println!("Testing: Silver (600) vs Diamond (1500) - 900 MMR difference");
+    println!("Testing: 600 vs 1500 - 900 MMR difference");
 
     let start_time = std::time::Instant::now();
 
@@ -884,17 +884,17 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
     // Should match after approximately 30 seconds (allow 25-35 second range)
     assert!(
         match_time.as_secs() >= 25,
-        "Silver vs Diamond should wait ~30s before matching, matched too quickly at {:?}",
+        "600 vs 1500 should wait ~30s before matching, matched too quickly at {:?}",
         match_time
     );
     assert!(
         match_time.as_secs() <= 35,
-        "Silver vs Diamond should match by ~30s (max wait time), took too long at {:?}",
+        "600 vs 1500 should match by ~30s (max wait time), took too long at {:?}",
         match_time
     );
 
     println!(
-        "✓ Silver vs Diamond matched in {:?} (expected: ~30s max)",
+        "✓ 600 vs 1500 matched in {:?} (expected: ~30s max)",
         match_time
     );
 
@@ -918,9 +918,9 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
     let mut env = TestEnvironment::new("test_extreme_mmr_30s_max").await?;
     env.add_server().await?;
 
-    // Create users with extreme MMR difference (bronze vs grandmaster)
-    env.create_user_with_mmr(300).await?; // Bronze
-    env.create_user_with_mmr(2000).await?; // Grandmaster
+    // Extreme 1700 MMR gap
+    env.create_user_with_mmr(300).await?;
+    env.create_user_with_mmr(2000).await?;
 
     let server_addr = env.ws_addr(0).expect("Server should exist");
 
@@ -932,7 +932,7 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
     client1.create_lobby().await?;
     client2.create_lobby().await?;
 
-    println!("Testing: Bronze (300) vs Grandmaster (2000) - 1700 MMR difference");
+    println!("Testing: 300 vs 2000 - 1700 MMR difference");
 
     let start_time = std::time::Instant::now();
 
