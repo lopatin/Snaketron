@@ -71,7 +71,7 @@ The account work does not remove the previously integrated portal behavior:
 | Loading/gameplay | Report loading around WASM/match loading and gameplay start/stop around controllable play, menus, countdowns, disconnects, and completion. |
 | Rooms/friends | Mirror the real server lobby through `updateRoom`/`leftRoom`, invite parameters, invite links, live joins, and Instant Multiplayer. Keep a party together across rounds and report queued/in-progress rooms as non-joinable. |
 | Chat/audio | Honor live `disableChat` and `muteAudio` settings; keep server profanity filtering in place. |
-| Ads | Keep ads disabled for Basic Launch. A later ad-enabled package must use only CrazyGames SDK ads and pass filled, unfilled, error, and ad-block tests. |
+| Ads | Keep server runtime ads disabled for Basic Launch. An approved ad-enabled deployment uses only the CrazyGames SDK adapter and treats filled, unfilled, error, timeout, and ad-block outcomes as normal lobby-barrier resolutions. |
 | Optional APIs | Do not expose IAP or native leaderboard UI until CrazyGames grants and configures those capabilities. |
 
 ## Backend deployment configuration
@@ -83,6 +83,27 @@ enabled:
 SNAKETRON_CRAZYGAMES_AUTH_ENABLED=true
 SNAKETRON_CRAZYGAMES_GAME_ID=60112
 ```
+
+Ads are a separate, server-owned runtime policy. Keep
+`SNAKETRON_ADS_ENABLED=false` for Basic Launch. After CrazyGames approves ads,
+enable the CrazyGames policy without changing the website or itch.io policy:
+
+```text
+SNAKETRON_ADS_ENABLED=true
+SNAKETRON_ADS_CRAZYGAMES_PROVIDER=crazygames
+SNAKETRON_ADS_WEB_PROVIDER=none
+SNAKETRON_ADS_ITCH_PROVIDER=none
+```
+
+The optional CrazyGames placement variables use the
+`SNAKETRON_ADS_CRAZYGAMES_*` prefix. The admin runtime record must also enable
+pre-match ads globally and for CrazyGames; it owns the minimum-games and
+minimum-interval rules, while the safety timeout remains deployment-owned. Ad
+blocking, no-fill, and SDK errors resolve the pre-match barrier without asking
+the player to change browser settings.
+Enable the switch only after the two-phase server rollout in that section is
+complete, every older task/connection has drained, and the protocol v9
+CrazyGames build is reporting its distribution.
 
 CDK exposes them through two matching contexts. Enabling authentication without
 a valid game ID fails synthesis; omitting both leaves the task definition free
@@ -162,9 +183,12 @@ The default release flags are:
 ```text
 ITCH_BUILD=false
 CRAZYGAMES_BUILD=true
-CRAZYGAMES_ADS_ENABLED=false
 CRAZYGAMES_DATA_ENABLED=false
 ```
+
+`CRAZYGAMES_BUILD` includes the CrazyGames SDK adapter but does not activate
+advertising. Activation comes only from the runtime server policy above, so the
+same reviewed client package can be used before and after approval.
 
 `CRAZYGAMES_DATA_ENABLED=true` is an explicit exceptional build. Do not use it
 unless a later feature has a separately documented Data Module contract and the

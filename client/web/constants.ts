@@ -1,3 +1,6 @@
+import type { ClientDistribution } from './types/generated/ClientDistribution';
+import type { WSMessage } from './types/generated/WSMessage';
+
 // Game tick interval constants (matching Rust constants)
 export const DEFAULT_TICK_INTERVAL_MS = 100;
 // Informational parity with the production v2 actor. Gameplay timing always
@@ -5,21 +8,49 @@ export const DEFAULT_TICK_INTERVAL_MS = 100;
 export const EXECUTOR_POLL_INTERVAL_MS = 10;
 export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // Gameplay protocol version. Predictive simulation requires an exact match:
-// protocol 8 changes scoring and physical growth, so continuing with a stale
-// engine would produce permanent body-geometry divergence.
+// protocol 8 changes scoring and physical growth, and protocol 9 adds
+// per-session distribution routing for server-owned advertisement policy.
 // Tracks WS_PROTOCOL_VERSION in server/src/lifecycle.rs.
-export const GAMEPLAY_PROTOCOL_VERSION = 8;
+export const GAMEPLAY_PROTOCOL_VERSION = 9;
 export const isGameplayProtocolCompatible = (serverVersion: unknown): boolean =>
   Number(serverVersion) === GAMEPLAY_PROTOCOL_VERSION;
 export const GAMEPLAY_UPDATE_REQUIRED_PREFIX = 'Gameplay update required';
 export const isGameplayUpdateRequiredReason = (reason: unknown): boolean =>
   typeof reason === 'string' && reason.startsWith(GAMEPLAY_UPDATE_REQUIRED_PREFIX);
+
+/**
+ * Identify the release surface represented by this bundle. This is sent to
+ * the server as routing context only: the server remains authoritative for
+ * whether ads are enabled and which provider/configuration the session gets.
+ */
+export const resolveClientDistribution = (
+  crazyGamesBuild: boolean,
+  itchBuild: boolean,
+): ClientDistribution => {
+  if (crazyGamesBuild && itchBuild) {
+    throw new Error('ITCH_BUILD and CRAZYGAMES_BUILD are mutually exclusive release targets');
+  }
+  if (crazyGamesBuild) {
+    return 'crazygames';
+  }
+  if (itchBuild) {
+    return 'itch';
+  }
+  return 'web';
+};
+
+export const CLIENT_DISTRIBUTION: ClientDistribution = resolveClientDistribution(
+  process.env.CRAZYGAMES_BUILD === 'true',
+  process.env.ITCH_BUILD === 'true',
+);
+
 export const buildGameplayAuthentication = (token: string) => ({
   Authenticate: {
     token,
     protocol_version: GAMEPLAY_PROTOCOL_VERSION,
+    distribution: CLIENT_DISTRIBUTION,
   },
-} as const);
+} as const satisfies WSMessage);
 // Game speed mappings
 export const GAME_SPEED_TO_MS = {
   slow: 200,

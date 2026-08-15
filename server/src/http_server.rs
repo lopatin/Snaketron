@@ -17,11 +17,13 @@ use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
+use crate::ads::AdsConfig;
+use crate::api::admin;
 use crate::api::auth::{self, AuthState};
 use crate::api::crazygames;
 use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
-use crate::api::middleware::{AuthMiddlewareState, auth_middleware};
+use crate::api::middleware::{AuthMiddlewareState, admin_middleware, auth_middleware};
 use crate::api::news::{self, NewsState};
 use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
 use crate::api::regions;
@@ -168,6 +170,8 @@ pub struct HttpServerState {
     pub lifecycle: TaskLifecycle,
     /// Region-scoped authoritative recovery namespace.
     pub cluster_namespace: ClusterNamespace,
+    /// Deployment advertisement capabilities advertised to every WebSocket session.
+    pub ads_config: Arc<AdsConfig>,
 }
 
 /// Install the combined API and WebSocket application behind the already-bound
@@ -191,6 +195,7 @@ pub async fn install_http_application(
     lobby_manager: Arc<LobbyManager>,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    ads_config: Arc<AdsConfig>,
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
@@ -215,6 +220,7 @@ pub async fn install_http_application(
         user_cache,
         lifecycle: lifecycle.clone(),
         cluster_namespace,
+        ads_config,
     };
 
     // Start background task to update user count in Redis every 5 seconds
@@ -254,11 +260,30 @@ pub async fn install_http_application(
     // Build protected API routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
+        .route("/api/history", get(admin::get_user_history))
         .route(
             "/api/auth/crazygames/preferences",
             put(crazygames::save_preferences)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
+        .layer(middleware::from_fn_with_state(
+            auth_middleware_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(auth_state.clone());
+
+    let admin_routes = Router::new()
+        .route("/api/admin/history", get(admin::get_admin_history))
+        .route(
+            "/api/admin/config",
+            get(admin::get_admin_config)
+                .put(admin::update_admin_config)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route("/api/admin/config/audit", get(admin::get_config_audit))
+        .layer(middleware::from_fn(admin_middleware))
+        // Authentication runs first and installs the DB-derived AuthUser used
+        // by the inner administrator authorization layer.
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -308,6 +333,7 @@ pub async fn install_http_application(
     // Build API routes with AuthState
     let api_routes = Router::new()
         .route("/api/health", get(regions::health_check_json))
+        .route("/api/config", get(admin::get_public_config))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/guest", post(auth::create_guest))
@@ -330,6 +356,7 @@ pub async fn install_http_application(
         // Catch-all preflight for all API routes to avoid 500s on OPTIONS
         .route("/api/*path", options(|| async { StatusCode::NO_CONTENT }))
         .merge(protected_routes)
+        .merge(admin_routes)
         .merge(region_routes)
         .merge(leaderboard_routes)
         .merge(news_routes)
@@ -476,6 +503,7 @@ async fn websocket_handler(
                 state.region,
                 lifecycle.clone(),
                 state.cluster_namespace,
+                state.ads_config,
             )
             .await;
             crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());

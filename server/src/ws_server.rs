@@ -1,14 +1,24 @@
+use crate::ads::{
+    AdBreakResolution, AdsConfig, ClientAdsConfig, ClientDistribution, LobbyAdBreak,
+    LobbyAdBreakView, MAX_AD_BREAK_PARTICIPANTS, lobby_meets_game_threshold,
+};
 use crate::api::auth::validate_username;
 use crate::chat_filter::filter_chat_message;
 use crate::cluster_membership::ClusterNamespace;
-use crate::db::Database;
+use crate::db::{Database, models::RuntimeAdsConfig};
 use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lifecycle::{DrainNotice, TaskLifecycle, WS_PROTOCOL_VERSION};
 use crate::lobby_manager;
-use crate::lobby_manager::{LeaveLobbyResult, LobbyJoinHandle, LobbyMember};
-use crate::matchmaking_manager::{ActiveMatch, MatchmakingManager};
+use crate::lobby_manager::{
+    AdBreakResolutionResult, BeginAdBreakResult, LobbyJoinHandle, LobbyMember, MAX_LOBBY_MEMBERS,
+    lobby_membership_valid_until_ms,
+};
+use crate::matchmaking_manager::{
+    ActiveMatch, LobbyAdmissionRejected, LobbyMembershipFence, MATCHMAKING_GAME_TYPES,
+    MatchmakingManager,
+};
 use crate::matchmaking_pool::MatchmakingPool;
 use crate::pubsub_manager::PubSubManager;
 use crate::recovery::{
@@ -68,6 +78,10 @@ pub enum WSMessage {
     Authenticate {
         token: String,
         protocol_version: u16,
+        /// Session build channel. A missing value resolves to a disabled ad
+        /// policy because the client's available SDK is unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        distribution: Option<ClientDistribution>,
     },
     JoinGame(u32),
     LeaveGame,
@@ -138,6 +152,9 @@ pub enum WSMessage {
         #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         socket_generation: u64,
     },
+    /// Server -> client distribution capability. Live pre-match authorization
+    /// is carried by each lobby break's targeted user IDs.
+    AdConfiguration(ClientAdsConfig),
     /// Client -> server: this player has read the pre-match briefing and is
     /// ready. `game_id` is echoed back for client-side routing only — the
     /// gateway canonicalizes it, and the player's identity, from the
@@ -180,6 +197,12 @@ pub enum WSMessage {
         estimated_wait_seconds: u32,
     },
     QueueLeft,
+    /// Client -> server terminal resolution for the current lobby ad break.
+    /// Every outcome releases this participant; ad blocking is not an error.
+    AdBreakResolved {
+        break_id: String,
+        resolution: AdBreakResolution,
+    },
     UpdateNickname {
         nickname: String,
     },
@@ -234,6 +257,8 @@ pub enum WSMessage {
         host_user_id: i32,
         state: String,
         preferences: lobby_manager::LobbyPreferences,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ad_break: Option<LobbyAdBreakView>,
     },
     UpdateLobbyPreferences {
         selected_modes: Vec<String>,
@@ -265,6 +290,14 @@ pub struct PlayerMetadata {
     pub token: String,
     pub is_guest: bool,
     pub matchmaking_pool: MatchmakingPool,
+    /// An ad break is only safe when every lobby member can acknowledge it.
+    /// Keeping this explicit also makes mixed-version durable lobby state fail
+    /// closed during a rolling deployment.
+    pub supports_ad_break: bool,
+    /// Deployment capability resolved from the authenticated distribution.
+    /// Live runtime policy is applied again when matchmaking targets a break.
+    pub can_show_video_ad: bool,
+    pub distribution: Option<ClientDistribution>,
 }
 
 const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
@@ -614,7 +647,11 @@ impl JwtVerifier for TestJwtVerifier {
     }
 }
 
-// Connection state machine - simplified to 2 states
+// Connection state machine - simplified to 2 states. Keeping the authenticated
+// fields inline preserves the existing single-owner lobby-handle lifecycle;
+// boxing that handle would complicate detach/close paths for negligible gain
+// at the gateway's connection counts.
+#[allow(clippy::large_enum_variant)]
 enum ConnectionState {
     // Initial state - waiting for authentication
     Unauthenticated,
@@ -691,6 +728,7 @@ struct LobbyUpdateFingerprint {
     host_user_id: i32,
     state: String,
     preferences: lobby_manager::LobbyPreferences,
+    ad_break: Option<LobbyAdBreakView>,
 }
 
 /// Publish the durable lobby snapshot, rather than trusting the at-most-once
@@ -711,7 +749,9 @@ async fn send_authoritative_lobby_update(
             host_user_id: 0,
             state: "deleted".to_owned(),
             preferences: lobby_manager::LobbyPreferences::default(),
+            ad_break: None,
         });
+    let ad_break = lobby.ad_break.as_ref().map(LobbyAdBreak::view);
     let fingerprint = LobbyUpdateFingerprint {
         lobby_code: lobby.lobby_code.clone(),
         members: lobby
@@ -722,6 +762,7 @@ async fn send_authoritative_lobby_update(
         host_user_id: lobby.host_user_id,
         state: lobby.state.clone(),
         preferences: lobby.preferences.clone(),
+        ad_break: ad_break.clone(),
     };
     if last_sent_update.as_ref() == Some(&fingerprint) {
         return Ok(true);
@@ -732,6 +773,7 @@ async fn send_authoritative_lobby_update(
         host_user_id: lobby.host_user_id,
         state: lobby.state,
         preferences: lobby.preferences,
+        ad_break,
     };
     let json_msg = serde_json::to_string(&ws_message)?;
     if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
@@ -759,6 +801,7 @@ pub async fn handle_websocket(
     region: String,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    ads_config: Arc<AdsConfig>,
 ) {
     info!("New WebSocket connection established");
 
@@ -779,6 +822,7 @@ pub async fn handle_websocket(
         region,
         lifecycle,
         cluster_namespace,
+        ads_config,
     )
     .await
     {
@@ -840,6 +884,7 @@ async fn handle_websocket_connection(
     region: String,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    ads_config: Arc<AdsConfig>,
 ) -> Result<()> {
     // Split the WebSocket into send and receive parts using futures_util
     let (mut ws_sink, mut ws_stream) = futures_util::StreamExt::split(ws_stream);
@@ -1127,6 +1172,7 @@ async fn handle_websocket_connection(
                                         socket_generation,
                                         &cluster_namespace,
                                         &cancellation_token,
+                                        &ads_config,
                                     ).await {
                                         Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby
@@ -1243,9 +1289,13 @@ async fn handle_websocket_connection(
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
                                                     let lobby_user_id_for_match = metadata.user_id as u32;
+                                                    let lobby_scope_cancellation = lobby_handle.scope_cancellation_token();
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let cancellation_token_clone = cancellation_token.clone();
+                                                    let lobby_scope_for_updates = lobby_scope_cancellation.clone();
                                                     let lobby_manager_clone = lobby_manager.clone();
+                                                    let db_for_ad_break_recovery = db.clone();
+                                                    let matchmaking_for_ad_break_recovery = matchmaking_manager.clone();
 
                                                     lobby_update_handle = Some(tokio::spawn(async move {
                                                         let mut last_sent_update = None;
@@ -1257,9 +1307,12 @@ async fn handle_websocket_connection(
                                                         );
                                                         loop {
                                                             tokio::select! {
-                                                                biased;
                                                                 _ = cancellation_token_clone.cancelled() => {
                                                                     debug!("Lobby update task cancelled for lobby {}", lobby_code_for_updates);
+                                                                    break;
+                                                                }
+                                                                _ = lobby_scope_for_updates.cancelled() => {
+                                                                    debug!("Superseded lobby scope stopped reconciliation for {}", lobby_code_for_updates);
                                                                     break;
                                                                 }
                                                                 update = lobby_rx.recv() => {
@@ -1292,6 +1345,18 @@ async fn handle_websocket_connection(
                                                                     }
                                                                 }
                                                                 _ = reconciliation.tick() => {
+                                                                    if let Err(error) = expire_lobby_ad_break_if_due(
+                                                                        &lobby_code_for_updates,
+                                                                        &db_for_ad_break_recovery,
+                                                                        &lobby_manager_clone,
+                                                                        &matchmaking_for_ad_break_recovery,
+                                                                    ).await {
+                                                                        warn!(
+                                                                            lobby_code = lobby_code_for_updates,
+                                                                            %error,
+                                                                            "Failed to recover an expired lobby ad break"
+                                                                        );
+                                                                    }
                                                                     match send_authoritative_lobby_update(
                                                                         &lobby_manager_clone,
                                                                         &lobby_code_for_updates,
@@ -1321,17 +1386,21 @@ async fn handle_websocket_connection(
                                                     let pubsub_manager_clone_for_match = pubsub_manager.clone();
                                                     let redis_clone_for_match = redis.clone();
                                                     let cancellation_token_clone_for_match = cancellation_token.clone();
+                                                    let lobby_scope_for_match = lobby_scope_cancellation.clone();
 
                                                     lobby_match_handle = Some(tokio::spawn(async move {
-                                                        subscribe_to_lobby_match_notifications(
-                                                            lobby_code_for_match,
-                                                            lobby_user_id_for_match,
-                                                            pubsub_manager_clone_for_match,
-                                                            redis_clone_for_match,
-                                                            ws_tx_clone_for_match,
-                                                            cancellation_token_clone_for_match,
-                                                        )
-                                                        .await;
+                                                        tokio::select! {
+                                                            _ = lobby_scope_for_match.cancelled() => {}
+                                                            _ = subscribe_to_lobby_match_notifications(
+                                                                lobby_code_for_match,
+                                                                lobby_user_id_for_match,
+                                                                pubsub_manager_clone_for_match,
+                                                                redis_clone_for_match,
+                                                                ws_tx_clone_for_match,
+                                                                cancellation_token_clone_for_match,
+                                                                LOBBY_MATCH_RECONCILIATION_INTERVAL,
+                                                            ) => {}
+                                                        }
                                                     }));
 
                                                     // Subscribe to lobby chat
@@ -1339,15 +1408,19 @@ async fn handle_websocket_connection(
                                                     let pubsub_manager_clone = pubsub_manager.clone();
 
                                                     let lobby_code_for_chat = lobby_handle.lobby_code.clone();
+                                                    let lobby_scope_for_chat = lobby_scope_cancellation.clone();
                                                     lobby_chat_handle = Some(tokio::spawn(async move {
-                                                        if let Err(e) = subscribe_to_lobby_chat(
-                                                            lobby_code_for_chat,
-                                                            pubsub_manager_clone,
-                                                            ws_tx_clone,
-                                                        )
-                                                        .await
-                                                        {
-                                                            error!("Lobby chat subscription failed: {}", e);
+                                                        tokio::select! {
+                                                            _ = lobby_scope_for_chat.cancelled() => {}
+                                                            result = subscribe_to_lobby_chat(
+                                                                lobby_code_for_chat,
+                                                                pubsub_manager_clone,
+                                                                ws_tx_clone,
+                                                            ) => {
+                                                                if let Err(e) = result {
+                                                                    error!("Lobby chat subscription failed: {}", e);
+                                                                }
+                                                            }
                                                         }
                                                     }));
 
@@ -1544,7 +1617,7 @@ async fn publish_game_chat_message(
 
 #[allow(clippy::too_many_arguments)]
 async fn queue_existing_lobby_for_game_types(
-    lobby_handle: &LobbyJoinHandle,
+    lobby_code: &str,
     game_types: &[common::GameType],
     queue_mode: &common::QueueMode,
     db: &Arc<dyn Database>,
@@ -1552,13 +1625,12 @@ async fn queue_existing_lobby_for_game_types(
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     requesting_user_id: u32,
     matchmaking_pool: MatchmakingPool,
+    expected_ad_break_id: Option<&str>,
 ) -> Result<()> {
-    if game_types.is_empty() {
-        return Err(anyhow!("Must specify at least one game type to queue"));
-    }
+    validate_matchmaking_game_types(game_types)?;
 
     let lobby_metadata = lobby_manager
-        .get_lobby_metadata(&lobby_handle.lobby_code)
+        .get_lobby_metadata(lobby_code)
         .await
         .context("Failed to load lobby metadata before queueing")?
         .ok_or_else(|| anyhow!("Lobby no longer exists"))?;
@@ -1567,44 +1639,517 @@ async fn queue_existing_lobby_for_game_types(
     }
 
     let members_map = lobby_manager
-        .get_lobby_members(&lobby_handle.lobby_code)
+        .get_lobby_members(lobby_code)
         .await
         .context("Failed to load lobby members before queueing")?;
 
     if members_map.is_empty() {
         return Err(anyhow!("Lobby has no active members to queue"));
     }
+    if members_map.len() > MAX_LOBBY_MEMBERS {
+        return Err(anyhow!("Lobby exceeds the supported member limit"));
+    }
+    if !members_map.contains_key(&requesting_user_id) {
+        return Err(anyhow!(
+            "The requesting user is not an active member of this lobby"
+        ));
+    }
 
-    let members: Vec<LobbyMember> = members_map.into_values().collect();
-    let avg_mmr = compute_lobby_avg_mmr(db, &members, matchmaking_pool).await?;
+    let expected_user_ids: Vec<u32> = members_map.keys().copied().collect();
+    let initial_members: Vec<LobbyMember> = members_map.into_values().collect();
+    let avg_mmr = compute_lobby_avg_mmr(db, &initial_members, matchmaking_pool).await?;
 
-    let mut mm_guard = matchmaking_manager.lock().await;
-    mm_guard
-        .add_lobby_to_queue_in_pool(
-            &lobby_handle.lobby_code,
-            members,
-            avg_mmr,
-            game_types.to_vec(),
-            queue_mode.clone(),
-            requesting_user_id,
-            matchmaking_pool,
-        )
-        .await
-        .context("Failed to add lobby to matchmaking queue")?;
-    drop(mm_guard);
+    // MMR reads may consume most of a short presence lease. Re-snapshot while
+    // holding the admission mutex, and retry only typed membership conflicts;
+    // this keeps the roster fence fresh without making users watch another ad.
+    let mut admitted = false;
+    for attempt in 0..3_u64 {
+        let mut mm_guard = matchmaking_manager.lock().await;
+        let membership_revision = lobby_manager
+            .get_lobby_membership_revision(lobby_code)
+            .await
+            .context("Failed to refresh lobby membership revision")?;
+        let fresh_members_map = lobby_manager
+            .get_lobby_members(lobby_code)
+            .await
+            .context("Failed to refresh lobby members before admission")?;
+        let fresh_user_ids: Vec<u32> = fresh_members_map.keys().copied().collect();
+        if fresh_user_ids != expected_user_ids
+            || !fresh_members_map.contains_key(&requesting_user_id)
+        {
+            return Err(anyhow!(
+                "Lobby membership changed while matchmaking was being prepared"
+            ));
+        }
+        let membership_fence = LobbyMembershipFence {
+            revision: membership_revision,
+            valid_until_ms: lobby_membership_valid_until_ms(fresh_members_map.values())?,
+        };
+        let fresh_members: Vec<LobbyMember> = fresh_members_map.into_values().collect();
+        let admission = mm_guard
+            .add_lobby_to_queue_in_pool_with_membership_fence(
+                lobby_code,
+                fresh_members,
+                avg_mmr,
+                game_types.to_vec(),
+                queue_mode.clone(),
+                requesting_user_id,
+                matchmaking_pool,
+                expected_ad_break_id,
+                membership_fence,
+            )
+            .await;
+        drop(mm_guard);
 
-    if let Err(error) = lobby_manager
-        .publish_lobby_update(&lobby_handle.lobby_code)
-        .await
-    {
+        match admission {
+            Ok(()) => {
+                admitted = true;
+                break;
+            }
+            Err(error)
+                if attempt < 2
+                    && error
+                        .downcast_ref::<LobbyAdmissionRejected>()
+                        .is_some_and(LobbyAdmissionRejected::is_retryable_membership_conflict) =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt + 1))).await;
+            }
+            Err(error) => {
+                return Err(error).context("Failed to add lobby to matchmaking queue");
+            }
+        }
+    }
+    if !admitted {
+        return Err(anyhow!(
+            "Lobby membership remained unstable during matchmaking admission"
+        ));
+    }
+
+    if let Err(error) = lobby_manager.publish_lobby_update(lobby_code).await {
         warn!(
-            lobby_code = lobby_handle.lobby_code,
+            lobby_code,
             %error,
             "Failed to publish queued lobby state"
         );
     }
 
     Ok(())
+}
+
+fn validate_matchmaking_game_types(game_types: &[common::GameType]) -> Result<()> {
+    if game_types.is_empty() {
+        return Err(anyhow!("Must specify at least one game type to queue"));
+    }
+    if game_types.len() > MATCHMAKING_GAME_TYPES.len() {
+        return Err(anyhow!(
+            "At most {} game types may be queued",
+            MATCHMAKING_GAME_TYPES.len()
+        ));
+    }
+    for (index, game_type) in game_types.iter().enumerate() {
+        if !MATCHMAKING_GAME_TYPES.contains(game_type) {
+            return Err(anyhow!("Unsupported matchmaking game type"));
+        }
+        if game_types[..index].contains(game_type) {
+            return Err(anyhow!("Duplicate matchmaking game type"));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_lobby_ad_break(
+    ad_break: &LobbyAdBreak,
+    lobby_code: &str,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+) -> Result<()> {
+    let Some(finalization_lease) = lobby_manager
+        .claim_ad_break_finalization(lobby_code, &ad_break.id)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let current_members = lobby_manager
+        .get_lobby_members(lobby_code)
+        .await
+        .context("Failed to reload lobby members after ad break")?;
+    let current_user_ids: Vec<u32> = current_members.keys().copied().collect();
+    if current_user_ids != ad_break.participant_user_ids {
+        lobby_manager
+            .cancel_ad_break(lobby_code, &ad_break.id)
+            .await?;
+        return Err(anyhow!(
+            "Lobby membership changed during the ad break; start matchmaking again"
+        ));
+    }
+
+    let admission = queue_existing_lobby_for_game_types(
+        lobby_code,
+        &ad_break.game_types,
+        &ad_break.queue_mode,
+        db,
+        lobby_manager,
+        matchmaking_manager,
+        ad_break.requesting_user_id,
+        ad_break.matchmaking_pool,
+        Some(&ad_break.id),
+    )
+    .await;
+
+    match admission {
+        Ok(()) => {
+            lobby_manager
+                .clear_ad_break(lobby_code, &ad_break.id)
+                .await?;
+            lobby_manager.publish_lobby_update(lobby_code).await?;
+            finalization_lease.release().await;
+            Ok(())
+        }
+        Err(error) => {
+            if error
+                .downcast_ref::<LobbyAdmissionRejected>()
+                .is_some_and(LobbyAdmissionRejected::is_retryable_membership_conflict)
+            {
+                // Keep the already-resolved break durable. Releasing the
+                // claim lets the one-second reconciler retry with a fresh
+                // roster/lease without showing another ad.
+                finalization_lease.release().await;
+                return Err(error);
+            }
+            // If admission committed but its response was lost, the queue Lua
+            // script already changed state to queued and this compare/cancel
+            // is harmless. Otherwise return the lobby to waiting.
+            let _ = lobby_manager
+                .cancel_ad_break(lobby_code, &ad_break.id)
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn expire_lobby_ad_break_if_due(
+    lobby_code: &str,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+) -> Result<bool> {
+    let Some(metadata) = lobby_manager.get_lobby_metadata(lobby_code).await? else {
+        return Ok(false);
+    };
+    let Some(active) = metadata.ad_break else {
+        return Ok(false);
+    };
+    // A crash can occur after the final durable resolution but before queue
+    // admission. Recover that state immediately; only unresolved breaks wait
+    // for the safety deadline authored by the metadata-slot Redis clock.
+    if active.is_resolved() {
+        finalize_lobby_ad_break(&active, lobby_code, db, lobby_manager, matchmaking_manager)
+            .await?;
+        return Ok(true);
+    }
+
+    match lobby_manager
+        .resolve_ad_break(lobby_code, &active.id, 0, AdBreakResolution::TimedOut)
+        .await?
+    {
+        AdBreakResolutionResult::Ready(resolved) => {
+            finalize_lobby_ad_break(
+                &resolved,
+                lobby_code,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+            )
+            .await?;
+            Ok(true)
+        }
+        AdBreakResolutionResult::Pending(_)
+        | AdBreakResolutionResult::NotDue(_)
+        | AdBreakResolutionResult::NoChange(_)
+        | AdBreakResolutionResult::Stale => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_lobby_or_begin_ad_break(
+    lobby_code: &str,
+    game_types: &[common::GameType],
+    queue_mode: &common::QueueMode,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+    requesting_user_id: u32,
+    matchmaking_pool: MatchmakingPool,
+    ads_config: &Arc<AdsConfig>,
+) -> Result<bool> {
+    // Validate the client-controlled fan-out before eligibility work or an ad
+    // break. Users must never watch an ad for queue families no worker drains.
+    validate_matchmaking_game_types(game_types)?;
+
+    if !ads_config.any_pre_match_video_enabled() || matchmaking_pool != MatchmakingPool::Public {
+        queue_existing_lobby_for_game_types(
+            lobby_code,
+            game_types,
+            queue_mode,
+            db,
+            lobby_manager,
+            matchmaking_manager,
+            requesting_user_id,
+            matchmaking_pool,
+            None,
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    // Runtime policy is strongly consistent and fail-closed for advertising.
+    // A control-plane outage must never delay gameplay or reuse stale ad
+    // authorization, so it falls through directly to normal matchmaking.
+    let runtime_record = match db.get_runtime_config().await {
+        Ok(record) if record.config.ads.enabled => record,
+        Ok(_) => {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+        Err(error) => {
+            warn!(lobby_code, %error, "Runtime ad policy unavailable; skipping ad break");
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+    let runtime_ads = &runtime_record.config.ads;
+
+    for snapshot_attempt in 0..3_u64 {
+        let membership_revision = lobby_manager
+            .get_lobby_membership_revision(lobby_code)
+            .await
+            .context("Failed to load lobby membership fence for ad eligibility")?;
+        let members = lobby_manager
+            .get_lobby_members(lobby_code)
+            .await
+            .context("Failed to load lobby members for ad eligibility")?;
+        if members.is_empty() {
+            return Err(anyhow!("Lobby has no active members to queue"));
+        }
+        if !members.contains_key(&requesting_user_id) {
+            return Err(anyhow!(
+                "The requesting user is not an active member of this lobby"
+            ));
+        }
+        if members.len() > MAX_AD_BREAK_PARTICIPANTS {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+        let membership_valid_until_ms = lobby_membership_valid_until_ms(members.values())?;
+
+        let Some(ad_user_ids) = lobby_video_ad_targets(members.values(), runtime_ads) else {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        };
+
+        let mut users = Vec::with_capacity(members.len());
+        for member in members.values() {
+            match db.get_user_by_id(member.user_id as i32).await {
+                Ok(Some(user)) => users.push(user),
+                Ok(None) => {
+                    // Missing history is treated as a newcomer. Skipping the ad
+                    // is conservative and never blocks matchmaking.
+                    users.clear();
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        lobby_code,
+                        user_id = member.user_id,
+                        %error,
+                        "Could not load ad eligibility; skipping the lobby ad break"
+                    );
+                    users.clear();
+                    break;
+                }
+            }
+        }
+
+        let eligible = users.len() == members.len()
+            && lobby_meets_game_threshold(
+                users.iter().map(|user| &user.games_played),
+                runtime_ads.minimum_games_played,
+            );
+        if !eligible {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let break_id = uuid::Uuid::new_v4().to_string();
+        let minimum_interval_ms =
+            i64::from(runtime_ads.minimum_interval_minutes).saturating_mul(60_000);
+        match db
+            .try_claim_pre_match_ad_break(
+                &break_id,
+                &ad_user_ids,
+                now_ms,
+                minimum_interval_ms,
+                runtime_record.version,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                queue_existing_lobby_for_game_types(
+                    lobby_code,
+                    game_types,
+                    queue_mode,
+                    db,
+                    lobby_manager,
+                    matchmaking_manager,
+                    requesting_user_id,
+                    matchmaking_pool,
+                    None,
+                )
+                .await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                warn!(lobby_code, %error, "Could not claim ad cooldown; skipping ad break");
+                queue_existing_lobby_for_game_types(
+                    lobby_code,
+                    game_types,
+                    queue_mode,
+                    db,
+                    lobby_manager,
+                    matchmaking_manager,
+                    requesting_user_id,
+                    matchmaking_pool,
+                    None,
+                )
+                .await?;
+                return Ok(false);
+            }
+        }
+        let timeout_ms = i64::try_from(ads_config.ad_break_timeout.as_millis()).unwrap_or(i64::MAX);
+        let requested = LobbyAdBreak {
+            id: break_id,
+            expires_at_ms: now_ms.saturating_add(timeout_ms),
+            participant_user_ids: members.keys().copied().collect(),
+            ad_user_ids,
+            resolutions: BTreeMap::new(),
+            game_types: game_types.to_vec(),
+            queue_mode: queue_mode.clone(),
+            requesting_user_id,
+            matchmaking_pool,
+        };
+        match lobby_manager
+            .begin_ad_break(
+                lobby_code,
+                &requested,
+                membership_revision,
+                membership_valid_until_ms,
+                ads_config.ad_break_timeout,
+            )
+            .await?
+        {
+            BeginAdBreakResult::Active { .. } => {
+                // Every connected lobby session runs the authoritative
+                // one-second reconciliation loop. Avoid retaining one
+                // detached timer task per rapidly-cycled break.
+                return Ok(true);
+            }
+            BeginAdBreakResult::MembershipChanged if snapshot_attempt < 2 => {
+                tokio::time::sleep(Duration::from_millis(10 * (snapshot_attempt + 1))).await;
+            }
+            BeginAdBreakResult::MembershipChanged => {
+                return Err(anyhow!(
+                    "Lobby membership kept changing while matchmaking was preparing; retry shortly"
+                ));
+            }
+        }
+    }
+    unreachable!("bounded lobby snapshot loop always returns")
+}
+
+/// All members must understand the barrier, while only one needs an enabled
+/// video provider. This permits mixed web/CrazyGames/itch lobbies: no-ad
+/// sessions resolve `unavailable`, and ad-enabled sessions use their own
+/// distribution-specific adapter.
+fn lobby_video_ad_targets<'a>(
+    members: impl IntoIterator<Item = &'a LobbyMember>,
+    runtime_ads: &RuntimeAdsConfig,
+) -> Option<Vec<u32>> {
+    let mut targets = Vec::new();
+    for member in members {
+        if !member.supports_ad_break {
+            return None;
+        }
+        let runtime_distribution_enabled = match member.distribution {
+            Some(ClientDistribution::Web) => runtime_ads.distributions.web.enabled,
+            Some(ClientDistribution::CrazyGames) => runtime_ads.distributions.crazygames.enabled,
+            Some(ClientDistribution::Itch) => runtime_ads.distributions.itch.enabled,
+            None => false,
+        };
+        if member.can_show_video_ad && runtime_distribution_enabled {
+            targets.push(member.user_id);
+        }
+    }
+    (!targets.is_empty()).then_some(targets)
 }
 
 async fn compute_lobby_avg_mmr(
@@ -3420,6 +3965,7 @@ async fn subscribe_to_lobby_match_notifications(
     redis: impl Into<RedisConnection>,
     ws_tx: mpsc::Sender<Message>,
     cancellation_token: CancellationToken,
+    reconciliation_interval: Duration,
 ) {
     let mut redis = redis.into();
     let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
@@ -3457,7 +4003,7 @@ async fn subscribe_to_lobby_match_notifications(
             return;
         }
 
-        let mut reconciliation = tokio::time::interval(LOBBY_MATCH_RECONCILIATION_INTERVAL);
+        let mut reconciliation = tokio::time::interval(reconciliation_interval);
         reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The immediate durable read above already covers the interval's first tick.
         reconciliation.tick().await;
@@ -3633,6 +4179,7 @@ async fn subscribe_to_lobby_chat(
 async fn authenticate_ws_connection(
     jwt_token: String,
     protocol_version: Option<u16>,
+    distribution: Option<ClientDistribution>,
     jwt_verifier: &Arc<dyn JwtVerifier>,
     db: &Arc<dyn Database>,
     ws_tx: &mpsc::Sender<Message>,
@@ -3643,6 +4190,7 @@ async fn authenticate_ws_connection(
     lifecycle: &TaskLifecycle,
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
+    ads_config: &AdsConfig,
 ) -> Result<ConnectionState> {
     if let Err(error) = validate_client_protocol_version(protocol_version) {
         warn!(%error, "Rejecting incompatible gameplay client");
@@ -3685,18 +4233,46 @@ async fn authenticate_ws_connection(
                 ));
             }
 
+            // Distribution routing entered the protocol in v9. Do not let an
+            // older shape accidentally inherit a provider based on a default
+            // or on its account's authentication method.
+            let distribution = protocol_version
+                .is_some_and(|version| version >= 9)
+                .then_some(distribution)
+                .flatten();
+            let client_ads_config = ads_config.client_config(distribution);
+            let supports_ad_break = protocol_version.is_some_and(|version| version >= 9);
+
             let metadata = PlayerMetadata {
                 user_id: user_token.user_id,
                 username: user.username.clone(),
                 token: jwt_token.clone(),
                 is_guest: user.is_guest,
                 matchmaking_pool: database_pool,
+                supports_ad_break,
+                can_show_video_ad: supports_ad_break
+                    && client_ads_config.enabled
+                    && client_ads_config.video.pre_match,
+                distribution,
             };
 
             info!(
                 "User authenticated: {} (id: {})",
                 metadata.username, metadata.user_id
             );
+
+            // Do not emit a new enum variant until the peer has advertised a
+            // protocol that can decode it. This keeps legacy strict-Serde
+            // clients compatible even when ads are globally disabled.
+            if metadata.supports_ad_break {
+                ws_tx
+                    .send(Message::Text(
+                        serde_json::to_string(&WSMessage::AdConfiguration(client_ads_config))?
+                            .into(),
+                    ))
+                    .await
+                    .context("WebSocket closed before advertisement configuration")?;
+            }
 
             let authenticated = WSMessage::Authenticated {
                 task_boot_id: lifecycle.task_boot_id().to_owned(),
@@ -3755,6 +4331,7 @@ async fn process_ws_message(
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
     cancellation_token: &CancellationToken,
+    ads_config: &Arc<AdsConfig>,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -3812,6 +4389,7 @@ async fn process_ws_message(
                     authenticate_ws_connection(
                         jwt_token,
                         None,
+                        None,
                         jwt_verifier,
                         db,
                         ws_tx,
@@ -3822,16 +4400,19 @@ async fn process_ws_message(
                         lifecycle,
                         socket_generation,
                         cluster_namespace,
+                        ads_config,
                     )
                     .await
                 }
                 WSMessage::Authenticate {
                     token: jwt_token,
                     protocol_version,
+                    distribution,
                 } => {
                     authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
+                        distribution,
                         jwt_verifier,
                         db,
                         ws_tx,
@@ -3842,6 +4423,7 @@ async fn process_ws_message(
                         lifecycle,
                         socket_generation,
                         cluster_namespace,
+                        ads_config,
                     )
                     .await
                 }
@@ -3870,6 +4452,18 @@ async fn process_ws_message(
             game_id,
             websocket_id,
         } => {
+            // Replacement transports and failed exact-presence heartbeats
+            // cancel the lobby scope. A retained handle is not authorization:
+            // normalize it before any inbound lobby mutation or chat action.
+            let mut lobby = lobby;
+            if lobby
+                .as_ref()
+                .is_some_and(|handle| handle.scope_cancellation_token().is_cancelled())
+                && let Some(handle) = lobby.take()
+            {
+                handle.detach_transport();
+            }
+
             match ws_message {
                 WSMessage::UpdateNickname { nickname } => {
                     let mut metadata = metadata;
@@ -3930,8 +4524,8 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
-                        if let Err(e) = queue_existing_lobby_for_game_types(
-                            lobby_handle,
+                        if let Err(e) = queue_lobby_or_begin_ad_break(
+                            &lobby_handle.lobby_code,
                             std::slice::from_ref(&game_type),
                             &queue_mode,
                             db,
@@ -3939,6 +4533,7 @@ async fn process_ws_message(
                             matchmaking_manager,
                             metadata.user_id as u32,
                             metadata.matchmaking_pool,
+                            ads_config,
                         )
                         .await
                         {
@@ -3988,8 +4583,8 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
-                        if let Err(e) = queue_existing_lobby_for_game_types(
-                            lobby_handle,
+                        if let Err(e) = queue_lobby_or_begin_ad_break(
+                            &lobby_handle.lobby_code,
                             &game_types,
                             &queue_mode,
                             db,
@@ -3997,6 +4592,7 @@ async fn process_ws_message(
                             matchmaking_manager,
                             metadata.user_id as u32,
                             metadata.matchmaking_pool,
+                            ads_config,
                         )
                         .await
                         {
@@ -4029,6 +4625,92 @@ async fn process_ws_message(
                     };
                     let json_msg = serde_json::to_string(&response)?;
                     ws_tx.send(Message::Text(json_msg.into())).await?;
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+                WSMessage::AdBreakResolved {
+                    break_id,
+                    resolution,
+                } => {
+                    if let (Some(lobby_handle), Ok(user_id)) =
+                        (lobby.as_ref(), u32::try_from(metadata.user_id))
+                    {
+                        match lobby_manager
+                            .resolve_ad_break(
+                                &lobby_handle.lobby_code,
+                                &break_id,
+                                user_id,
+                                resolution,
+                            )
+                            .await
+                        {
+                            Ok(AdBreakResolutionResult::Ready(ad_break)) => {
+                                if let Err(error) = finalize_lobby_ad_break(
+                                    &ad_break,
+                                    &lobby_handle.lobby_code,
+                                    db,
+                                    lobby_manager,
+                                    matchmaking_manager,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        lobby_code = lobby_handle.lobby_code,
+                                        break_id,
+                                        %error,
+                                        "Failed to finalize resolved lobby ad break"
+                                    );
+                                }
+                            }
+                            Ok(AdBreakResolutionResult::Pending(ad_break)) => {
+                                debug!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id,
+                                    resolved = ad_break.resolutions.len(),
+                                    participants = ad_break.participant_user_ids.len(),
+                                    "Lobby ad break is still waiting for participants"
+                                );
+                            }
+                            Ok(AdBreakResolutionResult::NotDue(_)) => {
+                                // Only the internal timeout sentinel can
+                                // produce this result; client ACKs never do.
+                            }
+                            Ok(AdBreakResolutionResult::NoChange(_)) => {
+                                debug!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id, "Ignored duplicate lobby ad-break resolution"
+                                );
+                            }
+                            Ok(AdBreakResolutionResult::Stale) => {
+                                debug!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id,
+                                    user_id,
+                                    "Ignored stale or non-participant ad-break resolution"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id,
+                                    user_id,
+                                    %error,
+                                    "Failed to record lobby ad-break resolution"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            break_id,
+                            user_id = metadata.user_id,
+                            "Ignored ad-break resolution outside a valid lobby session"
+                        );
+                    }
+
                     Ok(ConnectionState::Authenticated {
                         metadata,
                         lobby_handle: lobby,
@@ -4143,45 +4825,82 @@ async fn process_ws_message(
                         metadata.username, metadata.user_id
                     );
 
+                    let authenticated_user_id =
+                        u32::try_from(metadata.user_id).context("User ID must be non-negative")?;
+
                     // Queue admission is lobby-authoritative. Remove only the
                     // exact currently admitted lobby identity; there is no
-                    // secondary per-player queue to reconcile.
+                    // secondary per-player queue to reconcile. If a gateway
+                    // restart lost the in-memory handle, recover authority
+                    // from this authenticated user's exact durable claim.
+                    let in_memory_lobby_code =
+                        lobby.as_ref().map(|handle| handle.lobby_code.clone());
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
-                    if let Some(lobby_handle) = &lobby {
-                        let lobby_code = lobby_handle.lobby_code.clone();
-                        match matchmaking_manager
-                            .remove_lobby_from_all_queues_by_code(&lobby_code)
-                            .await
-                        {
-                            Ok(removed) => {
-                                if removed {
-                                    info!(
-                                        lobby_code = lobby_code,
-                                        "Removed lobby from matchmaking queues after cancel"
-                                    );
-                                } else {
-                                    info!(
-                                        lobby_code = lobby_code,
-                                        "Lobby was not present in matchmaking queues on cancel"
-                                    );
+                    let mut removal_result = Ok(None);
+                    for attempt in 0..2 {
+                        removal_result = match in_memory_lobby_code.as_deref() {
+                            Some(lobby_code) => match matchmaking_manager
+                                .remove_lobby_from_all_queues_by_code_for_user(
+                                    lobby_code,
+                                    authenticated_user_id,
+                                )
+                                .await
+                            {
+                                Ok(true) => Ok(Some(lobby_code.to_owned())),
+                                Ok(false) => {
+                                    matchmaking_manager
+                                        .remove_lobby_from_queue_for_user_claim(
+                                            authenticated_user_id,
+                                        )
+                                        .await
                                 }
-                                if let Err(error) =
-                                    lobby_manager.publish_lobby_update(&lobby_code).await
-                                {
-                                    warn!(
-                                        lobby_code = lobby_code,
-                                        %error,
-                                        "Failed to publish reconciled lobby state after cancel"
-                                    );
-                                }
+                                Err(error) => Err(error),
+                            },
+                            None => {
+                                matchmaking_manager
+                                    .remove_lobby_from_queue_for_user_claim(authenticated_user_id)
+                                    .await
                             }
-                            Err(e) => {
-                                error!(
-                                    lobby_code = lobby_code,
-                                    error = %e,
-                                    "Failed to remove lobby from matchmaking queues on cancel"
+                        };
+                        if removal_result.is_ok() {
+                            break;
+                        }
+                        if attempt == 0 {
+                            warn!("Retrying ambiguous lobby matchmaking cancellation");
+                        }
+                    }
+                    match removal_result {
+                        Ok(Some(lobby_code)) => {
+                            info!(
+                                lobby_code,
+                                "Removed lobby from matchmaking queues after cancel"
+                            );
+                            if let Err(error) =
+                                lobby_manager.publish_lobby_update(&lobby_code).await
+                            {
+                                warn!(
+                                    lobby_code,
+                                    %error,
+                                    "Failed to publish reconciled lobby state after cancel"
                                 );
                             }
+                        }
+                        Ok(None) => {
+                            info!("No authorized lobby queue identity was present on cancel");
+                        }
+                        Err(error) => {
+                            error!(
+                                %error,
+                                "Failed to remove lobby from matchmaking queues on cancel"
+                            );
+                            let response = WSMessage::AccessDenied {
+                                reason: format!(
+                                    "Could not confirm queue cancellation; retry: {error}"
+                                ),
+                            };
+                            ws_tx
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await?;
                         }
                     }
 
@@ -4243,6 +4962,9 @@ async fn process_ws_message(
                                     region.to_string(),
                                     None,
                                     metadata.matchmaking_pool,
+                                    metadata.distribution,
+                                    metadata.supports_ad_break,
+                                    metadata.can_show_video_ad,
                                 )
                                 .await
                             {
@@ -4394,6 +5116,9 @@ async fn process_ws_message(
                             region.to_string(),
                             preferences,
                             metadata.matchmaking_pool,
+                            metadata.distribution,
+                            metadata.supports_ad_break,
+                            metadata.can_show_video_ad,
                         )
                         .await
                     {
@@ -4434,32 +5159,7 @@ async fn process_ws_message(
                     if let Some(mut lobby_handle) = lobby {
                         let lobby_code = lobby_handle.lobby_code.clone();
                         match lobby_handle.close().await {
-                            Ok(result) => {
-                                if let LeaveLobbyResult::LobbyDeleted = result {
-                                    let mut mm = matchmaking_manager.lock().await;
-                                    match mm.remove_lobby_from_all_queues_by_code(&lobby_code).await
-                                    {
-                                        Ok(true) => {
-                                            info!(
-                                                "Removed empty lobby {} from matchmaking queues",
-                                                lobby_code
-                                            );
-                                        }
-                                        Ok(false) => {
-                                            info!(
-                                                "Lobby {} was not present in matchmaking queues",
-                                                lobby_code
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to remove lobby {} from matchmaking queues: {}",
-                                                lobby_code, e
-                                            );
-                                        }
-                                    }
-                                }
-
+                            Ok(_) => {
                                 let response = WSMessage::LeftLobby;
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -4830,6 +5530,8 @@ struct LobbyUpdatePayload {
     host_user_id: i32,
     state: String,
     preferences: lobby_manager::LobbyPreferences,
+    #[serde(default)]
+    ad_break: Option<LobbyAdBreakView>,
 }
 
 /// Subscribe to lobby updates and forward to WebSocket client
@@ -4866,6 +5568,7 @@ async fn subscribe_to_lobby_updates(
                     host_user_id,
                     state,
                     preferences,
+                    ad_break,
                 } = update;
 
                 let ws_message = WSMessage::LobbyUpdate {
@@ -4874,6 +5577,7 @@ async fn subscribe_to_lobby_updates(
                     host_user_id,
                     state,
                     preferences,
+                    ad_break,
                 };
 
                 let json_msg = match serde_json::to_string(&ws_message) {
@@ -5105,17 +5809,20 @@ mod lifecycle_protocol_tests {
         abort_and_join_game_event_forwarder, acknowledge_lobby_match_handoff,
         canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
         game_join_denied, game_join_failure_message, load_game_chat_history,
-        missing_game_join_failure, next_game_subscription_input, next_lobby_match,
-        next_outbound_message, publish_game_chat_message, queue_planned_drain_notice,
-        recovery_bridge_snapshot, refresh_connection_username, repair_legacy_chat_history,
-        require_game_command_publication, send_command_outcomes_from_resolved,
-        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
-        slow_command_publish_wait_ms, snapshot_requires_command_outcomes, subscribe_to_game_chat,
+        lobby_video_ad_targets, missing_game_join_failure, next_game_subscription_input,
+        next_lobby_match, next_outbound_message, publish_game_chat_message,
+        queue_planned_drain_notice, recovery_bridge_snapshot, refresh_connection_username,
+        repair_legacy_chat_history, require_game_command_publication,
+        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
+        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
+        snapshot_requires_command_outcomes, subscribe_to_game_chat,
         subscribe_to_lobby_match_notifications, take_lobby_update_receiver,
         validate_client_protocol_version, validate_game_matchmaking_pool,
     };
+    use crate::ads::ClientDistribution;
+    use crate::db::models::RuntimeAdsConfig;
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
-    use crate::lobby_manager::{Lobby, LobbyPreferences};
+    use crate::lobby_manager::{Lobby, LobbyMember, LobbyPreferences};
     use crate::matchmaking_manager::{ActiveMatch, MatchStatus};
     use crate::matchmaking_pool::MatchmakingPool;
     use crate::pubsub_manager::PubSubManager;
@@ -5137,6 +5844,49 @@ mod lifecycle_protocol_tests {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
 
+    fn ad_capability_member(
+        user_id: u32,
+        distribution: Option<ClientDistribution>,
+        supports_ad_break: bool,
+        can_show_video_ad: bool,
+    ) -> LobbyMember {
+        LobbyMember {
+            user_id,
+            username: format!("player-{user_id}"),
+            ts: 1.0,
+            supports_ad_break,
+            can_show_video_ad,
+            distribution,
+        }
+    }
+
+    #[test]
+    fn mixed_distribution_lobby_runs_only_when_someone_can_show_video() {
+        let web = ad_capability_member(1, Some(ClientDistribution::Web), true, true);
+        let itch = ad_capability_member(2, Some(ClientDistribution::Itch), true, true);
+        let runtime_ads = RuntimeAdsConfig {
+            enabled: true,
+            distributions: crate::db::models::RuntimeAdsDistributionsConfig {
+                web: crate::db::models::RuntimeDistributionAdsConfig { enabled: true },
+                crazygames: crate::db::models::RuntimeDistributionAdsConfig { enabled: true },
+                itch: crate::db::models::RuntimeDistributionAdsConfig { enabled: false },
+            },
+            ..RuntimeAdsConfig::default()
+        };
+        assert_eq!(
+            lobby_video_ad_targets([&web, &itch], &runtime_ads),
+            Some(vec![1])
+        );
+
+        let another_no_ad_build =
+            ad_capability_member(3, Some(ClientDistribution::Itch), true, false);
+        assert!(lobby_video_ad_targets([&itch, &another_no_ad_build], &runtime_ads).is_none());
+
+        let legacy = ad_capability_member(4, None, false, false);
+        assert!(lobby_video_ad_targets([&web, &legacy], &runtime_ads).is_none());
+        assert!(lobby_video_ad_targets(std::iter::empty(), &runtime_ads).is_none());
+    }
+
     #[test]
     fn successful_guest_rename_refreshes_same_socket_identity() {
         let mut metadata = PlayerMetadata {
@@ -5145,6 +5895,9 @@ mod lifecycle_protocol_tests {
             token: "session-token".to_owned(),
             is_guest: true,
             matchmaking_pool: MatchmakingPool::Public,
+            supports_ad_break: true,
+            can_show_video_ad: false,
+            distribution: Some(ClientDistribution::Web),
         };
 
         refresh_connection_username(&mut metadata, "CrazyPlayer".to_owned());
@@ -5237,6 +5990,7 @@ mod lifecycle_protocol_tests {
             host_user_id: 7,
             state: "open".to_owned(),
             preferences: LobbyPreferences::default(),
+            ad_break: None,
         };
         updates
             .send(initial)
@@ -5262,6 +6016,7 @@ mod lifecycle_protocol_tests {
             host_user_id: 7,
             state: "open".to_owned(),
             preferences: LobbyPreferences::default(),
+            ad_break: None,
         };
         updates
             .send(next)
@@ -5323,6 +6078,7 @@ mod lifecycle_protocol_tests {
         let value = serde_json::to_value(WSMessage::Authenticate {
             token: "jwt".to_owned(),
             protocol_version: WS_PROTOCOL_VERSION,
+            distribution: Some(ClientDistribution::Web),
         })
         .unwrap();
         assert_eq!(value["Authenticate"]["token"], "jwt");
@@ -5330,6 +6086,25 @@ mod lifecycle_protocol_tests {
             value["Authenticate"]["protocol_version"],
             WS_PROTOCOL_VERSION
         );
+        assert_eq!(value["Authenticate"]["distribution"], "web");
+    }
+
+    #[test]
+    fn authentication_request_can_omit_distribution() {
+        let value: WSMessage = serde_json::from_value(serde_json::json!({
+            "Authenticate": {
+                "token": "jwt",
+                "protocol_version": WS_PROTOCOL_VERSION
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            value,
+            WSMessage::Authenticate {
+                distribution: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5640,6 +6415,7 @@ mod lifecycle_protocol_tests {
             redis,
             ws_tx,
             cancellation.clone(),
+            Duration::from_millis(100),
         ));
 
         let first = timeout(Duration::from_secs(2), ws_rx.recv())
@@ -5686,7 +6462,7 @@ mod lifecycle_protocol_tests {
             .query_async::<()>(&mut control)
             .await
             .unwrap();
-        let second = timeout(Duration::from_secs(6), ws_rx.recv())
+        let second = timeout(Duration::from_secs(1), ws_rx.recv())
             .await
             .expect("periodic reconciliation did not recover the missed hint")
             .expect("listener closed before periodic reconciliation");

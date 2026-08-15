@@ -79,7 +79,7 @@ export interface CrazyGamesDataModule {
   setItem(key: string, value: string): void;
 }
 
-interface CrazyGamesAdError {
+export interface CrazyGamesAdError {
   code?: string;
   message?: string;
 }
@@ -161,7 +161,7 @@ export interface CrazyGamesSnapshot {
   hasAdblock: boolean | null;
   adState: CrazyGamesAdState;
   lastAdError: CrazyGamesAdError | null;
-  adsEnabled: boolean;
+  adSdkAvailable: boolean;
   dataEnabled: boolean;
   iapEnabled: false;
   leaderboardsEnabled: false;
@@ -173,11 +173,14 @@ export interface CrazyGamesAdResult {
   error?: CrazyGamesAdError;
 }
 
+export interface CrazyGamesBannerResult {
+  status: 'filled' | 'error' | 'disabled';
+  error?: CrazyGamesAdError;
+}
+
 const IS_CRAZY_GAMES_BUILD = process.env.CRAZYGAMES_BUILD === 'true';
-const ARE_CRAZY_GAMES_ADS_ENABLED = process.env.CRAZYGAMES_ADS_ENABLED === 'true';
 const IS_CRAZY_GAMES_DATA_ENABLED = process.env.CRAZYGAMES_DATA_ENABLED === 'true';
 const SDK_INIT_TIMEOUT_MS = 15_000;
-const AD_REQUEST_TIMEOUT_MS = 15_000;
 const PROFILE_LOOKUP_DELAY_MS = 300;
 
 const DEFAULT_SETTINGS: CrazyGamesGameSettings = {
@@ -269,7 +272,9 @@ class CrazyGamesService {
     hasAdblock: null,
     adState: 'idle',
     lastAdError: null,
-    adsEnabled: IS_CRAZY_GAMES_BUILD && ARE_CRAZY_GAMES_ADS_ENABLED,
+    // This is SDK/build capability only. The server's AdConfiguration owns
+    // whether any placement is enabled for the current deployment.
+    adSdkAvailable: IS_CRAZY_GAMES_BUILD,
     dataEnabled: IS_CRAZY_GAMES_BUILD && IS_CRAZY_GAMES_DATA_ENABLED,
     iapEnabled: false,
     leaderboardsEnabled: false,
@@ -471,6 +476,20 @@ class CrazyGamesService {
       return null;
     }
     return this.sdk.data;
+  };
+
+  detectAdblock = async (): Promise<boolean | null> => {
+    if (!this.canUseSdk(this.sdk)) {
+      return null;
+    }
+    try {
+      const hasAdblock = await this.sdk.ad.hasAdblock();
+      this.updateSnapshot({ hasAdblock });
+      return hasAdblock;
+    } catch (error) {
+      console.info('CrazyGames adblock detection unavailable:', errorMessage(error));
+      return null;
+    }
   };
 
   loadingStart = (): void => {
@@ -725,7 +744,7 @@ class CrazyGamesService {
 
   requestAd = (type: CrazyGamesAdType): Promise<CrazyGamesAdResult> => {
     const sdk = this.sdk;
-    if (!this.snapshot.adsEnabled || !this.canUseSdk(sdk)) {
+    if (!this.snapshot.adSdkAvailable || !this.canUseSdk(sdk)) {
       return Promise.resolve({ status: 'disabled' });
     }
     if (this.snapshot.adState !== 'idle') {
@@ -738,16 +757,12 @@ class CrazyGamesService {
     this.updateSnapshot({ adState: 'requesting', lastAdError: null });
     return new Promise<CrazyGamesAdResult>((resolve) => {
       let settled = false;
-      let requestTimeout: ReturnType<typeof setTimeout> | null = null;
+      let started = false;
       const finish = (result: CrazyGamesAdResult) => {
         if (settled) {
           return;
         }
         settled = true;
-        if (requestTimeout) {
-          clearTimeout(requestTimeout);
-          requestTimeout = null;
-        }
         this.updateSnapshot({
           adState: 'idle',
           lastAdError: result.status === 'error' ? result.error ?? null : null,
@@ -755,19 +770,11 @@ class CrazyGamesService {
         resolve(result);
       };
 
-      requestTimeout = setTimeout(() => finish({
-        status: 'error',
-        error: { code: 'requestTimeout', message: 'Advertisement request timed out' },
-      }), AD_REQUEST_TIMEOUT_MS);
-
       try {
         sdk.ad.requestAd(type, {
           adStarted: () => {
-            if (!settled) {
-              if (requestTimeout) {
-                clearTimeout(requestTimeout);
-                requestTimeout = null;
-              }
+            if (!settled && !started) {
+              started = true;
               this.gameplayStop();
               this.updateSnapshot({ adState: 'playing' });
             }
@@ -785,7 +792,7 @@ class CrazyGamesService {
   };
 
   requestBanner = async (input: { id: string; width: number; height: number }): Promise<boolean> => {
-    if (!this.snapshot.adsEnabled || !this.canUseSdk(this.sdk)) {
+    if (!this.snapshot.adSdkAvailable || !this.canUseSdk(this.sdk)) {
       return false;
     }
     try {
@@ -797,16 +804,22 @@ class CrazyGamesService {
     }
   };
 
-  requestResponsiveBanner = async (containerId: string): Promise<boolean> => {
-    if (!this.snapshot.adsEnabled || !this.canUseSdk(this.sdk)) {
-      return false;
+  requestResponsiveBanner = async (containerId: string): Promise<CrazyGamesBannerResult> => {
+    if (!this.snapshot.adSdkAvailable || !this.canUseSdk(this.sdk)) {
+      return { status: 'disabled' };
     }
     try {
       await this.sdk.banner.requestResponsiveBanner(containerId);
-      return true;
+      return { status: 'filled' };
     } catch (error) {
       console.info('CrazyGames responsive banner unavailable:', errorMessage(error));
-      return false;
+      return {
+        status: 'error',
+        error: {
+          code: errorCode(error) || 'other',
+          message: errorMessage(error),
+        },
+      };
     }
   };
 

@@ -5,7 +5,10 @@
 //! effect has a stable identity and is applied through a DynamoDB transaction
 //! containing both the mutation and its idempotency marker.
 
-use crate::db::Database;
+use crate::db::{
+    Database,
+    models::{MatchHistoryPlayer, MatchHistorySummary},
+};
 use crate::mmr_persistence::calculate_mmr_effect_specs;
 use crate::season::{Season, get_region, get_season_at};
 use anyhow::{Result, anyhow};
@@ -17,6 +20,12 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const COMPLETION_SCHEMA_VERSION: u16 = 1;
+pub const MATCH_HISTORY_SCHEMA_VERSION: u16 = 1;
+/// A DynamoDB transaction contains the effect marker, completion anchor,
+/// completed-game row, canonical history row, and one projection per player.
+/// Keep the total at or below DynamoDB's 100-action limit.
+pub const MAX_HISTORY_TRANSACTION_PLAYERS: usize = 96;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
 /// Serialize a durable payload with recursively sorted object keys. Recovery
 /// reparses `GameState` hash maps in a fresh process, so ordinary JSON bytes
@@ -158,6 +167,15 @@ impl CompletionRecordV1 {
                 "stress-test completion must not contain progression or ranking effects"
             ));
         }
+        if !self.final_state.is_stress_test
+            && self.final_state.players.len() > MAX_HISTORY_TRANSACTION_PLAYERS
+        {
+            return Err(anyhow!(
+                "completion has {} players; at most {} can be persisted atomically with history",
+                self.final_state.players.len(),
+                MAX_HISTORY_TRANSACTION_PLAYERS
+            ));
+        }
 
         for effect in &self.effects {
             if let CompletionEffect::UpdateRanking {
@@ -282,6 +300,151 @@ impl CompletionRecordV1 {
             )),
         }
     }
+}
+
+/// Build the compact immutable result written to the canonical history row and
+/// copied into each player's history partition. This intentionally depends only
+/// on the durable completion payload plus the retention policy captured by the
+/// successful write attempt.
+pub fn match_history_summary(
+    completion: &CompletionRecordV1,
+    snapshot_retention_days: u16,
+) -> Result<MatchHistorySummary> {
+    let state = &completion.final_state;
+    let (mode, mode_label) = match &state.game_type {
+        GameType::Solo => ("solo".to_string(), "Solo".to_string()),
+        GameType::TeamMatch { per_team: 1 } => ("duel".to_string(), "Duel".to_string()),
+        GameType::TeamMatch { per_team: 2 } => ("2v2".to_string(), "2v2".to_string()),
+        GameType::TeamMatch { per_team } => {
+            let name = format!("{per_team}v{per_team}");
+            (name.clone(), name)
+        }
+        GameType::FreeForAll { .. } => ("ffa".to_string(), "Free for All".to_string()),
+        GameType::Custom { .. } => ("custom".to_string(), "Custom".to_string()),
+    };
+    let queue_mode = match state.queue_mode {
+        QueueMode::Quickmatch => "quickmatch",
+        QueueMode::Competitive => "competitive",
+    }
+    .to_string();
+
+    let mut winner_user_ids: Vec<u32> = completion
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            CompletionEffect::UpdateRanking {
+                user_id, won: true, ..
+            } => Some(*user_id),
+            _ => None,
+        })
+        .collect();
+
+    // Stress and solo records intentionally have no ranking effects. The
+    // terminal winner remains authoritative for those modes and is also a
+    // defensive fallback for historical/custom records.
+    if winner_user_ids.is_empty() && !matches!(state.game_type, GameType::Solo) {
+        let winning_snake_id = match state.status {
+            GameStatus::Complete { winning_snake_id } => winning_snake_id,
+            _ => None,
+        };
+        if let Some(winning_snake_id) = winning_snake_id {
+            let winning_team = state
+                .arena
+                .snakes
+                .get(winning_snake_id as usize)
+                .and_then(|snake| snake.team_id);
+            winner_user_ids.extend(state.players.iter().filter_map(|(user_id, player)| {
+                if state.is_player_idle_kicked(*user_id) {
+                    return None;
+                }
+                let snake = state.arena.snakes.get(player.snake_id as usize)?;
+                let won = winning_team
+                    .map(|team| snake.team_id == Some(team))
+                    .unwrap_or(player.snake_id == winning_snake_id);
+                won.then_some(*user_id)
+            }));
+        }
+    }
+    winner_user_ids.sort_unstable();
+    winner_user_ids.dedup();
+
+    let mmr_deltas: std::collections::HashMap<u32, i32> = completion
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            CompletionEffect::AddMmr { user_id, delta, .. } => Some((*user_id, *delta)),
+            _ => None,
+        })
+        .collect();
+    let multiple_players = state.players.len() > 1;
+    let has_winner = !winner_user_ids.is_empty();
+
+    let mut player_ids: Vec<u32> = state.players.keys().copied().collect();
+    player_ids.sort_unstable();
+    let players = player_ids
+        .into_iter()
+        .map(|user_id| {
+            let player = state
+                .players
+                .get(&user_id)
+                .expect("player id came from the same map");
+            let team_id = state
+                .arena
+                .snakes
+                .get(player.snake_id as usize)
+                .and_then(|snake| snake.team_id)
+                .map(|team| team.0);
+            let outcome = if matches!(state.game_type, GameType::Solo) {
+                "completed"
+            } else if state.is_player_idle_kicked(user_id) {
+                "removed"
+            } else if winner_user_ids.binary_search(&user_id).is_ok() {
+                "win"
+            } else if has_winner {
+                "loss"
+            } else if multiple_players {
+                "draw"
+            } else {
+                "completed"
+            };
+            MatchHistoryPlayer {
+                user_id,
+                username: username_for(state, user_id),
+                team_id,
+                score: state.scores.get(&player.snake_id).copied().unwrap_or(0),
+                team_score: team_id.and_then(|team_id| {
+                    state
+                        .team_scores
+                        .as_ref()
+                        .and_then(|scores| scores.get(&common::TeamId(team_id)).copied())
+                }),
+                xp_gained: state.player_xp.get(&user_id).copied().unwrap_or(0),
+                mmr_delta: mmr_deltas.get(&user_id).copied(),
+                outcome: outcome.to_string(),
+            }
+        })
+        .collect();
+
+    let started_at_ms = state.simulation_epoch_ms.unwrap_or(state.start_ms);
+    Ok(MatchHistorySummary {
+        schema_version: MATCH_HISTORY_SCHEMA_VERSION,
+        game_id: completion.game_id,
+        started_at_ms,
+        ended_at_ms: completion.ended_at_ms,
+        duration_ms: state.elapsed_match_ms(),
+        mode,
+        mode_label,
+        queue_mode,
+        is_private: state.game_code.is_some()
+            || matches!(&state.game_type, GameType::Custom { settings } if settings.is_private),
+        is_stress_test: state.is_stress_test,
+        completed_by_inactivity: state.completed_by_inactivity,
+        players,
+        winner_user_ids,
+        snapshot_available_until_ms: completion
+            .ended_at_ms
+            .saturating_add(i64::from(snapshot_retention_days).saturating_mul(MILLIS_PER_DAY)),
+    })
 }
 
 /// `chrono` is intentionally kept out of the durable record's public schema;
@@ -725,5 +888,48 @@ mod tests {
                 .to_string()
                 .contains("stress-test completion")
         );
+    }
+
+    #[test]
+    fn solo_history_is_completed_without_a_competitive_winner() {
+        let mut state = GameState::new(
+            40,
+            40,
+            GameType::Solo,
+            QueueMode::Quickmatch,
+            Some(1),
+            1_000,
+        );
+        let player = state
+            .add_player(7, Some("solo-player".into()))
+            .expect("solo player should be added");
+        state.tick = 12;
+        state.simulation_epoch_ms = Some(1_500);
+        state.scores.insert(player.snake_id, 9);
+        state.player_xp.insert(7, 25);
+        // Legacy snapshots may contain a terminal snake even though Solo is
+        // presented as a completed run, not a win/loss match.
+        state.status = GameStatus::Complete {
+            winning_snake_id: Some(player.snake_id),
+        };
+        let record = CompletionRecordV1 {
+            schema_version: COMPLETION_SCHEMA_VERSION,
+            game_id: 42,
+            partition_id: 3,
+            revision: Uuid::new_v4(),
+            ended_at_ms: 5_000,
+            server_id: 1,
+            season: Some(0),
+            final_state: state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+
+        let summary = match_history_summary(&record, 30).unwrap();
+        assert_eq!(summary.started_at_ms, 1_500);
+        assert_eq!(summary.duration_ms, 12 * 50);
+        assert!(summary.winner_user_ids.is_empty());
+        assert_eq!(summary.players[0].score, 9);
+        assert_eq!(summary.players[0].xp_gained, 25);
+        assert_eq!(summary.players[0].outcome, "completed");
     }
 }

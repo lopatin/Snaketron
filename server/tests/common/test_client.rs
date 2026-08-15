@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use common::{ClientCommandIdentityV2, GameCommandMessage, GameEventMessage};
 use futures_util::{SinkExt, StreamExt};
+use server::ads::{ClientAdsConfig, ClientDistribution};
 use server::lifecycle::WS_PROTOCOL_VERSION;
 use server::ws_server::WSMessage;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -12,6 +13,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 pub struct TestClient {
     ws: WebSocketStream<MaybeTlsStream<TokioTcpStream>>,
     pub user_id: Option<i32>,
+    pub ad_configuration: Option<ClientAdsConfig>,
     command_session_id: String,
     next_command_sequence: u64,
 }
@@ -22,6 +24,7 @@ impl TestClient {
         Ok(TestClient {
             ws: ws_stream,
             user_id: None,
+            ad_configuration: None,
             command_session_id: uuid::Uuid::new_v4().to_string(),
             next_command_sequence: 1,
         })
@@ -35,17 +38,59 @@ impl TestClient {
     }
 
     pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
+        self.authenticate_with_protocol(token, WS_PROTOCOL_VERSION)
+            .await
+    }
+
+    pub async fn authenticate_for_distribution(
+        &mut self,
+        user_id: i32,
+        distribution: ClientDistribution,
+    ) -> Result<()> {
+        self.authenticate_with_protocol_and_distribution(
+            &user_id.to_string(),
+            WS_PROTOCOL_VERSION,
+            Some(distribution),
+        )
+        .await?;
+        self.user_id = Some(user_id);
+        Ok(())
+    }
+
+    pub async fn authenticate_with_protocol(
+        &mut self,
+        token: &str,
+        protocol_version: u16,
+    ) -> Result<()> {
+        self.authenticate_with_protocol_and_distribution(
+            token,
+            protocol_version,
+            (protocol_version >= 9).then_some(ClientDistribution::Web),
+        )
+        .await
+    }
+
+    pub async fn authenticate_with_protocol_and_distribution(
+        &mut self,
+        token: &str,
+        protocol_version: u16,
+        distribution: Option<ClientDistribution>,
+    ) -> Result<()> {
         // Send the exact token string and wait for the server-side verification
         // boundary. Merely writing a token is not authentication.
         self.send_message(WSMessage::Authenticate {
             token: token.to_string(),
-            protocol_version: WS_PROTOCOL_VERSION,
+            protocol_version,
+            distribution,
         })
         .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match self.receive_message().await? {
                     WSMessage::Authenticated { .. } => return Ok(()),
+                    WSMessage::AdConfiguration(configuration) => {
+                        self.ad_configuration = Some(configuration);
+                    }
                     WSMessage::UserCountUpdate { .. } => {}
                     other => {
                         return Err(anyhow::anyhow!(

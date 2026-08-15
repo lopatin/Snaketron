@@ -33,6 +33,7 @@ use crate::{
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::ads::AdsConfig;
 use common::{BoostConfig, MATCH_READY_WINDOW_MS, NORMAL_SNAKE_SPEED_MILLI};
 
 const ECS_METADATA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,6 +222,8 @@ pub struct GameServerConfig {
     /// exercised, but startup omits a fixed grace sleep and shutdown uses
     /// bounded cancellation instead of production traffic/lease handoff.
     pub test_mode: bool,
+    /// Deployment advertisement capability ceiling and SDK routing, resolved once at startup.
+    pub ads_config: AdsConfig,
 }
 
 /// A complete game server instance with all components
@@ -389,6 +392,7 @@ impl GameServer {
             player_idle_config,
             match_ready_window_ms,
             test_mode,
+            ads_config,
         } = config;
         let runtime_mode = ServerRuntimeMode::from_test_mode(test_mode);
 
@@ -822,6 +826,7 @@ impl GameServer {
             lobby_manager.clone(),
             lifecycle.clone(),
             cluster_namespace.clone(),
+            Arc::new(ads_config),
         )
         .await?;
 
@@ -1125,13 +1130,14 @@ pub async fn start_test_server_with_grpc(
     jwt_verifier: Arc<dyn JwtVerifier>,
     enable_grpc: bool,
 ) -> Result<GameServer> {
-    start_test_server_with_grpc_and_mode(
+    start_test_server_with_grpc_options(
         db,
         jwt_manager,
         jwt_verifier,
         enable_grpc,
         true,
         MATCH_READY_WINDOW_MS,
+        AdsConfig::default(),
     )
     .await
 }
@@ -1145,9 +1151,56 @@ pub async fn start_test_server_with_grpc_and_mode(
     db: Arc<dyn Database>,
     jwt_manager: JwtManager,
     jwt_verifier: Arc<dyn JwtVerifier>,
+    enable_grpc: bool,
+    test_mode: bool,
+    match_ready_window_ms: i64,
+) -> Result<GameServer> {
+    start_test_server_with_grpc_options(
+        db,
+        jwt_manager,
+        jwt_verifier,
+        enable_grpc,
+        test_mode,
+        match_ready_window_ms,
+        AdsConfig::default(),
+    )
+    .await
+}
+
+/// Helper function to start a test server with explicit deployment ad capabilities.
+/// Production reads these capabilities from the environment once at startup; tests
+/// inject it directly so process-global environment variables cannot race.
+pub async fn start_test_server_with_grpc_and_ads(
+    db: Arc<dyn Database>,
+    jwt_manager: JwtManager,
+    jwt_verifier: Arc<dyn JwtVerifier>,
+    enable_grpc: bool,
+    ads_config: AdsConfig,
+) -> Result<GameServer> {
+    start_test_server_with_grpc_options(
+        db,
+        jwt_manager,
+        jwt_verifier,
+        enable_grpc,
+        true,
+        MATCH_READY_WINDOW_MS,
+        ads_config,
+    )
+    .await
+}
+
+/// Start test wiring with explicit lifecycle, readiness, and ad configuration.
+/// Narrower public helpers delegate here so integration environments that need
+/// more than one override do not fall back to process-global configuration.
+#[doc(hidden)]
+pub async fn start_test_server_with_grpc_options(
+    db: Arc<dyn Database>,
+    jwt_manager: JwtManager,
+    jwt_verifier: Arc<dyn JwtVerifier>,
     _enable_grpc: bool,
     test_mode: bool,
     match_ready_window_ms: i64,
+    ads_config: AdsConfig,
 ) -> Result<GameServer> {
     // Get available ports
     let http_port = get_available_port();
@@ -1191,6 +1244,7 @@ pub async fn start_test_server_with_grpc_and_mode(
         player_idle_config: PlayerIdleConfig::default(),
         match_ready_window_ms,
         test_mode,
+        ads_config,
     };
 
     let game_server = GameServer::start(config).await?;

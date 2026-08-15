@@ -20,8 +20,21 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
-import { CrazyGamesAdOverlay, CrazyGamesBridge } from './components/CrazyGamesBridge';
+import { CrazyGamesBridge } from './components/CrazyGamesBridge';
 import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
+import { AdminRoute } from './components/AdminRoute';
+import { RuntimeAnnouncement } from './components/RuntimeAnnouncement';
+import { RuntimeConfigProvider, useRuntimeConfig } from './contexts/RuntimeConfigContext';
+import { AdsProvider } from './contexts/AdsContext';
+import { AdBannerLayout } from './components/AdBannerLayout';
+import { PreMatchAdBreak } from './components/PreMatchAdBreak';
+import { isDurableBannerRoute } from './services/ads/bannerPlan';
+
+const IS_EMBEDDED_BUILD = process.env.ITCH_BUILD === 'true'
+  || process.env.CRAZYGAMES_BUILD === 'true';
+const AdminPage = !IS_EMBEDDED_BUILD
+  ? React.lazy(() => import('./components/AdminPage'))
+  : null;
 
 // Design-review harness for the post-match rating reveal. Only reachable —
 // and only bundled — outside production builds.
@@ -38,11 +51,16 @@ function AppContent() {
     retryCrazyGamesSession,
   } = useAuth();
   const { isCrazyGamesBuild, showAuthPrompt } = useCrazyGames();
+  const { config } = useRuntimeConfig();
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
+  const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
   const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
+  const showRuntimeAnnouncement = config.announcement.enabled
+    && config.announcement.message.trim().length > 0
+    && !isGameArenaActive;
 
   const handleOpenAuth = useCallback(() => {
     if (isCrazyGamesBuild) {
@@ -110,9 +128,16 @@ function AppContent() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className={`app-shell app-route-layout min-h-screen flex flex-col${
+      showRuntimeAnnouncement ? ' has-runtime-announcement' : ''
+    }${isBannerScreenEligible ? ' app-route-layout--banner-safe' : ''}`}>
+      {showRuntimeAnnouncement && <RuntimeAnnouncement />}
       {showBackdrop && <ArenaBackdrop />}
       <MatchmakingBanner />
+      <AdBannerLayout
+        isGameplayActive={isGameArenaActive}
+        isScreenEligible={isBannerScreenEligible}
+      />
       <AnimatedRoutes>
         <Route
           path="/"
@@ -135,6 +160,16 @@ function AppContent() {
         />
         <Route path="/profile" element={<Navigate to="/" replace />} />
         <Route path="/history" element={<Navigate to="/" replace />} />
+        <Route
+          path="/admin"
+          element={AdminPage ? (
+              <AdminRoute>
+                <React.Suspense fallback={null}>
+                  <AdminPage />
+                </React.Suspense>
+              </AdminRoute>
+          ) : <Navigate to="/" replace />}
+        />
         <Route
           path="/privacy"
           element={isCrazyGamesBuild ? <CrazyGamesPrivacy /> : <Navigate to="/" replace />}
@@ -191,7 +226,7 @@ function AppContent() {
 // Embedded static builds are served from deep paths with no History-API
 // fallback, so client routes live in the URL hash there. The regular build
 // keeps clean History-API URLs.
-const Router = process.env.ITCH_BUILD === 'true' || process.env.CRAZYGAMES_BUILD === 'true'
+const Router = IS_EMBEDDED_BUILD
   ? HashRouter
   : BrowserRouter;
 
@@ -199,17 +234,21 @@ function App() {
   return (
     <Router>
       <CrazyGamesProvider>
-        <AuthProvider>
-          <UIProvider>
-            <LatencyProvider>
-              <WebSocketProvider>
-                <CrazyGamesBridge />
-                <AppContent />
-                <CrazyGamesAdOverlay />
-              </WebSocketProvider>
-            </LatencyProvider>
-          </UIProvider>
-        </AuthProvider>
+        <RuntimeConfigProvider>
+          <AuthProvider>
+            <UIProvider>
+              <LatencyProvider>
+                <WebSocketProvider>
+                  <AdsProvider>
+                    <CrazyGamesBridge />
+                    <AppContent />
+                    <PreMatchAdBreak />
+                  </AdsProvider>
+                </WebSocketProvider>
+              </LatencyProvider>
+            </UIProvider>
+          </AuthProvider>
+        </RuntimeConfigProvider>
       </CrazyGamesProvider>
     </Router>
   );
