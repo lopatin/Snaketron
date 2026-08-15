@@ -228,29 +228,10 @@ test('the panel stays closed while pending, and both fills arrive by animating',
   );
   await expect(page.getByTestId('potg-sponsor')).toContainText('Sponsored');
 
-  // The sponsor slot fills the same space, so it makes the same entrance —
-  // otherwise it reads as the card jumping rather than presenting something.
-  const entrance = await page.getByTestId('potg-sponsor').evaluate((el) => {
-    const style = getComputedStyle(el);
-    return {
-      name: style.animationName,
-      duration: style.animationDuration,
-      easing: style.animationTimingFunction,
-    };
-  });
-  const replayEntrance = await page.evaluate(async () => {
-    const response = { name: null, duration: null, easing: null };
-    const probe = document.createElement('div');
-    probe.className = 'potg-band';
-    document.body.append(probe);
-    const style = getComputedStyle(probe);
-    response.name = style.animationName;
-    response.duration = style.animationDuration;
-    response.easing = style.animationTimingFunction;
-    probe.remove();
-    return response;
-  });
-  expect(entrance).toEqual(replayEntrance);
+  // The sponsor slot fills the same space, so it opens the same way — inside
+  // the slot, which is what pushes the rest of the card down as it grows.
+  await expect(page.getByTestId('potg-slot')).toHaveCount(1);
+  await expect(page.getByTestId('potg-slot').locator('.potg-sponsor')).toHaveCount(1);
 
   // ...but it keeps its own quiet border rather than the replay's recess.
   const inset = await page.getByTestId('potg-sponsor').evaluate((el) => (
@@ -264,6 +245,44 @@ test('the panel stays closed while pending, and both fills arrive by animating',
     'incompatible',
   );
 });
+
+for (const [label, state] of [['replay', 'ready'], ['sponsor slot', 'unavailable']]) {
+  test(`the ${label} opens by pushing the card, not by appearing at full height`, async ({ page }) => {
+    await page.goto(`/qa/play-of-the-game?state=${state}&chrome=0`);
+    await page.getByTestId('game-over-card').waitFor();
+
+    const frames = await page.evaluate(() => new Promise((resolve) => {
+      const samples = [];
+      const startedAt = performance.now();
+      const tick = () => {
+        const slot = document.querySelector('.potg-slot');
+        const statline = document.querySelector('.game-over-statline');
+        if (slot && statline) {
+          samples.push({
+            slot: slot.getBoundingClientRect().height,
+            statTop: statline.getBoundingClientRect().top,
+          });
+        }
+        if (performance.now() - startedAt < 900) requestAnimationFrame(tick);
+        else resolve(samples);
+      };
+      requestAnimationFrame(tick);
+    }));
+
+    expect(frames.length).toBeGreaterThan(10);
+    const heights = frames.map((frame) => frame.slot);
+    const settled = heights[heights.length - 1];
+
+    // It opens from nothing, and every frame is at least as tall as the last:
+    // the card is displaced continuously rather than in one step.
+    expect(heights[0]).toBeLessThan(settled * 0.9);
+    expect(heights.every((h, i) => i === 0 || h >= heights[i - 1] - 0.5)).toBe(true);
+
+    // What sits below it moves with it, which is the whole point.
+    const statTops = frames.map((frame) => frame.statTop);
+    expect(statTops[statTops.length - 1]).toBeGreaterThan(statTops[0] + 20);
+  });
+}
 
 for (const malformedState of ['malformed-anchor', 'bad-end-hash']) {
   test(`${malformedState} collapses to the branded poster with replay hidden`, async ({ page }) => {

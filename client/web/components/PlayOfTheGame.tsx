@@ -420,18 +420,25 @@ const PlayOfTheGame: React.FC<PlayOfTheGameProps> = ({
   if (highlight.phase === 'idle' || highlight.phase === 'pending') {
     return null;
   }
-  if (highlight.phase === 'unavailable') {
-    return <SponsorSlot reason={highlight.reason} />;
-  }
+
+  // Whichever fill this space gets, it opens inside the same slot, so the
+  // card grows with it instead of jumping to its final height and then
+  // fading something into the gap.
   return (
-    <HighlightReplay
-      key={`${highlight.clip.game_id}:${highlight.clip.window.start_tick}`}
-      clip={highlight.clip}
-      starRank={starRank}
-      ratingSettled={ratingSettled}
-      autoplayAllowed={autoplayAllowed}
-      onAutoplayStarted={onAutoplayStarted}
-    />
+    <div className="potg-slot" data-testid="potg-slot">
+      {highlight.phase === 'unavailable' ? (
+        <SponsorSlot reason={highlight.reason} />
+      ) : (
+        <HighlightReplay
+          key={`${highlight.clip.game_id}:${highlight.clip.window.start_tick}`}
+          clip={highlight.clip}
+          starRank={starRank}
+          ratingSettled={ratingSettled}
+          autoplayAllowed={autoplayAllowed}
+          onAutoplayStarted={onAutoplayStarted}
+        />
+      )}
+    </div>
   );
 };
 

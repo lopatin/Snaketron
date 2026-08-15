@@ -61,27 +61,43 @@
    resting corner while the cover clears the arena. Each duration here mirrors
    a constant in PlayOfTheGame.tsx.
    --------------------------------------------------------------------------- */
-/* Sharp off the mark, long settle — the panel is most of the way in before
-   the eye catches up, which is what makes the arrival feel like a snap rather
-   than a drawer being pulled.
-
-   The sponsor slot shares it. Whichever of the two fills this space, it
-   arrives the same way: appearing without the move reads as the card
-   mis-laying itself out rather than as something being presented. */
-.potg-band,
-.potg-sponsor {
-  animation: potg-band-in 480ms cubic-bezier(0.1, 0.86, 0.18, 1) both;
+/* The panel opens by growing its own row, so the statline, the roster and the
+   card's own height are displaced over the same 480ms rather than jumping to
+   the final layout while something fades into the space. Sharp off the mark,
+   long settle.
+   `0fr -> 1fr` is what makes this animatable at all: the panel's height comes
+   from a 21:9 canvas, so there is no pixel value to animate to. The resting
+   state is the open one, which is what lets reduced motion simply switch the
+   animation off.
+   Whichever fills the slot — the replay or the sponsor — opens the same way;
+   appearing without the growth reads as the card mis-laying itself out rather
+   than as something being presented. */
+.potg-slot {
+  display: grid;
+  grid-template-rows: 1fr;
+  /* Leading but legible: ~90% of the height inside 250ms. The sharper curve
+     this replaced put 90% of it in 69ms, which is fast enough that the card
+     simply appeared taller — the push was there but nobody could see it. */
+  animation: potg-slot-open 560ms cubic-bezier(0.34, 0.68, 0.3, 1) both;
 }
 
-@keyframes potg-band-in {
+/* Both fills are named rather than using `> *`: the sponsor slot sets its own
+   min-height, and at equal specificity that would win and stop the row
+   collapsing — it would open from 94px instead of from nothing. */
+.potg-slot > .potg-band,
+.potg-slot > .potg-sponsor {
+  min-height: 0;
+}
+
+@keyframes potg-slot-open {
   from {
+    grid-template-rows: 0fr;
     opacity: 0;
-    transform: translateY(-10px);
   }
 
   to {
+    grid-template-rows: 1fr;
     opacity: 1;
-    transform: translateY(0);
   }
 }
 
@@ -494,8 +510,11 @@
 @media (prefers-reduced-motion: reduce) {
   /* Autoplay (and therefore the intro) never runs under reduced motion, but
      pin the resting state anyway so a mid-flight preference change cannot
-     leave the title parked at the centre of the band. */
-  .potg-band {
+     leave the title parked at the centre of the band. The slot's resting
+     state is the open one, so switching its animation off simply presents
+     the panel at full height. */
+  .potg-band,
+  .potg-slot {
     animation: none;
   }
 
