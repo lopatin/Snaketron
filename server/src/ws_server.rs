@@ -1126,6 +1126,7 @@ async fn handle_websocket_connection(
                                         &lifecycle,
                                         socket_generation,
                                         &cluster_namespace,
+                                        &cancellation_token,
                                     ).await {
                                         Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby
@@ -2394,16 +2395,29 @@ async fn notify_durable_active_game_after_auth(
 /// proof the confirmation can no longer outrun creation. The wait fails open
 /// at its deadline: a confirmation the executor cannot attribute costs the
 /// player nothing worse than waiting out the readiness deadline.
+///
+/// The wait deliberately outlives its socket — a player who confirms and
+/// immediately reconnects has still confirmed — but not its server: it is
+/// bound to the task cancellation token so shutdown cannot be raced by a
+/// publish on a retiring gateway's connections. Abandoning is safe because a
+/// drained client re-joins elsewhere and re-confirms well inside
+/// `MATCH_READY_WINDOW_MS`.
 async fn publish_player_ready_after_game_exists(
     game_bus: Arc<GameBus>,
     cluster_namespace: ClusterNamespace,
     game_id: u32,
     user_id: u32,
+    cancellation_token: CancellationToken,
 ) {
     let partition_id = game_id % PARTITION_COUNT;
     let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
     loop {
-        match game_bus.get_recovery(&cluster_namespace, game_id).await {
+        let recovery = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return,
+            recovery = game_bus.get_recovery(&cluster_namespace, game_id) => recovery,
+        };
+        match recovery {
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(error) => {
@@ -2417,7 +2431,11 @@ async fn publish_player_ready_after_game_exists(
             );
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     }
 
     let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
@@ -3736,6 +3754,7 @@ async fn process_ws_message(
     lifecycle: &TaskLifecycle,
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
+    cancellation_token: &CancellationToken,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -4612,6 +4631,7 @@ async fn process_ws_message(
                             cluster_namespace.clone(),
                             game_id,
                             user_id,
+                            cancellation_token.clone(),
                         ));
                     } else {
                         warn!(
