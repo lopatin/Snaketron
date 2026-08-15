@@ -27,6 +27,9 @@ pub const CATALOG: &[&str] = &[
     "tidewave@1",
     "voltage@1",
     "lantern@1",
+    "gambit@1",
+    "harlequin@1",
+    "pitlane@1",
 ];
 
 /// Longest id worth considering. Sized for a future `sha256:<64 hex>` ref so

@@ -345,6 +345,13 @@ impl OpRecorder {
         self.ops.iter().map(PaintOp::shape).collect()
     }
 
+    /// The recorded ops themselves, for a test that needs an argument rather
+    /// than a name — where a rectangle actually landed, say. Golden text and
+    /// op names both answer "did this change"; this answers "to what".
+    pub fn ops(&self) -> &[PaintOp] {
+        &self.ops
+    }
+
     /// The union of every painted bound, **in device pixels**, honouring the
     /// transform stack and every clip in force.
     ///

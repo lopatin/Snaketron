@@ -52,6 +52,20 @@ These are behaviours, not bugs. If a diff touches one, you broke something:
 ## The PR says enough
 
 - Contact sheet committed under `docs/screenshots/skins/<name>/`.
+- **The screenshots are embedded in the PR body, not just committed.** A skin PR
+  is a visual change, and a reviewer should not have to check out the branch to
+  see it. At minimum: the `all-skins` comparison sheet, and per skin the roles
+  strip and — if it animates — the animation film strip. The rest goes in a
+  `<details>` block so the body stays readable.
+- **Image URLs are absolute and pinned to the commit.** Relative paths do not
+  resolve in a PR body; they render as broken links. Use
+  `https://raw.githubusercontent.com/<owner>/<repo>/<sha>/docs/screenshots/...`
+  for images and `.../tree/<sha>/...` for folder links. Pin the **SHA**, not the
+  branch: branch URLs break the moment the branch is deleted after merge, and a
+  branch name containing a `/` is ambiguous in a raw URL. Then actually check
+  them — `curl -o /dev/null -w '%{http_code}'` over every URL in the body.
+- A line telling a reviewer how to see it move: `/qa/skins` after a fresh
+  `wasm-pack build`, because the film strip is fixed samples and never animates.
 - If it is a Rust skin: the one specific effect that the document schema could
   not express.
 - If you changed anything shared: what, and why the goldens still pass.

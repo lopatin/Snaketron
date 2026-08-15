@@ -28,6 +28,9 @@ const SKINS = [
   'tidewave@1',
   'voltage@1',
   'lantern@1',
+  'gambit@1',
+  'harlequin@1',
+  'pitlane@1',
 ];
 
 /** Three tiles that between them show palette, corner handling and the Boost band. */

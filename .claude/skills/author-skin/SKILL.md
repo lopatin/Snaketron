@@ -122,6 +122,26 @@ PR with the contact sheet committed under `docs/screenshots/skins/<name>/`, the
 conformance and golden runs green, and one line on why the skin needed Rust if
 it did.
 
+**Embed the screenshots in the PR body.** A skin PR is a visual change and it
+should be reviewable without checking out the branch. Relative paths render as
+broken links in a PR body, so use absolute URLs pinned to the commit SHA — not
+the branch, which disappears on merge:
+
+```
+https://raw.githubusercontent.com/<owner>/<repo>/<sha>/docs/screenshots/skins/<name>/<file>.png
+```
+
+Then verify them, because a broken image looks exactly like a missing one until
+someone opens the page:
+
+```bash
+gh pr view <n> --json body -q .body | grep -oE 'https://[^")> ]+' | sort -u |
+  while read -r u; do printf '%s %s\n' "$(curl -s -o /dev/null -w '%{http_code}' "$u")" "$u"; done
+```
+
+Say how to see it move, too: the film strip in the sheet is fixed samples and
+never animates, so a reviewer needs `/qa/skins` and a fresh `wasm-pack build`.
+
 ## Files
 
 - `templates/skin.template.json` — every field, commented

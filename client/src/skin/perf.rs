@@ -34,7 +34,13 @@ pub const PERF_BODY: &[(f64, f64)] = &[(20.0, 4.0), (0.0, 4.0)];
 pub const PERF_CELL_SIZE: f64 = 15.0;
 
 /// One skin per snake, cycling the catalogue so the frame resolves as many
-/// distinct painters as the catalogue has.
+/// distinct painters as it can hold.
+///
+/// Eight is a property of the arena, and the catalogue is not: once there are
+/// more skins than snakes, a frame simply cannot contain them all. That is why
+/// the op census below walks the catalogue instead of this frame — the
+/// per-snake budget is a property of a skin, and a skin that never landed in
+/// the first eight slots would otherwise be measured by nothing at all.
 pub fn perf_frame_skins() -> Vec<&'static dyn SnakeSkin> {
     let catalogue = skin_registry().entries();
     (0..PERF_SNAKE_COUNT)
@@ -80,12 +86,20 @@ mod census {
         pub ops: usize,
     }
 
-    /// Record every snake in the perf frame, boosting, over the arena mask —
-    /// the most expensive configuration the arena actually produces.
+    /// Record every skin in the catalogue on the perf body, boosting, over the
+    /// arena mask — the most expensive configuration the arena produces.
+    ///
+    /// The catalogue rather than the frame: the per-snake ceiling is a property
+    /// of a skin, and a catalogue longer than the frame would otherwise leave
+    /// its last entries unmeasured. Identities cycle so no skin is measured
+    /// only in the role that happens to be cheapest for it.
     pub fn census_frame() -> Vec<SnakeCensus> {
-        perf_frame_skins()
+        let identities = perf_frame_identities();
+        skin_registry()
+            .entries()
             .into_iter()
-            .zip(perf_frame_identities())
+            .enumerate()
+            .map(|(index, skin)| (skin, identities[index % identities.len()]))
             .map(|(skin, identity)| {
                 let mut recorder = OpRecorder::new();
                 let pose = SnakePose::still(PERF_BODY, PERF_CELL_SIZE, true);
@@ -212,20 +226,41 @@ mod tests {
 
     /// The perf frame has to resolve distinct painters, or every number this
     /// module reports describes one skin measured eight times.
+    ///
+    /// It resolves as many as it can hold. Eight snakes is the arena's
+    /// maximum; the catalogue is free to be longer, and once it is, the frame
+    /// covers a subset by construction. What must never happen is a frame that
+    /// repeats a painter while a different one goes unused.
     #[test]
-    fn perf_frame_resolves_the_whole_catalogue() {
+    fn perf_frame_resolves_as_many_distinct_skins_as_it_can_hold() {
+        let catalogue = skin_registry().entries().len();
         let ids: std::collections::HashSet<&str> =
             perf_frame_skins().iter().map(|skin| skin.id()).collect();
         assert_eq!(
             ids.len(),
-            skin_registry().entries().len(),
-            "the perf frame must resolve every catalogue skin, not repeat one"
+            catalogue.min(PERF_SNAKE_COUNT),
+            "the perf frame repeats a painter while another goes unused"
         );
         assert!(
             ids.len() >= 6,
             "section 11 measures on six distinct skins; found {}",
             ids.len()
         );
+    }
+
+    /// ...and the op census covers the ones the frame could not fit.
+    #[test]
+    fn the_op_census_measures_every_catalogue_skin() {
+        let census = census_frame();
+        let measured: std::collections::HashSet<&str> =
+            census.iter().map(|snake| snake.skin_id.as_str()).collect();
+        for skin in skin_registry().entries() {
+            assert!(
+                measured.contains(skin.id()),
+                "{} is in the catalogue but nothing measures its op count",
+                skin.id()
+            );
+        }
     }
 
     /// The op-count baseline.
@@ -236,8 +271,12 @@ mod tests {
     /// that budget made enforceable: it is deliberately loose enough that the
     /// compositor may cost more than the stroke painter, and tight enough that
     /// a per-cell or per-texel loop escaping onto the frame path fails.
-    /// Measured on this frame at the time of writing: classic 64, ember 66,
-    /// aurora 68, tidewave 86, voltage 60, lantern 64.
+    /// Measured at the time of writing: classic 64, ember 66, aurora 68,
+    /// tidewave 86, voltage 60, lantern 64, gambit 111, harlequin 115,
+    /// pitlane 135. The three checkerboards are the first skins here that pay
+    /// for a pattern — two lanes of tiles across a 21-cell body — and they are
+    /// where the "roughly double a classic-equivalent skin" budget stops being
+    /// theoretical.
     #[test]
     fn perf_frame_op_census_stays_inside_its_budget() {
         /// Section 11's "rich six-layer image skin roughly doubles a snake's
@@ -245,7 +284,7 @@ mod tests {
         const PER_SNAKE_CEILING: usize = 200;
 
         let census = census_frame();
-        assert_eq!(census.len(), PERF_SNAKE_COUNT);
+        assert_eq!(census.len(), skin_registry().entries().len());
 
         let total: usize = census.iter().map(|snake| snake.ops).sum();
         for snake in &census {
@@ -258,12 +297,12 @@ mod tests {
             );
         }
 
-        // A frame is also allowed to be cheap in aggregate; the grid alone is
-        // ~2,300 arcs, so a snake budget that approached it would be the wrong
-        // shape of design regardless of the per-snake number.
+        // The catalogue is also allowed to be cheap in aggregate; the grid
+        // alone is ~2,300 arcs, so a snake budget that approached it would be
+        // the wrong shape of design regardless of the per-snake number.
         assert!(
-            total <= PER_SNAKE_CEILING * PERF_SNAKE_COUNT,
-            "the perf frame costs {total} ops\nfull census: {census:#?}"
+            total <= PER_SNAKE_CEILING * census.len(),
+            "the catalogue costs {total} ops\nfull census: {census:#?}"
         );
     }
 
