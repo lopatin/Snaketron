@@ -4022,6 +4022,20 @@ mod readiness_tests {
         assert_eq!(state.simulation_start_ms(), Some(25_000));
     }
 
+    #[test]
+    fn a_gated_match_never_ticks_even_when_its_original_start_is_far_in_the_past() {
+        let state = gated_duel(2);
+        let mut engine = crate::GameEngine::new_from_state(7, state);
+
+        let events = engine
+            .run_until(1_000_000)
+            .expect("a gated engine should remain runnable");
+
+        assert!(events.is_empty());
+        assert_eq!(engine.get_committed_state().tick, 0);
+        assert!(engine.get_committed_state().is_awaiting_readiness());
+    }
+
     /// `start_ms` is the durable runtime game identity: join authorization
     /// denies a game whose `start_ms` moved, and completion records key off
     /// it. Releasing the gate must therefore never touch it.

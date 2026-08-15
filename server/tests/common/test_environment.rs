@@ -1,9 +1,13 @@
 use super::mock_jwt::MockJwtVerifier;
 use anyhow::{Context, Result};
+use futures_util::future::join_all;
 use server::{
+    ads::AdsConfig,
     api::jwt::JwtManager,
     db::{Database, dynamodb::DynamoDatabase},
-    game_server::{GameServer, start_test_server_with_grpc},
+    game_server::{
+        GameServer, start_test_server_with_grpc_and_mode, start_test_server_with_grpc_options,
+    },
     ws_server::JwtVerifier,
 };
 use std::sync::Arc;
@@ -19,6 +23,8 @@ pub struct TestEnvironment {
     user_ids: Vec<i32>,
     /// Test name for debugging
     test_name: String,
+    /// Explicit readiness deadline used by servers started in this environment.
+    match_ready_window_ms: i64,
 }
 
 impl TestEnvironment {
@@ -82,7 +88,15 @@ impl TestEnvironment {
             servers: Vec::new(),
             user_ids: Vec::new(),
             test_name: test_name.to_string(),
+            match_ready_window_ms: ::common::MATCH_READY_WINDOW_MS,
         })
+    }
+
+    /// Override the readiness window for tests that specifically exercise the
+    /// deadline. All other environments retain the production value.
+    pub fn with_match_ready_window_ms(mut self, match_ready_window_ms: i64) -> Self {
+        self.match_ready_window_ms = match_ready_window_ms;
+        self
     }
 
     /// Get the database instance for this test environment
@@ -104,16 +118,72 @@ impl TestEnvironment {
             .await
     }
 
+    /// Start the ordinary integration wiring but retain production shutdown
+    /// behavior. Used only by the planned-handoff regression test.
+    pub async fn add_production_mode_server(&mut self) -> Result<(usize, u64)> {
+        let jwt_manager = JwtManager::new("test_secret_key_for_testing");
+        let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
+
+        self.add_server_with_jwt_verifier_and_mode(jwt_manager, jwt_verifier, false, false)
+            .await
+    }
+
+    /// Add a server with an explicit runtime advertisement policy. Keeping the
+    /// policy injectable avoids mutating process-global environment variables
+    /// in integration tests that already share one serialized dependency set.
+    pub async fn add_server_with_ads_config(
+        &mut self,
+        ads_config: AdsConfig,
+    ) -> Result<(usize, u64)> {
+        let jwt_manager = JwtManager::new("test_secret_key_for_testing");
+        let jwt_verifier = Arc::new(MockJwtVerifier::accept_any()) as Arc<dyn JwtVerifier>;
+        let server = start_test_server_with_grpc_options(
+            self.db(),
+            jwt_manager,
+            jwt_verifier,
+            false,
+            true,
+            self.match_ready_window_ms,
+            ads_config,
+        )
+        .await
+        .context("Failed to start server")?;
+
+        Ok(self.push_server(server))
+    }
+
     pub async fn add_server_with_jwt_verifier(
         &mut self,
         jwt_manager: JwtManager,
         jwt_verifier: Arc<dyn JwtVerifier>,
         enable_grpc: bool,
     ) -> Result<(usize, u64)> {
-        let server = start_test_server_with_grpc(self.db(), jwt_manager, jwt_verifier, enable_grpc)
+        self.add_server_with_jwt_verifier_and_mode(jwt_manager, jwt_verifier, enable_grpc, true)
             .await
-            .context("Failed to start server")?;
+    }
 
+    async fn add_server_with_jwt_verifier_and_mode(
+        &mut self,
+        jwt_manager: JwtManager,
+        jwt_verifier: Arc<dyn JwtVerifier>,
+        enable_grpc: bool,
+        test_mode: bool,
+    ) -> Result<(usize, u64)> {
+        let server = start_test_server_with_grpc_and_mode(
+            self.db(),
+            jwt_manager,
+            jwt_verifier,
+            enable_grpc,
+            test_mode,
+            self.match_ready_window_ms,
+        )
+        .await
+        .context("Failed to start server")?;
+
+        Ok(self.push_server(server))
+    }
+
+    fn push_server(&mut self, server: GameServer) -> (usize, u64) {
         let index = self.servers.len();
         let server_id = server.id();
         info!(
@@ -133,7 +203,7 @@ impl TestEnvironment {
         }
 
         self.servers.push(server);
-        Ok((index, server_id))
+        (index, server_id)
     }
 
     // Add a server with custom JWT verifier
@@ -217,9 +287,13 @@ impl TestEnvironment {
     pub async fn shutdown(mut self) -> Result<()> {
         info!("Shutting down test environment: {}", self.test_name);
 
-        // Shutdown all servers
-        for server in self.servers.drain(..) {
-            server.shutdown().await?;
+        // Servers own independent listeners and task trees. Stop them
+        // concurrently so a multi-server test pays one bounded teardown
+        // window rather than one per server. Wait for every result before
+        // propagating an error so one failed shutdown cannot detach the rest.
+        let shutdown_results = join_all(self.servers.drain(..).map(GameServer::shutdown)).await;
+        for result in shutdown_results {
+            result?;
         }
 
         // Database cleanup happens automatically when db_guard is dropped

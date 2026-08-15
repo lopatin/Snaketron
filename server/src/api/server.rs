@@ -10,10 +10,11 @@ use tracing::info;
 
 use crate::db::Database;
 
+use super::admin;
 use super::auth::{self, AuthState};
 use super::crazygames;
 use super::jwt::JwtManager;
-use super::middleware::{AuthMiddlewareState, auth_middleware};
+use super::middleware::{AuthMiddlewareState, admin_middleware, auth_middleware};
 use super::rate_limit::{rate_limit_layer, rate_limit_middleware};
 
 pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str) -> Result<()> {
@@ -43,11 +44,27 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
     // Build router with protected routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
+        .route("/api/history", get(admin::get_user_history))
         .route(
             "/api/auth/crazygames/preferences",
             put(crazygames::save_preferences)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
+        .layer(middleware::from_fn_with_state(
+            auth_middleware_state.clone(),
+            auth_middleware,
+        ));
+
+    let admin_routes = Router::new()
+        .route("/api/admin/history", get(admin::get_admin_history))
+        .route(
+            "/api/admin/config",
+            get(admin::get_admin_config)
+                .put(admin::update_admin_config)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route("/api/admin/config/audit", get(admin::get_config_audit))
+        .layer(middleware::from_fn(admin_middleware))
         .layer(middleware::from_fn_with_state(
             auth_middleware_state,
             auth_middleware,
@@ -55,6 +72,7 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
 
     let app = Router::new()
         .route("/api/health", get(health_check))
+        .route("/api/config", get(admin::get_public_config))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route(
@@ -74,6 +92,7 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
             )),
         )
         .merge(protected_routes)
+        .merge(admin_routes)
         .layer(cors)
         .with_state(auth_state);
 

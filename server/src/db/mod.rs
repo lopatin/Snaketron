@@ -202,6 +202,66 @@ pub trait Database: Send + Sync {
         server_id: i32,
         game_state: &GameState,
     ) -> Result<()>;
+    /// Read one user's compact match history. Implementations must use the
+    /// supplied authenticated user ID as the partition scope and treat cursors
+    /// as opaque, scope-bound continuation tokens.
+    async fn get_match_history(
+        &self,
+        _user_id: i32,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        Err(anyhow::anyhow!(
+            "match history is not supported by this database"
+        ))
+    }
+    /// Read the global administrative history projection without loading full
+    /// game snapshots.
+    async fn get_admin_match_history(
+        &self,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        Err(anyhow::anyhow!(
+            "administrative match history is not supported by this database"
+        ))
+    }
+    /// Missing configuration intentionally resolves to safe defaults so test
+    /// and alternate database implementations fail closed for ads.
+    async fn get_runtime_config(&self) -> Result<RuntimeConfigRecord> {
+        Ok(RuntimeConfigRecord::default())
+    }
+    async fn update_runtime_config(
+        &self,
+        _expected_version: u64,
+        _config: &RuntimeConfig,
+        _actor: &RuntimeConfigActor,
+    ) -> Result<RuntimeConfigRecord> {
+        Err(anyhow::anyhow!(
+            "runtime configuration updates are not supported by this database"
+        ))
+    }
+    async fn get_runtime_config_audit(
+        &self,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<RuntimeConfigAuditPage> {
+        Err(anyhow::anyhow!(
+            "runtime configuration audit is not supported by this database"
+        ))
+    }
+    /// Atomically reserve one pre-match ad-break opportunity for every
+    /// targeted user. Alternate database implementations fail closed for ads.
+    async fn try_claim_pre_match_ad_break(
+        &self,
+        _break_id: &str,
+        _user_ids: &[u32],
+        _now_ms: i64,
+        _minimum_interval_ms: i64,
+        _policy_version: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     /// Apply one immutable completion effect with its idempotency marker in
     /// the same database transaction as the mutation.
     async fn apply_completion_effect(

@@ -8,6 +8,15 @@ test.skip(
 
 const appUrl = process.env.SNAKETRON_TEST_BASE_URL || 'http://127.0.0.1:3100';
 
+const fulfillRuntimeConfig = route => route.fulfill({
+  contentType: 'application/json',
+  headers: { 'access-control-allow-origin': '*' },
+  body: JSON.stringify({
+    version: 1,
+    announcement: { enabled: false, message: '' },
+  }),
+});
+
 const sdkScript = `
 (() => {
   const portalUser = {
@@ -146,6 +155,7 @@ test('fresh CrazyGames identity wins before cached session or socket startup', a
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     requests.push(pathname);
     const headers = { 'access-control-allow-origin': '*' };
 
@@ -259,6 +269,7 @@ test('an eligible guest is promoted only after explicit CrazyGames link consent'
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       exchanges.push({
@@ -355,6 +366,7 @@ test('declining guest promotion creates the CrazyGames identity without sharing 
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       exchanges.push({
@@ -437,6 +449,7 @@ test('an unavailable account-link prompt fails closed and preserves the guest se
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       exchanges.push({
@@ -490,6 +503,7 @@ test('a direct privacy visit stays passive and resolves the account only after l
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       exchanges.push(request.postDataJSON());
@@ -563,6 +577,7 @@ test('preference writes stay serialized and a delayed response cannot overwrite 
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       return route.fulfill({
@@ -656,6 +671,7 @@ test('signed-out CrazyGames users stay guest-capable without restoring a linked 
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     requests.push(pathname);
     const headers = { 'access-control-allow-origin': '*' };
 
@@ -721,6 +737,7 @@ test('a transient guest verification failure preserves the saved guest for retry
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/me') {
       meCalls += 1;
@@ -784,6 +801,7 @@ test('embeds without CrazyGames account support remain fully guest-capable', asy
   }));
   await page.route('http://localhost:8080/api/**', async route => {
     const pathname = new URL(route.request().url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       exchangeCalls += 1;
@@ -820,6 +838,7 @@ test('a successfully initialized disabled SDK environment remains fully guest-ca
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       exchangeCalls += 1;
@@ -908,6 +927,7 @@ test('an auth event during the initial exchange invalidates the old account befo
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       const { token } = request.postDataJSON();
@@ -987,6 +1007,7 @@ test('an auth event on the exchange-completion render boundary cannot be missed'
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/crazygames/exchange') {
       const { token } = request.postDataJSON();
@@ -1048,6 +1069,7 @@ test('an in-page CrazyGames sign-in clears portal room state and reloads into th
   await page.route('http://localhost:8080/api/**', async route => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/config') return fulfillRuntimeConfig(route);
     const headers = { 'access-control-allow-origin': '*' };
     if (pathname === '/api/auth/guest') {
       guestCalls += 1;

@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use common::{
-    BoostConfig, GAME_START_COUNTDOWN_MS, GameState, GameType, MATCH_READY_WINDOW_MS,
-    boost_config_for,
-};
+use common::{BoostConfig, GAME_START_COUNTDOWN_MS, GameState, GameType, boost_config_for};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -1095,16 +1092,7 @@ async fn create_lobby_matches(
         // 0s: 100 MMR
         // 10s: 300 MMR
         // 30s+: unlimited (9999)
-        let max_mmr_diff = if wait_seconds < 10.0 {
-            // Linear interpolation from 100 to 300 over 0-10 seconds
-            100.0 + (wait_seconds / 10.0) * 200.0
-        } else if wait_seconds < 30.0 {
-            // Linear interpolation from 300 to 900 over 10-30 seconds
-            300.0 + ((wait_seconds - 10.0) / 20.0) * 600.0
-        } else {
-            // After 30 seconds, match with anyone
-            9999.0
-        };
+        let max_mmr_diff = calculate_max_mmr_diff(wait_seconds);
 
         // Store the max acceptable MMR difference in the lobby (we'll use this for filtering)
         // For now, we don't modify the lobby's MMR, we'll filter during matching
@@ -1410,7 +1398,11 @@ async fn prepare_game_from_lobbies(
     // confirm, and making every stress match idle out the readiness window
     // would measure the gate rather than the runtime.
     if !game_state.is_stress_test {
-        game_state.arm_readiness_gate(Utc::now().timestamp_millis() + MATCH_READY_WINDOW_MS);
+        let ready_deadline_ms = Utc::now()
+            .timestamp_millis()
+            .checked_add(matchmaking_manager.match_ready_window_ms())
+            .context("match readiness deadline overflowed i64")?;
+        game_state.arm_readiness_gate(ready_deadline_ms);
     }
 
     let mut lobby_codes: Vec<String> = combination
@@ -1555,6 +1547,9 @@ mod tests {
                     user_id: *user_id,
                     username: format!("player_{user_id}"),
                     ts: queued_at as f64,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 })
                 .collect(),
             avg_mmr: 1000,
@@ -1563,7 +1558,43 @@ mod tests {
             queued_at,
             requesting_user_id: user_ids[0],
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         }
+    }
+
+    #[test]
+    fn competitive_mmr_expansion_keeps_the_production_boundaries() {
+        assert_eq!(calculate_max_mmr_diff(0.0), 100.0);
+        assert_eq!(calculate_max_mmr_diff(5.0), 200.0);
+        assert!(calculate_max_mmr_diff(9.999) < 300.0);
+        assert_eq!(calculate_max_mmr_diff(10.0), 300.0);
+        assert_eq!(calculate_max_mmr_diff(20.0), 600.0);
+        assert!(calculate_max_mmr_diff(29.999) < 900.0);
+        assert_eq!(calculate_max_mmr_diff(30.0), 9999.0);
+        assert_eq!(calculate_max_mmr_diff(300.0), 9999.0);
+    }
+
+    #[test]
+    fn competitive_mmr_expansion_requires_both_lobbies_to_reach_the_boundary() {
+        const NOW_MS: i64 = 100_000;
+        let mut silver = ffa_lobby("silver", &[1], NOW_MS - 10_000);
+        silver.avg_mmr = 600;
+        silver.queue_mode = QueueMode::Competitive;
+        let mut gold = ffa_lobby("gold", &[2], NOW_MS - 9_999);
+        gold.avg_mmr = 900;
+        gold.queue_mode = QueueMode::Competitive;
+
+        assert!(!are_lobbies_compatible(&silver, &gold, NOW_MS));
+        gold.queued_at = NOW_MS - 10_000;
+        assert!(are_lobbies_compatible(&silver, &gold, NOW_MS));
+
+        silver.avg_mmr = 300;
+        silver.queued_at = NOW_MS - 30_000;
+        gold.avg_mmr = 2_000;
+        gold.queued_at = NOW_MS - 29_999;
+        assert!(!are_lobbies_compatible(&silver, &gold, NOW_MS));
+        gold.queued_at = NOW_MS - 30_000;
+        assert!(are_lobbies_compatible(&silver, &gold, NOW_MS));
     }
 
     fn random_game_id_base() -> u32 {
@@ -2015,6 +2046,9 @@ mod tests {
                 user_id: 5,
                 username: "solo_player".to_string(),
                 ts: 100.0,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: None,
             }],
             avg_mmr: 1000,
             game_types: vec![GameType::Solo],
@@ -2022,6 +2056,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 5,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::Solo)
@@ -2043,11 +2078,17 @@ mod tests {
                     user_id: 10,
                     username: "player_one".to_string(),
                     ts: 123.0,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 },
                 LobbyMember {
                     user_id: 11,
                     username: "player_two".to_string(),
                     ts: 124.0,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 },
             ],
             avg_mmr: 1200,
@@ -2056,6 +2097,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 10,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 1 })
@@ -2090,6 +2132,9 @@ mod tests {
                     user_id,
                     username: format!("player_{user_id}"),
                     ts: f64::from(user_id),
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 })
                 .collect(),
             avg_mmr: 1200,
@@ -2098,6 +2143,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 20,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 2 })

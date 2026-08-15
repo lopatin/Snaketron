@@ -1,7 +1,8 @@
-import React, { useRef } from 'react';
+import React, { useCallback, useRef } from 'react';
 import { User } from '../types';
-import { HistoryIcon } from './Icons';
+import { api } from '../services/api';
 import { LobbyModal } from './LobbyModal';
+import { MatchHistoryList } from './MatchHistoryList';
 import RankIcon from './RankIcon';
 import { formatRankLabel, getRankFromMMR } from '../utils/rank';
 
@@ -15,6 +16,11 @@ interface AccountModalProps {
 
 export const AccountModal: React.FC<AccountModalProps> = ({ view, user, onClose }) => {
   const doneButtonRef = useRef<HTMLButtonElement>(null);
+  const historyFocusRef = useRef<HTMLDivElement>(null);
+  const loadHistory = useCallback(
+    (cursor: string | null) => api.getMatchHistory(cursor),
+    [],
+  );
 
   if (!view || !user || user.isGuest) {
     return null;
@@ -29,14 +35,18 @@ export const AccountModal: React.FC<AccountModalProps> = ({ view, user, onClose 
       onClose={onClose}
       title={isHistory ? 'History' : 'Profile'}
       description={isHistory
-        ? 'Completed matches will be collected here.'
+        ? 'Your completed matches, ratings, and rewards.'
         : 'Your Snaketron player details.'}
-      initialFocusRef={doneButtonRef}
+      initialFocusRef={isHistory ? historyFocusRef : doneButtonRef}
+      size={isHistory ? 'wide' : 'default'}
     >
       {isHistory ? (
-        <div className="account-history-empty">
-          <HistoryIcon className="account-history-icon" />
-          <h3>Match history is coming soon</h3>
+        <div ref={historyFocusRef} tabIndex={-1} className="account-history-panel">
+          <MatchHistoryList
+            variant="compact"
+            currentUserId={user.id}
+            loadPage={loadHistory}
+          />
         </div>
       ) : (
         <dl className="account-profile-details">

@@ -50,7 +50,7 @@ test('an early Start Game click waits for the authenticated regional socket', as
           socket.send(JSON.stringify({
             Authenticated: {
               task_boot_id: 'start-race-test',
-              protocol_version: 8,
+              protocol_version: 9,
               capabilities: REQUIRED_CAPABILITIES,
               socket_generation: 1,
             },
@@ -76,6 +76,18 @@ test('an early Start Game click waits for the authenticated regional socket', as
   await page.route('http://localhost:8080/api/**', async route => {
     const { pathname } = new URL(route.request().url());
     const corsHeaders = { 'access-control-allow-origin': '*' };
+
+    if (pathname === '/api/config') {
+      await route.fulfill({
+        contentType: 'application/json',
+        headers: corsHeaders,
+        body: JSON.stringify({
+          version: 1,
+          announcement: { enabled: false, message: '' },
+        }),
+      });
+      return;
+    }
 
     if (pathname === '/api/regions') {
       await regionGate;
@@ -151,7 +163,8 @@ test('an early Start Game click waits for the authenticated regional socket', as
       {
         Authenticate: {
           token: 'guest-race-token',
-          protocol_version: 8,
+          protocol_version: 9,
+          distribution: 'web',
         },
       },
       'CreateLobby',
