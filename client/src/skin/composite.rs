@@ -1393,6 +1393,7 @@ mod tests {
             &SnakePose {
                 cells,
                 cell_size: 10.0,
+                detail_scale: 1.0,
                 boost_active: false,
                 anim_ms: 0.0,
                 reduced_motion: true,

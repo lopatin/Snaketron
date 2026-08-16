@@ -511,10 +511,7 @@ async fn read_user_ranking(
             // what made an established player's badge flip to Unranked and
             // back between page loads. A failure status lets the client keep
             // showing the rank it already had.
-            error!(
-                user_id,
-                "Failed to read user ranking: {error:?}"
-            );
+            error!(user_id, "Failed to read user ranking: {error:?}");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
