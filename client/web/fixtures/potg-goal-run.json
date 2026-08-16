@@ -10,9 +10,9 @@
       "points": 15
     }
   },
-  "score": 125,
+  "score": 140,
   "breakdown": {
-    "total": 125,
+    "total": 140,
     "focus_tick": 144,
     "kills": 0,
     "boosted_cutoff_kills": 0,
@@ -21,7 +21,7 @@
     "max_chain": 0,
     "pickups": 0,
     "demolition_points": 0,
-    "banking_points": 125,
+    "banking_points": 140,
     "combo_points": 0
   },
   "window": {
@@ -331,12 +331,13 @@
       "2": "DEFENDER",
       "1": "BANKER"
     },
+    "skins": {},
     "spectators": [],
     "scores": {},
     "food_pickups": {},
     "team_scores": {
-      "1": 0,
-      "0": 0
+      "0": 0,
+      "1": 0
     },
     "player_xp": {},
     "player_action_counts": {},
@@ -635,7 +636,7 @@
     ]
   },
   "config": {
-    "rules_version": 1,
+    "rules_version": 2,
     "minimum_score": 120,
     "elimination": 90,
     "mutual_trade": 60,
@@ -646,9 +647,9 @@
     "laden_per_point": 4,
     "laden_cap": 50,
     "teammate_kill": -80,
-    "banked_per_point": 5,
+    "banked_per_point": 6,
     "big_carry": 50,
-    "combo_step": 15,
+    "combo_step": 21,
     "nick_of_time": 10,
     "boosted_pickup": 5,
     "feeding_frenzy": 20,

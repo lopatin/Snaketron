@@ -33,6 +33,33 @@ selected clip, writes `corpus-summary.json`, and exits unsuccessfully unless:
   two active players produce a highlight;
 - no Demolition, Banking, Combo, or Frenzy category exceeds 60% of winners.
 
+> **Point it at a scratch directory unless you mean to redo the human gate.**
+> Writing straight into this directory also rewrites `corpus-summary.json`,
+> `top-20-review.json` and `review-template.csv` with blank human-review
+> fields, discarding hand-entered verdicts that are not tool output. Nothing
+> regenerates those, and `client/web/tests/unit/potgCalibrationArtifacts.test.ts`
+> fails once they are gone.
+>
+> To refresh only the clip data — which is what a `GAMEPLAY_REPLAY_VERSION`
+> bump or a change to the serialized shape of `GameState` requires, since
+> the browser rejects any clip whose `gameplay_version` differs from the
+> protocol it speaks — generate into a scratch directory and copy `clips/`
+> back:
+>
+> ```sh
+> cargo run -p server --release --bin highlight_tune -- \
+>   --bot-corpus-dir /tmp/potg-regen \
+>   --games 200 --seed 0x534e414b4554524f --review-count 20
+> cp /tmp/potg-regen/clips/*.json docs/qa/play-of-the-game-calibration/clips/
+> ```
+>
+> Diff the scratch `corpus-summary.json` and `top-20-review.json` against the
+> checked-in ones first: apart from the blanked human-review fields they should
+> be identical, and any other difference means the corpus itself moved and the
+> human gate genuinely has to be redone. Clip regeneration is deterministic in
+> content but not byte-stable — `HashMap` fields such as `last_death_causes`
+> serialize in arbitrary key order, so expect reordering noise in the diff.
+
 `tuning-rounds.json` records the fixed-seed baseline and the only tuning round.
 Round 1 changed only `banked_per_point` (`5 -> 6`) and `combo_step` (`15 ->
 21`), promoting the calibrated defaults to rules version 2. The 120-point

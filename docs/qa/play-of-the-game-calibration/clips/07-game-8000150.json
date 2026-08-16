@@ -1,6 +1,6 @@
 {
   "clip_format_version": 1,
-  "gameplay_version": 9,
+  "gameplay_version": 10,
   "game_id": 8000150,
   "star_user_id": 10000,
   "star_snake_id": 0,
@@ -333,14 +333,15 @@
       "10000": "Corpus Bot 1",
       "10001": "Corpus Bot 2"
     },
+    "skins": {},
     "spectators": [],
     "scores": {
-      "1": 16,
-      "0": 12
+      "0": 12,
+      "1": 16
     },
     "food_pickups": {
-      "0": 9,
-      "1": 12
+      "1": 12,
+      "0": 9
     },
     "team_scores": {
       "0": 12,

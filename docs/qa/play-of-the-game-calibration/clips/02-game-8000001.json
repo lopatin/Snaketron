@@ -1,6 +1,6 @@
 {
   "clip_format_version": 1,
-  "gameplay_version": 9,
+  "gameplay_version": 10,
   "game_id": 8000001,
   "star_user_id": 10000,
   "star_snake_id": 0,
@@ -403,6 +403,7 @@
       }
     ],
     "last_death_causes": {
+      "0": "Banked",
       "1": {
         "HeadToHead": {
           "other_snake_id": 3
@@ -412,8 +413,7 @@
         "HeadToHead": {
           "other_snake_id": 1
         }
-      },
-      "0": "Banked"
+      }
     },
     "game_type": {
       "TeamMatch": {
@@ -450,21 +450,21 @@
       "tombstone_ids": []
     },
     "players": {
-      "10000": {
-        "user_id": 10000,
-        "snake_id": 0
-      },
-      "10002": {
-        "user_id": 10002,
-        "snake_id": 2
+      "10003": {
+        "user_id": 10003,
+        "snake_id": 3
       },
       "10001": {
         "user_id": 10001,
         "snake_id": 1
       },
-      "10003": {
-        "user_id": 10003,
-        "snake_id": 3
+      "10002": {
+        "user_id": 10002,
+        "snake_id": 2
+      },
+      "10000": {
+        "user_id": 10000,
+        "snake_id": 0
       }
     },
     "rng": null,
@@ -474,18 +474,19 @@
     "event_sequence": 62,
     "usernames": {
       "10000": "Corpus Bot 1",
-      "10003": "Corpus Bot 4",
+      "10001": "Corpus Bot 2",
       "10002": "Corpus Bot 3",
-      "10001": "Corpus Bot 2"
+      "10003": "Corpus Bot 4"
     },
+    "skins": {},
     "spectators": [],
     "scores": {
-      "0": 4,
-      "2": 7
+      "2": 7,
+      "0": 4
     },
     "food_pickups": {
-      "2": 4,
-      "0": 3
+      "0": 3,
+      "2": 4
     },
     "team_scores": {
       "0": 4,
@@ -493,16 +494,16 @@
     },
     "player_xp": {},
     "player_action_counts": {
-      "10002": 8,
-      "10001": 4,
       "10003": 4,
-      "10000": 5
+      "10000": 5,
+      "10002": 8,
+      "10001": 4
     },
     "player_last_activity_ticks": {
-      "10002": 98,
-      "10001": 98,
+      "10003": 98,
       "10000": 98,
-      "10003": 98
+      "10001": 98,
+      "10002": 98
     },
     "idle_kicked_user_ids": [],
     "completed_by_inactivity": false,
@@ -11855,10 +11856,10 @@
       "event": {
         "XPAwarded": {
           "player_xp": {
-            "10002": 110,
+            "10003": 10,
             "10001": 10,
-            "10000": 150,
-            "10003": 10
+            "10002": 110,
+            "10000": 150
           }
         }
       }

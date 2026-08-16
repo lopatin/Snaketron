@@ -1,7 +1,15 @@
 //! Regenerates the browser QA's production-shaped Play-of-the-Game fixture.
 //!
-//! Run from the repository root:
-//! `cargo run -q -p common --example export_potg_fixture`
+//! The clip is written to stdout, so the redirect is not optional — without it
+//! the fixture on disk keeps whatever scoring rules and gameplay version it was
+//! last written under, and the QA lab silently exercises a stale clip. Run from
+//! the repository root:
+//!
+//! `cargo run -q -p common --example export_potg_fixture > client/web/fixtures/potg-goal-run.json`
+//!
+//! Regenerate after any change to `HighlightConfig`'s defaults (including its
+//! `rules_version`), to `GAMEPLAY_REPLAY_VERSION`, or to the serialized shape
+//! of `GameState`: the fixture embeds all three and nothing else validates it.
 
 use anyhow::{Context, Result};
 use common::{
