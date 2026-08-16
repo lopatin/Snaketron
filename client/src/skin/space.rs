@@ -102,10 +102,10 @@ impl Run {
         let head_side = if self.index == 0 {
             0.5
         } else {
-            policy.joint_reach()
+            policy.head_reach()
         };
         let tail_side = if self.has_next {
-            policy.joint_reach()
+            policy.tail_reach()
         } else {
             0.5
         };
@@ -127,12 +127,19 @@ impl Run {
 /// surface with no implementation behind it is worse than an absence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CornerPolicy {
-    /// Each run paints its own half of the joint cell.
+    /// The head-ward run paints the **whole** joint cell; the tail-ward run
+    /// does not touch it.
     ///
-    /// The artifact is a hard 90-degree orientation flip along the joint cell's
-    /// midline, across the full ribbon width. On a solid or a gradient it is
-    /// invisible. On a directional texture it is a visible break, and skin
-    /// authors are owed that fact rather than a discovery.
+    /// Splitting the cell down the middle was the first attempt and it is
+    /// geometrically incoherent: each run keeps the half nearer its own end
+    /// *in its own frame*, and at a turn those two halves are perpendicular. So
+    /// a quarter of the cell gets painted twice and the opposite quarter never
+    /// gets painted at all — a notch of bare body on the outside of every
+    /// corner, plainly visible on any textured skin.
+    ///
+    /// Giving the cell to one run costs nothing and fixes both: coverage is
+    /// exact, and the orientation flip moves from the cell's midline to its
+    /// far edge, which is where a viewer already expects the body to turn.
     #[default]
     Own,
     /// Each run reaches the joint cell's far edge, so the two overlap across
@@ -147,12 +154,24 @@ pub enum CornerPolicy {
 }
 
 impl CornerPolicy {
-    /// How far past a joint a run's ribbon reaches, in cells.
-    fn joint_reach(self) -> f64 {
+    /// How far back past a joint at the run's **head** end its ribbon reaches.
+    ///
+    /// Negative under `Own`: the joint cell belongs to the run before this one,
+    /// so this one starts half a cell late and leaves it alone.
+    fn head_reach(self) -> f64 {
         match self {
-            CornerPolicy::Own => 0.0,
+            CornerPolicy::Own => -0.5,
             CornerPolicy::Bisector => 0.5,
         }
+    }
+
+    /// How far past a joint at the run's **tail** end its ribbon reaches.
+    ///
+    /// Half a cell under either policy, which is the whole joint cell. They
+    /// differ in what the *next* run does with it: `Own` skips it, `Bisector`
+    /// paints it again on top.
+    fn tail_reach(self) -> f64 {
+        0.5
     }
 
     /// Whether a source that can only fill axis-aligned rectangles may use it.
@@ -388,6 +407,25 @@ pub struct RibbonPlan<'a> {
     pub fill_before_strokes: bool,
     /// Re-set the fill style immediately before the tail disc.
     pub refill_before_tail_cap: bool,
+    /// Paint the whole ribbon as **one** stroked path.
+    ///
+    /// The default emits a stroke per run plus a disc per joint, and at a joint
+    /// all three are the *same circle*: `radius` is exactly half `line_width`,
+    /// so a run's round cap and the joint disc have identical boundaries. With
+    /// an opaque colour the interior is unchanged — but the antialiased edge
+    /// pixels composite two or three times, turning about 50% coverage into
+    /// about 87%. The elbow of every corner comes out harder and heavier than
+    /// the rest of the outline, which is visible and was reported as such.
+    ///
+    /// One path with one `stroke` rasterises the union in a single coverage
+    /// pass, so a shared boundary is antialiased once. The joint and tail discs
+    /// are then redundant — the round caps already cover exactly those circles
+    /// — and are skipped.
+    ///
+    /// Off by default because classic's committed trace pins its op sequence
+    /// byte for byte, and that trace is the tripwire for accidental changes to
+    /// shared painting.
+    pub single_pass: bool,
 }
 
 impl RibbonPlan<'_> {
@@ -434,6 +472,25 @@ pub fn emit_ribbon(
     ctx.set_stroke(plan.color);
     if plan.fill_before_strokes {
         ctx.set_fill(plan.color);
+    }
+
+    if plan.single_pass {
+        ctx.set_line_width(plan.line_width(cell_size));
+        ctx.set_line_cap("round");
+        ctx.begin_path();
+        for_each_run(cells, |run| {
+            let (ax, ay) = centre(run.from);
+            let (bx, by) = centre(run.to);
+            if run.from.0 == run.to.0 {
+                ctx.move_to(ax, ay.min(by));
+                ctx.line_to(ax, ay.max(by));
+            } else {
+                ctx.move_to(ax.min(bx), ay);
+                ctx.line_to(ax.max(bx), ay);
+            }
+        });
+        ctx.stroke();
+        return Ok(());
     }
 
     let mut error = None;
@@ -556,22 +613,86 @@ mod tests {
         }
     }
 
-    /// Corner policy decides how much of the shared cell each run keeps. `Own`
-    /// stops at the joint centre and leaves the outer wedge to whatever is
-    /// underneath; `Bisector` lets both runs cover the whole cell.
+    /// One pass means one coverage computation, which is the whole point: the
+    /// default paints a joint's circle up to three times — two round caps and a
+    /// disc, all the same circle — and an antialiased boundary composited three
+    /// times is a visibly heavier edge even in a fully opaque colour.
     #[test]
-    fn corner_policy_changes_only_the_joint_reach() {
+    fn a_single_pass_ribbon_paints_each_boundary_once() {
+        let cells = [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0)];
+        let plan = |single_pass| RibbonPlan {
+            color: "#1b6fd0",
+            extra: 5.0,
+            joints: true,
+            tail_cap: false,
+            fill_before_strokes: false,
+            refill_before_tail_cap: false,
+            single_pass,
+        };
+        let count = |single_pass| {
+            let mut recorder = crate::skin::paint::OpRecorder::new();
+            emit_ribbon(
+                &mut PaintCtx::recording(&mut recorder),
+                &cells,
+                10.0,
+                &plan(single_pass),
+            )
+            .expect("a recording painter cannot fail");
+            let strokes = recorder
+                .ops()
+                .iter()
+                .filter(|op| matches!(op, crate::skin::paint::PaintOp::Stroke))
+                .count();
+            let fills = recorder
+                .ops()
+                .iter()
+                .filter(|op| matches!(op, crate::skin::paint::PaintOp::Fill))
+                .count();
+            (strokes, fills)
+        };
+
+        // Two runs and one interior joint: three paints over the joint circle.
+        assert_eq!(count(false), (2, 1));
+        // One paint, covering exactly the same union.
+        assert_eq!(count(true), (1, 0));
+    }
+
+    /// Corner policy decides who owns the shared cell. Under `Own` the
+    /// head-ward run takes all of it and the tail-ward run starts past it, so
+    /// the two ranges **abut exactly**: no gap to leave a bare notch, no
+    /// overlap to paint twice. `Bisector` instead lets both cover it.
+    #[test]
+    fn corner_policy_hands_the_joint_cell_to_one_run() {
         let cells = [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0)];
         let found = runs(&cells);
 
         let (head_start, head_end) = found[0].ribbon_range(CornerPolicy::Own);
         assert_eq!(
             (head_start, head_end),
-            (-0.5, 4.0),
-            "own stops at the joint"
+            (-0.5, 4.5),
+            "the head-ward run takes the whole joint cell"
         );
         let (tail_start, tail_end) = found[1].ribbon_range(CornerPolicy::Own);
-        assert_eq!((tail_start, tail_end), (4.0, 7.5), "the tail keeps its cap");
+        assert_eq!(
+            (tail_start, tail_end),
+            (4.5, 7.5),
+            "the tail-ward run starts past it"
+        );
+        assert_eq!(head_end, tail_start, "the two must abut exactly");
+
+        // Total covered arc equals the paintable body, once over.
+        let covered: f64 = found
+            .iter()
+            .map(|run| {
+                let (from, to) = run.ribbon_range(CornerPolicy::Own);
+                to - from
+            })
+            .sum();
+        assert_eq!(
+            covered,
+            arc_length(&cells) + 1.0,
+            "every cell painted exactly once, caps included"
+        );
 
         let (_, overlap_end) = found[0].ribbon_range(CornerPolicy::Bisector);
         let (overlap_start, _) = found[1].ribbon_range(CornerPolicy::Bisector);

@@ -45,6 +45,15 @@ await page.click(selector);
 // One frame for the tiles to repaint against the newly selected skin.
 await page.waitForTimeout(150);
 
+// A textured skin fetches its pixels on its first paint, so a sheet captured
+// straight after selecting one would show every tile wearing the flat coat
+// underneath. The tiles repaint themselves once this goes false; wait for that
+// first, or the screenshot is of the fallback.
+await page.waitForFunction(() => window.wasm?.skinAssetsPending() === false, {
+  timeout: 10_000,
+});
+await page.waitForTimeout(150);
+
 const slug = skinRef.replace(/[^a-z0-9]+/gi, '-');
 await page.screenshot({
   path: join(outDir, `${slug}-sheet.png`),

@@ -1,5 +1,5 @@
 import React, { useLayoutEffect, useRef } from 'react';
-import { getWasm, initWasm } from '../wasm';
+import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
 import type { SnakeSkinColors, SnakeSkinInputs } from '../utils/snakeSkin';
 
 export type RosterSnakeFacing = 'left' | 'right';
@@ -108,7 +108,17 @@ const RosterSnakeCanvas: React.FC<RosterSnakeCanvasProps> = ({
 
     // The renderer lives in WASM, so the first paint may have to wait for it.
     void initWasm().then(() => {
-      if (!disposed) scheduleDraw();
+      if (disposed) return undefined;
+      // Painted now rather than on the next frame, because the paint is what
+      // *requests* a textured skin's pixels — and the wait below has to start
+      // after that request or it finds nothing pending and resolves at once.
+      draw();
+      // A textured skin cannot show its coat until the pixels decode, and
+      // nothing else would ever make this canvas repaint: the roster is drawn
+      // once per state change, not per frame.
+      return whenSkinAssetsSettle().then(() => {
+        if (!disposed) scheduleDraw();
+      });
     }).catch(() => undefined);
 
     void document.fonts?.ready.then(() => {

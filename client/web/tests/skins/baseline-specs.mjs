@@ -15,6 +15,12 @@ export const SHIPPED_SKINS = [
   'gambit@1',
   'harlequin@1',
   'pitlane@1',
+  'zebra@1',
+  'zebra-print@1',
+  'tiger@1',
+  'tiger-print@1',
+  'jaguar@1',
+  'jaguar-print@1',
 ];
 
 /**

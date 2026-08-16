@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getWasm, initWasm } from '../wasm';
+import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
+import SkinTuningSidebar from './SkinTuningSidebar';
 import {
   DEFAULT_SKIN_REF,
   readSkinCatalog,
@@ -65,6 +66,8 @@ interface TileProps {
    * state, so a wall of live tiles costs canvas work and nothing else.
    */
   live?: boolean;
+  /** Bumped by the tuning sidebar; a fixed-sample tile repaints on it. */
+  revision?: number;
   label: string;
   testId: string;
 }
@@ -79,6 +82,7 @@ const FixtureTile: React.FC<TileProps> = ({
   animMs = 0,
   reducedMotion = true,
   live = false,
+  revision = 0,
   label,
   testId,
 }) => {
@@ -115,7 +119,19 @@ const FixtureTile: React.FC<TileProps> = ({
 
     if (!live) {
       paint(animMs);
-      return;
+      // A textured skin requests its pixels on that first paint. A still tile
+      // would otherwise hold the flat coat for good — and a contact sheet of
+      // flat coats is exactly the kind of quiet wrong answer this route exists
+      // to prevent. Resolves immediately once the textures are in.
+      let stale = false;
+      void whenSkinAssetsSettle().then(() => {
+        if (!stale) {
+          paint(animMs);
+        }
+      });
+      return () => {
+        stale = true;
+      };
     }
 
     let frame = requestAnimationFrame(function loop(now: number) {
@@ -123,7 +139,7 @@ const FixtureTile: React.FC<TileProps> = ({
       frame = requestAnimationFrame(loop);
     });
     return () => cancelAnimationFrame(frame);
-  }, [skinRef, pose, role, boostActive, dead, animMs, reducedMotion, live]);
+  }, [skinRef, pose, role, boostActive, dead, animMs, reducedMotion, live, revision]);
 
   return (
     <figure className="skins-qa-tile" data-testid={testId}>
@@ -146,6 +162,7 @@ const SkinsQA: React.FC = () => {
   const [skinRef, setSkinRef] = useState(DEFAULT_SKIN_REF);
   // Someone who has asked the OS for less motion gets a paused sheet they can
   // start themselves, rather than a wall of moving snakes.
+  const [revision, setRevision] = useState(0);
   const [playing, setPlaying] = useState(
     () =>
       typeof window === 'undefined' ||
@@ -209,7 +226,8 @@ const SkinsQA: React.FC = () => {
   }
 
   return (
-    <main className="skins-qa" data-testid="skins-qa">
+    <main className="skins-qa skins-qa-with-sidebar" data-testid="skins-qa">
+      <div className="skins-qa-main">
       <h1>Skins</h1>
 
       <section aria-labelledby="skins-qa-select">
@@ -254,6 +272,7 @@ const SkinsQA: React.FC = () => {
         </div>
         <div className="skins-qa-grid">
           <FixtureTile
+            revision={revision}
             testId="fixture-live-long"
             skinRef={skinRef}
             pose="longer_than_head_gradient"
@@ -263,6 +282,7 @@ const SkinsQA: React.FC = () => {
             label="long body"
           />
           <FixtureTile
+            revision={revision}
             testId="fixture-live-turning"
             skinRef={skinRef}
             pose="zigzag"
@@ -272,6 +292,7 @@ const SkinsQA: React.FC = () => {
             label="turning"
           />
           <FixtureTile
+            revision={revision}
             testId="fixture-live-boost"
             skinRef={skinRef}
             pose="longer_than_head_gradient"
@@ -289,6 +310,7 @@ const SkinsQA: React.FC = () => {
         <div className="skins-qa-grid">
           {fixtures.roles.map((role) => (
             <FixtureTile
+            revision={revision}
               key={role}
               testId={`fixture-role-${role}`}
               skinRef={skinRef}
@@ -306,6 +328,7 @@ const SkinsQA: React.FC = () => {
         <div className="skins-qa-grid">
           {fixtures.poses.map((pose) => (
             <FixtureTile
+            revision={revision}
               key={pose.name}
               testId={`fixture-pose-${pose.name}`}
               skinRef={skinRef}
@@ -322,6 +345,7 @@ const SkinsQA: React.FC = () => {
         <h2 id="skins-qa-states">States</h2>
         <div className="skins-qa-grid">
           <FixtureTile
+            revision={revision}
             testId="fixture-state-boost"
             skinRef={skinRef}
             pose="single_corner"
@@ -331,6 +355,7 @@ const SkinsQA: React.FC = () => {
             label="boosting"
           />
           <FixtureTile
+            revision={revision}
             testId="fixture-state-dead"
             skinRef={skinRef}
             pose="single_corner"
@@ -340,6 +365,7 @@ const SkinsQA: React.FC = () => {
             label="dead (always the shared corpse)"
           />
           <FixtureTile
+            revision={revision}
             testId="fixture-state-single-cell"
             skinRef={skinRef}
             pose="single_cell"
@@ -348,6 +374,7 @@ const SkinsQA: React.FC = () => {
             label="single cell"
           />
           <FixtureTile
+            revision={revision}
             testId="fixture-state-single-cell-boost"
             skinRef={skinRef}
             pose="single_cell"
@@ -372,6 +399,7 @@ const SkinsQA: React.FC = () => {
         <div className="skins-qa-grid">
           {fixtures.animSamples.map((animMs) => (
             <FixtureTile
+            revision={revision}
               key={animMs}
               testId={`fixture-anim-${animMs}`}
               skinRef={skinRef}
@@ -384,6 +412,7 @@ const SkinsQA: React.FC = () => {
             />
           ))}
           <FixtureTile
+            revision={revision}
             testId="fixture-anim-reduced"
             skinRef={skinRef}
             pose="longer_than_head_gradient"
@@ -415,6 +444,11 @@ const SkinsQA: React.FC = () => {
           ))}
         </ul>
       </section>
+      </div>
+      <SkinTuningSidebar
+        skinRef={skinRef}
+        onChanged={() => setRevision((n) => n + 1)}
+      />
     </main>
   );
 };

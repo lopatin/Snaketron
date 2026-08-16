@@ -46,3 +46,38 @@ export function initWasm(): Promise<WasmModule> {
 export function getWasm(): WasmModule | null {
   return loaded;
 }
+
+/** How long to keep waiting on a texture before giving up on it. */
+const SKIN_ASSET_TIMEOUT_MS = 5000;
+
+/**
+ * Resolve once every skin texture requested so far has decoded or failed.
+ *
+ * A textured skin (the animal family) fetches its pixels the first time it
+ * paints, so the first paint shows the flat coat underneath. The arena repaints
+ * every frame and never notices. Surfaces that paint **once** — the roster
+ * glyph, a contact-sheet tile — would keep the flat coat forever, so they paint,
+ * await this, and paint once more.
+ *
+ * Resolves immediately when nothing is pending, which is the common case: only
+ * the first appearance of a textured skin in a session ever waits.
+ */
+export function whenSkinAssetsSettle(): Promise<void> {
+  const wasm = getWasm();
+  if (!wasm?.skinAssetsPending()) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const deadline = Date.now() + SKIN_ASSET_TIMEOUT_MS;
+    const poll = () => {
+      if (!getWasm()?.skinAssetsPending() || Date.now() > deadline) {
+        resolve();
+        return;
+      }
+      // rAF rather than a timer: a hidden tab has nothing to repaint anyway,
+      // and this keeps the wait off the clock until it does.
+      requestAnimationFrame(poll);
+    };
+    requestAnimationFrame(poll);
+  });
+}

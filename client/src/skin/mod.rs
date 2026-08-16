@@ -13,6 +13,7 @@
 //!
 //! See `specs/skins-prd.md` for the boundary rulings this module implements.
 
+pub mod animal;
 pub mod atlas;
 pub mod checker;
 pub mod classic;
@@ -29,6 +30,7 @@ pub mod paint;
 pub mod perf;
 pub mod registry;
 pub mod space;
+pub mod sprite;
 
 #[cfg(test)]
 mod conformance;
@@ -186,6 +188,38 @@ pub struct SkinColors<'a> {
     pub swatch: &'a str,
 }
 
+/// Which of a skin's reported colours carries the friend/foe reading.
+///
+/// Team games are played through colour, and the guarantee that survives every
+/// skin is that a viewer can tell a teammate from an opponent. What *changes*
+/// between skins is which part of the snake says so.
+///
+/// A painted skin says it with the body: classic's blue and red fills are the
+/// whole cue. A skin whose body is a photographic coat cannot — a tiger is
+/// orange whoever is wearing it, and tinting it cool for a teammate would make
+/// it a striped blue snake rather than a tiger. Those skins keep the body
+/// truthful and move the cue to the contour, which they widen to pay for it.
+///
+/// Declaring this is what keeps the rule enforceable rather than abandoned:
+/// `skin_conformance_team_colours_stay_on_their_own_side` checks whichever
+/// channel the skin nominates, and checks that the two sides are actually far
+/// apart in it. A skin cannot opt out of carrying the cue — only choose where.
+///
+/// Nothing outside the test build reads it, and that is the intended shape: it
+/// is a *claim a skin makes about itself* so the suite can hold it to the right
+/// rule. Painting never consults it — the colours it describes are already in
+/// [`SkinColors`], where the renderer and the DOM both find them.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideCue {
+    /// The body fill reads as the side. The default, and what every painted
+    /// skin does.
+    Body,
+    /// The contour reads as the side, because the body is a coat that belongs
+    /// to an animal rather than to a team.
+    Contour,
+}
+
 /// What the renderer needs to know about a skin's shape to lay out around it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SkinMetrics {
@@ -293,6 +327,13 @@ pub trait SnakeSkin: Send + Sync {
     fn colors(&self, identity: &SkinIdentity) -> SkinColors<'_>;
 
     fn metrics(&self, boost_active: bool) -> SkinMetrics;
+
+    /// Where this skin's friend/foe reading lives. See [`SideCue`] — including
+    /// why only the conformance suite calls it.
+    #[allow(dead_code)]
+    fn side_cue(&self) -> SideCue {
+        SideCue::Body
+    }
 
     /// Paint one living snake.
     ///

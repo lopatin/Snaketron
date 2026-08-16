@@ -15,3 +15,16 @@ loadtest-reports/
 
 # Machine-readable staging certification bundles.
 test-results/autoscaling-*/
+
+# Design-tool scratch: fetched texture originals and Python bytecode. The
+# sources are third-party downloads (see client/web/THIRD_PARTY_ASSETS.md) and
+# only the built strips under client/web/public/images/skins/ are committed.
+client/design/tools/.texture-cache/
+# Byte-compiled helpers the texture tools import each other as. Narrow on
+# purpose: three .pyc files are tracked from before this rule existed, and a
+# blanket *.pyc would delete them out from under the build.
+client/design/tools/__pycache__/build_coat_textures.*.pyc
+client/design/tools/__pycache__/neural_tile.*.pyc
+client/design/tools/__pycache__/diffuse_tile.*.pyc
+client/design/tools/__pycache__/sprite_sheet.*.pyc
+client/design/tools/__pycache__/tileify.*.pyc

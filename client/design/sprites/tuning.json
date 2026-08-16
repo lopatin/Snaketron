@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Live-tunable properties of the sprite-sheet skins, and the source of truth",
+    "for them. Written by the sidebar on /qa/skins (Save), read by",
+    "client/src/skin/sprite.rs at compile time via include_str!.",
+    "",
+    "Only properties that can change without rebuilding the art belong here.",
+    "Rotation and repeat length are baked into the PNG by",
+    "client/design/tools/sprite_sheet.py and are not tunable at runtime."
+  ],
+  "zebra-live@1": {
+    "anim_speed": 1,
+    "drift_cells": -15
+  },
+  "tiger-live@1": {
+    "anim_speed": 0.3,
+    "drift_cells": 0
+  },
+  "stars-and-stripes@1": {
+    "anim_speed": 0.3,
+    "drift_cells": 0
+  },
+  "race-livery@1": {
+    "anim_speed": 1,
+    "drift_cells": 0
+  }
+}

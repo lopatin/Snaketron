@@ -46,7 +46,32 @@ async function openHarness(page) {
   await page.goto('/qa/skin-parity');
   await page.waitForSelector('[data-testid="skin-parity-ready"]');
   await page.waitForFunction(() => window.__skinParity?.ready === true);
+  await warmTextures(page);
   return failures;
+}
+
+/**
+ * Paint every skin once, then wait for the pixels.
+ *
+ * A textured skin requests its atlas on its *first* paint and cannot show it
+ * until it decodes. Every entry point here paints synchronously, so without
+ * this the suite would baseline the flat coat underneath a coat skin — and then
+ * pass forever against that baseline, which is the failure mode a pixel oracle
+ * exists to rule out.
+ */
+async function warmTextures(page) {
+  await page.evaluate((skins) => {
+    for (const skin of skins) {
+      window.__skinParity.render('a', {
+        skin,
+        pose: 'straight_horizontal',
+        cellSize: 15,
+      });
+    }
+  }, SHIPPED_SKINS);
+  await page.waitForFunction(() => window.wasm?.skinAssetsPending() === false, {
+    timeout: 10_000,
+  });
 }
 
 /** The pose names the harness reports, straight from the Rust fixture corpus. */

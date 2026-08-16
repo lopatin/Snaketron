@@ -85,6 +85,55 @@ module.exports = {
   },
   devServer: {
     historyApiFallback: true,
+    // The /qa/skins sidebar writes skin tuning back to the repo.
+    //
+    // Deliberately a dev-server middleware and nothing else: it exists only
+    // while someone is running `npm start` on a checkout, so there is no
+    // production surface to secure, and the file it writes is the same one
+    // `client/src/skin/sprite.rs` compiles in. Live preview happens in wasm;
+    // this is what makes the change outlive the page.
+    setupMiddlewares: (middlewares, devServer) => {
+      const fs = require('fs');
+      const tuningPath = path.join(__dirname, '..', 'design', 'sprites', 'tuning.json');
+
+      devServer.app.post('/qa/skin-tuning', (req, res) => {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+          // A dev endpoint still should not be a way to fill the disk.
+          if (body.length > 64 * 1024) req.destroy();
+        });
+        req.on('end', () => {
+          let incoming;
+          try {
+            incoming = JSON.parse(body);
+          } catch (error) {
+            res.status(400).json({ error: 'not JSON' });
+            return;
+          }
+          let current = {};
+          try {
+            current = JSON.parse(fs.readFileSync(tuningPath, 'utf8'));
+          } catch (error) {
+            // A missing or broken file is replaced rather than merged into.
+          }
+          for (const [id, values] of Object.entries(incoming)) {
+            // Only ids the file already knows, and only the two numbers that
+            // mean anything — so a typo cannot invent a skin or smuggle a
+            // field the Rust side will silently ignore.
+            if (!Object.prototype.hasOwnProperty.call(current, id)) continue;
+            const speed = Number(values.anim_speed);
+            const drift = Number(values.drift_cells);
+            if (!Number.isFinite(speed) || !Number.isFinite(drift)) continue;
+            current[id] = { anim_speed: speed, drift_cells: drift };
+          }
+          fs.writeFileSync(tuningPath, JSON.stringify(current, null, 2) + '\n');
+          res.json({ saved: true, path: tuningPath });
+        });
+      });
+
+      return middlewares;
+    },
     static: {
       directory: path.join(__dirname, 'dist'),
     },
