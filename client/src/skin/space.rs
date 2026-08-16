@@ -299,14 +299,26 @@ fn build_silhouette(
         let (bx, by) = centre(run.to);
         let (x0, y0) = (ax.min(bx), ay.min(by));
         let (x1, y1) = (ax.max(bx), ay.max(by));
-        // The straight part, plus a disc at each end for the round cap. The
-        // discs at interior joints are what round the corners.
-        ctx.rect(
-            x0 - radius,
-            y0 - radius,
-            x1 - x0 + cell_size,
-            y1 - y0 + cell_size,
-        );
+        // The straight part runs **centre to centre** and is half a cell wide
+        // either side of the run; the discs below are what round the caps.
+        //
+        // Extending the rectangle by the radius along the run axis as well —
+        // which is what this did until a checkerboard was the first skin to
+        // clip against it — squares off both caps, so `Silhouette` quietly
+        // became `Cells` for any straight body. Nothing caught it because no
+        // shipped skin had a layer that clipped: classic's ribbon *is* the
+        // silhouette, so it emits no clip at all. A patterned body layer is
+        // the first thing that can paint into the corner the cap rounds away,
+        // and it duly did, right where the contour should have been.
+        let (rx, ry, rw, rh) = if x1 > x0 {
+            (x0, y0 - radius, x1 - x0, cell_size)
+        } else if y1 > y0 {
+            (x0 - radius, y0, cell_size, y1 - y0)
+        } else {
+            // No extent in either axis: the discs are the whole shape.
+            (x0, y0, 0.0, 0.0)
+        };
+        ctx.rect(rx, ry, rw, rh);
         if let Err(cause) = ctx.arc(ax, ay, radius, 0.0, FULL_CIRCLE) {
             error = Some(cause);
             return;
@@ -621,6 +633,66 @@ mod tests {
             recorder.painted_extent(),
             Some((10.0, 10.0, 50.0, 50.0)),
             "the cells clip covers every body cell square"
+        );
+    }
+
+    /// The silhouette's straight part runs centre to centre, and the caps are
+    /// the discs.
+    ///
+    /// This has to be asserted on the path itself rather than on
+    /// `painted_extent`, and that is the whole point of the test. The recorder
+    /// tracks a clip as its **bounding box** (`skin::paint`), and a capsule and
+    /// the cell rectangle around it have the *same* bounding box — so the
+    /// measurement every other clip test uses is structurally blind to a
+    /// squared-off cap. It was blind to one: the rectangle extended by the
+    /// radius along the run axis too, which made `Silhouette` behave as `Cells`
+    /// for every straight body, and the first skin with a clipped body layer
+    /// painted into the corner the contour rounds away.
+    #[test]
+    fn the_silhouettes_straight_part_stops_at_the_end_centres() {
+        let cell_size = 10.0;
+        let rects = |cells: &[(f64, f64)]| {
+            let mut recorder = OpRecorder::new();
+            {
+                let mut ctx = PaintCtx::recording(&mut recorder);
+                clip_to_body(&mut ctx, cells, cell_size, ClipShape::Silhouette).unwrap();
+            }
+            recorder
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    crate::skin::paint::PaintOp::Rect(x, y, w, h) => Some((*x, *y, *w, *h)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Cells x = 1..4 on row y = 1, at cell 10: centres run x = 15..45, and
+        // the ribbon is half a cell either side of y = 15.
+        assert_eq!(
+            rects(&[(1.0, 1.0), (4.0, 1.0)]),
+            vec![(15.0, 10.0, 30.0, 10.0)],
+            "a horizontal run's rectangle must stop at the end centres; \
+             reaching 10.0..50.0 would square off both caps"
+        );
+
+        // The same, turned: centres run y = 15..45, ribbon either side of 15.
+        assert_eq!(
+            rects(&[(1.0, 1.0), (1.0, 4.0)]),
+            vec![(10.0, 15.0, 10.0, 30.0)]
+        );
+
+        // A one-cell body never reaches the run walk at all: it is a single
+        // disc, and a rectangle here would square that disc off too.
+        assert_eq!(rects(&[(1.0, 1.0)]), Vec::new());
+
+        // Consecutive turns make one-cell runs, which is where a rectangle
+        // that reached past the end centres would overlap its neighbour's cap
+        // and square off the outside of the turn.
+        assert_eq!(
+            rects(&[(1.0, 1.0), (1.0, 2.0), (2.0, 2.0)]),
+            vec![(10.0, 15.0, 10.0, 10.0), (15.0, 20.0, 10.0, 10.0)],
+            "each one-cell run spans its own centres and no further"
         );
     }
 

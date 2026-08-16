@@ -323,6 +323,25 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                          honouring it for a blit needs a per-run clip",
                     );
                 }
+                // A band that reaches past |t| = 0.5 leans on the silhouette
+                // clip to stay inside the body. That clip is real, but leaning
+                // on it means the layer's declared shape stops describing what
+                // it paints — and the declared shape is what makes
+                // `overhang_px` computable rather than measured.
+                if let Source::Tiled {
+                    half_width,
+                    t_center,
+                    ..
+                } = source
+                    && t_center.abs() + half_width.abs() > 0.5 + 1e-9
+                {
+                    reject(
+                        &mut problems,
+                        layer,
+                        "a tiled band must stay inside the body: \
+                         |t_center| + half_width may not exceed 0.5",
+                    );
+                }
             }
             LayerKind::HeadRamp { .. } => {}
         }
@@ -810,6 +829,8 @@ impl CompositeSkin {
             period_cells,
             duty,
             half_width,
+            t_center,
+            phase_cells,
             alpha,
         } = source
         {
@@ -822,14 +843,19 @@ impl CompositeSkin {
 
             let cell = pose.cell_size;
             let half = half_width.clamp(0.0, 0.5);
+            // The band's own lane across the body. Validation has already
+            // established that the lane fits inside the silhouette, so the
+            // clamp here is defence against a hand-built layer rather than the
+            // rule itself.
+            let centre = t_center.clamp(-0.5 + half, 0.5 - half);
             // Tiles are laid out from the head along the body, not per run, so
             // a repeat that straddles a corner stays one tile in body space and
             // the pattern does not restart at every turn.
-            let first = (allocation.start / period).floor();
-            let last = (allocation.end / period).ceil();
+            let first = ((allocation.start - phase_cells) / period).floor();
+            let last = ((allocation.end - phase_cells) / period).ceil();
             let mut index = first;
             while index < last {
-                let tile_start = index * period;
+                let tile_start = index * period + phase_cells;
                 index += 1.0;
                 let (from, to) = (
                     tile_start.max(allocation.start),
@@ -842,7 +868,7 @@ impl CompositeSkin {
                 if let Some(expr) = alpha {
                     let value = expr.eval(&skin_schema::expr::Env {
                         s: (from + to) / 2.0,
-                        t: 0.0,
+                        t: centre,
                         len: _body_len,
                         time: frame.time_turns,
                         boost: if pose.boost_active { 1.0 } else { 0.0 },
@@ -858,8 +884,8 @@ impl CompositeSkin {
                     if end <= start {
                         return;
                     }
-                    let near = run.point(cell, start, -half);
-                    let far = run.point(cell, end, half);
+                    let near = run.point(cell, start, centre - half);
+                    let far = run.point(cell, end, centre + half);
                     ctx.fill_rect(
                         near.0.min(far.0),
                         near.1.min(far.1),
@@ -1197,6 +1223,8 @@ mod tests {
                 period_cells: 3.0,
                 duty: 0.5,
                 half_width: 0.5,
+                t_center: 0.0,
+                phase_cells: 0.0,
                 alpha: alpha.map(|src| {
                     std::sync::Arc::new(skin_schema::expr::Expr::parse(src).expect("grammatical"))
                 }),
@@ -1321,6 +1349,145 @@ mod tests {
         };
         assert_ne!(golden(0.0), golden(500.0), "the tile alpha never moved");
         assert_eq!(golden(0.0), golden(1_000.0), "the ring did not close");
+    }
+
+    fn band_layer(t_center: f64, phase_cells: f64, half_width: f64) -> Layer {
+        span_layer(
+            "band",
+            Region::Body,
+            Span::WHOLE,
+            Source::Tiled {
+                color: ColorSlot::Fill,
+                period_cells: 1.0,
+                duty: 0.5,
+                half_width,
+                t_center,
+                phase_cells,
+                alpha: None,
+            },
+        )
+    }
+
+    fn band_rects(layer: Layer, cells: &[(f64, f64)]) -> Vec<(f64, f64, f64, f64)> {
+        let skin = CompositeSkin::new(
+            "band@test",
+            "Band",
+            vec![layer],
+            vec![frame()],
+            1_000.0,
+            CompositeConfig {
+                boost_color: "#fff200".to_string(),
+                head_core_color: "#333333".to_string(),
+                head_core_ratio: 0.38,
+                head_core_is_dark: true,
+                wave: None,
+            },
+            None,
+            None,
+        )
+        .expect("a single body band is a valid stack");
+
+        let mut recorder = crate::skin::paint::OpRecorder::new();
+        skin.paint_alive(
+            &mut PaintCtx::recording(&mut recorder),
+            &SnakePose {
+                cells,
+                cell_size: 10.0,
+                boost_active: false,
+                anim_ms: 0.0,
+                reduced_motion: true,
+            },
+            &SkinIdentity {
+                role: SnakeRole::Own,
+                shade_slot: 0,
+            },
+        )
+        .expect("a recording painter cannot fail");
+
+        recorder
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                crate::skin::paint::PaintOp::FillRect(x, y, w, h) => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The two degrees of freedom a checkerboard needs, and the reason they are
+    /// on `Tiled` rather than in a bespoke source: one band offset across the
+    /// body and half a period along it is the *other* half of the pattern.
+    ///
+    /// A horizontal snake at cell 10 occupies ten pixels across, so the lane a
+    /// band paints is directly readable in the recorded rectangles.
+    #[test]
+    fn a_band_paints_its_own_lane_across_the_body() {
+        let cells = [(0.0, 0.0), (5.0, 0.0)];
+
+        // The body sits on row y = 0, so at cell 10 it occupies pixels 0..10
+        // and its centreline is at 5.
+
+        // Centred: the classic single band, spanning the full width.
+        let centred = band_rects(band_layer(0.0, 0.0, 0.5), &cells);
+        assert!(!centred.is_empty());
+        for (_, y, _, height) in &centred {
+            assert!((*y - 0.0).abs() < 1e-9, "centred band moved: y = {y}");
+            assert!((*height - 10.0).abs() < 1e-9);
+        }
+
+        // A quarter-cell lane either side of the centreline: two rows, each
+        // half the width, meeting exactly at the middle and nowhere else.
+        let near = band_rects(band_layer(-0.25, 0.0, 0.25), &cells);
+        let far = band_rects(band_layer(0.25, 0.0, 0.25), &cells);
+        assert!(!near.is_empty() && !far.is_empty());
+        for (_, y, _, height) in &near {
+            assert!((*y - 0.0).abs() < 1e-9, "near row is not against the top");
+            assert!((*height - 5.0).abs() < 1e-9);
+        }
+        for (_, y, _, height) in &far {
+            assert!((*y - 5.0).abs() < 1e-9, "far row is not below the middle");
+            assert!((*height - 5.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_phase_offset_interleaves_two_bands_instead_of_stacking_them() {
+        let cells = [(0.0, 0.0), (5.0, 0.0)];
+        let unshifted = band_rects(band_layer(-0.25, 0.0, 0.25), &cells);
+        let shifted = band_rects(band_layer(0.25, 0.5, 0.25), &cells);
+
+        let starts =
+            |rects: &[(f64, f64, f64, f64)]| rects.iter().map(|(x, ..)| *x).collect::<Vec<_>>();
+        let (a, b) = (starts(&unshifted), starts(&shifted));
+        assert!(!a.is_empty() && !b.is_empty());
+        for start in &a {
+            assert!(
+                !b.iter().any(|other| (other - start).abs() < 1e-9),
+                "the two rows share a tile at x = {start}, so this is stripes \
+                 rather than a checkerboard"
+            );
+        }
+        // Half a period apart, in pixels, at cell 10.
+        assert!(
+            b.iter().any(|other| (other - (a[0] + 5.0)).abs() < 1e-9),
+            "the shifted row is not half a period along: {a:?} vs {b:?}"
+        );
+    }
+
+    /// The lane bound is declarative so registration can enforce it. Leaving it
+    /// to the silhouette clip would mean the layer's declared shape no longer
+    /// described what it paints, which is the thing `overhang_px` is computed
+    /// from rather than measured.
+    #[test]
+    fn a_band_that_would_reach_past_the_body_is_rejected_at_registration() {
+        let problems = validate_layers(&[band_layer(0.4, 0.0, 0.25)], &[frame()]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].problem.contains("t_center"), "{problems:?}");
+
+        assert!(
+            validate_layers(&[band_layer(0.25, 0.0, 0.25)], &[frame()]).is_empty(),
+            "a lane that exactly reaches the edge is legal"
+        );
     }
 
     /// The section 8.4 gate: one atlas region over the first N cells, another

@@ -14,6 +14,7 @@
 //! See `specs/skins-prd.md` for the boundary rulings this module implements.
 
 pub mod atlas;
+pub mod checker;
 pub mod classic;
 pub mod composite;
 pub mod corpse;
