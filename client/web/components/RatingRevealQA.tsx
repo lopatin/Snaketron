@@ -168,6 +168,7 @@ const fixturePresentation: MatchPresentation = {
     xpGained: snakeId === 0 ? 140 : 95,
     actionCount: 115,
     isWinner: snakeId === 0,
+    deathAttribution: snakeId === 1 ? 'Demolished by You' : null,
     isReady: null,
   })),
   currentPlayer: null,

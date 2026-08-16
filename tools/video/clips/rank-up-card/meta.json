@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "scenario_id": "rank-up-card",
+  "fixture_id": "rank-up-card",
+  "source_kind": "fixture-card",
+  "source_file": "rank-up.html",
+  "source_sha256": "8e0566fbdc4e8086810b8fe61ad65b01dc88f3404d17f560d71a5aa14755c915",
+  "source_params": {},
+  "capture_vfps": 60,
+  "encoded_fps": 60,
+  "width": 1920,
+  "height": 1080,
+  "duration": 6,
+  "duration_ms": 6000,
+  "frame_count": 360,
+  "capture_path": "contract-screenshot",
+  "deterministic_scope": "same-machine-software-raster",
+  "rendered_tick": 6000,
+  "anchors": {
+    "reveal": 0.85,
+    "settle": 1.4
+  },
+  "cue_track": {
+    "anchors": {
+      "reveal": 0.85,
+      "settle": 1.4
+    },
+    "duration": 4,
+    "capture_vfps": 60,
+    "encoded_fps": 60
+  },
+  "cue_timeline": [
+    {
+      "type": "reveal",
+      "at_master_seconds": 0.85
+    },
+    {
+      "type": "settle",
+      "at_master_seconds": 1.4
+    }
+  ],
+  "master_sha256": "2294df109a452ef1cc8c538e11c7ac8886a6eff72c230622003b7fcbc60ed8a5",
+  "master_file": "master.mkv"
+}

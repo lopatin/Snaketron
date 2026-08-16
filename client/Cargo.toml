@@ -7,6 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+anyhow = "1"
 common = { path = "../common" }
 skin-schema = { path = "../skin-schema" }
 wasm-bindgen = "0.2"

@@ -17,6 +17,7 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::sleep;
@@ -28,11 +29,13 @@ use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
     canonical_json_bytes, match_history_summary,
 };
+use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
 use crate::season::{Season, get_season_at};
 
 pub struct DynamoDatabase {
     client: Client,
     table_prefix: String,
+    replay_store: Option<Arc<dyn ReplayStore>>,
 }
 
 const COMPLETED_GAME_RETENTION_DAYS_ENV: &str = "SNAKETRON_COMPLETED_GAME_RETENTION_DAYS";
@@ -112,6 +115,129 @@ struct DynamoPageCursor {
     gsi2sk: Option<String>,
 }
 const RECENT_COMPLETED_GAMES_PAGE_SIZE: usize = 100;
+const MAX_DYNAMODB_REPLAY_METADATA_BYTES: usize = 8 * 1024;
+const MAX_DYNAMODB_HIGHLIGHT_BYTES: usize = 256 * 1024;
+const SPLIT_HIGHLIGHT_SORT_KEY: &str = "HIGHLIGHT";
+/// Keep the two largest JSON attributes well below DynamoDB's 400 KiB item
+/// ceiling. The remaining 200 KiB covers attribute names and game metadata.
+/// A valid highlight that would cross this budget is written to a separate
+/// item by the same completion transaction.
+const MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES: usize = 200 * 1024;
+
+#[derive(Debug)]
+struct PersistableReplayArtifacts {
+    replay_object_json: Option<String>,
+    play_of_the_game_json: Option<String>,
+    split_play_of_the_game_json: Option<String>,
+}
+
+/// Materialize replay artifacts before the DynamoDB transaction. Object keys
+/// and gzip bytes are deterministic/content-addressed, so retrying these
+/// writes is idempotent while the transaction remains the durable metadata
+/// boundary.
+async fn prepare_replay_artifacts(
+    replay_store: Option<&dyn ReplayStore>,
+    completion: &CompletionRecordV1,
+) -> Result<PersistableReplayArtifacts> {
+    if completion.recording_journal.is_some() {
+        return Err(anyhow!(
+            "PersistGame received an unmaterialized replay journal reference"
+        ));
+    }
+    let replay_object = match &completion.recording {
+        Some(recording) => {
+            let replay_store = replay_store.ok_or_else(|| {
+                anyhow!(
+                    "completion {} contains a replay recording, but {} is not configured",
+                    completion.revision,
+                    crate::replay_store::REPLAY_S3_BUCKET_ENV
+                )
+            })?;
+            let serialized;
+            let recording_bytes = match &completion.recording_canonical_bytes {
+                Some(bytes) => bytes.as_slice(),
+                None => {
+                    // Compatibility path for inline completion records written
+                    // before journal-only materialization. New PersistGame
+                    // records arrive with bytes produced on the bounded
+                    // blocking materializer pool.
+                    serialized = canonical_json_bytes(recording)
+                        .context("Failed to serialize deterministic game recording")?;
+                    serialized.as_slice()
+                }
+            };
+            let metadata = replay_store
+                .put_recording(completion.game_id, recording_bytes)
+                .await
+                .context("Failed to upload completed-game recording before persistence")?;
+            replay_store
+                .validate_reference(&metadata)
+                .context("Replay store returned an invalid durable reference")?;
+            if metadata.game_id != completion.game_id {
+                return Err(anyhow!(
+                    "replay store returned metadata for game {} while persisting game {}",
+                    metadata.game_id,
+                    completion.game_id
+                ));
+            }
+            Some(metadata)
+        }
+        None => None,
+    };
+    let replay_object_json = replay_object
+        .map(|metadata| -> Result<String> {
+            let metadata_json = String::from_utf8(canonical_json_bytes(&metadata)?)
+                .context("Canonical replay metadata was not UTF-8 JSON")?;
+            if metadata_json.len() > MAX_DYNAMODB_REPLAY_METADATA_BYTES {
+                return Err(anyhow!(
+                    "replay metadata is {} bytes, exceeding the {} byte DynamoDB limit",
+                    metadata_json.len(),
+                    MAX_DYNAMODB_REPLAY_METADATA_BYTES
+                ));
+            }
+            Ok(metadata_json)
+        })
+        .transpose()?;
+
+    let final_state_bytes = canonical_json_bytes(&completion.final_state)
+        .context("Failed to size completed game state")?
+        .len();
+    let (play_of_the_game_json, split_play_of_the_game_json) = match &completion.play_of_the_game {
+        Some(clip) => {
+            let json = String::from_utf8(canonical_json_bytes(clip)?)
+                .context("Canonical Play-of-the-Game JSON was not UTF-8")?;
+            if json.len() > MAX_DYNAMODB_HIGHLIGHT_BYTES {
+                warn!(
+                    game_id = completion.game_id,
+                    highlight_bytes = json.len(),
+                    max_highlight_bytes = MAX_DYNAMODB_HIGHLIGHT_BYTES,
+                    "Omitting oversized Play-of-the-Game from DynamoDB"
+                );
+                (None, None)
+            } else if final_state_bytes.saturating_add(json.len())
+                > MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES
+            {
+                debug!(
+                    game_id = completion.game_id,
+                    final_state_bytes,
+                    highlight_bytes = json.len(),
+                    combined_budget = MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES,
+                    "Writing Play-of-the-Game to a split DynamoDB item"
+                );
+                (None, Some(json))
+            } else {
+                (Some(json), None)
+            }
+        }
+        None => (None, None),
+    };
+
+    Ok(PersistableReplayArtifacts {
+        replay_object_json,
+        play_of_the_game_json,
+        split_play_of_the_game_json,
+    })
+}
 
 #[derive(Debug, Clone)]
 struct CrazyGamesIdentityRecord {
@@ -167,6 +293,21 @@ impl DynamoDatabase {
     pub async fn new() -> Result<Self> {
         let client = dynamodb_client().await;
 
+        let replay_store = match ReplayStoreConfig::from_env()? {
+            Some(config) => {
+                info!(
+                    bucket = %config.bucket,
+                    prefix = %config.key_prefix,
+                    "Durable replay recording storage enabled"
+                );
+                Some(Arc::new(S3ReplayStore::new(config).await?) as Arc<dyn ReplayStore>)
+            }
+            None => {
+                info!("Durable replay recording storage is not configured");
+                None
+            }
+        };
+
         let table_prefix =
             std::env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
 
@@ -178,6 +319,7 @@ impl DynamoDatabase {
         let db = Self {
             client,
             table_prefix,
+            replay_store,
         };
 
         // Ensure all required tables exist
@@ -813,6 +955,29 @@ impl DynamoDatabase {
             Self::extract_optional_datetime(item, "createdAt")?.unwrap_or_else(Utc::now);
         let last_activity =
             Self::extract_optional_datetime(item, "lastActivity")?.unwrap_or(created_at);
+        let replay_object = match Self::extract_string(item, "replayObject") {
+            Some(value) => {
+                let metadata: ReplayObjectMetadata = serde_json::from_str(&value)
+                    .context("Invalid replayObject JSON on game metadata row")?;
+                metadata
+                    .validate()
+                    .context("Invalid replayObject metadata on game row")?;
+                if metadata.game_id != game_id as u32 {
+                    return Err(anyhow!(
+                        "game {game_id} contains a replay reference for game {}",
+                        metadata.game_id
+                    ));
+                }
+                Some(metadata)
+            }
+            None => None,
+        };
+        let play_of_the_game = Self::extract_string(item, "playOfTheGame")
+            .map(|value| {
+                serde_json::from_str::<common::HighlightClip>(&value)
+                    .context("Invalid playOfTheGame JSON on game metadata row")
+            })
+            .transpose()?;
 
         Ok(Game {
             id: game_id,
@@ -832,10 +997,58 @@ impl DynamoDatabase {
                 .unwrap_or_else(|| "matchmaking".to_string()),
             is_private: Self::extract_bool(item, "isPrivate").unwrap_or(false),
             game_code: Self::extract_string(item, "gameCode"),
+            replay_object,
+            play_of_the_game,
             news_eligible: Self::extract_bool(item, "newsEligible") == Some(true)
                 && Self::extract_bool(item, "isPrivate") == Some(false)
                 && Self::extract_string(item, "gameCode").is_none(),
         })
+    }
+
+    async fn hydrate_split_game_highlight(
+        &self,
+        game_id: i32,
+        game_item: &mut HashMap<String, AttributeValue>,
+    ) -> Result<()> {
+        if Self::extract_bool(game_item, "playOfTheGameSplit") != Some(true) {
+            return Ok(());
+        }
+        if Self::extract_string(game_item, "playOfTheGame").is_some() {
+            return Err(anyhow!(
+                "game {game_id} marks a split highlight but also embeds one"
+            ));
+        }
+        let expected_revision = Self::extract_string(game_item, "completionRevision")
+            .context("Split-highlight game row is missing completionRevision")?;
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s(SPLIT_HIGHLIGHT_SORT_KEY))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to load split Play-of-the-Game item")?;
+        let split = response
+            .item
+            .context("Game metadata references a missing split Play-of-the-Game item")?;
+        if Self::item_is_expired(&split, Utc::now().timestamp()) {
+            return Err(anyhow!(
+                "Game metadata references an expired split Play-of-the-Game item"
+            ));
+        }
+        if Self::extract_string(&split, "completionRevision").as_deref()
+            != Some(expected_revision.as_str())
+        {
+            return Err(anyhow!(
+                "Split Play-of-the-Game revision does not match game metadata"
+            ));
+        }
+        let json = Self::extract_string(&split, "playOfTheGame")
+            .context("Split Play-of-the-Game item is missing its payload")?;
+        game_item.insert("playOfTheGame".into(), Self::av_s(json));
+        Ok(())
     }
 
     fn completed_game_retention_days(configured_value: Option<&str>) -> i64 {
@@ -2213,7 +2426,12 @@ impl DynamoDatabase {
             1,
             self.completion_revision_anchor(completion, &record_hash)?,
         );
-        if !matches!(effect, CompletionEffect::PersistGame { .. }) {
+        // XP/MMR are allowed to settle while replay-backed PersistGame is
+        // retrying (for example during an S3 outage). Their immutable record
+        // anchor + effect marker already fence conflicting revisions.
+        // High-score publication alone depends on the completed game row;
+        // UpdateRanking carries its narrower MMR-effect dependency below.
+        if matches!(effect, CompletionEffect::InsertHighScore { .. }) {
             mutations.insert(2, self.game_completion_revision_guard(completion)?);
             mutations.insert(
                 3,
@@ -3375,7 +3593,11 @@ impl Database for DynamoDatabase {
                 );
                 Ok(None)
             }
-            Some(item) => Ok(Some(Self::game_from_item(game_id, &item)?)),
+            Some(mut item) => {
+                self.hydrate_split_game_highlight(game_id, &mut item)
+                    .await?;
+                Ok(Some(Self::game_from_item(game_id, &item)?))
+            }
             None => Ok(None),
         }
     }
@@ -4014,6 +4236,16 @@ impl Database for DynamoDatabase {
     ) -> Result<EffectApplyResult> {
         completion.validate_effect(effect)?;
 
+        let replay_artifacts = if matches!(effect, CompletionEffect::PersistGame { .. }) {
+            Some(
+                prepare_replay_artifacts(self.replay_store.as_deref(), completion)
+                    .await
+                    .context("Failed to prepare completed-game replay artifacts")?,
+            )
+        } else {
+            None
+        };
+
         let max_attempts = if matches!(
             effect,
             CompletionEffect::AddXp { .. }
@@ -4027,6 +4259,9 @@ impl Database for DynamoDatabase {
         for attempt in 0..max_attempts {
             let mutations = match effect {
                 CompletionEffect::PersistGame { .. } => {
+                    let replay_artifacts = replay_artifacts
+                        .as_ref()
+                        .expect("persist-game replay artifacts were prepared above");
                     let ended_at = DateTime::<Utc>::from_timestamp_millis(completion.ended_at_ms)
                         .ok_or_else(|| anyhow!("invalid completion timestamp"))?;
                     let created_at =
@@ -4108,6 +4343,29 @@ impl Database for DynamoDatabase {
                     if completion.season.is_some() {
                         expression.push_str(", season=:season");
                     }
+                    if replay_artifacts.replay_object_json.is_some() {
+                        expression.push_str(", replayObject=:replay_object");
+                    }
+                    if replay_artifacts.play_of_the_game_json.is_some() {
+                        expression.push_str(", playOfTheGame=:play_of_the_game");
+                    }
+                    if replay_artifacts.split_play_of_the_game_json.is_some() {
+                        expression.push_str(", playOfTheGameSplit=:play_of_the_game_split");
+                    }
+                    let mut removals = Vec::with_capacity(3);
+                    if replay_artifacts.replay_object_json.is_none() {
+                        removals.push("replayObject");
+                    }
+                    if replay_artifacts.play_of_the_game_json.is_none() {
+                        removals.push("playOfTheGame");
+                    }
+                    if replay_artifacts.split_play_of_the_game_json.is_none() {
+                        removals.push("playOfTheGameSplit");
+                    }
+                    if !removals.is_empty() {
+                        expression.push_str(" REMOVE ");
+                        expression.push_str(&removals.join(", "));
+                    }
 
                     let mut update = Update::builder()
                         .table_name(self.main_table())
@@ -4157,6 +4415,24 @@ impl Database for DynamoDatabase {
                     if let Some(season) = completion.season {
                         update = update.expression_attribute_values(":season", Self::av_n(season));
                     }
+                    if let Some(replay_object) = &replay_artifacts.replay_object_json {
+                        update = update.expression_attribute_values(
+                            ":replay_object",
+                            Self::av_s(replay_object),
+                        );
+                    }
+                    if let Some(play_of_the_game) = &replay_artifacts.play_of_the_game_json {
+                        update = update.expression_attribute_values(
+                            ":play_of_the_game",
+                            Self::av_s(play_of_the_game),
+                        );
+                    }
+                    if replay_artifacts.split_play_of_the_game_json.is_some() {
+                        update = update.expression_attribute_values(
+                            ":play_of_the_game_split",
+                            Self::av_bool(true),
+                        );
+                    }
                     let mut mutations = vec![
                         TransactWriteItem::builder()
                             .update(
@@ -4166,6 +4442,29 @@ impl Database for DynamoDatabase {
                             )
                             .build(),
                     ];
+                    if let Some(play_of_the_game) = &replay_artifacts.split_play_of_the_game_json {
+                        let split_highlight = Put::builder()
+                            .table_name(self.main_table())
+                            .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+                            .item("sk", Self::av_s(SPLIT_HIGHLIGHT_SORT_KEY))
+                            .item("gameId", Self::av_n(completion.game_id))
+                            .item("playOfTheGame", Self::av_s(play_of_the_game))
+                            .item(
+                                "completionRevision",
+                                Self::av_s(completion.revision.to_string()),
+                            )
+                            .item("ttl", Self::av_n(snapshot_ttl))
+                            .condition_expression(
+                                "attribute_not_exists(pk) OR completionRevision=:revision",
+                            )
+                            .expression_attribute_values(
+                                ":revision",
+                                Self::av_s(completion.revision.to_string()),
+                            )
+                            .build()
+                            .context("Failed to build split Play-of-the-Game item")?;
+                        mutations.push(TransactWriteItem::builder().put(split_highlight).build());
+                    }
 
                     let canonical_history = Put::builder()
                         .table_name(self.main_table())
@@ -5776,6 +6075,94 @@ impl DynamoDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay_store::InMemoryReplayStore;
+    use common::{
+        GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameRecordingV1, GameState,
+        GameStatus, GameType, HighlightClip, HighlightConfig, HighlightPresentation,
+        HighlightReason, HighlightScoreBreakdown, HighlightWindow, QueueMode, ReplayAnchor,
+        ReplayVisibility,
+    };
+
+    fn completion_with_recording(game_id: u32) -> CompletionRecordV1 {
+        let mut final_state = GameState::new(
+            20,
+            20,
+            GameType::Solo,
+            QueueMode::Quickmatch,
+            Some(7),
+            1_000,
+        );
+        final_state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let recording = GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            visibility: ReplayVisibility::Public,
+            anchors: vec![ReplayAnchor {
+                tick: final_state.tick,
+                sequence: 0,
+                state: final_state.clone(),
+            }],
+            messages: Vec::new(),
+            end_tick: final_state.tick,
+            end_sync_hash: final_state.sync_hash(),
+        };
+        let completion = CompletionRecordV1 {
+            schema_version: crate::completion::COMPLETION_SCHEMA_VERSION,
+            game_id,
+            partition_id: 3,
+            revision: uuid::Uuid::new_v4(),
+            ended_at_ms: 2_000,
+            server_id: 9,
+            season: Some(1),
+            recording: Some(recording),
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
+            final_state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+        completion.validate().unwrap();
+        completion
+    }
+
+    fn completion_with_highlight(game_id: u32, star_name_bytes: usize) -> CompletionRecordV1 {
+        let mut completion = completion_with_recording(game_id);
+        completion.recording = None;
+        let anchor = completion.final_state.clone();
+        let mut breakdown = HighlightScoreBreakdown::default();
+        breakdown.total = 125;
+        breakdown.max_chain = 8;
+        completion.play_of_the_game = Some(HighlightClip {
+            clip_format_version: common::HIGHLIGHT_CLIP_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            star_user_id: 1,
+            star_snake_id: 0,
+            star_name: "S".repeat(star_name_bytes),
+            reason: HighlightReason::ComboFrenzy { max_chain: 8 },
+            score: 125,
+            breakdown,
+            window: HighlightWindow {
+                start_tick: anchor.tick,
+                end_tick: anchor.tick,
+                focus_tick: anchor.tick,
+            },
+            anchor: anchor.clone(),
+            messages: Vec::new(),
+            end_sync_hash: anchor.sync_hash(),
+            presentation: HighlightPresentation {
+                rotation: 0,
+                follow_snake_id: 0,
+                segments: Vec::new(),
+            },
+            config: HighlightConfig::default(),
+        });
+        completion.validate().unwrap();
+        completion
+    }
 
     #[test]
     fn runtime_dynamodb_standard_retry_policy_is_capped_at_five_attempts() {
@@ -5831,6 +6218,8 @@ mod tests {
         );
         assert_eq!(game.game_state, Some(json!({ "tick": 42 })));
         assert_eq!(game.season, None, "legacy rows have no proven season");
+        assert!(game.replay_object.is_none());
+        assert!(game.play_of_the_game.is_none());
         assert!(!game.news_eligible, "legacy rows must fail closed");
 
         item.insert("season".to_string(), DynamoDatabase::av_n(7));
@@ -5845,6 +6234,91 @@ mod tests {
             DynamoDatabase::game_from_item(123, &item).unwrap().season,
             None
         );
+    }
+
+    #[test]
+    fn game_from_item_parses_replay_metadata_strictly() {
+        let metadata = ReplayObjectMetadata {
+            format_version: crate::replay_store::REPLAY_OBJECT_FORMAT_VERSION,
+            game_id: 123,
+            object_key: "recordings/v1/games/0000000123.replay.json.gz".into(),
+            uncompressed_sha256: "a".repeat(64),
+            compressed_sha256: "b".repeat(64),
+            uncompressed_bytes: 100,
+            compressed_bytes: 50,
+        };
+        let mut item = HashMap::new();
+        item.insert(
+            "replayObject".to_string(),
+            DynamoDatabase::av_s(serde_json::to_string(&metadata).unwrap()),
+        );
+        let game = DynamoDatabase::game_from_item(123, &item).unwrap();
+        assert_eq!(game.replay_object, Some(metadata));
+
+        item.insert("replayObject".to_string(), DynamoDatabase::av_s("not-json"));
+        assert!(DynamoDatabase::game_from_item(123, &item).is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_artifacts_upload_deterministically_before_metadata_persistence() {
+        let completion = completion_with_recording(123);
+        let store = InMemoryReplayStore::new();
+
+        let first = prepare_replay_artifacts(Some(&store), &completion)
+            .await
+            .unwrap();
+        let second = prepare_replay_artifacts(Some(&store), &completion)
+            .await
+            .unwrap();
+
+        assert_eq!(first.replay_object_json, second.replay_object_json);
+        assert_eq!(store.object_count().await, 1);
+        let metadata: ReplayObjectMetadata =
+            serde_json::from_str(first.replay_object_json.as_deref().unwrap()).unwrap();
+        let stored = store.get_recording(&metadata).await.unwrap().unwrap();
+        assert_eq!(
+            stored.bytes,
+            canonical_json_bytes(completion.recording.as_ref().unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_without_configured_store_fails_loudly() {
+        let error = prepare_replay_artifacts(None, &completion_with_recording(124))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::replay_store::REPLAY_S3_BUCKET_ENV)
+        );
+    }
+
+    #[tokio::test]
+    async fn highlights_split_before_the_game_item_budget_and_only_drop_at_response_cap() {
+        let normal = prepare_replay_artifacts(None, &completion_with_highlight(125, 16))
+            .await
+            .unwrap();
+        assert!(normal.play_of_the_game_json.is_some());
+        assert!(normal.split_play_of_the_game_json.is_none());
+
+        let split = prepare_replay_artifacts(
+            None,
+            &completion_with_highlight(126, MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES),
+        )
+        .await
+        .unwrap();
+        assert!(split.play_of_the_game_json.is_none());
+        assert!(split.split_play_of_the_game_json.is_some());
+
+        let oversized = prepare_replay_artifacts(
+            None,
+            &completion_with_highlight(127, MAX_DYNAMODB_HIGHLIGHT_BYTES),
+        )
+        .await
+        .unwrap();
+        assert!(oversized.play_of_the_game_json.is_none());
+        assert!(oversized.split_play_of_the_game_json.is_none());
     }
 
     #[test]

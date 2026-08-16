@@ -1,14 +1,24 @@
-import React, { useEffect, useId, useRef } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useInputSurface } from '../hooks/useInputSurface';
 import type { MatchPresentation } from '../utils/gamePresentation';
+import type { Rank } from '../types';
 import {
   formatPerMinuteRate,
   getPlayAgainShortcutAction,
 } from '../utils/gamePresentation';
 import { resolveSnakeSkinColors } from '../utils/snakeSkin';
 import type { MatchRatingState } from '../utils/ratingReveal';
+import type { MatchHighlightState } from '../utils/highlightPresentation';
 import GameOverJewel from './GameOverJewel';
+import PlayOfTheGame from './PlayOfTheGame';
 import RatingReveal from './RatingReveal';
+
+/**
+ * Longest the replay will wait on the rating sweep before mounting anyway.
+ * Comfortably past a normal sweep; it only ever fires when the animation has
+ * stalled (a throttled background tab being the usual reason).
+ */
+const RATING_SETTLE_CEILING_MS = 6000;
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -21,8 +31,12 @@ const FOCUSABLE_SELECTOR = [
 
 export interface GameOverCardProps {
   open: boolean;
+  gameId?: string;
   presentation: MatchPresentation;
   rating?: MatchRatingState;
+  highlight?: MatchHighlightState;
+  /** Ladder rank of whoever earned the highlight; see `useStarRank`. */
+  starRank?: Rank | null;
   onDismiss: () => void;
   onMenu: () => void;
   onPlayAgain: () => void;
@@ -61,8 +75,11 @@ const MetricLabel: React.FC<MetricLabelProps> = ({
 
 const GameOverCard: React.FC<GameOverCardProps> = ({
   open,
+  gameId,
   presentation,
   rating,
+  highlight,
+  starRank = null,
   onDismiss,
   onMenu,
   onPlayAgain,
@@ -78,10 +95,44 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
   const summaryId = useId();
   const ppmTooltipId = useId();
   const apmTooltipId = useId();
+  const [ratingSettled, setRatingSettled] = useState(
+    rating === undefined || rating.phase === 'idle' || rating.phase === 'unavailable',
+  );
+  const autoplayGameIdRef = useRef<number | null>(null);
 
   onDismissRef.current = onDismiss;
   onPlayAgainRef.current = onPlayAgain;
   playAgainDisabledRef.current = playAgainDisabled;
+
+  useEffect(() => {
+    setRatingSettled(
+      rating === undefined || rating.phase === 'idle' || rating.phase === 'unavailable',
+    );
+  }, [gameId, rating?.phase]);
+
+  useEffect(() => {
+    // Closing unmounts the replay player. Treat a later reopen as a new modal
+    // presentation so the one-shot gate cannot strand a controls-free PotG on
+    // its first frame.
+    if (!open) {
+      autoplayGameIdRef.current = null;
+    }
+  }, [open]);
+
+  // The replay waits for the rating sweep, and the sweep runs on rAF — which a
+  // background tab throttles to a stop. Without a ceiling, a card opened out of
+  // view would come back with no replay on it at all, so treat the sweep as
+  // finished once it has had more than enough time.
+  useEffect(() => {
+    if (!open || ratingSettled) return undefined;
+    const timer = window.setTimeout(() => setRatingSettled(true), RATING_SETTLE_CEILING_MS);
+    return () => window.clearTimeout(timer);
+  }, [open, ratingSettled]);
+
+  const handleRatingSettled = useCallback(() => setRatingSettled(true), []);
+  const handleHighlightAutoplayStarted = useCallback((playedGameId: number) => {
+    autoplayGameIdRef.current = playedGameId;
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -179,6 +230,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
     ? `${presentation.sides[0]?.score ?? 0}–${presentation.sides[1]?.score ?? 0}`
     : current?.score.toString() ?? presentation.soloScore.toString();
 
+
   return (
     <div
       className="game-over-backdrop"
@@ -225,7 +277,25 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
           </button>
         </header>
 
-        {rating && <RatingReveal state={rating} />}
+        {rating && <RatingReveal state={rating} onSettled={handleRatingSettled} />}
+
+        {/* One thing at a time: the rating panel owns the card until its sweep
+            finishes, and only then does the replay mount and slide in. Mounting
+            both at once put two animations on screen competing for attention
+            and made the card land at its full height before either had
+            anything to show. */}
+        {highlight && ratingSettled && (
+          <PlayOfTheGame
+            highlight={highlight}
+            starRank={starRank}
+            ratingSettled={ratingSettled}
+            autoplayAllowed={
+              highlight.phase !== 'ready' ||
+              autoplayGameIdRef.current !== highlight.clip.game_id
+            }
+            onAutoplayStarted={handleHighlightAutoplayStarted}
+          />
+        )}
 
         <div className="game-over-statline" aria-label="Your match statistics">
           <div>
@@ -277,10 +347,20 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                 } as React.CSSProperties}
                 aria-hidden="true"
               />
-              <span className="game-over-player-name">
-                {player.name}
-                {player.isWinner && <span className="game-over-winner">Winner</span>}
-                {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
+              <span className="game-over-player-details">
+                <span className="game-over-player-name">
+                  {player.name}
+                  {player.isWinner && <span className="game-over-winner">Winner</span>}
+                  {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
+                </span>
+                {player.deathAttribution && (
+                  <span
+                    className="game-over-death-attribution"
+                    data-testid={`death-attribution-${player.snakeId}`}
+                  >
+                    {player.deathAttribution}
+                  </span>
+                )}
               </span>
               <strong>{player.score}</strong>
             </div>

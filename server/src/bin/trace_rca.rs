@@ -7,13 +7,51 @@
 
 use anyhow::{Context, Result, bail};
 use common::replay::{ClientReplay, ServerReplay, diff_traces, trace_side};
-use common::trace::{TraceSide, read_trace};
+use common::trace::{TraceRecord, TraceSide, read_trace};
+use common::{DeathCause, GameEvent};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 struct Args {
     traces: Vec<PathBuf>,
     json: bool,
     emit_test: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TraceDeath {
+    tick: u32,
+    snake_id: u32,
+    cause: DeathCause,
+}
+
+fn trace_deaths(records: &[TraceRecord]) -> Vec<TraceDeath> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let message = match record {
+                TraceRecord::EventOut { msg, .. } | TraceRecord::EventIn { msg, .. } => msg,
+                _ => return None,
+            };
+            match &message.event {
+                GameEvent::SnakeDied { snake_id, cause } => Some(TraceDeath {
+                    tick: message.tick,
+                    snake_id: *snake_id,
+                    cause: cause.clone(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn print_deaths(deaths: &[TraceDeath]) {
+    for death in deaths {
+        println!(
+            "Death tick {}: snake {} — {:?}",
+            death.tick, death.snake_id, death.cause
+        );
+    }
 }
 
 fn parse_args() -> Result<Args> {
@@ -86,6 +124,7 @@ fn main() -> Result<()> {
     let mut json_out = serde_json::Map::new();
 
     for (path, side, records) in &loaded {
+        let deaths = trace_deaths(records);
         match side {
             TraceSide::Server => {
                 let outcome = ServerReplay::from_records(records.clone())?
@@ -93,9 +132,11 @@ fn main() -> Result<()> {
                     .with_context(|| format!("Server replay of {} failed", path.display()))?;
                 if args.json {
                     json_out.insert("server_replay".into(), serde_json::to_value(&outcome)?);
+                    json_out.insert("server_deaths".into(), serde_json::to_value(&deaths)?);
                 } else {
                     println!("=== Server replay: {} ===", path.display());
                     println!("{}", outcome.render());
+                    print_deaths(&deaths);
                     println!();
                 }
             }
@@ -105,9 +146,11 @@ fn main() -> Result<()> {
                     .with_context(|| format!("Client replay of {} failed", path.display()))?;
                 if args.json {
                     json_out.insert("client_replay".into(), serde_json::to_value(&outcome)?);
+                    json_out.insert("client_deaths".into(), serde_json::to_value(&deaths)?);
                 } else {
                     println!("=== Client replay: {} ===", path.display());
                     println!("{}", outcome.render());
+                    print_deaths(&deaths);
                     println!();
                 }
             }
@@ -201,4 +244,59 @@ fn emit_repro_test(
 
     std::fs::write(out, body).with_context(|| format!("Failed to write {}", out.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::GameEventMessage;
+
+    #[test]
+    fn death_summary_surfaces_banking_and_player_attribution() {
+        let records = vec![
+            TraceRecord::EventOut {
+                ts_ms: 10,
+                msg: Box::new(GameEventMessage {
+                    game_id: 1,
+                    tick: 4,
+                    sequence: 1,
+                    stream_seq: 1,
+                    user_id: None,
+                    event: GameEvent::SnakeDied {
+                        snake_id: 0,
+                        cause: DeathCause::Banked,
+                    },
+                }),
+            },
+            TraceRecord::EventOut {
+                ts_ms: 20,
+                msg: Box::new(GameEventMessage {
+                    game_id: 1,
+                    tick: 8,
+                    sequence: 2,
+                    stream_seq: 2,
+                    user_id: None,
+                    event: GameEvent::SnakeDied {
+                        snake_id: 1,
+                        cause: DeathCause::SnakeBody { killer_snake_id: 0 },
+                    },
+                }),
+            },
+        ];
+        assert_eq!(
+            trace_deaths(&records),
+            vec![
+                TraceDeath {
+                    tick: 4,
+                    snake_id: 0,
+                    cause: DeathCause::Banked,
+                },
+                TraceDeath {
+                    tick: 8,
+                    snake_id: 1,
+                    cause: DeathCause::SnakeBody { killer_snake_id: 0 },
+                },
+            ]
+        );
+    }
 }

@@ -1,0 +1,45 @@
+{
+  "format_version": 1,
+  "id": "combo-frenzy",
+  "world": {
+    "game_type": "Solo",
+    "queue_mode": "Quickmatch",
+    "rng_seed": null,
+    "overrides": {
+      "combo": { "window_ms": 2000, "max_food_value": 3 },
+      "player_idle_timeout_ms": 600000
+    }
+  },
+  "pose": {
+    "snakes": [
+      {
+        "user_id": 1,
+        "name": "COMBO PILOT",
+        "body": [{ "x": 10, "y": 20 }, { "x": 7, "y": 20 }],
+        "direction": "Right"
+      }
+    ],
+    "food": [
+      { "x": 11, "y": 20 },
+      { "x": 12, "y": 20 },
+      { "x": 13, "y": 20 },
+      { "x": 14, "y": 20 },
+      { "x": 15, "y": 20 },
+      { "x": 16, "y": 20 },
+      { "x": 17, "y": 20 },
+      { "x": 18, "y": 20 }
+    ],
+    "start_tick": 0
+  },
+  "commands": [],
+  "run_ticks": 20,
+  "presentation": {
+    "camera": { "Follow": { "snake_id": 0 } },
+    "default_time_scale": 1.0,
+    "star_snake_id": 0,
+    "addons": { "combo_callout": true, "boost_meter": false }
+  },
+  "expect": [
+    { "FinalSyncHash": "0x31f1750fe661b5d8" }
+  ]
+}

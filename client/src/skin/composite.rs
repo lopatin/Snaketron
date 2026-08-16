@@ -688,7 +688,9 @@ impl CompositeSkin {
                 pose.cell_size,
                 &RibbonPlan {
                     color: color(*slot, swatch, frame, &self.config),
-                    extra: *extra,
+                    // A skin quotes its contour in 1x pixels; the arena scales
+                    // it with the cell so the rim keeps its weight at any zoom.
+                    extra: *extra * pose.detail_scale,
                     joints: *joints,
                     tail_cap: *tail_cap,
                     fill_before_strokes: *fill_before_strokes,
@@ -1264,6 +1266,7 @@ mod tests {
                 boost_active: false,
                 anim_ms,
                 reduced_motion: false,
+                detail_scale: 1.0,
             },
             &SkinIdentity {
                 role: SnakeRole::Own,
@@ -1334,6 +1337,7 @@ mod tests {
                     boost_active: false,
                     anim_ms,
                     reduced_motion: false,
+                    detail_scale: 1.0,
                 },
                 &SkinIdentity {
                     role: SnakeRole::Own,
@@ -1389,6 +1393,7 @@ mod tests {
             &SnakePose {
                 cells,
                 cell_size: 10.0,
+                detail_scale: 1.0,
                 boost_active: false,
                 anim_ms: 0.0,
                 reduced_motion: true,

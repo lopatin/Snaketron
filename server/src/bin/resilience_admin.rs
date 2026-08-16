@@ -2298,7 +2298,10 @@ mod tests {
             .arg("data")
             .arg(serde_json::to_vec(&event(
                 1,
-                GameEvent::SnakeDied { snake_id: 1 },
+                GameEvent::SnakeDied {
+                    snake_id: 1,
+                    cause: common::DeathCause::Unknown,
+                },
             ))?)
             .query_async(&mut redis)
             .await?;
@@ -2318,7 +2321,10 @@ mod tests {
                 .arg("data")
                 .arg(serde_json::to_vec(&event(
                     stream_seq,
-                    GameEvent::SnakeDied { snake_id: 2 },
+                    GameEvent::SnakeDied {
+                        snake_id: 2,
+                        cause: common::DeathCause::Unknown,
+                    },
                 ))?)
                 .query_async(&mut redis)
                 .await?;

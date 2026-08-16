@@ -22,7 +22,7 @@ pub(crate) fn transform_coords(
 }
 
 /// Get effective dimensions based on rotation (swap width/height for 90/270)
-fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
+pub(crate) fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
     match rotation {
         90 | 270 => (height, width),
         _ => (width, height),
@@ -225,8 +225,27 @@ fn nos_pressure_plate_dimensions(
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn scenario_capture_fonts_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+        .and_then(|element| element.get_attribute("data-scenario-capture"))
+        .as_deref()
+        == Some("true")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scenario_capture_fonts_enabled() -> bool {
+    false
+}
+
 fn nos_wordmark_font(size: f64) -> String {
-    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    if scenario_capture_fonts_enabled() {
+        format!("italic 800 {size}px \"Snaketron Capture Black\", sans-serif")
+    } else {
+        format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    }
 }
 
 /// Paint one faceted Pressure Plate NOS bottle in a local vector coordinate
@@ -936,6 +955,8 @@ pub fn render_skin_fixture(
         boost_active,
         anim_ms,
         reduced_motion,
+        // A fixture sheet is a 1x design-review surface, not the arena.
+        detail_scale: 1.0,
     };
     let mut paint = PaintCtx::web(&ctx);
     if dead {
@@ -1081,6 +1102,7 @@ pub fn skin_perf_smoke(
                 // measured on a cached step it would never hit in play.
                 anim_ms: frame as f64 * 16.7,
                 reduced_motion: false,
+                detail_scale: 1.0,
             };
             paint_alive_with_occlusion(
                 &mut PaintCtx::web(&ctx),
@@ -1304,9 +1326,14 @@ fn carried_food_label_layout(
         cell_size + across_body_bleed_px
     };
     let per_digit = CARRIED_LABEL_DIGIT_ADVANCE_EM * digits.max(1) as f64;
+    // The ceiling is a ratio, not a pixel count: physical pixels are not what
+    // the reader compares the glyph against — the snake is. At DPR 4 the cell
+    // arrives here around 60 px, where a flat 14 px ceiling drew the carried
+    // count at under a quarter of the body it sits inside.
+    let max_px = CARRIED_LABEL_MAX_PX * crate::skin::arena_detail_scale(cell_size);
     let font_px = cell_size
         .min(available / per_digit)
-        .clamp(CARRIED_LABEL_MIN_PX, CARRIED_LABEL_MAX_PX);
+        .clamp(CARRIED_LABEL_MIN_PX, max_px);
 
     CarriedFoodLabelLayout {
         font_px,
@@ -1421,11 +1448,51 @@ pub struct FrameOptions<'a> {
     pub local_skin_ref: Option<&'a str>,
 }
 
+/// Temporarily expose the canvas' public, un-translated coordinate system to a
+/// JavaScript cosmetic layer, then restore the renderer's one-pixel field
+/// translation. Each callback is isolated so a failed effect cannot suppress
+/// the authoritative arena frame.
+///
+/// A cosmetic renderer must never suppress gameplay. The web-side renderer
+/// also isolates each swappable effect in `finally` blocks; the save/restore
+/// here and the explicit resets below are defense in depth for an error that
+/// still crosses the WASM boundary, or a callback that changed canvas state
+/// outside its own save/restore pair before throwing.
+fn call_canvas_effect(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    canvas: &web_sys::HtmlCanvasElement,
+    cell_size: f64,
+    padding: f64,
+    callback: &js_sys::Function,
+    error_message: &str,
+) -> Result<(), JsValue> {
+    ctx.restore();
+    ctx.save();
+    // Canvas and cell size are supplied for focused renderers such as the
+    // tutorial crop. Existing live callbacks intentionally ignore arguments.
+    let callback_result = callback.call2(
+        &JsValue::NULL,
+        canvas.as_ref(),
+        &JsValue::from_f64(cell_size),
+    );
+    ctx.restore();
+    if let Err(error) = callback_result {
+        web_sys::console::error_2(&JsValue::from_str(error_message), &error);
+    }
+
+    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
+    ctx.set_global_alpha(1.0);
+    ctx.save();
+    ctx.translate(padding, padding)?;
+    Ok(())
+}
+
 pub fn render_game_state(
     state: &GameState,
     canvas: &web_sys::HtmlCanvasElement,
     options: FrameOptions<'_>,
     draw_celebration: &js_sys::Function,
+    draw_post_snakes: &js_sys::Function,
 ) -> Result<(), JsValue> {
     let FrameOptions {
         cell_size,
@@ -2002,30 +2069,14 @@ pub fn render_game_state(
     // coordinate system so the callback can use the same 1px-padded positions
     // it used when effects were painted after the complete Rust frame. Restore
     // our field transform afterwards before drawing snakes and walls.
-    ctx.restore();
-    ctx.save();
-    // Canvas and cell size are supplied for focused renderers such as the
-    // tutorial crop. Existing live callbacks intentionally ignore arguments.
-    let celebration_result = draw_celebration.call2(
-        &JsValue::NULL,
-        canvas.as_ref(),
-        &JsValue::from_f64(cell_size),
-    );
-    ctx.restore();
-    if let Err(error) = celebration_result {
-        // A cosmetic renderer must never suppress gameplay. The web-side
-        // renderer also isolates each swappable effect in `finally` blocks;
-        // this callback-level save/restore and the explicit resets below are
-        // defense in depth for any error that still crosses the WASM boundary.
-        web_sys::console::error_2(
-            &JsValue::from_str("Score celebration callback failed"),
-            &error,
-        );
-    }
-    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
-    ctx.set_global_alpha(1.0);
-    ctx.save();
-    ctx.translate(padding, padding)?;
+    call_canvas_effect(
+        &ctx,
+        canvas,
+        cell_size,
+        padding,
+        draw_celebration,
+        "Score celebration callback failed",
+    )?;
 
     // Draw snakes (both alive and dead)
     let snakes = &arena.snakes;
@@ -2089,6 +2140,7 @@ pub fn render_game_state(
                 boost_active: snake.boost().active,
                 anim_ms,
                 reduced_motion,
+                detail_scale: crate::skin::arena_detail_scale(cell_size),
             };
             paint_alive_with_occlusion(
                 &mut PaintCtx::web(&ctx),
@@ -2344,6 +2396,19 @@ pub fn render_game_state(
         }
         ctx.restore();
     }
+
+    // Crash explosions and other impact treatments intentionally sit above
+    // every snake, wall, and carried-food label. Focused renderers invoke this
+    // on their full-arena scratch canvas before cropping, so the existing
+    // full-arena coordinate math remains valid.
+    call_canvas_effect(
+        &ctx,
+        canvas,
+        cell_size,
+        padding,
+        draw_post_snakes,
+        "Post-snakes callback failed",
+    )?;
 
     // Restore the canvas state (remove padding translation)
     ctx.restore();

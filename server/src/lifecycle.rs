@@ -13,9 +13,13 @@ const PHASE_STOPPING: u8 = 3;
 /// WebSocket. Keep these stable: clients use them to decide whether a planned
 /// make-before-break handoff is supported.
 ///
-/// Version 9 adds the server-coordinated, provider-neutral lobby ad-break
-/// barrier, runtime advertisement configuration, and per-session distribution
-/// routing for advertisement policy.
+/// Version 10 is the same kind of collision as version 7 above, and is
+/// resolved the same way. Two branches each shipped a wire change and each
+/// independently claimed 9; git merged the constants silently, so 9 would
+/// have named two mutually unintelligible protocols. Version 10 carries
+/// both: deterministic death causes on `SnakeDied` events, and the
+/// server-coordinated, provider-neutral lobby ad-break barrier with runtime
+/// advertisement configuration and per-session distribution routing.
 ///
 /// Version 8 adds authoritative combo configuration/state and enriched food
 /// events so clients can predict growth and render the same food value.
@@ -27,7 +31,7 @@ const PHASE_STOPPING: u8 = 3;
 /// fail to understand half the messages it receives. This must stay in lockstep
 /// with `GAMEPLAY_PROTOCOL_VERSION` in client/web/constants.ts; the bot and
 /// loadtest clients import this constant directly so they cannot drift at all.
-pub const WS_PROTOCOL_VERSION: u16 = 9;
+pub const WS_PROTOCOL_VERSION: u16 = 10;
 pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "explicit-auth-v1",
     "planned-drain-v1",

@@ -1,6 +1,8 @@
 //! Crash-authoritative, fenced partition executor.
 
-use crate::completion::{CompletionRecordV1, EffectApplyResult, materialize_completion};
+use crate::completion::{
+    CompletionEffect, CompletionRecordV1, EffectApplyResult, materialize_completion,
+};
 use crate::db::Database;
 use crate::game_bus::{CommandDelivery, CommandDeliveryPayload, GameBus, SnapshotRequest};
 use crate::game_executor::{PARTITION_COUNT, StreamEvent, authorize_game_command};
@@ -14,16 +16,17 @@ use anyhow::{Context, Result, bail};
 use common::{
     ClientCommandIdentityV2, CommandId, EXECUTOR_POLL_INTERVAL_MS, GAME_START_COUNTDOWN_MS,
     GameCommand, GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameStatus,
+    HighlightConfig, select_highlight,
 };
 use futures_util::FutureExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +47,28 @@ const TICK_HASH_INTERVAL: Duration = Duration::from_secs(1);
 // into an unbounded handoff obligation. Accepted deliveries are still ordered
 // and settled in per-game stream order by each game's FIFO mailbox.
 const DISPATCH_FANOUT_WINDOW: usize = 64;
+/// A highlight is optional presentation data carried through the fenced
+/// completion record. Keep it comfortably below DynamoDB's item limit before
+/// that immutable record is committed; an oversized play degrades to the
+/// banner path instead of poisoning completion retries.
+const MAX_COMPLETION_HIGHLIGHT_JSON_BYTES: usize = 128 * 1024;
+const POTG_SELECTION_TIMEOUT: Duration = Duration::from_millis(500);
+const POTG_SCORER_CONCURRENCY: usize = 2;
+pub const POTG_ENABLED_ENV: &str = "SNAKETRON_POTG_ENABLED";
+static POTG_SCORER_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(POTG_SCORER_CONCURRENCY)));
+
+fn potg_enabled() -> bool {
+    std::env::var(POTG_ENABLED_ENV)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
 
 /// Activation metrics intentionally describe only inactive-to-active requests.
 /// A manual stop is an independent command and must not inflate activation
@@ -63,6 +88,146 @@ fn is_retryable_checkpoint_error(error: &anyhow::Error) -> bool {
                 .downcast_ref::<tokio::time::error::Elapsed>()
                 .is_some()
     })
+}
+
+/// Highlight selection is optional presentation work. A malformed archive,
+/// explicit CPU budget rejection, or scorer panic must never poison the
+/// completion record that carries XP, ranking, and the final game snapshot.
+fn select_completion_highlight_sync(
+    recording: &common::GameRecordingV1,
+) -> Option<common::HighlightClip> {
+    if !potg_enabled() {
+        info!(
+            game_id = recording.game_id,
+            config = POTG_ENABLED_ENV,
+            "Play-of-the-Game disabled by server configuration"
+        );
+        return None;
+    }
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        select_highlight(recording, &HighlightConfig::default())
+    })) {
+        Ok(Ok(highlight)) => {
+            let highlight = highlight.and_then(|clip| match serde_json::to_vec(&clip) {
+                Ok(bytes) if bytes.len() <= MAX_COMPLETION_HIGHLIGHT_JSON_BYTES => {
+                    if let Err(error) = clip.replay_and_verify() {
+                        warn!(
+                            game_id = recording.game_id,
+                            %error,
+                            "Play-of-the-Game clip verification degraded to unavailable"
+                        );
+                        None
+                    } else {
+                        Some(clip)
+                    }
+                }
+                Ok(bytes) => {
+                    warn!(
+                        game_id = recording.game_id,
+                        highlight_bytes = bytes.len(),
+                        max_highlight_bytes = MAX_COMPLETION_HIGHLIGHT_JSON_BYTES,
+                        "Play-of-the-Game exceeded its completion payload budget"
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        game_id = recording.game_id,
+                        %error,
+                        "Play-of-the-Game could not be serialized"
+                    );
+                    None
+                }
+            });
+            if let Some(clip) = &highlight {
+                info!(
+                    game_id = recording.game_id,
+                    score = clip.score,
+                    reason = ?clip.reason,
+                    "Play-of-the-Game selected"
+                );
+            }
+            highlight
+        }
+        Ok(Err(error)) => {
+            warn!(
+                game_id = recording.game_id,
+                %error,
+                "Play-of-the-Game selection degraded to unavailable"
+            );
+            None
+        }
+        Err(_) => {
+            error!(
+                game_id = recording.game_id,
+                "Play-of-the-Game scorer panicked; completion remains available"
+            );
+            None
+        }
+    }
+}
+
+/// Keep optional editorial work off the partition actor and behind a strict
+/// wall-clock/concurrency budget. `spawn_blocking` jobs cannot be force-killed,
+/// so the owned semaphore permit remains with an overrun until it actually
+/// exits; at most two pathological scorers can consume background CPU.
+async fn select_completion_highlight_with_budget<F>(
+    recording: common::GameRecordingV1,
+    slots: Arc<Semaphore>,
+    budget: Duration,
+    score: F,
+) -> Option<common::HighlightClip>
+where
+    F: FnOnce(&common::GameRecordingV1) -> Option<common::HighlightClip> + Send + 'static,
+{
+    let game_id = recording.game_id;
+    let deadline = Instant::now() + budget;
+    let permit = match tokio::time::timeout_at(deadline, slots.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            error!(game_id, "Play-of-the-Game scorer gate closed");
+            return None;
+        }
+        Err(_) => {
+            warn!(
+                game_id,
+                timeout_ms = budget.as_millis(),
+                "Play-of-the-Game scorer capacity timed out"
+            );
+            return None;
+        }
+    };
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        score(&recording)
+    });
+    match tokio::time::timeout_at(deadline, worker).await {
+        Ok(Ok(highlight)) => highlight,
+        Ok(Err(error)) => {
+            error!(game_id, %error, "Play-of-the-Game scorer task failed");
+            None
+        }
+        Err(_) => {
+            warn!(
+                game_id,
+                timeout_ms = budget.as_millis(),
+                "Play-of-the-Game scorer exceeded its wall-clock budget"
+            );
+            None
+        }
+    }
+}
+
+async fn select_completion_highlight(
+    recording: common::GameRecordingV1,
+) -> Option<common::HighlightClip> {
+    select_completion_highlight_with_budget(
+        recording,
+        Arc::clone(&POTG_SCORER_SLOTS),
+        POTG_SELECTION_TIMEOUT,
+        select_completion_highlight_sync,
+    )
+    .await
 }
 
 fn persisted_checkpoint_age(
@@ -557,6 +722,7 @@ struct GameActor {
     resolved: ResolvedCommandState,
     command_cursor: String,
     next_event_stream_sequence: u64,
+    replay_recording: crate::recovery::ReplayRecordingState,
     planned_handoff_event_stream_watermark: Option<u64>,
     pending_stream_ids: Vec<String>,
     snapshot_requested: bool,
@@ -694,10 +860,15 @@ impl GameActor {
         );
         let now = Instant::now();
         let last_checkpoint_success = now.checked_sub(persisted_checkpoint_age).unwrap_or(now);
+        let mut replay_recording = envelope.replay_recording;
         let mut game_state = envelope.game_state;
         let start_event_pending = matches!(game_state.status, GameStatus::Stopped);
         if start_event_pending {
             game_state.status = GameStatus::Started { server_id };
+        }
+        replay_recording.enable_from_checkpoint_if_needed(&game_state);
+        if start_event_pending {
+            replay_recording.replace_pristine_activation(&game_state);
         }
         Self {
             server_id,
@@ -710,6 +881,7 @@ impl GameActor {
             resolved: envelope.resolved_client_commands,
             command_cursor: envelope.command_cursor,
             next_event_stream_sequence: envelope.next_event_stream_sequence,
+            replay_recording,
             planned_handoff_event_stream_watermark: envelope.planned_handoff_event_stream_watermark,
             pending_stream_ids: Vec::new(),
             snapshot_requested: false,
@@ -1100,6 +1272,7 @@ impl GameActor {
             let submitted_at_ms = i64::try_from(submitted_at_ms)
                 .context("command stream timestamp exceeds signed milliseconds")?;
             let catch_up_events = self.engine.run_until(submitted_at_ms)?;
+            self.replay_recording.record_events(&catch_up_events)?;
             self.retain_combo_metrics_from_events(&catch_up_events);
             if self.engine.get_committed_state().is_complete() {
                 // Catch-up can discover terminal state only after the outer
@@ -1230,6 +1403,8 @@ impl GameActor {
                 decision.next_server_command_sequence
             );
         }
+        self.replay_recording
+            .record_event(decision.event.tick, decision.event.event.clone())?;
         self.next_event_stream_sequence = decision.event.stream_seq;
         Ok(V2Incorporation::Incorporated)
     }
@@ -1284,6 +1459,8 @@ impl GameActor {
         self.bus
             .publish_command_decision_fenced(&self.guard, &decision)
             .await?;
+        self.replay_recording
+            .record_event(decision.event.tick, decision.event.event.clone())?;
         self.next_event_stream_sequence = stream_seq;
         Ok(())
     }
@@ -1367,7 +1544,7 @@ impl GameActor {
     }
 
     fn envelope(&self) -> RecoveryEnvelopeV2 {
-        RecoveryEnvelopeV2::new(
+        let mut envelope = RecoveryEnvelopeV2::new(
             self.game_id,
             self.guard.partition(),
             self.engine.get_committed_state().clone(),
@@ -1377,7 +1554,9 @@ impl GameActor {
             self.next_event_stream_sequence,
             chrono::Utc::now().timestamp_millis(),
             self.guard.encoded_token(),
-        )
+        );
+        envelope.replay_recording = self.replay_recording.checkpoint_view();
+        envelope
     }
 
     fn terminal_pending(&self) -> bool {
@@ -1394,6 +1573,10 @@ impl GameActor {
         let mut retry_delay = Duration::from_millis(25);
         loop {
             let covered = self.pending_stream_ids.clone();
+            let checkpoint = (!terminal_pending).then(|| self.envelope());
+            let checkpoint_journal_cursor = checkpoint
+                .as_ref()
+                .map(|envelope| envelope.replay_recording.journal_cursor());
             let result = if terminal_pending {
                 self.bus
                     .refresh_recovery_ttl_fenced(&self.guard, self.game_id, self.config.retention)
@@ -1403,7 +1586,9 @@ impl GameActor {
                 self.bus
                     .checkpoint_and_ack_fenced(
                         &self.guard,
-                        &self.envelope(),
+                        checkpoint
+                            .as_ref()
+                            .expect("non-terminal checkpoint envelope exists"),
                         &covered,
                         self.config.retention,
                     )
@@ -1414,6 +1599,10 @@ impl GameActor {
                     if !terminal_pending {
                         crate::resilience_metrics::record_checkpoint_writes(1);
                         self.pending_stream_ids.clear();
+                        self.replay_recording.mark_journal_persisted(
+                            checkpoint_journal_cursor
+                                .expect("non-terminal checkpoint cursor exists"),
+                        )?;
                     }
                     self.last_checkpoint_success = Instant::now();
                     return Ok(());
@@ -1533,6 +1722,7 @@ impl GameActor {
         // consumers after the recovery checkpoint is durable.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let catch_up_events = self.engine.run_until(now_ms)?;
+        self.replay_recording.record_events(&catch_up_events)?;
         self.retain_combo_metrics_from_events(&catch_up_events);
         // Durable decisions have now replayed in stream order. Merge the
         // incumbent's planned-handoff publication watermark only after that
@@ -1551,6 +1741,8 @@ impl GameActor {
             self.commit_completion_until_handoff().await?;
             return Ok(());
         }
+        self.replay_recording
+            .maybe_anchor(self.engine.get_committed_state())?;
         self.checkpoint().await?;
         // Catch-up deltas are intentionally collapsed into the checkpoint and
         // fresh snapshot rather than republished individually. The successful
@@ -1599,6 +1791,8 @@ impl GameActor {
     /// this actor behind its own stream.
     async fn record_readiness_transition(&mut self, event: GameEvent) -> Result<()> {
         self.engine.apply_pre_match_readiness_event(event.clone())?;
+        self.replay_recording
+            .record_event(self.engine.get_committed_state().tick, event.clone())?;
         self.publish_event(event).await
     }
 
@@ -1650,6 +1844,8 @@ impl GameActor {
             simulation_epoch_ms: now_ms + GAME_START_COUNTDOWN_MS,
         };
         self.engine.apply_pre_match_readiness_event(event.clone())?;
+        self.replay_recording
+            .record_event(self.engine.get_committed_state().tick, event.clone())?;
         // Persist the resolved epoch before making it visible. `checkpoint`
         // owns the bounded retry loop, so a transient write failure keeps this
         // event unpublished until the same epoch is durable. If authority is
@@ -1698,6 +1894,7 @@ impl GameActor {
             .run_until_observing_boost(now_ms, &mut |transition| {
                 boost_transitions.push(transition);
             })?;
+        self.replay_recording.record_events(&events)?;
         let advance_duration = advance_started.elapsed();
         let advanced_state = self.engine.get_committed_state();
         let batch_quanta = advanced_state.tick.saturating_sub(before_tick);
@@ -1735,6 +1932,8 @@ impl GameActor {
             self.commit_completion_until_handoff().await?;
             return Ok(());
         }
+        self.replay_recording
+            .maybe_anchor(self.engine.get_committed_state())?;
         // A continuing game exposes an idle removal outside the terminal
         // completion transaction. Persist that state before its event or any
         // global slot deletion becomes visible. Existing recovered removals
@@ -1763,7 +1962,7 @@ impl GameActor {
                 final_state.clone(),
                 chrono::Utc::now().timestamp_millis(),
             );
-            let Some(record) = materialize_completion_game_local(
+            let Some(mut record) = materialize_completion_game_local(
                 self.game_id,
                 &mut self.completion_materialization_retry_at,
                 attempt,
@@ -1772,6 +1971,45 @@ impl GameActor {
             else {
                 return Ok(());
             };
+            // Keep completion on the partition hot path bounded: the actor
+            // commits only the fenced journal cursor/sequence and terminal
+            // sync boundary. PersistGame hydrates, verifies, and serializes
+            // the complete archive after player progression effects.
+            record.recording_journal = self
+                .replay_recording
+                .journal_reference(self.game_id, &final_state)?;
+            if self.replay_recording.potg_ring_truncated() {
+                let evicted_seconds = self
+                    .replay_recording
+                    .potg_ring_evicted_seconds(final_state.properties.tick_duration_ms);
+                crate::resilience_metrics::record_potg_ring_truncated(evicted_seconds);
+                warn!(
+                    game_id = self.game_id,
+                    ring_evicted_seconds = evicted_seconds,
+                    retained_bytes = self.replay_recording.potg_selection_ring_bytes(),
+                    "Play-of-the-Game selection ring was truncated"
+                );
+            }
+            record.play_of_the_game = match self
+                .replay_recording
+                .finish_potg_selection(self.game_id, &final_state)
+            {
+                Ok(Some(selection_recording)) => {
+                    select_completion_highlight(selection_recording).await
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    warn!(
+                        game_id = self.game_id,
+                        %error,
+                        "Play-of-the-Game ring could not be replayed; completion remains available"
+                    );
+                    None
+                }
+            };
+            // The budgeted scorer structurally validates its bounded ring and
+            // verifies the selected clip before returning it. Do not replay
+            // either artifact again on the partition actor.
             record.validate()?;
             self.pending_completion = Some(record);
         }
@@ -3221,9 +3459,46 @@ async fn drain_pending_completions(
         let record = bus
             .load_pending_completion(guard.namespace(), guard.partition(), game_id)
             .await?;
+        let effects_done = bus
+            .load_completion_effects_done(guard.namespace(), guard.partition(), game_id)
+            .await?;
+        let pending_replay_persist = record.recording_journal.is_some()
+            && record.effects.iter().any(|effect| {
+                matches!(effect, CompletionEffect::PersistGame { id } if !effects_done.contains(id))
+            });
+        if pending_replay_persist {
+            // Keep the archive alive across a long progression/database
+            // outage, but never let a replay-journal fault hold earned
+            // XP/MMR/ranking effects hostage. PersistGame performs its own
+            // authoritative fenced load+TTL refresh before touching S3.
+            if let Err(error) = bus
+                .refresh_completion_replay_journal_ttl_fenced(guard, game_id, cleanup_grace)
+                .await
+            {
+                warn!(
+                    game_id,
+                    %error,
+                    "Could not refresh pending replay journal; progression remains eligible"
+                );
+            }
+        }
         bus.cleanup_matchmaking_for_completion(&record).await?;
         for effect in &record.effects {
-            if db.apply_completion_effect(&record, effect).await?
+            if effects_done.contains(effect.id()) {
+                continue;
+            }
+            let materialized = if record.recording_journal.is_some()
+                && matches!(effect, CompletionEffect::PersistGame { .. })
+            {
+                Some(
+                    bus.materialize_completion_replay_journal(guard, &record, cleanup_grace)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let effect_record = materialized.as_ref().unwrap_or(&record);
+            if db.apply_completion_effect(effect_record, effect).await?
                 == EffectApplyResult::AlreadyApplied
             {
                 crate::resilience_metrics::record_duplicate_completion_effect_prevented(1);
@@ -3248,7 +3523,10 @@ mod tests {
     use crate::redis_keys::RedisKeys;
     use crate::redis_utils::RedisConnection;
     use crate::replication::{GameEventRouter, SubscriptionUpdate};
-    use common::{CommandId, Direction, GameCommand, GameState, GameType, Position, QueueMode};
+    use common::{
+        CommandId, Direction, GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameCommand,
+        GameRecordingV1, GameState, GameType, Position, QueueMode, ReplayVisibility,
+    };
     use redis::AsyncCommands;
 
     #[test]
@@ -3261,6 +3539,85 @@ mod tests {
             boost_activation_snake_id(&GameCommand::DeactivateBoost { snake_id: 7 }),
             None
         );
+    }
+
+    #[test]
+    fn malformed_highlight_input_never_fails_completion_work() {
+        let recording = GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id: 44,
+            visibility: ReplayVisibility::Public,
+            anchors: Vec::new(),
+            messages: Vec::new(),
+            end_tick: 0,
+            end_sync_hash: 0,
+        };
+        assert!(select_completion_highlight_sync(&recording).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn potg_saturation_uses_one_absolute_deadline_for_permit_and_worker() {
+        let recording = GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id: 45,
+            visibility: ReplayVisibility::Public,
+            anchors: Vec::new(),
+            messages: Vec::new(),
+            end_tick: 0,
+            end_sync_hash: 0,
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&slots)
+            .acquire_owned()
+            .await
+            .expect("test scorer gate remains open");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(held);
+        });
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+        let worker_finished = Arc::clone(&finished);
+        let began = Instant::now();
+        let selected = select_completion_highlight_with_budget(
+            recording,
+            slots,
+            Duration::from_millis(300),
+            move |_| {
+                worker_started.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(300));
+                worker_finished.store(true, Ordering::Release);
+                None
+            },
+        )
+        .await;
+        let elapsed = began.elapsed();
+
+        assert!(selected.is_none());
+        assert!(
+            started.load(Ordering::Acquire),
+            "worker should consume the remainder of the shared deadline"
+        );
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "a second full worker timeout would exceed the absolute budget"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "permit wait and worker took {elapsed:?}, exceeding one budget plus scheduler slack"
+        );
+
+        release.await.expect("permit release task succeeds");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !finished.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached blocking scorer should eventually release its permit");
     }
 
     #[test]
@@ -3284,7 +3641,10 @@ mod tests {
             })
         );
         assert_eq!(
-            PendingComboMetric::from_event(&GameEvent::SnakeDied { snake_id: 4 }),
+            PendingComboMetric::from_event(&GameEvent::SnakeDied {
+                snake_id: 4,
+                cause: common::DeathCause::Unknown,
+            }),
             None
         );
     }
@@ -5198,6 +5558,7 @@ mod tests {
                     self.namespace.partition_assignment(self.partition),
                     live_guard.lease_key(),
                     self.namespace.recovery(self.game_id),
+                    self.namespace.replay_journal(self.game_id),
                     self.namespace.planned_handoff_watermark(self.game_id),
                     self.namespace.recovery_failure(self.game_id),
                     self.namespace.active_games(self.partition),
@@ -5263,6 +5624,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_journal_checkpoint_retry_is_idempotent_and_ttl_bounded() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("replay-journal-retry").await?;
+            let mut envelope = harness.recovery().await?;
+            let state = envelope.game_state.clone();
+            let mut recorder = crate::recovery::ReplayRecordingState::new(&state);
+            recorder.record_event(
+                state.tick,
+                GameEvent::StatusUpdated {
+                    status: state.status.clone(),
+                },
+            )?;
+            envelope.replay_recording = recorder.checkpoint_view();
+
+            for _ in 0..2 {
+                harness
+                    .bus
+                    .checkpoint_and_ack_fenced(
+                        &harness.guard,
+                        &envelope,
+                        &[],
+                        Duration::from_secs(60),
+                    )
+                    .await?;
+            }
+            let journal_key = harness.namespace.replay_journal(harness.game_id);
+            assert_eq!(harness.raw.hlen::<_, usize>(&journal_key).await?, 2);
+            let ttl_ms: i64 = harness.raw.pttl(&journal_key).await?;
+            assert!(ttl_ms > 0 && ttl_ms <= 60_000);
+
+            let recovered = harness.recovery().await?;
+            let recording = recovered
+                .replay_recording
+                .finish(harness.game_id, &recovered.game_state)?
+                .context("recovered production replay is enabled")?;
+            assert_eq!(recording.anchors.len(), 1);
+            assert_eq!(recording.messages.len(), 1);
+            recording.verify_end_hash()?;
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn takeover_trims_valid_replay_journal_cells_ahead_of_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("replay-journal-ahead").await?;
+            let checkpoint = harness.recovery().await?;
+            assert_eq!(checkpoint.replay_recording.journal_cursor(), 0);
+            let recorder = crate::recovery::ReplayRecordingState::new(&checkpoint.game_state);
+            let ahead = recorder
+                .pending_journal()
+                .first()
+                .context("activation anchor delta")?;
+            let journal_key = harness.namespace.replay_journal(harness.game_id);
+            let _: usize = harness
+                .raw
+                .hset(
+                    &journal_key,
+                    ahead.cursor().to_string(),
+                    crate::completion::canonical_json_bytes(ahead)?,
+                )
+                .await?;
+
+            let recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&harness.guard, Duration::from_secs(60))
+                .await?;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].replay_recording.journal_cursor(), 0);
+            assert_eq!(harness.raw.hlen::<_, usize>(&journal_key).await?, 0);
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn takeover_rejects_replay_journal_behind_checkpoint() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("replay-journal-behind").await?;
+            let mut envelope = harness.recovery().await?;
+            let recorder = crate::recovery::ReplayRecordingState::new(&envelope.game_state);
+            envelope.replay_recording = recorder.checkpoint_view();
+            harness
+                .bus
+                .checkpoint_and_ack_fenced(&harness.guard, &envelope, &[], Duration::from_secs(60))
+                .await?;
+
+            let journal_key = harness.namespace.replay_journal(harness.game_id);
+            assert_eq!(harness.raw.hdel::<_, _, usize>(&journal_key, "1").await?, 1);
+            let recovered = harness
+                .bus
+                .load_partition_recovery_fenced(&harness.guard, Duration::from_secs(60))
+                .await?;
+            assert!(recovered.is_empty());
+            assert!(
+                !harness
+                    .raw
+                    .sismember::<_, _, bool>(
+                        harness.namespace.active_games(harness.partition),
+                        harness.game_id,
+                    )
+                    .await?
+            );
+            let failure = harness
+                .bus
+                .get_recovery_failure(&harness.namespace, harness.game_id)
+                .await?
+                .context("missing replay history must leave a terminal failure marker")?;
+            assert!(failure.diagnostic.contains("behind checkpoint cursor 1"));
+            assert!(!harness.raw.exists::<_, bool>(&journal_key).await?);
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_persist_game_refreshes_then_atomically_retires_replay_journal() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut harness = CrashBoundaryHarness::new("completion-replay-journal").await?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut started = GameState::new(
+                20,
+                20,
+                GameType::FreeForAll { max_players: 4 },
+                QueueMode::Quickmatch,
+                Some(7),
+                now - 1_000,
+            );
+            started.status = GameStatus::Started { server_id: 1 };
+            let mut recorder = crate::recovery::ReplayRecordingState::new(&started);
+            let mut final_state = started.clone();
+            final_state.status = GameStatus::Complete {
+                winning_snake_id: None,
+            };
+            recorder.record_event(
+                final_state.tick,
+                GameEvent::StatusUpdated {
+                    status: final_state.status.clone(),
+                },
+            )?;
+            let recording = recorder
+                .finish(harness.game_id, &final_state)?
+                .context("production replay recorder is enabled")?;
+            let recording_bytes = crate::completion::canonical_json_bytes(&recording)?;
+            let recording_journal = recorder
+                .journal_reference(harness.game_id, &final_state)?
+                .context("enabled recorder creates a journal reference")?;
+            assert_eq!(recording_journal.end_tick, Some(final_state.tick));
+            assert_eq!(
+                recording_journal.end_sync_hash,
+                Some(final_state.sync_hash())
+            );
+            assert!(recording_journal.recording_sha256.is_none());
+            assert!(recording_journal.recording_bytes.is_none());
+
+            let mut envelope = RecoveryEnvelopeV2::new(
+                harness.game_id,
+                harness.partition,
+                final_state.clone(),
+                "0-0".into(),
+                ResolvedCommandState::default(),
+                0,
+                7,
+                now,
+                harness.guard.encoded_token(),
+            );
+            envelope.replay_recording = recorder.checkpoint_view();
+            let record = CompletionRecordV1 {
+                schema_version: crate::completion::COMPLETION_SCHEMA_VERSION,
+                game_id: harness.game_id,
+                partition_id: harness.partition,
+                revision: uuid::Uuid::new_v4(),
+                ended_at_ms: now,
+                server_id: 1,
+                season: None,
+                recording: None,
+                recording_canonical_bytes: None,
+                recording_journal: Some(recording_journal),
+                play_of_the_game: None,
+                final_state,
+                effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+            };
+            record.validate()?;
+            assert!(
+                harness
+                    .bus
+                    .commit_completion_record_fenced(
+                        &harness.guard,
+                        &envelope,
+                        &[],
+                        &record,
+                        Duration::from_secs(60),
+                    )
+                    .await?
+            );
+
+            let journal_key = harness.namespace.replay_journal(harness.game_id);
+            assert!(harness.raw.exists::<_, bool>(&journal_key).await?);
+            let _: bool = harness.raw.pexpire(&journal_key, 1_000).await?;
+            let materialized = harness
+                .bus
+                .materialize_completion_replay_journal(
+                    &harness.guard,
+                    &record,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            assert!(materialized.recording_journal.is_none());
+            assert_eq!(
+                crate::completion::canonical_json_bytes(
+                    materialized
+                        .recording
+                        .as_ref()
+                        .context("PersistGame materializes the full recording")?,
+                )?,
+                recording_bytes,
+            );
+            let refreshed_ttl_ms: i64 = harness.raw.pttl(&journal_key).await?;
+            assert!(refreshed_ttl_ms > 20_000 && refreshed_ttl_ms <= 30_000);
+
+            assert!(
+                harness
+                    .bus
+                    .mark_completion_effect_done_fenced(
+                        &harness.guard,
+                        &record,
+                        "game",
+                        Duration::from_secs(30),
+                    )
+                    .await?
+            );
+            assert!(!harness.raw.exists::<_, bool>(&journal_key).await?);
+            assert!(
+                harness
+                    .bus
+                    .load_completion_effects_done(
+                        &harness.namespace,
+                        harness.partition,
+                        harness.game_id,
+                    )
+                    .await?
+                    .contains("game")
+            );
+
+            // An ambiguous completion retry after the durable PersistGame
+            // marker must not recreate the mutable journal that marker owns.
+            assert!(
+                !harness
+                    .bus
+                    .commit_completion_record_fenced(
+                        &harness.guard,
+                        &envelope,
+                        &[],
+                        &record,
+                        Duration::from_secs(60),
+                    )
+                    .await?
+            );
+            assert!(!harness.raw.exists::<_, bool>(&journal_key).await?);
+
+            let guard = harness.guard.clone();
+            harness.cleanup(&guard).await?;
+            Result::<()>::Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn catch_up_publishes_distinct_quantum_events_with_consistent_snapshot_tick() -> Result<()>
     {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -5307,6 +5950,7 @@ mod tests {
             state.arena.snakes[3].body = vec![Position { x: 40, y: 30 }, Position { x: 37, y: 30 }];
             state.arena.snakes[3].direction = Direction::Right;
             state.validate_boost_invariants()?;
+            envelope.replay_recording = crate::recovery::ReplayRecordingState::new(&state);
             envelope.game_state = state;
             let mut actor = harness.actor(envelope, harness.guard.clone());
 
@@ -5344,12 +5988,36 @@ mod tests {
                         } if *pad_id == packet.id
                     )
             }));
+
+            let recording = actor
+                .replay_recording
+                .finish(harness.game_id, actor.engine.get_committed_state())?
+                .context("production actor did not retain its replay feed")?;
+            recording.verify_end_hash()?;
+            assert!(recording.messages.iter().any(|message| {
+                matches!(
+                    &message.event,
+                    GameEvent::SnakeDied {
+                        snake_id: 0,
+                        cause: common::DeathCause::Banked,
+                    }
+                )
+            }));
+            assert!(recording.messages.iter().any(|message| {
+                matches!(
+                    &message.event,
+                    GameEvent::SnakeDied {
+                        snake_id: 2,
+                        cause: common::DeathCause::OutOfBounds,
+                    }
+                )
+            }));
             for snake_id in [0, 2] {
                 assert!(published.iter().any(|message| {
                     message.tick == 2
                         && matches!(
                             &message.event,
-                            GameEvent::SnakeDied { snake_id: observed } if *observed == snake_id
+                            GameEvent::SnakeDied { snake_id: observed, .. } if *observed == snake_id
                         )
                 }));
                 assert!(published.iter().any(|message| {
@@ -6298,6 +6966,7 @@ mod tests {
             // mode's food target is a validated gameplay invariant, so zeroing
             // it would make recovery reject the checkpoint outright.
             state.rng = None;
+            checkpoint.replay_recording = crate::recovery::ReplayRecordingState::new(&state);
             checkpoint.game_state = state;
             checkpoint.checkpointed_at_ms = start_ms;
 
@@ -6368,6 +7037,21 @@ mod tests {
                 "a live resend must not renew activity"
             );
             assert_eq!(original.engine.next_server_command_sequence(), 1);
+            let original_recording = original
+                .replay_recording
+                .finish(harness.game_id, original.engine.get_committed_state())?
+                .context("live actor did not retain command decisions")?;
+            assert_eq!(
+                original_recording
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(&message.event, GameEvent::CommandScheduledV2 { .. })
+                    })
+                    .count(),
+                2,
+                "the original decision and its durable deduplicated replay are both recorded"
+            );
 
             let mut decisions = harness
                 .bus
@@ -8934,6 +9618,59 @@ mod tests {
         .await;
         assert!(record.is_none());
         assert!(retry_polled);
+    }
+
+    #[tokio::test]
+    async fn progression_effects_precede_journal_hydration_persist_game() -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut state = GameState::new(
+            40,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Competitive,
+            Some(7),
+            now - 1_000,
+        );
+        let first = state.add_player(101, Some("first".into()))?;
+        state.add_player(202, Some("second".into()))?;
+        state.player_xp.insert(101, 25);
+        state.player_xp.insert(202, 10);
+        state.status = GameStatus::Complete {
+            winning_snake_id: Some(first.snake_id),
+        };
+
+        let db = UnusedDatabase::fail_mmr_reads(0);
+        let record = materialize_completion(&db, 17, 7, 1, state, now).await?;
+        let persist_index = record
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, CompletionEffect::PersistGame { .. }))
+            .context("completion has PersistGame")?;
+        assert!(persist_index > 0);
+        assert!(record.effects[..persist_index].iter().all(|effect| {
+            matches!(
+                effect,
+                CompletionEffect::AddXp { .. }
+                    | CompletionEffect::AddMmr { .. }
+                    | CompletionEffect::UpdateRanking { .. }
+            )
+        }));
+        assert!(
+            record.effects[..persist_index]
+                .iter()
+                .any(|effect| matches!(effect, CompletionEffect::AddXp { .. }))
+        );
+        assert!(
+            record.effects[..persist_index]
+                .iter()
+                .any(|effect| matches!(effect, CompletionEffect::AddMmr { .. }))
+        );
+        assert!(
+            record.effects[..persist_index]
+                .iter()
+                .any(|effect| matches!(effect, CompletionEffect::UpdateRanking { .. }))
+        );
+        Ok(())
     }
 
     #[tokio::test]

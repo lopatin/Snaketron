@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scenario_id": "logo-intro",
+  "fixture_id": "logo-intro",
+  "source_kind": "fixture-card",
+  "source_file": "http://127.0.0.1:3000/qa/trailer-card?card=logo-intro&ms=2600",
+  "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_params": {},
+  "capture_vfps": 60,
+  "encoded_fps": 60,
+  "width": 1920,
+  "height": 1080,
+  "duration": 2.6,
+  "duration_ms": 2600,
+  "frame_count": 156,
+  "capture_path": "contract-screenshot",
+  "deterministic_scope": "same-machine-software-raster",
+  "rendered_tick": 2600,
+  "anchors": {
+    "logo": 0.45
+  },
+  "cue_track": {
+    "anchors": {
+      "logo": 0.45
+    },
+    "duration": 2.6,
+    "capture_vfps": 60,
+    "encoded_fps": 60
+  },
+  "cue_timeline": [
+    {
+      "type": "logo",
+      "at_master_seconds": 0.45
+    }
+  ],
+  "master_sha256": "5bdb4474262b2f79d3b588800a652cc9954aa0ca0ff07d6d61090c338cb5af78",
+  "master_file": "master.mkv"
+}

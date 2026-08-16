@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { GameState } from '../../types/index.ts';
 import {
+  buildDeathAttribution,
   buildMatchPresentation,
   calculatePerMinuteRate,
   formatMatchClock,
@@ -109,6 +110,53 @@ test('team presentation puts the local side first and hands the renderer real sk
       { snake_index: 3, team_id: 1, team_member_slot: 1, ...base },
     ],
   );
+});
+
+test('team standings retain the latest demolition and resolve teammate names deterministically', () => {
+  const state = duelState();
+  state.last_death_causes = {
+    // The local player ran into teammate Wing.
+    0: { SnakeBody: { killer_snake_id: 2 } },
+    // Rival ran into the local player.
+    1: { HeadToHead: { other_snake_id: 0 } },
+    2: 'Wall',
+    // Banking is a life-ending transition, but never presented as a death.
+    3: 'Banked',
+  };
+
+  const presentation = buildMatchPresentation(state, 7);
+
+  assert.deepEqual(
+    presentation.players.map((player) => player.deathAttribution),
+    [
+      'Demolished by Wing',
+      'Demolished by You',
+      'Demolished by wall',
+      null,
+    ],
+  );
+});
+
+test('terminal modes surface every supported elimination label and hide absent history', () => {
+  const resolveSnakeName = (snakeId: number) => ['You', 'Rival'][snakeId] ?? `Player ${snakeId + 1}`;
+
+  assert.equal(
+    buildDeathAttribution({ SnakeBody: { killer_snake_id: 1 } }, false, resolveSnakeName),
+    'Eliminated by Rival',
+  );
+  assert.equal(
+    buildDeathAttribution({ HeadToHead: { other_snake_id: 0 } }, false, resolveSnakeName),
+    'Eliminated by You',
+  );
+  assert.equal(buildDeathAttribution('Wall', false, resolveSnakeName), 'Eliminated by wall');
+  assert.equal(buildDeathAttribution('OutOfBounds', false, resolveSnakeName), 'Eliminated by boundary');
+  assert.equal(buildDeathAttribution('EnemyBase', false, resolveSnakeName), 'Eliminated by enemy base');
+  assert.equal(buildDeathAttribution('SelfCollision', false, resolveSnakeName), 'Eliminated by yourself');
+  assert.equal(buildDeathAttribution('EnemyBase', true, resolveSnakeName), 'Demolished by enemy base');
+  assert.equal(buildDeathAttribution('SelfCollision', true, resolveSnakeName), 'Demolished by yourself');
+  assert.equal(buildDeathAttribution('Banked', false, resolveSnakeName), null);
+  assert.equal(buildDeathAttribution('Unknown', false, resolveSnakeName), null);
+  assert.equal(buildDeathAttribution(undefined, false, resolveSnakeName), null);
 });
 
 test('a spectator reports no local snake so the renderer falls back to canonical team colours', () => {

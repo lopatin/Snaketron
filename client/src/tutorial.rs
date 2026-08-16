@@ -130,6 +130,7 @@ fn add_crash_cue(state: &mut GameState, snake_id: u32, crash_position: Position)
         tick: state.tick,
         snake_id,
         position: crash_position,
+        cause: common::DeathCause::Unknown,
     });
 }
 
@@ -752,6 +753,7 @@ fn render_scene(
     scratch: &web_sys::HtmlCanvasElement,
     target: &web_sys::HtmlCanvasElement,
     draw_celebration: &js_sys::Function,
+    draw_post_snakes: &js_sys::Function,
 ) -> Result<(), JsValue> {
     let target_width = target.width() as f64;
     let target_height = target.height() as f64;
@@ -796,6 +798,7 @@ fn render_scene(
             local_skin_ref: None,
         },
         draw_celebration,
+        draw_post_snakes,
     )?;
 
     let context = target
@@ -891,6 +894,7 @@ impl TutorialScenePlayer {
             &self.scratch,
             target,
             self.draw_celebration.as_ref().unchecked_ref(),
+            self.draw_celebration.as_ref().unchecked_ref(),
         )
     }
 
@@ -904,7 +908,35 @@ impl TutorialScenePlayer {
         draw_celebration: &js_sys::Function,
     ) -> Result<(), JsValue> {
         let scene = SCENES[self.scene_index].frame(elapsed_ms);
-        render_scene(&scene, elapsed_ms, &self.scratch, target, draw_celebration)
+        render_scene(
+            &scene,
+            elapsed_ms,
+            &self.scratch,
+            target,
+            draw_celebration,
+            self.draw_celebration.as_ref().unchecked_ref(),
+        )
+    }
+
+    /// Render both JavaScript-owned cosmetic layers on the full-arena scratch
+    /// frame before it is camera-cropped into the tutorial canvas.
+    #[wasm_bindgen(js_name = renderFrameWithEffects)]
+    pub fn render_frame_with_effects(
+        &self,
+        elapsed_ms: u32,
+        target: &web_sys::HtmlCanvasElement,
+        draw_celebration: &js_sys::Function,
+        draw_post_snakes: &js_sys::Function,
+    ) -> Result<(), JsValue> {
+        let scene = SCENES[self.scene_index].frame(elapsed_ms);
+        render_scene(
+            &scene,
+            elapsed_ms,
+            &self.scratch,
+            target,
+            draw_celebration,
+            draw_post_snakes,
+        )
     }
 }
 

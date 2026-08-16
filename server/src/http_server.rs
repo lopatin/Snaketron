@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
-    extract::{State, ws::WebSocketUpgrade},
-    http::{Request, StatusCode},
+    extract::{Path, State, ws::WebSocketUpgrade},
+    http::{HeaderMap, Request, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, options, post, put},
 };
+use common::{GAMEPLAY_REPLAY_VERSION, HIGHLIGHT_CLIP_FORMAT_VERSION, HighlightClip};
+use serde::Serialize;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -15,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ads::AdsConfig;
 use crate::api::admin;
@@ -25,15 +28,21 @@ use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::{AuthMiddlewareState, admin_middleware, auth_middleware};
 use crate::api::news::{self, NewsState};
-use crate::api::rate_limit::{rate_limit_layer, rate_limit_middleware};
+use crate::api::rate_limit::{
+    global_rate_limit_middleware, rate_limit_layer, rate_limit_middleware,
+};
 use crate::api::regions;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
+use crate::db::models::Game;
 use crate::game_bus::GameBus;
 use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::redis_keys::RedisKeys;
 use crate::region_cache::RegionCache;
+use crate::replay_cache::{ReplayCacheConfig, ValkeyReplayCache};
+use crate::replay_repository::{ReplayLoadSource, ReplayRepository};
+use crate::replay_store::{ReplayStoreConfig, S3ReplayStore};
 use crate::replication::GameEventRouter;
 use crate::user_cache::UserCache;
 use crate::ws_server::{JwtVerifier, handle_websocket};
@@ -43,6 +52,9 @@ use redis::AsyncCommands;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const ACTIVE_SERVER_METRIC_TTL_MS: u64 = 10_000;
+const REPLAY_ROUTE_REQUEST_BODY_LIMIT: usize = 1024;
+const MAX_REPLAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HIGHLIGHT_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// A dependency-free listener that serves liveness immediately and installs
 /// the full application router once Redis-dependent bootstrap has converged.
@@ -166,6 +178,9 @@ pub struct HttpServerState {
     pub lobby_manager: Arc<LobbyManager>,
     /// User cache for quick user lookups
     pub user_cache: UserCache,
+    /// Verified cache-aside access to durable completed-game recordings.
+    /// Absent only when replay object storage is intentionally not configured.
+    pub replay_repository: Option<Arc<ReplayRepository>>,
     /// Process lifecycle used for truthful readiness and planned drain.
     pub lifecycle: TaskLifecycle,
     /// Region-scoped authoritative recovery namespace.
@@ -199,6 +214,17 @@ pub async fn install_http_application(
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
+    let replay_repository = match ReplayStoreConfig::from_env()? {
+        Some(config) => {
+            let store = Arc::new(S3ReplayStore::new(config).await?);
+            let cache = Arc::new(ValkeyReplayCache::new(
+                redis.clone(),
+                ReplayCacheConfig::from_env()?,
+            )?);
+            Some(Arc::new(ReplayRepository::new(store, cache)))
+        }
+        None => None,
+    };
 
     // Create state for both API and WebSocket handlers
     let state = HttpServerState {
@@ -218,6 +244,7 @@ pub async fn install_http_application(
         region_cache,
         lobby_manager,
         user_cache,
+        replay_repository,
         lifecycle: lifecycle.clone(),
         cluster_namespace,
         ads_config,
@@ -256,6 +283,11 @@ pub async fn install_http_application(
     // Create rate limiter for username check endpoint
     let username_check_limiter = rate_limit_layer(1000, 60);
     let crazygames_exchange_limiter = rate_limit_layer(60, 60);
+    // Replay reads are public by product policy but can trigger object-store
+    // I/O, decompression, parsing, and deterministic hash verification. A
+    // process-global backstop cannot be evaded with spoofed proxy headers;
+    // cache-aside still makes ordinary repeat views cheap.
+    let replay_read_limiter = rate_limit_layer(600, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
@@ -312,6 +344,10 @@ pub async fn install_http_application(
     let leaderboard_state = LeaderboardState { db: db.clone() };
     let leaderboard_routes = Router::new()
         .route("/api/leaderboard", get(leaderboard::get_leaderboard))
+        .route(
+            "/api/leaderboard/users/:user_id",
+            get(leaderboard::get_user_ranking_by_id),
+        )
         .route("/api/seasons", get(leaderboard::list_seasons))
         .with_state(leaderboard_state.clone());
 
@@ -320,6 +356,13 @@ pub async fn install_http_application(
     let news_routes = Router::new()
         .route("/api/news", get(news::get_news))
         .with_state(NewsState::new(db.clone()));
+
+    // Replay and highlight reads are intentionally anonymous. At launch all
+    // runtime games, including custom games, are public; no username or lobby
+    // membership ACL is applied here.
+    let replay_routes = build_replay_routes(db.clone(), state.replay_repository.clone()).layer(
+        middleware::from_fn_with_state(replay_read_limiter, global_rate_limit_middleware),
+    );
 
     // Build protected leaderboard routes (requires authentication)
     let protected_leaderboard_routes = Router::new()
@@ -360,6 +403,7 @@ pub async fn install_http_application(
         .merge(region_routes)
         .merge(leaderboard_routes)
         .merge(news_routes)
+        .merge(replay_routes)
         .merge(protected_leaderboard_routes)
         .merge(debug_routes)
         .with_state(auth_state);
@@ -378,6 +422,365 @@ pub async fn install_http_application(
     deferred.install(app)?;
     info!("HTTP API and WebSocket routes installed");
     Ok(())
+}
+
+#[async_trait]
+trait ReplayGameReader: Send + Sync {
+    async fn get_game(&self, game_id: i32) -> Result<Option<Game>>;
+}
+
+struct DatabaseReplayGameReader {
+    db: Arc<dyn Database>,
+}
+
+#[async_trait]
+impl ReplayGameReader for DatabaseReplayGameReader {
+    async fn get_game(&self, game_id: i32) -> Result<Option<Game>> {
+        self.db.get_game_by_id(game_id).await
+    }
+}
+
+#[derive(Clone)]
+struct ReplayApiState {
+    games: Arc<dyn ReplayGameReader>,
+    repository: Option<Arc<ReplayRepository>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum HighlightApiResponse {
+    Pending,
+    Ready {
+        play_of_the_game: Box<HighlightClip>,
+    },
+    Unavailable,
+}
+
+#[derive(Serialize)]
+struct ReplayApiError {
+    error: &'static str,
+}
+
+fn build_replay_routes(
+    db: Arc<dyn Database>,
+    repository: Option<Arc<ReplayRepository>>,
+) -> Router<AuthState> {
+    let state = ReplayApiState {
+        games: Arc::new(DatabaseReplayGameReader { db }),
+        repository,
+    };
+    replay_route_template().with_state::<AuthState>(state)
+}
+
+fn replay_route_template() -> Router<ReplayApiState> {
+    Router::new()
+        .route("/api/games/:game_id/highlight", get(get_game_highlight))
+        .route("/api/games/:game_id/replay", get(get_game_replay))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            REPLAY_ROUTE_REQUEST_BODY_LIMIT,
+        ))
+}
+
+fn parse_public_game_id(raw: &str) -> Option<i32> {
+    if raw.is_empty() || raw.len() > 10 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<i32>().ok().filter(|game_id| *game_id > 0)
+}
+
+fn parse_replay_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = value.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, inclusive_end) = spec.split_once('-')?;
+    if start.is_empty() {
+        let suffix = inclusive_end.parse::<u64>().ok()?.min(total);
+        if suffix == 0 {
+            return None;
+        }
+        return Some((total - suffix, total));
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if inclusive_end.is_empty() {
+        total
+    } else {
+        inclusive_end
+            .parse::<u64>()
+            .ok()?
+            .checked_add(1)?
+            .min(total)
+    };
+    (start < end && end <= total).then_some((start, end))
+}
+
+fn json_api_error(status: StatusCode, error: &'static str) -> Response {
+    (status, Json(ReplayApiError { error })).into_response()
+}
+
+fn highlight_api_response(payload: HighlightApiResponse) -> Response {
+    let pending = matches!(payload, HighlightApiResponse::Pending);
+    let mut response = Json(payload).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(if pending {
+            "no-store"
+        } else {
+            "public, max-age=300"
+        }),
+    );
+    if pending {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    response
+}
+
+async fn get_game_highlight(
+    State(state): State<ReplayApiState>,
+    Path(raw_game_id): Path<String>,
+) -> Response {
+    let Some(game_id) = parse_public_game_id(&raw_game_id) else {
+        return json_api_error(StatusCode::BAD_REQUEST, "invalid game id");
+    };
+    let game = match state.games.get_game(game_id).await {
+        Ok(Some(game)) => game,
+        // The terminal snapshot is committed to Valkey before PersistGame
+        // creates the DynamoDB META row. A first post-match poll therefore
+        // commonly races this read. Keep a missing row pending; the bounded
+        // client poll will settle to unavailable if the game truly does not
+        // exist or persistence never completes.
+        Ok(None) => return highlight_api_response(HighlightApiResponse::Pending),
+        Err(error) => {
+            warn!(game_id, %error, "Failed to load game highlight metadata");
+            return json_api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "highlight metadata unavailable",
+            );
+        }
+    };
+    if game.status != "complete" {
+        return highlight_api_response(HighlightApiResponse::Pending);
+    }
+    let Some(clip) = game.play_of_the_game else {
+        return highlight_api_response(HighlightApiResponse::Unavailable);
+    };
+    let shape_is_compatible = clip.game_id == game_id as u32
+        && clip.clip_format_version == HIGHLIGHT_CLIP_FORMAT_VERSION
+        && clip.gameplay_version == GAMEPLAY_REPLAY_VERSION
+        && clip.anchor.tick <= clip.window.start_tick
+        && clip.window.start_tick <= clip.window.focus_tick
+        && clip.window.focus_tick <= clip.window.end_tick
+        && clip
+            .messages
+            .windows(2)
+            .all(|pair| (pair[0].tick, pair[0].sequence) < (pair[1].tick, pair[1].sequence))
+        && clip.messages.iter().all(|message| {
+            message.tick >= clip.anchor.tick && message.tick <= clip.window.end_tick
+        });
+    if !shape_is_compatible {
+        warn!(
+            game_id,
+            clip_game_id = clip.game_id,
+            "Rejecting incompatible highlight metadata"
+        );
+        return highlight_api_response(HighlightApiResponse::Unavailable);
+    }
+    // PersistGame only writes clips that were replay-verified before the
+    // immutable completion commit. Re-simulating on every anonymous GET would
+    // turn this public endpoint into CPU amplification; the browser performs
+    // the final end-hash assertion before it presents the clip.
+    let ready = HighlightApiResponse::Ready {
+        play_of_the_game: Box::new(clip),
+    };
+    match serde_json::to_vec(&ready) {
+        Ok(bytes) if bytes.len() <= MAX_HIGHLIGHT_RESPONSE_BYTES => highlight_api_response(ready),
+        Ok(bytes) => {
+            warn!(
+                game_id,
+                response_bytes = bytes.len(),
+                "Rejecting oversized highlight response"
+            );
+            highlight_api_response(HighlightApiResponse::Unavailable)
+        }
+        Err(error) => {
+            warn!(game_id, %error, "Failed to serialize highlight response");
+            highlight_api_response(HighlightApiResponse::Unavailable)
+        }
+    }
+}
+
+async fn get_game_replay(
+    State(state): State<ReplayApiState>,
+    Path(raw_game_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(game_id) = parse_public_game_id(&raw_game_id) else {
+        return json_api_error(StatusCode::BAD_REQUEST, "invalid game id");
+    };
+    let game = match state.games.get_game(game_id).await {
+        Ok(Some(game)) => game,
+        Ok(None) => return json_api_error(StatusCode::NOT_FOUND, "replay unavailable"),
+        Err(error) => {
+            warn!(game_id, %error, "Failed to load game replay metadata");
+            return json_api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay metadata unavailable",
+            );
+        }
+    };
+    if game.status != "complete" {
+        return json_api_error(StatusCode::NOT_FOUND, "replay unavailable");
+    }
+    let Some(metadata) = game.replay_object else {
+        return json_api_error(StatusCode::NOT_FOUND, "replay unavailable");
+    };
+    let Some(repository) = state.repository else {
+        warn!(
+            game_id,
+            "Replay metadata exists but replay storage is disabled"
+        );
+        return json_api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replay storage unavailable",
+        );
+    };
+    let total_bytes = match repository.recording_length(&metadata).await {
+        Ok(Some(total)) => total,
+        Ok(None) => return json_api_error(StatusCode::NOT_FOUND, "replay unavailable"),
+        Err(error) => {
+            warn!(game_id, %error, "Failed to load verified replay length");
+            return json_api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay storage unavailable",
+            );
+        }
+    };
+
+    if let Some(range_header) = headers.get(header::RANGE) {
+        let Some((start, end)) = range_header
+            .to_str()
+            .ok()
+            .and_then(|value| parse_replay_byte_range(value, total_bytes))
+        else {
+            return json_api_error(StatusCode::RANGE_NOT_SATISFIABLE, "invalid replay range");
+        };
+        if end - start > MAX_REPLAY_RESPONSE_BYTES as u64 {
+            return json_api_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "replay range exceeds response limit",
+            );
+        }
+        let loaded = match repository.get_recording_range(&metadata, start, end).await {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => return json_api_error(StatusCode::NOT_FOUND, "replay unavailable"),
+            Err(error) => {
+                warn!(game_id, %error, "Verified replay range lookup failed");
+                return json_api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "replay storage unavailable",
+                );
+            }
+        };
+        let source = match loaded.source {
+            ReplayLoadSource::Cache => "cache",
+            ReplayLoadSource::ObjectStore => "object_store",
+        };
+        let mut response = Response::new(Body::from(loaded.bytes));
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/octet-stream"),
+        );
+        response.headers_mut().insert(
+            header::ACCEPT_RANGES,
+            axum::http::HeaderValue::from_static("bytes"),
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+            "bytes {}-{}/{}",
+            loaded.start,
+            loaded.end - 1,
+            loaded.total_bytes
+        )) {
+            response.headers_mut().insert(header::CONTENT_RANGE, value);
+        }
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-snaketron-replay-source"),
+            axum::http::HeaderValue::from_static(source),
+        );
+        return response;
+    }
+
+    if total_bytes > MAX_REPLAY_RESPONSE_BYTES as u64 {
+        warn!(
+            game_id,
+            response_bytes = total_bytes,
+            "Replay requires a bounded byte-range request"
+        );
+        let mut response = json_api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "replay requires a byte range",
+        );
+        response.headers_mut().insert(
+            header::ACCEPT_RANGES,
+            axum::http::HeaderValue::from_static("bytes"),
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("bytes */{total_bytes}")) {
+            response.headers_mut().insert(header::CONTENT_RANGE, value);
+        }
+        return response;
+    }
+    let loaded = match repository.get_recording(&metadata).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return json_api_error(StatusCode::NOT_FOUND, "replay unavailable"),
+        Err(error) => {
+            warn!(game_id, %error, "Verified replay lookup failed");
+            return json_api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay storage unavailable",
+            );
+        }
+    };
+    if loaded.recording.bytes.len() > MAX_REPLAY_RESPONSE_BYTES {
+        warn!(
+            game_id,
+            response_bytes = loaded.recording.bytes.len(),
+            "Rejecting oversized replay response"
+        );
+        return json_api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "replay exceeds response limit",
+        );
+    }
+
+    let source = match loaded.source {
+        ReplayLoadSource::Cache => "cache",
+        ReplayLoadSource::ObjectStore => "object_store",
+    };
+    let content_length = loaded.recording.bytes.len().to_string();
+    let mut response = Response::new(Body::from(loaded.recording.bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&content_length) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=300"),
+    );
+    response.headers_mut().insert(
+        header::ACCEPT_RANGES,
+        axum::http::HeaderValue::from_static("bytes"),
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-snaketron-replay-source"),
+        axum::http::HeaderValue::from_static(source),
+    );
+    response
 }
 
 async fn observe_application_request(request: Request<Body>, next: middleware::Next) -> Response {
@@ -674,11 +1077,326 @@ async fn broadcast_user_counts(mut redis: RedisConnection) -> Result<()> {
 #[cfg(test)]
 mod deferred_http_tests {
     use super::*;
+    use crate::replay_cache::InMemoryReplayCache;
+    use crate::replay_store::{InMemoryReplayStore, ReplayStore};
     use axum::routing::get;
+    use chrono::Utc;
+    use common::{
+        GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameRecordingV1, GameState,
+        GameStatus, GameType, HighlightConfig, HighlightPresentation, HighlightReason,
+        HighlightScoreBreakdown, HighlightWindow, QueueMode, ReplayAnchor, ReplayVisibility,
+    };
+    use std::collections::HashMap;
     use std::time::Duration;
 
     static ACTIVE_SERVER_METRICS_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    struct StaticReplayGameReader {
+        games: HashMap<i32, Game>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplayGameReader for StaticReplayGameReader {
+        async fn get_game(&self, game_id: i32) -> Result<Option<Game>> {
+            Ok(self.games.get(&game_id).cloned())
+        }
+    }
+
+    fn replay_test_recording(game_id: u32) -> GameRecordingV1 {
+        let mut state = GameState::new(
+            20,
+            20,
+            GameType::Solo,
+            QueueMode::Quickmatch,
+            Some(11),
+            1_000,
+        );
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            visibility: ReplayVisibility::Public,
+            anchors: vec![ReplayAnchor {
+                tick: state.tick,
+                sequence: 0,
+                state: state.clone(),
+            }],
+            messages: Vec::new(),
+            end_tick: state.tick,
+            end_sync_hash: state.sync_hash(),
+        }
+    }
+
+    fn replay_test_highlight(recording: &GameRecordingV1) -> HighlightClip {
+        let anchor = recording.anchors[0].state.clone();
+        HighlightClip {
+            clip_format_version: common::HIGHLIGHT_CLIP_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id: recording.game_id,
+            star_user_id: 1,
+            star_snake_id: 1,
+            star_name: "Replay Tester".into(),
+            reason: HighlightReason::ComboFrenzy { max_chain: 2 },
+            score: 150,
+            breakdown: HighlightScoreBreakdown::default(),
+            window: HighlightWindow {
+                start_tick: anchor.tick,
+                end_tick: anchor.tick,
+                focus_tick: anchor.tick,
+            },
+            anchor,
+            messages: Vec::new(),
+            end_sync_hash: recording.end_sync_hash,
+            presentation: HighlightPresentation {
+                rotation: 0,
+                follow_snake_id: 1,
+                segments: Vec::new(),
+            },
+            config: HighlightConfig::default(),
+        }
+    }
+
+    fn replay_test_game(id: i32, status: &str) -> Game {
+        let now = Utc::now();
+        Game {
+            id,
+            server_id: Some(1),
+            season: Some(1),
+            game_type: serde_json::json!({"Solo": {}}),
+            game_state: None,
+            status: status.into(),
+            ended_at: (status == "complete").then_some(now),
+            last_activity: now,
+            created_at: now,
+            game_mode: "matchmaking".into(),
+            is_private: false,
+            game_code: None,
+            replay_object: None,
+            play_of_the_game: None,
+            news_eligible: false,
+        }
+    }
+
+    fn replay_test_app(
+        games: HashMap<i32, Game>,
+        repository: Option<Arc<ReplayRepository>>,
+    ) -> Router {
+        replay_route_template().with_state(ReplayApiState {
+            games: Arc::new(StaticReplayGameReader { games }),
+            repository,
+        })
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_HIGHLIGHT_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn get_path(app: Router, path: &str) -> Response {
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn get_path_with_range(app: Router, path: &str, range: &str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .uri(path)
+                .header(header::RANGE, range)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn public_game_ids_are_positive_decimal_database_ids() {
+        assert_eq!(parse_public_game_id("1"), Some(1));
+        assert_eq!(parse_public_game_id("2147483647"), Some(i32::MAX));
+        for invalid in ["", "0", "-1", "+1", " 1", "1 ", "1.0", "2147483648"] {
+            assert_eq!(parse_public_game_id(invalid), None, "accepted {invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_highlight_route_has_bounded_pending_ready_and_unavailable_states() {
+        let recording = replay_test_recording(3);
+        let mut waiting = replay_test_game(1, "playing");
+        waiting.is_private = true;
+        waiting.game_code = Some("PUBLIC-NOW".into());
+        let complete_without_clip = replay_test_game(2, "complete");
+        let mut ready = replay_test_game(3, "complete");
+        ready.is_private = true;
+        ready.game_code = Some("PUBLIC-NOW".into());
+        ready.play_of_the_game = Some(replay_test_highlight(&recording));
+        let app = replay_test_app(
+            [(1, waiting), (2, complete_without_clip), (3, ready)]
+                .into_iter()
+                .collect(),
+            None,
+        );
+
+        let pending = get_path(app.clone(), "/api/games/1/highlight").await;
+        assert_eq!(pending.status(), StatusCode::OK);
+        assert_eq!(pending.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(response_json(pending).await["status"], "pending");
+
+        let unavailable = get_path(app.clone(), "/api/games/2/highlight").await;
+        assert_eq!(unavailable.status(), StatusCode::OK);
+        assert_eq!(response_json(unavailable).await["status"], "unavailable");
+
+        let missing = get_path(app.clone(), "/api/games/999/highlight").await;
+        assert_eq!(missing.status(), StatusCode::OK);
+        assert_eq!(missing.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(response_json(missing).await["status"], "pending");
+
+        let mut participant_payloads = Vec::new();
+        for _ in 0..4 {
+            let ready = get_path(app.clone(), "/api/games/3/highlight").await;
+            assert_eq!(ready.status(), StatusCode::OK);
+            let ready_json = response_json(ready).await;
+            assert_eq!(ready_json["status"], "ready");
+            assert_eq!(ready_json["play_of_the_game"]["game_id"], 3);
+            participant_payloads.push(ready_json);
+        }
+        assert!(
+            participant_payloads
+                .windows(2)
+                .all(|pair| pair[0] == pair[1]),
+            "all four clients must receive the same immutable selected clip"
+        );
+
+        let invalid = get_path(app, "/api/games/-1/highlight").await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn highlight_route_uses_precommit_verification_without_request_path_resimulation() {
+        let recording = replay_test_recording(4);
+        let mut clip = replay_test_highlight(&recording);
+        // Persistence only accepts replay-verified clips. Deliberately corrupt
+        // this fixture's end hash to prove an anonymous GET does not perform a
+        // CPU-amplifying deterministic simulation; the browser still verifies
+        // the immutable payload before presenting it.
+        clip.end_sync_hash ^= 1;
+        let mut game = replay_test_game(4, "complete");
+        game.play_of_the_game = Some(clip);
+        let app = replay_test_app([(4, game)].into_iter().collect(), None);
+
+        let response = get_path(app, "/api/games/4/highlight").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn anonymous_replay_route_returns_verified_json_through_cache_aside() {
+        let recording = replay_test_recording(7);
+        let bytes = crate::completion::canonical_json_bytes(&recording).unwrap();
+        let store = Arc::new(InMemoryReplayStore::new());
+        let metadata = store.put_recording(7, &bytes).await.unwrap();
+        let repository = Arc::new(ReplayRepository::new(
+            store,
+            Arc::new(InMemoryReplayCache::new()),
+        ));
+        let mut game = replay_test_game(7, "complete");
+        game.is_private = true;
+        game.game_code = Some("CUSTOM-PUBLIC".into());
+        game.replay_object = Some(metadata);
+        let app = replay_test_app([(7, game)].into_iter().collect(), Some(repository));
+
+        let first = get_path(app.clone(), "/api/games/7/replay").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(first.headers()["x-snaketron-replay-source"], "object_store");
+        let returned: GameRecordingV1 = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), MAX_REPLAY_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(returned.game_id, 7);
+
+        let cached = get_path(app, "/api/games/7/replay").await;
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert_eq!(cached.headers()["x-snaketron-replay-source"], "cache");
+    }
+
+    #[tokio::test]
+    async fn replay_route_relies_on_persist_game_verification_without_resimulation() {
+        let store = Arc::new(InMemoryReplayStore::new());
+        let metadata = store
+            .put_recording(8, br#"{"not":"a recording"}"#)
+            .await
+            .unwrap();
+        let repository = Arc::new(ReplayRepository::new(
+            store,
+            Arc::new(InMemoryReplayCache::new()),
+        ));
+        let mut game = replay_test_game(8, "complete");
+        game.replay_object = Some(metadata);
+        let app = replay_test_app([(8, game)].into_iter().collect(), Some(repository));
+
+        let response = get_path(app, "/api/games/8/replay").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), MAX_REPLAY_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+            br#"{"not":"a recording"}"#.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn large_replay_requires_and_serves_bounded_byte_ranges() {
+        let mut bytes = vec![0u8; 9 * 1024 * 1024 + 99];
+        for (index, chunk) in bytes
+            .chunks_mut(crate::replay_store::REPLAY_CHUNK_UNCOMPRESSED_BYTES)
+            .enumerate()
+        {
+            chunk.fill(index as u8);
+        }
+        let store = Arc::new(InMemoryReplayStore::new());
+        let metadata = store.put_recording(9, &bytes).await.unwrap();
+        let cache = Arc::new(InMemoryReplayCache::new());
+        let repository = Arc::new(ReplayRepository::new(store, cache.clone()));
+        let mut game = replay_test_game(9, "complete");
+        game.replay_object = Some(metadata);
+        let app = replay_test_app([(9, game)].into_iter().collect(), Some(repository));
+
+        let full = get_path(app.clone(), "/api/games/9/replay").await;
+        assert_eq!(full.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(
+            cache.object_count().await,
+            1,
+            "preflight loads only manifest"
+        );
+
+        let start = crate::replay_store::REPLAY_CHUNK_UNCOMPRESSED_BYTES - 5;
+        let end = start + 31;
+        let partial = get_path_with_range(
+            app,
+            "/api/games/9/replay",
+            &format!("bytes={start}-{}", end - 1),
+        )
+        .await;
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial.headers()[header::CONTENT_RANGE],
+            format!("bytes {start}-{}/{}", end - 1, bytes.len())
+        );
+        let returned = axum::body::to_bytes(partial.into_body(), MAX_REPLAY_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(returned.as_ref(), &bytes[start..end]);
+    }
 
     #[tokio::test]
     async fn active_server_registry_refreshes_and_prunes_expired_tasks() -> Result<()> {

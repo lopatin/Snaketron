@@ -8,10 +8,14 @@ export const DEFAULT_TICK_INTERVAL_MS = 100;
 export const EXECUTOR_POLL_INTERVAL_MS = 10;
 export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // Gameplay protocol version. Predictive simulation requires an exact match:
-// protocol 8 changes scoring and physical growth, and protocol 9 adds
+// Protocol 10 is a merge collision resolved upward: this branch and the
+// advertising branch each shipped a wire change and each independently
+// claimed 9, so 9 would name two mutually unintelligible protocols. 10
+// carries both — deterministic death attribution on SnakeDied events, and
 // per-session distribution routing for server-owned advertisement policy.
+// (Protocol 8 changed scoring and physical growth.)
 // Tracks WS_PROTOCOL_VERSION in server/src/lifecycle.rs.
-export const GAMEPLAY_PROTOCOL_VERSION = 9;
+export const GAMEPLAY_PROTOCOL_VERSION = 10;
 export const isGameplayProtocolCompatible = (serverVersion: unknown): boolean =>
   Number(serverVersion) === GAMEPLAY_PROTOCOL_VERSION;
 export const GAMEPLAY_UPDATE_REQUIRED_PREFIX = 'Gameplay update required';

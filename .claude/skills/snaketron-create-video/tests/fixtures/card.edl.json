@@ -1,0 +1,6 @@
+{
+  "output": { "w": 320, "h": 180, "fps": 10 },
+  "timeline": [
+    { "clip": "rank-up-card", "in": 0.0, "out": 0.4 }
+  ]
+}

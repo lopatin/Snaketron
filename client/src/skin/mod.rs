@@ -151,10 +151,35 @@ pub struct SnakePose<'a> {
     /// Mirrors the viewer's `prefers-reduced-motion` setting. An animated skin
     /// must paint a still frame when this is set.
     pub reduced_motion: bool,
+    /// Multiplier on every contour weight a skin document quotes.
+    ///
+    /// A skin quotes its contours in pixels at 1x, and the arena canvas is not
+    /// devicePixelRatio-scaled — so on a high-DPI display, or under the
+    /// trailer capture at deviceScaleFactor 4, the arena draws a cell several
+    /// times larger while a 2 px contour stays 2 px and reads as a scratch.
+    /// The arena sets this from its cell size; every other surface leaves it
+    /// at 1.
+    ///
+    /// It cannot be inferred from `cell_size` alone: the roster glyph sizes
+    /// its cell to fill a row and legitimately reaches ~28 px at 1x, which is
+    /// larger than anything the arena draws. Cell size does not distinguish a
+    /// big glyph from a zoomed one; only the caller knows which it is.
+    pub detail_scale: f64,
+}
+
+/// The cell the arena caps at, in CSS pixels (`GameArena.tsx` walks down from
+/// here). Contour weights are quoted at this size.
+pub const ARENA_MAX_CELL_PX: f64 = 15.0;
+
+/// Contour multiplier for an arena cell. 1.0 at or below the cap, so 1x
+/// rendering is untouched.
+pub fn arena_detail_scale(cell_size: f64) -> f64 {
+    (cell_size / ARENA_MAX_CELL_PX).max(1.0)
 }
 
 impl<'a> SnakePose<'a> {
-    /// A pose for a surface that does not animate.
+    /// A pose for a surface that does not animate: roster glyphs, golden
+    /// traces, contact sheets. All of them are 1x, so contours are unscaled.
     pub fn still(cells: &'a [(f64, f64)], cell_size: f64, boost_active: bool) -> Self {
         Self {
             cells,
@@ -162,6 +187,7 @@ impl<'a> SnakePose<'a> {
             boost_active,
             anim_ms: 0.0,
             reduced_motion: true,
+            detail_scale: 1.0,
         }
     }
 }
@@ -437,6 +463,44 @@ mod tests {
         for index in 0..2 {
             let identity = SkinIdentity::resolve(index, None, 0, 2, false, None, None);
             assert_eq!(identity.role, SnakeRole::Enemy);
+        }
+    }
+}
+
+#[cfg(test)]
+mod detail_scale_tests {
+    use super::*;
+
+    /// Contour weight is a fixed share of the body at any zoom, and 1x is
+    /// untouched. Skins quote their contours in 1x pixels, and the arena canvas
+    /// is not devicePixelRatio-scaled, so without this a 2 px rim stays 2 px
+    /// around a 60 px body and reads as a scratch.
+    #[test]
+    fn arena_scales_above_its_cap_and_nowhere_below_it() {
+        for cell in [4.0, 9.0, 15.0] {
+            assert_eq!(
+                arena_detail_scale(cell),
+                1.0,
+                "1x rendering must be byte-identical at cell {cell}"
+            );
+        }
+        assert_eq!(arena_detail_scale(2.0 * ARENA_MAX_CELL_PX), 2.0);
+        assert_eq!(arena_detail_scale(4.0 * ARENA_MAX_CELL_PX), 4.0);
+    }
+
+    /// The scale cannot be inferred from cell size: the roster glyph fills a
+    /// row and legitimately reaches ~28 px at 1x, larger than anything the
+    /// arena draws. Every non-arena surface must therefore opt out explicitly,
+    /// which `still()` does — the golden traces are the regression barrier.
+    #[test]
+    fn still_poses_never_scale_however_large_their_cell() {
+        for cell in [17.0, 28.0, 64.0] {
+            let cells = [(0.0, 0.0), (3.0, 0.0)];
+            assert_eq!(
+                SnakePose::still(&cells, cell, false).detail_scale,
+                1.0,
+                "a 1x surface must not scale merely because its cell is large"
+            );
         }
     }
 }

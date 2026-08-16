@@ -38,6 +38,13 @@ The rules that are not negotiable, and why:
   colour. A teammate who looks like an enemy is a competitive bug.
 - **The Boost band stays `#fff200` at +6px** in documents. Opponents read that
   band to know you are boosting.
+- **Every contour width is quoted at 1×.** The arena canvas is not
+  devicePixelRatio-scaled, so on a high-DPI display it draws a cell several
+  times larger than the 15 px the layout caps at; `SnakePose.detail_scale`
+  multiplies your `extra` values to match. Author in 1× pixels and you are
+  correct at every zoom — do not pre-compensate, and do not read `cell_size`
+  to decide a width yourself. The roster glyph legitimately draws a ~28 px cell
+  at 1×, so cell size alone cannot tell a large glyph from a zoomed one.
 - **Reported colours are flat 6-digit hex**, even for a gradient skin — the
   results-table pill and the contrast maths need one representative colour.
 - **The head core stays dark**, or the roster's white ready-check vanishes.

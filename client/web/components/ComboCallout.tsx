@@ -5,6 +5,11 @@ export interface ComboCalloutProps {
   hud: ComboHudView;
   isVisible: boolean;
   pickupIdentity: string;
+  /**
+   * Capture-only deterministic animation clock. Live playback deliberately
+   * leaves this unset so the production CSS animation follows wall time.
+   */
+  animationElapsedMs?: number;
 }
 
 /**
@@ -17,6 +22,7 @@ const ComboCallout: React.FC<ComboCalloutProps> = ({
   hud,
   isVisible,
   pickupIdentity,
+  animationElapsedMs,
 }) => (
   <div
     className="game-combo-callout"
@@ -37,6 +43,10 @@ const ComboCallout: React.FC<ComboCalloutProps> = ({
         data-animation-key={pickupIdentity}
         data-next-food-value={hud.nextFoodValue}
         aria-hidden="true"
+        style={animationElapsedMs === undefined ? undefined : {
+          animationDelay: `${-Math.min(360, Math.max(0, animationElapsedMs))}ms`,
+          animationPlayState: 'paused',
+        }}
       >
         <span className="game-combo-callout__value">+{hud.nextFoodValue}</span>
         <span className="game-combo-callout__label">Combo!</span>

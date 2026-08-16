@@ -61,7 +61,7 @@ import type {
   PredictedCrashVisualState,
 } from '../utils/crashExplosion';
 import type { PredictedScoreVisualState } from '../utils/scoreEffects';
-import BoostCanisterMark from './BoostCanisterMark';
+import BoostMeter from './BoostMeter';
 import ComboCallout from './ComboCallout';
 import TouchControls, {
   TOUCH_LANDSCAPE_SIDE_RESERVE_PX,
@@ -71,6 +71,8 @@ import TouchControls, {
 import { useInputSurface } from '../hooks/useInputSurface';
 import { useFullscreen } from '../hooks/useFullscreen';
 import { useMatchRating } from '../hooks/useMatchRating';
+import { useHighlight } from '../hooks/useHighlight';
+import { useStarRank } from '../hooks/useStarRank';
 import './GameArena.css';
 
 /**
@@ -356,6 +358,13 @@ export default function GameArena() {
     committedState ?? gameState,
     isGameComplete,
     user?.id,
+  );
+  const matchHighlight = useHighlight(gameId, isGameComplete);
+  const starRank = useStarRank(
+    matchHighlight.phase === 'ready' ? matchHighlight.clip.star_user_id : undefined,
+    committedState ?? gameState,
+    user?.id,
+    matchRating.phase === 'ready' ? matchRating.reveal.toRank : null,
   );
   const isTouchSurface = inputSurface === 'touch';
   const fullscreen = useFullscreen();
@@ -884,9 +893,9 @@ export default function GameArena() {
   // serialize/parse round-trip and no untyped `serde_json::Value` indexing;
   // usernames and teams are resolved inside the renderer from the typed state.
   // The Rust renderer clears the canvas at the start of each frame, paints the
-  // field, invokes our score-effect callback, and then paints snakes and walls.
-  // This keeps celebrations behind gameplay actors while crash effects remain
-  // the intentionally topmost layer.
+  // field, invokes our score-effect callback, paints snakes and walls, then
+  // invokes the crash callback. This keeps celebrations behind gameplay actors
+  // while crash effects remain the intentionally topmost layer.
   //
   // Both crash and score cues are driven from the same predicted visual state,
   // read here rather than from React committed state, so a celebration starts
@@ -961,17 +970,19 @@ export default function GameArena() {
               reducedMotion: prefersReducedMotionRef.current,
             });
           },
-        );
-        drawCrashExplosions(
-          context,
-          crashExplosionSpriteRef.current,
-          crashExplosionsRef.current,
-          now,
-          cellSize,
-          renderArenaWidth,
-          renderArenaHeight,
-          rotation,
-          prefersReducedMotionRef.current,
+          () => {
+            drawCrashExplosions(
+              context,
+              crashExplosionSpriteRef.current,
+              crashExplosionsRef.current,
+              now,
+              cellSize,
+              renderArenaWidth,
+              renderArenaHeight,
+              rotation,
+              prefersReducedMotionRef.current,
+            );
+          },
         );
       } catch (error) {
         console.error('Error rendering game:', error);
@@ -1545,8 +1556,6 @@ export default function GameArena() {
     sendBoostDecision,
   ]);
 
-  const boostButtonDisabled = !boostHud || boostHud.buttonDisabled;
-  
   const convertLobbyModeToGameType = (mode: LobbyGameMode): GameType => {
     switch (mode) {
       case 'duel':
@@ -1655,59 +1664,17 @@ export default function GameArena() {
   ) : null;
 
   const boostControl = boostConfig && localSnake && boostHud && !gameOver ? (
-    <div
-      className={`game-boost-hud${isArenaVisible ? ' is-visible' : ''}${boostHud.active ? ' is-active' : ''}${boostHud.ready ? ' is-ready' : ''}`}
-      data-testid="boost-hud"
-      data-location="arena-bottom"
-      data-ready={boostHud.ready ? 'true' : 'false'}
-    >
-      <span
-        className="game-boost-meter__track"
-        role="progressbar"
-        aria-label="Stored Boost charge"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={boostHud.percent}
-        aria-valuetext={
-          boostHud.unlimited
-            ? `Unlimited${boostHud.active ? ', active' : ''}`
-            : `${boostHud.percent}%${boostHud.active ? ', active' : ''}`
-        }
-      >
-        <span
-          className="game-boost-meter__fill"
-          style={{ transform: `scaleX(${boostHud.fillRatio})` }}
-        />
-      </span>
-      <button
-        type="button"
-        onClick={handleBoostButtonPress}
-        onKeyDown={handleBoostControlKeyDown}
-        onPointerDown={hudBoostPointer.onPointerDown}
-        onPointerUp={hudBoostPointer.onPointerRelease}
-        onPointerCancel={hudBoostPointer.onPointerRelease}
-        onLostPointerCapture={hudBoostPointer.onPointerRelease}
-        disabled={boostButtonDisabled}
-        aria-label={boostInputMode === 'hold'
-          ? (boostHud.active
-              ? `Release Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
-              : `Hold to Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)
-          : (boostHud.active
-              ? `Stop Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% remaining`}`
-              : `Activate Boost, ${boostHud.unlimited ? 'unlimited' : `${boostHud.percent}% charged`}`)}
-        aria-keyshortcuts="Space"
-        className="game-boost-meter"
-        data-testid="boost-button"
-      >
-        <span className="game-boost-meter__canister-dock" aria-hidden="true">
-          <BoostCanisterMark />
-        </span>
-        <span className="game-boost-meter__reservoir" aria-hidden="true" />
-        <strong className="game-boost-meter__value">
-          {boostHud.unlimited ? '∞' : `${boostHud.percent}%`}
-        </strong>
-      </button>
-    </div>
+    <BoostMeter
+      hud={boostHud}
+      isVisible={isArenaVisible}
+      interaction={{
+        inputMode: boostInputMode,
+        onClick: handleBoostButtonPress,
+        onKeyDown: handleBoostControlKeyDown,
+        onPointerDown: hudBoostPointer.onPointerDown,
+        onPointerRelease: hudBoostPointer.onPointerRelease,
+      }}
+    />
   ) : null;
 
   // Keep the live region mounted, but render its visual burst only while the
@@ -1755,6 +1722,8 @@ export default function GameArena() {
           currentUserId={user?.id}
           queueMode={queueMode}
           rating={matchRating}
+          highlight={matchHighlight}
+          starRank={starRank}
           onMenu={handleBackToMenu}
           onPlayAgain={handlePlayAgain}
           playAgainDisabled={isLobbyQueued}

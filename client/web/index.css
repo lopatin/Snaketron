@@ -910,7 +910,11 @@ button.game-scoreboard-brand {
 .game-over-card {
   position: relative;
   width: min(560px, 100%);
-  max-height: min(680px, calc(100dvh - 40px));
+  /* The replay band added a 21:9 block above the fold, which pushed Play
+     again and Main menu below it at 680px. The card is a results summary
+     with two calls to action — it should use the viewport it has rather than
+     hide its own buttons. */
+  max-height: calc(100dvh - 32px);
   overflow: auto;
   border: 1px solid rgb(63 63 65 / 52%);
   border-radius: 7px;
@@ -1411,6 +1415,7 @@ button.game-scoreboard-brand {
 }
 
 .rating-reveal-medallion {
+  position: relative;
   display: flex;
   width: 46px;
   height: 46px;
@@ -1419,29 +1424,44 @@ button.game-scoreboard-brand {
   justify-content: center;
 }
 
-.rating-reveal-medallion img,
-.rating-reveal-medallion svg {
+/* The badge overflows its box during the turnover — the outgoing one blows
+   out to ~2x and the ring reaches past that — so the transition has to be
+   allowed out of the card's `overflow: hidden` band. */
+.rating-reveal-medallion.is-turning {
+  z-index: 1;
+}
+
+.rating-reveal-medallion-layer {
+  position: absolute;
+  display: flex;
   width: 100%;
   height: 100%;
-  animation: rating-medallion-stamp 360ms cubic-bezier(0.2, 1.4, 0.3, 1) both;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center center;
+  will-change: transform, opacity;
+}
+
+.rating-reveal-medallion-layer svg,
+.rating-reveal-medallion-layer img {
+  width: 100%;
+  height: 100%;
   filter: drop-shadow(0 2px 0 rgb(20 24 31 / 14%));
   object-fit: contain;
 }
 
-@keyframes rating-medallion-stamp {
-  0% {
-    opacity: 0;
-    transform: scale(1.8) rotate(-8deg);
-  }
-
-  62% {
-    opacity: 1;
-    transform: scale(0.93) rotate(1.5deg);
-  }
-
-  100% {
-    transform: scale(1) rotate(0deg);
-  }
+/* The promotion burst: a ring in the destination tier's accent, expanding out
+   of the badge as it turns over. Painted from the accent custom property, so
+   crossing into Grand Master rings gold and a demotion rings its own tier. */
+.rating-reveal-medallion-burst {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border: 3px solid var(--rating-accent, #d49a00);
+  border-radius: 50%;
+  pointer-events: none;
+  transform-origin: center center;
+  will-change: transform, opacity;
 }
 
 .rating-reveal-main {
@@ -2766,8 +2786,9 @@ button.game-scoreboard-brand {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rating-reveal-medallion img,
-  .rating-reveal-medallion svg,
+  /* The medallion turnover is inline geometry, and `promotionFrameAt` is
+     skipped outright under reduced motion, so there is no animation here to
+     switch off — only the CSS-driven siblings. */
   .rating-reveal-ribbon,
   .rating-reveal-tallying,
   .rating-reveal-beam {
@@ -2973,11 +2994,31 @@ button.game-scoreboard-brand {
   font-size: 12px;
 }
 
-.game-over-player-name {
+.game-over-player-details {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.game-over-player-name,
+.game-over-death-attribution {
+  max-width: 100%;
   overflow: hidden;
-  font-weight: 800;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.game-over-player-name {
+  font-weight: 800;
+}
+
+.game-over-death-attribution {
+  color: rgb(63 63 65 / 68%);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.2;
 }
 
 .game-over-winner {
@@ -4599,14 +4640,19 @@ body {
   margin-bottom: 32px;
 }
 
+/* The ticker sits centred in the run between the wordmark and the start form
+   instead of tucked under the tagline. The two gaps still sum to the 65px the
+   lockup always reserved, so the distance from logo to input is unchanged —
+   only where the ticker sits inside it moves. The lower gap is mostly the
+   form's own 32px of padding, which is why this margin is so small. */
 .home-brand-lockup:has(.news-ticker) {
-  margin-bottom: 18px;
+  margin-bottom: 0.5px;
 }
 
 .news-ticker {
   position: relative;
   width: min(44rem, calc(100vw - 36px));
-  margin-top: 15px;
+  margin-top: 32.5px;
 }
 
 .news-ticker.is-empty {
@@ -5431,13 +5477,16 @@ a.home-social-icon:hover {
     margin-bottom: 32px;
   }
 
+  /* Same centring at the mobile size. Here the form's 32px of padding is
+     already wider than half the run, so the lockup gives a little back to
+     keep the total — and therefore the logo-to-input distance — identical. */
   .home-brand-lockup:has(.news-ticker) {
-    margin-bottom: 10px;
+    margin-bottom: -5.5px;
   }
 
   .news-ticker {
     width: calc(100vw - 20px);
-    margin-top: 11px;
+    margin-top: 26.5px;
   }
 
   .news-ticker-viewport {

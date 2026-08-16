@@ -1,11 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { GameState, QueueMode } from '../types';
+import type { GameState, QueueMode, Rank } from '../types';
 import { buildMatchPresentation } from '../utils/gamePresentation';
 import type { MatchRatingState } from '../utils/ratingReveal';
+import type { MatchHighlightState } from '../utils/highlightPresentation';
 import GameOverCard from './GameOverCard';
 import MatchRosterBand from './MatchRosterBand';
 import Scoreboard from './Scoreboard';
+
+/**
+ * Beat between the match ending and the results card taking over the screen.
+ * Long enough to see how it ended, short enough not to feel like a stall.
+ */
+const SCORE_CARD_REVEAL_DELAY_MS = 1600;
 
 export interface GameHudShellProps {
   gameState: GameState | null;
@@ -14,6 +21,8 @@ export interface GameHudShellProps {
   currentUserId?: number;
   queueMode?: QueueMode;
   rating?: MatchRatingState;
+  highlight: MatchHighlightState;
+  starRank?: Rank | null;
   onMenu: () => void;
   onPlayAgain: () => void;
   playAgainDisabled?: boolean;
@@ -27,6 +36,8 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
   currentUserId,
   queueMode,
   rating,
+  highlight,
+  starRank = null,
   onMenu,
   onPlayAgain,
   playAgainDisabled = false,
@@ -44,14 +55,23 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
   useEffect(() => {
     const complete = presentation?.isComplete ?? false;
     const prior = priorMatchRef.current;
+    let timer: number | undefined;
     if (!prior || prior.key !== matchKey) {
+      // First sight of this match. An already-finished game (a rejoin, a
+      // spectator arriving late) has no ending to register, so it opens flat.
       setScoreCardOpen(complete);
     } else if (complete && !prior.complete) {
-      setScoreCardOpen(true);
+      // The match just ended under the player. Let the final moment land
+      // before the results card covers the arena — cutting straight to the
+      // modal reads as though the game was interrupted rather than finished.
+      timer = window.setTimeout(() => setScoreCardOpen(true), SCORE_CARD_REVEAL_DELAY_MS);
     } else if (!complete) {
       setScoreCardOpen(false);
     }
     priorMatchRef.current = { key: matchKey, complete };
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [matchKey, presentation?.isComplete]);
 
   if (!presentation || !gameState) {
@@ -93,8 +113,11 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
 
       <GameOverCard
         open={scoreCardOpen && presentation.isComplete}
+        gameId={matchKey}
         presentation={presentation}
         rating={rating}
+        highlight={highlight}
+        starRank={starRank}
         onDismiss={() => setScoreCardOpen(false)}
         onMenu={onMenu}
         onPlayAgain={onPlayAgain}

@@ -862,6 +862,7 @@ mod tests {
                             .expect("the corpus has a long body")
                             .cells,
                         cell_size: 12.0,
+                        detail_scale: 1.0,
                         boost_active: false,
                         anim_ms,
                         reduced_motion,
