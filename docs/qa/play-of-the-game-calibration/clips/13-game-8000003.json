@@ -1,6 +1,6 @@
 {
   "clip_format_version": 1,
-  "gameplay_version": 9,
+  "gameplay_version": 10,
   "game_id": 8000003,
   "star_user_id": 10000,
   "star_snake_id": 0,
@@ -401,9 +401,9 @@
       }
     ],
     "last_death_causes": {
-      "2": "Banked",
-      "3": "Banked",
       "1": "Banked",
+      "3": "Banked",
+      "2": "Banked",
       "0": "Banked"
     },
     "game_type": {
@@ -441,21 +441,21 @@
       "tombstone_ids": []
     },
     "players": {
+      "10003": {
+        "user_id": 10003,
+        "snake_id": 3
+      },
       "10000": {
         "user_id": 10000,
         "snake_id": 0
-      },
-      "10001": {
-        "user_id": 10001,
-        "snake_id": 1
       },
       "10002": {
         "user_id": 10002,
         "snake_id": 2
       },
-      "10003": {
-        "user_id": 10003,
-        "snake_id": 3
+      "10001": {
+        "user_id": 10001,
+        "snake_id": 1
       }
     },
     "rng": null,
@@ -464,40 +464,41 @@
     "start_ms": 0,
     "event_sequence": 236,
     "usernames": {
-      "10001": "Corpus Bot 2",
       "10002": "Corpus Bot 3",
+      "10001": "Corpus Bot 2",
       "10000": "Corpus Bot 1",
       "10003": "Corpus Bot 4"
     },
+    "skins": {},
     "spectators": [],
     "scores": {
-      "0": 10,
+      "3": 12,
       "1": 15,
       "2": 11,
-      "3": 12
+      "0": 10
     },
     "food_pickups": {
-      "2": 7,
       "1": 10,
-      "3": 9,
-      "0": 8
+      "2": 7,
+      "0": 8,
+      "3": 9
     },
     "team_scores": {
-      "0": 21,
-      "1": 27
+      "1": 27,
+      "0": 21
     },
     "player_xp": {},
     "player_action_counts": {
-      "10003": 27,
+      "10000": 29,
       "10002": 25,
-      "10001": 20,
-      "10000": 29
+      "10003": 27,
+      "10001": 20
     },
     "player_last_activity_ticks": {
-      "10001": 298,
+      "10003": 298,
       "10002": 298,
-      "10000": 298,
-      "10003": 298
+      "10001": 298,
+      "10000": 298
     },
     "idle_kicked_user_ids": [],
     "completed_by_inactivity": false,

@@ -1,6 +1,6 @@
 {
   "clip_format_version": 1,
-  "gameplay_version": 9,
+  "gameplay_version": 10,
   "game_id": 8000103,
   "star_user_id": 10002,
   "star_snake_id": 2,
@@ -385,8 +385,8 @@
     "last_death_causes": {
       "3": "Banked",
       "2": "Banked",
-      "0": "Banked",
-      "1": "Banked"
+      "1": "Banked",
+      "0": "Banked"
     },
     "game_type": {
       "TeamMatch": {
@@ -423,14 +423,6 @@
       "tombstone_ids": []
     },
     "players": {
-      "10000": {
-        "user_id": 10000,
-        "snake_id": 0
-      },
-      "10001": {
-        "user_id": 10001,
-        "snake_id": 1
-      },
       "10002": {
         "user_id": 10002,
         "snake_id": 2
@@ -438,6 +430,14 @@
       "10003": {
         "user_id": 10003,
         "snake_id": 3
+      },
+      "10001": {
+        "user_id": 10001,
+        "snake_id": 1
+      },
+      "10000": {
+        "user_id": 10000,
+        "snake_id": 0
       }
     },
     "rng": null,
@@ -446,34 +446,35 @@
     "start_ms": 0,
     "event_sequence": 307,
     "usernames": {
-      "10001": "Corpus Bot 2",
       "10000": "Corpus Bot 1",
+      "10001": "Corpus Bot 2",
       "10003": "Corpus Bot 4",
       "10002": "Corpus Bot 3"
     },
+    "skins": {},
     "spectators": [],
     "scores": {
+      "2": 10,
       "1": 16,
       "0": 12,
-      "3": 16,
-      "2": 10
+      "3": 16
     },
     "food_pickups": {
-      "1": 12,
       "2": 7,
       "3": 12,
-      "0": 8
+      "0": 8,
+      "1": 12
     },
     "team_scores": {
-      "1": 28,
-      "0": 14
+      "0": 14,
+      "1": 28
     },
     "player_xp": {},
     "player_action_counts": {
-      "10002": 36,
       "10001": 25,
       "10000": 32,
-      "10003": 35
+      "10003": 35,
+      "10002": 36
     },
     "player_last_activity_ticks": {
       "10002": 398,
