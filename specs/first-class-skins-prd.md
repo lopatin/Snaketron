@@ -454,3 +454,69 @@ Open decisions (each needs an owner before its phase starts, none blocks M0–M2
 - **Review SLA and staffing** (M4): who reviews, target queue age, escalation path.
 - **Repeat-chargeback policy** (M5): threshold at which reversal-abusing accounts lose purchase privileges or are suspended; interacts with the negative-balance state.
 - **Xsolla vs. alternatives** (M5): the brief names Xsolla ("Zsolla"); if merchant-of-record terms disappoint, Stripe + tax handling is the fallback with materially more compliance surface. Decision needed before M5 design review.
+
+## 20. Addendum: the forge does not belong in the game server
+
+Section 6 sketched a `texture-forge` worker consuming the job queue and doing
+the pixel work — decode, seam measurement, **LaMa repair**, ladder resizing.
+Investigating what it would take to wire that up produced a different answer,
+recorded here so the question is settled with evidence rather than re-litigated.
+
+**The server must not shell out to `forge.py`.** There is no precedent for it:
+the only `process::Command` anywhere outside a test harness is in
+`server/tests/executor_process_chaos_tests.rs`, which spawns the server binary
+in order to kill it. And the runtime image cannot run it anyway —
+`server/Dockerfile`'s runtime stage is `ubuntu:24.04` with ca-certificates,
+libssl3 and curl. `forge.py` needs Python, numpy and Pillow, and its repair
+path imports `simple_lama_inpainting`, which brings PyTorch, opencv, and a
+learned model. That is hundreds of megabytes and a model load *inside the
+process running authoritative game partitions*, added to every region's image
+to support a feature that is off wherever no image-provider key is configured.
+
+**A full Rust port is the wrong framing too**, because the two halves are not
+equally portable. The *measurement* half — seam ratio, correlation length, the
+multi-scale structural check — is array arithmetic, and the repo already treats
+those numbers as a shared contract: `forge.py`'s ladders are asserted against
+`server/src/texture.rs` rather than trusted, and `SeamReport::ACCEPTABLE_RATIO`
+is already the Rust copy of the Python threshold. The *repair* half is a neural
+model, is not portable, and — decisively — **is not the gate**. `forge.py` says
+so itself: a structurally disagreeing source is regenerated, never
+force-repaired, because inpainting a join between two pieces of texture that
+were never meant to meet produces mush, and mush passes a one-pixel metric.
+
+**So the shape is**: port measurement to Rust, drop repair from the server path
+entirely, and let a failed seam become a `SeamsRejected` fed back through
+`retry_prompt` — which the generation module's own documentation already frames
+as the local tooling's philosophy. `forge.py` stays what it is: the offline
+tool for hand-authored art, where a human is present to judge a repair. The
+cost is honest and priced: without repair, a borderline generation that the
+model would have rescued now spends another provider call, and
+`Budget::max_attempts_per_texture` already bounds that.
+
+If the repair ever proves load-bearing for acceptance rates, the correct shape
+is a **separate service** — its own image, called over HTTP with a timeout and
+a size cap, exactly as `generation_providers.rs` already calls image models.
+Never a subprocess inside the serving container.
+
+### 20.1 What this investigation fixed on the way
+
+Three bugs in the existing pipeline, none reachable today because nothing
+drains the queue, all of them landmines for whoever builds the worker. Each is
+now fixed with a test:
+
+- **The daily spend total read only the first page.** It is the circuit breaker
+  on a bill, and it stopped halting exactly when the spend was highest.
+- **A job's lifetime was written only at creation**, while an update replaces
+  the whole item — so the first progress write made the record permanent.
+- **The ledger ignored the spend a job had already persisted**, so a job
+  re-claimed after a crash got a fresh full budget, turning a per-job ceiling
+  into a per-attempt-of-the-job one.
+
+### 20.2 What a worker still needs before it can be written
+
+Recorded so the next attempt starts from the real list rather than rediscovering
+it: **a claim lease**. `claim_generation_job` removes the queue index entry and
+sets `generating` with no expiry, so a worker that dies mid-job strands that job
+invisibly forever and the client polls a state that will never change. A lease
+plus a reaper — or a claim condition that also accepts a stale `generating` —
+is a prerequisite, not a refinement.
