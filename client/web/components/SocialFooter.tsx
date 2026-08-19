@@ -69,7 +69,13 @@ export const SocialFooter: React.FC = () => {
           </Link>
         </p>
       )}
-      <p className="home-copyright">© {currentYear} Snaketron</p>
+      <p className="home-copyright">
+        © {currentYear} Snaketron
+        <span className="home-copyright-separator" aria-hidden="true">·</span>
+        <Link to="/privacy" className="home-copyright-link">
+          Privacy
+        </Link>
+      </p>
     </footer>
   );
 };

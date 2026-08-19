@@ -5017,6 +5017,24 @@ a.home-social-icon:hover {
   letter-spacing: 0.45px;
 }
 
+/* The privacy link sits beside the copyright as a peer, not as an accent: it
+   is a legal-notice link, so it stays in the footer's muted voice and only
+   asserts itself on hover and focus. */
+.home-copyright-separator {
+  margin: 0 0.5em;
+}
+
+.home-copyright-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.home-copyright-link:hover,
+.home-copyright-link:focus-visible {
+  color: #4b5563;
+  text-decoration: underline;
+}
+
 .home-status-rack {
   position: absolute;
   top: 86px;

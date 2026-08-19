@@ -21,14 +21,27 @@ if (isItchBuild && isCrazyGamesBuild) {
 
 const isEmbeddedBuild = isItchBuild || isCrazyGamesBuild;
 
-// GameAnalytics ships only in the ordinary web build. The itch and CrazyGames
-// packages are reviewed release artifacts whose packaging invariants exclude
-// third-party trackers (see CRAZYGAMES.md), so the keys are dropped rather
-// than merely left unused: an embedded bundle must not even contain them.
-const gameAnalyticsGameKey = isEmbeddedBuild ? '' : (process.env.GAMEANALYTICS_GAME_KEY || '');
-const gameAnalyticsSecretKey = isEmbeddedBuild ? '' : (process.env.GAMEANALYTICS_SECRET_KEY || '');
+// GameAnalytics ships in every distribution by default, including the itch and
+// CrazyGames packages: both portals permit third-party game analytics, and
+// CrazyGames publishes an analytics partner of its own. Portal traffic is the
+// larger audience, so excluding it would hide most of the players.
+//
+// GAMEANALYTICS_DISABLE_EMBEDDED=true takes it back out of the reviewed
+// release packages, for a portal whose policy changes or a submission that
+// needs to carry no third-party SDK at all. Defaults to off.
+const disableEmbeddedAnalytics = process.env.GAMEANALYTICS_DISABLE_EMBEDDED === 'true';
+const analyticsExcludedFromBuild = isEmbeddedBuild && disableEmbeddedAnalytics;
 
-if (!isEmbeddedBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gameAnalyticsSecretKey)) {
+// When excluded, the keys are dropped rather than merely left unused: the
+// artifact must not even contain them.
+const gameAnalyticsGameKey = analyticsExcludedFromBuild
+  ? ''
+  : (process.env.GAMEANALYTICS_GAME_KEY || '');
+const gameAnalyticsSecretKey = analyticsExcludedFromBuild
+  ? ''
+  : (process.env.GAMEANALYTICS_SECRET_KEY || '');
+
+if (!analyticsExcludedFromBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gameAnalyticsSecretKey)) {
   throw new Error(
     'GAMEANALYTICS_GAME_KEY and GAMEANALYTICS_SECRET_KEY must be set together: '
     + 'GameAnalytics signs every request with the secret, so half a pair would '
@@ -71,15 +84,15 @@ module.exports = {
     // checkout, which would otherwise let stale WASM silently back the UI.
     alias: {
       'wasm-snaketron': path.resolve(__dirname, '../pkg'),
-      // Stub the analytics SDK out of the reviewed release packages entirely.
+      // When analytics is switched off for a release package, stub the SDK out
+      // entirely.
       //
       // Dropping the keys is not enough on its own: the dynamic import is
       // still statically reachable, so webpack emits the ~93 KB vendor chunk
       // into the ZIP even though nothing will ever request it. `false` here
-      // resolves it to an empty module, so the embedded artifact contains no
-      // third-party tracker code at all — the invariant CRAZYGAMES.md states
-      // and the packaging script checks.
-      ...(isEmbeddedBuild ? { gameanalytics: false } : {}),
+      // resolves it to an empty module, so the artifact contains no
+      // third-party SDK code at all.
+      ...(analyticsExcludedFromBuild ? { gameanalytics: false } : {}),
     },
   },
   module: {
@@ -149,6 +162,9 @@ module.exports = {
       'process.env.GAMEANALYTICS_GAME_KEY': JSON.stringify(gameAnalyticsGameKey),
       'process.env.GAMEANALYTICS_SECRET_KEY': JSON.stringify(gameAnalyticsSecretKey),
       'process.env.GAMEANALYTICS_BUILD': JSON.stringify(process.env.GAMEANALYTICS_BUILD || ''),
+      'process.env.GAMEANALYTICS_DISABLE_EMBEDDED': JSON.stringify(
+        disableEmbeddedAnalytics ? 'true' : '',
+      ),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')
     })
   ],

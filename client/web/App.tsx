@@ -28,7 +28,7 @@ import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
 import { AnalyticsBridge } from './components/AnalyticsBridge';
 import { CrazyGamesBridge } from './components/CrazyGamesBridge';
-import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
+import { PrivacyPolicy } from './components/PrivacyPolicy';
 import {
   isPlayOfTheGameQaRoute,
   isScenarioCaptureMode,
@@ -91,7 +91,7 @@ function AppContent() {
   // backdrop and suppress the runtime announcement on an ordinary screen.
   const isGameArenaActive = activeGameIdFromPath(location.pathname) !== null;
   const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
-  const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
+  const isPrivacyPage = location.pathname === '/privacy';
   // Two kinds of route keep the floating social chrome off screen. The public
   // match page is a landing surface for people arriving from a shared link,
   // most of whom have no session at all, so the chrome would be furniture for
@@ -127,7 +127,7 @@ function AppContent() {
 
   if (
     isCrazyGamesBuild &&
-    !isCrazyGamesPrivacyPage &&
+    !isPrivacyPage &&
     crazyGamesSessionStatus === 'resolving'
   ) {
     return (
@@ -148,7 +148,7 @@ function AppContent() {
 
   if (
     isCrazyGamesBuild &&
-    !isCrazyGamesPrivacyPage &&
+    !isPrivacyPage &&
     crazyGamesSessionStatus === 'error'
   ) {
     return (
@@ -234,10 +234,9 @@ function AppContent() {
               </AdminRoute>
           ) : <Navigate to="/" replace />}
         />
-        <Route
-          path="/privacy"
-          element={isCrazyGamesBuild ? <CrazyGamesPrivacy /> : <Navigate to="/" replace />}
-        />
+        {/* Reachable in every build: the website and itch packages collect the
+            same account data as the portal one, and all three report analytics. */}
+        <Route path="/privacy" element={<PrivacyPolicy />} />
         <Route
           path="/game-modes/:category"
           element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <GameModeSelector />}

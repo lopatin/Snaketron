@@ -16,7 +16,10 @@ import {
   resolveAnalyticsDecision,
   type ExclusionInputs,
 } from '../../services/analytics/exclusion.ts';
-import { resolveAnalyticsBuildConfig } from '../../services/analytics/config.ts';
+import {
+  resolveAnalyticsBuildConfig,
+  resolveEmbeddedAnalyticsSupport,
+} from '../../services/analytics/config.ts';
 import type { GameType } from '../../types/generated/GameType.ts';
 
 const duel: GameType = { TeamMatch: { per_team: 1 } };
@@ -45,7 +48,37 @@ test('an ordinary player on a configured web build is reported', () => {
   );
 });
 
-test('a bundle with no keys, or an embedded package, never reports', () => {
+/**
+ * The embedded packages report by default now — both portals permit
+ * third-party game analytics, and portal traffic is most of the players. The
+ * switch exists for a policy change, so it has to be the thing that turns it
+ * off, not the default.
+ */
+test('an embedded package reports unless the switch is thrown', () => {
+  assert.deepEqual(
+    resolveEmbeddedAnalyticsSupport({ distribution: 'crazygames', disableEmbedded: false }),
+    true,
+  );
+  assert.deepEqual(
+    resolveEmbeddedAnalyticsSupport({ distribution: 'itch', disableEmbedded: false }),
+    true,
+  );
+  assert.deepEqual(
+    resolveEmbeddedAnalyticsSupport({ distribution: 'crazygames', disableEmbedded: true }),
+    false,
+  );
+  assert.deepEqual(
+    resolveEmbeddedAnalyticsSupport({ distribution: 'itch', disableEmbedded: true }),
+    false,
+  );
+  // The website build is never affected by a switch aimed at release packages.
+  assert.deepEqual(
+    resolveEmbeddedAnalyticsSupport({ distribution: 'web', disableEmbedded: true }),
+    true,
+  );
+});
+
+test('a bundle with no keys, or a disabled distribution, never reports', () => {
   assert.deepEqual(resolveAnalyticsDecision({ ...counted, configured: false }), {
     report: false,
     reason: 'notConfigured',

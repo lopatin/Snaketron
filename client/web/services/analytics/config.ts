@@ -9,6 +9,7 @@
  */
 
 import { CLIENT_DISTRIBUTION } from '../../constants.ts';
+import type { ClientDistribution } from '../../types/generated/ClientDistribution';
 
 export interface AnalyticsBuildConfig {
   gameKey: string;
@@ -22,15 +23,27 @@ export interface AnalyticsBuildConfig {
 }
 
 /**
- * GameAnalytics ships only in the ordinary web build.
+ * Whether this distribution reports at all.
  *
- * The itch and CrazyGames packages are reviewed release artifacts, and
- * `CRAZYGAMES.md` records "Google Tag Manager/Google Analytics are absent from
- * the embedded package" as a packaging invariant enforced at build time. A
- * third-party analytics SDK is the same class of payload, so it follows the
- * same rule; see `ANALYTICS.md` before changing this.
+ * Every distribution does by default, including the itch and CrazyGames
+ * packages: both portals permit third-party game analytics, and CrazyGames
+ * publishes an analytics partner of its own. Portal traffic is the larger
+ * audience, so excluding it would hide most of the players.
+ *
+ * `GAMEANALYTICS_DISABLE_EMBEDDED=true` takes it back out of the reviewed
+ * release packages without touching the ordinary website build — for a portal
+ * whose policy changes, or a submission that must carry no third-party SDK.
+ * The website build is never affected by that switch.
  */
-export const ANALYTICS_SUPPORTED_DISTRIBUTION = CLIENT_DISTRIBUTION === 'web';
+export const resolveEmbeddedAnalyticsSupport = (input: {
+  distribution: ClientDistribution;
+  disableEmbedded: boolean;
+}): boolean => !(input.distribution !== 'web' && input.disableEmbedded);
+
+export const ANALYTICS_SUPPORTED_DISTRIBUTION = resolveEmbeddedAnalyticsSupport({
+  distribution: CLIENT_DISTRIBUTION,
+  disableEmbedded: process.env.GAMEANALYTICS_DISABLE_EMBEDDED === 'true',
+});
 
 const readKey = (value: string | undefined): string => (value ?? '').trim();
 

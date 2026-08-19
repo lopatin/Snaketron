@@ -39,25 +39,33 @@ against a separate GameAnalytics game, not the production one.
 
 ## Distribution scope
 
-GameAnalytics ships in the `web` distribution only.
+GameAnalytics ships in **every** distribution by default — website, itch, and
+CrazyGames. Both portals permit third-party game analytics; CrazyGames goes
+further and publishes [ByteBrew](https://docs.crazygames.com/resources/partners/)
+as an official analytics partner, and itch.io offers its own Google Analytics
+integration. Portal traffic is the larger audience, so excluding it would hide
+most of the players.
 
-`CRAZYGAMES.md` records "Google Tag Manager/Google Analytics are absent from the
-embedded package" as a packaging invariant, and the itch and CrazyGames ZIPs are
-reviewed release artifacts. A third-party analytics SDK is the same class of
-payload, so it follows the same rule, enforced in two places:
+`CRAZYGAMES.md` still keeps Google Tag Manager and Google Analytics out of the
+embedded packages. That invariant is about a general-purpose tag manager that
+can inject arbitrary third-party script — a different risk from a game
+analytics SDK — and it stands.
 
-- the keys are blanked for any embedded build, so the integration is inert; and
-- `gameanalytics` is aliased to an empty module, so webpack does not emit the
-  ~93 KB vendor chunk into the ZIP at all.
+To take analytics back out of the reviewed release packages, for a portal whose
+policy changes or a submission that must carry no third-party SDK:
 
-An embedded package therefore contains no GameAnalytics SDK code, no
-`api.gameanalytics.com` endpoint, and no keys. A ~2 KB inert wrapper and a
-98-byte empty chunk remain; neither can reach a network.
+```bash
+GAMEANALYTICS_DISABLE_EMBEDDED=true CRAZYGAMES_BUILD=true npm run build:prod
+```
 
-If CrazyGames or itch later approve game-analytics SDKs, removing the
-`isEmbeddedBuild` guards in `client/web/webpack.config.js` and
-`ANALYTICS_SUPPORTED_DISTRIBUTION` in `client/web/services/analytics/config.ts`
-is the whole change — but update the packaging invariant first.
+That blanks the keys *and* aliases `gameanalytics` to an empty module, because
+dropping the keys alone is not enough: the dynamic import stays statically
+reachable, so webpack would still emit the ~93 KB vendor chunk into the ZIP.
+With the switch on, the package contains no SDK code, no
+`api.gameanalytics.com` endpoint, and no keys — only a ~2 KB inert wrapper and
+a 98-byte empty chunk, neither of which can reach a network.
+
+The switch never affects the ordinary website build.
 
 ## Keeping your own play out of the numbers
 
@@ -168,7 +176,8 @@ Usernames, emails, and CrazyGames identifiers are never sent.
 **Operational consequence:** the user id is personal data held by a third party.
 A deletion request under the procedure in `CRAZYGAMES_PRIVACY.md` now also means
 deleting that id from GameAnalytics (their GDPR/data-deletion tooling), not only
-from Snaketron's own records.
+from Snaketron's own records. The player-facing notice at `/privacy` states
+this, and is linked from the footer of every build.
 
 **Session dimensions**
 
@@ -211,6 +220,7 @@ funnels, currently a failed WASM initialization.
 | File | Role |
 | --- | --- |
 | `server/src/api/analytics.rs` | `GET /api/analytics/consent`; address matching |
+| `client/web/components/PrivacyPolicy.tsx` | The player-facing notice, incl. the analytics disclosure |
 | `client/web/services/sessionIdentity.ts` | Reads the user id from the session token, before init |
 | `client/web/services/analytics/config.ts` | Build-time keys and distribution scope |
 | `client/web/services/analytics/exclusion.ts` | The three-signal gate (pure decision) |
