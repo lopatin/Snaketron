@@ -1766,10 +1766,10 @@ mod tests {
             &SnakePose {
                 cells,
                 cell_size: 10.0,
-                detail_scale: 1.0,
                 boost_active: false,
                 anim_ms: 0.0,
                 reduced_motion: true,
+                detail_scale: 1.0,
             },
             &SkinIdentity {
                 role: SnakeRole::Own,
@@ -2418,6 +2418,7 @@ mod tests {
                 boost_active: false,
                 anim_ms,
                 reduced_motion: false,
+                detail_scale: 1.0,
             },
             &SkinIdentity {
                 role: SnakeRole::Own,
@@ -2552,6 +2553,7 @@ mod tests {
                         boost_active: false,
                         anim_ms: ms,
                         reduced_motion: false,
+                        detail_scale: 1.0,
                     },
                     &SkinIdentity {
                         role: SnakeRole::Own,

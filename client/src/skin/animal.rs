@@ -921,6 +921,7 @@ mod tests {
                             .cells,
                         cell_size: 12.0,
                         boost_active: false,
+                        detail_scale: 1.0,
                         anim_ms,
                         reduced_motion,
                     },

@@ -747,6 +747,7 @@ mod tests {
                 boost_active: false,
                 anim_ms,
                 reduced_motion: false,
+                detail_scale: 1.0,
             },
             &SkinIdentity {
                 role: SnakeRole::Own,
@@ -802,10 +803,12 @@ mod tests {
     fn a_sheet_skin_plays_every_row_exactly_once_per_cycle() {
         let skin = by_id("zebra-live@1");
         let body = [(0.0, 0.0), (24.0, 0.0)];
-        // The skin's own period, not the default: `anim_speed` scales it, and
-        // a literal here would make this test pass only for skins that play at
-        // exactly one row per `MS_PER_ROW`.
-        let period = MS_PER_ROW * DEFAULT_SPRITE_ROWS as f64 / skin.0.anim_speed;
+        // The engine's own period. Deriving it from `recipe.anim_speed` was
+        // wrong in a way that only showed up once somebody used the sidebar:
+        // the recipe literal is a *fallback*, and the skin actually plays at
+        // whatever `tuning.json` says. A test that reads a different source
+        // from the code under test is testing nothing.
+        let period = skin.engine().period_ms();
 
         let mut rows = Vec::new();
         for step in 0..DEFAULT_SPRITE_ROWS {
@@ -1158,18 +1161,26 @@ mod tests {
                 skin.0.id
             );
         }
-        let zebra = by_id("zebra-live@1");
-        assert_eq!(
-            Tuning::of(zebra.0).sane(),
-            Tuning {
-                anim_speed: 0.5,
-                drift_cells: -0.5
-            },
-            "the committed file should be what the zebra paints with"
-        );
+        // The mechanism, not the numbers. `tuning.json` is edited from the QA
+        // sidebar and committed as data, so pinning a value here would make
+        // every tuning session a failing build — which is exactly what
+        // happened, and is a worse outcome than the check is worth.
+        for skin in &FAMILY {
+            let from_file = tuning_table()
+                .get(skin.0.id)
+                .copied()
+                .expect("checked above");
+            assert_eq!(
+                Tuning::of(skin.0),
+                from_file,
+                "{} paints with something other than the file",
+                skin.0.id
+            );
+        }
 
         // A live edit changes the period, which is the observable end of
         // `anim_speed`, and it must take effect without a rebuild.
+        let zebra = by_id("zebra-live@1");
         let period = |skin: &SpriteSkin| skin.engine().period_ms();
         let before = period(zebra);
         assert!(tune(
