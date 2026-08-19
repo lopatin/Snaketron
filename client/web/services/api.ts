@@ -523,6 +523,18 @@ class API {
     return this.request<Wallet>('/api/wallet');
   }
 
+  /**
+   * One skin's document, by the reference that names it.
+   *
+   * Fetched by content reference rather than by skin id, because that is what
+   * a reference *is*: the bytes are immutable, so this response can be cached
+   * hard, and a revision an author has since replaced still resolves for the
+   * replay that recorded it.
+   */
+  async getSkinDocument(contentRef: string): Promise<unknown> {
+    return this.request<unknown>(`/api/skins/by-ref/${encodeURIComponent(contentRef)}`);
+  }
+
   /** Create a skin from a document the editor has already compiled. */
   async createSkin(request: { name: string; document: unknown; kind?: 'snake' | 'base' }): Promise<SkinSummary> {
     return this.request<SkinSummary>('/api/skins', {

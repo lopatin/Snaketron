@@ -7338,6 +7338,333 @@ a.home-social-icon:hover {
   margin: 18px auto 0;
 }
 
+/* The layers panel and its inspector.
+
+   Two columns at desk width and one stacked column below it, with the stack
+   first either way: the stack is the map of the skin, and an inspector with
+   nothing selected explains nothing. */
+.builder-workbench {
+  display: grid;
+  width: min(100%, 72rem);
+  grid-template-columns: minmax(240px, 20rem) 1fr;
+  gap: 18px;
+  margin: 18px auto 0;
+  align-items: start;
+}
+
+.builder-stack,
+.builder-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px 16px 16px;
+}
+
+.builder-inspector {
+  gap: 14px;
+}
+
+.builder-inspector form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.builder-panel-title {
+  margin: 0 0 2px;
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.builder-layer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px 8px;
+  cursor: grab;
+}
+
+.builder-layer-row.is-selected {
+  border-color: var(--game-graphite);
+  background: #f8fafc;
+}
+
+.builder-layer-row.is-dragging {
+  opacity: 0.45;
+}
+
+/* An engine-owned layer. Shown because the stacking the panel draws has to be
+   the stacking that happens — a locked row is honest where an absent one
+   would quietly misrepresent what sits on top. */
+.builder-layer-row.is-system {
+  border-style: dashed;
+  background: #f9fafb;
+  cursor: default;
+}
+
+.builder-layer-name {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  border: 0;
+  background: none;
+  padding: 0;
+  text-align: left;
+  cursor: inherit;
+  font: inherit;
+}
+
+.builder-layer-name strong {
+  color: var(--game-graphite);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.builder-layer-name span {
+  color: rgb(63 63 65 / 50%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.builder-eye,
+.builder-icon-button {
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  padding: 2px 5px;
+  color: rgb(63 63 65 / 62%);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-eye:hover,
+.builder-icon-button:hover {
+  background: #eef2f7;
+  color: var(--game-graphite);
+}
+
+.builder-eye.is-locked {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.builder-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+}
+
+/* An expression field: one value, two views. */
+.builder-field-expression .builder-field-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.builder-field-expression .builder-field-head > span:first-child {
+  flex: 1;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+/* Where the value is worked out, shown beside the control that incurs it, so
+   cost is visible at the moment it is chosen rather than at save time. */
+.builder-site {
+  border-radius: 3px;
+  background: #eef2f7;
+  padding: 2px 5px;
+  color: rgb(63 63 65 / 62%);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.builder-fx {
+  border: 1px solid #9ca3af;
+  border-radius: 4px;
+  background: #fff;
+  padding: 2px 7px;
+  color: rgb(63 63 65 / 70%);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.builder-fx.is-on {
+  border-color: var(--game-graphite);
+  background: var(--game-graphite);
+  color: #fff;
+}
+
+.builder-fx:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.builder-expression-input {
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
+  padding: 7px 9px;
+  color: var(--game-graphite);
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.builder-field-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+
+.builder-field-toggle > span {
+  color: var(--game-graphite);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.builder-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px 10px 12px;
+}
+
+.builder-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.builder-list-head strong {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+/* The cost meter. Red at the ceiling is the same red the save produces, so an
+   author never discovers the budget at publish time. */
+.builder-cost {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 0 auto;
+  color: rgb(63 63 65 / 56%);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.builder-cost.is-over {
+  color: #b91c1c;
+}
+
+.builder-templates {
+  display: grid;
+  width: min(100%, 72rem);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin: 0 auto;
+}
+
+.builder-template {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 16px;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.builder-template:hover {
+  border-color: var(--game-graphite);
+}
+
+.builder-template strong {
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+}
+
+.builder-template span {
+  color: rgb(63 63 65 / 56%);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.builder-document {
+  width: min(100%, 72rem);
+  margin: 18px auto 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 12px 16px;
+}
+
+.builder-document summary {
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.builder-document form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.builder-note {
+  margin: 0;
+  color: rgb(63 63 65 / 50%);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 860px) {
+  .builder-workbench {
+    grid-template-columns: 1fr;
+  }
+}
+
 .builder-group {
   display: flex;
   flex-direction: column;

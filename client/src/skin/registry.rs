@@ -295,8 +295,11 @@ pub fn register_draft_skin(handle: &str, document_json: &str) -> Result<(), Stri
         ));
     }
 
-    let skin = ParamSkin::from_json(document_json).map_err(readable)?;
-    let compiled: &'static dyn SnakeSkin = Box::leak(Box::new(skin));
+    // The same door authored skins come through, so the editor previews a
+    // draft by exactly the path that will render it once it is saved. A
+    // version-specific path here would mean the Builder could show something
+    // the game then could not.
+    let compiled = compile_document(document_json)?;
 
     let mut registered = draft_skins()
         .lock()

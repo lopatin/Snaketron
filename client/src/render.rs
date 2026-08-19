@@ -980,6 +980,71 @@ pub fn skin_doc_schema() -> Result<String, JsValue> {
         .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
+/// What a v2 layer document contains, as a layers panel can render it.
+///
+/// The panel is generated from this — stack, inspector, add-menu and all — for
+/// the same reason v1's form was: a vocabulary the editor keeps its own copy of
+/// is a vocabulary the editor will fall behind.
+#[wasm_bindgen(js_name = skinSchemaV2)]
+pub fn skin_schema_v2() -> Result<String, JsValue> {
+    serde_json::to_string(&skin_schema::describe_v2::describe_v2())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// What one document would cost per snake, and what it may cost.
+///
+/// The same function the save-time gate calls, so the meter in the panel and
+/// the refusal at save can never disagree — the author who watches the meter
+/// approach the line is watching the line they will actually hit.
+#[wasm_bindgen(js_name = skinCostV2)]
+pub fn skin_cost_v2(document_json: &str) -> Result<String, JsValue> {
+    let doc: skin_schema::v2::SkinDocV2 = serde_json::from_str(document_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&serde_json::json!({
+        "ops": skin_schema::v2::predict_ops(&doc),
+        "maxOps": skin_schema::v2::MAX_OPS_PER_SNAKE,
+        "layers": doc.layers.len(),
+        "maxLayers": skin_schema::v2::MAX_LAYERS,
+    }))
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Turn a v1 document into the v2 form the layers panel edits.
+///
+/// Opening an existing skin goes through this, so a v1 skin is not a
+/// second-class citizen in the new editor — it is the same skin, described the
+/// way v2 describes things. The conversion is the one the client already trusts
+/// for rendering, so what an author sees on opening is what they had.
+#[wasm_bindgen(js_name = upgradeSkinDocument)]
+pub fn upgrade_skin_document(document_json: &str) -> Result<String, JsValue> {
+    match skin_schema::v2::load_any(document_json) {
+        Ok(skin_schema::v2::AnySkinDoc::V2(doc)) => {
+            serde_json::to_string(&doc).map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+        Ok(skin_schema::v2::AnySkinDoc::V1(doc)) => {
+            serde_json::to_string(&skin_schema::v2::upgrade(&doc))
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+        Err(errors) => Err(JsValue::from_str(
+            &errors
+                .iter()
+                .map(|error| format!("{} — {}", error.field, error.problem))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+    }
+}
+
+/// The documents a new skin can start from.
+///
+/// Templates rather than an empty stack, because an empty stack is not a skin
+/// and the first thing an author should see is something that already paints.
+#[wasm_bindgen(js_name = skinTemplatesV2)]
+pub fn skin_templates_v2() -> Result<String, JsValue> {
+    serde_json::to_string(&skin_schema::v2::templates())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 /// Compile an in-progress document for preview, under a caller-chosen handle.
 ///
 /// The Builder repaints on every settled edit, and a draft has no content

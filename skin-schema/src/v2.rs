@@ -23,9 +23,10 @@
 
 use crate::expr::{Expr, ExprError, Input, Tier};
 use crate::{
-    BaseTheme, CelebrationTheme, LabelStyle, MAX_ANIMATION_PERIOD_MS, MAX_HEAD_CORE_RATIO,
-    MAX_OUTLINE_EXTRA_PX, MIN_ANIMATION_PERIOD_MS, MIN_HEAD_CORE_RATIO, MIN_OUTLINE_EXTRA_PX,
-    MIN_READY_CHECK_CONTRAST, READY_CHECK_INK, RolePalette, SkinDoc, SkinDocError,
+    BaseTheme, CelebrationTheme, ColorPair, LabelStyle, MAX_ANIMATION_PERIOD_MS,
+    MAX_HEAD_CORE_RATIO, MAX_OUTLINE_EXTRA_PX, MIN_ANIMATION_PERIOD_MS, MIN_HEAD_CORE_RATIO,
+    MIN_OUTLINE_EXTRA_PX, MIN_READY_CHECK_CONTRAST, READY_CHECK_INK, RolePalette, SkinDoc,
+    SkinDocError,
     color::{Rgb, contrast_ratio},
 };
 use serde::{Deserialize, Serialize};
@@ -1427,6 +1428,219 @@ fn source_ops(source: &SourceV2, runs: usize, cells: usize) -> usize {
     }
 }
 
+/// A starting point for a new skin.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Template {
+    pub id: String,
+    pub label: String,
+    pub help: String,
+    pub document: SkinDocV2,
+}
+
+/// The documents a new skin can start from.
+///
+/// Ordinary v2 documents rather than code, which is the point: a template is
+/// something an author could have built in the panel, and taking one apart is
+/// how the panel teaches itself.
+///
+/// None of them is classic. Classic's document carries a recorded exemption
+/// from the label rule — see `LIT_LABEL_EXEMPT` — so starting a new skin from
+/// it would open the editor on a document the validator immediately refuses,
+/// which is a poor first impression and a baffling one.
+pub fn templates() -> Vec<Template> {
+    let base = |name: &str| SkinDocV2 {
+        schema_version: SCHEMA_VERSION_V2,
+        id: "draft@1".to_string(),
+        name: name.to_string(),
+        palette: RolePalette {
+            friendly: [
+                ColorPair {
+                    fill: "#5ad2e0".to_string(),
+                    outline: "#2e8fa0".to_string(),
+                    accent: None,
+                },
+                ColorPair {
+                    fill: "#38b6d6".to_string(),
+                    outline: "#1d7690".to_string(),
+                    accent: None,
+                },
+            ],
+            enemy: [
+                ColorPair {
+                    fill: "#ff7a59".to_string(),
+                    outline: "#b8452c".to_string(),
+                    accent: None,
+                },
+                ColorPair {
+                    fill: "#f2564e".to_string(),
+                    outline: "#a32f2e".to_string(),
+                    accent: None,
+                },
+            ],
+            free_for_all: [
+                ColorPair {
+                    fill: "#5ad2e0".to_string(),
+                    outline: "#2e8fa0".to_string(),
+                    accent: None,
+                },
+                ColorPair {
+                    fill: "#ff7a59".to_string(),
+                    outline: "#b8452c".to_string(),
+                    accent: None,
+                },
+                ColorPair {
+                    fill: "#93a3b5".to_string(),
+                    outline: "#5d6e81".to_string(),
+                    accent: None,
+                },
+                ColorPair {
+                    fill: "#f5c04a".to_string(),
+                    outline: "#a3781f".to_string(),
+                    accent: None,
+                },
+            ],
+        },
+        labels: LabelStyle::default(),
+        base: None,
+        celebration: None,
+        literals: BTreeMap::new(),
+        textures: Vec::new(),
+        period_ms: 2_400.0,
+        head_core: HeadCoreV2 {
+            ratio: 0.36,
+            color: "#10203a".to_string(),
+        },
+        layers: Vec::new(),
+    };
+
+    let layer = |name: &str, opacity: &str, body: LayerBodyV2| LayerV2 {
+        name: name.to_string(),
+        boost_only: false,
+        omit_on_single_cell: false,
+        opacity: PropExpr(opacity.to_string()),
+        transform: TransformV2::default(),
+        body,
+    };
+    let ribbon = |name: &str, region: RegionV2, slot: SlotName, extra_px: f64, tail_cap: bool| {
+        layer(
+            name,
+            "1",
+            LayerBodyV2::Ribbon {
+                region,
+                color: ColorRef::slot(slot),
+                extra_px,
+                joints: true,
+                tail_cap,
+            },
+        )
+    };
+    let glow = |length: f64, peak: f64| {
+        let mut glow = layer(
+            "Head glow",
+            &format!("(1 - s / {length}) * {peak}"),
+            LayerBodyV2::HeadRamp {
+                color: "#ffffff".to_string(),
+                length_cells: length,
+            },
+        );
+        glow.omit_on_single_cell = true;
+        glow
+    };
+
+    let mut minimal = base("My skin");
+    minimal.layers = vec![
+        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
+        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+    ];
+
+    let mut lit = base("Lit");
+    lit.layers = vec![
+        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
+        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+        glow(10.0, 0.3),
+    ];
+
+    let mut shine = base("Shine");
+    shine
+        .literals
+        .insert("gleam".to_string(), "#ffffff".to_string());
+    let stop = |offset: &str, target: ColorTarget, alpha: &str| StopV2 {
+        offset: PropExpr(offset.to_string()),
+        color: ColorRef {
+            target,
+            lighten: None,
+        },
+        alpha: PropExpr(alpha.to_string()),
+    };
+    shine.layers = vec![
+        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
+        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+        layer(
+            "Shine",
+            "1",
+            LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Silhouette,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Gradient {
+                    axis: GradientAxis::AlongBody,
+                    stops: vec![
+                        stop(
+                            "saw(time) - 0.12",
+                            ColorTarget::Slot {
+                                slot: SlotName::Fill,
+                            },
+                            "0",
+                        ),
+                        stop(
+                            "saw(time)",
+                            ColorTarget::Literal {
+                                literal: "gleam".to_string(),
+                            },
+                            "0.14",
+                        ),
+                        stop(
+                            "saw(time) + 0.12",
+                            ColorTarget::Slot {
+                                slot: SlotName::Fill,
+                            },
+                            "0",
+                        ),
+                    ],
+                },
+            },
+        ),
+        glow(10.0, 0.3),
+    ];
+
+    vec![
+        Template {
+            id: "minimal".to_string(),
+            label: "Minimal".to_string(),
+            help: "A body and an outline. Everything else is yours to add.".to_string(),
+            document: minimal,
+        },
+        Template {
+            id: "lit".to_string(),
+            label: "Lit".to_string(),
+            help: "Adds the brightening behind the head that tells players \
+                   which way you are going."
+                .to_string(),
+            document: lit,
+        },
+        Template {
+            id: "shine".to_string(),
+            label: "Shine".to_string(),
+            help: "A gleam that travels the length of the snake. Open its \
+                   stops to see how — the position reads the clock."
+                .to_string(),
+            document: shine,
+        },
+    ]
+}
+
 /// A document of either version, told apart by `schema_version`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnySkinDoc {
@@ -2009,6 +2223,29 @@ mod tests {
             },
         });
         assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+    }
+
+    /// A template is the first thing an author sees, so every one of them has
+    /// to be a skin that validates, renders and stays inside the budget. A
+    /// template that opened on an error would be the worst possible
+    /// introduction to the editor.
+    #[test]
+    fn every_template_is_a_skin_that_validates() {
+        let templates = templates();
+        assert!(!templates.is_empty());
+        for template in templates {
+            if let Err(errors) = validate_v2(&template.document) {
+                panic!("template `{}` does not validate: {errors:?}", template.id);
+            }
+            assert!(
+                predict_ops(&template.document) <= MAX_OPS_PER_SNAKE,
+                "template `{}` starts over budget",
+                template.id
+            );
+            // None of them may inherit the shipped document's exemption, which
+            // is only sound because none of them is the shipped document.
+            assert_ne!(template.document.id, "classic-doc@1");
+        }
     }
 
     #[test]
