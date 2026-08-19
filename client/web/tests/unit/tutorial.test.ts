@@ -69,7 +69,7 @@ test('custom games get no tutorial rather than a wrong one', () => {
   );
 });
 
-test('every mode names the boost key, and only collectible modes mention NOS', () => {
+test('every mode names the boost key, and only collectible modes mention fuel', () => {
   for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
     // Every matchmade mode has Boost on the same key.
     for (const mode of ['duel', '2v2', 'ffa', 'solo'] as const) {
@@ -79,13 +79,13 @@ test('every mode names the boost key, and only collectible modes mention NOS', (
     // The three contested modes fuel from pickups on the map...
     for (const mode of ['duel', '2v2', 'ffa'] as const) {
       const text = tutorialContent(mode, queueMode).steps.map((step) => step.body).join(' ');
-      assert.match(text, /NOS/, `${mode} must explain NOS`);
+      assert.match(text, /fuel/i, `${mode} must explain fuel`);
     }
     // ...but a solo tank never empties and has nothing to collect, so telling
     // a solo player to look for canisters would send them hunting for
     // objectives the map does not contain.
     const solo = tutorialContent('solo', queueMode).steps.map((step) => step.body).join(' ');
-    assert.doesNotMatch(solo, /NOS|canister/i, 'solo has no boost pickups');
+    assert.doesNotMatch(solo, /fuel|canister/i, 'solo has no boost pickups');
     assert.match(solo, /unlimited/i, 'solo must say the boost is unlimited');
   }
 });
@@ -263,7 +263,7 @@ test('the persistence key distinguishes ranked from casual for the same mode', (
   assert.equal(tutorialKey('duel', 'Quickmatch'), 'duel:casual');
 });
 
-test('touch surfaces teach the d-pad and NOS button instead of keyboard keys', () => {
+test('touch surfaces teach the d-pad and Boost button instead of keyboard keys', () => {
   for (const mode of MODES) {
     for (const inputMode of ['hold', 'toggle'] as const) {
       const touchCopy = tutorialContent(
@@ -276,11 +276,11 @@ test('touch surfaces teach the d-pad and NOS button instead of keyboard keys', (
 
       assert.doesNotMatch(touchCopy, /Space/, `${mode}:${inputMode} mentions Space on touch`);
       assert.doesNotMatch(touchCopy, /arrow keys/i, `${mode}:${inputMode} mentions arrow keys on touch`);
-      assert.match(touchCopy, /NOS button/, `${mode}:${inputMode} must name the NOS button`);
+      assert.match(touchCopy, /Boost button/, `${mode}:${inputMode} must name the Boost button`);
       if (inputMode === 'hold') {
-        assert.match(touchCopy, /hold the NOS button/i);
+        assert.match(touchCopy, /hold the Boost button/i);
       } else {
-        assert.match(touchCopy, /tap the NOS button/i);
+        assert.match(touchCopy, /tap the Boost button/i);
       }
     }
   }

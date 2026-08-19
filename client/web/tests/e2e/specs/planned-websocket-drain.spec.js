@@ -1023,7 +1023,7 @@ test('the pre-match guide reveals one animated real-arena step at a time', async
   await readyButton.focus();
   await expect.poll(() => modal.getAttribute('data-step'), { timeout: 6_500 }).toBe('2');
   await expect(readyButton).toBeFocused();
-  await expect(modal).toContainText('Collect NOS, then hold Space to boost.');
+  await expect(modal).toContainText('Collect fuel, then hold Space to boost.');
   await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
 
   await page.keyboard.press('Escape');
