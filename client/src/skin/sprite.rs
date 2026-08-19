@@ -238,6 +238,9 @@ struct Sheet {
     width: f64,
     height: f64,
     rows: usize,
+    /// Texels per cell of body the art was drawn for. Must match `CELL` in
+    /// `client/design/tools/sprite_sheet.py`, which is what wrote the file.
+    texels_per_cell: f64,
 }
 
 impl Sheet {
@@ -248,6 +251,21 @@ impl Sheet {
     /// declared so the two can never disagree.
     fn cells(&self) -> f64 {
         self.width / (self.height / self.rows as f64)
+    }
+
+    /// Cells of body one row covers **at authored scale**.
+    ///
+    /// The same as `cells()` for a sheet whose rows are one cell tall, which is
+    /// every coat. They part company for a picture: a flag's row is 1.4 cells
+    /// tall, so its aspect says 14.5 cells while it was drawn to span 20.
+    fn cells_long(&self) -> f64 {
+        self.width / self.texels_per_cell
+    }
+
+    /// How tall a row is, in cells, at authored scale. Above 1 means the body
+    /// clips it — see [`Fit::Cutout`].
+    fn cells_tall(&self) -> f64 {
+        (self.height / self.rows as f64) / self.texels_per_cell
     }
 }
 
@@ -387,6 +405,7 @@ static TIGER_LIVE: Recipe = Recipe {
         width: 896.0,
         height: 320.0,
         rows: DEFAULT_SPRITE_ROWS,
+        texels_per_cell: 16.0,
     },
     wear: living_coat(0.0),
     base: SAVANNA_BASE,
@@ -414,6 +433,7 @@ static ZEBRA_LIVE: Recipe = Recipe {
         width: 576.0,
         height: 320.0,
         rows: DEFAULT_SPRITE_ROWS,
+        texels_per_cell: 16.0,
     },
     // Half a cell of travel per animation cycle, backwards: the marks creep
     // *toward* the head, which reads as the snake sliding forwards through its
@@ -454,9 +474,10 @@ static STARS_AND_STRIPES: Recipe = Recipe {
     ramp_rgb: (255, 250, 245),
     sheet: Sheet {
         url: "images/skins/stars-and-stripes.v1.png",
-        width: 448.0,
-        height: 320.0,
+        width: 320.0,
+        height: 440.0,
         rows: DEFAULT_SPRITE_ROWS,
+        texels_per_cell: 16.0,
     },
     wear: Wear {
         from: Anchor::Head,
@@ -520,6 +541,7 @@ static RACE_LIVERY: Recipe = Recipe {
         width: 1280.0,
         height: 320.0,
         rows: DEFAULT_SPRITE_ROWS,
+        texels_per_cell: 16.0,
     },
     wear: living_coat(0.0),
     base: GARAGE_BASE,
@@ -623,7 +645,14 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
         Region::Body,
         Span {
             from: recipe.wear.from,
-            natural: recipe.wear.cells.or((!recipe.wear.repeat).then_some(cells)),
+            // A picture spans what it was *drawn* to span, not what its
+            // aspect implies: the flag's row is 1.4 cells tall, so its aspect
+            // says 14.5 cells while it was authored for 20. Using the aspect
+            // here would cut the flag short and nothing would say so.
+            natural: recipe
+                .wear
+                .cells
+                .or((!recipe.wear.repeat).then(|| recipe.sheet.cells_long())),
             // A sprite squeezed below a few cells is a smear rather than a
             // picture, so it steps aside and lets the base show instead.
             min: if recipe.wear.repeat { 0.0 } else { 3.0 },
@@ -636,7 +665,9 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
                     cells_per_repeat: Some(cells),
                 }
             } else {
-                Fit::Clip
+                Fit::Cutout {
+                    cells_tall: recipe.sheet.cells_tall(),
+                }
             },
             fade: recipe.wear.fade,
             drift_cells: tuning.drift_cells,
@@ -1094,6 +1125,7 @@ mod tests {
             width: 320.0,
             height: 320.0,
             rows: 20,
+            texels_per_cell: 16.0,
         };
         assert_eq!(square.cells(), 20.0);
         // Same 16px rows, twice the width: twice the repeat, same texel density.
@@ -1215,6 +1247,55 @@ mod tests {
 
         // Put it back, so test order cannot matter.
         assert!(tune("zebra-live@1", Tuning::of(zebra.0)));
+    }
+
+    /// A picture is drawn at authored scale and clipped, not squashed to fit.
+    ///
+    /// The flag is 14.7 times wider than tall, so mapping its full height onto
+    /// one cell — which is what every other fit does, correctly, for a texture —
+    /// compressed it until it read as wrapped round a cylinder. `Fit::Cutout`
+    /// draws it taller than the body instead and lets the silhouette clip trim
+    /// the slivers.
+    #[test]
+    fn a_picture_sheet_is_drawn_taller_than_the_body_and_clipped() {
+        let flag = by_id("stars-and-stripes@1");
+        let sheet = flag.0.sheet;
+        assert!(
+            sheet.cells_tall() > 1.0,
+            "a picture worth clipping has to overflow the body: {}",
+            sheet.cells_tall()
+        );
+        // Authored scale in both axes, which is what makes it undistorted: the
+        // row's aspect and its cells-long-by-cells-tall must agree.
+        let drawn_aspect = sheet.cells_long() / sheet.cells_tall();
+        let row_aspect = sheet.width / (sheet.height / sheet.rows as f64);
+        assert!(
+            (drawn_aspect - row_aspect).abs() < 1e-6,
+            "the flag would be stretched: drawn {drawn_aspect:.3} vs source {row_aspect:.3}"
+        );
+
+        // And the engine actually emits it taller than one cell.
+        let ops = ops(flag, &[(0.0, 0.0), (30.0, 0.0)], 0.0);
+        let heights: Vec<f64> = ops
+            .iter()
+            .filter_map(|op| match op {
+                PaintOp::DrawImage {
+                    dest: (_, dy, _, dh),
+                    ..
+                } => Some((*dy, *dh)),
+                _ => None,
+            })
+            .map(|(dy, dh)| {
+                // Centred on the centreline, so the top edge is -h/2.
+                assert!((dy + dh / 2.0).abs() < 1e-9, "not centred: {dy} {dh}");
+                dh
+            })
+            .collect();
+        assert!(!heights.is_empty());
+        assert!(
+            heights.iter().all(|h| *h > 1.0),
+            "the picture must overflow the body: {heights:?}"
+        );
     }
 
     /// The declared dimensions and the committed PNG cannot drift, because the

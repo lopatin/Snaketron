@@ -499,6 +499,79 @@ def repair_centre(lama, image, axis, slice_fraction=SLICE_FRACTION):
 CELLS_PER_MARK = 2.2
 
 
+def vertical_period(image):
+    """The lag at which the source starts repeating itself downwards, in pixels.
+
+    Reported because the sheet's `y` axis is **time**, so its whole height is
+    one loop of the animation — and a source that stacks fifteen copies of a
+    picture makes that loop fifteen pictures long. The flag showed this
+    plainly: one row of twenty spanned 63 source pixels, which is nine stripes
+    and part of a canton crammed into a single cell of body *width*. Drawn on a
+    snake that reads as the picture wrapped around a cylinder, and playing the
+    rows rolls it.
+
+    Returned rather than acted on. A homogeneous texture has a period too — the
+    fur grain, eight pixels on both animals here — and cropping to it would be
+    absurd. Only the author knows whether a period is a *picture* repeating or
+    a weave.
+    """
+    grey = np.asarray(image.convert("RGB"), dtype=np.float64) @ np.array(
+        [0.2126, 0.7152, 0.0722]
+    )
+    profile = grey.mean(axis=1)
+    profile = profile - profile.mean()
+    if not np.any(profile):
+        return image.height
+    spectrum = np.fft.rfft(profile)
+    correlation = np.fft.irfft((spectrum * np.conj(spectrum)).real, n=profile.size)
+    correlation = correlation / correlation[0]
+    low = max(8, profile.size // 200)
+    high = max(low + 1, profile.size // 2)
+    return low + int(np.argmax(correlation[low:high]))
+
+
+def crop_to_period(image, period):
+    """Keep `period` pixels of height, so the sheet spans exactly one loop."""
+    period = int(min(max(period, 8), image.height))
+    top = (image.height - period) // 2
+    return image.crop((0, top, image.width, top + period))
+
+
+def frames_from_period(image, rows, cell, cells_long):
+    """Build a sheet whose every row is **one whole repeat** of the source.
+
+    For a *picture* that tiles down the image — a flag, not fur — the ordinary
+    reading is wrong. The sheet's height is one loop of the animation, so
+    spanning fifteen stacked flags puts 0.7 of a flag in every row, and a row is
+    one cell of body *width*: the whole picture ends up crammed across the
+    snake, which reads as wrapped round a cylinder.
+
+    Here each row is instead one full repeat, sampled at a different phase down
+    the source. The source's own stack of copies is already a sequence of wave
+    phases, so playing the rows animates the picture rather than scrolling
+    through duplicates of it — and each frame is a complete, undistorted flag.
+
+    Rows are as tall as the repeat's real aspect demands, which for a 14.7:1
+    flag is a little over one cell. `Fit::Cutout` draws that at authored scale
+    and the body clips the slivers.
+    """
+    period = vertical_period(image)
+    width = cells_long * cell
+    # Uniform scale in both axes — the whole point is that nothing is squashed.
+    scale = width / image.width
+    row_height = max(1, int(round(period * scale)))
+    sheet = Image.new("RGB", (width, row_height * rows))
+    for row in range(rows):
+        # Evenly spaced phases through the source's stack of repeats.
+        top = int(round(row * (image.height - period) / max(1, rows - 1)))
+        window = image.crop((0, top, image.width, top + period))
+        sheet.paste(
+            window.resize((width, row_height), Image.Resampling.LANCZOS),
+            (0, row * row_height),
+        )
+    return sheet, row_height
+
+
 def rotate_field(image, degrees):
     """Turn the texture, sampling from a tiling so no corner comes up empty.
 
@@ -629,6 +702,7 @@ def process(
     resize_first=True,
     cells=None,
     rotate=0.0,
+    period=None,
 ):
     """One image, end to end. Returns a report dict; never raises on a bad seam.
 
@@ -651,6 +725,11 @@ def process(
     # neighbourhood by clamping, which would either fabricate a join that is not
     # in the source or hide one that is.
     source = rotate_field(original, rotate)
+    detected = vertical_period(source)
+    cropped = None
+    if period:
+        source = crop_to_period(source, detected if period == "auto" else int(period))
+        cropped = source.height
     cells = cells or cells_for(source, rows, cell)
     width = cells * cell
     source = wrapped_resize(source, rows * cell, width) if resize_first else source
@@ -661,6 +740,8 @@ def process(
         "working_size": [source.width, source.height],
         "rows": rows,
         "rotation_degrees": rotate,
+        "vertical_period": detected,
+        "cropped_to_period": cropped,
         "repaired": [],
         "status": "ok",
     }
@@ -918,6 +999,11 @@ def describe(report):
             f"\n      {label:20s} {ladder}   align {align.get('mad', 0):.1f} MAD "
             f"(lag {align.get('lag', 0):+d}px)"
         )
+    if report.get("vertical_period"):
+        line += (
+            f"\n      source repeats every {report['vertical_period']}px down"
+            f"{' — cropped to one' if report.get('cropped_to_period') else ''}"
+        )
     if report.get("rotation_degrees"):
         line += f"\n      rotated {report['rotation_degrees']:g} degrees before measuring"
     for note in report.get("ignored", []):
@@ -950,6 +1036,13 @@ if __name__ == "__main__":
     parser.add_argument("images", nargs="+")
     parser.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     parser.add_argument("--cell", type=int, default=CELL, help="texels per row")
+    parser.add_argument(
+        "--period",
+        default=None,
+        help="crop the source's height to one loop: 'auto', or a pixel count. "
+        "Use when the source stacks copies of a picture; leave off for a "
+        "homogeneous texture, whose period is just its grain",
+    )
     parser.add_argument(
         "--rotate",
         type=float,
@@ -1009,6 +1102,7 @@ if __name__ == "__main__":
             colors=args.colors,
             cells=args.cells,
             rotate=args.rotate,
+            period=args.period,
         )
         reports.append(report)
         print(describe(report))

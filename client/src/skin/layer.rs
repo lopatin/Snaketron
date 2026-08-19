@@ -182,6 +182,26 @@ pub enum Fit {
         /// resolution suits it and then worn at whatever scale reads best.
         cells_per_repeat: Option<f64>,
     },
+    /// Draw at the art's **authored scale** and let the body clip the rest.
+    ///
+    /// Every other fit maps the source's height onto exactly one cell, which is
+    /// the right answer for a texture — a coat is one cell wide because a snake
+    /// is. It is the wrong answer for a *picture*. A flag is 14.7 times wider
+    /// than it is tall; squeezing its full height into one cell squashes it,
+    /// and the alternative of showing only a thin band throws the picture away.
+    ///
+    /// So this one keeps the art's proportions and draws it **taller than the
+    /// body**, centred on the centreline. The silhouette clip every body span
+    /// already carries does the rest, so the snake becomes a window onto the
+    /// picture: on a 1.4-cell-tall flag it hides the outermost slivers and
+    /// shows the rest undistorted, and a turn reveals a different part of it.
+    ///
+    /// Costs nothing extra — the overflow is clipped, not painted — and the op
+    /// count is unchanged.
+    Cutout {
+        /// The region's height, in cells, at the scale it was authored for.
+        cells_tall: f64,
+    },
 }
 
 impl Fit {

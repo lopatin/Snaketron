@@ -1302,6 +1302,41 @@ impl CompositeSkin {
                             }
                             failed
                         }
+                        // A picture at authored scale, drawn taller than the
+                        // body so the silhouette clip trims it. The overflow
+                        // costs nothing: it is clipped, never rasterised.
+                        crate::skin::layer::Fit::Cutout { cells_tall } => {
+                            let tall = cells_tall.max(1e-6);
+                            // One cell of body is `sh / tall` source pixels,
+                            // in **both** axes — that is what "authored scale"
+                            // means and why the picture comes out undistorted.
+                            let source_per_cell = sh / tall;
+                            fade_pieces(fade.as_ref(), allocation, start, end, &mut pieces);
+                            let mut failed = None;
+                            for &(a, b, alpha) in &pieces {
+                                let offset = (a - allocation.start) * source_per_cell;
+                                let (slice_x, slice_w) = (sx + offset, (b - a) * source_per_cell);
+                                let clipped_w = slice_w.min((sx + sw - slice_x).max(0.0));
+                                if clipped_w <= 0.0 {
+                                    continue;
+                                }
+                                if faded {
+                                    ctx.set_global_alpha(base_alpha * alpha);
+                                }
+                                let drawn_cells = clipped_w / source_per_cell.max(1e-6);
+                                failed = ctx
+                                    .draw_image(
+                                        image,
+                                        (slice_x, sy, clipped_w, sh),
+                                        (a - run.s0, -tall / 2.0, drawn_cells, tall),
+                                    )
+                                    .err();
+                                if failed.is_some() {
+                                    break;
+                                }
+                            }
+                            failed
+                        }
                         // A sprite: one blit, at natural scale or squeezed.
                         fit => {
                             // How much of the source one cell of body consumes.
