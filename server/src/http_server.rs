@@ -332,6 +332,14 @@ pub async fn install_http_application(
             "/api/skins/:skin_id",
             put(skins::update_skin).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
+        .route(
+            "/api/skins/:skin_id/publish-request",
+            post(skins::request_publication),
+        )
+        .route(
+            "/api/skins/:skin_id/report",
+            post(skins::report_skin).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -340,6 +348,10 @@ pub async fn install_http_application(
 
     let admin_routes = Router::new()
         .route("/api/admin/history", get(admin::get_admin_history))
+        .route(
+            "/api/admin/skins/:skin_id/status",
+            put(skins::admin_set_status).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/admin/config",
             get(admin::get_admin_config)

@@ -686,6 +686,200 @@ async fn load_visible_skin(
     Ok(skin)
 }
 
+// ---------------------------------------------------------------------------
+// Review, reporting, and the kill switch
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportRequest {
+    /// Why this was reported. A closed set, so the queue can be triaged
+    /// without reading every note.
+    pub reason: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+const REPORT_REASONS: &[&str] = &["offensive", "impersonation", "copyright", "other"];
+const MAX_REPORT_NOTE_LENGTH: usize = 500;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdminStatusRequest {
+    /// One of `published`, `unpublished`, `disabled`, `private`.
+    pub publication: String,
+    /// Which revision to publish. Required when publishing, ignored otherwise.
+    #[serde(default)]
+    pub revision: Option<u32>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Ask for a skin to be reviewed.
+pub async fn request_publication(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(skin_id): Path<i32>,
+) -> Result<Response, SkinsApiError> {
+    let skin = load_visible_skin(&state, skin_id, &auth_user).await?;
+    if !skin.may_edit(auth_user.user_id, auth_user.is_admin) {
+        return Err(SkinsApiError::NotFound);
+    }
+    if skin.publication == Publication::Disabled {
+        return Err(SkinsApiError::Gone);
+    }
+
+    state
+        .db
+        .set_skin_pending_revision(skin_id, Some(skin.head_revision))
+        .await
+        .map_err(SkinsApiError::Internal)?;
+
+    let mut response = StatusCode::ACCEPTED.into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// Report a skin.
+///
+/// Deliberately available from the moment player content can reach another
+/// player's screen, rather than arriving with the admin queue UI later: the
+/// report path and the kill switch are what bound the window between a draft
+/// being worn in a public match and a human having looked at it.
+pub async fn report_skin(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(skin_id): Path<i32>,
+    Json(request): Json<ReportRequest>,
+) -> Result<Response, SkinsApiError> {
+    if !REPORT_REASONS.contains(&request.reason.as_str()) {
+        return Err(SkinsApiError::Invalid(vec![format!(
+            "reason: must be one of {}",
+            REPORT_REASONS.join(", ")
+        )]));
+    }
+    if request
+        .note
+        .as_ref()
+        .is_some_and(|note| note.chars().count() > MAX_REPORT_NOTE_LENGTH)
+    {
+        return Err(SkinsApiError::Invalid(vec![format!(
+            "note: must be at most {MAX_REPORT_NOTE_LENGTH} characters"
+        )]));
+    }
+
+    let skin = state
+        .db
+        .get_skin(skin_id)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or(SkinsApiError::NotFound)?;
+
+    // A report is a review request against the skin's current head, recorded
+    // with its reporter so an abusive reporter is as visible as abusive content.
+    let note = match &request.note {
+        Some(note) => format!(
+            "reported ({}) by {}: {note}",
+            request.reason, auth_user.username
+        ),
+        None => format!("reported ({}) by {}", request.reason, auth_user.username),
+    };
+    state
+        .db
+        .set_skin_publication(
+            skin_id,
+            skin.publication,
+            None,
+            auth_user.user_id,
+            Some(&note),
+        )
+        .await
+        .map_err(SkinsApiError::Internal)?;
+
+    let mut response = StatusCode::ACCEPTED.into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// Approve, reject, withdraw, or take down a skin.
+pub async fn admin_set_status(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(skin_id): Path<i32>,
+    Json(request): Json<AdminStatusRequest>,
+) -> Result<Response, SkinsApiError> {
+    let publication = Publication::parse(&request.publication).ok_or_else(|| {
+        SkinsApiError::Invalid(vec![format!(
+            "publication: {} is not a publication state",
+            request.publication
+        )])
+    })?;
+
+    let skin = state
+        .db
+        .get_skin(skin_id)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or(SkinsApiError::NotFound)?;
+
+    // Publishing means approving one specific revision, so the approval and the
+    // publication move together. The revision defaults to whatever review was
+    // asked about rather than to the head, because the head may have moved
+    // since — approving something an admin never looked at is the one mistake
+    // this endpoint must not make easy.
+    let published_revision = if publication == Publication::Published {
+        let revision = request
+            .revision
+            .or(skin.pending_revision)
+            .or(skin.published_revision)
+            .ok_or_else(|| {
+                SkinsApiError::Invalid(vec![
+                    "revision: nothing has been submitted for review".to_string(),
+                ])
+            })?;
+        state
+            .db
+            .approve_skin_revision(skin_id, revision)
+            .await
+            .map_err(SkinsApiError::Internal)?;
+        Some(revision)
+    } else {
+        None
+    };
+
+    state
+        .db
+        .set_skin_publication(
+            skin_id,
+            publication,
+            published_revision,
+            auth_user.user_id,
+            request.reason.as_deref(),
+        )
+        .await
+        .map_err(SkinsApiError::Internal)?;
+
+    // Whatever the decision, the review request is answered. Rejecting an edit
+    // clears only this — a published skin keeps its previously approved
+    // revision, so a rejection cannot silently unpublish anything.
+    state
+        .db
+        .set_skin_pending_revision(skin_id, None)
+        .await
+        .map_err(SkinsApiError::Internal)?;
+
+    let updated = state
+        .db
+        .get_skin(skin_id)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or(SkinsApiError::NotFound)?;
+
+    let mut response = Json(SkinSummary::of(&updated, Some(auth_user.user_id))).into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +982,75 @@ mod tests {
             validate_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap(),
             Some(None)
         );
+    }
+
+    #[test]
+    fn a_report_must_name_one_of_the_known_reasons() {
+        for reason in REPORT_REASONS {
+            let body = format!(r#"{{"reason":"{reason}"}}"#);
+            let request: ReportRequest = serde_json::from_str(&body).expect("parses");
+            assert!(REPORT_REASONS.contains(&request.reason.as_str()));
+        }
+        let freeform: ReportRequest =
+            serde_json::from_str(r#"{"reason":"because I said so"}"#).expect("parses");
+        assert!(
+            !REPORT_REASONS.contains(&freeform.reason.as_str()),
+            "an unrecognised reason is refused by the handler"
+        );
+    }
+
+    /// Documents are accepted by the same validator the Builder runs, so a
+    /// document the editor passed is a document this route stores — and the
+    /// bytes it stores are the ones its reference names.
+    #[test]
+    fn an_accepted_document_is_canonical_and_named_by_its_own_hash() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/aurora.skin.json"))
+                .expect("the shipped document parses");
+
+        let (canonical, reference, schema_version) =
+            accept_document(&document).expect("a shipped document is valid");
+
+        assert_eq!(schema_version, skin_schema::SCHEMA_VERSION);
+        assert!(skin_schema::content::is_content_ref(&reference));
+        assert_eq!(
+            reference,
+            skin_schema::content::reference_for_bytes(canonical.as_bytes()),
+            "the stored bytes must be the ones the reference names"
+        );
+
+        // Canonical form is stable: re-accepting what we stored is a no-op.
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&canonical).expect("canonical bytes are JSON");
+        let (again, same_reference, _) = accept_document(&reparsed).expect("still valid");
+        assert_eq!(canonical, again);
+        assert_eq!(reference, same_reference);
+    }
+
+    /// The validator is the gate, and it is the shared one — a document that
+    /// would paint a teammate in enemy colours is refused here, not left for a
+    /// player to discover mid-match.
+    #[test]
+    fn a_document_the_shared_validator_rejects_is_refused() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/aurora.skin.json"))
+                .expect("parses");
+        // Give the friendly palette an enemy-red fill.
+        document["palette"]["friendly"][0]["fill"] = serde_json::json!("#ff2b2b");
+
+        let error = accept_document(&document).expect_err("hue windows are enforced");
+        let SkinsApiError::Invalid(problems) = error else {
+            panic!("expected a validation error");
+        };
+        assert!(!problems.is_empty());
+    }
+
+    #[test]
+    fn a_name_must_be_present_and_bounded() {
+        assert!(accept_name("  Tidal  ").is_ok());
+        assert_eq!(accept_name(" Tidal ").unwrap(), "Tidal");
+        assert!(accept_name("   ").is_err());
+        assert!(accept_name(&"x".repeat(MAX_SKIN_NAME_LENGTH + 1)).is_err());
     }
 
     #[test]
