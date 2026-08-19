@@ -26,15 +26,81 @@
 //! Natively — in the golden and conformance suites — no image is ever ready.
 //! That is deliberate: the no-atlas path is the one that has to be correct on
 //! every skin, so it is the one the test suite exercises by default.
+//!
+//! **Fetching is lazy, and that is a product decision rather than an
+//! optimisation.** A skin's pixels are requested the first time that skin
+//! actually paints, so a player wearing one texture does not download the other
+//! two. The cost is that a surface which paints *once* — a roster glyph, a
+//! contact-sheet tile — can render before the pixels arrive and never look
+//! again. [`any_pending`] is what those surfaces wait on; the arena, which
+//! repaints every frame, needs nothing.
 
-// The compositor's surface runs ahead of the skins that ship on it: every item
-// below is implemented and covered by the test suite, but the six catalogue
-// skins are all the classic-shaped stack, so the non-test build never reaches
-// them. That is the intended state after `specs/skin-shading-prd.md` S7-S8 —
-// the engine gained spans, tiling, images and corner policies before any
-// first-party skin needed them. Deleting them to satisfy the lint would delete
-// the features; the alternative is to say so here.
+// `image_count`/`region_count` exist for registration-time validation and for
+// tests; the paint path reaches regions by index. See the same note in
+// `skin::layer`.
 #![allow(dead_code)]
+
+/// One skin's atlas: the images it draws from, and the rectangles inside them.
+///
+/// Images are named by **versioned relative URL**, resolved against the page's
+/// `<base href>` so an embedded build under a non-root path finds them too.
+/// A URL is turned into a store handle at most once, on the first frame that
+/// wants it, which is what keeps the fetch lazy without making the skin carry
+/// mutable state.
+#[derive(Debug, Default)]
+pub struct Atlas {
+    images: Vec<Image>,
+    regions: Vec<AtlasRegion>,
+}
+
+/// One atlas image, and the store handle it resolves to once requested.
+#[derive(Debug)]
+struct Image {
+    url: String,
+    handle: std::sync::OnceLock<usize>,
+}
+
+impl Atlas {
+    /// An atlas over `urls`, whose regions index into that list by position.
+    pub fn new(urls: impl IntoIterator<Item = String>, regions: Vec<AtlasRegion>) -> Self {
+        Self {
+            images: urls
+                .into_iter()
+                .map(|url| Image {
+                    url,
+                    handle: std::sync::OnceLock::new(),
+                })
+                .collect(),
+            regions,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty() && self.images.is_empty()
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    pub fn region(&self, index: usize) -> Option<&AtlasRegion> {
+        self.regions.get(index)
+    }
+
+    /// The store handle for one image, requesting it if this is the first ask.
+    ///
+    /// Painting is synchronous and decoding is not, so this never waits: it
+    /// hands back a handle that may not be drawable yet, and the blit is a
+    /// no-op until it is.
+    pub fn handle(&self, image: usize) -> Option<usize> {
+        let image = self.images.get(image)?;
+        Some(*image.handle.get_or_init(|| request(&image.url)))
+    }
+}
 
 /// A named rectangle inside an atlas.
 ///
@@ -42,6 +108,20 @@
 /// Arc lengths are not integers, so fractional source coordinates are
 /// unavoidable, and bilinear sampling will otherwise pull a neighbouring
 /// region's pixels in along the seams.
+///
+/// A region tiled along the body ([`crate::skin::layer::Fit::Tile`]) is the one
+/// exception on its left and right edges, and it has to be: padding there would
+/// put a transparent gap between every repeat. Such a region must instead reach
+/// the image's own edges and be authored to **wrap** — the pixels at `x = 0`
+/// continuing the pixels at `x = w - 1` — so the clamp canvas applies at an
+/// image edge lands on matching colour instead of a seam.
+///
+/// A sprite sheet's rows are the same exception in `y`, and there the bleed is
+/// not merely tolerable but wanted: a row is downsampled hard — sixty source
+/// pixels into a fifteen-pixel cell — so a neighbouring row inevitably mixes
+/// in, and neighbouring rows are *adjacent moments of the same animation*.
+/// What would be a stranger's pixels in an atlas is a frame of motion blur
+/// here. Padding the rows apart would replace it with transparent gaps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtlasRegion {
     /// Index into the skin's image list.
@@ -50,20 +130,78 @@ pub struct AtlasRegion {
     pub y: f64,
     pub width: f64,
     pub height: f64,
-    /// A strip of equally sized frames laid out along `x`, animated by moving
-    /// the source rectangle. One `drawImage` with different arguments, so
-    /// op-count invariance is satisfied by construction.
+    /// Equally sized frames animated by moving the source rectangle. One
+    /// `drawImage` with different arguments, so op-count invariance is
+    /// satisfied by construction.
     pub frames: Option<FrameStrip>,
 }
 
+/// Which way a region's frames are laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameAxis {
+    /// Side by side along `x`. Each frame is a small whole picture and the
+    /// region's width is divided between them — a sprite that plays.
+    X,
+    /// Stacked down `y`: **one row per moment**, each row spanning the full
+    /// width. This is the sprite-sheet layout, and it is a different shape of
+    /// art from the one above rather than the same idea rotated. A row is a
+    /// whole snake's worth of skin — `x` is distance along the body, from the
+    /// head — so playing the rows in order animates the coat *in place*
+    /// instead of moving a picture around.
+    Y,
+}
+
+/// Frames laid out inside one region, and how fast they play.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameStrip {
     pub count: usize,
     /// Turns through the animation cycle per full pass over the strip.
     pub cycles: f64,
+    pub axis: FrameAxis,
+}
+
+/// Rows in a sprite sheet when the author has not said otherwise.
+///
+/// A square sheet at this many rows is also, and not by accident, this many
+/// cells long: one row is one cell tall, so the sheet's own aspect makes
+/// `Fit::Tile`'s default repeat and `Fit::Clip`'s natural scale agree without
+/// either being told the number.
+pub const DEFAULT_SPRITE_ROWS: usize = 20;
+
+impl FrameStrip {
+    /// A sprite sheet: `count` rows, one cycle per animation period.
+    pub const fn rows(count: usize) -> Self {
+        Self {
+            count,
+            cycles: 1.0,
+            axis: FrameAxis::Y,
+        }
+    }
 }
 
 impl AtlasRegion {
+    /// A whole image read as a sprite sheet of `rows` rows.
+    pub fn sheet(image: usize, width: f64, height: f64, rows: usize) -> Self {
+        Self {
+            image,
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            frames: Some(FrameStrip::rows(rows)),
+        }
+    }
+
+    /// How many cells of body one frame of this region covers at its own scale.
+    ///
+    /// One row is one cell across the body, so a frame's aspect *is* its length
+    /// in cells. Both `Fit::Clip` and `Fit::Tile` derive their scale from this,
+    /// which is why a square sheet needs no measurements written down anywhere.
+    pub fn frame_cells(&self, time: f64) -> f64 {
+        let (_, _, width, height) = self.source_rect(time);
+        width / height.max(1e-6)
+    }
+
     /// The source rectangle for one moment in the animation cycle.
     ///
     /// `time` is in turns. A region with no strip ignores it entirely, which is
@@ -74,15 +212,28 @@ impl AtlasRegion {
             return (self.x, self.y, self.width, self.height);
         };
         let count = strip.count.max(1);
-        let frame_width = self.width / count as f64;
         let phase = (time * strip.cycles).rem_euclid(1.0);
-        let index = ((phase * count as f64).floor() as usize).min(count - 1);
-        (
-            self.x + index as f64 * frame_width,
-            self.y,
-            frame_width,
-            self.height,
-        )
+        let index = ((phase * count as f64).floor() as usize).min(count - 1) as f64;
+        match strip.axis {
+            FrameAxis::X => {
+                let frame_width = self.width / count as f64;
+                (
+                    self.x + index * frame_width,
+                    self.y,
+                    frame_width,
+                    self.height,
+                )
+            }
+            FrameAxis::Y => {
+                let frame_height = self.height / count as f64;
+                (
+                    self.x,
+                    self.y + index * frame_height,
+                    self.width,
+                    frame_height,
+                )
+            }
+        }
     }
 }
 
@@ -100,8 +251,19 @@ pub fn request(_url: &str) -> usize {
     0
 }
 
+/// Whether any requested image is still in flight.
+///
+/// Natively this is always `false`, and the two answers are consistent rather
+/// than contradictory: nothing outside a browser ever *starts* a fetch, so
+/// nothing is pending and the fallback is the permanent state. A surface that
+/// paints once waits on this; the arena, which repaints continuously, does not.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn any_pending() -> bool {
+    false
+}
+
 #[cfg(target_arch = "wasm32")]
-pub use browser::{image_element, is_ready, request};
+pub use browser::{any_pending, image_element, is_ready, request};
 
 /// A stub so the non-wasm build can still name the symbol the painter calls.
 #[cfg(not(target_arch = "wasm32"))]
@@ -175,6 +337,20 @@ mod browser {
                 .map(|entry| entry.element.clone())
         })
     }
+
+    /// Whether any requested image has neither decoded nor given up.
+    ///
+    /// `complete` covers both outcomes, which is what makes this settle rather
+    /// than hang: an atlas that 404s stops being pending, and the surface
+    /// waiting on it repaints once and keeps its fallback.
+    pub fn any_pending() -> bool {
+        IMAGES.with(|images| {
+            images
+                .borrow()
+                .iter()
+                .any(|entry| !entry.element.complete())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -188,8 +364,56 @@ mod tests {
             y: 20.0,
             width: 80.0,
             height: 16.0,
-            frames: Some(FrameStrip { count, cycles }),
+            frames: Some(FrameStrip {
+                count,
+                cycles,
+                axis: FrameAxis::X,
+            }),
         }
+    }
+
+    /// A sprite sheet walks *down* its rows: each row is a whole body's worth
+    /// of skin, so the source rectangle is full width and one row tall.
+    #[test]
+    fn a_sprite_sheet_walks_its_rows_in_order_and_stays_in_bounds() {
+        let sheet = AtlasRegion::sheet(0, 1000.0, 500.0, 20);
+        assert_eq!(sheet.source_rect(0.0), (0.0, 0.0, 1000.0, 25.0));
+        assert_eq!(sheet.source_rect(0.05), (0.0, 25.0, 1000.0, 25.0));
+        assert_eq!(sheet.source_rect(0.5), (0.0, 250.0, 1000.0, 25.0));
+        // Rows are visited in order, once each, and the cycle closes.
+        let rows: Vec<f64> = (0..20)
+            .map(|step| sheet.source_rect(step as f64 / 20.0).1)
+            .collect();
+        assert_eq!(
+            rows,
+            (0..20).map(|row| row as f64 * 25.0).collect::<Vec<_>>()
+        );
+        assert_eq!(sheet.source_rect(1.0), sheet.source_rect(0.0));
+        for time in [0.0, 0.999_999, 7.25, -2.3] {
+            let (_, y, _, height) = sheet.source_rect(time);
+            assert!(
+                y >= 0.0 && y + height <= 500.0,
+                "row at {time} left the sheet: {y} + {height}"
+            );
+        }
+    }
+
+    /// The property that lets a square sheet carry no measurements: one row is
+    /// one cell tall, so a frame's aspect is its length in cells. Twenty rows
+    /// of a square sheet is twenty cells of body, and both fits agree on it.
+    #[test]
+    fn a_square_sheet_is_as_many_cells_long_as_it_has_rows() {
+        for rows in [4, 12, DEFAULT_SPRITE_ROWS, 32] {
+            let sheet = AtlasRegion::sheet(0, 1248.0, 1248.0, rows);
+            assert!(
+                (sheet.frame_cells(0.0) - rows as f64).abs() < 1e-9,
+                "a square sheet of {rows} rows should be {rows} cells long"
+            );
+        }
+        // A non-square sheet is believed rather than corrected: the author
+        // chose the aspect, and `cells_per_repeat` is there to override it.
+        let wide = AtlasRegion::sheet(0, 2000.0, 1000.0, 20);
+        assert!((wide.frame_cells(0.0) - 40.0).abs() < 1e-9);
     }
 
     /// A frame strip is one `drawImage` whose source rectangle moves. Nothing
@@ -237,5 +461,38 @@ mod tests {
     fn no_atlas_is_ready_outside_a_browser() {
         assert!(!is_ready(request("skins/example/atlas.v1.png")));
         assert!(image_element(0).is_none());
+        assert!(
+            !any_pending(),
+            "nothing outside a browser ever starts a fetch, so nothing may \
+             report as still arriving"
+        );
+    }
+
+    /// A URL becomes a store handle at most once. Resolving per frame would
+    /// turn a lazy fetch into a lookup on the hot path, and the handle is
+    /// exactly the kind of thing a skin must not have to hold mutably.
+    #[test]
+    fn an_atlas_resolves_each_image_once_and_only_on_demand() {
+        let atlas = Atlas::new(
+            ["images/skins/example.v1.png".to_string()],
+            vec![AtlasRegion {
+                image: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 96.0,
+                height: 16.0,
+                frames: None,
+            }],
+        );
+
+        assert_eq!(atlas.image_count(), 1);
+        assert_eq!(atlas.region_count(), 1);
+        assert!(!atlas.is_empty());
+        let first = atlas.handle(0).expect("image 0 exists");
+        assert_eq!(atlas.handle(0), Some(first), "the handle is stable");
+        assert_eq!(atlas.handle(1), None, "there is no second image");
+        assert!(atlas.region(1).is_none());
+
+        assert!(Atlas::default().is_empty());
     }
 }

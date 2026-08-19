@@ -559,8 +559,14 @@ The rewrite is feasible and lower-risk than it looks, because the current code a
 
 Proceed with the hybrid trait-plus-document design. Treat golden capture, the conformance suite landing with the trait, the hue validator, and the dogfooded skill run as launch prerequisites.
 
-> **Update (skin shading engine, S2).** Gate 2 now exists:
-> `client/web/tests/skins/skin-parity.spec.mjs` compares every shipped skin
-> against a committed baseline sheet in a headless browser, and the
-> `skin-pixels` CI job runs it on every pull request. Section 15.5's account of
-> what was missing is left intact as the record of how it was missing.
+> **Update (skin shading engine, S2).** Gate 2 was built:
+> `client/web/tests/skins/skin-parity.spec.mjs` compared every shipped skin
+> against a committed baseline sheet in a headless browser, run by the
+> `skin-pixels` CI job.
+>
+> **Update (textured skins).** It has since been removed as too expensive for
+> what it caught — a Chromium install per pull request and a megabyte of
+> baselines that had to be re-blessed whenever any shared painting changed. The
+> CI job it lived in is now `wasm-build`, which keeps the one thing only that
+> job did: compiling to `wasm32`. Section 15.5's account of what was missing is
+> left intact, and is once again accurate.

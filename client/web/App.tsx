@@ -41,14 +41,11 @@ const AdminPage = !IS_EMBEDDED_BUILD
   ? React.lazy(() => import('./components/AdminPage'))
   : null;
 
-// Design-review harnesses (post-match rating reveal, rank badges, skins, skin
-// pixel parity, trailer cards). Only reachable — and only bundled — outside
-// production builds.
+// Design-review harnesses (post-match rating reveal, rank badges, skins,
+// trailer cards). Only reachable — and only bundled — outside production
+// builds.
 const SkinsQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/SkinsQA'))
-  : null;
-const SkinParityQA = process.env.NODE_ENV !== 'production'
-  ? React.lazy(() => import('./components/SkinParityQA'))
   : null;
 const TrailerCardQA =
   process.env.NODE_ENV !== 'production'
@@ -262,16 +259,6 @@ function AppContent() {
             element={
               <React.Suspense fallback={null}>
                 <SkinsQA />
-              </React.Suspense>
-            }
-          />
-        )}
-        {SkinParityQA && (
-          <Route
-            path="/qa/skin-parity"
-            element={
-              <React.Suspense fallback={null}>
-                <SkinParityQA />
               </React.Suspense>
             }
           />

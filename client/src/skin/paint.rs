@@ -740,6 +740,14 @@ impl<'a> PaintCtx<'a> {
     /// `drawImage` with different arguments, which satisfies op-count
     /// invariance exactly. That is why `specs/skin-shading-prd.md` section 8.4
     /// makes frame strips the sanctioned way to animate sprite art.
+    ///
+    /// **The op is recorded whether or not the pixels have arrived.** That is
+    /// what keeps op-count invariance a property of the pose rather than of the
+    /// network: an atlas decoding mid-match would otherwise change a skin's op
+    /// sequence between two frames of the same snake. Canvas refuses to draw a
+    /// broken image at all — it throws — so the readiness check is here rather
+    /// than left to the browser, and a texture that never arrives simply leaves
+    /// the layer beneath it showing.
     pub fn draw_image(
         &mut self,
         image: usize,
@@ -747,6 +755,7 @@ impl<'a> PaintCtx<'a> {
         dest: (f64, f64, f64, f64),
     ) -> Result<(), JsValue> {
         if let PaintSink::Web(ctx) = &mut self.sink
+            && crate::skin::atlas::is_ready(image)
             && let Some(element) = crate::skin::atlas::image_element(image)
         {
             ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(

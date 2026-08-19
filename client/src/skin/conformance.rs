@@ -13,7 +13,7 @@ use crate::skin::doc::ParamSkin;
 use crate::skin::fixtures::{ANIM_SAMPLES, CELL_SIZES, POSES};
 use crate::skin::paint::{OpRecorder, PaintCtx};
 use crate::skin::registry::skin_registry;
-use crate::skin::{ClassicSkin, SkinIdentity, SnakePose, SnakeRole, SnakeSkin};
+use crate::skin::{ClassicSkin, SideCue, SkinIdentity, SnakePose, SnakeRole, SnakeSkin};
 
 /// Every role a skin can be asked to paint, with both shade slots.
 fn identities() -> Vec<SkinIdentity> {
@@ -78,6 +78,9 @@ impl SnakeSkin for RegistryRef {
     }
     fn metrics(&self, boost_active: bool) -> crate::skin::SkinMetrics {
         self.0.metrics(boost_active)
+    }
+    fn side_cue(&self) -> SideCue {
+        self.0.side_cue()
     }
     fn paint_alive(
         &self,
@@ -321,9 +324,21 @@ fn skin_conformance_reduced_motion_is_actually_still() {
 /// reading is enforced for document skins by the schema validator, and here for
 /// every skin — including first-party Rust ones, which the validator never
 /// sees. A skin that gets this wrong is a competitive bug, not a bold choice.
+///
+/// **Which colour carries the reading is the skin's to choose**, and it says so
+/// through [`SideCue`]. A painted skin says it with the body; a skin whose body
+/// is an animal's coat says it with the contour, because a tiger is orange
+/// whoever wears it. What no skin may do is fail to say it at all — so the
+/// nominated channel is held to the hue windows *and* required to be visibly
+/// different between the two sides, which is the property a hue window on its
+/// own does not give.
 #[test]
 fn skin_conformance_team_colours_stay_on_their_own_side() {
-    use skin_schema::color::{ENEMY_HUES, FRIENDLY_HUES, NEUTRAL_CHROMA, Rgb};
+    use skin_schema::color::{ENEMY_HUES, FRIENDLY_HUES, NEUTRAL_CHROMA, Rgb, perceptual_distance};
+
+    /// Two sides that differ by less than this are not telling anyone apart.
+    /// Comfortably above the ~0.08 nobody would miss.
+    const MIN_SIDE_DISTANCE: f64 = 0.15;
 
     let friendly_roles = [
         SnakeRole::Own,
@@ -333,6 +348,14 @@ fn skin_conformance_team_colours_stay_on_their_own_side() {
     let hostile_roles = [SnakeRole::Enemy, SnakeRole::SpectatedTeam(1)];
 
     for skin in skins_under_test() {
+        let cue = skin.side_cue();
+        let read = |colors: &crate::skin::SkinColors<'_>| -> String {
+            match cue {
+                SideCue::Body => colors.fill.to_string(),
+                SideCue::Contour => colors.outline.to_string(),
+            }
+        };
+
         for shade_slot in 0..2u8 {
             for (roles, window, side) in [
                 (friendly_roles.as_slice(), FRIENDLY_HUES, "friendly"),
@@ -343,22 +366,48 @@ fn skin_conformance_team_colours_stay_on_their_own_side() {
                         role: *role,
                         shade_slot,
                     });
-                    let parsed = Rgb::parse(colors.fill).expect("a flat hex fill");
+                    let value = read(&colors);
+                    let parsed = Rgb::parse(&value).expect("a flat hex colour");
                     let (hue, chroma) = parsed.oklch_hue_chroma();
                     if chroma <= NEUTRAL_CHROMA {
                         // A near-gray carries no side information; legibility
-                        // is checked elsewhere.
+                        // is checked elsewhere. A skin that nominated this
+                        // channel and then made it gray is caught by the
+                        // distance check below rather than slipping through.
                         continue;
                     }
                     assert!(
                         window.contains(hue),
-                        "{} paints {role:?} as {} ({hue:.0}deg), which does not \
-                         read as {side}",
+                        "{} paints {role:?}'s {cue:?} as {value} ({hue:.0}deg), \
+                         which does not read as {side}",
                         skin.id(),
-                        colors.fill
                     );
                 }
             }
+
+            // ...and the two sides have to be *distinguishable* in that
+            // channel, not merely each inside a window. This is the check that
+            // catches a skin nominating a channel it does not actually vary.
+            let friendly = skin.colors(&SkinIdentity {
+                role: SnakeRole::Teammate,
+                shade_slot,
+            });
+            let hostile = skin.colors(&SkinIdentity {
+                role: SnakeRole::Enemy,
+                shade_slot,
+            });
+            let (friendly, hostile) = (read(&friendly), read(&hostile));
+            let distance = perceptual_distance(
+                Rgb::parse(&friendly).expect("a flat hex colour"),
+                Rgb::parse(&hostile).expect("a flat hex colour"),
+            );
+            assert!(
+                distance >= MIN_SIDE_DISTANCE,
+                "{}: a teammate's {cue:?} `{friendly}` and an opponent's \
+                 `{hostile}` are only {distance:.3} apart, so this skin's own \
+                 side cue does not tell them apart",
+                skin.id(),
+            );
         }
     }
 }

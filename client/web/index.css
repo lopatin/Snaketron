@@ -6131,3 +6131,90 @@ a.home-social-icon:hover {
   border-color: #3c8dde;
   color: #1d4ed8;
 }
+
+/* /qa/skins tuning sidebar.
+   A dev-only affordance: edit a sheet skin's live properties beside the tiles
+   they change, so judging a drift rate is a drag rather than a rebuild. */
+.skins-qa-with-sidebar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 24px;
+  align-items: start;
+}
+.skins-qa-main {
+  min-width: 0;
+}
+.skins-qa-tuning {
+  position: sticky;
+  top: 16px;
+  padding: 14px;
+  border: 1px solid #d8dee9;
+  border-radius: 8px;
+  background: #fbfcfe;
+  font-size: 13px;
+}
+.skins-qa-tuning h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+.skins-qa-field {
+  display: block;
+  margin: 14px 0;
+}
+.skins-qa-field > span {
+  display: flex;
+  justify-content: space-between;
+  font-weight: 600;
+}
+.skins-qa-field output {
+  font-variant-numeric: tabular-nums;
+  color: #33507a;
+}
+.skins-qa-inputs {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0 2px;
+}
+.skins-qa-field input[type='range'] {
+  flex: 1;
+  min-width: 0;
+}
+.skins-qa-field input[type='number'] {
+  width: 72px;
+  padding: 3px 5px;
+  font-variant-numeric: tabular-nums;
+}
+.skins-qa-field small {
+  color: #5b6b80;
+}
+.skins-qa-baked {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 14px 0 6px;
+}
+.skins-qa-baked dt {
+  font-weight: 600;
+}
+.skins-qa-baked dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.skins-qa-tuning-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+.skins-qa-tuning-actions button {
+  flex: 1;
+  padding: 6px 10px;
+}
+@media (max-width: 900px) {
+  .skins-qa-with-sidebar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .skins-qa-tuning {
+    position: static;
+  }
+}

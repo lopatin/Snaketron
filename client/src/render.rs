@@ -1135,6 +1135,19 @@ pub fn skin_perf_smoke(
     .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Whether any skin texture requested so far is still arriving.
+///
+/// A textured skin fetches its pixels the first time it paints, and decoding is
+/// asynchronous while painting is not — so the first frame of such a skin shows
+/// its flat coat. The arena does not care: it repaints every frame and the
+/// texture appears the moment it lands. A surface that paints **once** does
+/// care, and this is what it waits on. `false` means every requested texture has
+/// either decoded or given up, so one more paint is the last one needed.
+#[wasm_bindgen(js_name = skinAssetsPending)]
+pub fn skin_assets_pending() -> bool {
+    crate::skin::atlas::any_pending()
+}
+
 /// The skins this build can render.
 ///
 /// Exported so the catalogue in the UI is generated from the renderer's own

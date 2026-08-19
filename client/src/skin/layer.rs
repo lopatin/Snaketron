@@ -13,13 +13,14 @@
 //! the pose, not of the clock, so two frames of the same pose always emit the
 //! same op sequence.
 
-// The compositor's surface runs ahead of the skins that ship on it: every item
-// below is implemented and covered by the test suite, but the six catalogue
-// skins are all the classic-shaped stack, so the non-test build never reaches
-// them. That is the intended state after `specs/skin-shading-prd.md` S7-S8 —
-// the engine gained spans, tiling, images and corner policies before any
-// first-party skin needed them. Deleting them to satisfy the lint would delete
-// the features; the alternative is to say so here.
+// The compositor's surface still runs slightly ahead of the skins that ship on
+// it. That was the intended state after `specs/skin-shading-prd.md` S7-S8 — the
+// engine gained spans, tiling, images and corner policies before any first-party
+// skin needed them — and it is now mostly historical: the checkerboards use
+// tiled bands and the animal family uses image textures, so the two biggest
+// items here have real consumers. What is left unused is genuinely unused
+// (`Fit::Stretch`, `CornerPolicy::Bisector`, frame strips), implemented and
+// tested. Deleting them to satisfy the lint would delete the features.
 #![allow(dead_code)]
 
 use crate::skin::space::{ClipShape, CornerPolicy};
@@ -151,7 +152,7 @@ impl Span {
 }
 
 /// What happens to a source when its span is shorter than its natural length.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Fit {
     /// Draw at natural scale and clip the far end. Art keeps its proportions.
     #[default]
@@ -159,8 +160,55 @@ pub enum Fit {
     /// Compress into the span. Available, not default: it distorts in ways an
     /// author cannot predict from looking at the source.
     Stretch,
-    /// Repeat along `s`. The right default for the middle of a three-slice.
-    Tile,
+    /// Repeat along `s`, for as many repeats as the span holds.
+    ///
+    /// This is what a *texture* is, as opposed to a sprite: the art is not
+    /// placed on the snake, it clothes it, and a body of any length is covered.
+    /// Repeats are laid out from the span's start in **arc length**, never per
+    /// run, so a repeat straddling a corner stays one repeat and the pattern
+    /// does not restart at every turn.
+    ///
+    /// A repeat may be as long as the author likes, and the interesting case is
+    /// **longer than one cell**: a coat pattern that repeated every cell would
+    /// read as a machine-made stripe rather than as an animal. Each repeat costs
+    /// one `drawImage`, so the length is also the cost knob — see
+    /// `skin::animal` for a family that picks it deliberately.
+    Tile {
+        /// How many cells of body one repeat covers.
+        ///
+        /// `None` keeps the region's own proportions, mapping its height across
+        /// the body and deriving the length from its aspect. `Some(n)` decouples
+        /// the two, which is what lets one texture be authored at whatever
+        /// resolution suits it and then worn at whatever scale reads best.
+        cells_per_repeat: Option<f64>,
+    },
+    /// Draw at the art's **authored scale** and let the body clip the rest.
+    ///
+    /// Every other fit maps the source's height onto exactly one cell, which is
+    /// the right answer for a texture — a coat is one cell wide because a snake
+    /// is. It is the wrong answer for a *picture*. A flag is 14.7 times wider
+    /// than it is tall; squeezing its full height into one cell squashes it,
+    /// and the alternative of showing only a thin band throws the picture away.
+    ///
+    /// So this one keeps the art's proportions and draws it **taller than the
+    /// body**, centred on the centreline. The silhouette clip every body span
+    /// already carries does the rest, so the snake becomes a window onto the
+    /// picture: on a 1.4-cell-tall flag it hides the outermost slivers and
+    /// shows the rest undistorted, and a turn reveals a different part of it.
+    ///
+    /// Costs nothing extra — the overflow is clipped, not painted — and the op
+    /// count is unchanged.
+    Cutout {
+        /// The region's height, in cells, at the scale it was authored for.
+        cells_tall: f64,
+    },
+}
+
+impl Fit {
+    /// A tile at the source's own proportions.
+    pub const TILE: Self = Self::Tile {
+        cells_per_repeat: None,
+    };
 }
 
 /// A gradient stop in body space.
@@ -198,7 +246,10 @@ pub enum Source {
     /// keeps the cost legible: a skin author can count the rectangles.
     ///
     /// Bitmap tiling is a different feature and lives on [`Source::Image`] as
-    /// [`Fit::Tile`].
+    /// [`Fit::Tile`], and the split is worth keeping straight: this source is a
+    /// *shape* a skin can describe in numbers, while that one is *pixels* an
+    /// artist drew. A stripe with a hard edge is cheaper and sharper here; a
+    /// stripe with a taper, a fork and a soft margin is only expressible there.
     Tiled {
         color: ColorSlot,
         /// Length of one repeat along the body, in cells.
@@ -225,7 +276,72 @@ pub enum Source {
         alpha: Option<std::sync::Arc<skin_schema::expr::Expr>>,
     },
     /// A named atlas region.
-    Image { region: usize, fit: Fit },
+    Image {
+        region: usize,
+        fit: Fit,
+        /// Optional alpha ramps at the span's two ends.
+        fade: Option<Fade>,
+        /// Cells the pattern slides along the body per animation cycle,
+        /// positive meaning *away* from the span's anchor. Only meaningful for
+        /// [`Fit::Tile`]; a sprite drawn once has nowhere to slide to.
+        ///
+        /// Drift is applied to which part of the texture each repeat **samples**,
+        /// never to where the repeats sit. Sliding the repeats themselves would
+        /// change how many of them overlap the body as the phase crossed a
+        /// boundary, and op-count invariance is checked across the clock — so
+        /// that version of this feature fails conformance rather than looking
+        /// wrong. Sampling instead costs one extra blit per repeat, always,
+        /// which keeps the count a property of the skin and not of the moment.
+        drift_cells: f64,
+    },
+}
+
+/// Alpha ramps at the ends of an image span.
+///
+/// This exists because a sprite that does not clothe the whole snake has to
+/// *end* somewhere, and a bitmap's own edge is a hard vertical line across the
+/// body — which reads as the art being cut off rather than as the art ending.
+/// A head-pinned twenty-cell sprite on a forty-cell snake is the ordinary case,
+/// not an edge case.
+///
+/// The ramp is approximated by `steps` constant-alpha slices rather than a real
+/// canvas gradient, and that is the whole design: `globalAlpha` is a number the
+/// recorder captures, so a fade is checkable natively like everything else,
+/// while a gradient-masked blit would need an offscreen canvas and would be
+/// invisible to every test outside a browser. The slice boundaries are fixed by
+/// the allocation, so the op count is a function of the pose and never of the
+/// clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fade {
+    /// Ramp length at the span's head-ward end, in cells. Alpha runs `0 -> 1`.
+    pub lead_cells: f64,
+    /// Ramp length at the span's tail-ward end, in cells. Alpha runs `1 -> 0`.
+    pub trail_cells: f64,
+    /// Constant-alpha slices per ramp. More is smoother and costs one blit
+    /// each; twelve is indistinguishable from a gradient at any cell size the
+    /// arena uses.
+    pub steps: usize,
+}
+
+impl Fade {
+    /// A fade only at the tail-ward end — what a head-pinned sprite wants.
+    pub const fn trailing(cells: f64, steps: usize) -> Self {
+        Self {
+            lead_cells: 0.0,
+            trail_cells: cells,
+            steps,
+        }
+    }
+
+    /// Whether this fade asks for nothing.
+    ///
+    /// Deliberately about the *lengths* only. Folding `steps == 0` in here as
+    /// well would turn a plainly wrong fade — six cells of ramp in zero slices
+    /// — into a silent no-fade, which is the hard edge the author was trying to
+    /// remove, arriving with no error to explain it.
+    pub fn is_noop(&self) -> bool {
+        self.lead_cells <= 0.0 && self.trail_cells <= 0.0
+    }
 }
 
 /// One layer of a compiled skin.
@@ -272,6 +388,10 @@ pub enum LayerKind {
         /// [`crate::skin::space::RibbonPlan`].
         fill_before_strokes: bool,
         refill_before_tail_cap: bool,
+        /// Paint the ribbon as one stroked path, so a boundary shared between
+        /// runs is antialiased once instead of two or three times. See
+        /// [`crate::skin::space::RibbonPlan::single_pass`].
+        single_pass: bool,
     },
     /// One rectangle per body cell, ramping with distance from the head.
     HeadRamp {
@@ -358,6 +478,7 @@ mod tests {
                 tail_cap: false,
                 fill_before_strokes: false,
                 refill_before_tail_cap: false,
+                single_pass: false,
             },
             transform: LayerTransform::default(),
             boost_only: false,
