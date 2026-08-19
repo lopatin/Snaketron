@@ -3021,6 +3021,39 @@ button.game-scoreboard-brand {
   line-height: 1.2;
 }
 
+/* The Winner pill's twin, so the two read as one family of row badges. Blue
+   because it is the only forward-looking thing on a card about a match that
+   is over. */
+.game-over-rematch-pill {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border: 1px solid #bfdbfe;
+  border-radius: 3px;
+  background: #eff6ff;
+  color: #2563eb;
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+/* Someone who has closed the card. Stated rather than implied, because it is
+   the reason a rematch is not going to happen. */
+.game-over-left-pill {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border: 1px solid #e5e7eb;
+  border-radius: 3px;
+  background: #f9fafb;
+  color: #9ca3af;
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
 .game-over-winner {
   margin-left: 8px;
   padding: 2px 5px;
@@ -6975,24 +7008,21 @@ a.home-social-icon:hover {
    is anyone else still here, and has anyone else said yes. Sits between the
    standings and the action footer, so it reads as part of the result rather
    than as another button. */
+/* One checkbox under the standings. Everything it used to explain now lives
+   on the rows themselves as pills. */
 .game-over-rematch {
-  display: grid;
-  gap: 8px;
-  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 0;
   padding: 12px 14px;
   border: 2px solid #e5e7eb;
   border-radius: 8px;
   background: #f9fafb;
-}
-
-.game-over-rematch-toggle {
-  display: flex;
-  align-items: center;
-  gap: 9px;
   cursor: pointer;
 }
 
-.game-over-rematch-toggle input {
+.game-over-rematch input {
   width: 16px;
   height: 16px;
   flex: none;
@@ -7002,67 +7032,17 @@ a.home-social-icon:hover {
 
 .game-over-rematch-label {
   color: rgb(0 0 0 / 78%);
-  font-size: 12px;
-  font-weight: 800;
-  letter-spacing: 0.7px;
-  text-transform: uppercase;
-}
-
-.game-over-rematch-status {
-  margin-left: auto;
-  color: var(--game-blue);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
-}
-
-.game-over-rematch-roster {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.game-over-rematch-player {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
   font-size: 11px;
-}
-
-.game-over-rematch-name {
-  overflow: hidden;
-  color: rgb(0 0 0 / 72%);
-  font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.game-over-rematch-verdict {
-  flex: none;
-  color: #9ca3af;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
   text-transform: uppercase;
-}
-
-.game-over-rematch-player.is-in .game-over-rematch-verdict {
-  color: #16a34a;
-}
-
-/* Greyed rather than removed: knowing someone walked away is what tells you
-   the rematch is not going to happen. */
-.game-over-rematch-player.is-gone {
-  opacity: 0.45;
 }
 
 .game-over-rematch-blocked {
-  margin: 0;
+  margin-left: auto;
   color: #b45309;
   font-size: 10px;
   font-weight: 700;
+  text-align: right;
 }
+

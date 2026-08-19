@@ -89,7 +89,10 @@ impl RematchState {
 /// someone who was not in the match.
 pub fn rematch_game_type(original: &GameType, opted_in: usize) -> Option<GameType> {
     match opted_in {
-        1 => Some(GameType::Solo),
+        // Running a duel back as a solo game is not what anyone ticking
+        // "Rematch" meant. One player only forms a game when the match they
+        // just played was itself solo.
+        1 => matches!(original, GameType::Solo).then_some(GameType::Solo),
         2 => Some(match original {
             GameType::TeamMatch { per_team: 1 } => GameType::TeamMatch { per_team: 1 },
             _ => GameType::FreeForAll { max_players: 2 },
@@ -326,7 +329,10 @@ mod tests {
     #[test]
     fn only_exactly_satisfiable_counts_get_a_game_type() {
         let duel = GameType::TeamMatch { per_team: 1 };
-        assert_eq!(rematch_game_type(&duel, 1), Some(GameType::Solo));
+        // One is only a game if the match being run back was already solo;
+        // otherwise the player is simply waiting for someone to join them.
+        assert_eq!(rematch_game_type(&duel, 1), None);
+        assert_eq!(rematch_game_type(&GameType::Solo, 1), Some(GameType::Solo));
         assert_eq!(rematch_game_type(&duel, 2), Some(duel.clone()));
         assert_eq!(
             rematch_game_type(&duel, 4),
@@ -398,9 +404,9 @@ mod tests {
             &GameType::TeamMatch { per_team: 1 },
             QueueMode::Quickmatch,
         );
-        // One of two is a solo game, which is a valid family — so it forms.
-        assert_eq!(one_in.game_type, Some(GameType::Solo));
-        assert_eq!(one_in.lobby_code.as_deref(), Some("USE1-ABCD1234"));
+        // One of two cannot run a duel back, so no lobby is offered yet.
+        assert_eq!(one_in.game_type, None);
+        assert_eq!(one_in.lobby_code, None);
 
         let three = vec![
             (7, "Ada".to_string()),

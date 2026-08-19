@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { rematchBlockReason, rematchVerdict } from '../../utils/rematchPresentation.ts';
+import {
+  canRematch,
+  hasOptedIntoRematch,
+  rematchBadgeFor,
+  rematchBlockReason,
+} from '../../utils/rematchPresentation.ts';
 import type { RematchState } from '../../types/generated/index.ts';
 
 const participant = (
@@ -49,21 +54,52 @@ test('a count the server refused to form says so, with the count', () => {
     ],
     game_type: null,
   });
-  assert.equal(rematchBlockReason(stuck), "3 players can't form a match — needs 1, 2, or 4.");
+  assert.equal(rematchBlockReason(stuck), "3 players can't form a match — needs 2 or 4.");
 });
 
-test('the count reads as a sentence at every size', () => {
-  const one = state({
-    participants: [participant(7, { opted_in: true })],
-    game_type: null,
+test('the badge answers the rematch question in one word, or says nothing', () => {
+  const base = state({
+    participants: [
+      participant(7, { opted_in: true }),
+      participant(9),
+      participant(11, { present: false }),
+    ],
   });
-  assert.equal(rematchBlockReason(one), "1 player can't form a match — needs 1, 2, or 4.");
+
+  assert.equal(rematchBadgeFor(base, 7), 'rematch');
+  // Still deciding earns no badge: an empty row is quieter than "Deciding".
+  assert.equal(rematchBadgeFor(base, 9), null);
+  assert.equal(rematchBadgeFor(base, 11), 'left');
 });
 
-test('a row says what that player did, with leaving taking precedence', () => {
-  assert.equal(rematchVerdict(participant(7)), 'Deciding…');
-  assert.equal(rematchVerdict(participant(7, { opted_in: true })), 'Ready');
-  assert.equal(rematchVerdict(participant(7, { present: false })), 'Left');
-  // Someone who opted in and then closed the tab is gone, not ready.
-  assert.equal(rematchVerdict(participant(7, { present: false, opted_in: true })), 'Left');
+test('leaving outranks having ticked the box on the way out', () => {
+  const gone = state({
+    participants: [participant(7, { present: false, opted_in: true })],
+  });
+  assert.equal(rematchBadgeFor(gone, 7), 'left');
+});
+
+test('a viewer who was not in the match gets no badge and no checkbox', () => {
+  const base = state();
+  assert.equal(rematchBadgeFor(base, 404), null);
+  assert.equal(rematchBadgeFor(base, null), null);
+  assert.equal(canRematch(base, 404), false);
+  assert.equal(canRematch(base, 7), true);
+  assert.equal(canRematch(null, 7), false);
+});
+
+test('the checkbox reflects only this viewer', () => {
+  const mixed = state({
+    participants: [participant(7, { opted_in: true }), participant(9)],
+  });
+  assert.equal(hasOptedIntoRematch(mixed, 7), true);
+  assert.equal(hasOptedIntoRematch(mixed, 9), false);
+  assert.equal(hasOptedIntoRematch(mixed, undefined), false);
+});
+
+test('one taker reads as waiting, not as a broken count', () => {
+  const alone = state({
+    participants: [participant(7, { opted_in: true }), participant(9)],
+  });
+  assert.equal(rematchBlockReason(alone), 'Waiting for someone else to run it back.');
 });

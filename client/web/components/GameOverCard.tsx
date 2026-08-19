@@ -10,9 +10,14 @@ import { resolveSnakeSkinColors } from '../utils/snakeSkin';
 import type { MatchRatingState } from '../utils/ratingReveal';
 import type { MatchHighlightState } from '../utils/highlightPresentation';
 import type { RematchState } from '../types';
+import {
+  canRematch,
+  hasOptedIntoRematch,
+  rematchBadgeFor,
+  rematchBlockReason,
+} from '../utils/rematchPresentation';
 import GameOverJewel from './GameOverJewel';
 import ShareGame from './ShareGame';
-import RematchPanel from './RematchPanel';
 import PlayOfTheGame from './PlayOfTheGame';
 import RatingReveal from './RatingReveal';
 
@@ -366,6 +371,17 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                   {player.name}
                   {player.isWinner && <span className="game-over-winner">Winner</span>}
                   {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
+                  {rematchBadgeFor(rematch, player.userId) === 'rematch' && (
+                    <span
+                      className="game-over-rematch-pill"
+                      data-testid={`rematch-pill-${player.snakeId}`}
+                    >
+                      Rematch
+                    </span>
+                  )}
+                  {rematchBadgeFor(rematch, player.userId) === 'left' && (
+                    <span className="game-over-left-pill">Left</span>
+                  )}
                 </span>
                 {player.deathAttribution && (
                   <span
@@ -381,12 +397,23 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
           ))}
         </div>
 
-        {rematch && onRematchToggle && (
-          <RematchPanel
-            state={rematch}
-            currentUserId={currentUserId}
-            onToggle={onRematchToggle}
-          />
+        {rematch && onRematchToggle && canRematch(rematch, currentUserId) && (
+          <label className="game-over-rematch" data-testid="rematch-toggle">
+            <input
+              type="checkbox"
+              checked={hasOptedIntoRematch(rematch, currentUserId)}
+              onChange={(event) => onRematchToggle(event.target.checked)}
+              data-testid="rematch-checkbox"
+            />
+            <span className="game-over-rematch-label">Rematch</span>
+            {/* Only ever shown when ticking the box cannot actually produce a
+                game; silence there would read as the feature being broken. */}
+            {rematchBlockReason(rematch) && (
+              <span className="game-over-rematch-blocked" role="status">
+                {rematchBlockReason(rematch)}
+              </span>
+            )}
+          </label>
         )}
 
         <footer className="game-over-actions">

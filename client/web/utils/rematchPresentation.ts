@@ -17,14 +17,59 @@ export function rematchBlockReason(state: RematchState): string | null {
   if (optedIn === 0 || state.game_type !== null) {
     return null;
   }
-  const noun = optedIn === 1 ? 'player' : 'players';
-  return `${optedIn} ${noun} can't form a match — needs 1, 2, or 4.`;
+  if (optedIn === 1) {
+    return 'Waiting for someone else to run it back.';
+  }
+  return `${optedIn} players can't form a match — needs 2 or 4.`;
 }
 
-/** What one other participant's row should say. */
-export function rematchVerdict(participant: RematchState['participants'][number]): string {
-  if (!participant.present) {
-    return 'Left';
+/**
+ * The badge one player earns on the standings list, if any.
+ *
+ * It sits beside `Winner` in the same row, so it has to answer the rematch
+ * question in one word or say nothing at all. "Left" outranks "Rematch":
+ * someone who walked away cannot be counted on even if they ticked the box on
+ * their way out.
+ */
+export type RematchBadge = 'rematch' | 'left' | null;
+
+export function rematchBadgeFor(
+  state: RematchState | null | undefined,
+  userId: number | null,
+): RematchBadge {
+  if (!state || userId === null) {
+    return null;
   }
-  return participant.opted_in ? 'Ready' : 'Deciding…';
+  const participant = state.participants.find((entry) => entry.user_id === userId);
+  if (!participant) {
+    return null;
+  }
+  if (!participant.present) {
+    return 'left';
+  }
+  return participant.opted_in ? 'rematch' : null;
+}
+
+/** Whether this viewer has opted in, for the checkbox's own state. */
+export function hasOptedIntoRematch(
+  state: RematchState | null | undefined,
+  userId: number | undefined,
+): boolean {
+  if (!state || userId === undefined) {
+    return false;
+  }
+  return state.participants.some(
+    (participant) => participant.user_id === userId && participant.opted_in,
+  );
+}
+
+/** Whether this viewer played in the match, and so has something to run back. */
+export function canRematch(
+  state: RematchState | null | undefined,
+  userId: number | undefined,
+): boolean {
+  if (!state || userId === undefined) {
+    return false;
+  }
+  return state.participants.some((participant) => participant.user_id === userId);
 }

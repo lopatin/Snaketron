@@ -246,19 +246,22 @@ const RatingRevealQA: React.FC = () => {
         // A fixture id so the card's share control renders here too; the
         // harness exists to review the card's real states, and share is one.
         shareGameId={4242}
-        // A fixture rematch so the panel's live roster is reviewable here.
-        currentUserId={7}
+        // Fixture rematch state. The ids match the presentation's players
+        // (`userId: snakeId + 1` above) so the row pills actually render here —
+        // that is the whole thing this harness is for.
+        currentUserId={1}
         onRematchToggle={setRematchOptIn}
         rematch={{
           game_id: 4242,
           participants: [
-            { user_id: 7, username: 'You', present: true, opted_in: rematchOptIn },
-            { user_id: 9, username: 'Rival', present: true, opted_in: true },
-            { user_id: 11, username: 'Vector', present: false, opted_in: false },
+            { user_id: 1, username: 'You', present: true, opted_in: rematchOptIn },
+            { user_id: 2, username: 'Rival', present: true, opted_in: true },
           ],
           lobby_code: null,
           host_user_id: null,
-          game_type: null,
+          // A formable count, so the harness shows the healthy state rather
+          // than the "can't form a match" copy.
+          game_type: { TeamMatch: { per_team: 1 } },
           queue_mode: 'Quickmatch',
           expires_at_ms: 0,
         }}
