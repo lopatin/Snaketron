@@ -7019,13 +7019,13 @@ a.home-social-icon:hover {
   margin: 0 22px 18px;
 }
 
-/* The same type as `.game-shell-button`: the checkbox sits on the same card as
-   Main menu and Share, and a label two sizes larger than the buttons beside it
-   reads as a heading rather than a choice. */
+/* Sized with `.game-shell-button`, because the checkbox sits on the same card
+   as Main menu and Share and a label two sizes larger reads as a heading
+   rather than a choice. Upright, though: the italic on those buttons is what
+   marks them as actions, and this is a state. */
 .game-over-rematch-label {
   color: var(--game-graphite);
   font-size: 9px;
-  font-style: italic;
   font-weight: 900;
   letter-spacing: 0.07em;
   text-transform: uppercase;
