@@ -14,7 +14,7 @@ SnakeTron is a competitive online multiplayer Snake game — real-time matches, 
 
 - **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
 - **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with server-moderated chat and invite links
-- **Combos**: every food pickup restarts a two-second timer; keep the chain alive and successive pickups are worth +1, +1, +2, and then +3 each, in both points and snake length
+- **Combos**: every food pickup restarts a one-second timer; keep the chain alive and successive pickups are worth +1, +1, +2, and then +3 each, in both points and snake length
 - **Boost**: hold-to-boost speed bursts fueled by Boost pads scattered around the arena (Solo gives you an unlimited tank to practice with)
 - **Accounts**: register/login with JWT auth, or play instantly as a guest
 - **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP

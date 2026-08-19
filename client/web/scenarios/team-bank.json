@@ -42,6 +42,6 @@
   },
   "expect": [
     { "SnakeDead": { "snake_id": 0, "at_tick": 4 } },
-    { "FinalSyncHash": "0xc8a1d444659a64f6" }
+    { "FinalSyncHash": "0x27e337dfa6cde7c2" }
   ]
 }

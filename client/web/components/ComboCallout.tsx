@@ -6,6 +6,11 @@ export interface ComboCalloutProps {
   isVisible: boolean;
   pickupIdentity: string;
   /**
+   * Measured by the arena so it can fade the callout while the local head
+   * drives underneath it. Capture surfaces leave it unset and stay opaque.
+   */
+  containerRef?: React.Ref<HTMLDivElement>;
+  /**
    * Capture-only deterministic animation clock. Live playback deliberately
    * leaves this unset so the production CSS animation follows wall time.
    */
@@ -22,9 +27,11 @@ const ComboCallout: React.FC<ComboCalloutProps> = ({
   hud,
   isVisible,
   pickupIdentity,
+  containerRef,
   animationElapsedMs,
 }) => (
   <div
+    ref={containerRef}
     className="game-combo-callout"
     role="status"
     aria-live="polite"
