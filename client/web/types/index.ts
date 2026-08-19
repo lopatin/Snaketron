@@ -188,6 +188,15 @@ export interface WebSocketContextType {
   // Lobby state
   lobbyRestorationComplete: boolean;
   currentLobby: Lobby | null;
+  /**
+   * Whether this player may change the game mode or start matchmaking.
+   *
+   * Both are lobby-wide actions, so the server admits them only from the
+   * lobby's host. A player with no lobby is also `true`: they are about to
+   * create one and become its host, and gating them would make the ordinary
+   * solo case unplayable.
+   */
+  isLobbyLeader: boolean;
   lobbyMembers: LobbyMember[];
   lobbyChatMessages: ChatMessage[];
   gameChatMessages: ChatMessage[];

@@ -59,6 +59,8 @@ export * from './NewsTickerKind';
 export * from './NewsTickerResponse';
 export * from './OnlinePlayer';
 export * from './Player';
+export * from './PlayerLobbyResponse';
+export * from './PlayerLobbyStatus';
 export * from './Position';
 export * from './PresenceActivity';
 export * from './PublicGamePlayer';

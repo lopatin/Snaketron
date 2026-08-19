@@ -1,5 +1,6 @@
 import React from 'react';
 import { useConnectionBanner } from '../hooks/useConnectionBanner';
+import type { HomeNotice } from '../utils/homeNotice';
 
 interface ConnectionStatusRackProps {
   /** From `isConnectionReady` — whether the client can act right now. */
@@ -7,6 +8,14 @@ interface ConnectionStatusRackProps {
   regionsLoading: boolean;
   regionsError: string | null;
   hasSelectedRegion: boolean;
+  /**
+   * A one-shot message from whatever redirected here, shown as one more badge.
+   *
+   * Unlike the connection badges it is not derived from live state, so it
+   * cannot clear itself — hence the dismiss control.
+   */
+  notice?: HomeNotice | null;
+  onDismissNotice?: () => void;
 }
 
 /**
@@ -22,6 +31,8 @@ export const ConnectionStatusRack: React.FC<ConnectionStatusRackProps> = ({
   regionsLoading,
   regionsError,
   hasSelectedRegion,
+  notice = null,
+  onDismissNotice,
 }) => {
   const showConnecting = useConnectionBanner(isReady);
   const showRegionError = Boolean(regionsError);
@@ -50,6 +61,24 @@ export const ConnectionStatusRack: React.FC<ConnectionStatusRackProps> = ({
         <div className="home-status-badge is-warning">
           <span className="home-status-dot" aria-hidden="true" />
           <span>Connecting to game server…</span>
+        </div>
+      )}
+      {notice && (
+        <div
+          data-testid="home-notice"
+          className={`home-status-badge is-prose${notice.tone === 'error' ? ' is-error' : ''}`}
+        >
+          <span>{notice.message}</span>
+          {onDismissNotice && (
+            <button
+              type="button"
+              aria-label="Dismiss notification"
+              onClick={onDismissNotice}
+              className="home-status-dismiss"
+            >
+              ×
+            </button>
+          )}
         </div>
       )}
     </div>

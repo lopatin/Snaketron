@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { LobbyModal } from './LobbyModal';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
 import { crazyGames } from '../services/crazyGames';
+import { useAuth } from '../contexts/AuthContext';
 
 interface InviteFriendsModalProps {
   isOpen: boolean;
@@ -11,19 +12,23 @@ interface InviteFriendsModalProps {
 }
 
 type CopyState = 'idle' | 'copied' | 'failed';
-type CopyTarget = 'code' | 'link';
+type CopyTarget = 'code' | 'link' | 'player';
+
+const COPY_SUBJECT: Record<CopyTarget, string> = {
+  code: 'Lobby code',
+  link: 'Invite link',
+  player: 'Personal link',
+};
 
 const copyFeedbackText = (
   target: CopyTarget,
   state: CopyState,
 ): string => {
   if (state === 'copied') {
-    return target === 'code' ? 'Lobby code copied.' : 'Invite link copied.';
+    return `${COPY_SUBJECT[target]} copied.`;
   }
   if (state === 'failed') {
-    return target === 'code'
-      ? 'Could not copy the lobby code. Try again.'
-      : 'Could not copy the invite link. Try again.';
+    return `Could not copy the ${COPY_SUBJECT[target].toLowerCase()}. Try again.`;
   }
   return '';
 };
@@ -35,12 +40,14 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
   region,
 }) => {
   const { isCrazyGamesBuild, available } = useCrazyGames();
+  const { user } = useAuth();
   const [codeCopyState, setCodeCopyState] = useState<CopyState>('idle');
   const [linkCopyState, setLinkCopyState] = useState<CopyState>('idle');
+  const [playerCopyState, setPlayerCopyState] = useState<CopyState>('idle');
   const [latestCopyTarget, setLatestCopyTarget] = useState<CopyTarget | null>(null);
   const copyCodeButtonRef = useRef<HTMLButtonElement>(null);
   const resetTimersRef = useRef<Partial<Record<CopyTarget, ReturnType<typeof setTimeout>>>>({});
-  const copyOperationRef = useRef<Record<CopyTarget, number>>({ code: 0, link: 0 });
+  const copyOperationRef = useRef<Record<CopyTarget, number>>({ code: 0, link: 0, player: 0 });
   const isMountedRef = useRef(true);
   const isOpenRef = useRef(isOpen);
   isOpenRef.current = isOpen;
@@ -68,6 +75,25 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
     return `${origin}/lobby/${encodeURIComponent(lobbyCode)}`;
   }, [available, isCrazyGamesBuild, lobbyCode, region]);
 
+  /**
+   * A stable link to this player rather than to one lobby: it resolves to
+   * whatever lobby they are in when it is followed, so it stays good after
+   * this lobby is gone.
+   *
+   * Only registered accounts get one. Guest names are neither unique nor
+   * reserved, so a guest's link could not be resolved back to them — and the
+   * server refuses to try.
+   */
+  const playerUrl = useMemo(() => {
+    if (!user || user.isGuest || !user.username || typeof window === 'undefined') {
+      return '';
+    }
+    const origin = process.env.ITCH_BUILD === 'true' || isCrazyGamesBuild
+      ? 'https://snaketron.io'
+      : window.location.origin;
+    return `${origin}/play/${encodeURIComponent(user.username)}`;
+  }, [isCrazyGamesBuild, user]);
+
   const clearResetTimer = (target: CopyTarget) => {
     const timer = resetTimersRef.current[target];
     if (timer) {
@@ -82,6 +108,7 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
       isMountedRef.current = false;
       clearResetTimer('code');
       clearResetTimer('link');
+      clearResetTimer('player');
     };
   }, []);
 
@@ -91,10 +118,13 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
     }
     clearResetTimer('code');
     clearResetTimer('link');
+    clearResetTimer('player');
     copyOperationRef.current.code += 1;
     copyOperationRef.current.link += 1;
+    copyOperationRef.current.player += 1;
     setCodeCopyState('idle');
     setLinkCopyState('idle');
+    setPlayerCopyState('idle');
     setLatestCopyTarget(null);
   }, [isOpen]);
 
@@ -152,11 +182,13 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
     }
   };
 
+  const copyStateFor: Record<CopyTarget, CopyState> = {
+    code: codeCopyState,
+    link: linkCopyState,
+    player: playerCopyState,
+  };
   const statusMessage = latestCopyTarget
-    ? copyFeedbackText(
-        latestCopyTarget,
-        latestCopyTarget === 'code' ? codeCopyState : linkCopyState,
-      )
+    ? copyFeedbackText(latestCopyTarget, copyStateFor[latestCopyTarget])
     : '';
 
   return (
@@ -198,6 +230,25 @@ export const InviteFriendsModal: React.FC<InviteFriendsModalProps> = ({
             </button>
           </div>
         </div>
+
+        {playerUrl && (
+          <div className="lobby-modal-field">
+            <span className="lobby-modal-label">Your personal link</span>
+            <div className="lobby-modal-share-row">
+              <div className="lobby-modal-value is-link" title={playerUrl}>{playerUrl}</div>
+              <button
+                type="button"
+                className="lobby-modal-button is-copy"
+                onClick={() => copyToClipboard('player', playerUrl, setPlayerCopyState)}
+              >
+                {playerCopyState === 'copied' ? 'Copied' : playerCopyState === 'failed' ? 'Try again' : 'Copy'}
+              </button>
+            </div>
+            <p className="lobby-modal-hint">
+              Always joins whichever lobby you are in — reuse it any time.
+            </p>
+          </div>
+        )}
       </div>
 
       <p className="sr-only" aria-live="polite">

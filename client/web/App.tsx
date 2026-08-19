@@ -1,12 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BrowserRouter, HashRouter, Navigate, Route, matchPath, useLocation } from 'react-router-dom';
+import { BrowserRouter, HashRouter, Navigate, Route, useLocation } from 'react-router-dom';
 import './index.css';
 import { AccountModal } from './components/AccountModal';
 import type { AccountModalView } from './components/AccountModal';
 import AuthModal from './components/AuthModal';
 import CustomGameCreator from './components/CustomGameCreator';
 import GameLobby from './components/GameLobby';
-import GameArena from './components/GameArena';
 import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
@@ -14,6 +13,7 @@ import LobbyInvitePage from './components/LobbyInvitePage';
 import GameResultPage from './components/GameResultPage';
 import OnlinePlayersPanel from './components/OnlinePlayersPanel';
 import ChallengesPanel from './components/ChallengesPanel';
+import PlayRoute from './components/PlayRoute';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
 import { Leaderboard } from './components/Leaderboard';
@@ -37,6 +37,7 @@ import { AdsProvider } from './contexts/AdsContext';
 import { AdBannerLayout } from './components/AdBannerLayout';
 import { PreMatchAdBreak } from './components/PreMatchAdBreak';
 import { isDurableBannerRoute } from './services/ads/bannerPlan';
+import { activeGameIdFromPath } from './services/websocketLifecycle';
 
 const IS_EMBEDDED_BUILD = process.env.ITCH_BUILD === 'true'
   || process.env.CRAZYGAMES_BUILD === 'true';
@@ -81,7 +82,10 @@ function AppContent() {
   const { config } = useRuntimeConfig();
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
-  const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
+  // Only a numeric segment is a live match. `/play/<username>` shares the
+  // prefix but is an invite page, and treating it as gameplay would strip the
+  // backdrop and suppress the runtime announcement on an ordinary screen.
+  const isGameArenaActive = activeGameIdFromPath(location.pathname) !== null;
   const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
   const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
   // Two kinds of route keep the floating social chrome off screen. The public
@@ -91,8 +95,7 @@ function AppContent() {
   // component in isolation, and a roster strip parked over the thing under
   // review is exactly the noise they are meant to avoid.
   const isSocialSuppressedRoute =
-    matchPath('/g/:gameId', location.pathname) !== null
-    || location.pathname.startsWith('/qa/');
+    location.pathname.startsWith('/g/') || location.pathname.startsWith('/qa/');
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
   const showRuntimeAnnouncement = config.announcement.enabled
     && config.announcement.message.trim().length > 0
@@ -232,14 +235,9 @@ function AppContent() {
             </ProtectedRoute>
           }
         />
-        <Route
-          path="/play/:gameId"
-          element={
-            <ProtectedRoute>
-              <GameArena />
-            </ProtectedRoute>
-          }
-        />
+        {/* Dispatches on the segment: a game id renders the arena, a
+            username renders the invite page. See PlayRoute. */}
+        <Route path="/play/:gameId" element={<PlayRoute />} />
         {TrailerCardQA && (
           <Route
             path="/qa/trailer-card"

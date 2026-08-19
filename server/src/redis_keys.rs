@@ -314,6 +314,23 @@ impl RedisKeys {
         format!("presence:{region}:updates")
     }
 
+    // === Presence ===
+
+    /// Which lobby a user is currently present in, for resolving a
+    /// `/play/<username>` invite to a joinable lobby code.
+    ///
+    /// This is the reverse of `lobby_members_set`, which can only be read
+    /// when the lobby code is already known. The value is the lobby code, and
+    /// the key carries a lease refreshed by the same lobby heartbeat that
+    /// renews membership, so a lost socket expires the record instead of
+    /// advertising a lobby the user has already left.
+    ///
+    /// Deliberately untagged: it is only ever read and written on its own, and
+    /// a lobby-slot tag would concentrate every user's presence on one shard.
+    pub fn user_presence(user_id: u32) -> String {
+        format!("presence:user:{}", user_id)
+    }
+
     // === Lobby Keys ===
 
     /// Lobby metadata hash (stores lobby details)

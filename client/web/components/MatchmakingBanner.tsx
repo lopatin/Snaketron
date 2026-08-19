@@ -3,7 +3,7 @@ import { useWebSocket } from '../contexts/WebSocketContext';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 
 export const MatchmakingBanner: React.FC = () => {
-  const { currentLobby } = useWebSocket();
+  const { currentLobby, isLobbyLeader } = useWebSocket();
   const { leaveQueue, isQueued, isJoiningGame } = useGameWebSocket();
 
   const isLobbyQueued = currentLobby?.state === 'queued';
@@ -13,7 +13,11 @@ export const MatchmakingBanner: React.FC = () => {
     return null;
   }
 
-  const showCancel = isQueued || isLobbyQueued;
+  // Cancelling pulls the whole lobby out of the queue, so it belongs to
+  // whoever was allowed to start it. A member of someone else's queued lobby
+  // still sees the banner — they should know a match is being found — but not
+  // a control that would cancel it for everyone.
+  const showCancel = (isQueued || isLobbyQueued) && isLobbyLeader;
   const statusText = (() => {
     if (isJoiningGame) {
       return 'Joining game...';

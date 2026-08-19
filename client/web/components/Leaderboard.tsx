@@ -100,7 +100,7 @@ const LeaderboardContent: React.FC<{
 }) => {
   const navigate = useNavigate();
   const { queueForMatch } = useGameWebSocket();
-  const { isConnected, currentLobby, createLobby, updateLobbyPreferences } = useWebSocket();
+  const { isConnected, currentLobby, isLobbyLeader, createLobby, updateLobbyPreferences } = useWebSocket();
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -237,7 +237,9 @@ const LeaderboardContent: React.FC<{
   };
 
   const startSelectedQueue = async (competitive: boolean) => {
-    if (isStartingQueue) {
+    // Starting from the leaderboard queues the player's whole lobby, exactly
+    // as the home screen's Start button does.
+    if (isStartingQueue || !isLobbyLeader) {
       return;
     }
 
@@ -282,10 +284,12 @@ const LeaderboardContent: React.FC<{
     const competitive = !isSoloMode;
 
     if (!isAuthenticated) {
-      updateLobbyPreferences({
-        selectedModes: [selectedMode],
-        competitive,
-      });
+      if (isLobbyLeader) {
+        updateLobbyPreferences({
+          selectedModes: [selectedMode],
+          competitive,
+        });
+      }
       navigate('/');
       return;
     }
@@ -334,7 +338,10 @@ const LeaderboardContent: React.FC<{
                 <button
                   type="button"
                   onClick={playSelectedMode}
-                  disabled={isStartingQueue}
+                  disabled={isStartingQueue || !isLobbyLeader}
+                  title={isLobbyLeader
+                    ? undefined
+                    : 'Waiting for lobby host to start matchmaking'}
                   className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   {isStartingQueue ? startingActionLabel : playActionLabel}

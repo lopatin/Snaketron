@@ -3278,6 +3278,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     sendMessage({ SetRematchIntent: { game_id: gameId, opt_in: optIn } });
   }, [sendMessage]);
 
+  // Mirrors the server's rule so non-leaders see controls that are already
+  // disabled rather than pressing them and collecting an AccessDenied. The
+  // server remains authoritative; this only keeps the UI honest.
+  //
+  // Having no lobby counts as leading, because the very next thing the Start
+  // button does is create one with this player as its host.
+  const isLobbyLeader = currentLobby === null
+    || (user?.id !== undefined && currentLobby.hostUserId === user.id);
+
   const value: WebSocketContextType = {
     isConnected,
     isSessionAuthenticated,
@@ -3293,6 +3302,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     adConfiguration,
     lobbyRestorationComplete,
     currentLobby,
+    isLobbyLeader,
     lobbyMembers,
     lobbyChatMessages,
     gameChatMessages,

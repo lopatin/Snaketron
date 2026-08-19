@@ -14,6 +14,7 @@ import {
   UpdateRuntimeConfigRequest,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
+import type { PlayerLobbyResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
 import type { PublicGameResponse } from '../types/generated';
@@ -198,6 +199,24 @@ class API {
     }
 
     return data as T;
+  }
+
+  /**
+   * Resolve a `/play/<username>` invite link to the lobby that player is in.
+   *
+   * Anonymous, because the link is followed before the visitor has an account.
+   * A failed request is reported as `notFound` rather than thrown: the caller
+   * always has to explain the outcome to a visitor either way, and there is
+   * nothing useful for them to do differently about a 500.
+   */
+  async getPlayerLobby(username: string): Promise<PlayerLobbyResponse> {
+    try {
+      return await this.request<PlayerLobbyResponse>(
+        `/api/players/${encodeURIComponent(username)}/lobby`,
+      );
+    } catch {
+      return { username, lobbyCode: null, status: 'notFound' };
+    }
   }
 
   async login(username: string, password: string): Promise<AuthResponse> {

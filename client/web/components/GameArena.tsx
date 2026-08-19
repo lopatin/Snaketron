@@ -297,6 +297,7 @@ export default function GameArena() {
     gameChatMessages,
     sendChatMessage,
     currentLobby,
+    isLobbyLeader,
     lobbyPreferences,
     isSessionAuthenticated,
     createLobby,
@@ -1622,7 +1623,9 @@ export default function GameArena() {
       return;
     }
 
-    if (isLobbyQueued) {
+    // Play again re-queues the whole lobby, so it is the same lobby-wide
+    // action the Start button is, and carries the same leadership rule.
+    if (isLobbyQueued || !isLobbyLeader) {
       return;
     }
 
@@ -1743,7 +1746,7 @@ export default function GameArena() {
           starRank={starRank}
           onMenu={handleBackToMenu}
           onPlayAgain={handlePlayAgain}
-          playAgainDisabled={isLobbyQueued}
+          playAgainDisabled={isLobbyQueued || !isLobbyLeader}
           utilityHost={hudUtilityHost}
         />
 

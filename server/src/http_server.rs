@@ -29,6 +29,7 @@ use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::{AuthMiddlewareState, admin_middleware, auth_middleware};
 use crate::api::news::{self, NewsState};
+use crate::api::players;
 use crate::api::rate_limit::{
     global_rate_limit_middleware, rate_limit_layer, rate_limit_middleware,
 };
@@ -296,6 +297,10 @@ pub async fn install_http_application(
     // crawler or a viral link actually hits, so they get their own budget
     // rather than sharing the replay backstop.
     let public_game_read_limiter = rate_limit_layer(3000, 60);
+    // An invite link is followed once per click, but the endpoint answers
+    // "does this account exist" to anyone. Per-IP, and tight enough that it is
+    // a poor way to enumerate usernames.
+    let player_lobby_limiter = rate_limit_layer(120, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
@@ -337,6 +342,19 @@ pub async fn install_http_application(
         .route(
             "/api/regions/server-counts",
             get(regions::get_server_counts),
+        )
+        .with_state(state.clone());
+
+    // Resolves `/play/<username>` invite links to a joinable lobby. Anonymous
+    // like the link itself, and rate limited because it is an unauthenticated
+    // probe against account names.
+    let player_routes = Router::new()
+        .route(
+            "/api/players/:username/lobby",
+            get(players::get_player_lobby).layer(middleware::from_fn_with_state(
+                player_lobby_limiter,
+                rate_limit_middleware,
+            )),
         )
         .with_state(state.clone());
 
@@ -416,6 +434,7 @@ pub async fn install_http_application(
         .merge(protected_routes)
         .merge(admin_routes)
         .merge(region_routes)
+        .merge(player_routes)
         .merge(leaderboard_routes)
         .merge(news_routes)
         .merge(replay_routes)
