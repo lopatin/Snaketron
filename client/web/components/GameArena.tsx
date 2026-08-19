@@ -26,6 +26,7 @@ import { readSkinPreference } from '../utils/skinPreference';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import { buildMatchPresentation, simulationStartMs } from '../utils/gamePresentation';
 import { crazyGames } from '../services/crazyGames';
+import { analytics } from '../services/analytics';
 import {
   hasSeenTutorial,
   markTutorialSeen,
@@ -783,6 +784,25 @@ export default function GameArena() {
       // Match completion ends provider gameplay. Advertisement policy is
       // server-owned and, when eligible, starts on the next queue request.
       crazyGames.gameplayStop();
+
+      const localPlayer = presentation.currentPlayer;
+      analytics.trackMatchEnd(
+        completedState,
+        localPlayer && { score: localPlayer.score, isWinner: localPlayer.isWinner },
+        presentation.elapsedMs,
+      );
+      // One death per finished match, read from the durable final state rather
+      // than the prediction stream: a rolled-back predicted crash is not a
+      // death that happened, and team modes respawn.
+      const localSnakeId = user?.id === undefined
+        ? undefined
+        : completedState.players?.[user.id]?.snake_id;
+      const deathCause = localSnakeId === undefined
+        ? undefined
+        : completedState.last_death_causes?.[localSnakeId];
+      if (deathCause) {
+        analytics.trackDeath(deathCause, completedState.game_type);
+      }
     }
   }, [committedState, gameId, gameState, isGameComplete, user?.id]);
 
@@ -1302,15 +1322,24 @@ export default function GameArena() {
     !showHelp &&
     !showCountdown;
 
+  const analyticsGameType = (committedState ?? gameState)?.game_type ?? null;
+  const analyticsQueueMode = (committedState ?? gameState)?.queue_mode ?? null;
+
   useEffect(() => {
     if (platformGameplayActive) {
       platformGameplayObservedForGameRef.current = gameId;
       crazyGames.gameplayStart();
+      // The same signal the portal uses for "the player is actually playing",
+      // so a match that was only spectated or abandoned in the lobby never
+      // opens a progression that would later have to be completed.
+      if (analyticsGameType && analyticsQueueMode) {
+        analytics.trackMatchStart(analyticsGameType, analyticsQueueMode);
+      }
     } else {
       crazyGames.gameplayStop();
     }
     return () => crazyGames.gameplayStop();
-  }, [gameId, platformGameplayActive]);
+  }, [analyticsGameType, analyticsQueueMode, gameId, platformGameplayActive]);
   const localIdle = buildPlayerIdlePresentation(gameState ?? committedState, user?.id);
   const idleWarning =
     isGameInteractionActive &&

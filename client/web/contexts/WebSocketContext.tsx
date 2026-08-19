@@ -62,6 +62,7 @@ import {
   replacementReadyForPromotion,
 } from '../services/websocketLifecycle';
 import { subscribeGameStorage } from '../services/gameStorage';
+import { analytics, queueIntentEvents } from '../services/analytics';
 import {
   DISABLED_AD_CONFIGURATION,
   normalizeAdConfiguration,
@@ -1724,6 +1725,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         retryAttempt: 0,
         retryTimeoutId: null,
       };
+      // The top of the play funnel. Reported on intent rather than on
+      // MatchFound so an unfilled queue is still visible as demand.
+      for (const intent of queueIntentEvents(message)) {
+        analytics.trackQueueRequest(intent.queue, intent.mode);
+      }
     } else if (message === 'LeaveQueue' || message === 'LeaveLobby') {
       clearPendingMatchmakingIntent();
     }

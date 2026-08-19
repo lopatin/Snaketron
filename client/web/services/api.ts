@@ -13,6 +13,7 @@ import {
   RuntimeConfigRecord,
   UpdateRuntimeConfigRequest,
 } from '../types';
+import type { AnalyticsConsent } from '../types/generated';
 import type { CheckUsernameResponse } from '../types/generated';
 import { CLIENT_DISTRIBUTION } from '../constants';
 import { getOrCreateAnonId } from '../utils/anonId';
@@ -477,6 +478,15 @@ class API {
 
   async getRuntimeConfig(): Promise<PublicRuntimeConfig> {
     return this.request<PublicRuntimeConfig>('/api/config');
+  }
+
+  /**
+   * Whether this caller's network is on the deployment's analytics exclusion
+   * list. Only the server can answer it — a browser cannot see its own public
+   * address.
+   */
+  async getAnalyticsConsent(): Promise<AnalyticsConsent> {
+    return this.request<AnalyticsConsent>('/api/analytics/consent');
   }
 
   async getAdminRuntimeConfig(): Promise<RuntimeConfigRecord> {

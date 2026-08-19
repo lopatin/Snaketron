@@ -26,6 +26,7 @@ import { WalletProvider } from './contexts/WalletContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
+import { AnalyticsBridge } from './components/AnalyticsBridge';
 import { CrazyGamesBridge } from './components/CrazyGamesBridge';
 import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
 import {
@@ -362,6 +363,7 @@ function App() {
                 <LatencyProvider>
                   <WebSocketProvider>
                     <AdsProvider>
+                      <AnalyticsBridge />
                       <CrazyGamesBridge />
                       <AppContent />
                       <PreMatchAdBreak />

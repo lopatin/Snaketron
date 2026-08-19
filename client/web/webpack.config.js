@@ -21,6 +21,21 @@ if (isItchBuild && isCrazyGamesBuild) {
 
 const isEmbeddedBuild = isItchBuild || isCrazyGamesBuild;
 
+// GameAnalytics ships only in the ordinary web build. The itch and CrazyGames
+// packages are reviewed release artifacts whose packaging invariants exclude
+// third-party trackers (see CRAZYGAMES.md), so the keys are dropped rather
+// than merely left unused: an embedded bundle must not even contain them.
+const gameAnalyticsGameKey = isEmbeddedBuild ? '' : (process.env.GAMEANALYTICS_GAME_KEY || '');
+const gameAnalyticsSecretKey = isEmbeddedBuild ? '' : (process.env.GAMEANALYTICS_SECRET_KEY || '');
+
+if (!isEmbeddedBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gameAnalyticsSecretKey)) {
+  throw new Error(
+    'GAMEANALYTICS_GAME_KEY and GAMEANALYTICS_SECRET_KEY must be set together: '
+    + 'GameAnalytics signs every request with the secret, so half a pair would '
+    + 'fail every call at runtime instead of staying inert.',
+  );
+}
+
 module.exports = {
   entry: "./bootstrap.ts",
   output: {
@@ -38,6 +53,15 @@ module.exports = {
     // checkout, which would otherwise let stale WASM silently back the UI.
     alias: {
       'wasm-snaketron': path.resolve(__dirname, '../pkg'),
+      // Stub the analytics SDK out of the reviewed release packages entirely.
+      //
+      // Dropping the keys is not enough on its own: the dynamic import is
+      // still statically reachable, so webpack emits the ~93 KB vendor chunk
+      // into the ZIP even though nothing will ever request it. `false` here
+      // resolves it to an empty module, so the embedded artifact contains no
+      // third-party tracker code at all — the invariant CRAZYGAMES.md states
+      // and the packaging script checks.
+      ...(isEmbeddedBuild ? { gameanalytics: false } : {}),
     },
   },
   module: {
@@ -101,6 +125,12 @@ module.exports = {
       'process.env.ITCH_BUILD': JSON.stringify(isItchBuild ? 'true' : ''),
       'process.env.CRAZYGAMES_BUILD': JSON.stringify(isCrazyGamesBuild ? 'true' : ''),
       'process.env.CRAZYGAMES_DATA_ENABLED': JSON.stringify(process.env.CRAZYGAMES_DATA_ENABLED || ''),
+      // GameAnalytics keys are compiled in, not fetched, so a bundle either
+      // reports or provably cannot. A checkout without them — every developer
+      // machine, CI, and any fork — never loads the SDK. See ANALYTICS.md.
+      'process.env.GAMEANALYTICS_GAME_KEY': JSON.stringify(gameAnalyticsGameKey),
+      'process.env.GAMEANALYTICS_SECRET_KEY': JSON.stringify(gameAnalyticsSecretKey),
+      'process.env.GAMEANALYTICS_BUILD': JSON.stringify(process.env.GAMEANALYTICS_BUILD || ''),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')
     })
   ],
