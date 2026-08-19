@@ -3119,6 +3119,39 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     return cleanup;
   }, [onMessage]);
 
+  // The server creates and joins a lobby on the challenger's behalf when they
+  // challenge from outside one, and announces it with an unsolicited
+  // `LobbyCreated`. Without a standing handler that frame is dropped — the only
+  // other one is the transient handler inside `createLobby` — and the
+  // challenger's own client never learns it is in the lobby its challenge
+  // points at.
+  useEffect(() => {
+    const cleanup = onMessage('LobbyCreated', (message) => {
+      const lobbyCode = (message?.data as { lobby_code?: unknown } | undefined)?.lobby_code;
+      if (typeof lobbyCode !== 'string' || !lobbyCode.trim()) {
+        return;
+      }
+      const normalizedCode = lobbyCode.trim().toUpperCase();
+      // An in-flight createLobby() has its own handler and richer follow-up
+      // (preferences, promise resolution); adopting here as well would be
+      // redundant, so only take frames it is not already handling.
+      if (currentLobbyRef.current?.code === normalizedCode) {
+        return;
+      }
+      const adopted: Lobby = {
+        id: null,
+        code: normalizedCode,
+        hostUserId: user?.id ?? 0,
+        region: '',
+        state: 'waiting',
+      };
+      currentLobbyRef.current = adopted;
+      setCurrentLobby(adopted);
+      persistLobby({ id: null, code: normalizedCode });
+    });
+    return cleanup;
+  }, [onMessage, persistLobby, user?.id]);
+
   useEffect(() => {
     const cleanup = onMessage('ChallengeFailed', (message) => {
       const reason = (message?.data as { reason?: unknown } | undefined)?.reason;

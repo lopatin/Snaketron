@@ -5838,7 +5838,6 @@ struct SocialSession {
     /// undo the newer socket's work.
     websocket_id: String,
     presence: PresenceRegistry,
-    challenges: ChallengeStore,
     /// What the lease should currently assert. Shared with the refresh loop so
     /// a heartbeat re-states the player's *current* name and activity rather
     /// than the ones captured when the connection authenticated.
@@ -5859,23 +5858,21 @@ impl SocialSession {
         for task in self.tasks.drain(..) {
             task.abort();
         }
-        // Only the socket that still owns the lease may declare this player
-        // gone. On a planned handoff the replacement already owns it, and
-        // withdrawing challenges here would cancel invitations for a player
-        // who never left.
-        let departed = match self
+        // Only the socket that still owns the lease may drop it. A planned
+        // handoff — and, far more commonly, a second browser tab — leaves the
+        // replacement owning the lease, and this must not delete its presence.
+        //
+        // Nothing is withdrawn here. A disconnect cannot tell "this player
+        // left" from "one of this player's sockets went away", so cancelling
+        // their challenges on it would cancel live invitations for someone
+        // still sitting in another tab. Challenges expire on their own two
+        // minute deadline, and a stale one fails honestly at accept time.
+        if let Err(error) = self
             .presence
             .release(self.user_id, &self.websocket_id)
             .await
         {
-            Ok(departed) => departed,
-            Err(error) => {
-                debug!(user_id = self.user_id, %error, "failed to release presence on disconnect");
-                false
-            }
-        };
-        if departed && let Err(error) = self.challenges.withdraw_all(self.user_id).await {
-            debug!(user_id = self.user_id, %error, "failed to withdraw challenges on disconnect");
+            debug!(user_id = self.user_id, %error, "failed to release presence on disconnect");
         }
     }
 }
@@ -5971,7 +5968,7 @@ async fn start_social_session(
     let challenges = ChallengeStore::new(redis.clone());
 
     if let Err(error) = presence
-        .refresh(
+        .claim(
             user_id,
             websocket_id,
             &metadata.username,
@@ -6122,7 +6119,6 @@ async fn start_social_session(
         user_id,
         websocket_id: websocket_id.to_string(),
         presence,
-        challenges,
         intent,
         tasks,
     })

@@ -39,6 +39,9 @@ const DEFAULT_PUBLIC_SITE_URL: &str = "https://snaketron.io";
 
 /// Public pages are cached hard because a finished match is immutable.
 const PUBLIC_SUMMARY_CACHE_CONTROL: &str = "public, max-age=600, stale-while-revalidate=86400";
+/// An unfinished match is a moving target; cache it only long enough to absorb
+/// a burst of viewers arriving from the same shared link.
+const PENDING_SUMMARY_CACHE_CONTROL: &str = "public, max-age=15";
 
 /// The two reads this module needs, named separately from `Database` so the
 /// routes can be exercised without standing up a whole persistence layer —
@@ -203,6 +206,13 @@ async fn load_public_summary(
     // No summary yet. An id at or below the allocation high-water mark has
     // been handed to a real match, so the honest answer is "not finished",
     // not "no such match".
+    //
+    // This deliberately cannot distinguish "still playing" from "abandoned
+    // without ever completing" or "the canonical row is unreadable" — nothing
+    // durable is written until completion, so there is no signal to read. The
+    // page says only what is certainly true (the id was issued, no result
+    // exists) and keeps polling; the alternative is telling someone their live
+    // match does not exist, which is wrong far more often.
     match state.games.latest_allocated_game_id().await {
         Ok(Some(latest)) if game_id <= latest => Ok(Some(PublicGameResponse::Pending {
             game_id: game_id as u32,
@@ -233,11 +243,19 @@ async fn get_public_game_summary(
     };
 
     match load_public_summary(&state, game_id).await {
-        Ok(Some(summary)) => {
-            let mut response = Json(summary).into_response();
+        Ok(Some(payload)) => {
+            // A finished match is immutable and cached hard; a pending one is
+            // about to change and must not be cached as though it were a
+            // result, or a viewer sits on "still being played" for ten minutes
+            // after the match ends.
+            let cache_control = match &payload {
+                PublicGameResponse::Final { .. } => PUBLIC_SUMMARY_CACHE_CONTROL,
+                PublicGameResponse::Pending { .. } => PENDING_SUMMARY_CACHE_CONTROL,
+            };
+            let mut response = Json(payload).into_response();
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static(PUBLIC_SUMMARY_CACHE_CONTROL),
+                axum::http::HeaderValue::from_static(cache_control),
             );
             response
         }
@@ -281,7 +299,7 @@ async fn get_public_game_page(
         Ok(Some(PublicGameResponse::Pending { game_id, .. })) => html_response(
             StatusCode::OK,
             render_pending_game_page(&state.site_url, game_id),
-            "public, max-age=15",
+            PENDING_SUMMARY_CACHE_CONTROL,
         ),
         // A genuine 404 is the right answer for a crawler: it de-indexes the
         // URL instead of recording an empty page under a 200.

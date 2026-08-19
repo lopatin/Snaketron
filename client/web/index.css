@@ -6929,3 +6929,25 @@ a.home-social-icon:hover {
     border: 1px solid CanvasText;
   }
 }
+
+.challenges-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 2px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.challenges-error button {
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}

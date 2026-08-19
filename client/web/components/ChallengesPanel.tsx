@@ -18,7 +18,8 @@ import { ChallengeIcon } from './Icons';
  */
 
 export const ChallengesPanel: React.FC = () => {
-  const { challenges, respondToChallenge, cancelChallenge } = useWebSocket();
+  const { challenges, challengeError, respondToChallenge, cancelChallenge, dismissChallengeError } =
+    useWebSocket();
   // Starts collapsed. Only a challenge addressed *at you* is worth taking the
   // screen for; your own outgoing challenge is something you already know
   // about, and on a phone an auto-opened card lands on the play button.
@@ -53,7 +54,17 @@ export const ChallengesPanel: React.FC = () => {
     previousPendingRef.current = pendingIncoming.length;
   }, [pendingIncoming.length]);
 
-  if (!hasAnything) {
+  // An error the player cannot see is an action that silently did nothing.
+  useEffect(() => {
+    if (challengeError) {
+      setIsExpanded(true);
+    }
+  }, [challengeError]);
+
+  // A failure raised by this panel's own buttons has to be visible from this
+  // panel: the roster strip that otherwise shows it is hidden during a match,
+  // which is exactly when Accept and Decline are still reachable.
+  if (!hasAnything && !challengeError) {
     return null;
   }
 
@@ -121,6 +132,15 @@ export const ChallengesPanel: React.FC = () => {
               </svg>
             </button>
           </div>
+
+          {challengeError && (
+            <p className="challenges-error" role="alert">
+              <span>{challengeError}</span>
+              <button type="button" onClick={dismissChallengeError} aria-label="Dismiss">
+                ✕
+              </button>
+            </p>
+          )}
 
           <ul className="challenges-list">
             {visible.incoming.map((challenge) => {

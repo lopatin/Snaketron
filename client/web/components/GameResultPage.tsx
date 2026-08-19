@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import type { PublicGameSummary } from '../types/generated';
-import { api } from '../services/api';
+import { api, isApiError } from '../services/api';
 import ShareGame from './ShareGame';
 
 /**
@@ -92,9 +92,12 @@ export const GameResultPage: React.FC = () => {
             return;
           }
           // A 404 is a real answer ("no such match"); anything else is a fault
-          // worth offering a retry for.
-          const message = error instanceof Error ? error.message : '';
-          setState({ phase: /404|not found/i.test(message) ? 'missing' : 'error' });
+          // worth offering a retry for. The API rejects with a plain object,
+          // not an `Error`, so `instanceof` would classify every failure —
+          // including every 404 — as a temporary fault.
+          setState({
+            phase: isApiError(error) && error.response.status === 404 ? 'missing' : 'error',
+          });
         });
     };
 

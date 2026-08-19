@@ -281,6 +281,12 @@ impl RedisKeys {
         format!("challenge:{{snaketron:ch:{user_id}}}:data")
     }
 
+    /// Rolling count of challenges one user has issued, for rate limiting.
+    /// Shares the user's challenge slot so it can be read alongside them.
+    pub fn user_challenge_rate(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:rate")
+    }
+
     /// Per-user loss-tolerant hint channel. Pub/Sub is at-most-once, so this
     /// only ever says "your challenge state moved, re-read it" — the durable
     /// keys above stay authoritative and a periodic reconcile covers a drop.
@@ -629,6 +635,7 @@ mod tests {
         assert_same_slot(&[
             RedisKeys::user_challenge_index(7),
             RedisKeys::user_challenge_data(7),
+            RedisKeys::user_challenge_rate(7),
         ]);
         assert_ne!(
             hash_tag(&RedisKeys::user_challenge_index(7)),

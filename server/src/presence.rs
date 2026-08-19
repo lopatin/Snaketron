@@ -87,14 +87,19 @@ pub struct RegionRoster {
 /// index before the record means a crash between the two leaves an orphaned
 /// index member (harmless, self-pruning) rather than a record that is counted
 /// forever.
+/// `ARGV[6]` is "1" only for the claim a connection makes when it joins the
+/// social layer. A heartbeat must NOT re-take ownership: during a
+/// make-before-break handoff both sockets are briefly alive, and a retiring
+/// socket that re-stamped itself as owner would then pass its own release
+/// check and delete the replacement's presence.
 const REFRESH_PRESENCE_SCRIPT: &str = r#"
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 redis.call('ZADD', KEYS[2], now_ms + tonumber(ARGV[3]), ARGV[1])
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
--- Ownership is recorded beside the record, so a retiring socket can tell
--- whether it is still the one holding this lease.
-redis.call('HSET', KEYS[1], ARGV[4], ARGV[5])
+if ARGV[6] == '1' then
+    redis.call('HSET', KEYS[1], ARGV[4], ARGV[5])
+end
 -- Keep the region's keys from outliving the last player in it.
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]) * 4)
 redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[3]) * 4)
@@ -123,6 +128,12 @@ local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now_ms)
 if #expired > 0 then
     redis.call('HDEL', KEYS[1], unpack(expired))
     redis.call('ZREM', KEYS[2], unpack(expired))
+    -- The expiry index only names the record field, so the ownership field
+    -- paired with it has to be removed here too or it accumulates forever in
+    -- a region with any churn.
+    for _, member in ipairs(expired) do
+        redis.call('HDEL', KEYS[1], 'owner:' .. member)
+    end
 end
 return redis.call('HGETALL', KEYS[1])
 "#;
@@ -153,6 +164,29 @@ impl PresenceRegistry {
     /// Assert (or re-assert) that this user is online. Idempotent by design:
     /// the refresh loop, an activity change, and a reconnect all take the same
     /// path, and the last writer simply wins.
+    /// Claim the lease for this connection. Exactly one of these per socket.
+    pub async fn claim(
+        &self,
+        user_id: u32,
+        websocket_id: &str,
+        username: &str,
+        is_guest: bool,
+        activity: PresenceActivity,
+        pool: MatchmakingPool,
+    ) -> Result<()> {
+        self.write(
+            user_id,
+            websocket_id,
+            username,
+            is_guest,
+            activity,
+            pool,
+            true,
+        )
+        .await
+    }
+
+    /// Re-assert an existing lease. Deliberately does not touch ownership.
     pub async fn refresh(
         &self,
         user_id: u32,
@@ -161,6 +195,29 @@ impl PresenceRegistry {
         is_guest: bool,
         activity: PresenceActivity,
         pool: MatchmakingPool,
+    ) -> Result<()> {
+        self.write(
+            user_id,
+            websocket_id,
+            username,
+            is_guest,
+            activity,
+            pool,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write(
+        &self,
+        user_id: u32,
+        websocket_id: &str,
+        username: &str,
+        is_guest: bool,
+        activity: PresenceActivity,
+        pool: MatchmakingPool,
+        take_ownership: bool,
     ) -> Result<()> {
         // Stress traffic is a separate matchmaking universe; letting it into
         // the public roster would put unchallengeable load-test identities in
@@ -187,6 +244,7 @@ impl PresenceRegistry {
             .arg(PRESENCE_LEASE_MS)
             .arg(owner_field(user_id))
             .arg(websocket_id)
+            .arg(if take_ownership { "1" } else { "0" })
             .invoke_async(&mut connection)
             .await
             .context("failed to refresh a presence lease")?;

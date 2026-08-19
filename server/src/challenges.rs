@@ -35,6 +35,15 @@ pub const RESOLVED_CHALLENGE_LINGER_MS: i64 = 20_000;
 /// inbox's size.
 pub const MAX_OUTGOING_CHALLENGES: usize = 5;
 pub const MAX_INCOMING_CHALLENGES: usize = 20;
+/// Challenges one player may *issue* in a rolling window.
+///
+/// The concurrency ceilings above are not a rate limit: cancelling or being
+/// declined frees a slot immediately, so `issue -> cancel -> issue` could
+/// hammer a named victim indefinitely. This bounds the churn itself.
+pub const CHALLENGE_RATE_LIMIT: usize = 12;
+pub const CHALLENGE_RATE_WINDOW_MS: usize = 60_000;
+/// The hint body, as a JSON string so subscribers can decode it.
+pub const CHALLENGE_HINT_PAYLOAD: &str = "\"challenges\"";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +106,7 @@ pub enum ChallengeRejection {
     AlreadyChallenged,
     TooManyOutgoing,
     TargetInboxFull,
+    RateLimited,
 }
 
 impl ChallengeRejection {
@@ -109,6 +119,7 @@ impl ChallengeRejection {
                 "You have too many challenges out. Wait for a reply or cancel one."
             }
             Self::TargetInboxFull => "That player has too many challenges pending.",
+            Self::RateLimited => "You are sending challenges too quickly. Wait a moment.",
         }
     }
 }
@@ -125,6 +136,21 @@ if #expired > 0 then
     redis.call('ZREM', KEYS[2], unpack(expired))
 end
 return redis.call('HGETALL', KEYS[1])
+"#;
+
+/// Count one issued challenge inside a rolling window, and report whether the
+/// caller is over budget. The window is a plain expiring counter rather than a
+/// sorted set: the exact eviction boundary does not matter for an anti-spam
+/// backstop, and one key beats one member per attempt.
+const RATE_LIMIT_SCRIPT: &str = r#"
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+if count > tonumber(ARGV[2]) then
+    return 0
+end
+return 1
 "#;
 
 const WRITE_CHALLENGE_SCRIPT: &str = r#"
@@ -213,6 +239,21 @@ impl ChallengeStore {
     ) -> Result<std::result::Result<Challenge, ChallengeRejection>> {
         if challenge.from_user_id == challenge.to_user_id {
             return Ok(Err(ChallengeRejection::Self_));
+        }
+
+        // Charged before any of the ceilings below, so a rejected attempt still
+        // costs budget — otherwise the cheapest way to spam is to keep making
+        // attempts that fail.
+        let mut connection = self.redis.clone();
+        let within_budget: i64 = redis::Script::new(RATE_LIMIT_SCRIPT)
+            .key(RedisKeys::user_challenge_rate(challenge.from_user_id))
+            .arg(CHALLENGE_RATE_WINDOW_MS)
+            .arg(CHALLENGE_RATE_LIMIT)
+            .invoke_async(&mut connection)
+            .await
+            .context("failed to record a challenge attempt")?;
+        if within_budget != 1 {
+            return Ok(Err(ChallengeRejection::RateLimited));
         }
 
         let now = now_ms();
@@ -309,42 +350,21 @@ impl ChallengeStore {
         Ok(Some(challenge))
     }
 
-    /// Expire every challenge this user is a party to. Used when they go
-    /// offline, so nobody is left staring at an invitation that can no longer
-    /// be answered.
-    pub async fn withdraw_all(&self, user_id: u32) -> Result<Vec<u32>> {
-        let inbox = self.inbox(user_id).await?;
-        let mut notified = Vec::new();
-        for challenge in inbox.incoming.into_iter().chain(inbox.outgoing) {
-            if challenge.state != ChallengeState::Pending {
-                continue;
-            }
-            let counterparty = if challenge.from_user_id == user_id {
-                challenge.to_user_id
-            } else {
-                challenge.from_user_id
-            };
-            let mut cancelled = challenge.clone();
-            cancelled.state = ChallengeState::Cancelled;
-            self.store(challenge.from_user_id, &cancelled).await?;
-            self.store(challenge.to_user_id, &cancelled).await?;
-            if !notified.contains(&counterparty) {
-                notified.push(counterparty);
-            }
-        }
-        for user in &notified {
-            self.hint(*user).await;
-        }
-        Ok(notified)
-    }
-
     /// Nudge one user's sockets to re-read their challenges. Best effort by
     /// construction — the durable record is what matters, and a socket that
     /// misses this reconciles on its own timer.
+    ///
+    /// The payload is a JSON string, not a bare word: subscribers decode every
+    /// Pub/Sub message with `serde_json`, and an unquoted `challenges` fails
+    /// to parse and is silently skipped, which would leave the feature running
+    /// at reconcile latency while looking instantaneous in code review.
     async fn hint(&self, user_id: u32) {
         let mut connection = self.redis.clone();
         let published: Result<(), _> = connection
-            .publish(RedisKeys::user_notifications_channel(user_id), "challenges")
+            .publish(
+                RedisKeys::user_notifications_channel(user_id),
+                CHALLENGE_HINT_PAYLOAD,
+            )
             .await;
         if let Err(error) = published {
             tracing::debug!(user_id, %error, "challenge hint publish failed; reconcile will cover it");
@@ -469,6 +489,17 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// Subscribers decode Pub/Sub payloads with serde_json and silently skip
+    /// anything that does not parse, so a malformed hint degrades the feature
+    /// to reconcile latency without any visible error.
+    #[test]
+    fn the_hint_payload_decodes_as_the_subscriber_reads_it() {
+        assert_eq!(
+            serde_json::from_str::<String>(CHALLENGE_HINT_PAYLOAD).unwrap(),
+            "challenges"
+        );
+    }
+
     #[test]
     fn every_rejection_reads_as_an_explanation() {
         for rejection in [
@@ -477,6 +508,7 @@ mod tests {
             ChallengeRejection::AlreadyChallenged,
             ChallengeRejection::TooManyOutgoing,
             ChallengeRejection::TargetInboxFull,
+            ChallengeRejection::RateLimited,
         ] {
             let reason = rejection.reason();
             assert!(reason.ends_with('.'), "{reason:?} is not a sentence");
