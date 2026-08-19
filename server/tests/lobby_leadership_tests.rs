@@ -227,8 +227,27 @@ async fn leadership_passes_to_a_remaining_member_when_the_host_leaves() -> Resul
         "the creator starts as host"
     );
 
-    let host = clients.remove(0);
-    host.disconnect().await?;
+    // Leave explicitly rather than dropping the socket. Transport loss is
+    // deliberately *not* treated as leaving (`detach_transport`, not `close`,
+    // in ws_server) so a player whose connection blips can reconnect into
+    // their lobby instead of being ejected. A host who closes their tab
+    // therefore keeps membership until their ~90s lease expires, and
+    // succession waits with it — bounded and self-healing, but far too slow
+    // to assert on here. The lease-expiry route into the same promotion is
+    // covered by `lobby_host_successor`'s unit tests, which exercise the
+    // choice against a roster the host is already absent from, however they
+    // came to be absent.
+    let mut host = clients.remove(0);
+    host.send_message(WSMessage::LeaveLobby).await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let WSMessage::LeftLobby = host.receive_message().await? {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await
+    .context("host did not receive LeftLobby")??;
 
     // Succession resolves on read, so the surviving member's own view is what
     // has to converge.
@@ -269,6 +288,7 @@ async fn leadership_passes_to_a_remaining_member_when_the_host_leaves() -> Resul
     .await
     .context("the promoted member could not change preferences")??;
 
+    host.disconnect().await?;
     for client in clients {
         client.disconnect().await?;
     }
