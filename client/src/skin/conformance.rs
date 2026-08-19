@@ -316,11 +316,16 @@ fn skin_conformance_the_v2_fixtures_really_do_animate() {
         shade_slot: 0,
     };
 
+    // Two fixtures deliberately do not read the clock, and naming them here is
+    // the point: a blanket skip would hide a fixture that stopped animating by
+    // accident. The reactive one varies with the snake and has its own check
+    // below; the text one is static because a worn word is, and pretending
+    // otherwise would be testing something no author would write.
+    const STILL_ON_PURPOSE: [&str; 2] = ["fixture-reactive@1", "fixture-text@1"];
+
     for doc in crate::skin::docv2::conformance_fixtures() {
         let skin = crate::skin::docv2::LayerSkin::compile(&doc).expect("fixture compiles");
-        // The Boost-reactive fixture varies with the snake rather than the
-        // clock, and is covered by its own check below.
-        if doc.id == "fixture-reactive@1" {
+        if STILL_ON_PURPOSE.contains(&doc.id.as_str()) {
             continue;
         }
         let rest = record(&skin, &pose(0.0), &identity);

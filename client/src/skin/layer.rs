@@ -397,6 +397,28 @@ pub enum Source {
         /// which keeps the count a property of the skin and not of the moment.
         drift_cells: f64,
     },
+    /// Letters along the body, one per cell.
+    ///
+    /// Lowered to the same `drawImage` every other bitmap source uses — the
+    /// glyph strip is an atlas region and a character is a sub-rect of it — so
+    /// text needs no new op, no font machinery and no measuring.
+    ///
+    /// What it does need is for the *count* to stay a property of the pose:
+    /// one blit per covered cell, with the string repeating rather than the
+    /// span stretching to hold it. A layer that emitted one blit per character
+    /// would change its op count when an author typed, which is exactly what
+    /// static topology forbids — and it would do so silently, since typing is
+    /// not an action anybody associates with a frame budget.
+    Text {
+        /// The bundled glyph strip.
+        region: usize,
+        color: ColorSlot,
+        /// One atlas index per character, resolved at registration so the paint
+        /// loop never searches a charset.
+        glyphs: std::sync::Arc<Vec<usize>>,
+        /// How much of a cell a letter fills, `0..1`.
+        scale: f64,
+    },
 }
 
 /// Alpha ramps at the ends of an image span.

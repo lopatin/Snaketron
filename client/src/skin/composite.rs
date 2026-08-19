@@ -191,18 +191,25 @@ impl CompositeSkin {
     ) -> Result<Self, Vec<LayerStackError>> {
         let mut problems = validate_layers(&layers, &frames);
         for layer in &layers {
-            let LayerKind::Span {
-                source:
-                    Source::Image {
-                        region,
-                        fade,
-                        drift_cells,
-                        ..
-                    },
-                ..
-            } = &layer.kind
-            else {
-                continue;
+            // Both bitmap sources name an atlas region, and both are refused
+            // at registration for naming one that does not exist — a blank
+            // snake discovered mid-match is the alternative.
+            let (region, fade, drift_cells) = match &layer.kind {
+                LayerKind::Span {
+                    source:
+                        Source::Image {
+                            region,
+                            fade,
+                            drift_cells,
+                            ..
+                        },
+                    ..
+                } => (region, *fade, *drift_cells),
+                LayerKind::Span {
+                    source: Source::Text { region, .. },
+                    ..
+                } => (region, None, 0.0),
+                _ => continue,
             };
             // A fade is a fixed number of extra blits per run, so an absurd
             // step count is a frame-rate bug rather than an ugly one — and it
@@ -492,7 +499,9 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                 }
             }
             LayerKind::Span { source, corner, .. } => {
-                let blit = matches!(source, Source::Image { .. });
+                // Text is a blit too: it draws glyph sub-rects from the bundled
+                // strip, so it inherits every rule a bitmap source has.
+                let blit = matches!(source, Source::Image { .. } | Source::Text { .. });
                 if blit && !corner.allows_blits() {
                     reject(
                         &mut problems,
@@ -1535,6 +1544,88 @@ impl CompositeSkin {
                         break;
                     }
                 }
+                Source::Text {
+                    region,
+                    color: slot,
+                    glyphs,
+                    scale,
+                } => {
+                    let Some(strip) = self.atlas.region(*region) else {
+                        ctx.restore();
+                        continue;
+                    };
+                    let Some(image) = self.atlas.handle(strip.image) else {
+                        ctx.restore();
+                        continue;
+                    };
+                    if glyphs.is_empty() {
+                        ctx.restore();
+                        continue;
+                    }
+
+                    // The strip is square cells, two rows of inks, so a cell is
+                    // half the region's height and the glyph count follows from
+                    // the width. Derived rather than declared: a strip
+                    // regenerated with more punctuation should not need a
+                    // constant edited to match it.
+                    let glyph_px = (strip.height / GLYPH_INK_ROWS as f64).max(1e-6);
+                    let count = (strip.width / glyph_px).round().max(1.0);
+
+                    // Which ink, chosen from the document's colour reference
+                    // resolved for *this* role.
+                    //
+                    // Canvas cannot tint a blit — `fillStyle` does not touch
+                    // `drawImage`, and the ways around that need either a
+                    // per-snake isolation buffer or an offscreen canvas, and
+                    // this engine has neither. So the strip carries its inks
+                    // and the reference picks between them by luminance. It is
+                    // a smaller promise than arbitrary colour and it keeps the
+                    // one that matters: legible on a light snake and on a dark
+                    // one. Picking the row is a source-rect *argument*, so it
+                    // varies per role without changing a single op.
+                    let ink_row =
+                        match skin_schema::color::Rgb::parse(color(*slot, swatch, &self.config)) {
+                            Some(chosen) if chosen.relative_luminance() >= 0.5 => 0.0,
+                            Some(_) => 1.0,
+                            None => 0.0,
+                        };
+
+                    // One blit per covered cell, indexed by the cell's place
+                    // along the body rather than by the character's place in
+                    // the string. That is what makes the count a function of
+                    // the pose: a longer word does not cost more, it wraps.
+                    let mut cell = start.floor().max(allocation.start.floor());
+                    let mut failed = None;
+                    while cell < end && failed.is_none() {
+                        let centre = cell + 0.5;
+                        cell += 1.0;
+                        if centre < start || centre >= end {
+                            continue;
+                        }
+                        let index =
+                            ((centre - allocation.start).floor().max(0.0) as usize) % glyphs.len();
+                        let glyph = glyphs[index].min(count as usize - 1);
+                        let half = scale.clamp(0.0, 1.0) / 2.0;
+                        failed = ctx
+                            .draw_image(
+                                image,
+                                (
+                                    strip.x + glyph as f64 * glyph_px,
+                                    strip.y + ink_row * glyph_px,
+                                    glyph_px,
+                                    glyph_px,
+                                ),
+                                (centre - run.s0 - half, -half, half * 2.0, half * 2.0),
+                            )
+                            .err();
+                    }
+
+                    if let Some(cause) = failed {
+                        ctx.restore();
+                        error = Some(cause);
+                        break;
+                    }
+                }
             }
             ctx.restore();
         }
@@ -1545,6 +1636,10 @@ impl CompositeSkin {
         }
     }
 }
+
+/// How many inks the bundled glyph strip carries, light row first. Mirrors
+/// `INKS` in `client/design/tools/build_glyph_atlas.py`.
+pub(crate) const GLYPH_INK_ROWS: usize = 2;
 
 /// A travelling wave, resolved to one moment in its cycle.
 ///

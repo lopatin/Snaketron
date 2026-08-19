@@ -51,6 +51,14 @@ const LABEL_SAMPLES_S: [f64; 4] = [1.5, 2.0, 2.5, 3.0];
 /// length of the snake.
 const SIDE_SAMPLES_S: [f64; 6] = [1.0, 4.0, 8.0, 12.0, 16.0, 20.0];
 
+/// How much of a cell one glyph's ink actually covers.
+///
+/// Measured from the strip `client/design/tools/build_glyph_atlas.py` writes:
+/// 569 opaque pixels across 41 glyphs of 16x16 each. Kept as a number here
+/// rather than read from the PNG, because this crate has no image decoder and
+/// deliberately no dependency that would give it one.
+const TEXT_INK_COVERAGE: f64 = 569.0 / (41.0 * 16.0 * 16.0);
+
 /// One resolved colour with an opacity, ready to composite.
 struct Paint {
     color: Rgb,
@@ -228,7 +236,24 @@ fn paint_of(
                         .map_or(1.0, |expr| scalar(expr, time, s, 1.0))
                         .clamp(0.0, 1.0),
             ),
-            SourceV2::Text { color, .. } => (resolve(color, pair, doc, time)?, layer_alpha),
+            SourceV2::Text { color, scale, .. } => (
+                resolve(color, pair, doc, time)?,
+                // A letter is mostly holes. Every other source here covers the
+                // stretch it claims, so treating text the same way would have
+                // a word behind the head reading as a solid dark band — and
+                // would refuse every text skin ever written.
+                //
+                // The fraction is measured from the strip the generator
+                // writes: 569 opaque pixels across 41 glyphs of 16x16, so
+                // about 5.4% of a cell is ink. Scale squares it, because
+                // shrinking a glyph shrinks it in both axes.
+                //
+                // This is an *area* model, which is the right answer for what
+                // a stretch of body reads as and an approximation for the
+                // label sitting directly on a letter. Text under the label is
+                // a judgement the review queue sees too.
+                layer_alpha * TEXT_INK_COVERAGE * scale.clamp(0.0, 1.0).powi(2),
+            ),
             // Pixels this crate does not hold. Deliberately not guessed at:
             // section 7.3 of the PRD makes texture *content* the forge's
             // question and the review queue's, not the sampler's.

@@ -764,7 +764,20 @@ fn source_variants() -> Vec<VariantV2> {
                         charset: Some(TEXT_CHARSET.to_string()),
                     },
                 ),
-                color_ref("source.color", "Colour"),
+                explained(
+                    "source.color",
+                    "Ink",
+                    KindV2::ColorRef {
+                        slots: exhaustiveness::slots()
+                            .into_iter()
+                            .map(|(value, label)| choice(value, label))
+                            .collect(),
+                    },
+                    "Letters come in light or dark, and this picks whichever \
+                     your colour is closer to — per side, so a word stays \
+                     legible on both. Canvas cannot tint letters the way it \
+                     tints a shape.",
+                ),
                 field(
                     "source.scale",
                     "Size",
@@ -779,11 +792,37 @@ fn source_variants() -> Vec<VariantV2> {
     ]
 }
 
+/// Every field a layer always has, spelled out.
+///
+/// A variant's default has to be *complete*, not merely valid. The schema is
+/// happy to fill `transform` in from serde defaults, but the panel is not: an
+/// absent value reads as "no constant here", which flips an expression field
+/// into its fx view showing an empty box. Valid document, baffling editor.
+fn with_common_fields(mut body: serde_json::Value) -> serde_json::Value {
+    let map = body.as_object_mut().expect("a layer default is an object");
+    map.entry("opacity")
+        .or_insert_with(|| serde_json::json!(1.0));
+    map.entry("boost_only")
+        .or_insert_with(|| serde_json::json!(false));
+    map.entry("omit_on_single_cell")
+        .or_insert_with(|| serde_json::json!(false));
+    map.entry("transform").or_insert_with(|| {
+        serde_json::json!({
+            "translate_s": 0.0,
+            "translate_t": 0.0,
+            "scale_s": 1.0,
+            "scale_t": 1.0,
+            "rotate_turns": 0.0
+        })
+    });
+    body
+}
+
 /// The five layer kinds an author can add.
 fn layer_variants() -> Vec<VariantV2> {
     let common = |extra: Vec<FieldV2>| extra;
 
-    vec![
+    let variants = vec![
         VariantV2 {
             value: "ribbon".to_string(),
             label: "Ribbon".to_string(),
@@ -936,7 +975,15 @@ fn layer_variants() -> Vec<VariantV2> {
             }),
             children: Vec::new(),
         },
-    ]
+    ];
+
+    variants
+        .into_iter()
+        .map(|variant| VariantV2 {
+            default: with_common_fields(variant.default),
+            ..variant
+        })
+        .collect()
 }
 
 /// The inspector: what every layer has, then what its kind adds.
@@ -1204,6 +1251,46 @@ mod tests {
             if let Err(errors) = validate_v2(&doc) {
                 panic!(
                     "`{}` inserts a layer that does not validate: {errors:?}",
+                    variant.value
+                );
+            }
+        }
+    }
+
+    /// A default has to be *complete*, not merely valid.
+    ///
+    /// Serde will happily fill a missing `transform` in, so a layer without one
+    /// validates — but the panel reads an absent value as "no constant here"
+    /// and flips the field into its expression view showing an empty box. The
+    /// document is fine and the editor looks broken, which is the worst of both.
+    #[test]
+    fn every_layer_default_spells_out_the_fields_every_layer_has() {
+        for variant in describe_v2().add_layer {
+            let object = variant
+                .default
+                .as_object()
+                .unwrap_or_else(|| panic!("`{}` is not an object", variant.value));
+            for key in ["opacity", "transform", "boost_only", "omit_on_single_cell"] {
+                assert!(
+                    object.contains_key(key),
+                    "`{}` omits `{key}`, which leaves the panel showing an \
+                     empty control for a value the schema quietly defaulted",
+                    variant.value
+                );
+            }
+            let transform = object["transform"]
+                .as_object()
+                .expect("the transform is an object");
+            for key in [
+                "translate_s",
+                "translate_t",
+                "scale_s",
+                "scale_t",
+                "rotate_turns",
+            ] {
+                assert!(
+                    transform.contains_key(key),
+                    "`{}` omits `transform.{key}`",
                     variant.value
                 );
             }
