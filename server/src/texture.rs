@@ -304,6 +304,48 @@ pub fn validate_shape(proposed: ProposedTexture) -> Result<(), Vec<TextureError>
     }
 }
 
+/// What a PNG header says the image is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PngHeader {
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+/// Read a PNG's dimensions from its header, without decoding it.
+///
+/// This is the gate that makes the size limits meaningful. A PNG's IHDR
+/// declares its dimensions in the first 24 bytes, and a 4 MB upload can
+/// declare 60,000 × 60,000 — which is fourteen gigabytes once a decoder
+/// believes it. Checking the header first means the limit is enforced against
+/// a number rather than against an allocation.
+pub fn read_png_header(bytes: &[u8]) -> Result<PngHeader, TextureError> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+    if bytes.len() < 24 {
+        return Err(TextureError::new("image", "is too short to be a PNG"));
+    }
+    if bytes[..8] != SIGNATURE {
+        return Err(TextureError::new(
+            "image",
+            "is not a PNG — only PNG is accepted, and the magic bytes decide, not the filename",
+        ));
+    }
+    // Bytes 8..12 are the IHDR length, 12..16 the chunk type.
+    if &bytes[12..16] != b"IHDR" {
+        return Err(TextureError::new("image", "has no IHDR where one must be"));
+    }
+
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    if width == 0 || height == 0 {
+        return Err(TextureError::new("image", "declares no extent"));
+    }
+    Ok(PngHeader {
+        width_px: width,
+        height_px: height,
+    })
+}
+
 /// How many cells of body one repeat of this image spans.
 pub fn repeat_cells(kind: TextureKind, width_px: u32) -> Option<f32> {
     if kind == TextureKind::Overlay {
@@ -536,6 +578,54 @@ mod tests {
             prompt.contains("does not tile"),
             "an overlay must not be asked for seamlessness it cannot have"
         );
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_png_header_gives_up_its_dimensions_without_a_decode() {
+        let header = read_png_header(&png_bytes(768, 64)).expect("a well-formed header");
+        assert_eq!(header.width_px, 768);
+        assert_eq!(header.height_px, 64);
+    }
+
+    /// The decompression-bomb gate: a small upload can declare an enormous
+    /// image, and the size limit has to be applied to the declaration rather
+    /// than to whatever a decoder allocates believing it.
+    #[test]
+    fn an_enormous_declaration_is_caught_from_a_tiny_upload() {
+        let bytes = png_bytes(60_000, 60_000);
+        assert!(bytes.len() < 32, "the upload itself is tiny");
+
+        let header = read_png_header(&bytes).expect("the header parses");
+        let refusal = validate_shape(ProposedTexture {
+            kind: TextureKind::Coat,
+            width_px: header.width_px,
+            height_px: header.height_px,
+            rows: None,
+            byte_len: bytes.len(),
+        })
+        .expect_err("14 gigabytes decoded");
+        assert!(refusal.iter().any(|error| error.problem.contains("limit")));
+    }
+
+    /// The magic bytes decide, not the content type or the filename.
+    #[test]
+    fn anything_that_is_not_a_png_is_refused_by_its_bytes() {
+        assert!(read_png_header(b"GIF89a and then some padding bytes").is_err());
+        assert!(read_png_header(b"too short").is_err());
+        assert!(read_png_header(&png_bytes(0, 64)).is_err(), "no extent");
+
+        let mut wrong_chunk = png_bytes(64, 64);
+        wrong_chunk[12..16].copy_from_slice(b"IDAT");
+        assert!(read_png_header(&wrong_chunk).is_err());
     }
 
     #[test]

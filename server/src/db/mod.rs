@@ -9,11 +9,13 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 use crate::completion::{CompletionEffect, CompletionRecordV1, EffectApplyResult};
+use crate::generation::GenerationJob;
 use crate::season::Season;
 use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
     SkinRevision,
 };
+use crate::texture::Texture;
 use crate::wallet::{LedgerSource, Wallet};
 use common::GameState;
 use models::*;
@@ -233,6 +235,45 @@ pub trait Database: Send + Sync {
         idempotency_key: &str,
         request_hash: &str,
     ) -> Result<PurchaseOutcome>;
+
+    // ---- Textures and generation jobs -------------------------------------
+
+    /// Store a texture's metadata. Bytes live in the texture store; this is
+    /// the record that says what they are.
+    async fn create_texture(&self, texture: &Texture) -> Result<Texture>;
+
+    async fn get_texture(&self, texture_id: i32) -> Result<Option<Texture>>;
+
+    /// Resolve a texture by the hash of its canonical variant — the render
+    /// path, which knows the reference and nothing else.
+    async fn get_texture_by_ref(&self, content_ref: &str) -> Result<Option<Texture>>;
+
+    async fn list_textures_by_owner(&self, user_id: i32, limit: usize) -> Result<Vec<Texture>>;
+
+    /// Allocate an id for a new texture.
+    async fn next_texture_id(&self) -> Result<i32>;
+
+    /// Record a generation job in its initial state.
+    async fn create_generation_job(&self, job: &GenerationJob) -> Result<()>;
+
+    async fn get_generation_job(&self, job_id: &str) -> Result<Option<GenerationJob>>;
+
+    /// Move a job forward, recording spend as it goes.
+    async fn update_generation_job(&self, job: &GenerationJob) -> Result<()>;
+
+    /// Take ownership of one queued job, if there is one.
+    ///
+    /// Conditional rather than leased through Redis: the region-scoped lease
+    /// primitives would hand the same job to one worker *per region*, and a
+    /// generation queue is global.
+    async fn claim_generation_job(
+        &self,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<Option<GenerationJob>>;
+
+    /// What generation has cost since a given moment, for the circuit breaker.
+    async fn generation_spend_since(&self, since_ms: i64) -> Result<u64>;
 
     /// Resolve one verified CrazyGames identity into a durable Snaketron
     /// account. Implementations own the uniqueness/claim transaction; callers

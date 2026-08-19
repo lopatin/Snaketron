@@ -5278,6 +5278,32 @@ mod tests {
             user_id: i32,
             recent_limit: usize
         ) -> crate::wallet::Wallet);
+        unused_database_method!(next_texture_id() -> i32);
+        unused_database_method!(create_texture(
+            texture: &crate::texture::Texture
+        ) -> crate::texture::Texture);
+        unused_database_method!(get_texture(texture_id: i32) -> Option<crate::texture::Texture>);
+        unused_database_method!(get_texture_by_ref(
+            content_ref: &str
+        ) -> Option<crate::texture::Texture>);
+        unused_database_method!(list_textures_by_owner(
+            user_id: i32,
+            limit: usize
+        ) -> Vec<crate::texture::Texture>);
+        unused_database_method!(create_generation_job(
+            job: &crate::generation::GenerationJob
+        ) -> ());
+        unused_database_method!(get_generation_job(
+            job_id: &str
+        ) -> Option<crate::generation::GenerationJob>);
+        unused_database_method!(update_generation_job(
+            job: &crate::generation::GenerationJob
+        ) -> ());
+        unused_database_method!(claim_generation_job(
+            worker: &str,
+            now_ms: i64
+        ) -> Option<crate::generation::GenerationJob>);
+        unused_database_method!(generation_spend_since(since_ms: i64) -> u64);
         unused_database_method!(purchase_skin(
             user_id: i32,
             skin_id: i32,

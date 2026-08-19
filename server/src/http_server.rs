@@ -35,6 +35,7 @@ use crate::api::rate_limit::{
 };
 use crate::api::regions;
 use crate::api::skins;
+use crate::api::textures;
 use crate::api::wallet as wallet_api;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
@@ -307,6 +308,9 @@ pub async fn install_http_application(
     // "does this account exist" to anyone. Per-IP, and tight enough that it is
     // a poor way to enumerate usernames.
     let player_lobby_limiter = rate_limit_layer(120, 60);
+    // Generation is the one route where a request turns into money, so it is
+    // throttled as well as quota'd and circuit-broken inside the handler.
+    let generation_limiter = rate_limit_layer(20, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
@@ -342,6 +346,19 @@ pub async fn install_http_application(
             post(skins::report_skin).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
         )
         .route("/api/wallet", get(wallet_api::get_wallet))
+        .route("/api/textures", get(textures::list_mine))
+        // Generation is slow and costs money per attempt, so the route that
+        // starts one is rate limited as well as quota'd inside the handler.
+        .route(
+            "/api/textures/generate",
+            post(textures::generate)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    generation_limiter,
+                    rate_limit_middleware,
+                )),
+        )
+        .route("/api/generation-jobs/:job_id", get(textures::get_job))
         .route(
             "/api/wallet/xsolla/checkout-token",
             post(wallet_api::xsolla_checkout_token)
@@ -449,6 +466,10 @@ pub async fn install_http_application(
             get(skins::get_document_by_ref),
         )
         .route("/api/skins/browse", get(skins::list_skins))
+        .route(
+            "/api/textures/by-ref/:content_ref/manifest",
+            get(textures::get_manifest),
+        )
         .route("/api/skins/:skin_id", get(skins::get_skin))
         .with_state(auth_state.clone());
 

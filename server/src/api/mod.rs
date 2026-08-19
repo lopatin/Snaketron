@@ -11,6 +11,7 @@ pub mod rate_limit;
 pub mod regions;
 pub mod server;
 pub mod skins;
+pub mod textures;
 pub mod wallet;
 
 pub use server::run_api_server;

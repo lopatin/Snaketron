@@ -30,12 +30,14 @@ use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
     canonical_json_bytes, match_history_summary,
 };
+use crate::generation::{GenerationJob, JobState};
 use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
 use crate::season::{Season, get_season_at};
 use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
     SkinRevision,
 };
+use crate::texture::Texture;
 use crate::wallet::{self, LedgerSource, Wallet};
 
 pub struct DynamoDatabase {
@@ -303,6 +305,131 @@ fn is_conditional_check_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, 
 }
 
 impl DynamoDatabase {
+    /// Read a texture back out of its item.
+    fn texture_from_item(item: &HashMap<String, AttributeValue>) -> Result<Texture> {
+        Ok(Texture {
+            texture_id: Self::extract_number(item, "textureId")
+                .ok_or_else(|| anyhow!("texture item has no id"))?,
+            owner_user_id: Self::extract_number(item, "ownerUserId").unwrap_or(0),
+            content_ref: Self::extract_string(item, "contentRef")
+                .ok_or_else(|| anyhow!("texture item has no content reference"))?,
+            kind: Self::extract_string(item, "kind")
+                .and_then(|value| crate::texture::TextureKind::parse(&value))
+                .ok_or_else(|| anyhow!("texture item has no usable kind"))?,
+            width_px: Self::extract_number(item, "widthPx").unwrap_or(0).max(0) as u32,
+            height_px: Self::extract_number(item, "heightPx").unwrap_or(0).max(0) as u32,
+            repeat_cells: Self::extract_string(item, "repeatCells")
+                .and_then(|value| value.parse().ok()),
+            rows: Self::extract_number(item, "rows").map(|rows| rows.max(0) as u32),
+            seams: Self::extract_string(item, "seams")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or(crate::texture::SeamReport {
+                    horizontal_ratio: 0.0,
+                    vertical_ratio: 0.0,
+                    repaired: false,
+                }),
+            last_prompt: Self::extract_string(item, "lastPrompt"),
+            variants: Self::extract_string(item, "variants")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
+            created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
+        })
+    }
+
+    /// The attribute map for one generation job.
+    ///
+    /// A queued job carries an index entry so a worker can find it; every
+    /// later state drops that entry, which is what keeps the queue partition
+    /// holding a queue rather than every job ever run.
+    fn generation_job_item(job: &GenerationJob) -> Result<HashMap<String, AttributeValue>> {
+        let mut item = HashMap::new();
+        item.insert(
+            "pk".to_string(),
+            Self::av_s(format!("GENJOB#{}", job.job_id)),
+        );
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("jobId".to_string(), Self::av_s(&job.job_id));
+        item.insert("ownerUserId".to_string(), Self::av_n(job.owner_user_id));
+        item.insert("kind".to_string(), Self::av_s(job.kind.as_str()));
+        item.insert("prompt".to_string(), Self::av_s(&job.prompt));
+        item.insert("state".to_string(), Self::av_s(job.state.as_str()));
+        item.insert(
+            "providerCalls".to_string(),
+            Self::av_n(job.spend.provider_calls),
+        );
+        item.insert(
+            "spendUsdMicros".to_string(),
+            Self::av_n(job.spend.usd_micros),
+        );
+        if let Some(texture_id) = job.texture_id {
+            item.insert("textureId".to_string(), Self::av_n(texture_id));
+        }
+        if let Some(failure) = job.failure {
+            item.insert("failure".to_string(), Self::av_s(failure.as_str()));
+        }
+        if let Some(detail) = &job.detail {
+            item.insert("detail".to_string(), Self::av_s(detail));
+        }
+        item.insert("createdAtMs".to_string(), Self::av_n(job.created_at_ms));
+        item.insert("updatedAtMs".to_string(), Self::av_n(job.updated_at_ms));
+
+        if job.state == JobState::Queued {
+            item.insert("gsi1pk".to_string(), Self::av_s("GENJOB_QUEUE"));
+            item.insert(
+                "gsi1sk".to_string(),
+                Self::av_s(format!("{:020}", job.created_at_ms)),
+            );
+        }
+        // Spend is totalled across a window, so every job carries a
+        // time-ordered entry regardless of state.
+        item.insert("gsi2pk".to_string(), Self::av_s("GENJOB_SPEND"));
+        item.insert(
+            "gsi2sk".to_string(),
+            Self::av_s(format!("{:020}", job.created_at_ms)),
+        );
+        Ok(item)
+    }
+
+    fn generation_job_from_item(item: &HashMap<String, AttributeValue>) -> Result<GenerationJob> {
+        Ok(GenerationJob {
+            job_id: Self::extract_string(item, "jobId")
+                .ok_or_else(|| anyhow!("job item has no id"))?,
+            owner_user_id: Self::extract_number(item, "ownerUserId").unwrap_or(0),
+            kind: Self::extract_string(item, "kind")
+                .and_then(|value| crate::texture::TextureKind::parse(&value))
+                .ok_or_else(|| anyhow!("job item has no usable kind"))?,
+            prompt: Self::extract_string(item, "prompt").unwrap_or_default(),
+            // An unreadable state is treated as failed rather than as queued:
+            // re-running a job whose state we cannot read is how one prompt
+            // becomes an unbounded bill.
+            state: Self::extract_string(item, "state")
+                .and_then(|value| JobState::parse(&value))
+                .unwrap_or(JobState::Failed),
+            spend: crate::generation::Spend {
+                provider_calls: Self::extract_number(item, "providerCalls").unwrap_or(0) as u32,
+                usd_micros: Self::extract_i64(item, "spendUsdMicros")
+                    .unwrap_or(0)
+                    .max(0) as u64,
+            },
+            texture_id: Self::extract_number(item, "textureId"),
+            failure: Self::extract_string(item, "failure").and_then(|value| {
+                use crate::generation::FailureKind::*;
+                match value.as_str() {
+                    "providerRefused" => Some(ProviderRefused),
+                    "providerUnavailable" => Some(ProviderUnavailable),
+                    "shapeRejected" => Some(ShapeRejected),
+                    "seamsRejected" => Some(SeamsRejected),
+                    "budgetExhausted" => Some(BudgetExhausted),
+                    "pipelineHalted" => Some(PipelineHalted),
+                    _ => None,
+                }
+            }),
+            detail: Self::extract_string(item, "detail"),
+            created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
+            updated_at_ms: Self::extract_i64(item, "updatedAtMs").unwrap_or(0),
+        })
+    }
+
     /// Query one of the skin indexes and page the result.
     ///
     /// Both listings are the same shape — a partition, newest first, resumable
@@ -3868,6 +3995,260 @@ impl Database for DynamoDatabase {
             balance_bux,
             recent,
         })
+    }
+
+    // ---- Textures and generation jobs -------------------------------------
+
+    async fn next_texture_id(&self) -> Result<i32> {
+        self.generate_id_for_entity("TEXTURE").await
+    }
+
+    async fn create_texture(&self, texture: &Texture) -> Result<Texture> {
+        let mut item = HashMap::new();
+        item.insert(
+            "pk".to_string(),
+            Self::av_s(format!("TEXTURE#{}", texture.texture_id)),
+        );
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("textureId".to_string(), Self::av_n(texture.texture_id));
+        item.insert("ownerUserId".to_string(), Self::av_n(texture.owner_user_id));
+        item.insert("contentRef".to_string(), Self::av_s(&texture.content_ref));
+        item.insert("kind".to_string(), Self::av_s(texture.kind.as_str()));
+        item.insert("widthPx".to_string(), Self::av_n(texture.width_px));
+        item.insert("heightPx".to_string(), Self::av_n(texture.height_px));
+        if let Some(repeat) = texture.repeat_cells {
+            item.insert("repeatCells".to_string(), Self::av_s(repeat.to_string()));
+        }
+        if let Some(rows) = texture.rows {
+            item.insert("rows".to_string(), Self::av_n(rows));
+        }
+        if let Some(prompt) = &texture.last_prompt {
+            item.insert("lastPrompt".to_string(), Self::av_s(prompt));
+        }
+        item.insert(
+            "seams".to_string(),
+            Self::av_s(serde_json::to_string(&texture.seams)?),
+        );
+        item.insert(
+            "variants".to_string(),
+            Self::av_s(serde_json::to_string(&texture.variants)?),
+        );
+        item.insert("createdAtMs".to_string(), Self::av_n(texture.created_at_ms));
+        // Hash lookup for the render path, sharded by the hash itself.
+        item.insert(
+            "gsi1pk".to_string(),
+            Self::av_s(format!("TEXREF#{}", texture.content_ref)),
+        );
+        item.insert("gsi1sk".to_string(), Self::av_s("-"));
+        item.insert(
+            "gsi2pk".to_string(),
+            Self::av_s(format!("TEXTURE_OWNER#{}", texture.owner_user_id)),
+        );
+        item.insert(
+            "gsi2sk".to_string(),
+            Self::av_s(format!("{:020}", texture.created_at_ms)),
+        );
+
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .send()
+            .await
+            .context("Failed to store a texture record")?;
+        Ok(texture.clone())
+    }
+
+    async fn get_texture(&self, texture_id: i32) -> Result<Option<Texture>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("TEXTURE#{texture_id}")))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read a texture")?;
+        response
+            .item
+            .as_ref()
+            .map(Self::texture_from_item)
+            .transpose()
+    }
+
+    async fn get_texture_by_ref(&self, content_ref: &str) -> Result<Option<Texture>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :reference")
+            .expression_attribute_values(":reference", Self::av_s(format!("TEXREF#{content_ref}")))
+            .limit(1)
+            .send()
+            .await
+            .context("Failed to resolve a texture reference")?;
+        response
+            .items
+            .and_then(|items| items.into_iter().next())
+            .map(|item| Self::texture_from_item(&item))
+            .transpose()
+    }
+
+    async fn list_textures_by_owner(&self, user_id: i32, limit: usize) -> Result<Vec<Texture>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI2")
+            .key_condition_expression("gsi2pk = :owner")
+            .expression_attribute_values(":owner", Self::av_s(format!("TEXTURE_OWNER#{user_id}")))
+            .scan_index_forward(false)
+            .limit(limit.clamp(1, 100) as i32)
+            .send()
+            .await
+            .context("Failed to list textures")?;
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| Self::texture_from_item(item).ok())
+            .collect())
+    }
+
+    async fn create_generation_job(&self, job: &GenerationJob) -> Result<()> {
+        let mut item = Self::generation_job_item(job)?;
+        // Jobs are working state, not a record: a week is long enough to read
+        // a failure and short enough that the table does not accumulate them.
+        item.insert(
+            "ttl".to_string(),
+            Self::av_n(job.created_at_ms / 1_000 + 7 * 24 * 60 * 60),
+        );
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await
+            .context("Failed to create a generation job")?;
+        Ok(())
+    }
+
+    async fn get_generation_job(&self, job_id: &str) -> Result<Option<GenerationJob>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GENJOB#{job_id}")))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read a generation job")?;
+        response
+            .item
+            .as_ref()
+            .map(Self::generation_job_from_item)
+            .transpose()
+    }
+
+    async fn update_generation_job(&self, job: &GenerationJob) -> Result<()> {
+        let item = Self::generation_job_item(job)?;
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_exists(pk)")
+            .send()
+            .await
+            .context("Failed to update a generation job")?;
+        Ok(())
+    }
+
+    async fn claim_generation_job(
+        &self,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<Option<GenerationJob>> {
+        // Queued jobs sit in one small index partition; it holds the queue
+        // rather than a history, because a claim removes the entry.
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :queue")
+            .expression_attribute_values(":queue", Self::av_s("GENJOB_QUEUE"))
+            .scan_index_forward(true)
+            .limit(10)
+            .send()
+            .await
+            .context("Failed to read the generation queue")?;
+
+        for item in response.items.unwrap_or_default() {
+            let Ok(job) = Self::generation_job_from_item(&item) else {
+                continue;
+            };
+            // The claim is the conditional write, not the read above: two
+            // workers reading the same job is expected, and exactly one of
+            // them wins the update.
+            let claimed = self
+                .client
+                .update_item()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("GENJOB#{}", job.job_id)))
+                .key("sk", Self::av_s("META"))
+                .update_expression(
+                    "SET #state = :generating, claimedBy = :worker, updatedAtMs = :now \
+                     REMOVE gsi1pk, gsi1sk",
+                )
+                .condition_expression("#state = :queued")
+                .expression_attribute_names("#state", "state")
+                .expression_attribute_values(
+                    ":generating",
+                    Self::av_s(JobState::Generating.as_str()),
+                )
+                .expression_attribute_values(":queued", Self::av_s(JobState::Queued.as_str()))
+                .expression_attribute_values(":worker", Self::av_s(worker))
+                .expression_attribute_values(":now", Self::av_n(now_ms))
+                .send()
+                .await;
+
+            match claimed {
+                Ok(_) => {
+                    let mut claimed = job;
+                    claimed.state = JobState::Generating;
+                    claimed.updated_at_ms = now_ms;
+                    return Ok(Some(claimed));
+                }
+                // Someone else took it. Try the next one rather than failing.
+                Err(error) if is_conditional_check_failure(&error) => continue,
+                Err(error) => return Err(error).context("Failed to claim a generation job"),
+            }
+        }
+        Ok(None)
+    }
+
+    async fn generation_spend_since(&self, since_ms: i64) -> Result<u64> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI2")
+            .key_condition_expression("gsi2pk = :spend AND gsi2sk >= :since")
+            .expression_attribute_values(":spend", Self::av_s("GENJOB_SPEND"))
+            .expression_attribute_values(":since", Self::av_s(format!("{since_ms:020}")))
+            .send()
+            .await
+            .context("Failed to total generation spend")?;
+
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| Self::extract_i64(item, "spendUsdMicros"))
+            .map(|value| value.max(0) as u64)
+            .sum())
     }
 
     async fn purchase_skin(
