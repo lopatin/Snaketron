@@ -8,6 +8,7 @@ import {
   UserRankingResponse,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
+import { getOrCreateAnonId } from '../utils/anonId';
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -74,6 +75,13 @@ class API {
     const token = this.getToken();
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    // Advisory analytics identifier. Sent on every request, including
+    // unauthenticated ones, because the top of the signup funnel happens
+    // before any token exists. The server never uses it for authorization.
+    if (config.headers) {
+      config.headers['x-snaketron-anon-id'] = getOrCreateAnonId();
     }
 
     const response = await fetch(url, config);

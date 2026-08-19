@@ -11,10 +11,16 @@ export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // gameplay protocol change must stay backwards compatible instead.
 // Tracks WS_PROTOCOL_VERSION in server/src/lifecycle.rs.
 export const GAMEPLAY_PROTOCOL_VERSION = 7;
-export const buildGameplayAuthentication = (token: string) => ({
+// `anon_id` is additive and optional on both ends: an older server ignores the
+// unknown field, and this server defaults it to absent for older clients. That
+// keeps the rule above intact — a shipped bundle that cannot update itself must
+// never be broken by a protocol addition, so the version is deliberately NOT
+// bumped for a backwards-compatible field.
+export const buildGameplayAuthentication = (token: string, anonId?: string) => ({
   Authenticate: {
     token,
     protocol_version: GAMEPLAY_PROTOCOL_VERSION,
+    ...(anonId ? { anon_id: anonId } : {}),
   },
 } as const);
 // Game speed mappings

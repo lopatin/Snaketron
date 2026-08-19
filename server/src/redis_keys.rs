@@ -312,6 +312,28 @@ impl RedisKeys {
         format!("snaketron:{{snaketron:assignment:{region}}}:assignment:v2")
     }
 
+    /// Durable analytics buffer, one stream per region.
+    ///
+    /// Deliberately NOT the game bus: that stream carries only in-match
+    /// GameEvents (16 of 17 analytics events never touch it), is trimmed to
+    /// 8192 entries for always-live replicas, has no consumer group, and
+    /// enforces a dedicated-connection rule analytics must not contend with.
+    pub fn analytics_events(region: &str) -> String {
+        format!("snaketron:{{snaketron:analytics:{region}}}:events:v1")
+    }
+
+    /// Consumer group for the regional S3 exporter.
+    pub fn analytics_exporter_group(region: &str) -> String {
+        format!("snaketron-analytics-exporter:{region}")
+    }
+
+    /// Prefix for hosted-service exclusion leases and epochs. One hash tag per
+    /// region keeps every hosted-service key in a single slot, matching the
+    /// convention used by the other cluster families.
+    pub fn cluster_hosted_service_prefix(region: &str) -> String {
+        format!("snaketron:{{snaketron:hosted:{region}}}:svc:v1")
+    }
+
     pub fn cluster_assignment_lease(region: &str) -> String {
         format!("snaketron:{{snaketron:assignment:{region}}}:assignment:lease:v2")
     }

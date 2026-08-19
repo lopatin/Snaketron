@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod api;
 pub mod cluster_membership;
 pub mod completion;
@@ -8,6 +9,7 @@ pub mod game_executor;
 pub mod game_executor_v2;
 pub mod game_server;
 pub mod grpc_server;
+pub mod hosted_services;
 pub mod http_server;
 pub mod lifecycle;
 pub mod lobby_manager;

@@ -54,6 +54,30 @@ jobs:
       - name: Run cargo clippy (same gate as snaketron-io)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Also identical to the snaketron-io gate. The analytics proto is the
+      # Iceberg table's schema and iceberg-rust can only add and delete
+      # columns, so a rename or retype reaches the table as drop+add and
+      # silently orphans the data already written under the old name.
+      - name: Check the analytics schema lock (same gate as snaketron-io)
+        run: cargo test -p server --lib analytics::schema
+
+      # The lock only protects the field numbers it records, so an unrecorded
+      # proto change must not reach main either.
+      - name: Require the analytics schema lock to be current
+        env:
+          UPDATE_SCHEMA_LOCK: 1
+        run: |
+          set -euo pipefail
+          lock=server/proto/analytics/v1/events.schema.lock
+          cargo test -p server --lib analytics::schema
+          # status, not diff: an uncommitted lock file is untracked, and a
+          # `git diff` against nothing would pass and protect nothing.
+          if [ -n "$(git status --porcelain -- "$lock")" ]; then
+            git diff -- "$lock" || true
+            echo "::error file=$lock::Stale schema lock. Regenerate with 'UPDATE_SCHEMA_LOCK=1 cargo test -p server --lib analytics::schema' and commit it."
+            exit 1
+          fi
+
       - name: Compile all test targets (no run)
         env:
           RUST_BACKTRACE: 1

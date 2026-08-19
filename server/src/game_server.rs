@@ -14,9 +14,21 @@ use crate::executor_cluster::{ExecutorClusterHandle, start_executor_cluster};
 use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::http_server::{DeferredHttpServer, install_http_application};
+/// Exclusion leases renew on a third of their TTL, so two consecutive failed
+/// renewals still leave room to fail closed before expiry.
+const HOSTED_SERVICE_LEASE_TTL: Duration = Duration::from_secs(6);
+/// Per-service stop budget, clamped by the host's remaining global deadline so
+/// one slow service delays only itself.
+const HOSTED_SERVICE_STOP_BUDGET: Duration = Duration::from_secs(10);
+
+use crate::hosted_services::{
+    DynamoKeyValueStore, ExclusionLeaseStore, SupervisorConfig, TaskLifecycleView,
+    ValkeyKeyValueStore, service_config_from_env, spawn_supervisor,
+};
 use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
+use crate::partition_lease::DEFAULT_COORDINATION_OPERATION_TIMEOUT;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_utils::{RedisClient, create_connection_manager_until_available};
 use crate::region_cache::RegionCache;
@@ -30,6 +42,10 @@ use crate::{
     ws_server::JwtVerifier,
 };
 use serde::Deserialize;
+use snaketron_service_api::deps::KeyValueStore;
+use snaketron_service_api::{
+    Environment, HostedServiceFactory, RegionId, ServiceContext, TaskIdentity,
+};
 use std::path::PathBuf;
 
 use common::{BoostConfig, NORMAL_SNAKE_SPEED_MILLI};
@@ -194,6 +210,11 @@ pub struct GameServerConfig {
     pub redis_url: String,
     /// Boost rules resolved and validated once at process startup.
     pub boost_config: BoostConfig,
+    /// Externally-supplied background work, supervised on the same terms as
+    /// the server's own tasks. Empty by default, so a deployment that
+    /// registers nothing behaves exactly as before.
+    /// See `snaketron/specs/hosted-services.md`.
+    pub hosted_services: Vec<Arc<dyn HostedServiceFactory>>,
 }
 
 /// A complete game server instance with all components
@@ -259,6 +280,7 @@ impl GameServer {
             replay_dir: _,
             redis_url,
             boost_config,
+            hosted_services,
         } = config;
 
         boost_config
@@ -595,6 +617,170 @@ impl GameServer {
             cancellation_token.child_token(),
         ));
 
+        // Analytics: the emitter feeds a bounded channel, the flusher drains it
+        // into the regional Valkey stream, and an elected exporter moves it to
+        // S3. Every hop sheds load rather than blocking, so a failure here can
+        // never reach gameplay.
+        let analytics_origin = Arc::new(crate::analytics::EventOrigin::from_env(
+            &region,
+            lifecycle.task_boot_id(),
+        ));
+        let (analytics_emitter, analytics_rx) =
+            crate::analytics::AnalyticsEmitter::new(crate::analytics::EmitterConfig::default());
+        let analytics_metrics = analytics_emitter.metrics();
+
+        crate::analytics::sink::install(analytics_emitter.clone(), (*analytics_origin).clone());
+
+        let analytics_redis = create_connection_manager_until_available(
+            redis_client.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        handles.push(crate::analytics::flusher::spawn(
+            analytics_redis,
+            analytics_rx,
+            analytics_metrics.clone(),
+            crate::analytics::flusher::FlusherConfig::from_env(
+                cluster_namespace.analytics_events(),
+            ),
+            cancellation_token.child_token(),
+        ));
+
+        // Externally-registered background work. Supervised on exactly the same
+        // terms as the server's own tasks: a child token, a retained handle,
+        // and the shared shutdown budget. A hosted service that failed to be
+        // joined here would silently lose its final flush, which is the whole
+        // reason the registry exists rather than each operator spawning their
+        // own detached task.
+        if !hosted_services.is_empty() || std::env::var("SNAKETRON_ANALYTICS_BUCKET").is_ok() {
+            // Leases are short and their renewals must not queue behind
+            // another subsystem's traffic, so they get their own connection.
+            let hosted_services_kv_redis = create_connection_manager_until_available(
+                redis_client.clone(),
+                cancellation_token.clone(),
+            )
+            .await?;
+            // Lower is more preferred. Deployment policy, not game policy: the
+            // game has no opinion about which region should lead, so the
+            // default is a single flat rank (first-come-first-served) and the
+            // operator orders its regions by setting this per region.
+            let node_rank: u32 = std::env::var("SNAKETRON_HOSTED_SERVICE_RANK")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+
+            let kv: Arc<dyn KeyValueStore> = Arc::new(ValkeyKeyValueStore::new(
+                hosted_services_kv_redis,
+                DEFAULT_COORDINATION_OPERATION_TIMEOUT,
+            ));
+            let region_leases = ExclusionLeaseStore::new(
+                kv.clone(),
+                cluster_namespace.hosted_service_prefix(),
+                HOSTED_SERVICE_LEASE_TTL,
+                DEFAULT_COORDINATION_OPERATION_TIMEOUT,
+                node_rank,
+            )
+            .context("hosted-service lease store")?;
+            // Cross-region exclusion cannot use Valkey, which is per region.
+            // DynamoDB is the only substrate both regions share: every task
+            // already reaches the US table because AWS_REGION is pinned
+            // fleet-wide.
+            let global_leases = match std::env::var("SNAKETRON_HOSTED_SERVICE_GLOBAL_TABLE") {
+                Ok(table) if !table.is_empty() => {
+                    let client = crate::db::dynamodb::dynamodb_client().await;
+                    let store: Arc<dyn KeyValueStore> =
+                        Arc::new(DynamoKeyValueStore::new(client, table));
+                    Some(
+                        ExclusionLeaseStore::new(
+                            store,
+                            "snaketron:hosted",
+                            HOSTED_SERVICE_LEASE_TTL,
+                            DEFAULT_COORDINATION_OPERATION_TIMEOUT,
+                            node_rank,
+                        )
+                        .context("global hosted-service lease store")?,
+                    )
+                }
+                _ => {
+                    // Absent rather than silently regional: a Global key must
+                    // fail loudly, because degrading it to per-region would
+                    // elect one holder per region and defeat the guarantee.
+                    info!(
+                        "no global hosted-service lease table configured; \
+                         Global exclusion keys will be refused"
+                    );
+                    None
+                }
+            };
+
+            let identity = TaskIdentity {
+                server_id: server_id as i32,
+                boot_id: boot_identity.to_string(),
+                task_boot_id: lifecycle.task_boot_id().to_owned(),
+            };
+            // The regional exporter is registered by the server itself rather
+            // than by the operator: it is the other half of the emitter above,
+            // and shipping one without the other would buffer events that
+            // nothing drains.
+            let mut factories = hosted_services;
+            if let Ok(bucket) = std::env::var("SNAKETRON_ANALYTICS_BUCKET")
+                && !bucket.is_empty()
+            {
+                let exporter_redis = create_connection_manager_until_available(
+                    redis_client.clone(),
+                    cancellation_token.clone(),
+                )
+                .await?;
+                // Pinned to the bucket's own region: the SDK does not follow S3
+                // region redirects, and every region writes to the one US bucket.
+                let s3_region = std::env::var("SNAKETRON_ANALYTICS_BUCKET_REGION")
+                    .unwrap_or_else(|_| "us-east-1".to_owned());
+                let client =
+                    crate::analytics::object_store::S3ObjectStore::client_for_region(&s3_region)
+                        .await;
+                let store: Arc<dyn crate::analytics::object_store::ObjectStore> = Arc::new(
+                    crate::analytics::object_store::S3ObjectStore::new(client, bucket),
+                );
+                factories.push(Arc::new(
+                    crate::analytics::exporter_service::ExporterFactory::new(
+                        exporter_redis,
+                        store,
+                        analytics_metrics.clone(),
+                        cluster_namespace.analytics_events(),
+                        cluster_namespace.analytics_exporter_group(),
+                        region.clone(),
+                    ),
+                ));
+            }
+
+            for factory in factories {
+                let context = ServiceContext::new(
+                    Environment(
+                        std::env::var("SNAKETRON_ENVIRONMENT").unwrap_or_else(|_| "dev".to_owned()),
+                    ),
+                    RegionId(region.clone()),
+                    std::env::var("SNAKETRON_AWS_REGION").unwrap_or_default(),
+                    identity.clone(),
+                    kv.clone(),
+                    Arc::new(TaskLifecycleView::new(lifecycle.clone())),
+                    service_config_from_env(factory.name()),
+                    None,
+                );
+                info!("registering hosted service {}", factory.name());
+                handles.push(spawn_supervisor(
+                    factory,
+                    SupervisorConfig {
+                        context,
+                        region_leases: Some(region_leases.clone()),
+                        global_leases: global_leases.clone(),
+                        holder_id: lifecycle.task_boot_id().to_owned(),
+                        stop_budget: HOSTED_SERVICE_STOP_BUDGET,
+                    },
+                    cancellation_token.child_token(),
+                ));
+            }
+        }
+
         // A bounded, independent Valkey probe drives readiness. Liveness is
         // intentionally unaffected so an outage cannot cause an ECS restart
         // storm. Use a write canary rather than PING: under Serverless capacity
@@ -670,6 +856,10 @@ impl GameServer {
             lobby_manager.clone(),
             lifecycle.clone(),
             cluster_namespace.clone(),
+            Some(crate::api::auth::AnalyticsHandle {
+                emitter: analytics_emitter.clone(),
+                origin: analytics_origin.clone(),
+            }),
         )
         .await?;
 
@@ -948,6 +1138,7 @@ pub async fn start_test_server_with_grpc(
 
     let config = GameServerConfig {
         db: db.clone(),
+        hosted_services: Vec::new(),
         http_addr: http_addr.clone(),
         grpc_addr,
         region: "test-region".to_string(),

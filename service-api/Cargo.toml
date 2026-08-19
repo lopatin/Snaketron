@@ -1,0 +1,15 @@
+[package]
+name = "snaketron-service-api"
+version = "0.1.0"
+edition = "2024"
+description = "Public surface for injecting supervised hosted services into a Snaketron game server."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

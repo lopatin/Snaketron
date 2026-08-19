@@ -56,6 +56,45 @@ fn log_client_protocol_version(protocol_version: Option<u16>) {
     }
 }
 
+/// Canonical lowercase hyphenated UUID, matching `isValidAnonId` in
+/// `client/web/utils/anonId.ts`.
+fn is_canonical_uuid(value: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = value.split('-');
+    for expected in GROUPS {
+        match groups.next() {
+            Some(group)
+                if group.len() == expected
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
+            _ => return false,
+        }
+    }
+    groups.next().is_none()
+}
+
+/// Accepts the client-reported analytics identifier only in its exact expected
+/// shape, dropping anything else.
+///
+/// This is untrusted, attacker-controlled input that is destined for an
+/// analytics event, so it is validated at the boundary rather than downstream:
+/// an unbounded string here would become an unbounded column value, and a
+/// non-UUID value would silently pollute retention analysis. Rejection is
+/// deliberately silent — a malformed id is an analytics gap, never a reason to
+/// refuse a player's connection.
+/// A session identifier, minted server-side at authentication.
+///
+/// UUIDv7 so it sorts by creation time, which makes a session's events cluster
+/// naturally in the analytics table.
+pub fn new_session_id() -> String {
+    format!("s_{}", uuid::Uuid::now_v7())
+}
+
+fn sanitize_anon_id(anon_id: Option<String>) -> Option<String> {
+    anon_id.filter(|candidate| is_canonical_uuid(candidate))
+}
+
 // Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +109,14 @@ pub enum WSMessage {
     Authenticate {
         token: String,
         protocol_version: u16,
+        /// Advisory pseudonymous browser identifier for product analytics.
+        /// Never used for authentication or authorization, and never trusted:
+        /// `sanitize_anon_id` validates it before anything downstream sees it.
+        /// Optional and defaulted so a client that predates the field — an
+        /// itch.io bundle cannot update itself — still authenticates.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-gen", ts(optional))]
+        anon_id: Option<String>,
     },
     JoinGame(u32),
     LeaveGame,
@@ -3467,7 +3514,19 @@ async fn process_ws_message(
                 WSMessage::Authenticate {
                     token: jwt_token,
                     protocol_version,
+                    anon_id,
                 } => {
+                    // Validated at the boundary so a malformed or unbounded
+                    // client string can never reach an analytics event.
+                    let anon_id = sanitize_anon_id(anon_id);
+                    // Minted here because this is the first identity-bearing
+                    // moment of a connection: the socket exists earlier, but
+                    // nothing is known about who is on it until now.
+                    let session_id = new_session_id();
+                    debug!(
+                        "websocket session {session_id} authenticated (anon_id present: {})",
+                        anon_id.is_some()
+                    );
                     authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
@@ -4722,10 +4781,11 @@ mod lifecycle_protocol_tests {
         game_join_denied, game_join_failure_message, log_client_protocol_version,
         missing_game_join_failure, next_game_subscription_input, next_outbound_message,
         queue_planned_drain_notice, recovery_bridge_snapshot, require_game_command_publication,
-        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
-        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
-        snapshot_requires_command_outcomes, subscribe_to_lobby_match_notifications,
-        take_lobby_update_receiver, unsent_lobby_match, validate_game_matchmaking_pool,
+        sanitize_anon_id, send_command_outcomes_from_resolved,
+        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
+        slow_command_publish_wait_ms, snapshot_requires_command_outcomes,
+        subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
+        validate_game_matchmaking_pool,
     };
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
     use crate::lobby_manager::{Lobby, LobbyPreferences};
@@ -4919,6 +4979,7 @@ mod lifecycle_protocol_tests {
         let value = serde_json::to_value(WSMessage::Authenticate {
             token: "jwt".to_owned(),
             protocol_version: WS_PROTOCOL_VERSION,
+            anon_id: None,
         })
         .unwrap();
         assert_eq!(value["Authenticate"]["token"], "jwt");
@@ -4926,6 +4987,74 @@ mod lifecycle_protocol_tests {
             value["Authenticate"]["protocol_version"],
             WS_PROTOCOL_VERSION
         );
+        // Absent rather than null, so the frame a version-less client sends is
+        // byte-identical to the one this server produces.
+        assert!(value["Authenticate"].get("anon_id").is_none());
+    }
+
+    /// The analytics identifier is additive in both directions: a client that
+    /// predates it still authenticates, and a client that sends it is not
+    /// refused by a server that ignores it. A shipped bundle cannot update
+    /// itself, so neither direction may ever become a hard failure.
+    #[test]
+    fn the_anon_id_is_optional_in_both_directions() {
+        let without = serde_json::json!({
+            "Authenticate": { "token": "jwt", "protocol_version": WS_PROTOCOL_VERSION }
+        });
+        let parsed: WSMessage = serde_json::from_value(without).unwrap();
+        assert!(matches!(
+            parsed,
+            WSMessage::Authenticate { anon_id: None, .. }
+        ));
+
+        let with = serde_json::json!({
+            "Authenticate": {
+                "token": "jwt",
+                "protocol_version": WS_PROTOCOL_VERSION,
+                "anon_id": "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607"
+            }
+        });
+        let parsed: WSMessage = serde_json::from_value(with).unwrap();
+        assert!(matches!(
+            parsed,
+            WSMessage::Authenticate { anon_id: Some(ref id), .. }
+                if id == "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607"
+        ));
+    }
+
+    /// Untrusted client input destined for an analytics event. Anything that is
+    /// not a canonical lowercase UUID is dropped rather than propagated, and a
+    /// rejection never affects admission.
+    #[test]
+    fn only_canonical_uuids_survive_anon_id_sanitization() {
+        let good = "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607";
+        assert_eq!(
+            sanitize_anon_id(Some(good.to_owned())),
+            Some(good.to_owned())
+        );
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "3F1A2B4C-5D6E-4F70-8A91-B2C3D4E5F607", // uppercase
+            "3f1a2b4c5d6e4f708a91b2c3d4e5f607",     // unhyphenated
+            "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f60",  // short group
+            "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607-x", // trailing group
+            "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5g607", // non-hex
+        ] {
+            assert_eq!(
+                sanitize_anon_id(Some(bad.to_owned())),
+                None,
+                "accepted {bad:?}"
+            );
+        }
+        assert_eq!(sanitize_anon_id(None), None);
+    }
+
+    /// An unbounded string must never reach a column value.
+    #[test]
+    fn an_oversized_anon_id_is_rejected() {
+        assert_eq!(sanitize_anon_id(Some("a".repeat(100_000))), None);
     }
 
     /// A stale, newer, or version-less client must never be refused: a shipped
@@ -5438,5 +5567,27 @@ mod lifecycle_protocol_tests {
                 terminal_rejection_reason: None,
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_identity_tests {
+    use super::new_session_id;
+
+    /// Session ids must be unique and time-ordered so a session's events
+    /// cluster in the analytics table.
+    #[test]
+    fn session_ids_are_unique_prefixed_and_sortable() {
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            ids.push(new_session_id());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ids.iter().all(|id| id.starts_with("s_")));
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "ids must be unique");
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "must sort in creation order");
     }
 }

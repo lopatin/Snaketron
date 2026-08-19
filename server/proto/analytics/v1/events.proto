@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+// Analytics event schema. This file is the single source of truth for both the
+// wire encoding and the derived Iceberg table schema.
+//
+// EVOLUTION RULES (enforced in CI, see analytics::schema tests):
+//   * Field names are append-only and NEVER reused or renamed. Iceberg's Rust
+//     writer supports only add_column/delete_column, so a rename would become
+//     drop+add and silently orphan the old column's data.
+//   * Field names must be lowercase. Athena makes a table with any uppercase
+//     column invisible to Glue, failing at query time far from the cause.
+//   * A message must never be the VALUE of a map: adding a field under
+//     <map>.value.<field> makes older Parquet files fail to read
+//     (apache/iceberg#14043) rather than null-fill.
+//   * Enums are carried as strings so adding a variant needs no schema change.
+package snaketron.analytics.v1;
+
+// Identity attached to every event. Nested rather than flattened so proto's
+// has_submessage() semantics survive into Iceberg: "identity absent" and
+// "identity present but user_id unset" are different facts.
+message Identity {
+  // Registered or guest account id. Preserved across guest upgrade, so
+  // conversion needs no stitching.
+  optional int64 user_id = 1;
+  // Pseudonymous browser id from localStorage. Never used for authorization.
+  optional string anon_id = 2;
+  // Server-minted, one per websocket session.
+  optional string session_id = 3;
+  bool is_guest = 4;
+  bool is_stress_test = 5;
+}
+
+message GuestCreated {
+  int64 mmr = 1;
+  string matchmaking_pool = 2;
+}
+
+message AccountRegistered {
+  int64 mmr = 1;
+}
+
+message GuestConverted {
+  int64 guest_age_ms = 1;
+}
+
+message UserLogin {}
+
+message SessionStarted {
+  int64 protocol_version = 1;
+}
+
+message SessionEnded {
+  int64 duration_ms = 1;
+  string close_reason = 2;
+}
+
+message LobbyCreated {
+  string lobby_id = 1;
+  string pool = 2;
+}
+
+message LobbyJoined {
+  string lobby_id = 1;
+  int64 member_count = 2;
+}
+
+message LobbyLeft {
+  string lobby_id = 1;
+  int64 member_count = 2;
+}
+
+message LobbyPreferencesSet {
+  string game_type = 1;
+  string queue_mode = 2;
+}
+
+message QueueEntered {
+  string game_type = 1;
+  string queue_mode = 2;
+  string admission_result = 3;
+}
+
+message QueueLeft {
+  int64 waited_ms = 1;
+}
+
+message MatchCommitted {
+  int64 game_id = 1;
+  int64 wait_ms = 2;
+  int64 player_count = 3;
+}
+
+message GameStarted {
+  int64 game_id = 1;
+  string game_type = 2;
+  string queue_mode = 3;
+  int64 player_count = 4;
+}
+
+message GameCompleted {
+  int64 game_id = 1;
+  string game_type = 2;
+  string queue_mode = 3;
+  int64 duration_ms = 4;
+  int64 player_count = 5;
+  bool completed_by_inactivity = 6;
+  optional int64 winner_user_id = 7;
+  string end_reason = 8;
+}
+
+message GamePlayerResult {
+  int64 game_id = 1;
+  int64 user_id = 2;
+  int64 score = 3;
+  bool won = 4;
+  int64 mmr_delta = 5;
+  int64 xp_awarded = 6;
+  string game_type = 7;
+  string queue_mode = 8;
+}
+
+// Type and size only. Message bodies are never recorded.
+message WebsocketMessage {
+  string direction = 1;
+  string message_type = 2;
+  int64 byte_len = 3;
+  optional int64 game_id = 4;
+}
+
+// The envelope. Top-level fields are deliberately flat: Athena cannot
+// partition by a nested field, and dt/region partitioning depends on it.
+message Event {
+  // UUIDv7: unique and time-sortable, giving a naturally clustered dedup key.
+  string event_id = 1;
+  string event_name = 2;
+  int64 event_version = 3;
+  int64 occurred_at_ms = 4;
+  string environment = 5;
+  // Logical region (use1 / euw1).
+  string region = 6;
+  string aws_region = 7;
+  string instance_id = 8;
+  Identity identity = 9;
+
+  // One optional struct per arm rather than N flattened columns: adding an
+  // event type is then a root-level column add, and adding a field to an
+  // existing arm is a single-level nested add.
+  oneof payload {
+    GuestCreated guest_created = 100;
+    AccountRegistered account_registered = 101;
+    GuestConverted guest_converted = 102;
+    UserLogin user_login = 103;
+    SessionStarted session_started = 104;
+    SessionEnded session_ended = 105;
+    LobbyCreated lobby_created = 106;
+    LobbyJoined lobby_joined = 107;
+    LobbyLeft lobby_left = 108;
+    LobbyPreferencesSet lobby_preferences_set = 109;
+    QueueEntered queue_entered = 110;
+    QueueLeft queue_left = 111;
+    MatchCommitted match_committed = 112;
+    GameStarted game_started = 113;
+    GameCompleted game_completed = 114;
+    GamePlayerResult game_player_result = 115;
+    WebsocketMessage websocket_message = 116;
+  }
+}

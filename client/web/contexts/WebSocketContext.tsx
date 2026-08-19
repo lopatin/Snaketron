@@ -22,6 +22,7 @@ import {
   buildGameplayAuthentication,
   GAMEPLAY_PROTOCOL_VERSION,
 } from '../constants';
+import { getOrCreateAnonId } from '../utils/anonId';
 import { useLatency } from './LatencyContext';
 import { useAuth } from './AuthContext';
 import {
@@ -1214,7 +1215,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       if (token) {
         slot.authStartedAtMs = Date.now();
         slot.authTokenSent = token;
-        slot.socket.send(JSON.stringify(buildGameplayAuthentication(token)));
+        slot.socket.send(
+          JSON.stringify(buildGameplayAuthentication(token, getOrCreateAnonId()))
+        );
         lastAuthTokenRef.current = token;
         armAuthenticationTimeout(slot, token);
       }
@@ -1614,7 +1617,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       slot.authStartedAtMs = Date.now();
       slot.authTokenSent = token;
       try {
-        slot.socket.send(JSON.stringify(buildGameplayAuthentication(token)));
+        slot.socket.send(
+          JSON.stringify(buildGameplayAuthentication(token, getOrCreateAnonId()))
+        );
       } catch (error) {
         slot.authStartedAtMs = null;
         slot.authTokenSent = null;

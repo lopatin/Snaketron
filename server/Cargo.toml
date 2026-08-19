@@ -31,7 +31,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1.19.0"
-uuid = { version = "1", features = ["v4", "serde"] }
+aws-sdk-s3 = "1.104"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 anyhow = "1"
 thiserror = "1"
 dotenv = "0.15"
@@ -47,7 +48,9 @@ gethostname = "1"
 tonic = "0.12.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 prost = "0.13.5"
+prost-reflect = { version = "0.14", features = ["serde"] }
 async-trait = "0.1"
+snaketron-service-api = { path = "../service-api" }
 jsonwebtoken = "9.3"
 bincode = { version = "2.0", features = ["serde"] }
 flate2 = "1.0"
@@ -65,6 +68,11 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 ts-rs = { version = "11", optional = true }
+# Iceberg catalog for the analytics committer. Pinned EXACTLY: these are 0.x
+# crates whose API breaks roughly every two months, and `iceberg-catalog-s3tables`
+# must move in lockstep with `iceberg` (it re-exports its `Catalog` trait).
+iceberg = "=0.10.1"
+iceberg-catalog-s3tables = "=0.10.1"
 
 [build-dependencies]
 tonic-build = { version = "0.12.3", features = ["prost"] }

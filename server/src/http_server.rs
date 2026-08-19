@@ -189,6 +189,9 @@ pub async fn install_http_application(
     lobby_manager: Arc<LobbyManager>,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    // Present when analytics is configured. Optional so a deployment without
+    // it builds and runs unchanged.
+    analytics: Option<crate::api::auth::AnalyticsHandle>,
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
@@ -229,6 +232,7 @@ pub async fn install_http_application(
 
     // Create auth state for API routes
     let auth_state = AuthState {
+        analytics: analytics.clone(),
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: Some(state.user_cache.clone()),

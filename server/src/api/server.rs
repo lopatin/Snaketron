@@ -19,6 +19,7 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
     let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
 
     let auth_state = AuthState {
+        analytics: None,
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: None,

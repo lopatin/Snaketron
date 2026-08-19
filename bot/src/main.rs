@@ -373,6 +373,7 @@ where
         WSMessage::Authenticate {
             token: token.to_owned(),
             protocol_version: CLIENT_PROTOCOL_VERSION,
+            anon_id: None,
         },
     )
     .await?;
@@ -1194,6 +1195,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+            anon_id: None,
                 } if token == "test-token"
             ));
             send_ws(

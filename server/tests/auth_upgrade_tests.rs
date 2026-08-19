@@ -40,6 +40,7 @@ async fn isolated_state() -> Result<(AuthState, Arc<dyn Database>, Arc<JwtManage
     let db = Arc::new(DynamoDatabase::new().await?) as Arc<dyn Database>;
     let jwt_manager = Arc::new(JwtManager::new(JWT_SECRET));
     let state = AuthState {
+        analytics: None,
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: None,
@@ -89,6 +90,7 @@ async fn login_response(
 ) -> Result<(StatusCode, Value)> {
     let response = match login(
         State(state),
+        axum::http::HeaderMap::new(),
         Json(LoginRequest {
             username: username.to_string(),
             password: password.to_string(),

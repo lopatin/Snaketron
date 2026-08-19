@@ -40,6 +40,8 @@ impl TestClient {
         self.send_message(WSMessage::Authenticate {
             token: token.to_string(),
             protocol_version: WS_PROTOCOL_VERSION,
+            // Analytics-only and optional; integration clients send none.
+            anon_id: None,
         })
         .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
