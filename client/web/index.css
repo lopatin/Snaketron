@@ -6630,7 +6630,9 @@ a.home-social-icon:hover {
   bottom: calc(100% + 8px);
   z-index: 90;
   display: grid;
-  width: 288px;
+  /* Wide enough that the longest network name fits its column without
+     truncating — four equal columns is what makes the row scannable. */
+  width: 320px;
   gap: 10px;
   padding: 14px;
   border: 2px solid var(--game-rule);
@@ -6718,13 +6720,13 @@ a.home-social-icon:hover {
 }
 
 .share-game-target {
-  padding: 8px 4px;
+  padding: 8px 2px;
+  font-size: 9px;
   border: 2px solid #e5e7eb;
   border-radius: 6px;
   color: rgb(0 0 0 / 70%);
-  font-size: 10px;
   font-weight: 800;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.3px;
   text-align: center;
   text-decoration: none;
   transition: border-color 150ms ease, background-color 150ms ease;
@@ -6905,7 +6907,7 @@ a.home-social-icon:hover {
   }
 
   .share-game-popover {
-    width: min(288px, calc(100vw - 32px));
+    width: min(320px, calc(100vw - 32px));
   }
 }
 

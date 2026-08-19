@@ -84,10 +84,15 @@ function AppContent() {
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
   const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
   const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
-  // The public match page is a landing surface for people arriving from a
-  // shared link, most of whom have no session at all. Floating social chrome
-  // there would be furniture for an account they do not have yet.
-  const isSocialSuppressedRoute = matchPath('/g/:gameId', location.pathname) !== null;
+  // Two kinds of route keep the floating social chrome off screen. The public
+  // match page is a landing surface for people arriving from a shared link,
+  // most of whom have no session at all, so the chrome would be furniture for
+  // an account they do not have yet. The QA harnesses exist to review one
+  // component in isolation, and a roster strip parked over the thing under
+  // review is exactly the noise they are meant to avoid.
+  const isSocialSuppressedRoute =
+    matchPath('/g/:gameId', location.pathname) !== null
+    || location.pathname.startsWith('/qa/');
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
   const showRuntimeAnnouncement = config.announcement.enabled
     && config.announcement.message.trim().length > 0

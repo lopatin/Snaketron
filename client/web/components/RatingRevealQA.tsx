@@ -242,6 +242,9 @@ const RatingRevealQA: React.FC = () => {
       <GameOverCard
         key={`${scenario.id}:${replayKey}`}
         open
+        // A fixture id so the card's share control renders here too; the
+        // harness exists to review the card's real states, and share is one.
+        shareGameId={4242}
         presentation={presentation}
         rating={scenario.state ?? undefined}
         onDismiss={() => setReplayKey((key) => key + 1)}
