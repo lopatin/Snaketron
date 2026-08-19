@@ -16,6 +16,7 @@ client/pkg/
 client/web/node_modules/
 client/web/dist/
 client/web/package-lock.json
+!client/web/package-lock.json
 
 # Old code
 _old/

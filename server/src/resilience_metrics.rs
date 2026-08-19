@@ -114,6 +114,9 @@ struct Counters {
     game_duration_ms_sum: AtomicU64,
     game_duration_ms_max: AtomicU64,
     completed_game_players: AtomicU64,
+    potg_ring_truncated: AtomicU64,
+    ring_evicted_seconds_sum: AtomicU64,
+    ring_evicted_seconds_max: AtomicU64,
     redis_requests: AtomicU64,
     redis_errors: AtomicU64,
     redis_request_latency_ms_sum: AtomicU64,
@@ -559,6 +562,20 @@ pub fn record_game_completed(duration_ms: u64, players: usize) {
     crate::otel_metrics::record_game_completed(duration_ms, players);
 }
 
+/// Completion-level telemetry for the bounded PotG scorer view. Emitting once
+/// per affected game makes this directly usable as a truncation incidence
+/// rate, independent of how many individual entries were evicted.
+pub fn record_potg_ring_truncated(evicted_seconds: u64) {
+    let counters = counters();
+    counters.potg_ring_truncated.fetch_add(1, Ordering::Relaxed);
+    record_sum_and_max(
+        &counters.ring_evicted_seconds_sum,
+        &counters.ring_evicted_seconds_max,
+        evicted_seconds,
+    );
+    crate::otel_metrics::record_potg_ring_truncated(evicted_seconds);
+}
+
 pub fn record_redis_request(latency: Duration, failed: bool) {
     let counters = counters();
     let latency_ms = duration_ms(latency);
@@ -642,6 +659,9 @@ struct CounterSnapshot {
     game_duration_ms_sum: u64,
     game_duration_ms_max: u64,
     completed_game_players: u64,
+    potg_ring_truncated: u64,
+    ring_evicted_seconds_sum: u64,
+    ring_evicted_seconds_max: u64,
     redis_requests: u64,
     redis_errors: u64,
     redis_request_latency_ms_sum: u64,
@@ -769,6 +789,9 @@ fn take_counter_snapshot() -> CounterSnapshot {
         game_duration_ms_sum: counters.game_duration_ms_sum.swap(0, Ordering::Relaxed),
         game_duration_ms_max: counters.game_duration_ms_max.swap(0, Ordering::Relaxed),
         completed_game_players: counters.completed_game_players.swap(0, Ordering::Relaxed),
+        potg_ring_truncated: counters.potg_ring_truncated.swap(0, Ordering::Relaxed),
+        ring_evicted_seconds_sum: counters.ring_evicted_seconds_sum.swap(0, Ordering::Relaxed),
+        ring_evicted_seconds_max: counters.ring_evicted_seconds_max.swap(0, Ordering::Relaxed),
         redis_requests: counters.redis_requests.swap(0, Ordering::Relaxed),
         redis_errors: counters.redis_errors.swap(0, Ordering::Relaxed),
         redis_request_latency_ms_sum: counters
@@ -1809,6 +1832,17 @@ fn emf_document(
             counters.completed_game_players,
             "Count",
         ),
+        ("PotgRingTruncated", counters.potg_ring_truncated, "Count"),
+        (
+            "RingEvictedSecondsSum",
+            counters.ring_evicted_seconds_sum,
+            "Seconds",
+        ),
+        (
+            "RingEvictedSecondsMax",
+            counters.ring_evicted_seconds_max,
+            "Seconds",
+        ),
         ("RedisRequests", counters.redis_requests, "Count"),
         ("RedisErrors", counters.redis_errors, "Count"),
         (
@@ -2010,6 +2044,7 @@ mod tests {
         record_matchmaking_integrity_error(1);
         record_game_created_outbox_delivery_error(1);
         record_game_completed(3_000, 4);
+        record_potg_ring_truncated(17);
         record_redis_request(Duration::from_millis(9), true);
         crate::redis_utils::drop_redis_request_measurement_for_test(true);
         crate::redis_utils::drop_redis_request_measurement_for_test(false);
@@ -2064,6 +2099,9 @@ mod tests {
         assert!(snapshot.game_duration_ms_sum >= 3_000);
         assert!(snapshot.game_duration_ms_max >= 3_000);
         assert!(snapshot.completed_game_players >= 4);
+        assert_eq!(snapshot.potg_ring_truncated, 1);
+        assert_eq!(snapshot.ring_evicted_seconds_sum, 17);
+        assert_eq!(snapshot.ring_evicted_seconds_max, 17);
         assert!(snapshot.redis_requests >= 2);
         assert!(snapshot.redis_errors >= 2);
         assert!(snapshot.redis_request_latency_ms_sum >= 9);

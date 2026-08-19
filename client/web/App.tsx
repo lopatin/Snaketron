@@ -22,6 +22,11 @@ import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
 import { CrazyGamesBridge } from './components/CrazyGamesBridge';
 import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
+import {
+  isPlayOfTheGameQaRoute,
+  isScenarioCaptureMode,
+  isScenarioPlayerQaRoute,
+} from './utils/scenarioCaptureMode';
 import { AdminRoute } from './components/AdminRoute';
 import { RuntimeAnnouncement } from './components/RuntimeAnnouncement';
 import { RuntimeConfigProvider, useRuntimeConfig } from './contexts/RuntimeConfigContext';
@@ -37,18 +42,31 @@ const AdminPage = !IS_EMBEDDED_BUILD
   : null;
 
 // Design-review harnesses (post-match rating reveal, rank badges, skins, skin
-// pixel parity). Only reachable — and only bundled — outside production builds.
+// pixel parity, trailer cards). Only reachable — and only bundled — outside
+// production builds.
 const SkinsQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/SkinsQA'))
   : null;
 const SkinParityQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/SkinParityQA'))
   : null;
+const TrailerCardQA =
+  process.env.NODE_ENV !== 'production'
+    ? React.lazy(() => import('./components/TrailerCardQA'))
+    : null;
 const RatingRevealQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/RatingRevealQA'))
   : null;
 const RankIconsQA = process.env.NODE_ENV !== 'production'
   ? React.lazy(() => import('./components/RankIconsQA'))
+  : null;
+
+const ScenarioPlayerQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/ScenarioPlayerQA'))
+  : null;
+
+const PlayOfTheGameQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/PlayOfTheGameQA'))
   : null;
 
 function AppContent() {
@@ -208,6 +226,16 @@ function AppContent() {
             </ProtectedRoute>
           }
         />
+        {TrailerCardQA && (
+          <Route
+            path="/qa/trailer-card"
+            element={
+              <React.Suspense fallback={null}>
+                <TrailerCardQA />
+              </React.Suspense>
+            }
+          />
+        )}
         {RatingRevealQA && (
           <Route
             path="/qa/rating-reveal"
@@ -270,25 +298,48 @@ const Router = IS_EMBEDDED_BUILD
   : BrowserRouter;
 
 function App() {
+  const captureMode = isScenarioCaptureMode();
+  const scenarioQaMode = isScenarioPlayerQaRoute();
+  const potgQaMode = isPlayOfTheGameQaRoute();
+
   return (
     <Router>
-      <CrazyGamesProvider>
-        <RuntimeConfigProvider>
-          <AuthProvider>
-            <UIProvider>
-              <LatencyProvider>
-                <WebSocketProvider>
-                  <AdsProvider>
-                    <CrazyGamesBridge />
-                    <AppContent />
-                    <PreMatchAdBreak />
-                  </AdsProvider>
-                </WebSocketProvider>
-              </LatencyProvider>
-            </UIProvider>
-          </AuthProvider>
-        </RuntimeConfigProvider>
-      </CrazyGamesProvider>
+      {/* Scenario capture deliberately mounts nothing but the player: the
+          harness runs with no API or socket, and every provider above is a
+          source of non-determinism or of a hanging readiness promise. */}
+      {scenarioQaMode && ScenarioPlayerQA ? (
+        <React.Suspense
+          fallback={captureMode
+            ? <main className="scenario-capture" aria-busy="true" />
+            : null}
+        >
+          <ScenarioPlayerQA captureMode={captureMode} />
+        </React.Suspense>
+      ) : potgQaMode && PlayOfTheGameQA ? (
+        <CrazyGamesProvider>
+          <React.Suspense fallback={null}>
+            <PlayOfTheGameQA />
+          </React.Suspense>
+        </CrazyGamesProvider>
+      ) : (
+        <CrazyGamesProvider>
+          <RuntimeConfigProvider>
+            <AuthProvider>
+              <UIProvider>
+                <LatencyProvider>
+                  <WebSocketProvider>
+                    <AdsProvider>
+                      <CrazyGamesBridge />
+                      <AppContent />
+                      <PreMatchAdBreak />
+                    </AdsProvider>
+                  </WebSocketProvider>
+                </LatencyProvider>
+              </UIProvider>
+            </AuthProvider>
+          </RuntimeConfigProvider>
+        </CrazyGamesProvider>
+      )}
     </Router>
   );
 }

@@ -1,0 +1,4582 @@
+{
+  "schema_version": 1,
+  "corpus_id": "bot-v1-200-534e414b4554524f-rules-2",
+  "minimum_deserved_reviews": 16,
+  "instruction": "Watch each clip, answer every rubric item independently, then set verdict to deserved only when all five answers are true. At least 80% deserved is required; leave fields null until a human reviews them.",
+  "rejection_codes": {
+    "CLIP_MISSING_FACT": "A caption fact or decisive setup/payoff lies outside the clip.",
+    "MISATTRIBUTED": "Credit is unfair, including teammate grief, AFK farming, or staged repeat trading.",
+    "ORDINARY_PLAY": "The play clears math thresholds but lacks visible skill or drama.",
+    "REPLAY_DEFECT": "Desync, camera, legibility, or playback behavior compromises review.",
+    "UNCLEAR_CAUSE": "The star's causal role is not visually legible."
+  },
+  "rubric": [
+    {
+      "id": "causal_clarity",
+      "question": "Can a viewer identify the star's action as the cause of the featured elimination, bank, or chain?",
+      "pass_rule": "The causal action and payoff are both visible; coincidence or an off-screen cause fails."
+    },
+    {
+      "id": "visible_skill",
+      "question": "Does the clip visibly demonstrate more than an ordinary bare elimination or routine pickup?",
+      "pass_rule": "A cutoff, trap, meaningful boost, laden takedown, large bank, sustained combo, or comparable readable skill is visible."
+    },
+    {
+      "id": "fair_credit",
+      "question": "Is the attribution fair and resistant to griefing or farming?",
+      "pass_rule": "Fail teammate grief, inactive-victim farming, or staged/repeated kill trading even if the numeric score is high."
+    },
+    {
+      "id": "clip_integrity",
+      "question": "Are setup, all caption facts, and the payoff contained and legible in the clip?",
+      "pass_rule": "The payoff is visible, the replay is coherent, and no caption claim depends on an event outside the clip."
+    },
+    {
+      "id": "proud_to_show",
+      "question": "Would you be proud to show this as the match's Play of the Game?",
+      "pass_rule": "Use a holistic yes only after the other four checks pass; this is the subjective launch gate."
+    }
+  ],
+  "entries": [
+    {
+      "rank": 1,
+      "corpus_index": 148,
+      "game_id": 8000148,
+      "seed": 16132935031883351557,
+      "mode": "2v2_competitive_bot_100ms",
+      "duration_ms": 38950,
+      "clip_file": "clips/01-game-8000148.json",
+      "selected": {
+        "star_user_id": 10002,
+        "star_snake_id": 2,
+        "reason": {
+          "Demolition": {
+            "kills": 2
+          }
+        },
+        "category": "demolition",
+        "score": 301,
+        "window": {
+          "start_tick": 538,
+          "end_tick": 718,
+          "focus_tick": 658
+        },
+        "breakdown": {
+          "total": 301,
+          "focus_tick": 658,
+          "kills": 2,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 4,
+          "max_chain": 3,
+          "pickups": 4,
+          "demolition_points": 225,
+          "banking_points": 24,
+          "combo_points": 52
+        }
+      },
+      "evidence": [
+        {
+          "tick": 560,
+          "clip_elapsed_ms": 1100,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 200,
+              "points": 2,
+              "position": {
+                "x": 29,
+                "y": 10
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 605,
+          "clip_elapsed_ms": 3350,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 39,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 605,
+          "clip_elapsed_ms": 3350,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 616,
+          "clip_elapsed_ms": 3900,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 42,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 639,
+          "clip_elapsed_ms": 5050,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 23,
+                "y": 23
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 645,
+          "clip_elapsed_ms": 5350,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 46,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 647,
+          "clip_elapsed_ms": 5450,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Right",
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 657,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1100,
+              "points": 1,
+              "position": {
+                "x": 31,
+                "y": 22
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 658,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 2
+                }
+              },
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 675,
+          "clip_elapsed_ms": 6850,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 2
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 675,
+          "clip_elapsed_ms": 6850,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 1
+                }
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 681,
+          "clip_elapsed_ms": 7150,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 44,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 707,
+          "clip_elapsed_ms": 8450,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 23,
+                "y": 22
+              },
+              "snake_id": 2
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA A",
+      "notes": "At viewer 8.0 s the star wins a visible head-to-head; at 9.7 s a second visible collision becomes a mutual trade. Both credited eliminations are on-screen, with no farming pattern."
+    }
+  },
+  {
+    "rank": 2,
+      "corpus_index": 1,
+      "game_id": 8000001,
+      "seed": 12584603080842408035,
+      "mode": "2v2_quickmatch_bot_100ms",
+      "duration_ms": 12700,
+      "clip_file": "clips/02-game-8000001.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "GoalRun": {
+            "points": 16
+          }
+        },
+        "category": "banking",
+        "score": 272,
+        "window": {
+          "start_tick": 134,
+          "end_tick": 314,
+          "focus_tick": 254
+        },
+        "breakdown": {
+          "total": 272,
+          "focus_tick": 254,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 16,
+          "max_chain": 7,
+          "pickups": 7,
+          "demolition_points": 0,
+          "banking_points": 146,
+          "combo_points": 126
+        }
+      },
+      "evidence": [
+        {
+          "tick": 144,
+          "clip_elapsed_ms": 500,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 26,
+                "y": 24
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 154,
+          "clip_elapsed_ms": 1000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1500,
+              "points": 1,
+              "position": {
+                "x": 30,
+                "y": 25
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 170,
+          "clip_elapsed_ms": 1800,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1200,
+              "points": 2,
+              "position": {
+                "x": 30,
+                "y": 33
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 172,
+          "clip_elapsed_ms": 1900,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1900,
+              "points": 3,
+              "position": {
+                "x": 30,
+                "y": 34
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 178,
+          "clip_elapsed_ms": 2200,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1700,
+              "points": 3,
+              "position": {
+                "x": 30,
+                "y": 37
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 180,
+          "clip_elapsed_ms": 2300,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 6,
+              "combo_remaining_ms_before": 1900,
+              "points": 3,
+              "position": {
+                "x": 30,
+                "y": 38
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 188,
+          "clip_elapsed_ms": 2700,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 7,
+              "combo_remaining_ms_before": 1600,
+              "points": 3,
+              "position": {
+                "x": 31,
+                "y": 35
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 254,
+          "clip_elapsed_ms": 6000,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 27,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 254,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA A",
+      "notes": "Seven pickups visibly chain from 0.5-2.7 s, followed by a sustained laden run and a legible +16 bank at the 8.0 s focus."
+    }
+  },
+  {
+    "rank": 3,
+      "corpus_index": 118,
+      "game_id": 8000118,
+      "seed": 16050230510643554394,
+      "mode": "2v2_competitive_bot_100ms",
+      "duration_ms": 26600,
+      "clip_file": "clips/03-game-8000118.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "GoalRun": {
+            "points": 20
+          }
+        },
+        "category": "banking",
+        "score": 230,
+        "window": {
+          "start_tick": 160,
+          "end_tick": 340,
+          "focus_tick": 280
+        },
+        "breakdown": {
+          "total": 230,
+          "focus_tick": 280,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 20,
+          "max_chain": 6,
+          "pickups": 6,
+          "demolition_points": 0,
+          "banking_points": 120,
+          "combo_points": 110
+        }
+      },
+      "evidence": [
+        {
+          "tick": 165,
+          "clip_elapsed_ms": 250,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 172,
+          "clip_elapsed_ms": 600,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 179,
+          "clip_elapsed_ms": 950,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 15,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 179,
+          "clip_elapsed_ms": 950,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 205,
+          "clip_elapsed_ms": 2250,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 16,
+                "y": 14
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 231,
+          "clip_elapsed_ms": 3550,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 700,
+              "points": 1,
+              "position": {
+                "x": 16,
+                "y": 1
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 248,
+          "clip_elapsed_ms": 4400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 19,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 255,
+          "clip_elapsed_ms": 4750,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 800,
+              "points": 2,
+              "position": {
+                "x": 26,
+                "y": 3
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 261,
+          "clip_elapsed_ms": 5050,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1700,
+              "points": 3,
+              "position": {
+                "x": 26,
+                "y": 6
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 269,
+          "clip_elapsed_ms": 5450,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1600,
+              "points": 3,
+              "position": {
+                "x": 26,
+                "y": 10
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 280,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 6,
+              "combo_remaining_ms_before": 1450,
+              "points": 3,
+              "position": {
+                "x": 26,
+                "y": 17
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 281,
+          "clip_elapsed_ms": 6050,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 16,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 310,
+          "clip_elapsed_ms": 7500,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 32,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 310,
+          "clip_elapsed_ms": 7500,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 23,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 310,
+          "clip_elapsed_ms": 7500,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA A",
+      "notes": "A visible +7 bank leads into a six-pickup chain with a boosted final pickup and a visible +13 bank; the full captioned 20-point run is contained."
+    }
+  },
+  {
+    "rank": 4,
+      "corpus_index": 103,
+      "game_id": 8000103,
+      "seed": 4164486381307232898,
+      "mode": "2v2_competitive_bot_100ms",
+      "duration_ms": 35750,
+      "clip_file": "clips/04-game-8000103.json",
+      "selected": {
+        "star_user_id": 10002,
+        "star_snake_id": 2,
+        "reason": {
+          "GoalRun": {
+            "points": 20
+          }
+        },
+        "category": "banking",
+        "score": 225,
+        "window": {
+          "start_tick": 439,
+          "end_tick": 619,
+          "focus_tick": 559
+        },
+        "breakdown": {
+          "total": 225,
+          "focus_tick": 559,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 20,
+          "max_chain": 6,
+          "pickups": 6,
+          "demolition_points": 0,
+          "banking_points": 120,
+          "combo_points": 105
+        }
+      },
+      "evidence": [
+        {
+          "tick": 463,
+          "clip_elapsed_ms": 1200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 21,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 463,
+          "clip_elapsed_ms": 1200,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 488,
+          "clip_elapsed_ms": 2450,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 36,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 525,
+          "clip_elapsed_ms": 4300,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 27,
+                "y": 13
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 531,
+          "clip_elapsed_ms": 4600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1700,
+              "points": 1,
+              "position": {
+                "x": 27,
+                "y": 10
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 536,
+          "clip_elapsed_ms": 4850,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 40,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 541,
+          "clip_elapsed_ms": 5100,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1500,
+              "points": 2,
+              "position": {
+                "x": 31,
+                "y": 9
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 545,
+          "clip_elapsed_ms": 5300,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1800,
+              "points": 3,
+              "position": {
+                "x": 32,
+                "y": 10
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 551,
+          "clip_elapsed_ms": 5600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1700,
+              "points": 3,
+              "position": {
+                "x": 32,
+                "y": 13
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 559,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Left",
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 559,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 6,
+              "combo_remaining_ms_before": 1600,
+              "points": 3,
+              "position": {
+                "x": 31,
+                "y": 16
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 563,
+          "clip_elapsed_ms": 6200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 28,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 575,
+          "clip_elapsed_ms": 6800,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 44,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 603,
+          "clip_elapsed_ms": 8200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 41,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 603,
+          "clip_elapsed_ms": 8200,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 2
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA A",
+      "notes": "A visible +7 bank leads into a six-pickup chain through traffic and a fully visible +13 bank; setup and the full 20-point payoff are coherent."
+    }
+  },
+  {
+    "rank": 5,
+      "corpus_index": 123,
+      "game_id": 8000123,
+      "seed": 17901268023921737556,
+      "mode": "2v2_competitive_bot_100ms",
+      "duration_ms": 38400,
+      "clip_file": "clips/05-game-8000123.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "Demolition": {
+            "kills": 2
+          }
+        },
+        "category": "demolition",
+        "score": 222,
+        "window": {
+          "start_tick": 563,
+          "end_tick": 743,
+          "focus_tick": 683
+        },
+        "breakdown": {
+          "total": 222,
+          "focus_tick": 683,
+          "kills": 2,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 7,
+          "max_chain": 1,
+          "pickups": 1,
+          "demolition_points": 180,
+          "banking_points": 42,
+          "combo_points": 0
+        }
+      },
+      "evidence": [
+        {
+          "tick": 576,
+          "clip_elapsed_ms": 650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 40,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 611,
+          "clip_elapsed_ms": 2400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 40,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 611,
+          "clip_elapsed_ms": 2400,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 622,
+          "clip_elapsed_ms": 2950,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 44,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 629,
+          "clip_elapsed_ms": 3300,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 44,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 653,
+          "clip_elapsed_ms": 4500,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 25,
+                "y": 23
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 671,
+          "clip_elapsed_ms": 5400,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Up",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 683,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Right",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 683,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 1
+                }
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 683,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 0
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 689,
+          "clip_elapsed_ms": 6300,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 48,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 735,
+          "clip_elapsed_ms": 8600,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 46,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 741,
+          "clip_elapsed_ms": 8900,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 3
+                }
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 741,
+          "clip_elapsed_ms": 8900,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 0
+                }
+              },
+              "snake_id": 3
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": false,
+      "fair_credit": false,
+      "clip_integrity": true,
+      "proud_to_show": false,
+      "verdict": "rejected",
+      "rejection_codes": [
+        "ORDINARY_PLAY",
+        "MISATTRIBUTED"
+      ],
+      "reviewer": "Codex visual QA A",
+      "notes": "Both credited eliminations are mutual head-to-head deaths. Repeated suicidal trades demonstrate no cutoff, trap, or survival and fail the anti-trading fairness rubric."
+    }
+  },
+  {
+    "rank": 6,
+      "corpus_index": 64,
+      "game_id": 8000064,
+      "seed": 6743749829553577056,
+      "mode": "duel_competitive_long_form_60s_prelude_then_bot_100ms",
+      "duration_ms": 125500,
+      "clip_file": "clips/06-game-8000064.json",
+      "selected": {
+        "star_user_id": 10001,
+        "star_snake_id": 1,
+        "reason": {
+          "ComboFrenzy": {
+            "max_chain": 6
+          }
+        },
+        "category": "combo",
+        "score": 213,
+        "window": {
+          "start_tick": 1246,
+          "end_tick": 1426,
+          "focus_tick": 1366
+        },
+        "breakdown": {
+          "total": 213,
+          "focus_tick": 1366,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 13,
+          "max_chain": 6,
+          "pickups": 8,
+          "demolition_points": 0,
+          "banking_points": 78,
+          "combo_points": 135
+        }
+      },
+      "evidence": [
+        {
+          "tick": 1248,
+          "clip_elapsed_ms": 100,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 1
+                }
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1248,
+          "clip_elapsed_ms": 100,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 0
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1286,
+          "clip_elapsed_ms": 2000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 42,
+                "y": 10
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1302,
+          "clip_elapsed_ms": 2800,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1200,
+              "points": 1,
+              "position": {
+                "x": 37,
+                "y": 7
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1318,
+          "clip_elapsed_ms": 3600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1200,
+              "points": 2,
+              "position": {
+                "x": 30,
+                "y": 6
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1338,
+          "clip_elapsed_ms": 4600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1000,
+              "points": 3,
+              "position": {
+                "x": 34,
+                "y": 12
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1358,
+          "clip_elapsed_ms": 5600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1000,
+              "points": 3,
+              "position": {
+                "x": 41,
+                "y": 16
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1366,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 6,
+              "combo_remaining_ms_before": 1600,
+              "points": 3,
+              "position": {
+                "x": 47,
+                "y": 16
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1371,
+          "clip_elapsed_ms": 6250,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 13,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1371,
+          "clip_elapsed_ms": 6250,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1409,
+          "clip_elapsed_ms": 8150,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 45,
+                "y": 33
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1415,
+          "clip_elapsed_ms": 8450,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1700,
+              "points": 1,
+              "position": {
+                "x": 43,
+                "y": 34
+              },
+              "snake_id": 1
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA A",
+      "notes": "A sustained six-pickup chain includes two visibly boosted pickups and converts into a clear +13 bank immediately after focus."
+    }
+  },
+  {
+    "rank": 7,
+      "corpus_index": 150,
+      "game_id": 8000150,
+      "seed": 1799712421838633363,
+      "mode": "duel_quickmatch_bot_100ms",
+      "duration_ms": 37700,
+      "clip_file": "clips/07-game-8000150.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 211,
+        "window": {
+          "start_tick": 444,
+          "end_tick": 624,
+          "focus_tick": 564
+        },
+        "breakdown": {
+          "total": 211,
+          "focus_tick": 564,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 4,
+          "max_chain": 3,
+          "pickups": 4,
+          "demolition_points": 130,
+          "banking_points": 24,
+          "combo_points": 57
+        }
+      },
+      "evidence": [
+        {
+          "tick": 456,
+          "clip_elapsed_ms": 600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 900,
+              "points": 2,
+              "position": {
+                "x": 31,
+                "y": 3
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 492,
+          "clip_elapsed_ms": 2400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 20,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 519,
+          "clip_elapsed_ms": 3750,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 16,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 519,
+          "clip_elapsed_ms": 3750,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 555,
+          "clip_elapsed_ms": 5550,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Left",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 557,
+          "clip_elapsed_ms": 5650,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Down",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 563,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 22,
+                "y": 27
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 564,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "SnakeBody": {
+                  "killer_snake_id": 0
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 573,
+          "clip_elapsed_ms": 6450,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1500,
+              "points": 1,
+              "position": {
+                "x": 28,
+                "y": 27
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 587,
+          "clip_elapsed_ms": 7150,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1300,
+              "points": 2,
+              "position": {
+                "x": 28,
+                "y": 37
+              },
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA A",
+      "notes": "The boosted star lays a horizontal body, turns upward, and the opponent visibly turns into the body and explodes at focus while the star survives."
+    }
+  },
+  {
+    "rank": 8,
+      "corpus_index": 151,
+      "game_id": 8000151,
+      "seed": 18280956071965923527,
+      "mode": "2v2_quickmatch_bot_100ms",
+      "duration_ms": 12100,
+      "clip_file": "clips/08-game-8000151.json",
+      "selected": {
+        "star_user_id": 10001,
+        "star_snake_id": 1,
+        "reason": {
+          "ComboFrenzy": {
+            "max_chain": 5
+          }
+        },
+        "category": "combo",
+        "score": 208,
+        "window": {
+          "start_tick": 48,
+          "end_tick": 228,
+          "focus_tick": 168
+        },
+        "breakdown": {
+          "total": 208,
+          "focus_tick": 168,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 14,
+          "max_chain": 5,
+          "pickups": 10,
+          "demolition_points": 0,
+          "banking_points": 84,
+          "combo_points": 124
+        }
+      },
+      "evidence": [
+        {
+          "tick": 48,
+          "clip_elapsed_ms": 0,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 36,
+                "y": 28
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 52,
+          "clip_elapsed_ms": 200,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1800,
+              "points": 1,
+              "position": {
+                "x": 35,
+                "y": 27
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 60,
+          "clip_elapsed_ms": 600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1600,
+              "points": 2,
+              "position": {
+                "x": 37,
+                "y": 25
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 88,
+          "clip_elapsed_ms": 2000,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 4,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 88,
+          "clip_elapsed_ms": 2000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 91,
+          "clip_elapsed_ms": 2150,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 4,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 97,
+          "clip_elapsed_ms": 2450,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 112,
+          "clip_elapsed_ms": 3200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 126,
+          "clip_elapsed_ms": 3900,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 40,
+                "y": 27
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 143,
+          "clip_elapsed_ms": 4750,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1150,
+              "points": 1,
+              "position": {
+                "x": 31,
+                "y": 27
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 151,
+          "clip_elapsed_ms": 5150,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1600,
+              "points": 2,
+              "position": {
+                "x": 31,
+                "y": 23
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 152,
+          "clip_elapsed_ms": 5200,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1950,
+              "points": 3,
+              "position": {
+                "x": 32,
+                "y": 23
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 168,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1200,
+              "points": 3,
+              "position": {
+                "x": 42,
+                "y": 23
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 179,
+          "clip_elapsed_ms": 6550,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 18,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 179,
+          "clip_elapsed_ms": 6550,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 215,
+          "clip_elapsed_ms": 8350,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 40,
+                "y": 26
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 219,
+          "clip_elapsed_ms": 8550,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 15,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 223,
+          "clip_elapsed_ms": 8750,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1600,
+              "points": 1,
+              "position": {
+                "x": 39,
+                "y": 29
+              },
+              "snake_id": 1
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA B",
+      "notes": "A complete second chain is visible from combo 1-5, with boosted pickups 2-5, followed by a legible +10 bank; setup and payoff are contained."
+    }
+  },
+  {
+    "rank": 9,
+      "corpus_index": 22,
+      "game_id": 8000022,
+      "seed": 16194508987713302632,
+      "mode": "duel_competitive_bot_100ms",
+      "duration_ms": 64250,
+      "clip_file": "clips/09-game-8000022.json",
+      "selected": {
+        "star_user_id": 10001,
+        "star_snake_id": 1,
+        "reason": {
+          "GoalRun": {
+            "points": 17
+          }
+        },
+        "category": "banking",
+        "score": 201,
+        "window": {
+          "start_tick": 206,
+          "end_tick": 386,
+          "focus_tick": 326
+        },
+        "breakdown": {
+          "total": 201,
+          "focus_tick": 326,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 17,
+          "max_chain": 5,
+          "pickups": 5,
+          "demolition_points": 0,
+          "banking_points": 102,
+          "combo_points": 99
+        }
+      },
+      "evidence": [
+        {
+          "tick": 230,
+          "clip_elapsed_ms": 1200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 11,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 230,
+          "clip_elapsed_ms": 1200,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 232,
+          "clip_elapsed_ms": 1300,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 276,
+          "clip_elapsed_ms": 3500,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 37,
+                "y": 32
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 287,
+          "clip_elapsed_ms": 4050,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1450,
+              "points": 1,
+              "position": {
+                "x": 39,
+                "y": 36
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 301,
+          "clip_elapsed_ms": 4750,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1300,
+              "points": 2,
+              "position": {
+                "x": 33,
+                "y": 37
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 325,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 800,
+              "points": 3,
+              "position": {
+                "x": 33,
+                "y": 24
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 326,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1950,
+              "points": 3,
+              "position": {
+                "x": 33,
+                "y": 23
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 355,
+          "clip_elapsed_ms": 7450,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 21,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 355,
+          "clip_elapsed_ms": 7450,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": false,
+      "proud_to_show": false,
+      "verdict": "rejected",
+      "rejection_codes": [
+        "CLIP_MISSING_FACT"
+      ],
+      "reviewer": "Codex visual QA B",
+      "notes": "The +7 and +10 banks and boosted combo are visible, but the first seven carried points were acquired before the clip. The GoalRun(17) caption therefore relies on setup outside the window."
+    }
+  },
+  {
+    "rank": 10,
+      "corpus_index": 65,
+      "game_id": 8000065,
+      "seed": 9480638457215776958,
+      "mode": "duel_quickmatch_bot_100ms",
+      "duration_ms": 37350,
+      "clip_file": "clips/10-game-8000065.json",
+      "selected": {
+        "star_user_id": 10001,
+        "star_snake_id": 1,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 195,
+        "window": {
+          "start_tick": 316,
+          "end_tick": 496,
+          "focus_tick": 436
+        },
+        "breakdown": {
+          "total": 195,
+          "focus_tick": 436,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 8,
+          "max_chain": 3,
+          "pickups": 4,
+          "demolition_points": 90,
+          "banking_points": 48,
+          "combo_points": 57
+        }
+      },
+      "evidence": [
+        {
+          "tick": 318,
+          "clip_elapsed_ms": 100,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 150,
+              "points": 2,
+              "position": {
+                "x": 30,
+                "y": 15
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 359,
+          "clip_elapsed_ms": 2150,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 359,
+          "clip_elapsed_ms": 2150,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 362,
+          "clip_elapsed_ms": 2300,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 415,
+          "clip_elapsed_ms": 4950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 38,
+                "y": 5
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 419,
+          "clip_elapsed_ms": 5150,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1800,
+              "points": 1,
+              "position": {
+                "x": 37,
+                "y": 4
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 425,
+          "clip_elapsed_ms": 5450,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Down",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 427,
+          "clip_elapsed_ms": 5550,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Left",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 435,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1200,
+              "points": 2,
+              "position": {
+                "x": 30,
+                "y": 5
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 436,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 1
+                }
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 490,
+          "clip_elapsed_ms": 8700,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 16,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 490,
+          "clip_elapsed_ms": 8700,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA B",
+      "notes": "A quick corner/intercept, combo-3 pickup at the meeting point, perpendicular head-to-head crash at 8.0 s, and survival are all visually readable."
+    }
+  },
+  {
+    "rank": 11,
+      "corpus_index": 72,
+      "game_id": 8000072,
+      "seed": 10507823224287492250,
+      "mode": "duel_competitive_bot_100ms",
+      "duration_ms": 66950,
+      "clip_file": "clips/11-game-8000072.json",
+      "selected": {
+        "star_user_id": 10001,
+        "star_snake_id": 1,
+        "reason": {
+          "ComboFrenzy": {
+            "max_chain": 5
+          }
+        },
+        "category": "combo",
+        "score": 193,
+        "window": {
+          "start_tick": 1201,
+          "end_tick": 1381,
+          "focus_tick": 1321
+        },
+        "breakdown": {
+          "total": 193,
+          "focus_tick": 1321,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 14,
+          "max_chain": 5,
+          "pickups": 5,
+          "demolition_points": 0,
+          "banking_points": 84,
+          "combo_points": 109
+        }
+      },
+      "evidence": [
+        {
+          "tick": 1223,
+          "clip_elapsed_ms": 1100,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 46,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1223,
+          "clip_elapsed_ms": 1100,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1270,
+          "clip_elapsed_ms": 3450,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 44,
+                "y": 3
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1289,
+          "clip_elapsed_ms": 4400,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1050,
+              "points": 1,
+              "position": {
+                "x": 30,
+                "y": 3
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1291,
+          "clip_elapsed_ms": 4500,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1900,
+              "points": 2,
+              "position": {
+                "x": 29,
+                "y": 4
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1294,
+          "clip_elapsed_ms": 4650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 40,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1309,
+          "clip_elapsed_ms": 5400,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Right",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1319,
+          "clip_elapsed_ms": 5900,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 600,
+              "points": 3,
+              "position": {
+                "x": 38,
+                "y": 16
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1321,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1900,
+              "points": 3,
+              "position": {
+                "x": 39,
+                "y": 16
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1339,
+          "clip_elapsed_ms": 6900,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 56,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1339,
+          "clip_elapsed_ms": 6900,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA B",
+      "notes": "A complete boosted combo 1-5 culminates at focus and is followed by a clear +10 bank; the match-ending authored hold is coherent."
+    }
+  },
+  {
+    "rank": 12,
+      "corpus_index": 99,
+      "game_id": 8000099,
+      "seed": 4324535701467127362,
+      "mode": "duel_competitive_long_form_60s_prelude_then_bot_100ms",
+      "duration_ms": 135800,
+      "clip_file": "clips/12-game-8000099.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 190,
+        "window": {
+          "start_tick": 1784,
+          "end_tick": 1964,
+          "focus_tick": 1904
+        },
+        "breakdown": {
+          "total": 190,
+          "focus_tick": 1904,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 8,
+          "max_chain": 3,
+          "pickups": 3,
+          "demolition_points": 90,
+          "banking_points": 48,
+          "combo_points": 52
+        }
+      },
+      "evidence": [
+        {
+          "tick": 1811,
+          "clip_elapsed_ms": 1350,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 23,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1811,
+          "clip_elapsed_ms": 1350,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1842,
+          "clip_elapsed_ms": 2900,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 25,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1851,
+          "clip_elapsed_ms": 3350,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 27,
+                "y": 19
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1867,
+          "clip_elapsed_ms": 4150,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1200,
+              "points": 1,
+              "position": {
+                "x": 31,
+                "y": 15
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1903,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 200,
+              "points": 2,
+              "position": {
+                "x": 30,
+                "y": 30
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1904,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 0
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1957,
+          "clip_elapsed_ms": 8650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 27,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1957,
+          "clip_elapsed_ms": 8650,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": false,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": false,
+      "verdict": "rejected",
+      "rejection_codes": [
+        "ORDINARY_PLAY"
+      ],
+      "reviewer": "Codex visual QA B",
+      "notes": "Attribution is readable, but the star mostly travels parallel and wins when the opponent turns into the contested cell; no cutoff, trap, boost, or comparable maneuver is visible."
+    }
+  },
+  {
+    "rank": 13,
+      "corpus_index": 3,
+      "game_id": 8000003,
+      "seed": 15531506325020720706,
+      "mode": "2v2_competitive_bot_100ms",
+      "duration_ms": 33150,
+      "clip_file": "clips/13-game-8000003.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "ComboFrenzy": {
+            "max_chain": 6
+          }
+        },
+        "category": "combo",
+        "score": 189,
+        "window": {
+          "start_tick": 380,
+          "end_tick": 560,
+          "focus_tick": 500
+        },
+        "breakdown": {
+          "total": 189,
+          "focus_tick": 500,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 14,
+          "max_chain": 6,
+          "pickups": 6,
+          "demolition_points": 0,
+          "banking_points": 84,
+          "combo_points": 105
+        }
+      },
+      "evidence": [
+        {
+          "tick": 393,
+          "clip_elapsed_ms": 650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 25,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 403,
+          "clip_elapsed_ms": 1150,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 34,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 436,
+          "clip_elapsed_ms": 2800,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 19,
+                "y": 39
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 462,
+          "clip_elapsed_ms": 4100,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 700,
+              "points": 1,
+              "position": {
+                "x": 31,
+                "y": 38
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 468,
+          "clip_elapsed_ms": 4400,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1700,
+              "points": 2,
+              "position": {
+                "x": 33,
+                "y": 39
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 485,
+          "clip_elapsed_ms": 5250,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 29,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 488,
+          "clip_elapsed_ms": 5400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 38,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 494,
+          "clip_elapsed_ms": 5700,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 700,
+              "points": 3,
+              "position": {
+                "x": 29,
+                "y": 30
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 498,
+          "clip_elapsed_ms": 5900,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1800,
+              "points": 3,
+              "position": {
+                "x": 29,
+                "y": 28
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 500,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 6,
+              "combo_remaining_ms_before": 1900,
+              "points": 3,
+              "position": {
+                "x": 29,
+                "y": 27
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 538,
+          "clip_elapsed_ms": 7900,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 42,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 546,
+          "clip_elapsed_ms": 8300,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 43,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 546,
+          "clip_elapsed_ms": 8300,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA B",
+      "notes": "A complete combo 1-6 is visibly sustained across the clip, with a crisp 4-5-6 focus sequence and a +14 bank before the end."
+    }
+  },
+  {
+    "rank": 14,
+      "corpus_index": 52,
+      "game_id": 8000052,
+      "seed": 8180240467374456232,
+      "mode": "duel_competitive_bot_100ms",
+      "duration_ms": 78400,
+      "clip_file": "clips/14-game-8000052.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 186,
+        "window": {
+          "start_tick": 1280,
+          "end_tick": 1460,
+          "focus_tick": 1400
+        },
+        "breakdown": {
+          "total": 186,
+          "focus_tick": 1400,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 9,
+          "max_chain": 3,
+          "pickups": 3,
+          "demolition_points": 90,
+          "banking_points": 54,
+          "combo_points": 42
+        }
+      },
+      "evidence": [
+        {
+          "tick": 1301,
+          "clip_elapsed_ms": 1050,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 37,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1301,
+          "clip_elapsed_ms": 1050,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1341,
+          "clip_elapsed_ms": 3050,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 45,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1357,
+          "clip_elapsed_ms": 3850,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 28,
+                "y": 12
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1373,
+          "clip_elapsed_ms": 4650,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1200,
+              "points": 1,
+              "position": {
+                "x": 29,
+                "y": 5
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1387,
+          "clip_elapsed_ms": 5350,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1300,
+              "points": 2,
+              "position": {
+                "x": 33,
+                "y": 2
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1389,
+          "clip_elapsed_ms": 5450,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Down",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1399,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Left",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1400,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "SnakeBody": {
+                  "killer_snake_id": 0
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1456,
+          "clip_elapsed_ms": 8800,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 41,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1456,
+          "clip_elapsed_ms": 8800,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA B",
+      "notes": "The star turns down before the head-on approach, leaves its body across the victim's line, then turns left as the victim visibly crashes at focus."
+    }
+  },
+  {
+    "rank": 15,
+      "corpus_index": 152,
+      "game_id": 8000152,
+      "seed": 7113398429579608392,
+      "mode": "duel_competitive_bot_100ms",
+      "duration_ms": 62850,
+      "clip_file": "clips/15-game-8000152.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "GoalRun": {
+            "points": 17
+          }
+        },
+        "category": "banking",
+        "score": 186,
+        "window": {
+          "start_tick": 88,
+          "end_tick": 268,
+          "focus_tick": 208
+        },
+        "breakdown": {
+          "total": 186,
+          "focus_tick": 208,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 17,
+          "max_chain": 5,
+          "pickups": 5,
+          "demolition_points": 0,
+          "banking_points": 102,
+          "combo_points": 84
+        }
+      },
+      "evidence": [
+        {
+          "tick": 98,
+          "clip_elapsed_ms": 500,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 7,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 98,
+          "clip_elapsed_ms": 500,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 148,
+          "clip_elapsed_ms": 3000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 20,
+                "y": 7
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 161,
+          "clip_elapsed_ms": 3650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 166,
+          "clip_elapsed_ms": 3900,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1100,
+              "points": 1,
+              "position": {
+                "x": 25,
+                "y": 3
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 182,
+          "clip_elapsed_ms": 4700,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1200,
+              "points": 2,
+              "position": {
+                "x": 30,
+                "y": 0
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 196,
+          "clip_elapsed_ms": 5400,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1300,
+              "points": 3,
+              "position": {
+                "x": 28,
+                "y": 5
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 208,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1400,
+              "points": 3,
+              "position": {
+                "x": 28,
+                "y": 11
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 249,
+          "clip_elapsed_ms": 8050,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 17,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 249,
+          "clip_elapsed_ms": 8050,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA C",
+      "notes": "The centered star banks +7, visibly builds a five-pickup chain culminating at focus, then banks +10; the complete 17-point run is readable."
+    }
+  },
+  {
+    "rank": 16,
+      "corpus_index": 82,
+      "game_id": 8000082,
+      "seed": 10370534412608296551,
+      "mode": "duel_competitive_bot_100ms",
+      "duration_ms": 75350,
+      "clip_file": "clips/16-game-8000082.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 185,
+        "window": {
+          "start_tick": 1196,
+          "end_tick": 1376,
+          "focus_tick": 1316
+        },
+        "breakdown": {
+          "total": 185,
+          "focus_tick": 1316,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 8,
+          "max_chain": 3,
+          "pickups": 4,
+          "demolition_points": 90,
+          "banking_points": 48,
+          "combo_points": 47
+        }
+      },
+      "evidence": [
+        {
+          "tick": 1203,
+          "clip_elapsed_ms": 350,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1200,
+              "points": 2,
+              "position": {
+                "x": 23,
+                "y": 29
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1241,
+          "clip_elapsed_ms": 2250,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 43,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1241,
+          "clip_elapsed_ms": 2250,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1252,
+          "clip_elapsed_ms": 2800,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 40,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1273,
+          "clip_elapsed_ms": 3850,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 16,
+                "y": 12
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1289,
+          "clip_elapsed_ms": 4650,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1200,
+              "points": 1,
+              "position": {
+                "x": 24,
+                "y": 12
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1307,
+          "clip_elapsed_ms": 5550,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1100,
+              "points": 2,
+              "position": {
+                "x": 35,
+                "y": 11
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1310,
+          "clip_elapsed_ms": 5700,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Down",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1316,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "SnakeBody": {
+                  "killer_snake_id": 0
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1364,
+          "clip_elapsed_ms": 8400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 47,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1364,
+          "clip_elapsed_ms": 8400,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA C",
+      "notes": "The star's combo buildup and turn form a visible L-shaped body trap; the active opponent follows into it and explodes at focus, followed by a +4 bank."
+    }
+  },
+  {
+    "rank": 17,
+      "corpus_index": 121,
+      "game_id": 8000121,
+      "seed": 8380555061724679266,
+      "mode": "2v2_quickmatch_bot_100ms",
+      "duration_ms": 16250,
+      "clip_file": "clips/17-game-8000121.json",
+      "selected": {
+        "star_user_id": 10002,
+        "star_snake_id": 2,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 185,
+        "window": {
+          "start_tick": 28,
+          "end_tick": 208,
+          "focus_tick": 148
+        },
+        "breakdown": {
+          "total": 185,
+          "focus_tick": 148,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 8,
+          "max_chain": 3,
+          "pickups": 6,
+          "demolition_points": 90,
+          "banking_points": 48,
+          "combo_points": 47
+        }
+      },
+      "evidence": [
+        {
+          "tick": 42,
+          "clip_elapsed_ms": 700,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 21,
+                "y": 29
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 50,
+          "clip_elapsed_ms": 1100,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1600,
+              "points": 1,
+              "position": {
+                "x": 23,
+                "y": 27
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 62,
+          "clip_elapsed_ms": 1700,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1400,
+              "points": 2,
+              "position": {
+                "x": 27,
+                "y": 30
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 80,
+          "clip_elapsed_ms": 2600,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 4,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 88,
+          "clip_elapsed_ms": 3000,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 4,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 96,
+          "clip_elapsed_ms": 3400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 105,
+          "clip_elapsed_ms": 3850,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 105,
+          "clip_elapsed_ms": 3850,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 147,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 29,
+                "y": 21
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 148,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 2
+                }
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 149,
+          "clip_elapsed_ms": 6050,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1900,
+              "points": 1,
+              "position": {
+                "x": 29,
+                "y": 22
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 155,
+          "clip_elapsed_ms": 6350,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1700,
+              "points": 2,
+              "position": {
+                "x": 28,
+                "y": 24
+              },
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 193,
+          "clip_elapsed_ms": 8250,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 193,
+          "clip_elapsed_ms": 8250,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 2
+            }
+          }
+        },
+        {
+          "tick": 200,
+          "clip_elapsed_ms": 8600,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 201,
+          "clip_elapsed_ms": 8650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 19,
+              "team_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA C",
+      "notes": "In active 2v2 traffic the star wins a visible head-to-head at focus; combo and bank setup before and after the elimination make it more than a bare kill."
+    }
+  },
+  {
+    "rank": 18,
+      "corpus_index": 191,
+      "game_id": 8000191,
+      "seed": 3197779010171768775,
+      "mode": "2v2_quickmatch_bot_100ms",
+      "duration_ms": 18050,
+      "clip_file": "clips/18-game-8000191.json",
+      "selected": {
+        "star_user_id": 10003,
+        "star_snake_id": 3,
+        "reason": {
+          "ComboFrenzy": {
+            "max_chain": 5
+          }
+        },
+        "category": "combo",
+        "score": 183,
+        "window": {
+          "start_tick": 60,
+          "end_tick": 240,
+          "focus_tick": 180
+        },
+        "breakdown": {
+          "total": 183,
+          "focus_tick": 180,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 14,
+          "max_chain": 5,
+          "pickups": 5,
+          "demolition_points": 0,
+          "banking_points": 84,
+          "combo_points": 99
+        }
+      },
+      "evidence": [
+        {
+          "tick": 80,
+          "clip_elapsed_ms": 1000,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 4,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 85,
+          "clip_elapsed_ms": 1250,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 4,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 108,
+          "clip_elapsed_ms": 2400,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 8,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 108,
+          "clip_elapsed_ms": 2400,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 124,
+          "clip_elapsed_ms": 3200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 142,
+          "clip_elapsed_ms": 4100,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 40,
+                "y": 15
+              },
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 156,
+          "clip_elapsed_ms": 4800,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1300,
+              "points": 1,
+              "position": {
+                "x": 38,
+                "y": 10
+              },
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 161,
+          "clip_elapsed_ms": 5050,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 16,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 172,
+          "clip_elapsed_ms": 5600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1200,
+              "points": 2,
+              "position": {
+                "x": 32,
+                "y": 12
+              },
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 173,
+          "clip_elapsed_ms": 5650,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Down",
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 173,
+          "clip_elapsed_ms": 5650,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1950,
+              "points": 3,
+              "position": {
+                "x": 32,
+                "y": 13
+              },
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 180,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Right",
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 180,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": true,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1650,
+              "points": 3,
+              "position": {
+                "x": 33,
+                "y": 17
+              },
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 204,
+          "clip_elapsed_ms": 7200,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 12,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 211,
+          "clip_elapsed_ms": 7550,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 22,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 211,
+          "clip_elapsed_ms": 7550,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 3
+            }
+          }
+        },
+        {
+          "tick": 240,
+          "clip_elapsed_ms": 9000,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 20,
+              "team_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA C",
+      "notes": "The star visibly sustains pickups through boosted chains 3, 4, and 5 at focus, then converts the sequence into a +10 bank."
+    }
+  },
+  {
+    "rank": 19,
+      "corpus_index": 199,
+      "game_id": 8000199,
+      "seed": 14256959718570127301,
+      "mode": "duel_competitive_long_form_60s_prelude_then_bot_100ms",
+      "duration_ms": 135350,
+      "clip_file": "clips/19-game-8000199.json",
+      "selected": {
+        "star_user_id": 10001,
+        "star_snake_id": 1,
+        "reason": {
+          "Demolition": {
+            "kills": 1
+          }
+        },
+        "category": "demolition",
+        "score": 180,
+        "window": {
+          "start_tick": 2042,
+          "end_tick": 2222,
+          "focus_tick": 2162
+        },
+        "breakdown": {
+          "total": 180,
+          "focus_tick": 2162,
+          "kills": 1,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 8,
+          "max_chain": 3,
+          "pickups": 4,
+          "demolition_points": 90,
+          "banking_points": 48,
+          "combo_points": 42
+        }
+      },
+      "evidence": [
+        {
+          "tick": 2051,
+          "clip_elapsed_ms": 450,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1100,
+              "points": 2,
+              "position": {
+                "x": 37,
+                "y": 8
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2093,
+          "clip_elapsed_ms": 2550,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 29,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2093,
+          "clip_elapsed_ms": 2550,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2120,
+          "clip_elapsed_ms": 3900,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 35,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 2137,
+          "clip_elapsed_ms": 4750,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 29,
+                "y": 20
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2147,
+          "clip_elapsed_ms": 5250,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 1500,
+              "points": 1,
+              "position": {
+                "x": 26,
+                "y": 18
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2161,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Left",
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2161,
+          "clip_elapsed_ms": 5950,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1300,
+              "points": 2,
+              "position": {
+                "x": 25,
+                "y": 24
+              },
+              "snake_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2162,
+          "clip_elapsed_ms": 6000,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": {
+                "HeadToHead": {
+                  "other_snake_id": 1
+                }
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 2215,
+          "clip_elapsed_ms": 8650,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 33,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 2215,
+          "clip_elapsed_ms": 8650,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 1
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": false,
+      "visible_skill": false,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": false,
+      "verdict": "rejected",
+      "rejection_codes": [
+        "UNCLEAR_CAUSE",
+        "ORDINARY_PLAY"
+      ],
+      "reviewer": "Codex visual QA C",
+      "notes": "The active duel rules out farming, but the snakes travel nearly parallel before impact and the decisive maneuver is hard to read; it looks like an ordinary collision."
+    }
+  },
+  {
+    "rank": 20,
+      "corpus_index": 47,
+      "game_id": 8000047,
+      "seed": 4987443458200913969,
+      "mode": "duel_competitive_bot_100ms",
+      "duration_ms": 62100,
+      "clip_file": "clips/20-game-8000047.json",
+      "selected": {
+        "star_user_id": 10000,
+        "star_snake_id": 0,
+        "reason": {
+          "ComboFrenzy": {
+            "max_chain": 5
+          }
+        },
+        "category": "combo",
+        "score": 178,
+        "window": {
+          "start_tick": 990,
+          "end_tick": 1170,
+          "focus_tick": 1110
+        },
+        "breakdown": {
+          "total": 178,
+          "focus_tick": 1110,
+          "kills": 0,
+          "boosted_cutoff_kills": 0,
+          "trap_kills": 0,
+          "banked_points": 14,
+          "max_chain": 5,
+          "pickups": 5,
+          "demolition_points": 0,
+          "banking_points": 84,
+          "combo_points": 94
+        }
+      },
+      "evidence": [
+        {
+          "tick": 1002,
+          "clip_elapsed_ms": 600,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 39,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1022,
+          "clip_elapsed_ms": 1600,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 38,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1022,
+          "clip_elapsed_ms": 1600,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1058,
+          "clip_elapsed_ms": 3400,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 1,
+              "combo_remaining_ms_before": 0,
+              "points": 1,
+              "position": {
+                "x": 10,
+                "y": 36
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1096,
+          "clip_elapsed_ms": 5300,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 2,
+              "combo_remaining_ms_before": 100,
+              "points": 1,
+              "position": {
+                "x": 25,
+                "y": 32
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1098,
+          "clip_elapsed_ms": 5400,
+          "kind": "star_turn_near_focus",
+          "details": {
+            "SnakeTurned": {
+              "direction": "Up",
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1098,
+          "clip_elapsed_ms": 5400,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 3,
+              "combo_remaining_ms_before": 1900,
+              "points": 2,
+              "position": {
+                "x": 25,
+                "y": 31
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1102,
+          "clip_elapsed_ms": 5600,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 4,
+              "combo_remaining_ms_before": 1800,
+              "points": 3,
+              "position": {
+                "x": 25,
+                "y": 29
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1110,
+          "clip_elapsed_ms": 6000,
+          "kind": "star_food",
+          "details": {
+            "FoodEaten": {
+              "boost_active": false,
+              "combo_chain": 5,
+              "combo_remaining_ms_before": 1600,
+              "points": 3,
+              "position": {
+                "x": 25,
+                "y": 25
+              },
+              "snake_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1128,
+          "clip_elapsed_ms": 6900,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 46,
+              "team_id": 1
+            }
+          }
+        },
+        {
+          "tick": 1144,
+          "clip_elapsed_ms": 7700,
+          "kind": "team_score",
+          "details": {
+            "TeamScoreUpdated": {
+              "score": 48,
+              "team_id": 0
+            }
+          }
+        },
+        {
+          "tick": 1144,
+          "clip_elapsed_ms": 7700,
+          "kind": "death",
+          "details": {
+            "SnakeDied": {
+              "cause": "Banked",
+              "snake_id": 0
+            }
+          }
+        }
+      ],
+    "review": {
+      "causal_clarity": true,
+      "visible_skill": true,
+      "fair_credit": true,
+      "clip_integrity": true,
+      "proud_to_show": true,
+      "verdict": "deserved",
+      "rejection_codes": [],
+      "reviewer": "Codex visual QA C",
+      "notes": "The centered star visibly builds combo 1-5, lands chain 5 at focus, then banks +10; the sustained-combo setup and payoff are complete and legible."
+    }
+    }
+  ]
+}

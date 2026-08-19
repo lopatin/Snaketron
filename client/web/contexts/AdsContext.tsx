@@ -347,8 +347,16 @@ export const AdsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   return <AdsContext.Provider value={value}>{children}</AdsContext.Provider>;
 };
 
+/**
+ * Ads policy for surfaces that may legitimately render outside `AdsProvider`,
+ * such as the design-review harnesses, which mount a single component with no
+ * socket or auth behind it. `null` means "policy unknown", and a caller that
+ * cannot confirm policy must not request inventory.
+ */
+export const useAdsOptional = (): AdsContextValue | null => useContext(AdsContext);
+
 export const useAds = (): AdsContextValue => {
-  const value = useContext(AdsContext);
+  const value = useAdsOptional();
   if (!value) {
     throw new Error('useAds must be used within AdsProvider');
   }

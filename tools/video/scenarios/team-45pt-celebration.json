@@ -1,0 +1,213 @@
+{
+ "format_version": 1,
+ "id": "team-45pt-celebration",
+ "world": {
+  "game_type": {
+   "TeamMatch": {
+    "per_team": 2
+   }
+  },
+  "queue_mode": "Competitive",
+  "rng_seed": null,
+  "overrides": {
+   "player_idle_timeout_ms": 600000
+  }
+ },
+ "pose": {
+  "snakes": [
+   {
+    "user_id": 1,
+    "name": "VAULT RUNNER",
+    "team_id": 0,
+    "body": [
+     {
+      "x": 30,
+      "y": 20
+     },
+     {
+      "x": 34,
+      "y": 20
+     }
+    ],
+    "direction": "Left",
+    "food": 45,
+    "boost_charge_ms": 3000
+   },
+   {
+    "user_id": 2,
+    "name": "DEFENDER",
+    "team_id": 1,
+    "body": [
+     {
+      "x": 38,
+      "y": 16
+     },
+     {
+      "x": 43,
+      "y": 16
+     }
+    ],
+    "direction": "Left",
+    "is_alive": false
+   },
+   {
+    "user_id": 3,
+    "name": "ESCORT",
+    "team_id": 0,
+    "body": [
+     {
+      "x": 24,
+      "y": 25
+     },
+     {
+      "x": 18,
+      "y": 25
+     }
+    ],
+    "direction": "Right"
+   },
+   {
+    "user_id": 4,
+    "name": "BLOCKER",
+    "team_id": 1,
+    "body": [
+     {
+      "x": 34,
+      "y": 26
+     },
+     {
+      "x": 39,
+      "y": 26
+     }
+    ],
+    "direction": "Left"
+   }
+  ],
+  "food": [
+   {
+    "x": 26,
+    "y": 15
+   },
+   {
+    "x": 18,
+    "y": 14
+   },
+   {
+    "x": 14,
+    "y": 26
+   },
+   {
+    "x": 28,
+    "y": 24
+   },
+   {
+    "x": 20,
+    "y": 27
+   },
+   {
+    "x": 24,
+    "y": 13
+   },
+   {
+    "x": 16,
+    "y": 23
+   },
+   {
+    "x": 21,
+    "y": 17
+   },
+   {
+    "x": 25,
+    "y": 22
+   },
+   {
+    "x": 29,
+    "y": 27
+   },
+   {
+    "x": 17,
+    "y": 19
+   },
+   {
+    "x": 33,
+    "y": 23
+   },
+   {
+    "x": 13,
+    "y": 16
+   },
+   {
+    "x": 19,
+    "y": 29
+   },
+   {
+    "x": 27,
+    "y": 18
+   },
+   {
+    "x": 23,
+    "y": 28
+   },
+   {
+    "x": 31,
+    "y": 13
+   },
+   {
+    "x": 15,
+    "y": 27
+   },
+   {
+    "x": 35,
+    "y": 19
+   },
+   {
+    "x": 12,
+    "y": 24
+   },
+   {
+    "x": 30,
+    "y": 30
+   },
+   {
+    "x": 11,
+    "y": 21
+   }
+  ],
+  "team_scores": [
+   [
+    0,
+    0
+   ],
+   [
+    1,
+    0
+   ]
+  ],
+  "start_tick": 0
+ },
+ "commands": [
+  {
+   "at_tick": 38,
+   "user_id": 4,
+   "command": {
+    "Turn": "Down"
+   }
+  }
+ ],
+ "run_ticks": 70,
+ "presentation": {
+  "camera": {
+   "Follow": {
+    "snake_id": 0,
+    "width_cells": 18.0
+   }
+  },
+  "default_time_scale": 1.0,
+  "star_snake_id": 0,
+  "addons": {
+   "combo_callout": false,
+   "boost_meter": true
+  }
+ },
+ "expect": []
+}

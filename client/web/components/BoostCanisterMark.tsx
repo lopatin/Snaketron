@@ -63,7 +63,7 @@ export function BoostCanisterMark({
           x="12.9"
           y="12.25"
           fill="#fff"
-          fontFamily="Arial, sans-serif"
+          fontFamily="'Snaketron Capture Sans', Arial, sans-serif"
           fontSize="5.5"
           fontStyle="normal"
           fontWeight="900"

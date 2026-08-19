@@ -3,6 +3,9 @@ set -e
 
 echo "Initializing DynamoDB tables..."
 
+REPLAY_BUCKET="${SNAKETRON_REPLAY_S3_BUCKET:-snaketron-replays-dev}"
+REPLAY_PREFIX="${SNAKETRON_REPLAY_S3_PREFIX:-recordings}"
+
 # Create main table
 awslocal dynamodb create-table \
     --table-name snaketron-main \
@@ -44,8 +47,30 @@ awslocal dynamodb update-time-to-live \
     --table-name snaketron-main \
     --time-to-live-specification "Enabled=true,AttributeName=ttl" || true
 
-echo "DynamoDB tables initialized successfully!"
+echo "Initializing private replay bucket..."
+
+awslocal s3api create-bucket --bucket "$REPLAY_BUCKET" || true
+
+awslocal s3api put-public-access-block \
+    --bucket "$REPLAY_BUCKET" \
+    --public-access-block-configuration \
+    'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+awslocal s3api put-bucket-encryption \
+    --bucket "$REPLAY_BUCKET" \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":false}]}'
+
+awslocal s3api put-bucket-lifecycle-configuration \
+    --bucket "$REPLAY_BUCKET" \
+    --lifecycle-configuration \
+    "{\"Rules\":[{\"ID\":\"abort-incomplete-replay-uploads\",\"Status\":\"Enabled\",\"Filter\":{\"Prefix\":\"${REPLAY_PREFIX}/\"},\"AbortIncompleteMultipartUpload\":{\"DaysAfterInitiation\":1}}]}"
+
+echo "LocalStack resources initialized successfully!"
 
 # List tables to confirm
 echo "Available tables:"
 awslocal dynamodb list-tables
+
+echo "Available buckets:"
+awslocal s3api list-buckets

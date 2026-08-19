@@ -29,7 +29,11 @@ use serde::{Deserialize, Serialize};
 /// Version 4 adds the authoritative combo configuration and each snake's
 /// combo countdown/chain state to the fingerprint. Replaying an older trace
 /// against the combo-aware engine would otherwise report misleading drift.
-pub const TRACE_FORMAT_VERSION: u32 = 4;
+///
+/// Version 5 adds deterministic death attribution to `SnakeDied` events and
+/// crash cues. Older traces deserialize through serde defaults, but retaining
+/// their version would conceal that attribution is absent during replay.
+pub const TRACE_FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceSide {

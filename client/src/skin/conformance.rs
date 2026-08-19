@@ -251,6 +251,7 @@ fn skin_conformance_animation_only_varies_paint_arguments() {
                         boost_active: false,
                         anim_ms: 0.0,
                         reduced_motion: false,
+                        detail_scale: 1.0,
                     },
                     &identity,
                 );
@@ -264,6 +265,7 @@ fn skin_conformance_animation_only_varies_paint_arguments() {
                             boost_active: false,
                             anim_ms,
                             reduced_motion: false,
+                            detail_scale: 1.0,
                         },
                         &identity,
                     );
@@ -297,6 +299,7 @@ fn skin_conformance_reduced_motion_is_actually_still() {
                             boost_active: false,
                             anim_ms,
                             reduced_motion: true,
+                            detail_scale: 1.0,
                         },
                         &identity,
                     )

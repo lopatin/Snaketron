@@ -14,6 +14,9 @@
 //!   activation or turn is detected before it mutates geometry.
 //! - `event_sequence`: client and server count locally-generated events
 //!   differently by design.
+//! - `recent_crashes`, `recent_goals`, and `last_death_causes`: replicated
+//!   presentation history. Hashing it would turn an expired visual cue into a
+//!   false gameplay divergence; the underlying state transition is hashed.
 //! - `usernames`, `skins`, `spectators`, `game_code`, `host_user_id`,
 //!   `start_ms`: cosmetic or static; not gameplay state. Skins in particular
 //!   must stay out: a player changing how their snake looks can never be

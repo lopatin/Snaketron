@@ -15,6 +15,7 @@ import {
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
+import type { HighlightClip } from '../types/generated';
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -70,6 +71,10 @@ export interface CrazyGamesExchangeResponse {
   preferences: CrazyGamesPreferences;
 }
 
+export type GameHighlightResponse =
+  | { status: 'pending' }
+  | { status: 'ready'; play_of_the_game: HighlightClip }
+  | { status: 'unavailable' };
 export interface AdminHistoryFilters {
   cursor?: string | null;
   limit?: number;
@@ -283,6 +288,18 @@ class API {
     return this.request<NewsTickerResponse>('/api/news');
   }
 
+  /** Public-by-design replay metadata. A bearer is still attached when one is
+   * available, including tab-scoped CrazyGames sessions. */
+  async getGameHighlight(
+    gameId: string,
+    signal?: AbortSignal,
+  ): Promise<GameHighlightResponse> {
+    return this.request<GameHighlightResponse>(
+      `/api/games/${encodeURIComponent(gameId)}/highlight`,
+      { signal },
+    );
+  }
+
   async getLeaderboard(
     queueMode: 'quickmatch' | 'competitive',
     gameType: 'solo' | 'duel' | '2v2' | 'ffa',
@@ -323,6 +340,32 @@ class API {
     if (region) params.append('region', region);
 
     return this.request<UserRankingResponse>(`/api/leaderboard/me?${params.toString()}`);
+  }
+
+  /**
+   * Any player's ranking in one region. Standing is already public — the
+   * leaderboard publishes the same MMR next to the username — so this needs
+   * no auth. It exists for surfaces that know a user id but are not that
+   * user, such as the Play of the Game caption naming whoever earned it.
+   */
+  async getUserRanking(
+    userId: number,
+    queueMode: 'quickmatch' | 'competitive',
+    gameType: 'solo' | 'duel' | '2v2' | 'ffa',
+    season?: number,
+    region?: string
+  ): Promise<UserRankingResponse> {
+    const params = new URLSearchParams({
+      queue_mode: queueMode,
+      game_type: gameType,
+    });
+
+    if (season !== undefined) params.append('season', season.toString());
+    if (region) params.append('region', region);
+
+    return this.request<UserRankingResponse>(
+      `/api/leaderboard/users/${userId}?${params.toString()}`
+    );
   }
 
   async getMatchHistory(cursor?: string | null, limit = 12): Promise<MatchHistoryPage> {

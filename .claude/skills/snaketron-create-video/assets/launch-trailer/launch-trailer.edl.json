@@ -1,0 +1,279 @@
+{
+ "output": {
+  "w": 1920,
+  "h": 1080,
+  "fps": 60
+ },
+ "music": {
+  "src": "launch-bed.wav",
+  "manifest": "launch-bed.beats.json",
+  "beat_snap": true,
+  "beat_snap_max_s": 0.05,
+  "duck_under": "sfx",
+  "volume": 1.0,
+  "duck": {
+   "threshold": 0.18,
+   "ratio": 2.0,
+   "attack_ms": 14,
+   "release_ms": 240
+  }
+ },
+ "timeline": [
+  {
+   "clip": "logo-intro",
+   "in": 0.0,
+   "out": 2.4,
+   "effects": []
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "demolition-cutoff",
+   "in": 0.0,
+   "out": 2.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "shake",
+     "at": "meta:kill",
+     "dur": 0.35,
+     "amp": 8,
+     "decay": 3
+    },
+    {
+     "t": "rgb_split",
+     "at": "meta:kill",
+     "dur": 0.12,
+     "px": 2
+    },
+    {
+     "t": "punch_in",
+     "at": "meta:kill",
+     "dur": 0.5,
+     "zoom": 1.12
+    }
+   ],
+   "texts": [
+    {
+     "value": "DEMOLITIONS!",
+     "at": "meta:kill+0.05",
+     "dur": 1.5,
+     "style": "impact"
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/impact.wav",
+     "at": "meta:kill",
+     "volume": 0.46
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "team-45pt-celebration",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "glow",
+     "at": "meta:bank",
+     "dur": 0.8,
+     "amount": 0.45
+    }
+   ],
+   "texts": [
+    {
+     "value": "TEAM MATCHES!",
+     "at": "meta:bank+0.05",
+     "dur": 1.4,
+     "style": "impact"
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/bank.wav",
+     "at": "meta:bank",
+     "volume": 0.44
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "ffa-four-snakes",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "shake",
+     "at": "meta:kill",
+     "dur": 0.3,
+     "amp": 6,
+     "decay": 4
+    },
+    {
+     "t": "punch_in",
+     "at": "meta:kill",
+     "dur": 0.45,
+     "zoom": 1.09
+    }
+   ],
+   "texts": [
+    {
+     "value": "FREE FOR ALL!",
+     "at": "meta:kill+0.05",
+     "dur": 1.5,
+     "style": "impact"
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/impact.wav",
+     "at": "meta:kill",
+     "volume": 0.46
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "boost-combo-clutch",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "effects": [
+    {
+     "t": "punch_in",
+     "at": "meta:combo",
+     "dur": 0.4,
+     "zoom": 1.1
+    }
+   ],
+   "texts": [
+    {
+     "value": "BOOST!",
+     "at": 0.3,
+     "dur": 3.1,
+     "style": "impact",
+     "side": "left"
+    },
+    {
+     "value": "COMBOS!",
+     "at": "meta:combo-0.1",
+     "dur": 2.5,
+     "style": "impact",
+     "side": "right"
+    }
+   ],
+   "sfx": [
+    {
+     "src": "../sfx/boost.wav",
+     "at": 0.35,
+     "volume": 0.7
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "solo-classic-run",
+   "in": 0.0,
+   "out": 3.4,
+   "speed": [
+    {
+     "rate": 1.0
+    }
+   ],
+   "texts": [
+    {
+     "value": "CLASSIC SNAKE!",
+     "at": 1.3,
+     "dur": 1.7,
+     "style": "impact"
+    }
+   ]
+  },
+  {
+   "transition": "smooth_left",
+   "duration": 0.4
+  },
+  {
+   "clip": "rank-up",
+   "in": 0.0,
+   "out": 2.9,
+   "effects": [
+    {
+     "t": "push_in",
+     "at": 0.0,
+     "dur": 2.9,
+     "zoom": 1.07
+    }
+   ],
+   "texts": [
+    {
+     "value": "RANK UP!",
+     "at": "meta:settle-0.1",
+     "dur": 1.6,
+     "style": "impact"
+    }
+   ]
+  },
+  {
+   "transition": "circle_open",
+   "duration": 0.4
+  },
+  {
+   "clip": "rankings",
+   "in": 0.0,
+   "out": 8.6,
+   "effects": []
+  },
+  {
+   "transition": "fadewhite",
+   "duration": 0.6
+  },
+  {
+   "clip": "logo-outro",
+   "in": 0.0,
+   "out": 3.6,
+   "effects": [
+    {
+     "t": "push_in",
+     "at": 0.0,
+     "dur": 3.6,
+     "zoom": 1.05
+    }
+   ]
+  }
+ ]
+}

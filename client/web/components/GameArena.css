@@ -311,6 +311,88 @@
   will-change: transform;
 }
 
+/* Vertical variant ----------------------------------------------------------
+   Used where the meter floats inside a frame instead of docking under the
+   arena: it is a closed rectangle on all four edges (the horizontal meter
+   deliberately opens its top edge into the arena border) and fills bottom-up.
+   Only the axis changes — colours, states and semantics stay shared. */
+.game-boost-hud.is-vertical {
+  width: var(--game-boost-vertical-width, 27px);
+  height: 100%;
+  flex: none;
+  align-self: stretch;
+  margin-top: 0;
+  transform: translateX(6px);
+}
+
+.game-boost-hud.is-vertical.is-visible {
+  transform: translateX(0);
+}
+
+.game-boost-hud.is-vertical .game-boost-meter {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 26px minmax(0, 1fr) 20px;
+  border: 1px solid var(--boost-frame);
+  border-radius: 6px;
+  box-shadow:
+    0 1px 3px rgb(23 32 51 / 12%),
+    inset 0 1px 0 rgb(255 255 255 / 62%);
+  text-align: center;
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__canister-dock {
+  width: 100%;
+  height: 100%;
+  border-right: 0;
+  border-bottom: 1px solid var(--boost-divider);
+  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 38%);
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__canister {
+  width: 18px;
+  height: 13px;
+}
+
+/* The tick marks run across the column, so the repeat axis and the fade mask
+   both rotate with the meter. */
+.game-boost-hud.is-vertical .game-boost-meter__reservoir {
+  width: 10px;
+  height: calc(100% - 16px);
+  align-self: center;
+  background: repeating-linear-gradient(
+    0deg,
+    rgb(42 61 87 / 34%) 0,
+    rgb(42 61 87 / 34%) 1px,
+    transparent 1px,
+    transparent 16px
+  );
+  mask-image: linear-gradient(0deg, transparent, #000 8%, #000 92%, transparent);
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__value {
+  border-top: 1px solid var(--boost-divider);
+  border-left: 0;
+  font-size: 9px;
+  letter-spacing: -0.03em;
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__track {
+  border-radius: 5px;
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__fill {
+  transform-origin: center bottom;
+  background: linear-gradient(
+    0deg,
+    var(--boost-charge-start) 0%,
+    var(--boost-charge-mid) 62%,
+    var(--boost-charge-end) 100%
+  );
+  box-shadow:
+    inset 1px 0 0 rgb(255 255 255 / 72%),
+    0 -4px 9px rgb(255 213 0 / 30%);
+}
+
 .game-boost-hud.is-active {
   --boost-frame: rgb(58 75 98 / 82%);
 }

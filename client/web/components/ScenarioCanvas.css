@@ -1,0 +1,513 @@
+.scenario-canvas {
+  --scenario-paper: #fff;
+  --scenario-graphite: #3f3f41;
+  --scenario-blue: #3b82f6;
+  --scenario-red: #ef4444;
+  --scenario-rule: #d1d5db;
+  width: 100%;
+  color: var(--scenario-graphite);
+  font-family: Arial, Helvetica, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Capture mode deliberately does NOT override typography. Substituting a
+   different family (build 1 used Barlow Condensed) makes the footage
+   typographically not the product — the brand-fidelity requirement (PRD P3.5)
+   allows pinning a metric-compatible substitute for determinism, not a
+   different face. Docker capture images resolve Arial/Arial Black through
+   tools/video/fonts-local.conf; macOS resolves the real faces. Each host is
+   internally deterministic, which is what reproducible capture requires. */
+
+.scenario-canvas__viewport {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
+  background: var(--scenario-paper);
+}
+
+.scenario-canvas__surface {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #fff;
+}
+
+.scenario-canvas__message {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  background: rgb(255 255 255 / 88%);
+  color: var(--scenario-graphite);
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.scenario-canvas__message.is-error {
+  flex-direction: column;
+  padding: 24px;
+  color: #991b1b;
+  text-align: center;
+}
+
+.scenario-canvas__message.is-error span {
+  max-width: 34rem;
+  color: #6b7280;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.5;
+  text-transform: none;
+}
+
+.scenario-canvas__loader {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgb(63 63 65 / 20%);
+  border-top-color: var(--scenario-blue);
+  border-radius: 50%;
+  animation: scenario-loader-spin 700ms linear infinite;
+}
+
+.scenario-canvas__poster-play {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 13px;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
+  background: #fff;
+  color: #14181f;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.scenario-canvas__poster-play:hover {
+  border-color: var(--scenario-blue);
+  background: #eff6ff;
+}
+
+/* The Boost meter stands on the replay's right edge rather than docking under
+   it: a 21:9 frame has no vertical band to spare, and a floating meter has to
+   be a closed rectangle instead of borrowing the arena border for its top. */
+.scenario-canvas__boost {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2;
+  /* Anchored to the bottom and kept short: a full-height column of charge
+     reads as a wall down the side of the arena, and the top-right corner is
+     reserved for the replay control. */
+  height: min(52%, 112px);
+  pointer-events: none;
+}
+
+.scenario-canvas__boost .game-boost-hud {
+  opacity: 1;
+  transform: none;
+}
+
+.scenario-canvas__rail {
+  position: relative;
+  display: grid;
+  min-height: 42px;
+  grid-template-columns: 30px auto minmax(64px, 1fr) auto auto 30px;
+  align-items: center;
+  gap: 9px;
+  margin: 10px 0 0;
+  padding: 5px 10px;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.scenario-canvas__transport {
+  display: inline-flex;
+  width: 27px;
+  height: 27px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1.5px solid #14181f;
+  border-radius: 6px;
+  background: #fff;
+  color: #14181f;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.scenario-canvas__transport:hover:not(:disabled) {
+  border-color: var(--scenario-blue);
+  background: #eff6ff;
+}
+
+.scenario-canvas__transport:disabled {
+  border-color: #d1d5db;
+  color: #9ca3af;
+  cursor: default;
+}
+
+.scenario-canvas__transport svg {
+  width: 13px;
+  height: 13px;
+}
+
+.scenario-canvas__time,
+.scenario-canvas__rate {
+  position: relative;
+  z-index: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.035em;
+  white-space: nowrap;
+}
+
+.scenario-canvas__time.is-duration {
+  color: #6b7280;
+}
+
+.scenario-canvas__rate {
+  min-width: 32px;
+  color: #1d4ed8;
+  text-align: right;
+}
+
+.scenario-canvas__scrubber {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.scenario-canvas__scrubber::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--scenario-blue) 0 calc(var(--scenario-progress) * 100%),
+    #e5e7eb calc(var(--scenario-progress) * 100%) 100%
+  );
+}
+
+.scenario-canvas__scrubber::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--scenario-blue) 0 calc(var(--scenario-progress) * 100%),
+    #e5e7eb calc(var(--scenario-progress) * 100%) 100%
+  );
+}
+
+.scenario-canvas__scrubber::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border: 1.5px solid #14181f;
+  border-radius: 50%;
+  appearance: none;
+  background: #fff;
+}
+
+.scenario-canvas__scrubber::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid #14181f;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.scenario-canvas button:focus-visible,
+.scenario-canvas input:focus-visible,
+.scenario-qa button:focus-visible,
+.scenario-qa select:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 44%);
+  outline-offset: 3px;
+}
+
+/* QA replay lab --------------------------------------------------------- */
+.scenario-qa {
+  position: relative;
+  z-index: 50;
+  box-sizing: border-box;
+  min-height: 100svh;
+  padding: clamp(86px, 10vh, 120px) clamp(18px, 5vw, 72px) 64px;
+  background:
+    linear-gradient(rgb(255 255 255 / 96%), rgb(255 255 255 / 96%)),
+    repeating-linear-gradient(90deg, transparent 0 39px, rgb(63 63 65 / 5%) 39px 40px);
+  color: #3f3f41;
+}
+
+.scenario-qa__shell {
+  width: min(100%, 72rem);
+  margin: 0 auto;
+}
+
+.scenario-qa__masthead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 24px;
+  margin-bottom: 24px;
+  padding-bottom: 18px;
+  border-bottom: 2px solid #3f3f41;
+}
+
+.scenario-qa__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: #ef4444;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.scenario-qa__eyebrow::before {
+  width: 20px;
+  height: 3px;
+  background: currentColor;
+  content: "";
+}
+
+.scenario-qa h1 {
+  margin: 0;
+  color: #3f3f41;
+  font-family: Impact, "Arial Black", Arial, sans-serif;
+  font-size: clamp(34px, 6vw, 72px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.025em;
+  line-height: 0.88;
+  text-transform: uppercase;
+}
+
+.scenario-qa__intro {
+  max-width: 36rem;
+  margin: 12px 0 0;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.scenario-qa__status {
+  display: grid;
+  min-width: 138px;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 1.5px solid #14181f;
+  border-radius: 8px;
+  background: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.scenario-qa__status strong {
+  color: #3b82f6;
+}
+
+.scenario-qa__deck {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 13rem;
+  align-items: start;
+  gap: 24px;
+}
+
+.scenario-qa__sidecar {
+  display: grid;
+  gap: 16px;
+}
+
+.scenario-qa__control-group {
+  padding-top: 12px;
+  border-top: 2px solid #3f3f41;
+}
+
+.scenario-qa__control-label {
+  display: block;
+  margin-bottom: 8px;
+  color: #6b7280;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.scenario-qa__scenario-list,
+.scenario-qa__rate-list {
+  display: grid;
+  gap: 6px;
+}
+
+.scenario-qa__rate-list {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.scenario-qa__scenario-button,
+.scenario-qa__rate-button {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 2px solid #d1d5db;
+  border-radius: 0;
+  background: #fff;
+  color: #3f3f41;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1.15;
+  text-align: left;
+  cursor: pointer;
+}
+
+.scenario-qa__rate-button {
+  padding: 7px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-align: center;
+}
+
+.scenario-qa__scenario-button[aria-pressed="true"],
+.scenario-qa__rate-button[aria-pressed="true"] {
+  border-color: #14181f;
+  background: #14181f;
+  color: #fff;
+}
+
+.scenario-qa__fixture-copy {
+  margin: 0;
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.scenario-capture {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  width: 100vw;
+  height: 100dvh;
+  place-items: stretch;
+  overflow: hidden;
+  background: #fff;
+}
+
+.scenario-capture .scenario-canvas,
+.scenario-capture .scenario-canvas__viewport {
+  width: 100%;
+  height: 100%;
+}
+
+.scenario-capture .scenario-canvas__viewport {
+  border: 0;
+  box-shadow: none;
+}
+
+/* Capture keeps the live game's full-width bottom meter, because trailer
+   footage has to look like the product: the live arena docks a horizontal
+   meter under the field, and shrinking it into a side badge would advertise
+   a HUD players do not have. (Build 1 authored `boost_meter: true` and
+   captured no meter at all, because the meter used to sit below the viewport
+   where a full-bleed capture grid pushed it past 100dvh and `overflow:
+   hidden` ate it. It is inside the frame now, so only the axis differs.) */
+.scenario-capture .scenario-canvas {
+  position: relative;
+}
+
+.scenario-capture .scenario-canvas__boost {
+  top: auto;
+  right: 0;
+  bottom: 2.6%;
+  left: 0;
+  width: calc(100% - 40px);
+  height: auto;
+  margin: 0 auto;
+}
+
+@keyframes scenario-loader-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 920px) {
+  .scenario-qa__deck {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-qa__sidecar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .scenario-canvas__rail {
+    grid-template-columns: 27px auto minmax(34px, 1fr) auto 27px;
+    gap: 5px;
+    padding: 4px 6px;
+  }
+
+  .scenario-canvas__rate {
+    display: none;
+  }
+
+  .scenario-canvas__time {
+    font-size: 8px;
+  }
+
+  .scenario-qa {
+    padding: 90px 10px 38px;
+  }
+
+  .scenario-qa__masthead {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-qa__status {
+    width: fit-content;
+  }
+
+  .scenario-qa__sidecar {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scenario-canvas *,
+  .scenario-qa * {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .scenario-canvas__loader {
+    animation: none;
+  }
+}

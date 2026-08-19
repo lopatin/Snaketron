@@ -1,37 +1,17 @@
 import React, { useEffect, useRef } from 'react';
+import {
+  defaultFlowFieldSpacing,
+  drawArenaFlowField,
+} from '../utils/arenaFlowField';
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
-
-const smoothstep = (edgeStart: number, edgeEnd: number, value: number): number => {
-  const progress = clamp((value - edgeStart) / (edgeEnd - edgeStart), 0, 1);
-  return progress * progress * (3 - 2 * progress);
-};
-
-interface Color {
-  red: number;
-  green: number;
-  blue: number;
-}
 
 // Kill switch for the backdrop during gameplay (/play/*), while investigating
 // rendering freezes and input delay. Flip to true to show it there again.
 export const SHOW_BACKDROP_DURING_GAMEPLAY = false;
 
 const FRAME_INTERVAL_MS = 1000 / 6;
-
-const INK: Color = { red: 71, green: 78, blue: 90 };
-const SKY: Color = { red: 91, green: 184, blue: 224 };
-const CORAL: Color = { red: 246, green: 112, blue: 123 };
-
-const mixColor = (from: Color, to: Color, amount: number): Color => ({
-  red: Math.round(from.red + (to.red - from.red) * amount),
-  green: Math.round(from.green + (to.green - from.green) * amount),
-  blue: Math.round(from.blue + (to.blue - from.blue) * amount),
-});
-
-const rgba = (color: Color, alpha: number): string =>
-  `rgba(${color.red}, ${color.green}, ${color.blue}, ${alpha})`;
 
 interface PointerPosition {
   x: number;
@@ -43,107 +23,6 @@ interface PointerPosition {
   isInside: boolean;
   isInitialized: boolean;
 }
-
-interface DrawContext {
-  context: CanvasRenderingContext2D;
-  width: number;
-  height: number;
-  time: number;
-  pointer: PointerPosition;
-  spacing: number;
-}
-
-const getQuietZone = (x: number, y: number, width: number, height: number): number => {
-  const horizontalRadius = width < 720 ? 235 : 340;
-  const verticalRadius = height < 720 ? 250 : 360;
-  const normalizedDistance = Math.hypot(
-    (x - width / 2) / horizontalRadius,
-    (y - height / 2) / verticalRadius,
-  );
-
-  return 0.04 + smoothstep(0.58, 1.18, normalizedDistance) * 0.96;
-};
-
-const getPointerEffect = (
-  x: number,
-  y: number,
-  pointer: PointerPosition,
-  influenceRadius: number,
-): { offsetX: number; offsetY: number; phaseShift: number; intensity: number } => {
-  if (!pointer.isInitialized || pointer.influence < 0.001) {
-    return { offsetX: 0, offsetY: 0, phaseShift: 0, intensity: 0 };
-  }
-
-  const deltaX = x - pointer.x;
-  const deltaY = y - pointer.y;
-  const distance = Math.hypot(deltaX, deltaY);
-  const safeDistance = Math.max(distance, 1);
-  const gaussianFalloff = Math.exp(
-    -(distance * distance) / (2 * influenceRadius * influenceRadius),
-  );
-  const intensity = pointer.influence * gaussianFalloff;
-  const tangentialDrift = Math.min(distance / influenceRadius, 1.4) * intensity * 2.1;
-
-  return {
-    offsetX: (-deltaY / safeDistance) * tangentialDrift,
-    offsetY: (deltaX / safeDistance) * tangentialDrift,
-    phaseShift: intensity * 0.28,
-    intensity,
-  };
-};
-
-const drawDot = (
-  context: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  radius: number,
-  color: Color,
-  alpha: number,
-): void => {
-  context.beginPath();
-  context.arc(x, y, radius, 0, Math.PI * 2);
-  context.fillStyle = rgba(color, alpha);
-  context.fill();
-};
-
-const drawFlowField = ({
-  context,
-  width,
-  height,
-  time,
-  pointer,
-  spacing,
-}: DrawContext): void => {
-  const pointerInfluenceRadius = clamp(Math.min(width, height) * 0.42, 260, 380);
-
-  for (let y = spacing / 2; y < height; y += spacing) {
-    for (let x = spacing / 2; x < width; x += spacing) {
-      const pointerEffect = getPointerEffect(x, y, pointer, pointerInfluenceRadius);
-      const diagonalPhase =
-        x * 0.009 + y * 0.006 - time * 0.52 + pointerEffect.phaseShift;
-      const crossPhase =
-        x * 0.003 - y * 0.011 + time * 0.28 - pointerEffect.phaseShift * 0.55;
-      const wave = Math.sin(diagonalPhase) * 0.68 + Math.cos(crossPhase) * 0.32;
-      const waveBand = Math.pow(clamp(0.5 + wave * 0.5, 0, 1), 2);
-      const quietZone = getQuietZone(x, y, width, height);
-      const colorBias = clamp((x / width + (1 - y / height)) / 2, 0, 1);
-      const accent = colorBias > 0.52 ? CORAL : SKY;
-      const accentStrength = 0.32 + waveBand * 0.4 + pointerEffect.intensity * 0.09;
-      const color = mixColor(INK, accent, accentStrength);
-      const alpha = (0.15 + waveBand * 0.38 + pointerEffect.intensity * 0.085) * quietZone;
-      const radius = 0.68 + waveBand * 0.64 + pointerEffect.intensity * 0.22;
-
-      drawDot(
-        context,
-        x + Math.cos(crossPhase) * 1.8 + pointerEffect.offsetX,
-        y + wave * 3.6 + pointerEffect.offsetY,
-        radius,
-        color,
-        alpha,
-      );
-    }
-  }
-};
 
 export const ArenaBackdrop: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -208,13 +87,13 @@ export const ArenaBackdrop: React.FC = () => {
 
       context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
       context.clearRect(0, 0, width, height);
-      drawFlowField({
+      drawArenaFlowField({
         context,
         width,
         height,
         time: reducedMotion ? 0 : timestamp / 1000,
         pointer,
-        spacing: width < 700 ? 20 : 23,
+        spacing: defaultFlowFieldSpacing(width),
       });
 
       if (!reducedMotion) {

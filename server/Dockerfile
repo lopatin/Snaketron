@@ -18,6 +18,7 @@ COPY macros ./macros
 COPY common ./common
 COPY server ./server
 COPY client ./client
+COPY skin-schema ./skin-schema
 COPY terminal ./terminal
 COPY bot ./bot
 COPY loadtest ./loadtest

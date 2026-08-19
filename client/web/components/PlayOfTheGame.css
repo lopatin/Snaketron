@@ -1,0 +1,553 @@
+/* The replay band keeps exactly two pieces of broadcast styling — the title
+   plate and the lower third — because they read as a sports replay caption.
+   Everything else (controls, sponsor slot, poster) uses the same quiet
+   black-on-white chrome as the rest of the results card. */
+.potg-band {
+  --potg-ink: #20232a;
+  --potg-blue: #3b82f6;
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  /* The negative margin swallows the rating panel's own hairline so the two
+     rules do not stack into a double line. */
+  margin-top: -1px;
+  border-top: 1px solid #14181f;
+  border-bottom: 1px solid #14181f;
+  background: #eef2f7;
+  color: #fff;
+  isolation: isolate;
+}
+
+/* Reads as a recess in the card rather than a slab bolted onto it: a hairline
+   on each edge plus a short shadow falling inward from both. It has to ride
+   above the arena — an inset shadow on the band itself paints under its own
+   children, so the canvas would cover it. */
+.potg-band::after {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  box-shadow:
+    inset 0 3px 0 rgb(0 0 0 / 20%),
+    inset 0 -2px 0 rgb(0 0 0 / 20%);
+  content: "";
+  pointer-events: none;
+}
+
+.potg-canvas .scenario-canvas__viewport {
+  border: 0;
+  background: #eef2f7;
+  box-shadow: none;
+}
+
+.potg-kicker {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  background: var(--potg-ink);
+  color: #fff;
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: 0.115em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+/* ---------------------------------------------------------------------------
+   Mount sequence. The band slides in behind a cover; the title reads over it;
+   the star plate arrives large in the same spot, holds, then travels to its
+   resting corner while the cover clears the arena. Each duration here mirrors
+   a constant in PlayOfTheGame.tsx.
+   --------------------------------------------------------------------------- */
+/* The panel opens by growing its own row, so the statline, the roster and the
+   card's own height are displaced over the same 480ms rather than jumping to
+   the final layout while something fades into the space. Sharp off the mark,
+   long settle.
+   `0fr -> 1fr` is what makes this animatable at all: the panel's height comes
+   from a 21:9 canvas, so there is no pixel value to animate to. The resting
+   state is the open one, which is what lets reduced motion simply switch the
+   animation off.
+   Whichever fills the slot — the replay or the sponsor — opens the same way;
+   appearing without the growth reads as the card mis-laying itself out rather
+   than as something being presented. */
+.potg-slot {
+  display: grid;
+  grid-template-rows: 1fr;
+  /* Leading but legible: ~90% of the height inside 250ms. The sharper curve
+     this replaced put 90% of it in 69ms, which is fast enough that the card
+     simply appeared taller — the push was there but nobody could see it. */
+  animation: potg-slot-open 560ms cubic-bezier(0.34, 0.68, 0.3, 1) both;
+}
+
+/* Both fills are named rather than using `> *`: the sponsor slot sets its own
+   min-height, and at equal specificity that would win and stop the row
+   collapsing — it would open from 94px instead of from nothing. */
+.potg-slot > .potg-band,
+.potg-slot > .potg-sponsor {
+  min-height: 0;
+}
+
+@keyframes potg-slot-open {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
+
+/* Veils the arena rather than replacing it, so the field is legible behind
+   the title and the reveal is a lift rather than a cut. 84% with a light blur
+   is the same treatment the in-arena overlays use (the idle board, the touch
+   d-pad), which is why it reads as part of the game and not as a modal. */
+.potg-cover {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: rgb(238 242 247 / 84%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 560ms ease;
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+.potg-band[data-intro="title"] .potg-cover,
+.potg-band[data-intro="star"] .potg-cover {
+  opacity: 1;
+  transition: none;
+}
+
+/* The card's own headline voice — the same italic 950 uppercase as VICTORY
+   and the star plate — with VICTORY's stepped shadow inverted to white, so
+   dark type still separates from the pale arena behind the veil. */
+.potg-title {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 5;
+  color: #14181f;
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: clamp(15px, 3.6vw, 28px);
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  text-align: center;
+  text-shadow:
+    2px 2px 0 rgb(255 255 255 / 92%),
+    4px 4px 0 rgb(255 255 255 / 62%);
+  text-transform: uppercase;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  transition: opacity 220ms ease;
+}
+
+.potg-band[data-intro="title"] .potg-title {
+  opacity: 1;
+  transition: opacity 300ms ease;
+}
+
+/* The replay control belongs to the settled state; during the intro it would
+   be a live button floating over a cover. */
+.potg-band[data-intro="title"] .potg-replay,
+.potg-band[data-intro="star"] .potg-replay,
+.potg-band[data-intro="travelling"] .potg-replay {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.potg-band[data-intro="idle"] .potg-lower-third,
+.potg-band[data-intro="title"] .potg-lower-third {
+  opacity: 0;
+}
+
+.potg-band[data-intro="star"] .potg-star,
+.potg-band[data-intro="travelling"] .potg-star {
+  z-index: 6;
+}
+
+.potg-band[data-intro="star"] .potg-star {
+  animation: potg-star-in 260ms ease both;
+}
+
+@keyframes potg-star-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.potg-band[data-intro="travelling"] .potg-star {
+  transition: transform 560ms cubic-bezier(0.22, 0.61, 0.24, 1);
+}
+
+/* Matches the results card's own close control, deliberately: it is the same
+   kind of thing (a small floating affordance over a panel) and inventing a
+   second visual language for it is what made this band feel foreign. */
+.potg-replay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+  display: flex;
+  width: 27px;
+  height: 27px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1.5px solid #14181f;
+  border-radius: 6px;
+  background: #fff;
+  color: #14181f;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.potg-replay svg {
+  width: 14px;
+  height: 14px;
+}
+
+.potg-replay:hover:not(:disabled) {
+  border-color: var(--potg-blue);
+  background: #eff6ff;
+}
+
+.potg-replay:disabled {
+  border-color: #d1d5db;
+  color: #9ca3af;
+  cursor: default;
+}
+
+.potg-replay:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 2px;
+}
+
+/* Hugs its content instead of spanning the frame: a full-width strip covers
+   whatever sits in the opposite corner (the player's own poster play button)
+   even when it is drawing nothing there. The cap keeps a long name clear of
+   the Boost rail on the right. */
+.potg-lower-third {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  z-index: 3;
+  display: flex;
+  max-width: calc(100% - 58px);
+  min-width: 0;
+  align-items: stretch;
+  pointer-events: none;
+}
+
+/* The one piece of broadcast styling left in the band. It is also the element
+   the intro flies in: its resting position here is where the journey ends. */
+.potg-star {
+  position: relative;
+  display: flex;
+  max-width: 100%;
+  min-height: 34px;
+  align-items: center;
+  overflow: visible;
+  padding: 0 12px;
+  background: var(--potg-blue);
+  color: #fff;
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 13px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: 0.045em;
+  line-height: 1;
+  pointer-events: auto;
+  /* VICTORY's stepped shadow, pulled a pixel tighter and much lighter: at
+     plate size the full-strength version reads as a second, blurred word. */
+  text-shadow:
+    1px 1px 0 rgb(20 24 31 / 10%),
+    3px 3px 0 rgb(20 24 31 / 10%);
+  text-transform: uppercase;
+  white-space: nowrap;
+  transform: skewX(-7deg);
+}
+
+.potg-star__rank {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 19px;
+  margin-right: 8px;
+  transform: skewX(7deg);
+}
+
+.potg-star__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: skewX(7deg);
+}
+
+/* Flat, semi-transparent, and only on demand: the achievement is the detail
+   behind the name, not a second permanent plate across the arena. */
+.potg-star__reason {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  padding: 6px 9px;
+  background: rgb(20 24 31 / 82%);
+  color: #fff;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1.2;
+  opacity: 0;
+  pointer-events: none;
+  /* The plate around it is uppercase; this is prose, so it opts out. */
+  text-transform: none;
+  transform: skewX(7deg) translateY(3px);
+  transition: opacity 140ms ease, transform 140ms ease;
+  white-space: nowrap;
+}
+
+.potg-star:hover .potg-star__reason,
+.potg-star:focus-visible .potg-star__reason {
+  opacity: 1;
+  transform: skewX(7deg) translateY(0);
+}
+
+.potg-star:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 44%);
+  outline-offset: 3px;
+}
+
+.potg-band.is-poster {
+  aspect-ratio: 21 / 9;
+}
+
+.potg-band.is-poster {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom-color: var(--potg-ink);
+  background: var(--potg-ink);
+}
+
+.potg-poster__grid {
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(90deg, transparent 0 44px, rgb(255 255 255 / 5%) 44px 45px),
+    repeating-linear-gradient(0deg, transparent 0 44px, rgb(255 255 255 / 5%) 44px 45px);
+}
+
+.potg-band.is-poster > .potg-kicker {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  border: 1px solid rgb(255 255 255 / 52%);
+}
+
+.potg-poster__logo {
+  position: absolute;
+  top: 50%;
+  left: 11%;
+  width: 27%;
+  max-height: 34%;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  opacity: 0.86;
+  transform: translateY(-50%);
+}
+
+.potg-poster__caption {
+  position: absolute;
+  right: 9%;
+  bottom: 17%;
+  display: flex;
+  max-width: 48%;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.potg-poster__caption strong {
+  display: flex;
+  align-items: center;
+  color: #fff;
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: clamp(14px, 4vw, 23px);
+  font-style: italic;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.potg-poster__caption .potg-star__rank {
+  width: 22px;
+  height: 22px;
+  flex-basis: 22px;
+  margin-right: 10px;
+  transform: none;
+}
+
+.potg-poster__caption span,
+.potg-poster__caption small {
+  font-size: 8px;
+  font-weight: 850;
+  letter-spacing: 0.07em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.potg-poster__caption small {
+  color: rgb(255 255 255 / 52%);
+  font-size: 7px;
+}
+
+.potg-sponsor {
+  --potg-ink: #20232a;
+  position: relative;
+  display: grid;
+  min-height: 94px;
+  place-items: center;
+  overflow: hidden;
+  border-bottom: 1px solid #d8dbe0;
+  background: #f7f8fa;
+}
+
+.potg-sponsor__label {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  z-index: 2;
+  padding: 2px 5px;
+  border: 1px solid rgb(63 63 65 / 24%);
+  background: #fff;
+  color: rgb(63 63 65 / 58%);
+  font-size: 6px;
+  font-weight: 900;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.potg-sponsor__sdk {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  min-height: 90px;
+}
+
+.potg-sponsor__fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: var(--potg-ink);
+}
+
+.potg-sponsor__fallback strong {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.potg-sponsor__fallback small {
+  color: rgb(63 63 65 / 55%);
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.potg-sponsor.has-live-banner .potg-sponsor__fallback {
+  display: none;
+}
+
+@media (max-width: 420px) {
+  .potg-kicker {
+    min-height: 18px;
+    padding: 0 6px;
+    font-size: 6.5px;
+  }
+
+  .potg-lower-third {
+    right: 7px;
+    bottom: 7px;
+    left: 7px;
+  }
+
+  .potg-star {
+    min-height: 27px;
+    padding: 0 8px;
+    font-size: 10px;
+  }
+
+  .potg-star__rank {
+    width: 15px;
+    height: 15px;
+    flex-basis: 15px;
+    margin-right: 6px;
+  }
+
+  .potg-replay {
+    width: 24px;
+    height: 24px;
+  }
+
+  .potg-sponsor {
+    min-height: 82px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Autoplay (and therefore the intro) never runs under reduced motion, but
+     pin the resting state anyway so a mid-flight preference change cannot
+     leave the title parked at the centre of the band. The slot's resting
+     state is the open one, so switching its animation off simply presents
+     the panel at full height. */
+  .potg-band,
+  .potg-slot {
+    animation: none;
+  }
+
+  .potg-star {
+    transition: none;
+    transform: skewX(-7deg) !important;
+  }
+
+  .potg-cover,
+  .potg-title {
+    display: none;
+  }
+
+  /* Opacity only. The caption strip spans the width of the frame and must
+     stay pointer-transparent — only the star plate inside it is interactive —
+     or it covers the player's own poster play button. */
+  .potg-band[data-intro] .potg-lower-third,
+  .potg-band[data-intro] .potg-replay {
+    animation: none;
+    opacity: 1;
+  }
+
+  .potg-band[data-intro] .potg-replay {
+    pointer-events: auto;
+  }
+}
+
+@media (forced-colors: active) {
+  .potg-band,
+  .potg-sponsor {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+}

@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SnakeTron Leaderboard Capture Fixture</title>
+  <!--
+    Mirrors the app's real panel language (client/web/index.css): paper ground,
+    hairline rules, 6-7px radii, soft elevation, upright Arial Black headlines.
+    See references/brand.md. Prefer mounting real leaderboard rows where a dev
+    server is available; this fixture is the no-server fallback.
+  -->
+  <style>
+    :root {
+      --game-paper: #ffffff;
+      --game-blue: #3b82f6;
+      --game-red: #ef4444;
+      --game-rule: #d1d5db;
+      --game-muted: #667085;
+      --game-boost: #f8c84a;
+      --game-ink: #14181f;
+      --nos-orange: #ff641e;
+      --display: "Arial Black", Arial, Helvetica, sans-serif;
+      --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      display: grid;
+      place-items: center;
+      background-color: var(--game-paper);
+      background-image: radial-gradient(circle, var(--game-rule) 1px, transparent 1px);
+      background-size: 26px 26px;
+      color: var(--game-ink);
+      font-family: var(--ui);
+    }
+    .card {
+      width: min(74vw, 1260px);
+      border: 1px solid rgb(63 63 65 / 52%);
+      border-radius: 7px;
+      background: var(--game-paper);
+      box-shadow: 0 18px 48px rgb(31 41 55 / 22%);
+      overflow: hidden;
+    }
+    header {
+      display: flex; align-items: flex-end; justify-content: space-between; gap: 32px;
+      padding: 44px 56px 26px;
+      border-bottom: 1.5px solid var(--game-ink);
+    }
+    h1 {
+      margin: 0; white-space: nowrap;
+      font-family: var(--display);
+      font-size: clamp(52px, 5.6vw, 104px);
+      font-weight: 900; line-height: .9;
+      letter-spacing: -.01em; text-transform: uppercase;
+      color: var(--game-ink);
+    }
+    header span {
+      flex: 0 0 auto; padding-bottom: 6px; white-space: nowrap;
+      color: var(--game-muted);
+      font-size: clamp(18px, 1.5vw, 26px); font-weight: 700;
+      letter-spacing: .16em; text-transform: uppercase;
+    }
+    ol { list-style: none; margin: 0; padding: 12px 24px 30px; display: grid; }
+    li {
+      display: grid; grid-template-columns: 92px 1fr 200px;
+      align-items: center; min-height: 88px;
+      padding: 12px 30px;
+      border-bottom: 1px solid var(--game-rule);
+      border-left: 3px solid transparent;
+      border-radius: 6px;
+      opacity: var(--opacity, 0);
+      transform: translateX(var(--x, 28px));
+    }
+    li:last-child { border-bottom: 0; }
+    li:nth-child(1) { border-left-color: var(--game-boost); background: #eff6ff; }
+    li:nth-child(2) { border-left-color: var(--game-blue); }
+    li:nth-child(3) { border-left-color: var(--game-red); }
+    .place {
+      color: var(--game-ink);
+      font-family: var(--display); font-size: 42px; font-weight: 900;
+    }
+    li:nth-child(1) .place { color: var(--game-ink); }
+    .name {
+      font-family: var(--display); font-size: 40px; font-weight: 900;
+      text-transform: uppercase; color: var(--game-ink);
+    }
+    .score {
+      text-align: right;
+      font-family: var(--display); font-size: 40px; font-weight: 900;
+      color: var(--game-ink);
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <header><h1>Global</h1><span>Season 1</span></header>
+    <!-- SAMPLE DATA — these rows are placeholders. Substitute real
+     anonymized ladder data (or clearly-labelled fiction) via the
+     ?player= / ?score= params before publishing. See PRD P3.8. -->
+    <ol id="leaders" data-sample="true">
+      <li><span class="place">01</span><span class="name">GridRider</span><span class="score">2,184</span></li>
+      <li><span class="place">02</span><span class="name" id="player">SnakeByte</span><span class="score" id="score">2,132</span></li>
+      <li><span class="place">03</span><span class="name">ApexLoop</span><span class="score">2,087</span></li>
+      <li><span class="place">04</span><span class="name">NeonFang</span><span class="score">2,041</span></li>
+    </ol>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    if (params.has("player")) document.getElementById("player").textContent = params.get("player");
+    if (params.has("score")) document.getElementById("score").textContent = params.get("score");
+    let elapsed = 0;
+    const rows = [...document.querySelectorAll("li")];
+    const render = () => rows.forEach((row, i) => {
+      const p = Math.max(0, Math.min(1, (elapsed - i * 110) / 520));
+      const eased = 1 - Math.pow(1 - p, 3);
+      row.style.setProperty("--opacity", String(eased));
+      row.style.setProperty("--x", `${28 * (1 - eased)}px`);
+    });
+    render();
+    const api = {
+      ready: async () => { await document.fonts.ready; render(); },
+      durationMs: () => 4000,
+      stepMs: async (ms) => { elapsed += Number(ms); render(); },
+      renderedTick: () => Math.round(elapsed),
+      cueTrack: () => ({ anchors: { rows: 0.85, crown: 1.5 }, duration: 4, capture_vfps: 60, encoded_fps: 60 })
+    };
+    window.__SNAKETRON_CAPTURE__ = api;
+    window.__snaketronCapture = api;
+  </script>
+</body>
+</html>

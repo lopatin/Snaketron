@@ -269,6 +269,7 @@ mod tests {
                     boost_active: false,
                     anim_ms,
                     reduced_motion,
+                    detail_scale: 1.0,
                 },
                 &identity,
             )

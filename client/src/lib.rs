@@ -1,4 +1,5 @@
 mod render;
+mod scenario;
 mod skin;
 mod tutorial;
 
@@ -391,7 +392,8 @@ impl GameClient {
     /// Render the engine's current predicted state directly to a canvas — no
     /// JSON round-trip. `draw_celebration` is invoked after the field and pickups
     /// but before snakes, so JavaScript-owned cosmetic effects can share this
-    /// canvas without covering gameplay actors.
+    /// canvas without covering gameplay actors; `draw_post_snakes` runs above the
+    /// completed arena frame for impacts such as explosions.
     ///
     /// `anim_ms` is the caller's presentation clock (the animation-frame
     /// timestamp in the arena), which animated skins paint from. It is
@@ -411,6 +413,7 @@ impl GameClient {
         reduced_motion: bool,
         local_skin_ref: Option<String>,
         draw_celebration: &js_sys::Function,
+        draw_post_snakes: &js_sys::Function,
     ) -> Result<(), JsValue> {
         render::render_game_state(
             self.render_state(),
@@ -424,6 +427,7 @@ impl GameClient {
                 local_skin_ref: local_skin_ref.as_deref(),
             },
             draw_celebration,
+            draw_post_snakes,
         )
     }
 }

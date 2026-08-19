@@ -1,0 +1,21 @@
+rank,game_id,causal_clarity,visible_skill,fair_credit,clip_integrity,proud_to_show,verdict,rejection_codes,reviewer,notes
+1,8000148,true,true,true,true,true,deserved,,Codex visual QA A,Two visible rapid eliminations; one clean win and one mutual trade.
+2,8000001,true,true,true,true,true,deserved,,Codex visual QA A,Seven-pickup chain into a visible +16 bank.
+3,8000118,true,true,true,true,true,deserved,,Codex visual QA A,Complete +7 and +13 banks with six-pickup chain.
+4,8000103,true,true,true,true,true,deserved,,Codex visual QA A,Complete +7 and +13 banks through traffic.
+5,8000123,true,false,false,true,false,rejected,ORDINARY_PLAY|MISATTRIBUTED,Codex visual QA A,Two repeated mutual trades fail skill and fairness.
+6,8000064,true,true,true,true,true,deserved,,Codex visual QA A,Six-pickup boosted chain into a +13 bank.
+7,8000150,true,true,true,true,true,deserved,,Codex visual QA A,Visible boosted body cutoff with survival.
+8,8000151,true,true,true,true,true,deserved,,Codex visual QA B,Complete boosted combo 1-5 into a +10 bank.
+9,8000022,true,true,true,false,false,rejected,CLIP_MISSING_FACT,Codex visual QA B,First seven captioned points were acquired before the clip.
+10,8000065,true,true,true,true,true,deserved,,Codex visual QA B,Visible perpendicular intercept and survival.
+11,8000072,true,true,true,true,true,deserved,,Codex visual QA B,Complete boosted combo 1-5 into a +10 bank.
+12,8000099,true,false,true,true,false,rejected,ORDINARY_PLAY,Codex visual QA B,Readable but routine collision without a visible maneuver.
+13,8000003,true,true,true,true,true,deserved,,Codex visual QA B,Complete combo 1-6 into a +14 bank.
+14,8000052,true,true,true,true,true,deserved,,Codex visual QA B,Readable last-second body cutoff and survival.
+15,8000152,true,true,true,true,true,deserved,,Codex visual QA C,Complete +7 and +10 banks with a five-pickup chain.
+16,8000082,true,true,true,true,true,deserved,,Codex visual QA C,Visible L-shaped body trap followed by a +4 bank.
+17,8000121,true,true,true,true,true,deserved,,Codex visual QA C,Visible head-to-head win amid combo and bank setup.
+18,8000191,true,true,true,true,true,deserved,,Codex visual QA C,Boosted chain 3-5 converted into a +10 bank.
+19,8000199,false,false,true,true,false,rejected,UNCLEAR_CAUSE|ORDINARY_PLAY,Codex visual QA C,Parallel approach makes the decisive maneuver unclear and ordinary.
+20,8000047,true,true,true,true,true,deserved,,Codex visual QA C,Complete combo 1-5 converted into a +10 bank.
