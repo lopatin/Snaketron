@@ -72,6 +72,13 @@ pub enum TexturesApiError {
     NotFound,
     GuestNotAllowed,
     Disabled,
+    /// The row exists and its pixels are unreachable.
+    ///
+    /// Distinct from `Disabled`, whose message is about *making* a texture:
+    /// a deployment that stores no textures still serves the rest of the API,
+    /// and "generation is unavailable" would send the reader looking in
+    /// entirely the wrong place.
+    StorageUnavailable,
     /// The image, or the request, is not what it claims to be.
     Invalid(Vec<String>),
     Internal(anyhow::Error),
@@ -88,6 +95,10 @@ impl IntoResponse for TexturesApiError {
             Self::Disabled => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Texture generation is not available right now".to_string(),
+            ),
+            Self::StorageUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Texture storage is not available right now".to_string(),
             ),
             Self::Invalid(problems) => (StatusCode::BAD_REQUEST, problems.join("; ")),
             Self::Internal(error) => {
@@ -259,6 +270,161 @@ pub async fn get_manifest(
     Ok(response)
 }
 
+/// The one database call the byte route needs.
+///
+/// Narrow on purpose, the way `ReplayGameReader` is: a route that serves public
+/// bytes should be testable without a database, and a trait with one method is
+/// what makes that a two-line fake rather than a mock of the whole schema.
+#[async_trait::async_trait]
+pub trait TextureCatalog: Send + Sync {
+    async fn get_texture_by_ref(
+        &self,
+        content_ref: &str,
+    ) -> anyhow::Result<Option<texture::Texture>>;
+}
+
+struct DatabaseTextureCatalog {
+    db: std::sync::Arc<dyn crate::db::Database>,
+}
+
+#[async_trait::async_trait]
+impl TextureCatalog for DatabaseTextureCatalog {
+    async fn get_texture_by_ref(
+        &self,
+        content_ref: &str,
+    ) -> anyhow::Result<Option<texture::Texture>> {
+        self.db.get_texture_by_ref(content_ref).await
+    }
+}
+
+/// What the byte route needs, which is deliberately not `AuthState`.
+///
+/// Adding a field to `AuthState` would break two integration-test binaries
+/// that construct it by hand, for a route that wants none of what it carries.
+/// Its own state merged in as a `Router<AuthState>` is the pattern the replay
+/// routes already established.
+#[derive(Clone)]
+pub struct TextureBytesState {
+    catalog: std::sync::Arc<dyn TextureCatalog>,
+    store: Option<std::sync::Arc<dyn crate::texture_store::TextureStore>>,
+}
+
+/// Serve the pixels of one variant.
+///
+/// Anonymous, like the skin-document route: these are the bytes a spectator's
+/// client needs to render somebody else's snake, and gating them behind a
+/// session would mean a match could not draw its own players.
+///
+/// Cached for a year and `immutable`, which is safe for exactly the reason the
+/// store gives for the same header on the S3 object: **the key is the hash of
+/// the bytes**, so this URL can never mean anything else. Moderation does not
+/// reach players through this route and does not need to — it reaches them
+/// through the 300-second document route, which stops handing out the
+/// reference at all.
+pub async fn get_variant_bytes(
+    State(state): State<TextureBytesState>,
+    Path((content_ref, variant)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, TexturesApiError> {
+    // Shape first, before the database is touched: a malformed reference is a
+    // 404 rather than a lookup, the same posture the document route takes.
+    if !skin_schema::content::is_content_ref(&content_ref) {
+        return Err(TexturesApiError::NotFound);
+    }
+    let Some(texels_per_cell) = parse_variant_segment(&variant) else {
+        return Err(TexturesApiError::NotFound);
+    };
+
+    let texture = state
+        .catalog
+        .get_texture_by_ref(&content_ref)
+        .await
+        .map_err(TexturesApiError::Internal)?
+        .ok_or(TexturesApiError::NotFound)?;
+
+    // Exact rung only. A nearest-match fallback would let one URL serve
+    // different pixel dimensions as the ladder changed, and a compiled skin's
+    // atlas region carries the width and height of the rung it *asked* for.
+    let entry = texture
+        .variants
+        .iter()
+        .find(|entry| entry.texels_per_cell == texels_per_cell)
+        .ok_or(TexturesApiError::NotFound)?;
+
+    // The digest is the strongest possible validator, so the revalidation is
+    // free and settles before any object storage is touched.
+    let etag = format!("\"{}\"", entry.sha256);
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == etag)
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        apply_immutable_headers(&mut response, &etag);
+        return Ok(response);
+    }
+
+    // Metadata without storage: the row is real and the pixels are unreachable,
+    // which is a deployment state rather than a missing texture.
+    let Some(store) = &state.store else {
+        return Err(TexturesApiError::StorageUnavailable);
+    };
+    let bytes = store
+        .get(&entry.sha256)
+        .await
+        .map_err(|error| {
+            error!(%content_ref, texels_per_cell, ?error, "failed to read texture bytes");
+            TexturesApiError::StorageUnavailable
+        })?
+        .ok_or(TexturesApiError::NotFound)?;
+
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    apply_immutable_headers(&mut response, &etag);
+    Ok(response)
+}
+
+/// `"32.png"` names the 32-texel rung. Anything else names nothing.
+fn parse_variant_segment(segment: &str) -> Option<u32> {
+    let stem = segment.strip_suffix(".png")?;
+    // Bounded before parsing so a very long digit string is refused on its
+    // shape rather than on overflow.
+    if stem.is_empty() || stem.len() > 4 || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    stem.parse().ok().filter(|texels| *texels > 0)
+}
+
+fn apply_immutable_headers(response: &mut Response, etag: &str) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+}
+
+/// The byte route, with its own state, ready to merge into the API router.
+pub fn build_texture_byte_routes(
+    db: std::sync::Arc<dyn crate::db::Database>,
+    store: Option<std::sync::Arc<dyn crate::texture_store::TextureStore>>,
+) -> axum::Router<crate::api::auth::AuthState> {
+    texture_byte_route_template().with_state::<crate::api::auth::AuthState>(TextureBytesState {
+        catalog: std::sync::Arc::new(DatabaseTextureCatalog { db }),
+        store,
+    })
+}
+
+fn texture_byte_route_template() -> axum::Router<TextureBytesState> {
+    axum::Router::new().route(
+        "/api/textures/by-ref/:content_ref/:variant",
+        axum::routing::get(get_variant_bytes),
+    )
+}
+
 fn no_store(response: &mut Response) {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -269,6 +435,161 @@ fn no_store(response: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rung is named exactly, or not at all.
+    ///
+    /// No nearest-match fallback: one URL has to mean one set of pixels
+    /// forever, because a compiled skin's atlas region carries the width and
+    /// height of the rung it *asked* for. A fuzzy match would let the same URL
+    /// start serving different dimensions as the ladder changed.
+    #[test]
+    fn a_variant_segment_names_one_rung_or_nothing() {
+        assert_eq!(parse_variant_segment("32.png"), Some(32));
+        assert_eq!(parse_variant_segment("8.png"), Some(8));
+
+        for segment in [
+            "32",        // no extension
+            "32.jpg",    // not our format
+            "0.png",     // a rung of nothing
+            "-8.png",    // not a count
+            "3.5.png",   // not an integer
+            "99999.png", // past any ladder, refused on shape
+            "../secret.png",
+            ".png",
+            "",
+        ] {
+            assert_eq!(
+                parse_variant_segment(segment),
+                None,
+                "`{segment}` should name nothing"
+            );
+        }
+    }
+
+    /// The route serves bytes, revalidates for free, and stays quiet about
+    /// what it does not have.
+    #[tokio::test]
+    async fn the_byte_route_serves_verifies_and_refuses() {
+        use crate::texture::{SeamReport, Texture, TextureVariant};
+        use crate::texture_store::{InMemoryTextureStore, TextureObject, TextureStore, digest};
+        use axum::http::HeaderMap;
+
+        let pixels = b"a rung's worth of pixels".to_vec();
+        let sha = digest(&pixels);
+        let store = InMemoryTextureStore::default();
+        store
+            .put(
+                &TextureObject {
+                    sha256: sha.clone(),
+                    content_type: "image/png",
+                    byte_len: pixels.len(),
+                },
+                &pixels,
+            )
+            .await
+            .expect("stored");
+
+        let content_ref = format!("sha256:{}", "c".repeat(64));
+        struct OneTexture(Texture);
+        #[async_trait::async_trait]
+        impl TextureCatalog for OneTexture {
+            async fn get_texture_by_ref(&self, reference: &str) -> anyhow::Result<Option<Texture>> {
+                Ok((reference == self.0.content_ref).then(|| self.0.clone()))
+            }
+        }
+
+        let state = TextureBytesState {
+            catalog: std::sync::Arc::new(OneTexture(Texture {
+                texture_id: 1,
+                owner_user_id: 7,
+                content_ref: content_ref.clone(),
+                kind: TextureKind::Coat,
+                width_px: 768,
+                height_px: 64,
+                repeat_cells: Some(12.0),
+                rows: None,
+                seams: SeamReport {
+                    horizontal_ratio: 0.8,
+                    vertical_ratio: 0.8,
+                    repaired: false,
+                },
+                last_prompt: None,
+                variants: vec![TextureVariant {
+                    texels_per_cell: 32,
+                    width_px: 384,
+                    height_px: 32,
+                    bytes: pixels.len() as u32,
+                    sha256: sha.clone(),
+                }],
+                created_at_ms: 0,
+            })),
+            store: Some(std::sync::Arc::new(store)),
+        };
+
+        let fetch = |variant: &str, headers: HeaderMap, reference: String| {
+            let state = state.clone();
+            let variant = variant.to_string();
+            async move { get_variant_bytes(State(state), Path((reference, variant)), headers).await }
+        };
+
+        // The rung that exists comes back with the digest as its validator and
+        // a year of immutable caching — safe precisely because the key *is*
+        // the hash, so this URL can never mean anything else.
+        let response = fetch("32.png", HeaderMap::new(), content_ref.clone())
+            .await
+            .expect("the rung exists");
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .expect("a validator")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+        assert_eq!(etag, format!("\"{sha}\""));
+        assert!(
+            response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("immutable")
+        );
+
+        // Revalidation settles before object storage is touched.
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag.parse().expect("valid"));
+        let response = fetch("32.png", conditional, content_ref.clone())
+            .await
+            .expect("revalidates");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        // A rung the ladder does not carry, and a reference nobody minted,
+        // are both simply absent — uniform, so neither confirms the other.
+        for (variant, reference) in [
+            ("16.png", content_ref.clone()),
+            ("32.png", format!("sha256:{}", "d".repeat(64))),
+            ("32.png", "not-a-reference".to_string()),
+        ] {
+            let error = fetch(variant, HeaderMap::new(), reference)
+                .await
+                .expect_err("absent");
+            assert!(matches!(error, TexturesApiError::NotFound));
+        }
+
+        // Metadata without storage is a deployment state, not a missing
+        // texture, and says so with its own message.
+        let stateless = TextureBytesState {
+            store: None,
+            ..state.clone()
+        };
+        let error = get_variant_bytes(
+            State(stateless),
+            Path((content_ref, "32.png".to_string())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("no storage configured");
+        assert!(matches!(error, TexturesApiError::StorageUnavailable));
+    }
 
     /// Generated sizes have to be shapes the validator accepts, or every
     /// generation is thrown away after it has been paid for.

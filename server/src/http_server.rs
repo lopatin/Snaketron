@@ -186,6 +186,10 @@ pub struct HttpServerState {
     /// Verified cache-aside access to durable completed-game recordings.
     /// Absent only when replay object storage is intentionally not configured.
     pub replay_repository: Option<Arc<ReplayRepository>>,
+    /// Where generated texture pixels live. Absent when this deployment
+    /// stores no textures, which serves 503 rather than 404 — the row exists
+    /// and its bytes are unreachable, which is a deployment state.
+    pub texture_store: Option<Arc<dyn crate::texture_store::TextureStore>>,
     /// Process lifecycle used for truthful readiness and planned drain.
     pub lifecycle: TaskLifecycle,
     /// Region-scoped authoritative recovery namespace.
@@ -222,6 +226,13 @@ pub async fn install_http_application(
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
+    // First caller of `texture_store::from_env`, which has existed since the
+    // generation pipeline landed and had nothing to construct it: the bytes
+    // were stored and served by nothing.
+    let texture_store: Option<Arc<dyn crate::texture_store::TextureStore>> =
+        crate::texture_store::from_env()
+            .await?
+            .map(|store| Arc::new(store) as Arc<dyn crate::texture_store::TextureStore>);
     let replay_repository = match ReplayStoreConfig::from_env()? {
         Some(config) => {
             let store = Arc::new(S3ReplayStore::new(config).await?);
@@ -253,6 +264,7 @@ pub async fn install_http_application(
         lobby_manager,
         user_cache,
         replay_repository,
+        texture_store,
         lifecycle: lifecycle.clone(),
         cluster_namespace,
         ads_config,
@@ -486,6 +498,19 @@ pub async fn install_http_application(
     let public_game_routes = public_games::build_public_game_routes(db.clone()).layer(
         middleware::from_fn_with_state(public_game_read_limiter, global_rate_limit_middleware),
     );
+    // Texture pixels, anonymous for the same reason replays are: these are the
+    // bytes a client needs to render somebody *else's* snake, so gating them
+    // behind a session would stop a match drawing its own players.
+    //
+    // The budget is far above the replay limiter's because the traffic shape is
+    // different: eight players, up to four textures each, all cold at the same
+    // instant when a match starts. A per-minute allowance sized for replays
+    // would black out arenas rather than shed load.
+    let texture_read_limiter = rate_limit_layer(6_000, 60);
+    let texture_byte_routes =
+        textures::build_texture_byte_routes(db.clone(), state.texture_store.clone()).layer(
+            middleware::from_fn_with_state(texture_read_limiter, global_rate_limit_middleware),
+        );
 
     // Build protected leaderboard routes (requires authentication)
     let protected_leaderboard_routes = Router::new()
@@ -532,6 +557,7 @@ pub async fn install_http_application(
         .merge(payment_routes)
         .merge(replay_routes)
         .merge(public_game_routes)
+        .merge(texture_byte_routes)
         .merge(protected_leaderboard_routes)
         .merge(debug_routes)
         .with_state(auth_state);

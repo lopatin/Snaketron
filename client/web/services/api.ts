@@ -123,6 +123,12 @@ class API {
     // Base API host; endpoints below include the /api prefix explicitly
     const envUrl = process.env.REACT_APP_API_URL?.replace(/\/+$/, '');
     this.baseURL = envUrl || 'http://localhost:8080';
+    // The wasm renderer builds texture URLs itself — a skin's atlas is loaded
+    // by the compiled skin, not by anything on this side — and it has no way
+    // to read the build's environment. Publishing what we resolved keeps the
+    // two from disagreeing about where the API is, which origin-relative URLs
+    // get wrong on every deployment that serves the app from a different host.
+    (globalThis as Record<string, unknown>).__snaketronApiOrigin = this.baseURL;
   }
 
   private getToken(): string | null {

@@ -695,7 +695,24 @@ fn build_atlas(doc: &SkinDocV2) -> crate::skin::atlas::Atlas {
 /// — a future device-pixel-aware arena selects a different one here, and
 /// nothing else moves.
 fn texture_url(content_ref: &str) -> String {
-    format!("/api/textures/by-ref/{content_ref}/32.png")
+    format!("{}/api/textures/by-ref/{content_ref}/32.png", api_origin())
+}
+
+/// Where the API lives, as far as the wasm side is concerned.
+///
+/// Origin-relative would be wrong wherever the app and the API are not the
+/// same host — which is every deployment that puts the client on a CDN, and
+/// the local dev setup, where the page is on :3100 and the API on another
+/// port. The web app already resolves this once and stashes it, so this reads
+/// what it decided rather than deciding again and disagreeing.
+fn api_origin() -> String {
+    js_sys::Reflect::get(
+        &js_sys::global(),
+        &wasm_bindgen::JsValue::from_str("__snaketronApiOrigin"),
+    )
+    .ok()
+    .and_then(|value| value.as_string())
+    .unwrap_or_default()
 }
 
 /// The shape the generation pipeline produces per kind, mirroring
