@@ -5205,6 +5205,11 @@ mod tests {
         unused_database_method!(update_user_mmr(user_id: i32, mmr: i32) -> ());
         unused_database_method!(update_guest_username(user_id: i32, username: &str) -> ());
         unused_database_method!(add_user_xp(user_id: i32, xp_to_add: i32) -> i32);
+        unused_database_method!(set_user_equipment(
+            user_id: i32,
+            selected_skin: Option<Option<&str>>,
+            selected_base: Option<Option<&str>>
+        ) -> ());
         unused_database_method!(resolve_crazygames_account(
             profile: &CrazyGamesProfile,
             guest_candidate_user_id: Option<i32>,

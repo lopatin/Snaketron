@@ -34,6 +34,7 @@ use crate::api::rate_limit::{
     global_rate_limit_middleware, rate_limit_layer, rate_limit_middleware,
 };
 use crate::api::regions;
+use crate::api::skins;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::db::models::Game;
@@ -315,6 +316,12 @@ pub async fn install_http_application(
             put(crazygames::save_preferences)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
+        // Two skin references and nothing else; a body larger than this is not
+        // an equip request that got long, it is something else entirely.
+        .route(
+            "/api/users/me/equipped",
+            put(skins::set_equipment).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -387,6 +394,10 @@ pub async fn install_http_application(
         .route("/api/news", get(news::get_news))
         .with_state(NewsState::new(db.clone()));
 
+    // Browsing the catalogue needs no account: the Skins page is a shop window
+    // as much as a picker, and a logged-out visitor should see what is on offer.
+    let skin_catalog_routes = Router::new().route("/api/skins", get(skins::browse));
+
     // Replay and highlight reads are intentionally anonymous. At launch all
     // runtime games, including custom games, are public; no username or lobby
     // membership ACL is applied here.
@@ -441,6 +452,7 @@ pub async fn install_http_application(
         .merge(player_routes)
         .merge(leaderboard_routes)
         .merge(news_routes)
+        .merge(skin_catalog_routes)
         .merge(replay_routes)
         .merge(public_game_routes)
         .merge(protected_leaderboard_routes)

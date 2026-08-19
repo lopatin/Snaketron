@@ -6560,6 +6560,92 @@ a.home-social-icon:hover {
   list-style: none;
 }
 
+/* ------------------------------------------------------------------ */
+/* Skins page                                                          */
+/* ------------------------------------------------------------------ */
+
+.skins-main {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 100svh;
+  padding: 128px clamp(24px, 5vw, 96px) calc(120px + var(--ad-route-bottom-reserve));
+}
+
+.skins-intro {
+  width: min(100%, 72rem);
+  margin: 0 auto 32px;
+}
+
+.skins-title {
+  margin: 0;
+  font-size: clamp(28px, 4vw, 44px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: var(--game-graphite);
+}
+
+.skins-subtitle {
+  margin: 8px 0 0;
+  max-width: 46ch;
+  color: var(--game-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.skins-error {
+  width: min(100%, 72rem);
+  margin: 0 auto 24px;
+  border: 2px solid var(--game-red);
+  padding: 10px 14px;
+  color: var(--game-red);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* The two columns the page is organised around: snakes are the main event and
+   get the room a wide horizontal preview needs; bases are a narrower rail. */
+.skins-columns {
+  display: grid;
+  width: min(100%, 72rem);
+  margin: 0 auto;
+  gap: clamp(24px, 4vw, 56px);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 20rem);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .skins-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.skins-column-heading {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+}
+
+.skins-column-note {
+  margin: 0 0 16px;
+  color: var(--game-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.skins-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
 .challenge-row {
   display: flex;
   align-items: center;
@@ -7058,4 +7144,139 @@ a.home-social-icon:hover {
 .game-shell-button.is-share-icon {
   width: 32px;
   padding: 0;
+}
+
+.skins-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 12px 16px;
+  transition: box-shadow 120ms ease, transform 120ms ease;
+}
+
+.skins-row:hover,
+.skins-row:focus-within {
+  box-shadow: 8px 8px 0 #000;
+  transform: translate(-2px, -2px);
+}
+
+.skins-row.is-equipped {
+  border-color: var(--game-blue);
+}
+
+/* Fixture poses paint at their own arena coordinates, so the canvas is larger
+   than the part worth showing and this window crops back to the snake. */
+.skins-preview-crop {
+  overflow: hidden;
+  flex: none;
+}
+
+.skins-preview-canvas {
+  display: block;
+}
+
+.skins-base-preview {
+  display: flex;
+  gap: 6px;
+}
+
+.skins-base-preview canvas {
+  display: block;
+  border: 1px solid var(--game-rule);
+}
+
+.skins-row-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.skins-row-name {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--game-graphite);
+  overflow-wrap: anywhere;
+}
+
+.skins-row-price {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--game-muted);
+}
+
+.skins-equip-button {
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 7px 16px;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+  cursor: pointer;
+}
+
+.skins-equip-button:hover:not(:disabled) {
+  background: var(--game-graphite);
+  color: var(--game-paper);
+}
+
+.skins-equip-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.skins-equipped-badge {
+  display: inline-block;
+  border: 2px solid var(--game-blue);
+  padding: 7px 16px;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-blue);
+}
+
+/* A hovered preview is the only motion on this page; someone who asked the OS
+   for less of it gets the still frame and no lift. */
+@media (prefers-reduced-motion: reduce) {
+  .skins-row {
+    transition: none;
+  }
+
+  .skins-row:hover,
+  .skins-row:focus-within {
+    transform: none;
+  }
+}
+
+/* The base column stacks its rows tighter: a base preview is two small
+   rectangles, not a snake, so it does not need the same row height. */
+.skins-column-bases .skins-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'preview preview'
+    'meta action';
+  row-gap: 12px;
+}
+
+.skins-column-bases .skins-row-preview {
+  grid-area: preview;
+}
+
+.skins-column-bases .skins-row-meta {
+  grid-area: meta;
+}
+
+.skins-column-bases .skins-row-action {
+  grid-area: action;
+  justify-self: start;
 }

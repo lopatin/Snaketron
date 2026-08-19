@@ -74,6 +74,20 @@ pub trait Database: Send + Sync {
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP
 
+    /// Record what a player is wearing.
+    ///
+    /// Each slot is addressed independently: `None` leaves that slot alone,
+    /// `Some(None)` clears it back to the default look, and `Some(Some(reference))`
+    /// equips. Callers pass references they have already resolved, because this
+    /// is storage — deciding whether a player may wear something is the API
+    /// layer's job, and doing it here would put catalogue policy in the database.
+    async fn set_user_equipment(
+        &self,
+        user_id: i32,
+        selected_skin: Option<Option<&str>>,
+        selected_base: Option<Option<&str>>,
+    ) -> Result<()>;
+
     /// Resolve one verified CrazyGames identity into a durable Snaketron
     /// account. Implementations own the uniqueness/claim transaction; callers
     /// must never construct an account from unverified portal profile data.

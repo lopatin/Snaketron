@@ -195,6 +195,7 @@ mod tests {
             profile_picture_url: None,
             profile_iat: None,
             selected_skin: None,
+            selected_base: None,
         }
     }
 

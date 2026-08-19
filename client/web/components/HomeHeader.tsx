@@ -17,7 +17,7 @@ import { useFullscreen } from '../hooks/useFullscreen';
 import { useInputSurface } from '../hooks/useInputSurface';
 
 interface HomeHeaderProps {
-  activePage?: 'play' | 'leaderboards';
+  activePage?: 'play' | 'leaderboards' | 'skins';
   currentUser: User | null;
   lobbyMembers: LobbyMember[];
   hasLobby: boolean;
@@ -109,6 +109,13 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
             aria-current={activePage === 'leaderboards' ? 'page' : undefined}
           >
             Leaderboards
+          </Link>
+          <Link
+            to="/skins"
+            className={`home-nav-link ${activePage === 'skins' ? 'is-active' : ''}`}
+            aria-current={activePage === 'skins' ? 'page' : undefined}
+          >
+            Skins
           </Link>
 
           <div className="home-social-menu" ref={socialMenuRef}>

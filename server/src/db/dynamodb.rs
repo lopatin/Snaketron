@@ -2786,6 +2786,7 @@ impl Database for DynamoDatabase {
             profile_picture_url: None,
             profile_iat: None,
             selected_skin: None,
+            selected_base: None,
         })
     }
 
@@ -2851,6 +2852,7 @@ impl Database for DynamoDatabase {
             profile_picture_url: None,
             profile_iat: None,
             selected_skin: None,
+            selected_base: None,
         })
     }
 
@@ -3033,6 +3035,7 @@ impl Database for DynamoDatabase {
                     profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
                     profile_iat: Self::extract_i64(&item, "profileIat"),
                     selected_skin: Self::extract_string(&item, "selectedSkin"),
+                    selected_base: Self::extract_string(&item, "selectedBase"),
                 };
                 Ok(Some(user))
             }
@@ -3074,6 +3077,64 @@ impl Database for DynamoDatabase {
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()> {
         self.mutate_user_progress(user_id, "mmr", UserProgressMutation::Set(mmr))
             .await?;
+        Ok(())
+    }
+
+    async fn set_user_equipment(
+        &self,
+        user_id: i32,
+        selected_skin: Option<Option<&str>>,
+        selected_base: Option<Option<&str>>,
+    ) -> Result<()> {
+        // Build one update expression covering only the slots the caller named,
+        // so equipping a skin cannot silently clear a base the request never
+        // mentioned. Nothing to say means nothing to write.
+        let mut sets: Vec<String> = Vec::new();
+        let mut removes: Vec<String> = Vec::new();
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk) AND attribute_exists(sk)");
+
+        for (slot, attribute, placeholder) in [
+            (selected_skin, "selectedSkin", ":skin"),
+            (selected_base, "selectedBase", ":base"),
+        ] {
+            match slot {
+                None => {}
+                Some(None) => removes.push(attribute.to_string()),
+                Some(Some(reference)) => {
+                    sets.push(format!("{attribute} = {placeholder}"));
+                    request =
+                        request.expression_attribute_values(placeholder, Self::av_s(reference));
+                }
+            }
+        }
+
+        if sets.is_empty() && removes.is_empty() {
+            return Ok(());
+        }
+
+        let mut expression = String::new();
+        if !sets.is_empty() {
+            expression.push_str(&format!("SET {}", sets.join(", ")));
+        }
+        if !removes.is_empty() {
+            if !expression.is_empty() {
+                expression.push(' ');
+            }
+            expression.push_str(&format!("REMOVE {}", removes.join(", ")));
+        }
+
+        request
+            .update_expression(expression)
+            .send()
+            .await
+            .context("Failed to update user equipment")?;
+
         Ok(())
     }
 

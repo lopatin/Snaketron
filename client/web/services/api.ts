@@ -19,6 +19,21 @@ import type { PlayerLobbyResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
 import type { PublicGameResponse } from '../types/generated';
+import type { BrowseResponse, Equipment, SkinKind } from '../types/generated';
+
+/**
+ * An equip request.
+ *
+ * Three-valued per slot, matching the server: omit a slot to leave it alone,
+ * pass `null` to clear it back to the default look, pass a reference to equip.
+ * Written by hand rather than generated because ts-rs flattens Rust's
+ * `Option<Option<T>>` into a single nullable, losing exactly the distinction
+ * this type exists to carry.
+ */
+export interface EquipRequest {
+  selectedSkin?: string | null;
+  selectedBase?: string | null;
+}
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -449,6 +464,25 @@ class API {
     const params = new URLSearchParams({ limit: limit.toString() });
     if (cursor) params.set('cursor', cursor);
     return this.request<RuntimeConfigAuditPage>(`/api/admin/config/audit?${params.toString()}`);
+  }
+
+  /** The catalogue. Needs no account — browsing is open to anyone. */
+  async browseSkins(kind: SkinKind = 'snake'): Promise<BrowseResponse> {
+    return this.request<BrowseResponse>(`/api/skins?kind=${kind}`);
+  }
+
+  /**
+   * Record what the signed-in player is wearing.
+   *
+   * Slots are addressed independently: omit a slot to leave it alone, pass
+   * `null` to clear it back to the default look. Returns both slots as they
+   * now stand, so a caller that changed one still learns the whole state.
+   */
+  async setEquipment(request: EquipRequest): Promise<Equipment> {
+    return this.request<Equipment>('/api/users/me/equipped', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
   }
 }
 

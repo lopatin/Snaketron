@@ -16,6 +16,7 @@ import ChallengesPanel from './components/ChallengesPanel';
 import PlayRoute from './components/PlayRoute';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
+import SkinsPage from './components/SkinsPage';
 import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
@@ -192,6 +193,15 @@ function AppContent() {
           path="/leaderboards"
           element={
             <Leaderboard
+              onOpenAuth={handleOpenAuth}
+              onOpenAccount={setAccountModalView}
+            />
+          }
+        />
+        <Route
+          path="/skins"
+          element={
+            <SkinsPage
               onOpenAuth={handleOpenAuth}
               onOpenAccount={setAccountModalView}
             />

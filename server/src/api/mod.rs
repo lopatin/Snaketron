@@ -10,5 +10,6 @@ pub mod players;
 pub mod rate_limit;
 pub mod regions;
 pub mod server;
+pub mod skins;
 
 pub use server::run_api_server;

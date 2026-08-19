@@ -966,6 +966,72 @@ pub fn render_skin_fixture(
     }
 }
 
+/// Paint one skin's base dressing as a standalone rectangle.
+///
+/// The Skins page needs to show what a base looks like without running a match,
+/// and the honest way to do that is to resolve the theme through the same
+/// `base_theme()` the arena reads. Drawing it from TypeScript instead would
+/// mean mirroring six hex values into the client, which is exactly the coupling
+/// `specs/skins-prd.md` removed.
+///
+/// `own` picks which half of the theme is being shown: a player's own end of
+/// the arena, or the opponent's. Which side of a real arena that lands on stays
+/// the renderer's decision — this is a swatch of the theme, not a map.
+#[wasm_bindgen(js_name = renderSkinBase)]
+pub fn render_skin_base(
+    canvas: &web_sys::HtmlCanvasElement,
+    skin_ref: &str,
+    own: bool,
+) -> Result<(), JsValue> {
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("no 2d context"))?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()?;
+
+    let width = canvas.width() as f64;
+    let height = canvas.height() as f64;
+    let theme = skin_registry()
+        .resolve(Some(skin_ref))
+        .base_theme()
+        .unwrap_or(crate::skin::classic::CLASSIC_BASE_THEME);
+    let (zone, wall, text) = if own {
+        (
+            theme.friendly_zone,
+            theme.friendly_wall,
+            theme.friendly_text,
+        )
+    } else {
+        (theme.enemy_zone, theme.enemy_wall, theme.enemy_text)
+    };
+
+    // The endzone as the arena builds it: the zone tint under everything, the
+    // goal wall as a band down one edge, and the endzone lettering over the
+    // tint. Proportions are the preview's own — this is a swatch, and pinning
+    // it to arena cell maths would make it depend on a match that is not
+    // running.
+    ctx.set_fill_style_str(ARENA_FIELD_COLOR);
+    ctx.fill_rect(0.0, 0.0, width, height);
+    ctx.set_fill_style_str(zone);
+    ctx.fill_rect(0.0, 0.0, width, height);
+
+    let wall_thickness = (width * 0.12).max(3.0);
+    ctx.set_fill_style_str(wall);
+    ctx.fill_rect(0.0, 0.0, wall_thickness, height);
+
+    let glyph_size = (height * 0.34).max(8.0);
+    ctx.set_fill_style_str(text);
+    ctx.set_font(&format!("italic 900 {glyph_size}px sans-serif"));
+    ctx.set_text_align("center");
+    ctx.set_text_baseline("middle");
+    ctx.fill_text(
+        if own { "HOME" } else { "AWAY" },
+        wall_thickness + (width - wall_thickness) / 2.0,
+        height / 2.0,
+    )?;
+
+    Ok(())
+}
+
 /// The colours a skin reports for one named fixture role.
 ///
 /// Exists so the QA route's swatch strip resolves roles exactly the way its

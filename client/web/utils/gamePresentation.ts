@@ -286,6 +286,10 @@ export const buildMatchPresentation = (
       is_team_game: isTeamSkin,
       local_snake_id: currentSnakeId,
       local_team_id: currentTeamId,
+      // The skin this player is actually wearing, so the results swatch and the
+      // roster portrait agree with what the arena drew. Absent for a snake with
+      // no user (a bot, a vacated slot), which reads as the classic look.
+      skin_ref: userId === null ? undefined : gameState.skins?.[userId],
     };
     const score = valueAt(gameState.scores, snakeId);
     const isIdleKicked = userId !== null && idleKickedUserIds.has(userId);
