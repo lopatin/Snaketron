@@ -600,8 +600,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
             ramp_opacity: GRADIENT_MAX_OPACITY,
             wave_phase_turns: 0.0,
             time_turns: row as f64 / recipe.sheet.rows as f64,
-            layer_opacity: Vec::new(),
-            scalars: Vec::new(),
+            params: Vec::new(),
             literals: Vec::new(),
         })
         .collect();
@@ -617,7 +616,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
     // a patch stamped on the art. The ramp and the dark core stay, because they
     // modulate the art rather than replace it, and the head is the one part of
     // a snake that has to stay unambiguous.
-    layers.retain(|layer| !matches!(layer.id, "head-cap" | "head-highlight"));
+    layers.retain(|layer| !matches!(layer.id.as_ref(), "head-cap" | "head-highlight"));
 
     // Rasterise the contour in one pass. `radius` is exactly half `line_width`,
     // so a run's round cap and a joint disc are the *same* circle — and painting
@@ -1028,8 +1027,7 @@ mod tests {
                 ramp_opacity: 0.2,
                 wave_phase_turns: 0.0,
                 time_turns: 0.0,
-                layer_opacity: Vec::new(),
-                scalars: Vec::new(),
+                params: Vec::new(),
                 literals: Vec::new(),
             }],
             1_000.0,

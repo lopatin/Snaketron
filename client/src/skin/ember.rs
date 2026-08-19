@@ -15,7 +15,7 @@ use crate::skin::classic::document_layers;
 use crate::skin::composite::{
     BaseThemeOwned, CelebrationThemeOwned, CompositeConfig, CompositeSkin, Frame, Swatch,
 };
-use crate::skin::layer::{ColorSlot, DiscPaint, Layer, LayerKind, LayerTransform, Region};
+use crate::skin::layer::{Binding, ColorSlot, DiscPaint, Layer, LayerKind, LayerTransform, Region};
 use crate::skin::space::ClipShape;
 use crate::skin::{
     BaseTheme, CelebrationTheme, PaintCtx, SkinColors, SkinIdentity, SkinMetrics, SnakePose,
@@ -148,11 +148,10 @@ fn ember_composite() -> CompositeSkin {
                 ramp_opacity: GRADIENT_MAX_OPACITY,
                 wave_phase_turns: 0.0,
                 time_turns: turns,
-                layer_opacity: Vec::new(),
                 // The glow stays inside the head disc, so it adds nothing to
                 // the skin's overhang and cannot creep out from under the
                 // renderer's occlusion mask.
-                scalars: vec![
+                params: vec![
                     (HEAD_CORE_RATIO * glow_scale(turns))
                         .clamp(HEAD_CORE_RATIO * 0.5, GLOW_MAX_RADIUS_RATIO),
                 ],
@@ -177,7 +176,7 @@ fn ember_composite() -> CompositeSkin {
         *paint = DiscPaint::Slot(ColorSlot::Accent);
     }
     layers.push(Layer {
-        id: "head-glow",
+        id: "head-glow".into(),
         region: Region::Head,
         clip: ClipShape::Silhouette,
         kind: LayerKind::HeadDisc {
@@ -185,13 +184,12 @@ fn ember_composite() -> CompositeSkin {
                 slot: ColorSlot::Accent,
                 stops: GLOW_STOPS,
             },
-            radius_ratio: HEAD_CORE_RATIO,
-            radius_track: Some(0),
+            radius: Binding::Param(0),
         },
         transform: LayerTransform::default(),
         boost_only: false,
         omit_on_single_cell: false,
-        opacity_track: None,
+        opacity: Binding::ONE,
     });
 
     CompositeSkin::new(

@@ -115,8 +115,7 @@ impl ParamSkin {
                     .map(|wave| wave.crests_per_cycle * step as f64 / steps.max(1) as f64)
                     .unwrap_or(0.0),
                 time_turns: step as f64 / steps.max(1) as f64,
-                layer_opacity: Vec::new(),
-                scalars: Vec::new(),
+                params: Vec::new(),
                 literals: Vec::new(),
             })
             .collect();
@@ -234,7 +233,12 @@ mod tests {
     #[test]
     fn a_document_compiles_to_the_classic_layer_shape() {
         let skin = classic_doc();
-        let ids: Vec<&str> = skin.engine.layers().iter().map(|layer| layer.id).collect();
+        let ids: Vec<&str> = skin
+            .engine
+            .layers()
+            .iter()
+            .map(|layer| layer.id.as_ref())
+            .collect();
         assert_eq!(
             ids,
             vec![

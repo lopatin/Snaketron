@@ -8,12 +8,13 @@
 use crate::skin::composite::{
     BaseThemeOwned, CelebrationThemeOwned, CompositeConfig, CompositeSkin, Frame, Swatch,
 };
-use crate::skin::layer::{ColorSlot, DiscPaint, Layer, LayerKind, LayerTransform, Region};
+use crate::skin::layer::{Binding, ColorSlot, DiscPaint, Layer, LayerKind, LayerTransform, Region};
 use crate::skin::space::ClipShape;
 use crate::skin::{
     BaseTheme, CelebrationTheme, PaintCtx, SkinColors, SkinIdentity, SkinMetrics, SnakePose,
     SnakeSkin,
 };
+use std::borrow::Cow;
 use wasm_bindgen::prelude::*;
 
 /// Team colours, indexed by the within-team shade slot.
@@ -110,8 +111,10 @@ pub fn document_layers(
     ramp_cells: f64,
     core_ratio: f64,
 ) -> Vec<Layer> {
-    let contour = |id, color, extra, boost_only| Layer {
-        id,
+    // First-party stacks name their layers with literals, so their ids are
+    // borrowed and cost nothing; a compiled document owns its names instead.
+    let contour = |id: &'static str, color, extra, boost_only| Layer {
+        id: Cow::Borrowed(id),
         region: Region::Contour,
         clip: ClipShape::Silhouette,
         kind: LayerKind::Ribbon {
@@ -126,21 +129,20 @@ pub fn document_layers(
         transform: LayerTransform::default(),
         boost_only,
         omit_on_single_cell: false,
-        opacity_track: None,
+        opacity: Binding::ONE,
     };
-    let head_disc = |id, paint, radius_ratio, omit_on_single_cell| Layer {
-        id,
+    let head_disc = |id: &'static str, paint, radius_ratio, omit_on_single_cell| Layer {
+        id: Cow::Borrowed(id),
         region: Region::Head,
         clip: ClipShape::Silhouette,
         kind: LayerKind::HeadDisc {
             paint,
-            radius_ratio,
-            radius_track: None,
+            radius: Binding::Const(radius_ratio),
         },
         transform: LayerTransform::default(),
         boost_only: false,
         omit_on_single_cell,
-        opacity_track: None,
+        opacity: Binding::ONE,
     };
 
     vec![
@@ -150,7 +152,7 @@ pub fn document_layers(
         contour("outline", ColorSlot::Outline, outline_extra, false),
         // The body itself: a capsule ribbon with rounded joints and a tail cap.
         Layer {
-            id: "body",
+            id: "body".into(),
             region: Region::Body,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Ribbon {
@@ -165,23 +167,27 @@ pub fn document_layers(
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: false,
-            opacity_track: None,
+            opacity: Binding::ONE,
         },
         // The brightening behind the head, so a glance tells you which way a
         // snake is travelling. Painted over full cell squares rather than the
         // rounded silhouette — see `ClipShape::Cells`.
         Layer {
-            id: "head-ramp",
+            id: "head-ramp".into(),
             region: Region::Body,
             clip: ClipShape::Cells,
             kind: LayerKind::HeadRamp {
                 rgb: ramp_rgb,
                 length_cells: ramp_cells,
+                // The legacy curve: a linear falloff scaled by the frame's
+                // `ramp_opacity`, with the configured wave added on top. A
+                // compiled v2 document supplies the whole curve instead.
+                opacity: None,
             },
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: true,
-            opacity_track: None,
+            opacity: Binding::ONE,
         },
         // The head is re-laid over the ramp, then brightened to the ramp's peak,
         // then cored. A single-cell snake skips the first two: its body disc is
@@ -215,8 +221,7 @@ pub fn classic_frame() -> Frame {
         ramp_opacity: HEAD_GRADIENT_MAX_OPACITY,
         wave_phase_turns: 0.0,
         time_turns: 0.0,
-        layer_opacity: Vec::new(),
-        scalars: Vec::new(),
+        params: Vec::new(),
         literals: Vec::new(),
     }
 }
@@ -333,7 +338,7 @@ mod tests {
         let contour: Vec<&str> = layers
             .iter()
             .filter(|layer| layer.region == Region::Contour)
-            .map(|layer| layer.id)
+            .map(|layer| layer.id.as_ref())
             .collect();
         assert_eq!(
             contour,
@@ -358,7 +363,7 @@ mod tests {
         let live: Vec<&str> = layers
             .iter()
             .filter(|layer| layer.region == Region::Contour && layer.applies(false, 5))
-            .map(|layer| layer.id)
+            .map(|layer| layer.id.as_ref())
             .collect();
         assert_eq!(live, vec!["outline"], "a calm snake has no Boost band");
         assert_eq!(ribbon_of("outline").1 / 2.0, 1.0);
