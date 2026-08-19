@@ -246,30 +246,13 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
           onLogout={logout}
         />
 
-        {homeNotice && (
-          <div className="home-notice-dock" role="status" aria-live="polite">
-            <div
-              data-testid="home-notice"
-              className={`home-notice${homeNotice.tone === 'error' ? ' is-error' : ''}`}
-            >
-              <span>{homeNotice.message}</span>
-              <button
-                type="button"
-                aria-label="Dismiss notification"
-                onClick={() => setHomeNotice(null)}
-                className="home-notice-dismiss"
-              >
-                ×
-              </button>
-            </div>
-          </div>
-        )}
-
         <ConnectionStatusRack
           isReady={isReady}
           regionsLoading={regionsLoading}
           regionsError={regionsError}
           hasSelectedRegion={currentRegionId !== ''}
+          notice={homeNotice}
+          onDismissNotice={() => setHomeNotice(null)}
         />
 
         <main className="home-main">

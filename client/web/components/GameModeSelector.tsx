@@ -110,7 +110,7 @@ function GameModeSelector() {
   const handleStartQueue = async () => {
     // Same lobby-wide action as the home screen's Start button.
     if (!isLobbyLeader) {
-      setAuthError('Only the lobby leader can start a match');
+      setAuthError('Waiting for lobby host to start matchmaking');
       return;
     }
 
@@ -296,9 +296,7 @@ function GameModeSelector() {
               >
                 {isAuthenticating
                   ? 'Starting...'
-                  : isLobbyLeader
-                    ? `Start Queue (${selectedModes.size} mode${selectedModes.size > 1 ? 's' : ''})`
-                    : 'Waiting for Leader'}
+                  : `Start Queue (${selectedModes.size} mode${selectedModes.size > 1 ? 's' : ''})`}
               </button>
             )}
           </div>

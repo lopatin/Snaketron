@@ -4964,6 +4964,43 @@ a.home-social-icon:hover {
   color: #a16207;
 }
 
+/* A badge carrying a full sentence rather than a status phrase. The 10px
+   uppercase treatment is right for "Connecting to game server…" and unreadable
+   for prose, so this keeps the chassis and relaxes only the type. */
+.home-status-badge.is-prose {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  text-transform: none;
+  color: #374151;
+}
+
+/* The rack is pointer-events: none so it never blocks the page; the one
+   interactive control inside it has to opt back in. */
+.home-status-dismiss {
+  flex: none;
+  margin-left: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.5;
+  pointer-events: auto;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.home-status-dismiss:hover,
+.home-status-dismiss:focus-visible {
+  opacity: 1;
+  background-color: rgba(0, 0, 0, 0.06);
+}
+
 .home-status-dot {
   width: 6px;
   height: 6px;
@@ -6216,96 +6253,5 @@ a.home-social-icon:hover {
   }
   .skins-qa-tuning {
     position: static;
-  }
-}
-
-/* Home notice
-   ---------------------------------------------------------------------------
-   A one-shot sentence from whatever redirected to the home screen — most often
-   an invite link whose target was not reachable. Docked below the 72px header
-   and centered over the page's own stack, so it never displaces the start
-   form: the message is an aside, and the player's next action is the form. */
-.home-notice-dock {
-  /* Docked bottom-centre rather than under the header: the top of this screen
-     is the brand lockup, and a toast there covers it. The left and right
-     bottom corners belong to the region selector and the chat trigger, so the
-     centre lane is the one free strip on the page. Raised clear of the social
-     footer that closes the home screen's centre stack. */
-  position: fixed;
-  right: 0;
-  bottom: calc(76px + var(--ad-route-bottom-reserve));
-  left: 0;
-  z-index: 45;
-  display: flex;
-  justify-content: center;
-  padding: 0 16px;
-  pointer-events: none;
-}
-
-/* Narrow screens have no free centre lane — both bottom docks span most of the
-   width — so the notice sits above them instead of beside them. */
-@media (max-width: 640px) {
-  .home-notice-dock {
-    bottom: calc(88px + var(--ad-route-bottom-reserve));
-  }
-}
-
-.home-notice {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  max-width: min(520px, 100%);
-  padding: 10px 12px 10px 16px;
-  border: 2px solid var(--color-black-70, #1a1a1a);
-  border-radius: 10px;
-  background: #ffffff;
-  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.12);
-  color: var(--color-black-70, #1a1a1a);
-  font-size: 14px;
-  line-height: 1.35;
-  pointer-events: auto;
-  animation: home-notice-enter 220ms ease-out;
-}
-
-.home-notice.is-error {
-  border-color: #b91c1c;
-  color: #b91c1c;
-}
-
-.home-notice-dismiss {
-  flex: none;
-  width: 24px;
-  height: 24px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  opacity: 0.55;
-  transition: opacity 120ms ease, background-color 120ms ease;
-}
-
-.home-notice-dismiss:hover,
-.home-notice-dismiss:focus-visible {
-  opacity: 1;
-  background-color: rgba(0, 0, 0, 0.06);
-}
-
-@keyframes home-notice-enter {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .home-notice {
-    animation: none;
   }
 }

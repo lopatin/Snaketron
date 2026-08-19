@@ -341,7 +341,7 @@ const LeaderboardContent: React.FC<{
                   disabled={isStartingQueue || !isLobbyLeader}
                   title={isLobbyLeader
                     ? undefined
-                    : 'Only the lobby leader can start a match'}
+                    : 'Waiting for lobby host to start matchmaking'}
                   className="font-bold text-blue-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   {isStartingQueue ? startingActionLabel : playActionLabel}

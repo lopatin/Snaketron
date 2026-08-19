@@ -246,9 +246,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     ? 'Finding Match...'
     : isLoading
         ? 'Starting...'
-        : isLobbyLeader
-            ? 'Start Game'
-            : 'Waiting for Leader';
+        : 'Start Game';
   const wasStartButtonDisabledRef = useRef(startButtonDisabled);
   const [enableAnimation, setEnableAnimation] = useState({ key: 0, visible: false });
 
@@ -389,7 +387,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
               className="mb-3 text-[13px] text-gray-500 text-center"
               data-testid="leader-only-notice"
             >
-              The lobby leader chooses the mode and starts the match.
+              Waiting for lobby host to start matchmaking
             </p>
           )}
           <div className="grid grid-cols-2 gap-3">
