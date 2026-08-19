@@ -7008,34 +7008,15 @@ a.home-social-icon:hover {
    is anyone else still here, and has anyone else said yes. Sits between the
    standings and the action footer, so it reads as part of the result rather
    than as another button. */
-/* One checkbox under the standings. Everything it used to explain now lives
-   on the rows themselves as pills. */
+/* One checkbox under the standings, with no container of its own — the
+   control is the same bare label the home form's Competitive checkbox uses,
+   and boxing it here would make it read as a section rather than a choice. */
 .game-over-rematch {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 14px 0 0;
-  padding: 12px 14px;
-  border: 2px solid #e5e7eb;
-  border-radius: 8px;
-  background: #f9fafb;
-  cursor: pointer;
-}
-
-.game-over-rematch input {
-  width: 16px;
-  height: 16px;
-  flex: none;
-  accent-color: var(--game-blue);
-  cursor: pointer;
-}
-
-.game-over-rematch-label {
-  color: rgb(0 0 0 / 78%);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.8px;
-  text-transform: uppercase;
+  gap: 14px;
+  /* Aligned with the standings block above it — 22px is the card's inset. */
+  margin: 0 22px 18px;
 }
 
 .game-over-rematch-blocked {
@@ -7046,3 +7027,22 @@ a.home-social-icon:hover {
   text-align: right;
 }
 
+
+/* Share adopting the shell button: the icon has to come down to the 9px type
+   it now sits beside, and the icon-only form in the HUD rail needs a square
+   footprint rather than the label padding. */
+.game-shell-button .share-game-icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* The shell button centres its content with no gap of its own, which runs the
+   icon straight into the word. */
+.game-shell-button:has(.share-game-icon) {
+  gap: 7px;
+}
+
+.game-shell-button.is-share-icon {
+  width: 32px;
+  padding: 0;
+}

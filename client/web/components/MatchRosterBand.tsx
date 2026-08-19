@@ -78,6 +78,7 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
       headline={presentation.isComplete ? presentation.resultSummary : null}
       variant="compact"
       className="game-roster-share"
+      triggerClassName="game-shell-button is-share-icon"
     />
   );
 

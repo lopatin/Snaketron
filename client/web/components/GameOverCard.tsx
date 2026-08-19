@@ -398,14 +398,45 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
         </div>
 
         {rematch && onRematchToggle && canRematch(rematch, currentUserId) && (
-          <label className="game-over-rematch" data-testid="rematch-toggle">
-            <input
-              type="checkbox"
-              checked={hasOptedIntoRematch(rematch, currentUserId)}
-              onChange={(event) => onRematchToggle(event.target.checked)}
-              data-testid="rematch-checkbox"
-            />
-            <span className="game-over-rematch-label">Rematch</span>
+          <div className="game-over-rematch" data-testid="rematch-toggle">
+            {/* Same control as the Competitive checkbox on the home form: a
+                bare label, the native input hidden for semantics, and a drawn
+                box. Copied rather than shared because the two are the only
+                checkboxes in the app and a component for two call sites would
+                be the wrong abstraction to reach for first. */}
+            <label className="flex items-center gap-3 cursor-pointer group">
+              <div className="relative">
+                <input
+                  type="checkbox"
+                  checked={hasOptedIntoRematch(rematch, currentUserId)}
+                  onChange={(event) => onRematchToggle(event.target.checked)}
+                  className="sr-only"
+                  data-testid="rematch-checkbox"
+                />
+                <div
+                  className={`w-6 h-6 border-2 rounded transition-all group-hover:border-gray-400 ${
+                    hasOptedIntoRematch(rematch, currentUserId)
+                      ? 'bg-blue-500 border-blue-500'
+                      : 'bg-white border-gray-300'
+                  }`}
+                >
+                  {hasOptedIntoRematch(rematch, currentUserId) && (
+                    <svg
+                      className="w-full h-full text-white"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={3}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                  )}
+                </div>
+              </div>
+              <span className="text-sm font-black uppercase tracking-1 text-black-70 select-none">
+                Rematch
+              </span>
+            </label>
             {/* Only ever shown when ticking the box cannot actually produce a
                 game; silence there would read as the feature being broken. */}
             {rematchBlockReason(rematch) && (
@@ -413,14 +444,18 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                 {rematchBlockReason(rematch)}
               </span>
             )}
-          </label>
+          </div>
         )}
 
         <footer className="game-over-actions">
           <button type="button" onClick={onMenu} className="game-shell-button is-menu">
             Main menu
           </button>
-          <ShareGame gameId={shareGameId} headline={presentation.resultSummary} />
+          <ShareGame
+            gameId={shareGameId}
+            headline={presentation.resultSummary}
+            triggerClassName="game-shell-button"
+          />
           <div className="game-over-replay-actions">
             {inputSurface !== 'touch' && (
               <span className="game-over-shortcut" aria-hidden="true">

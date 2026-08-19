@@ -25,6 +25,15 @@ export interface ShareGameProps {
   variant?: 'default' | 'compact';
   className?: string;
   label?: string;
+  /**
+   * Button class for surfaces that already have a button vocabulary.
+   *
+   * The results card and the HUD rail both speak `game-shell-button`, and a
+   * share control that invents its own border and radius next to a Main menu
+   * button reads as a different kind of thing. The standalone match page has
+   * no such vocabulary, so it keeps the default.
+   */
+  triggerClassName?: string;
 }
 
 type CopyState = 'idle' | 'copied' | 'failed';
@@ -40,6 +49,7 @@ export const ShareGame: React.FC<ShareGameProps> = ({
   variant = 'default',
   className = '',
   label = 'Share',
+  triggerClassName,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [copyState, setCopyState] = useState<CopyState>('idle');
@@ -149,7 +159,10 @@ export const ShareGame: React.FC<ShareGameProps> = ({
       <button
         ref={triggerRef}
         type="button"
-        className={`share-game-trigger${variant === 'compact' ? ' is-compact' : ''}`}
+        className={
+          triggerClassName
+            ?? `share-game-trigger${variant === 'compact' ? ' is-compact' : ''}`
+        }
         onClick={() => setIsOpen((open) => !open)}
         aria-expanded={isOpen}
         aria-haspopup="dialog"
