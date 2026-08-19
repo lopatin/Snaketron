@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | **In progress.** V0 shipped (schema, converter, compiler, byte-parity gate). Section 14's open questions are resolved — see 14.1–14.3. |
+| Status | **Implemented**, V0–V5. Section 14's open questions are resolved — see 14.1–14.3; section 15 records what was built differently and what is not built. |
 | Product | Snaketron skins: document schema, client renderer, Skin Builder |
 | Scope | Replaces SkinDoc v1's closed vocabulary with a document form of the layer compositor; replaces the Builder's parameter form (including the entire Animations section) with a layers panel over that model |
 | Depends on | `specs/skin-shading-prd.md` (shipped: the compositor, body space, the expression language), `specs/first-class-skins-prd.md` (shipped M0–M5: storage, equip, review, textures, economy) |
@@ -733,3 +733,70 @@ narrows something the earlier sections stated more loosely:
   fills it from the snake's index in the state, and still surfaces (roster
   glyphs, golden traces, contact sheets) pin it to zero so their output stays
   reproducible.
+
+## 15. What shipped, and what did not
+
+### 15.1 Built as designed
+
+V0–V5 are in. The gates all hold:
+
+- **classic-as-v2 is byte-identical to classic-as-v1**, across five poses and
+  both Boost states. That is the same oracle the compositor flip was held to,
+  pointed at the schema flip, and it is what makes "v2 is the compositor's own
+  model" a checked claim rather than a description.
+- **The v2 vocabulary runs through the whole conformance suite** — a travelling
+  gradient, a sliding band, a Boost-reactive layer, a group, a reshaped glow, a
+  worn word — with two extra checks so the suite cannot pass for the wrong
+  reason: the fixtures must paint *differently* across the clock while keeping
+  their op sequence, and the Boost-reactive one is compared on its alpha ops
+  alone, since boosting also brings the Boost band into the stack.
+- **The cost model bounds the recorder**, pinned by a test. A budget that
+  sometimes under-predicts would clear a skin at save time and blow a frame in
+  a match, where nobody could attribute it.
+- **The sampler rediscovers, by compositing, the weak spot v1 found
+  analytically** — the steel free-for-all slot, same slot, same reason. Two
+  independent methods landing on the same answer is the strongest evidence
+  available that the model is right.
+
+### 15.2 Built differently
+
+- **Three binding tiers, not two.** Section 11 planned constants and a per-step
+  table. `boost` and `seed` needed a third: they are constant-*tier* — neither
+  changes within a snake-frame — yet an expression reading them cannot be
+  folded, because it is not constant across *snakes*. A tier-based compiler
+  would have frozen every boost-reactive layer at "not boosting" and nothing
+  would have reported it.
+- **The evaluation *site*, not a tier cap.** Naming where a value is worked out
+  is what lets an error say why an input is unavailable, and it is what the
+  Builder shows beside each fx field. "Bounded" fell out of it: a head disc's
+  radius and a band's lane are what keep a layer inside the silhouette, so
+  their range has to be checkable before the skin paints — they refuse
+  per-snake inputs even though the site is otherwise per-snake.
+- **Text carries its ink rather than being tinted.** Canvas cannot tint a
+  `drawImage`: `fillStyle` does not touch a blit, and the ways around it need a
+  per-snake isolation buffer or an offscreen canvas — neither of which this
+  engine has, and both of which would be invisible to the recorder that
+  verifies every other skin. So the strip ships two inks and a document's
+  colour reference picks between them by luminance, per role, as a source-rect
+  argument. A smaller promise than arbitrary colour; the one that matters.
+- **Groups carry opacity only** (14.3), and the per-role literal question
+  resolved into the accent slot (14.2) rather than a per-role literal table.
+
+### 15.3 Not built
+
+- **Texture bytes are not served.** A document can declare a texture, name it
+  from an image layer, and have all of it validate, compile and cost — and the
+  atlas points at `/api/textures/by-ref/{ref}/32.png`, which does not exist
+  yet. This is an **M3 gap rather than a v2 one**: that milestone stored rungs
+  by digest and shipped a manifest route, and never a route for the pixels. It
+  needs the texture store threaded onto `AuthState` and one handler; the client
+  side is done and waiting.
+- **One ladder rung, chosen at compile time.** An atlas holds URLs and the
+  arena's cell size varies per frame, so picking per frame would mean reloading
+  art mid-match. The arena caps at 15 px a cell, so the 32-texel rung is the
+  one selected. The others are stored and reachable — a device-pixel-aware
+  arena changes one function.
+- **The Nyquist bound on per-step expressions** (14, risks) is not enforced. An
+  author can still write `sin(tau * time * 40)` and alias against the 32-step
+  ring. The check is cheap — sample at 2× ring resolution and compare — and it
+  is not in.
