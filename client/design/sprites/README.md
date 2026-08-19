@@ -3,8 +3,20 @@
 Drop sourced square images here, then run:
 
 ```bash
-python3 client/design/tools/sprite_sheet.py client/design/sprites/*.png --rows 20
+# coats: a repeating texture, both axes must wrap
+python3 client/design/tools/sprite_sheet.py client/design/sprites/{zebra,tiger,race}*.png
+
+# the flag: a picture, one whole source repeat per frame at authored scale
+python3 client/design/tools/sprite_sheet.py \
+  client/design/sprites/stars-and-stripes.png --picture 20
 ```
+
+**A picture is not a texture.** `--picture N` builds each frame from one whole
+vertical repeat of the source and keeps the art's real proportions, so the frame
+comes out taller than the body and `Fit::Cutout` lets the silhouette clip it.
+The frame stride is one whole period, checked on the finished pixels: any other
+stride *translates* the picture between frames, and a translation across a
+one-cell body is indistinguishable from the snake rotating.
 
 The script measures both wrap joins, repairs them if it can, and writes the
 finished sheets to `client/web/public/images/skins/<name>.v1.png`. A sheet it
@@ -12,13 +24,13 @@ cannot repair is reported and saved to `client/design/tools/.sprite-state/`
 rather than failing the batch — check that directory after any run that warns.
 
 The output name is the input's basename, so the file names here decide the URLs
-`client/src/skin/sprite.rs` declares. The three it currently expects:
+`client/src/skin/sprite.rs` declares. The four it currently expects:
 
 | file to drop | becomes | worn as |
 |---|---|---|
 | `zebra-live.png` | `zebra-live.v1.png` | repeating coat |
 | `tiger-live.png` | `tiger-live.v1.png` | repeating coat |
-| `stars-and-stripes.png` | `stars-and-stripes.v1.png` | 20 cells from the head, fading out over the last 6 |
+| `stars-and-stripes.png` | `stars-and-stripes.v1.png` | picture: `--picture 20`, head-pinned, fading over the last 6 |
 | `race-livery.png` | `race-livery.v1.png` | repeating coat |
 
 Sources **are** committed here, which is the opposite of the rule the coat

@@ -475,8 +475,13 @@ static STARS_AND_STRIPES: Recipe = Recipe {
     sheet: Sheet {
         url: "images/skins/stars-and-stripes.v1.png",
         width: 320.0,
-        height: 440.0,
-        rows: DEFAULT_SPRITE_ROWS,
+        height: 308.0,
+        // Fourteen, not twenty: a picture's frames must step by a whole period
+        // of the source or they *translate* between frames, and a translation
+        // across a one-cell body is indistinguishable from the snake rotating.
+        // This source holds fourteen whole periods, so it gets fourteen honest
+        // frames rather than twenty that slide.
+        rows: 14,
         texels_per_cell: 16.0,
     },
     wear: Wear {

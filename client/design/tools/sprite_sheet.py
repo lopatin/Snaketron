@@ -537,6 +537,47 @@ def crop_to_period(image, period):
     return image.crop((0, top, image.width, top + period))
 
 
+def frame_translation(sheet, rows):
+    """Pixels the picture *moves* between consecutive frames. Must be zero.
+
+    The bug this exists to make impossible: frames sampled at a stride that is
+    not a whole period do not change phase, they **translate**. Playing them
+    slides the picture across the body, and a slide across something one cell
+    wide reads as the snake rotating. Measured on the first attempt: a stride of
+    61.5px against an 85px period moved the flag 1.00 cells per frame against a
+    1.00-cell body.
+
+    Checked on the finished pixels rather than on the arithmetic that produced
+    them, so it holds however a sheet was built.
+    """
+    pixels = np.asarray(sheet.convert("RGB"), dtype=np.float64) @ np.array(
+        [0.2126, 0.7152, 0.0722]
+    )
+    height = pixels.shape[0] // rows
+    if height < 4:
+        return 0
+    shifts = []
+    for row in range(rows):
+        first = pixels[row * height : (row + 1) * height]
+        second = pixels[((row + 1) % rows) * height :][:height]
+        if second.shape[0] != height:
+            continue
+        # Circular cross-correlation down the frame; the peak is how far the
+        # content moved. Zero means the frames are the same view.
+        a = first.mean(axis=1) - first.mean()
+        b = second.mean(axis=1) - second.mean()
+        if not np.any(a) or not np.any(b):
+            continue
+        correlation = np.fft.irfft(
+            np.fft.rfft(b) * np.conj(np.fft.rfft(a)), n=height
+        )
+        lag = int(np.argmax(correlation))
+        shifts.append(lag - height if lag > height // 2 else lag)
+    if not shifts:
+        return 0
+    return int(np.median(shifts))
+
+
 def frames_from_period(image, rows, cell, cells_long):
     """Build a sheet whose every row is **one whole repeat** of the source.
 
@@ -546,30 +587,41 @@ def frames_from_period(image, rows, cell, cells_long):
     one cell of body *width*: the whole picture ends up crammed across the
     snake, which reads as wrapped round a cylinder.
 
-    Here each row is instead one full repeat, sampled at a different phase down
-    the source. The source's own stack of copies is already a sequence of wave
-    phases, so playing the rows animates the picture rather than scrolling
-    through duplicates of it — and each frame is a complete, undistorted flag.
+    Rows step by **exactly one period**, which is the whole point and was the
+    bug the first time round. Stepping by anything else translates the picture
+    between frames instead of advancing its phase, and a translation across a
+    one-cell body is indistinguishable from the snake rotating. Stepping by a
+    whole period holds the picture still and animates only what genuinely
+    differs between the source's stacked copies.
 
-    Rows are as tall as the repeat's real aspect demands, which for a 14.7:1
-    flag is a little over one cell. `Fit::Cutout` draws that at authored scale
-    and the body clips the slivers.
+    That caps the frame count at however many whole periods the source holds —
+    fourteen for this flag — and fewer honest frames beat twenty that slide.
     """
     period = vertical_period(image)
+    available = max(1, image.height // period)
+    rows = min(rows, available)
     width = cells_long * cell
     # Uniform scale in both axes — the whole point is that nothing is squashed.
     scale = width / image.width
     row_height = max(1, int(round(period * scale)))
     sheet = Image.new("RGB", (width, row_height * rows))
     for row in range(rows):
-        # Evenly spaced phases through the source's stack of repeats.
-        top = int(round(row * (image.height - period) / max(1, rows - 1)))
+        top = row * period
         window = image.crop((0, top, image.width, top + period))
         sheet.paste(
             window.resize((width, row_height), Image.Resampling.LANCZOS),
             (0, row * row_height),
         )
-    return sheet, row_height
+
+    drift = frame_translation(sheet, rows)
+    if abs(drift) > max(1, row_height // 8):
+        raise ValueError(
+            f"frames translate {drift}px between them out of a {row_height}px "
+            f"frame — the picture would slide across the body and read as the "
+            f"snake rotating. The row stride must be one whole period "
+            f"({period}px of {image.height})."
+        )
+    return sheet, row_height, rows, drift
 
 
 def rotate_field(image, degrees):
@@ -703,6 +755,7 @@ def process(
     cells=None,
     rotate=0.0,
     period=None,
+    picture=None,
 ):
     """One image, end to end. Returns a report dict; never raises on a bad seam.
 
@@ -726,6 +779,32 @@ def process(
     # in the source or hide one that is.
     source = rotate_field(original, rotate)
     detected = vertical_period(source)
+    if picture:
+        # A picture sheet is built frame-per-period and skips everything below:
+        # there is no wrap to repair, because each row is one whole repeat of
+        # the source and the rows are frames rather than a continuous field.
+        sheet, row_height, built_rows, drift = frames_from_period(
+            source, rows, cell, int(picture)
+        )
+        if colors:
+            sheet = sheet.quantize(colors=colors, dither=Image.Dither.FLOYDSTEINBERG)
+        os.makedirs(out_dir, exist_ok=True)
+        destination = os.path.join(out_dir, f"{name}.v1.png")
+        sheet.save(destination, optimize=True)
+        return {
+            "name": name,
+            "source": path,
+            "source_size": [original.width, original.height],
+            "rows": built_rows,
+            "repaired": [],
+            "status": "ok",
+            "vertical_period": detected,
+            "frame_translation": drift,
+            "output": destination,
+            "output_size": [sheet.width, sheet.height],
+            "repeat_cells": round(sheet.width / cell, 2),
+            "cells_tall": round(row_height / cell, 3),
+        }
     cropped = None
     if period:
         source = crop_to_period(source, detected if period == "auto" else int(period))
@@ -882,6 +961,10 @@ def process(
         )
 
     sheet = unroll_half(rolled)
+    # Reported for every sheet, enforced only where it is a defect. A coat's
+    # rows are adjacent slices of fur and *do* travel, which reads as the coat
+    # shimmering; a picture that travels reads as the snake rotating.
+    report["frame_translation"] = frame_translation(sheet, rows)
     if not resize_first:
         sheet = wrapped_resize(sheet, rows * cell, width)
     if colors:
@@ -999,6 +1082,10 @@ def describe(report):
             f"\n      {label:20s} {ladder}   align {align.get('mad', 0):.1f} MAD "
             f"(lag {align.get('lag', 0):+d}px)"
         )
+    if report.get("frame_translation"):
+        line += (
+            f"\n      frames travel {report['frame_translation']}px between them"
+        )
     if report.get("vertical_period"):
         line += (
             f"\n      source repeats every {report['vertical_period']}px down"
@@ -1021,6 +1108,8 @@ def describe(report):
         line += f"\n      note: {warning}"
     if report.get("report"):
         line += f"\n      wrap check {report['report']}"
+    if report.get("cells_tall"):
+        line += f"\n      each frame is {report['cells_tall']} cells tall — the body clips it"
     if report.get("output"):
         size = report["output_size"]
         line += (
@@ -1036,6 +1125,14 @@ if __name__ == "__main__":
     parser.add_argument("images", nargs="+")
     parser.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     parser.add_argument("--cell", type=int, default=CELL, help="texels per row")
+    parser.add_argument(
+        "--picture",
+        type=int,
+        default=None,
+        help="build a picture sheet N cells long: one whole source repeat per "
+        "frame, at authored scale, for art the body should clip rather than "
+        "squash. Use with Fit::Cutout",
+    )
     parser.add_argument(
         "--period",
         default=None,
@@ -1103,6 +1200,7 @@ if __name__ == "__main__":
             cells=args.cells,
             rotate=args.rotate,
             period=args.period,
+            picture=args.picture,
         )
         reports.append(report)
         print(describe(report))
