@@ -41,6 +41,12 @@
   left: 50%;
   z-index: 6;
   pointer-events: none;
+  /* The arena measures the head against this box every movement tick and
+     fades the announcement out of its own way for the last couple of cells.
+     Default to fully opaque so any surface that does not drive the variable
+     (scenario capture, tests of the component in isolation) is unchanged. */
+  opacity: var(--combo-callout-proximity, 1);
+  transition: opacity 140ms linear;
   transform: translateX(-50%);
 }
 
@@ -1043,6 +1049,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .game-combo-callout,
   .game-combo-callout__burst,
   .game-boost-hud,
   .game-boost-meter,

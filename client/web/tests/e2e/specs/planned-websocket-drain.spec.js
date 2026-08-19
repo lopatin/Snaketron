@@ -24,7 +24,7 @@ const CONNECTION_BANNER_SHOW_DELAY_MS = 800;
 const CONNECTION_BANNER_MIN_VISIBLE_MS = 1_200;
 // This test expires the callout with an explicit snapshot. A long, valid
 // window keeps slow CI from racing the real predictor between UI assertions;
-// unit and engine tests continue to pin the production rule at two seconds.
+// unit and engine tests continue to pin the production rule at one second.
 const COMBO_CALLOUT_TEST_WINDOW_MS = 60_000;
 
 const gameState = (tick = 5) => ({
@@ -98,7 +98,18 @@ const snapshot = (streamSequence, tick = 5) => ({
   },
 });
 
-const comboSnapshot = (streamSequence, tick, chainCount, remainingMs) => {
+// Solo snake 0 renders at 270 degrees, where the renderer maps grid (x, y) to
+// screen (y, 39 - x). Grid x = 38 is therefore the second row from the top of
+// the screen, and grid y = 20 is its horizontal center: exactly under the
+// callout. Grid (20, 20) renders mid-field, well clear of it.
+const COMBO_HEAD_UNDER_CALLOUT = { x: 38, y: 20 };
+// Same column, ten rows down the screen: several cells clear of the callout's
+// bottom edge and therefore still fully opaque. This pins the fade to the last
+// couple of cells of the approach rather than the whole run-up.
+const COMBO_HEAD_BELOW_CALLOUT = { x: 29, y: 20 };
+const COMBO_HEAD_MID_FIELD = { x: 20, y: 20 };
+
+const comboSnapshot = (streamSequence, tick, chainCount, remainingMs, head) => {
   const frame = snapshot(streamSequence, tick);
   const state = frame.GameEvent.event.Snapshot.game_state;
   state.start_ms = Date.now() - tick * state.properties.tick_duration_ms;
@@ -111,6 +122,13 @@ const comboSnapshot = (streamSequence, tick, chainCount, remainingMs) => {
     chain_count: chainCount,
     remaining_ms: remainingMs,
   };
+  if (head) {
+    // Travel along the grid's y axis, which is the screen's x axis, so the
+    // head keeps its distance from the top edge while prediction advances
+    // between snapshots instead of driving into the wall.
+    state.arena.snakes[0].body = [head, { x: head.x, y: head.y + 3 }];
+    state.arena.snakes[0].direction = 'Up';
+  }
   state.arena.food = [{ x: 24, y: 20 }];
   return frame;
 };
@@ -2129,7 +2147,7 @@ test('Combo callout stays hidden while priming, then drains and re-pops', async 
   if (!buildingBurst) throw new Error('building Combo burst is missing');
 
   // Drive the authoritative timer directly instead of sleeping against the
-  // production two-second window. The right edge retreats while the left edge
+  // production one-second window. The right edge retreats while the left edge
   // stays anchored, making this deterministic even on a busy CI runner.
   await emitServerMessage(
     page,
@@ -2177,6 +2195,57 @@ test('Combo callout stays hidden while priming, then drains and re-pops', async 
   await expect(callout).toHaveAttribute('data-active', 'false');
   await expect(burst).toHaveCount(0);
   await expect(announcement).toHaveText('');
+});
+
+test('Combo callout fades out of the way of its own head, then returns', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
+  const callout = page.getByTestId('combo-callout');
+  const burst = page.getByTestId('combo-callout-burst');
+
+  // Prediction keeps advancing the head between snapshots, so each poll
+  // re-parks it rather than measuring one frozen frame. That also proves the
+  // fade tracks the head continuously instead of latching once.
+  let streamSequence = 10;
+  let tick = 5;
+  const opacityWithHeadAt = async (head) => {
+    streamSequence += 1;
+    tick += 1;
+    await emitServerMessage(
+      page,
+      socketIndex,
+      comboSnapshot(streamSequence, tick, 2, COMBO_CALLOUT_TEST_WINDOW_MS, head),
+    );
+    await expect(burst).toHaveCount(1);
+    return Number(await callout.evaluate((element) => (
+      window.getComputedStyle(element).opacity
+    )));
+  };
+
+  expect(await opacityWithHeadAt(COMBO_HEAD_MID_FIELD)).toBeGreaterThan(0.95);
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/combo-callout-clear.png`,
+      fullPage: true,
+    });
+  }
+
+  expect(await opacityWithHeadAt(COMBO_HEAD_BELOW_CALLOUT)).toBeGreaterThan(0.95);
+
+  await expect
+    .poll(() => opacityWithHeadAt(COMBO_HEAD_UNDER_CALLOUT))
+    .toBeLessThan(0.35);
+
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/combo-callout-dimmed.png`,
+      fullPage: true,
+    });
+  }
+
+  await expect
+    .poll(() => opacityWithHeadAt(COMBO_HEAD_MID_FIELD))
+    .toBeGreaterThan(0.95);
 });
 
 test('competitive results settle on the persisted regional ranking and remain visible', async ({ page }) => {

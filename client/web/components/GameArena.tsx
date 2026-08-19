@@ -49,6 +49,7 @@ import {
 } from '../utils/boostInput';
 import { buildBoostHudView } from '../utils/boostHud';
 import { buildComboHudView } from '../utils/comboHud';
+import { comboCalloutProximityOpacity } from '../utils/comboProximity';
 import { buildPlayerIdlePresentation } from '../utils/idlePresentation';
 import {
   createScoreEffectRuntime,
@@ -249,6 +250,7 @@ export default function GameArena() {
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const comboCalloutRef = useRef<HTMLDivElement>(null);
   const joinedGameIdRef = useRef<string | null>(null);
   const previousGameIdRef = useRef<string | null>(null);
   const drainingGameEventsRef = useRef(false);
@@ -1323,6 +1325,46 @@ export default function GameArena() {
     ? buildComboHudView(comboConfig, localSnake)
     : null;
 
+  // The callout parks at the top center of the field, which is somewhere the
+  // snake genuinely has to drive through. While a chain is live, measure the
+  // head against the callout's real box each movement tick and fade the
+  // announcement down for the last couple of cells so it stops hiding them,
+  // then bring it straight back once the head clears. Only the head is
+  // tracked: the body trails through ground the player already committed to.
+  const comboHeadCell = comboHud?.active ? localSnake?.body?.[0] : undefined;
+  const comboHeadX = comboHeadCell?.x;
+  const comboHeadY = comboHeadCell?.y;
+  useLayoutEffect(() => {
+    const callout = comboCalloutRef.current;
+    if (!callout) {
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas || comboHeadX === undefined || comboHeadY === undefined) {
+      callout.style.removeProperty('--combo-callout-proximity');
+      return;
+    }
+
+    const opacity = comboCalloutProximityOpacity({
+      head: { x: comboHeadX, y: comboHeadY },
+      arenaWidth: renderArenaWidth,
+      arenaHeight: renderArenaHeight,
+      rotation,
+      cellSize,
+      canvasRect: canvas.getBoundingClientRect(),
+      calloutRect: callout.getBoundingClientRect(),
+    });
+    callout.style.setProperty('--combo-callout-proximity', opacity.toFixed(3));
+  }, [
+    comboHeadX,
+    comboHeadY,
+    renderArenaWidth,
+    renderArenaHeight,
+    rotation,
+    cellSize,
+  ]);
+
   const currentStatus = gameState?.status;
   const isGameTerminal = Boolean(
     gameOver ||
@@ -1696,6 +1738,7 @@ export default function GameArena() {
         !isModalOwningInput
       )}
       pickupIdentity={`${gameId}:${localSnake.combo.chain_count}`}
+      containerRef={comboCalloutRef}
     />
   ) : null;
 
