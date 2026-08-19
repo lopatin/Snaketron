@@ -1311,7 +1311,6 @@ async fn handle_websocket_connection(
                                     // Check state before consuming it
                                     let was_in_game = matches!(&state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                     let was_in_lobby = matches!(&state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
-                                    let was_authenticated = matches!(&state, ConnectionState::Authenticated { .. });
                                     if was_in_lobby
                                         && matches!(
                                             &ws_message,
@@ -1377,8 +1376,11 @@ async fn handle_websocket_connection(
 
                                             // Join the social layer the moment there is an identity to be
                                             // present as, and keep the roster's activity honest afterwards.
+                                            // A failed claim (a Redis blip at exactly the wrong moment)
+                                            // retries on the next inbound message rather than leaving this
+                                            // connection socially invisible for its whole life.
                                             if let ConnectionState::Authenticated { metadata, .. } = &new_state {
-                                                if !was_authenticated && social_session.is_none() {
+                                                if social_session.is_none() && social_layer_admits(metadata) {
                                                     social_session = start_social_session(
                                                         metadata,
                                                         &websocket_id,
@@ -5940,6 +5942,17 @@ async fn send_challenge_inbox_if_changed(
     outcome
 }
 
+/// Whether this identity belongs in the social layer at all.
+///
+/// Separate from `start_social_session` because the answer never changes for a
+/// connection: a failed *claim* is worth retrying on the next message, but a
+/// stress identity being ineligible is not. Stress traffic is a separate
+/// matchmaking universe, and putting load-test names in everyone's roster
+/// would be visible to real players.
+fn social_layer_admits(metadata: &PlayerMetadata) -> bool {
+    u32::try_from(metadata.user_id).is_ok() && metadata.matchmaking_pool != MatchmakingPool::Stress
+}
+
 /// Bring one authenticated socket into the social layer: claim a presence
 /// lease, send the current roster and challenge state, and keep both live.
 async fn start_social_session(
@@ -5953,12 +5966,6 @@ async fn start_social_session(
     let Ok(user_id) = u32::try_from(metadata.user_id) else {
         return None;
     };
-    // Stress identities are a separate matchmaking universe and never appear
-    // to real players; giving them a social session would put load-test names
-    // in everyone's roster.
-    if metadata.matchmaking_pool == MatchmakingPool::Stress {
-        return None;
-    }
 
     let presence = PresenceRegistry::new(redis.clone(), region.to_string());
     let challenges = ChallengeStore::new(redis.clone());
