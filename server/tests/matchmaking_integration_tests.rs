@@ -13,7 +13,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 // Example: SNAKETRON_ENV=test cargo test -p server --test matchmaking_integration_tests
 
 mod common;
-use self::common::{TestClient, TestEnvironment};
+use self::common::{TestClient, TestEnvironment, is_unsolicited_push};
 
 // Serializes the tests in this binary: TestEnvironment::new() sets process-wide
 // env vars (DYNAMODB_TABLE_PREFIX, SNAKETRON_REDIS_URL) and flushes the shared
@@ -290,7 +290,7 @@ async fn test_queue_for_match_requires_an_explicit_lobby() -> Result<()> {
                         assert_eq!(reason, "Join a lobby before queueing for matchmaking");
                         return Ok::<(), anyhow::Error>(());
                     }
-                    WSMessage::UserCountUpdate { .. } => {}
+                    other if is_unsolicited_push(&other) => {}
                     other => {
                         return Err(anyhow::anyhow!(
                             "Expected no-lobby matchmaking denial, got {:?}",

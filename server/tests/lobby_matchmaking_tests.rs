@@ -26,7 +26,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 mod common;
-use self::common::{TestClient, TestEnvironment};
+use self::common::{TestClient, TestEnvironment, is_unsolicited_push};
 
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -513,7 +513,7 @@ async fn websocket_lobby_joins_are_denied_across_both_pool_directions() -> Resul
         loop {
             match stress_host.receive_message().await? {
                 WSMessage::AccessDenied { reason } => return Ok::<_, anyhow::Error>(reason),
-                WSMessage::UserCountUpdate { .. } => {}
+                other if is_unsolicited_push(&other) => {}
                 other => {
                     return Err(anyhow::anyhow!("Expected cross-pool denial, got {other:?}"));
                 }
@@ -538,7 +538,7 @@ async fn websocket_lobby_joins_are_denied_across_both_pool_directions() -> Resul
         loop {
             match public_joiner.receive_message().await? {
                 WSMessage::AccessDenied { reason } => return Ok::<_, anyhow::Error>(reason),
-                WSMessage::UserCountUpdate { .. } => {}
+                other if is_unsolicited_push(&other) => {}
                 other => {
                     return Err(anyhow::anyhow!("Expected cross-pool denial, got {other:?}"));
                 }
