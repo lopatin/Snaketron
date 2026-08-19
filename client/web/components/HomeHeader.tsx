@@ -13,6 +13,8 @@ import {
   UserPlusIcon,
 } from './Icons';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { useWallet } from '../contexts/WalletContext';
+import { BUX_UNIT, formatBux, shouldShowBuxChip } from '../utils/walletChip';
 import { useFullscreen } from '../hooks/useFullscreen';
 import { useInputSurface } from '../hooks/useInputSurface';
 
@@ -44,6 +46,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onLogout,
 }) => {
   const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
+  const { balanceBux } = useWallet();
   const fullscreen = useFullscreen();
   const inputSurface = useInputSurface();
   // The CrazyGames portal owns fullscreen chrome, and desktop users have F11;
@@ -205,6 +208,20 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
         </nav>
 
         <div className="home-account home-account-menu" ref={accountMenuRef}>
+          {/* Inside the account cluster rather than beside it: the header is a
+              two-child flexbox with `space-between`, so a third top-level child
+              would silently re-third the layout and move both existing groups. */}
+          {shouldShowBuxChip(Boolean(currentUser), balanceBux) && (
+            <Link
+              to="/skins"
+              className="home-bux-chip"
+              title={`${formatBux(balanceBux)} ${BUX_UNIT}`}
+              data-testid="home-bux-chip"
+            >
+              <span className="home-bux-amount">{formatBux(balanceBux)}</span>
+              <span className="home-bux-unit">{BUX_UNIT}</span>
+            </Link>
+          )}
           {showFullscreenToggle && (
             <button
               type="button"

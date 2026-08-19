@@ -275,6 +275,7 @@ export const buildMatchPresentation = (
   const players: MatchPlayerPresentation[] = gameState.arena.snakes.map((snake, snakeId) => {
     const userId = playerBySnake.get(snakeId) ?? null;
     const isCurrentPlayer = userId !== null && userId === currentUserId;
+    const skinRef = userId === null ? undefined : gameState.skins?.[userId];
     const skin: SnakeSkinInputs = {
       snake_index: snakeId,
       team_id: snake.team_id,
@@ -289,7 +290,12 @@ export const buildMatchPresentation = (
       // The skin this player is actually wearing, so the results swatch and the
       // roster portrait agree with what the arena drew. Absent for a snake with
       // no user (a bot, a vacated slot), which reads as the classic look.
-      skin_ref: userId === null ? undefined : gameState.skins?.[userId],
+      //
+      // Spread rather than assigned, so "no skin" is a missing key rather than
+      // a present one holding `undefined`. The two serialize identically and
+      // are different objects, which is exactly the sort of difference a
+      // structural comparison notices and a reader does not.
+      ...(skinRef === undefined ? {} : { skin_ref: skinRef }),
     };
     const score = valueAt(gameState.scores, snakeId);
     const isIdleKicked = userId !== null && idleKickedUserIds.has(userId);

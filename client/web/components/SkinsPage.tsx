@@ -4,6 +4,8 @@ import { HomeHeader } from './HomeHeader';
 import { SocialFooter } from './SocialFooter';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
+import { useWallet } from '../contexts/WalletContext';
+import { coerceBalance, purchaseMessage } from '../utils/walletChip';
 import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import type { CatalogEntry, SkinSummary } from '../types/generated';
@@ -373,6 +375,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
 
 const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   const { user, logout } = useAuth();
+  const { applyBalance } = useWallet();
   const [ready, setReady] = useState(false);
   const [snakeSkins, setSnakeSkins] = useState<CatalogEntry[]>([]);
   const [baseSkins, setBaseSkins] = useState<CatalogEntry[]>([]);
@@ -541,10 +544,29 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
           skin.priceBux,
           crypto.randomUUID(),
         );
+        // The server's number, always — only `purchased` actually debits, and
+        // any outcome can race a credit landing from a payment provider.
+        // Subtracting the price locally would be right most of the time, which
+        // is the worst kind of wrong for money.
+        applyBalance(coerceBalance(result.balanceBux));
         if (result.outcome === 'purchased' || result.outcome === 'alreadyOwned') {
           await equip('snake', skin.reference);
         }
       } catch (cause) {
+        // A refused purchase answers 402 or 409 with a `PurchaseResult` body
+        // and no `error` or `message` key at all, so the generic reader fell
+        // through to "Request failed" — which is what a player short of Bux
+        // was being told. It also carries the balance, which is worth taking.
+        if (isApiError(cause) && (cause.response.status === 402 || cause.response.status === 409)) {
+          const body = cause.response.data as {
+            outcome?: string;
+            balanceBux?: unknown;
+            actualPriceBux?: number | null;
+          };
+          applyBalance(coerceBalance(body.balanceBux));
+          setError(purchaseMessage(body.outcome, body.actualPriceBux));
+          return;
+        }
         setError(
           isApiError(cause)
             ? cause.message
@@ -552,7 +574,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
         );
       }
     },
-    [equip, onOpenAuth, user],
+    [applyBalance, equip, onOpenAuth, user],
   );
 
 

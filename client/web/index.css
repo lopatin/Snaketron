@@ -3802,6 +3802,50 @@ body {
   height: 18px;
 }
 
+/* The Boost Bux chip.
+
+   Borrowed from `.home-fullscreen-toggle` above — the only other bordered
+   element in this cluster — so the account corner reads as one set of
+   controls rather than two visual languages sharing a row. A link rather
+   than a readout, because the useful next thing to do with a balance is
+   spend it. */
+.home-bux-chip {
+  display: flex;
+  height: 40px;
+  flex: none;
+  align-items: baseline;
+  gap: 4px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 0 11px;
+  color: rgb(0 0 0 / 60%);
+  text-decoration: none;
+  transition: border-color 150ms ease, color 150ms ease;
+}
+
+.home-bux-chip:hover,
+.home-bux-chip:focus-visible {
+  border-color: #3b82f6;
+  color: rgb(0 0 0 / 80%);
+}
+
+.home-bux-amount {
+  align-self: center;
+  color: var(--game-graphite);
+  font-size: 13px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.home-bux-unit {
+  align-self: center;
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+}
+
 .home-account-action {
   padding: 8px 0;
   border: 0;
@@ -5515,6 +5559,12 @@ a.home-social-icon:hover {
     white-space: nowrap;
   }
 
+  /* Same cluster, same pressure: three rules already exist to stop this row
+     overflowing, and an unbounded chip would undo all of them. */
+  .home-bux-chip {
+    padding: 0 8px;
+  }
+
   .home-fullscreen-toggle {
     width: 36px;
     height: 36px;
@@ -6073,6 +6123,16 @@ a.home-social-icon:hover {
 
   .home-account-username {
     max-width: 84px;
+  }
+
+  /* Below this the header does not fit *before* the chip exists — the nav
+     alone is 258px against a 375px phone, which is why `overflow-x: hidden`
+     is doing quiet work here. Measured: the chip costs 69px on a cluster
+     already 22px over. So it goes, and the balance stays where it is
+     actionable anyway — the Skins page, one tap away, shows it beside the
+     things it buys. */
+  .home-bux-chip {
+    display: none;
   }
 }
 

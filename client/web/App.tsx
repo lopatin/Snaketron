@@ -22,6 +22,7 @@ import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { WalletProvider } from './contexts/WalletContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
@@ -356,7 +357,8 @@ function App() {
         <CrazyGamesProvider>
           <RuntimeConfigProvider>
             <AuthProvider>
-              <UIProvider>
+              <WalletProvider>
+                <UIProvider>
                 <LatencyProvider>
                   <WebSocketProvider>
                     <AdsProvider>
@@ -366,7 +368,8 @@ function App() {
                     </AdsProvider>
                   </WebSocketProvider>
                 </LatencyProvider>
-              </UIProvider>
+                </UIProvider>
+              </WalletProvider>
             </AuthProvider>
           </RuntimeConfigProvider>
         </CrazyGamesProvider>
