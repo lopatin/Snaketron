@@ -5470,10 +5470,9 @@ a.home-social-icon:hover {
 
   .home-main {
     align-items: flex-start;
-    /* Clears the mobile social rail — the online-players strip and the
-       challenges trigger share one row above the region selector and chat
-       dock — so scrolling to the bottom never parks content underneath it. */
-    padding: 154px 6px calc(140px + var(--ad-route-bottom-reserve));
+    /* Clears the challenges dock, which sits above the chat dock on the mobile
+       bottom rail, so scrolling to the bottom never parks content under it. */
+    padding: 154px 6px calc(126px + var(--ad-route-bottom-reserve));
   }
 
   .home-brand-lockup {
@@ -6223,41 +6222,49 @@ a.home-social-icon:hover {
 }
 
 /* Online players ------------------------------------------------------------
-   A floating black translucent strip naming everyone online in the region,
-   with a one-click challenge per row.
+   A floating column of names for everyone online in the region.
 
-   Deliberately the app's only dark content surface. It floats over whichever
-   screen you are on rather than sitting inside a page, and the paper-white
-   panel language would read as another page element competing for the same
-   plane. Horizontal and scrollable so a busy region stays one line tall.
-
-   Bottom-anchored chrome must offset by the ad reserve and the safe-area
-   inset, never a raw pixel value, or a live bottom banner covers it. It sits
-   above the z-50/55 banner layer for the same reason, and below the game-over
-   card at 80. */
+   Black and translucent because it floats over whichever screen you are on;
+   the app's white paper surfaces are page furniture and this is not part of
+   the page. Square corners, no per-name rules or fills: it is a list, and
+   every box drawn around a name is one more thing between the reader and the
+   names. Which margin it sits in is decided at runtime — see
+   utils/panelPlacement.ts. */
 .online-players {
   position: fixed;
   z-index: 56;
-  /* Shares the bottom rail with the region selector on the left and the chat
-     dock on the right, inset far enough to clear both. Sitting a row higher
-     would put a full-width strip straight across the primary call to action,
-     which is worse than a narrower strip. */
-  right: calc(190px + env(safe-area-inset-right, 0px));
-  bottom: calc(20px + var(--ad-route-bottom-reserve));
-  left: calc(190px + env(safe-area-inset-left, 0px));
+  /* Centred in the band between the header and the bottom dock rail, not in
+     the viewport: plain centring puts the panel's lower edge into the
+     challenges dock, which shares this side. */
+  top: calc(50% - 40px);
+  width: 176px;
+  max-height: min(560px, calc(100svh - 300px));
   display: flex;
-  max-width: min(920px, calc(100vw - 40px));
-  align-items: center;
-  gap: 12px;
-  margin: 0 auto;
-  padding: 8px 12px;
-  border: 1px solid rgb(255 255 255 / 14%);
-  border-radius: 10px;
+  flex-direction: column;
+  padding: 10px 0 4px;
+  border: 1px solid rgb(255 255 255 / 12%);
   background: rgb(9 12 20 / 72%);
   -webkit-backdrop-filter: blur(10px);
   backdrop-filter: blur(10px);
   color: #fff;
   box-shadow: 0 10px 30px rgb(0 0 0 / 22%);
+  transform: translateY(-50%);
+}
+
+.online-players.is-right {
+  right: 0;
+  border-right: none;
+}
+
+.online-players.is-left {
+  left: 0;
+  border-left: none;
+}
+
+/* Collapsed it is just the region tag, so it costs a sliver of the margin. */
+.online-players.is-collapsed {
+  width: auto;
+  padding: 0;
 }
 
 .online-players-toggle {
@@ -6265,21 +6272,23 @@ a.home-social-icon:hover {
   flex: none;
   align-items: center;
   gap: 8px;
-  padding: 4px 8px;
+  padding: 4px 12px 10px;
   border: none;
-  border-radius: 6px;
   background: transparent;
-  color: rgb(255 255 255 / 78%);
+  color: rgb(255 255 255 / 72%);
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.8px;
   text-transform: uppercase;
   cursor: pointer;
-  transition: background-color 150ms ease, color 150ms ease;
+  transition: color 150ms ease;
+}
+
+.online-players.is-collapsed .online-players-toggle {
+  padding: 10px 12px;
 }
 
 .online-players-toggle:hover {
-  background: rgb(255 255 255 / 8%);
   color: #fff;
 }
 
@@ -6291,30 +6300,33 @@ a.home-social-icon:hover {
   background: #22c55e;
 }
 
+.online-players-region {
+  overflow: hidden;
+  flex: 1;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .online-players-count {
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: rgb(255 255 255 / 12%);
-  color: #fff;
+  flex: none;
+  color: rgb(255 255 255 / 45%);
   font-variant-numeric: tabular-nums;
 }
 
 .online-players-list {
-  overflow-x: auto;
+  overflow-y: auto;
   flex: 1;
-  min-width: 0;
-  /* Thin and dark: a default scrollbar is a light-on-light bar across the
-     bottom of a black panel. */
+  min-height: 0;
   scrollbar-width: thin;
   scrollbar-color: rgb(255 255 255 / 22%) transparent;
 }
 
 .online-players-list::-webkit-scrollbar {
-  height: 5px;
+  width: 5px;
 }
 
 .online-players-list::-webkit-scrollbar-thumb {
-  border-radius: 3px;
   background: rgb(255 255 255 / 22%);
 }
 
@@ -6323,32 +6335,30 @@ a.home-social-icon:hover {
 }
 
 .online-players-list ul {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  display: grid;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .online-player {
-  display: flex;
-  flex: none;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
-  max-width: 240px;
-  padding: 5px 6px 5px 9px;
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 7px;
+  padding: 4px 12px;
+}
+
+.online-player:hover {
   background: rgb(255 255 255 / 6%);
 }
 
 .online-player-status {
   width: 5px;
   height: 5px;
-  flex: none;
-  border-radius: 50%;
+  border-radius: 2px;
   background: #22c55e;
+  cursor: help;
 }
 
 .online-player-status.is-lobby {
@@ -6356,91 +6366,80 @@ a.home-social-icon:hover {
 }
 
 .online-player-status.is-playing {
-  background: rgb(255 255 255 / 32%);
+  background: rgb(255 255 255 / 30%);
 }
 
 .online-player-name {
   overflow: hidden;
-  max-width: 130px;
   color: #fff;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.online-player-activity {
-  color: rgb(255 255 255 / 45%);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
+/* A link, not a button: no container, and no underline until it is wanted. */
 .online-player-challenge {
-  display: flex;
-  width: 26px;
-  height: 26px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid rgb(255 255 255 / 16%);
-  border-radius: 6px;
-  background: rgb(255 255 255 / 8%);
-  color: #fff;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #93c5fd;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-decoration: none;
   cursor: pointer;
-  transition: background-color 150ms ease, border-color 150ms ease, opacity 150ms ease;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
 }
 
-.online-player-challenge:hover:not(:disabled) {
-  border-color: var(--game-blue);
-  background: var(--game-blue);
+/* Revealed on approach, so a resting list is only names. Keyboard users get
+   it on focus, and coarse pointers — which have no hover — always. */
+.online-player:hover .online-player-challenge,
+.online-player-challenge:focus-visible {
+  opacity: 1;
 }
 
-.online-player-challenge:disabled {
-  cursor: default;
-  opacity: 0.35;
+.online-player-challenge:hover,
+.online-player-challenge:focus-visible {
+  color: #fff;
+  text-decoration: underline;
 }
 
-.online-player-challenge.is-pending {
-  border-color: var(--game-boost);
-  color: var(--game-boost);
-  opacity: 0.8;
+@media (hover: none) {
+  .online-player-challenge {
+    opacity: 1;
+  }
 }
 
-.online-player-challenge-icon {
-  width: 14px;
-  height: 14px;
+.online-player-pending {
+  color: rgb(255 255 255 / 40%);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
 }
 
 .online-players-empty,
 .online-players-overflow {
   margin: 0;
-  color: rgb(255 255 255 / 52%);
+  padding: 2px 12px 6px;
+  color: rgb(255 255 255 / 45%);
   font-size: 11px;
   font-weight: 600;
-  white-space: nowrap;
-}
-
-.online-players-overflow {
-  padding-left: 8px;
 }
 
 .online-players-error {
-  position: absolute;
-  right: 12px;
-  bottom: calc(100% + 8px);
   display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0;
-  padding: 7px 10px;
-  border: 1px solid rgb(239 68 68 / 45%);
-  border-radius: 7px;
-  background: rgb(9 12 20 / 92%);
+  flex: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  border-top: 1px solid rgb(239 68 68 / 35%);
   color: #fecaca;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
 }
 
@@ -6451,17 +6450,9 @@ a.home-social-icon:hover {
   cursor: pointer;
 }
 
-/* Collapsed, it hugs the left of its track rather than the viewport edge, so
-   it never drifts under the chat dock. */
-.online-players.is-collapsed {
-  right: auto;
-  max-width: none;
-  padding: 6px 8px;
-}
-
 .online-players :is(button, a):focus-visible {
   outline: 2px solid #93c5fd;
-  outline-offset: 2px;
+  outline-offset: -2px;
 }
 
 /* Challenges dock -----------------------------------------------------------
@@ -6863,43 +6854,21 @@ a.home-social-icon:hover {
 @media (max-width: 700px) {
   /* Phones get the collapsed strip by default: a full roster row would take
      the whole width that the nickname form and play button need. */
-  /* Two rows is all there is room for on a phone: the region selector and
-     chat dock own the bottom one, and the strip shares the row above with the
-     challenges trigger. Stacking them into a third row would put a floating
-     panel across the play button. */
+  /* A phone has no margin to float in, so the panel always resolves to "does
+     not fit" and starts as the collapsed region tag. Vertical centring would
+     park that tag in the middle of the form, so on mobile it hangs from the
+     band between the header and the content instead, and opens downward from
+     there. The bottom rail is not an option: the region selector already sits
+     there showing this same region and count. */
   .online-players {
-    /* Just clear of the icon-only challenges trigger sharing this row. */
-    right: calc(78px + env(safe-area-inset-right, 0px));
-    bottom: calc(68px + var(--ad-route-bottom-reserve));
-    left: calc(12px + env(safe-area-inset-left, 0px));
-    padding: 6px 8px;
-  }
-
-  .online-players.is-collapsed {
-    right: auto;
-  }
-
-  .online-player {
-    max-width: 200px;
-  }
-
-  .online-player-activity {
-    display: none;
+    top: calc(88px + env(safe-area-inset-top, 0px));
+    max-height: min(420px, calc(100svh - 220px));
+    transform: none;
   }
 
   .challenges-dock {
     right: calc(12px + env(safe-area-inset-right, 0px));
     bottom: calc(68px + var(--ad-route-bottom-reserve));
-  }
-
-  .challenges-trigger {
-    min-width: 0;
-  }
-
-  /* The label is what the strip needs the width for; the icon plus its badge
-     still says which dock this is. */
-  .challenges-trigger .home-chat-label {
-    display: none;
   }
 
   .challenges-panel {
@@ -6925,10 +6894,20 @@ a.home-social-icon:hover {
 
 @media (forced-colors: active) {
   .online-players,
-  .online-player,
   .share-game-popover,
   .challenge-row {
     border: 1px solid CanvasText;
+  }
+
+  /* Forced colours drop the translucent fill the panel relies on, so the
+     hover row and the challenge link need marks of their own. */
+  .online-player:hover {
+    background: Highlight;
+  }
+
+  .online-player-challenge {
+    opacity: 1;
+    text-decoration: underline;
   }
 }
 
