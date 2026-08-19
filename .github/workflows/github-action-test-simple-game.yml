@@ -248,19 +248,23 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Gate 2: the skin pixel suite.
+  # The wasm build, and only the wasm build.
   #
-  # `specs/skins-prd.md` section 6.2 described this and it was never built; the
-  # shading engine (`specs/skin-shading-prd.md` sections 12 and 17) makes it a
-  # prerequisite rather than a nice-to-have, because a golden op trace stops
-  # being a proxy for appearance the moment a lowering changes grammar.
+  # This was the skin pixel-parity gate: every shipped skin rendered headless
+  # and compared against a committed baseline sheet. It was removed as too
+  # expensive for what it caught — a Chromium install, a browser run, and a
+  # megabyte of baseline PNGs that had to be re-blessed whenever any shared
+  # painting changed.
   #
-  # This is the only job that builds wasm, so it is also the only place a
-  # `wasm32` compile error is caught before someone loads the game.
-  skin-pixels:
-    name: Skin Pixel Parity (Gate 2)
+  # What is kept is the part that was never really about skins. This is the
+  # only job that compiles to `wasm32`, so without it a `#[cfg(target_arch =
+  # "wasm32")]` block or a `#[wasm_bindgen]` signature can break and every
+  # other job still passes — the failure surfacing when somebody loads the
+  # game. It costs a couple of minutes and no browser.
+  wasm-build:
+    name: WASM Build and Type Check
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
@@ -298,27 +302,8 @@ jobs:
         run: npm ci
         working-directory: client/web
 
+      # Needs the wasm build above: the generated client.d.ts is what types
+      # every `getWasm()` call site.
       - name: Type-check the web client
         run: npx tsc --noEmit
         working-directory: client/web
-
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
-        working-directory: client/web
-
-      # Never bless in CI. A run that could re-record its own baselines would
-      # pass by rewriting the thing it is checking against.
-      - name: Compare every skin against its committed baseline
-        run: npm run test:skins
-        working-directory: client/web
-        env:
-          CI: 'true'
-
-      - name: Upload failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: skin-pixel-failures-${{ github.sha }}
-          path: client/web/test-results/**
-          if-no-files-found: ignore
-          retention-days: 7

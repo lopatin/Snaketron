@@ -48,8 +48,10 @@ Read the one closest to what you want before writing a fourth.
   the PNGs are build output and are never hand-edited.
 
 Prefer shapes to pixels when both would work. A texture costs a fetch, cannot be
-tinted per role, and is invisible to every native test — the only oracle for it
-is the browser suite in `client/web/tests/skins`.
+tinted per role, and is **invisible to every automated test**: natively no atlas
+image is ever ready, so the suites exercise the fallback layers and never the
+pixels. The only oracle for a texture is you, looking at `/qa/skins` and at the
+committed contact sheet.
 
 ### Making a texture tile: the `[T, X, T]` trick
 
@@ -526,10 +528,9 @@ Errors name the field and say what the rule protects. Fix, re-run.
 - Both: add the id to `CATALOG` in `server/src/skin_catalog.rs`. The two lists
   are compared by a test, so forgetting one fails the build rather than
   silently giving players a skin that turns back into classic at join.
-- Also add it to `SHIPPED_SKINS` in `client/web/tests/skins/baseline-specs.mjs`
-  and record a baseline (step 5). Nothing fails if you skip this — the skin just
-  ships with no appearance oracle at all, which for a textured skin means no
-  oracle whatsoever.
+- Capture a contact sheet (step 4) and commit it under
+  `docs/screenshots/skins/<name>/`. Nothing enforces this, and it is the only
+  durable record of what the skin looked like when it shipped.
 
 ## 4. Look at it
 
@@ -582,18 +583,18 @@ exit green. The suite discovers every registered skin itself.
 The classic golden traces must be **untouched**. If they moved, you changed
 shared code, not just your skin — go find out what.
 
-Then the browser oracle, which is the only thing that has seen your skin's
-actual pixels:
+**There is no pixel oracle.** A headless per-skin baseline suite used to run
+here and was removed as too expensive: a Chromium install, a browser run, and a
+megabyte of PNGs to re-bless whenever any shared painting changed. What it
+bought is now yours to do by hand, and the gap is real — so when you touch
+anything **shared** (`skin::space`, `skin::composite`, a corner or clip policy),
+look at more than your own skin. The last such change moved nine skins and the
+worst tile was `one_cell_runs` every time; only a sweep of the contact sheets
+would have caught that now.
 
-```bash
-cd client/web && SKIN_BASELINE_BLESS=1 npx playwright test --config playwright.skins.config.js
-```
-
-Blessing re-records **every** skin, so `git status` on
-`client/web/tests/skins/baselines/` afterwards is a free regression check: only
-your new sheet should appear. Any existing baseline showing as modified means
-you changed shared painting code, and the diff is the review. Re-run without
-`SKIN_BASELINE_BLESS` to confirm the committed sheets pass.
+`cargo test -p client` still catches op-stream changes on every registered skin,
+which is what the golden traces and the conformance suite are for. It cannot see
+colour, texture, or antialiasing.
 
 ## 6. Ship it
 
