@@ -44,6 +44,7 @@ pub mod skin_store;
 pub mod sync_trace;
 pub mod telemetry;
 pub mod user_cache;
+pub mod wallet;
 pub mod ws_server;
 pub mod xp_persistence;
 

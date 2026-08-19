@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use super::models::*;
 use super::skins_dynamo;
-use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
+use super::{Database, PurchaseOutcome, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
     canonical_json_bytes, match_history_summary,
@@ -36,6 +36,7 @@ use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
     SkinRevision,
 };
+use crate::wallet::{self, LedgerSource, Wallet};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -3657,6 +3658,298 @@ impl Database for DynamoDatabase {
             .context("Failed to update user equipment")?;
 
         Ok(())
+    }
+
+    // ---- Boost Bux --------------------------------------------------------
+
+    async fn apply_ledger_entry(
+        &self,
+        user_id: i32,
+        source: LedgerSource,
+        idempotency_key: &str,
+        delta: i64,
+        request_hash: &str,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now().timestamp_millis();
+        let sort_key = wallet::ledger_sort_key(source, idempotency_key);
+
+        let mut entry = HashMap::new();
+        entry.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        entry.insert("sk".to_string(), Self::av_s(&sort_key));
+        entry.insert("source".to_string(), Self::av_s(source.as_str()));
+        entry.insert("idempotencyKey".to_string(), Self::av_s(idempotency_key));
+        entry.insert("delta".to_string(), Self::av_n(delta));
+        entry.insert("requestHash".to_string(), Self::av_s(request_hash));
+        entry.insert("createdAtMs".to_string(), Self::av_n(now));
+        if let Some(note) = note {
+            entry.insert("note".to_string(), Self::av_s(note));
+        }
+        // The ledger is a financial record and outlives the session that made
+        // it, so unlike the job items it carries no TTL.
+        entry.insert(
+            "gsi2pk".to_string(),
+            Self::av_s(format!("WALLET#{user_id}")),
+        );
+        entry.insert("gsi2sk".to_string(), Self::av_s(format!("{now:020}")));
+
+        let put_entry = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(entry))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build a ledger entry")?;
+        let move_balance = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD boostBux :delta")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":delta", Self::av_n(delta))
+            .build()
+            .context("Failed to build a balance change")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_entry).build())
+            .transact_items(TransactWriteItem::builder().update(move_balance).build())
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                // The key is taken. Whether that is a duplicate or a collision
+                // depends on whether the request matches what it was taken for.
+                let existing = self
+                    .client
+                    .get_item()
+                    .table_name(self.main_table())
+                    .key("pk", Self::av_s(format!("USER#{user_id}")))
+                    .key("sk", Self::av_s(&sort_key))
+                    .send()
+                    .await
+                    .context("Failed to read an existing ledger entry")?
+                    .item;
+
+                match existing.as_ref().and_then(|item| {
+                    item.get("requestHash").and_then(|value| match value {
+                        AttributeValue::S(hash) => Some(hash.clone()),
+                        _ => None,
+                    })
+                }) {
+                    Some(stored) if stored == request_hash => Ok(false),
+                    Some(_) => Err(anyhow!(
+                        "idempotency key already used for a different request"
+                    )),
+                    // The condition failed but no entry exists, so it was the
+                    // balance update's condition: there is no such user.
+                    None => Err(anyhow!("User not found")),
+                }
+            }
+            Err(error) => Err(error).context("Failed to apply a ledger entry"),
+        }
+    }
+
+    async fn get_wallet(&self, user_id: i32, recent_limit: usize) -> Result<Wallet> {
+        let balance_bux = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read a wallet balance")?
+            .item
+            .and_then(|item| Self::extract_i64(&item, "boostBux"))
+            .unwrap_or(0);
+
+        // Newest first, off the time-ordered index: the ledger's own sort key
+        // orders by idempotency key, which is a UUID and therefore not a time.
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI2")
+            .key_condition_expression("gsi2pk = :wallet")
+            .expression_attribute_values(":wallet", Self::av_s(format!("WALLET#{user_id}")))
+            .scan_index_forward(false)
+            .limit(recent_limit.clamp(1, 100) as i32)
+            .send()
+            .await
+            .context("Failed to read a wallet ledger")?;
+
+        let recent = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| {
+                Some(wallet::LedgerEntry {
+                    source: LedgerSource::parse(&Self::extract_string(item, "source")?)?,
+                    idempotency_key: Self::extract_string(item, "idempotencyKey")?,
+                    delta: Self::extract_i64(item, "delta").unwrap_or(0),
+                    request_hash: Self::extract_string(item, "requestHash").unwrap_or_default(),
+                    created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
+                    note: Self::extract_string(item, "note"),
+                })
+            })
+            .collect();
+
+        Ok(Wallet {
+            balance_bux,
+            recent,
+        })
+    }
+
+    async fn purchase_skin(
+        &self,
+        user_id: i32,
+        skin_id: i32,
+        expected_price_bux: u32,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<PurchaseOutcome> {
+        if self.has_skin_grant(user_id, skin_id).await? {
+            return Ok(PurchaseOutcome::AlreadyOwned);
+        }
+
+        let skin = self
+            .get_skin(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+        if skin.price_bux != expected_price_bux {
+            return Ok(PurchaseOutcome::PriceChanged {
+                actual_bux: skin.price_bux,
+            });
+        }
+
+        // A free skin needs no ledger row at all: nothing moves, so there is
+        // nothing to make idempotent beyond the grant, which already is.
+        if skin.price_bux == 0 {
+            self.grant_skin(user_id, skin_id, GrantSource::Grant, 0)
+                .await?;
+            return Ok(PurchaseOutcome::Purchased);
+        }
+
+        let wallet = self.get_wallet(user_id, 1).await?;
+        if !wallet.may_spend(skin.price_bux) {
+            return Ok(PurchaseOutcome::InsufficientFunds);
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let price = i64::from(skin.price_bux);
+
+        let mut entry = HashMap::new();
+        entry.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        entry.insert(
+            "sk".to_string(),
+            Self::av_s(wallet::ledger_sort_key(
+                LedgerSource::Purchase,
+                idempotency_key,
+            )),
+        );
+        entry.insert(
+            "source".to_string(),
+            Self::av_s(LedgerSource::Purchase.as_str()),
+        );
+        entry.insert("idempotencyKey".to_string(), Self::av_s(idempotency_key));
+        entry.insert("delta".to_string(), Self::av_n(-price));
+        entry.insert("requestHash".to_string(), Self::av_s(request_hash));
+        entry.insert("createdAtMs".to_string(), Self::av_n(now));
+        entry.insert("skinId".to_string(), Self::av_n(skin_id));
+        entry.insert(
+            "gsi2pk".to_string(),
+            Self::av_s(format!("WALLET#{user_id}")),
+        );
+        entry.insert("gsi2sk".to_string(), Self::av_s(format!("{now:020}")));
+
+        // Three conditions, one transaction: the key is unused, the wallet can
+        // cover it, and the skin still costs what the buyer was shown. Any one
+        // of them failing takes the whole thing with it, so there is no state
+        // where a player is charged without receiving the skin.
+        let put_entry = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(entry))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build a purchase ledger entry")?;
+        let debit = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD boostBux :delta")
+            .condition_expression("attribute_exists(pk) AND boostBux >= :price")
+            .expression_attribute_values(":delta", Self::av_n(-price))
+            .expression_attribute_values(":price", Self::av_n(price))
+            .build()
+            .context("Failed to build a purchase debit")?;
+        let price_unchanged = ConditionCheck::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("priceBux = :price AND publication = :published")
+            .expression_attribute_values(":price", Self::av_n(skin.price_bux))
+            .expression_attribute_values(":published", Self::av_s(Publication::Published.as_str()))
+            .build()
+            .context("Failed to build a price check")?;
+        let grant = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::grant_item(
+                user_id,
+                skin_id,
+                GrantSource::Purchase,
+                skin.price_bux,
+                now,
+            )))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build a purchase grant")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_entry).build())
+            .transact_items(TransactWriteItem::builder().update(debit).build())
+            .transact_items(
+                TransactWriteItem::builder()
+                    .condition_check(price_unchanged)
+                    .build(),
+            )
+            .transact_items(TransactWriteItem::builder().put(grant).build())
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(PurchaseOutcome::Purchased),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                // Something moved under us between the reads above and the
+                // transaction. Re-read to say which, so the client can show the
+                // right thing rather than a generic failure.
+                if self.has_skin_grant(user_id, skin_id).await? {
+                    return Ok(PurchaseOutcome::AlreadyOwned);
+                }
+                let current = self.get_skin(skin_id).await?;
+                match current {
+                    Some(current) if current.price_bux != expected_price_bux => {
+                        Ok(PurchaseOutcome::PriceChanged {
+                            actual_bux: current.price_bux,
+                        })
+                    }
+                    _ => Ok(PurchaseOutcome::InsufficientFunds),
+                }
+            }
+            Err(error) => Err(error).context("Failed to purchase a skin"),
+        }
     }
 
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()> {

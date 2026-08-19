@@ -35,6 +35,7 @@ use crate::api::rate_limit::{
 };
 use crate::api::regions;
 use crate::api::skins;
+use crate::api::wallet as wallet_api;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::db::models::Game;
@@ -340,6 +341,11 @@ pub async fn install_http_application(
             "/api/skins/:skin_id/report",
             post(skins::report_skin).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
         )
+        .route("/api/wallet", get(wallet_api::get_wallet))
+        .route(
+            "/api/skins/:skin_id/purchase",
+            post(wallet_api::purchase_skin).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -424,6 +430,13 @@ pub async fn install_http_application(
 
     // Reading a skin document needs no account: a spectator or a replay viewer
     // holding a reference out of a snapshot has to be able to draw it.
+    let payment_routes = Router::new()
+        .route(
+            "/api/wallet/xsolla/webhook",
+            post(wallet_api::xsolla_webhook).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
+        )
+        .with_state(auth_state.clone());
+
     let skin_document_routes = Router::new()
         .route(
             "/api/skins/by-ref/:content_ref",
@@ -489,6 +502,7 @@ pub async fn install_http_application(
         .merge(news_routes)
         .merge(skin_catalog_routes)
         .merge(skin_document_routes)
+        .merge(payment_routes)
         .merge(replay_routes)
         .merge(public_game_routes)
         .merge(protected_leaderboard_routes)

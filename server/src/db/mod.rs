@@ -14,6 +14,7 @@ use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
     SkinRevision,
 };
+use crate::wallet::{LedgerSource, Wallet};
 use common::GameState;
 use models::*;
 
@@ -22,6 +23,23 @@ use models::*;
 /// lookup) so a region is never advertised while its servers are considered
 /// ineligible, or vice versa.
 pub const SERVER_HEARTBEAT_FRESHNESS_SECONDS: i64 = 60;
+
+/// What happened to a purchase attempt.
+///
+/// Every failure is named rather than collapsed into an error, because the
+/// client shows a different thing for each: a price that moved re-prompts, an
+/// empty wallet opens the shop, and an already-owned skin just equips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurchaseOutcome {
+    Purchased,
+    /// The caller already owned it. Idempotent success.
+    AlreadyOwned,
+    /// The stored price is not the one the buyer was shown.
+    PriceChanged {
+        actual_bux: u32,
+    },
+    InsufficientFunds,
+}
 
 /// The metadata a server registers under; heartbeats re-assert it so a
 /// registration deleted out from under a live server (TTL reaper, manual
@@ -175,6 +193,43 @@ pub trait Database: Send + Sync {
 
     async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>>;
     async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool>;
+
+    // ---- Boost Bux --------------------------------------------------------
+    //
+    // The balance is moved only by these, and only ever together with the
+    // ledger row that names the change (`crate::wallet`).
+
+    /// Apply one signed change to a balance, once.
+    ///
+    /// Returns whether this call was the one that applied it. A repeat of the
+    /// same key and the same request is `false` and changes nothing; a repeat
+    /// of the same key with a *different* request is an error, because it is
+    /// two different intentions wearing one name.
+    async fn apply_ledger_entry(
+        &self,
+        user_id: i32,
+        source: LedgerSource,
+        idempotency_key: &str,
+        delta: i64,
+        request_hash: &str,
+        note: Option<&str>,
+    ) -> Result<bool>;
+
+    async fn get_wallet(&self, user_id: i32, recent_limit: usize) -> Result<Wallet>;
+
+    /// Buy a skin: debit, grant, and ledger row, or none of them.
+    ///
+    /// `expected_price_bux` is conditioned on inside the transaction so a price
+    /// that moved between the confirm dialog and this call fails the purchase
+    /// rather than charging a price the buyer never saw.
+    async fn purchase_skin(
+        &self,
+        user_id: i32,
+        skin_id: i32,
+        expected_price_bux: u32,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<PurchaseOutcome>;
 
     /// Resolve one verified CrazyGames identity into a durable Snaketron
     /// account. Implementations own the uniqueness/claim transaction; callers

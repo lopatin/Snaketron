@@ -5263,6 +5263,25 @@ mod tests {
         ) -> ());
         unused_database_method!(list_skin_grants(user_id: i32) -> Vec<crate::skin_store::SkinGrant>);
         unused_database_method!(has_skin_grant(user_id: i32, skin_id: i32) -> bool);
+        unused_database_method!(apply_ledger_entry(
+            user_id: i32,
+            source: crate::wallet::LedgerSource,
+            idempotency_key: &str,
+            delta: i64,
+            request_hash: &str,
+            note: Option<&str>
+        ) -> bool);
+        unused_database_method!(get_wallet(
+            user_id: i32,
+            recent_limit: usize
+        ) -> crate::wallet::Wallet);
+        unused_database_method!(purchase_skin(
+            user_id: i32,
+            skin_id: i32,
+            expected_price_bux: u32,
+            idempotency_key: &str,
+            request_hash: &str
+        ) -> crate::db::PurchaseOutcome);
         unused_database_method!(resolve_crazygames_account(
             profile: &CrazyGamesProfile,
             guest_candidate_user_id: Option<i32>,
