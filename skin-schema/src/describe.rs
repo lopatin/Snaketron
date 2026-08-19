@@ -55,6 +55,7 @@ mod exhaustiveness {
         let ColorPair {
             fill: _,
             outline: _,
+            accent: _,
         } = value;
     }
 
@@ -381,6 +382,18 @@ fn describe_color_pair(prefix: &str, label: &str) -> FieldNode {
             children: vec![
                 node(&format!("{prefix}.fill"), "Fill", FieldKind::Color),
                 node(&format!("{prefix}.outline"), "Outline", FieldKind::Color),
+                optional(
+                    &format!("{prefix}.accent"),
+                    "Accent",
+                    vec![node(
+                        &format!("{prefix}.accent"),
+                        "Colour",
+                        FieldKind::Color,
+                    )],
+                    "A third colour for this skin's signature element. Left \
+                     alone, it is your fill.",
+                    serde_json::json!("#ffffff"),
+                ),
             ],
         },
     )

@@ -266,6 +266,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         // and the rim is the only thing here that does.
         swatch: outline.to_string(),
         accent: recipe.coat.to_string(),
+        extra: Vec::new(),
     };
 
     // Nothing about this family varies with the clock: a coat is a coat. One
@@ -289,7 +290,6 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         wave_phase_turns: 0.0,
         time_turns: 0.0,
         params: Vec::new(),
-        literals: Vec::new(),
     }];
 
     let mut layers = document_layers(

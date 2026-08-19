@@ -20,6 +20,7 @@ pub mod classic;
 pub mod composite;
 pub mod corpse;
 pub mod doc;
+pub mod docv2;
 pub mod ember;
 pub mod fixtures;
 pub mod geometry;

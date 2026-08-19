@@ -21,7 +21,7 @@
 //! expression in a static field fails deserialization rather than freezing
 //! quietly.
 
-use crate::expr::{Expr, ExprError, Tier};
+use crate::expr::{Expr, ExprError, Input, Tier};
 use crate::{
     BaseTheme, CelebrationTheme, LabelStyle, MAX_ANIMATION_PERIOD_MS, MAX_HEAD_CORE_RATIO,
     MAX_OUTLINE_EXTRA_PX, MIN_ANIMATION_PERIOD_MS, MIN_HEAD_CORE_RATIO, MIN_OUTLINE_EXTRA_PX,
@@ -160,6 +160,39 @@ impl Default for TransformV2 {
             scale_t: expr_one(),
             rotate_turns: expr_zero(),
         }
+    }
+}
+
+impl TransformV2 {
+    /// Whether this transform asks for nothing.
+    ///
+    /// Compares the parsed value rather than the source text, so `"1"`,
+    /// `"1.0"` and `1` are all the identity — an author should not be able to
+    /// pay for a canvas op by typing a zero differently.
+    pub fn is_identity(&self) -> bool {
+        let at = |expr: &PropExpr, value: f64| {
+            expr.parse()
+                .map(|parsed| {
+                    parsed.inputs().is_empty() && parsed.eval(&crate::expr::Env::default()) == value
+                })
+                .unwrap_or(false)
+        };
+        at(&self.translate_s, 0.0)
+            && at(&self.translate_t, 0.0)
+            && at(&self.scale_s, 1.0)
+            && at(&self.scale_t, 1.0)
+            && at(&self.rotate_turns, 0.0)
+    }
+
+    /// Each field with the name an error should use.
+    pub fn fields(&self) -> [(&'static str, &PropExpr); 5] {
+        [
+            ("translate_s", &self.translate_s),
+            ("translate_t", &self.translate_t),
+            ("scale_s", &self.scale_s),
+            ("scale_t", &self.scale_t),
+            ("rotate_turns", &self.rotate_turns),
+        ]
     }
 }
 
@@ -496,17 +529,26 @@ pub fn upgrade(doc: &SkinDoc) -> SkinDocV2 {
         lighten: track_sum(crate::TrackTarget::BodyLightness).map(PropExpr),
     };
 
-    // The head ramp's opacity carries what v1 split across `max_opacity`, the
-    // gradient-opacity tracks, and the travelling wave. The wave term reads
-    // `s`, which is what makes it travel; its sign convention (crests moving
-    // head-to-tail for positive speeds) is pinned by the compiler's fixture,
-    // not re-derived here.
+    // The head glow's whole curve, which v1 split across three places: a peak
+    // (`max_opacity` plus its tracks), a linear falloff the renderer applied,
+    // and a wave added *after* that falloff. Writing it out is not a
+    // translation loss — it is the point. The falloff stops being a shape the
+    // renderer knows and becomes something an author can see and change.
+    //
+    // The structure below mirrors the legacy arithmetic exactly, term for
+    // term and in the same association order, which is what lets a still
+    // document keep painting byte-identical pixels.
     let ramp_opacity = {
-        let mut source = format!("{}", doc.head.gradient.max_opacity);
-        if let Some(tracks) = track_sum(crate::TrackTarget::GradientOpacity) {
-            write!(source, " + {tracks}").expect("string write");
-        }
+        let peak = match track_sum(crate::TrackTarget::GradientOpacity) {
+            // Clamped the way the baked frame clamped it, so a peak driven
+            // past 1 by its tracks behaves as it always did.
+            Some(tracks) => format!("clamp({} + {tracks}, 0, 1)", doc.head.gradient.max_opacity),
+            None => format!("{}", doc.head.gradient.max_opacity),
+        };
+        let mut source = format!("(1 - s / {}) * {peak}", doc.head.gradient.length_cells);
         if let Some(wave) = doc.animation.as_ref().and_then(|spec| spec.wave.as_ref()) {
+            // The wave rides on top of the falloff rather than under it, which
+            // is why light still reaches the tail end of the glow.
             write!(
                 source,
                 " + {} * sin(tau * (s / {} - {} * time))",
@@ -605,17 +647,65 @@ pub fn upgrade(doc: &SkinDoc) -> SkinDocV2 {
     }
 }
 
-/// The tier a property's expression may not exceed, and why it is per
-/// property: an expression is evaluated where the renderer can afford to
-/// evaluate it, and each property has exactly one such place.
-fn tier_cap(property: &str) -> Tier {
-    match property {
-        // The head ramp already walks cells and prices its opacity per cell;
-        // band alpha is evaluated once per emitted tile.
-        "opacity(head_ramp)" | "band.alpha" => Tier::PerCell,
-        // Everything else is baked per step: transforms, stop geometry,
-        // radii, lightness shifts, drift rates, layer opacity.
-        _ => Tier::PerStep,
+/// Where in the renderer a property's expression is evaluated.
+///
+/// This is the schema's cost model made explicit, and it decides what an
+/// expression may read: an input is available exactly where the renderer knows
+/// it. Naming the site rather than capping a tier is what lets an error say
+/// *why* — "colours are baked once for every snake wearing the skin, so a
+/// palette shift cannot read `boost`" — and it is what the Builder shows
+/// beside each fx field so cost is visible where it is incurred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalSite {
+    /// Baked into the palette ring at registration. One colour string per
+    /// step, shared by every snake wearing the skin — so nothing per-snake.
+    Palette,
+    /// Once per snake, per frame: opacity, transforms, stop geometry, drift.
+    Snake,
+    /// Once per cell or per emitted tile: the head glow's curve, a band's
+    /// alpha. The only site that may read position along the body.
+    Cell,
+    /// Like [`EvalSite::Snake`], but the value's *range* has to be knowable
+    /// before the skin paints, because that range is what keeps a layer inside
+    /// the silhouette. Per-snake inputs are unbounded at registration, so they
+    /// are refused here.
+    Bounded,
+}
+
+impl EvalSite {
+    /// What an expression evaluated here is allowed to read.
+    pub fn allowed_inputs(self) -> &'static [Input] {
+        match self {
+            EvalSite::Palette | EvalSite::Bounded => &[Input::Time],
+            EvalSite::Snake => &[Input::Time, Input::Len, Input::Boost, Input::Seed],
+            EvalSite::Cell => &Input::ALL,
+        }
+    }
+
+    /// Why this site is limited the way it is, in the author's terms.
+    fn because(self) -> &'static str {
+        match self {
+            EvalSite::Palette => {
+                "colours are resolved once per animation step and shared by \
+                 every snake wearing the skin"
+            }
+            EvalSite::Snake => {
+                "this is worked out once per snake per frame, before the \
+                 renderer knows which cell it is painting"
+            }
+            EvalSite::Cell => "this is worked out for every cell",
+            EvalSite::Bounded => {
+                "this value's range has to be checkable before the skin paints \
+                 — it is what keeps the layer inside the snake"
+            }
+        }
+    }
+
+    /// `noise` is per-texel wherever it appears, so it is only affordable at
+    /// the one site that already runs per cell.
+    fn allows_noise(self) -> bool {
+        self == EvalSite::Cell
     }
 }
 
@@ -777,27 +867,44 @@ fn count_flattened(layers: &[LayerV2]) -> usize {
         .sum()
 }
 
-/// Parse one expression-valued property and hold it to its tier cap.
-fn check_expr(field: &str, property: &str, expr: &PropExpr, errors: &mut Vec<SkinDocError>) {
-    match expr.parse() {
-        Err(error) => errors.push(SkinDocError::new(field, format!("`{}`: {error}", expr.0))),
-        Ok(parsed) => {
-            let cap = tier_cap(property);
-            if parsed.tier() > cap {
-                let (uses, place) = match cap {
-                    Tier::PerStep => ("`s`, `t` or `noise`", "once per animation step"),
-                    Tier::PerCell => ("`t` or `noise`", "once per cell"),
-                    _ => ("inputs beyond its tier", "at its tier"),
-                };
-                errors.push(SkinDocError::new(
-                    field,
-                    format!(
-                        "reads {uses}, but this property is evaluated {place} — \
-                         the renderer has nowhere cheaper to put it"
-                    ),
-                ));
-            }
+/// Parse one expression-valued property and hold it to its evaluation site.
+fn check_expr(field: &str, site: EvalSite, expr: &PropExpr, errors: &mut Vec<SkinDocError>) {
+    let parsed = match expr.parse() {
+        Err(error) => {
+            errors.push(SkinDocError::new(field, format!("`{}`: {error}", expr.0)));
+            return;
         }
+        Ok(parsed) => parsed,
+    };
+
+    if let Some(offender) = parsed.inputs().first_outside(site.allowed_inputs()) {
+        errors.push(SkinDocError::new(
+            field,
+            format!(
+                "reads `{}`, which is not available here: {}. Available: {}",
+                offender.name(),
+                site.because(),
+                site.allowed_inputs()
+                    .iter()
+                    .map(|input| format!("`{}`", input.name()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+
+    // `noise` reads no input but is per-texel by construction, so the input
+    // check above cannot see it. Caught by tier instead.
+    if parsed.tier() == Tier::PerTexel && !site.allows_noise() {
+        errors.push(SkinDocError::new(
+            field,
+            format!(
+                "uses `noise`, which varies faster than anything else in the \
+                 language and is only affordable where the renderer already \
+                 works per cell: {}",
+                site.because()
+            ),
+        ));
     }
 }
 
@@ -811,7 +918,12 @@ fn check_color_ref(doc: &SkinDocV2, field: &str, color: &ColorRef, errors: &mut 
         ));
     }
     if let Some(lighten) = &color.lighten {
-        check_expr(&format!("{field}.lighten"), "lighten", lighten, errors);
+        check_expr(
+            &format!("{field}.lighten"),
+            EvalSite::Palette,
+            lighten,
+            errors,
+        );
     }
 }
 
@@ -829,26 +941,22 @@ fn validate_layer(
         ));
     }
 
-    let opacity_property = match &layer.body {
-        LayerBodyV2::HeadRamp { .. } => "opacity(head_ramp)",
-        _ => "opacity",
+    // The head glow is the one layer whose opacity is evaluated per cell,
+    // because it is the one layer that already walks them.
+    let opacity_site = match &layer.body {
+        LayerBodyV2::HeadRamp { .. } => EvalSite::Cell,
+        _ => EvalSite::Snake,
     };
     check_expr(
         &format!("{field}.opacity"),
-        opacity_property,
+        opacity_site,
         &layer.opacity,
         errors,
     );
-    for (name, expr) in [
-        ("translate_s", &layer.transform.translate_s),
-        ("translate_t", &layer.transform.translate_t),
-        ("scale_s", &layer.transform.scale_s),
-        ("scale_t", &layer.transform.scale_t),
-        ("rotate_turns", &layer.transform.rotate_turns),
-    ] {
+    for (name, expr) in layer.transform.fields() {
         check_expr(
             &format!("{field}.transform.{name}"),
-            "transform",
+            EvalSite::Snake,
             expr,
             errors,
         );
@@ -856,6 +964,23 @@ fn validate_layer(
 
     match &layer.body {
         LayerBodyV2::Group { layers } => {
+            // A group is flattened before the compositor ever sees it, and
+            // opacity flattens exactly: two opacities multiply into one.
+            // A transform does not. Composing two translate/rotate/scale
+            // triples is only an affine in general — a rotation between two
+            // non-uniform scales is a shear, which this triple cannot express
+            // — so a group transform would have to be either a matrix the
+            // renderer does not have or an approximation that looks right in
+            // the panel and wrong on a corner. Refused rather than rounded.
+            if !layer.transform.is_identity() {
+                errors.push(SkinDocError::new(
+                    format!("{field}.transform"),
+                    "a group cannot carry a transform: groups are flattened \
+                     away before painting, and two transforms do not combine \
+                     into one without shearing. Put the transform on each \
+                     layer inside the group.",
+                ));
+            }
             if depth >= MAX_GROUP_DEPTH {
                 errors.push(SkinDocError::new(
                     field.to_string(),
@@ -948,9 +1073,11 @@ fn validate_layer(
             if let DiscPaintV2::Ref(color) = paint {
                 check_color_ref(doc, &format!("{field}.paint"), color, errors);
             }
+            // Bounded: the disc may not escape the silhouette, and that has
+            // to be provable at registration.
             check_expr(
                 &format!("{field}.radius_ratio"),
-                "radius_ratio",
+                EvalSite::Bounded,
                 radius_ratio,
                 errors,
             );
@@ -1000,11 +1127,16 @@ fn validate_source(
                 let stop_field = format!("{field}.source.stops[{index}]");
                 check_expr(
                     &format!("{stop_field}.offset"),
-                    "stop",
+                    EvalSite::Snake,
                     &stop.offset,
                     errors,
                 );
-                check_expr(&format!("{stop_field}.alpha"), "stop", &stop.alpha, errors);
+                check_expr(
+                    &format!("{stop_field}.alpha"),
+                    EvalSite::Snake,
+                    &stop.alpha,
+                    errors,
+                );
                 check_color_ref(doc, &format!("{stop_field}.color"), &stop.color, errors);
             }
         }
@@ -1037,22 +1169,24 @@ fn validate_source(
                     "must be a length in cells",
                 ));
             }
+            // Bounded: |t_center| + half_width is what keeps a body layer off
+            // the Boost band.
             check_expr(
                 &format!("{field}.source.half_width"),
-                "band.geometry",
+                EvalSite::Bounded,
                 half_width,
                 errors,
             );
             check_expr(
                 &format!("{field}.source.t_center"),
-                "band.geometry",
+                EvalSite::Bounded,
                 t_center,
                 errors,
             );
             if let Some(alpha) = alpha {
                 check_expr(
                     &format!("{field}.source.alpha"),
-                    "band.alpha",
+                    EvalSite::Cell,
                     alpha,
                     errors,
                 );
@@ -1112,7 +1246,7 @@ fn validate_source(
             }
             check_expr(
                 &format!("{field}.source.drift_cells"),
-                "drift",
+                EvalSite::Snake,
                 drift_cells,
                 errors,
             );
@@ -1340,12 +1474,53 @@ mod tests {
         );
         assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
 
-        // Still document: every property is a constant expression.
+        // The glow's falloff is now written down rather than assumed by the
+        // renderer, so its curve reads `s` — but a still document's curve
+        // still reads no clock.
         let LayerBodyV2::HeadRamp { .. } = &v2.layers[2].body else {
             panic!("the third layer is the head ramp");
         };
         let ramp_opacity = v2.layers[2].opacity.parse().expect("grammatical");
-        assert_eq!(ramp_opacity.tier(), Tier::Constant);
+        assert_eq!(ramp_opacity.tier(), Tier::PerCell);
+        assert!(!ramp_opacity.inputs().contains(Input::Time), "still");
+
+        // Everything else about a still document folds to a constant.
+        assert!(
+            v2.layers
+                .iter()
+                .all(|layer| layer.opacity.parse().unwrap().inputs().is_empty()
+                    || matches!(layer.body, LayerBodyV2::HeadRamp { .. })),
+            "only the glow's curve should depend on anything"
+        );
+    }
+
+    /// The conversion has one obligation above all others: a still v1
+    /// document must go on painting exactly what it painted. The renderer's
+    /// legacy glow is `(1 - d/L) * peak`, and the converted expression has to
+    /// agree with it to the last bit — not approximately, because the parity
+    /// gate compares op *text* and a formatted f64 shows every bit.
+    #[test]
+    fn the_converted_glow_curve_is_bit_identical_to_the_legacy_falloff() {
+        let doc = classic_v1();
+        let v2 = upgrade(&doc);
+        let curve = v2.layers[2].opacity.parse().expect("grammatical");
+
+        let length = doc.head.gradient.length_cells;
+        let peak = doc.head.gradient.max_opacity;
+        for cell in 0..12 {
+            let distance = f64::from(cell);
+            // Exactly the arithmetic in `CompositeSkin::paint_layer`.
+            let legacy = (1.0 - distance / length) * peak;
+            let converted = curve.eval(&crate::expr::Env {
+                s: distance,
+                ..crate::expr::Env::default()
+            });
+            assert_eq!(
+                legacy.to_bits(),
+                converted.to_bits(),
+                "cell {cell}: {legacy} vs {converted}"
+            );
+        }
     }
 
     #[test]
@@ -1401,11 +1576,12 @@ mod tests {
         assert_eq!(
             v2.layers[2].opacity.0,
             format!(
-                "{} + 0.05 * sin(tau * time) + 0.08 * sin(tau * (s / 8 - 2 * time))",
-                doc.head.gradient.max_opacity
+                "(1 - s / {}) * clamp({} + 0.05 * sin(tau * time), 0, 1) \
+                 + 0.08 * sin(tau * (s / 8 - 2 * time))",
+                doc.head.gradient.length_cells, doc.head.gradient.max_opacity
             )
         );
-        // The wave reads `s`, and the ramp is the one place that may.
+        // The wave reads `s`, and the glow is the one place that may.
         assert_eq!(ramp.tier(), Tier::PerCell);
         assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
     }
@@ -1425,24 +1601,92 @@ mod tests {
         assert!(error.problem.contains("at byte 4"), "{error}");
     }
 
-    /// The tier discipline: a per-cell input on a per-step property is an
-    /// error naming what was read and where it would have to be evaluated.
+    /// Each property may read exactly what the renderer knows where that
+    /// property is evaluated, and the error names the offending input rather
+    /// than gesturing at a tier.
     #[test]
-    fn a_property_may_not_read_faster_than_its_tier() {
+    fn a_property_may_only_read_what_its_evaluation_site_knows() {
+        // `s` on a per-snake property: the value is worked out before the
+        // renderer knows which cell it is painting.
         let mut v2 = upgrade(&classic_v1());
         v2.layers[0].opacity = PropExpr("s / len".to_string());
+        let errors = validate_v2(&v2).expect_err("must fail");
+        let error = errors
+            .iter()
+            .find(|e| e.field == "layers[0].opacity")
+            .expect("the property is named");
+        assert!(error.problem.contains("`s`"), "{error}");
+        assert!(error.problem.contains("per snake per frame"), "{error}");
+
+        // The same expression is legal on the head glow, which walks cells.
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers[2].opacity = PropExpr("0.3 + 0.05 * sin(tau * (s / 8 - time))".to_string());
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+
+        // A colour shift is baked once for every snake wearing the skin, so
+        // it may not read a per-snake input even though a *layer* may.
+        let mut v2 = upgrade(&classic_v1());
+        let LayerBodyV2::Ribbon { color, .. } = &mut v2.layers[1].body else {
+            panic!("the second layer is the body ribbon");
+        };
+        color.lighten = Some(PropExpr("0.1 * boost".to_string()));
         let errors = validate_v2(&v2).expect_err("must fail");
         assert!(
             errors
                 .iter()
-                .any(|e| e.field == "layers[0].opacity" && e.problem.contains("animation step")),
+                .any(|e| e.problem.contains("`boost`") && e.problem.contains("every snake")),
             "{errors:?}"
         );
 
-        // The same expression is legal where the renderer walks cells.
+        // ...and the same input is fine on the layer's opacity, which is the
+        // PRD's boost-reactive coat.
         let mut v2 = upgrade(&classic_v1());
-        v2.layers[2].opacity = PropExpr("0.3 + 0.05 * sin(tau * (s / 8 - time))".to_string());
-        assert!(validate_v2(&v2).is_ok());
+        v2.layers[1].opacity = PropExpr("mix(0.7, 1.0, boost)".to_string());
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+    }
+
+    /// `noise` reads no input at all, so the input check cannot see it — it is
+    /// caught by tier, and only the per-cell site can afford it.
+    #[test]
+    fn noise_is_confined_to_the_one_site_that_already_works_per_cell() {
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers[1].opacity = PropExpr("0.6 + 0.4 * noise(1, 2)".to_string());
+        let errors = validate_v2(&v2).expect_err("must fail");
+        assert!(
+            errors.iter().any(|e| e.problem.contains("`noise`")),
+            "{errors:?}"
+        );
+
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers[2].opacity = PropExpr("0.3 * noise(s, time)".to_string());
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+    }
+
+    /// A bounded property is the one place a per-snake input is refused even
+    /// though the site is otherwise per-snake: the bound is what keeps the
+    /// layer inside the snake, and it has to be checkable before painting.
+    #[test]
+    fn a_bounded_property_refuses_inputs_that_cannot_be_bounded() {
+        let mut v2 = upgrade(&classic_v1());
+        let LayerBodyV2::HeadDisc { radius_ratio, .. } = &mut v2.layers[3].body else {
+            panic!("the fourth layer is the head cap");
+        };
+        *radius_ratio = PropExpr("0.5 * boost".to_string());
+        let errors = validate_v2(&v2).expect_err("must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.problem.contains("`boost`") && e.problem.contains("range")),
+            "{errors:?}"
+        );
+
+        // Animating it against the clock is fine — that range *is* knowable.
+        let mut v2 = upgrade(&classic_v1());
+        let LayerBodyV2::HeadDisc { radius_ratio, .. } = &mut v2.layers[3].body else {
+            panic!("the fourth layer is the head cap");
+        };
+        *radius_ratio = PropExpr("0.45 + 0.05 * sin(tau * time)".to_string());
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
     }
 
     /// The static/animatable split is a type boundary: an expression where a

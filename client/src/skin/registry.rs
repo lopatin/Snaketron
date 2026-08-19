@@ -7,6 +7,7 @@
 use crate::skin::animal::AnimalSkin;
 use crate::skin::checker::CheckerSkin;
 use crate::skin::doc::ParamSkin;
+use crate::skin::docv2::LayerSkin;
 use crate::skin::ember::EmberSkin;
 use crate::skin::sprite::SpriteSkin;
 use crate::skin::{ClassicSkin, SnakeSkin};
@@ -132,9 +133,10 @@ pub const MAX_AUTHORED_SKINS: usize = 64;
 ///
 /// A `Mutex` rather than a `RefCell` so the type is `Sync` and can live in a
 /// `static`; in wasm there is only ever one thread, so it is never contended.
-fn authored_skins() -> &'static std::sync::Mutex<Vec<(String, &'static ParamSkin)>> {
-    static AUTHORED: OnceLock<std::sync::Mutex<Vec<(String, &'static ParamSkin)>>> =
-        OnceLock::new();
+type SkinTable = std::sync::Mutex<Vec<(String, &'static dyn SnakeSkin)>>;
+
+fn authored_skins() -> &'static SkinTable {
+    static AUTHORED: OnceLock<SkinTable> = OnceLock::new();
     AUTHORED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
@@ -146,7 +148,7 @@ fn resolve_authored(id: &str) -> Option<&'static dyn SnakeSkin> {
     registered
         .iter()
         .find(|(reference, _)| reference == id)
-        .map(|(_, skin)| *skin as &'static dyn SnakeSkin)
+        .map(|(_, skin)| *skin)
 }
 
 /// Compile one player-authored document and make it resolvable.
@@ -189,9 +191,30 @@ pub fn register_authored_skin(content_ref: &str, document_json: &str) -> Result<
         ));
     }
 
-    let skin = ParamSkin::from_json(document_json).map_err(readable)?;
-    registered.push((content_ref.to_string(), Box::leak(Box::new(skin))));
+    registered.push((content_ref.to_string(), compile_document(document_json)?));
     Ok(())
+}
+
+/// Compile a document of either schema version.
+///
+/// The version is read from the document rather than from the caller, so a
+/// client that understands both never has to be told which it is looking at,
+/// and one that understands neither falls back to classic — the behaviour a
+/// document from a newer build has always had.
+///
+/// The compiled skin is leaked for the reason described on
+/// [`register_authored_skin`]: the render loop interns what it resolves, so a
+/// skin that could be freed while a frame still points at it would be a
+/// use-after-free rather than a saving.
+fn compile_document(json: &str) -> Result<&'static dyn SnakeSkin, String> {
+    match skin_schema::v2::load_any(json).map_err(readable)? {
+        skin_schema::v2::AnySkinDoc::V1(doc) => ParamSkin::compile(&doc)
+            .map(|skin| Box::leak(Box::new(skin)) as &'static dyn SnakeSkin)
+            .map_err(readable),
+        skin_schema::v2::AnySkinDoc::V2(doc) => LayerSkin::compile(&doc)
+            .map(|skin| Box::leak(Box::new(skin)) as &'static dyn SnakeSkin)
+            .map_err(readable),
+    }
 }
 
 /// Turn validator complaints into something a person can act on.
@@ -243,8 +266,8 @@ fn pretty_field(field: &str) -> String {
 /// catalogue id or a content reference.
 pub const DRAFT_HANDLE_PREFIX: &str = "draft:";
 
-fn draft_skins() -> &'static std::sync::Mutex<Vec<(String, &'static ParamSkin)>> {
-    static DRAFTS: OnceLock<std::sync::Mutex<Vec<(String, &'static ParamSkin)>>> = OnceLock::new();
+fn draft_skins() -> &'static SkinTable {
+    static DRAFTS: OnceLock<SkinTable> = OnceLock::new();
     DRAFTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
@@ -256,7 +279,7 @@ fn resolve_draft(id: &str) -> Option<&'static dyn SnakeSkin> {
     registered
         .iter()
         .find(|(handle, _)| handle == id)
-        .map(|(_, skin)| *skin as &'static dyn SnakeSkin)
+        .map(|(_, skin)| *skin)
 }
 
 /// Compile a draft under `handle`, replacing any previous compilation of it.
@@ -273,7 +296,7 @@ pub fn register_draft_skin(handle: &str, document_json: &str) -> Result<(), Stri
     }
 
     let skin = ParamSkin::from_json(document_json).map_err(readable)?;
-    let compiled: &'static ParamSkin = Box::leak(Box::new(skin));
+    let compiled: &'static dyn SnakeSkin = Box::leak(Box::new(skin));
 
     let mut registered = draft_skins()
         .lock()
@@ -415,6 +438,34 @@ mod tests {
         // And it is resolvable, which is the whole point.
         let registry = SkinRegistry::new();
         assert_eq!(registry.resolve(Some(&reference)).id(), doc.id);
+    }
+
+    /// A v2 layer document travels the same road as a v1 one: same content
+    /// reference, same registration, same resolution. Nothing outside this
+    /// function needs to know which schema a skin was written in, which is
+    /// what lets both versions live indefinitely.
+    #[test]
+    fn a_v2_layer_document_registers_and_resolves_like_any_other() {
+        let v1: skin_schema::SkinDoc =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
+                .expect("the shipped classic document parses");
+        let mut v2 = skin_schema::v2::upgrade(&v1);
+        v2.id = "layered@1".to_string();
+
+        let canonical = String::from_utf8(
+            skin_schema::content::canonical_bytes(&serde_json::to_value(&v2).expect("serializes"))
+                .expect("canonicalises"),
+        )
+        .expect("canonical bytes are utf-8");
+        let reference = skin_schema::content::reference_for_bytes(canonical.as_bytes());
+
+        assert!(register_authored_skin(&reference, &canonical).is_ok());
+        let registry = SkinRegistry::new();
+        let resolved = registry.resolve(Some(&reference));
+        assert_eq!(resolved.id(), "layered@1");
+        // ...and it answers the questions every other skin answers, so the
+        // roster and the arena need no v2-specific path.
+        assert!(resolved.metrics(false).overhang_px > 0.0);
     }
 
     /// An unregistered content reference is not an error anywhere — it is the

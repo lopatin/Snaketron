@@ -84,6 +84,7 @@ impl ParamSkin {
                 // A document skin has no signature element beyond its body, so
                 // its accent is its fill.
                 accent: fill.to_hex(),
+                extra: Vec::new(),
                 swatch,
             }
         };
@@ -116,7 +117,6 @@ impl ParamSkin {
                     .unwrap_or(0.0),
                 time_turns: step as f64 / steps.max(1) as f64,
                 params: Vec::new(),
-                literals: Vec::new(),
             })
             .collect();
 

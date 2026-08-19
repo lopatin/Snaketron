@@ -55,6 +55,15 @@ pub struct Swatch {
     /// A third colour for a skin's signature element. Defaults to the fill for
     /// skins that have no such element.
     pub accent: String,
+    /// Colours the document computed, resolved for *this* role at this step,
+    /// named by [`ColorSlot::Literal`].
+    ///
+    /// Per role rather than per frame, and that placement is the whole point.
+    /// A plain literal is one colour for everyone, so it lands here identical
+    /// across roles and costs nothing. A *derived* colour — a lightened fill,
+    /// which is how v1's brightness tracks convert — is a different colour on
+    /// each side of the match, and a frame-level table could not hold both.
+    pub extra: Vec<String>,
 }
 
 /// Everything one animation step resolves to.
@@ -81,8 +90,6 @@ pub struct Frame {
     /// separate because each was added for the one property that needed it,
     /// and a document compiler would have had to grow a third. See [`Binding`].
     pub params: Vec<f64>,
-    /// Colours a layer can name with [`ColorSlot::Literal`].
-    pub literals: Vec<String>,
 }
 
 /// The parts of a skin that never vary with role or time.
@@ -289,6 +296,16 @@ impl CompositeSkin {
 
     pub fn layers(&self) -> &[Layer] {
         &self.layers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_at(&self, step: usize) -> &Frame {
+        &self.frames[step]
     }
 
     /// Which precomputed frame a clock reading lands on.
@@ -778,20 +795,15 @@ fn allocate_spans(layers: &[Layer], body_len: f64, into: &mut Vec<Option<Allocat
 }
 
 /// Resolve a colour slot against a frame.
-fn color<'a>(
-    slot: ColorSlot,
-    swatch: &'a Swatch,
-    frame: &'a Frame,
-    config: &'a CompositeConfig,
-) -> &'a str {
+fn color<'a>(slot: ColorSlot, swatch: &'a Swatch, config: &'a CompositeConfig) -> &'a str {
     match slot {
         ColorSlot::Fill => &swatch.fill,
         ColorSlot::Outline => &swatch.outline,
         ColorSlot::Boost => &config.boost_color,
         ColorSlot::HeadCore => &config.head_core_color,
         ColorSlot::Accent => &swatch.accent,
-        ColorSlot::Literal(index) => frame
-            .literals
+        ColorSlot::Literal(index) => swatch
+            .extra
             .get(index)
             .map(String::as_str)
             // A literal index that survived validation cannot be missing; if
@@ -1023,7 +1035,7 @@ impl CompositeSkin {
                 pose.cells,
                 pose.cell_size,
                 &RibbonPlan {
-                    color: color(*slot, swatch, frame, &self.config),
+                    color: color(*slot, swatch, &self.config),
                     // A skin quotes its contour in 1x pixels; the arena scales
                     // it with the cell so the rim keeps its weight at any zoom.
                     extra: *extra * pose.detail_scale,
@@ -1089,16 +1101,14 @@ impl CompositeSkin {
                 );
                 let radius = pose.cell_size * radius.get(&frame.params, env, 0.0);
                 match paint {
-                    DiscPaint::Slot(slot) => {
-                        ctx.set_fill(color(*slot, swatch, frame, &self.config))
-                    }
+                    DiscPaint::Slot(slot) => ctx.set_fill(color(*slot, swatch, &self.config)),
                     DiscPaint::RampPeak => {
                         let (r, g, b) = ramp_rgb(&self.layers);
-                        let opacity = frame.ramp_opacity;
+                        let opacity = ramp_peak(&self.layers, frame, env);
                         ctx.set_fill(&format!("rgba({r}, {g}, {b}, {opacity})"));
                     }
                     DiscPaint::RadialGlow { slot, stops } => {
-                        let base = color(*slot, swatch, frame, &self.config);
+                        let base = color(*slot, swatch, &self.config);
                         ctx.set_fill_gradient(&crate::skin::paint::Gradient::Radial {
                             x0: centre.0,
                             y0: centre.1,
@@ -1163,7 +1173,7 @@ impl CompositeSkin {
         // per run after the fill is set. Sources that need the run's own
         // coordinate frame are the ones that pay for a transform.
         if let Source::Solid(slot) = source {
-            ctx.set_fill(color(*slot, swatch, frame, &self.config));
+            ctx.set_fill(color(*slot, swatch, &self.config));
             let cell = pose.cell_size;
             for_each_run(pose.cells, |run| {
                 let (ribbon_start, ribbon_end) = run.ribbon_range(corner);
@@ -1201,7 +1211,7 @@ impl CompositeSkin {
             if painted <= 0.0 {
                 return Ok(());
             }
-            ctx.set_fill(color(*slot, swatch, frame, &self.config));
+            ctx.set_fill(color(*slot, swatch, &self.config));
 
             let cell = pose.cell_size;
             let half = half_width.get(&frame.params, env, 0.0).clamp(0.0, 0.5);
@@ -1561,6 +1571,33 @@ fn ramp_rgb(layers: &[Layer]) -> (u8, u8, u8) {
         .unwrap_or((255, 255, 255))
 }
 
+/// The head ramp's opacity at the head itself — what [`DiscPaint::RampPeak`]
+/// paints with.
+///
+/// Read off the ramp layer rather than taken from the frame, because a skin
+/// whose glow is an expression has no single "peak" stored anywhere: the peak
+/// is that curve at `s = 0`. For the legacy pairing the two agree by
+/// construction — a linear falloff at zero distance is the frame's
+/// `ramp_opacity` — which is what keeps classic's highlight disc byte-identical
+/// through this generalisation.
+fn ramp_peak(layers: &[Layer], frame: &Frame, env: &skin_schema::expr::Env) -> f64 {
+    layers
+        .iter()
+        .find_map(|layer| match &layer.kind {
+            LayerKind::HeadRamp {
+                opacity: Some(curve),
+                ..
+            } => Some(
+                curve
+                    .eval(&skin_schema::expr::Env { s: 0.0, ..*env })
+                    .clamp(0.0, 1.0),
+            ),
+            LayerKind::HeadRamp { opacity: None, .. } => Some(frame.ramp_opacity),
+            _ => None,
+        })
+        .unwrap_or(frame.ramp_opacity)
+}
+
 fn wave_offset(wave: GradientWave, distance: f64) -> f64 {
     let turns = distance / wave.cells_per_crest - wave.phase_turns;
     wave.amplitude * (turns * std::f64::consts::TAU).sin()
@@ -1590,7 +1627,7 @@ fn build_gradient(
                 .get(&frame.params, binding_env, 0.0)
                 .clamp(0.0, 1.0),
             color: rgba_of(
-                color(stop.color, swatch, frame, config),
+                color(stop.color, swatch, config),
                 stop.alpha
                     .get(&frame.params, binding_env, 1.0)
                     .clamp(0.0, 1.0),
@@ -1666,6 +1703,8 @@ mod tests {
             label: "#ffffff".to_string(),
             swatch: "#3c8dde".to_string(),
             accent: "#3c8dde".to_string(),
+            // One entry so a fixture may name `ColorSlot::Literal(0)`.
+            extra: vec!["#ffffff".to_string()],
         };
         Frame {
             friendly: [swatch(), swatch()],
@@ -1675,7 +1714,6 @@ mod tests {
             wave_phase_turns: 0.0,
             time_turns: 0.0,
             params: vec![1.0],
-            literals: vec!["#ffffff".to_string()],
         }
     }
 

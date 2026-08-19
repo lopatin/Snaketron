@@ -72,6 +72,19 @@ pub const MAX_ANIMATION_AMPLITUDE: f64 = 0.35;
 pub struct ColorPair {
     pub fill: String,
     pub outline: String,
+    /// A third colour for whatever this skin's signature element is.
+    ///
+    /// The renderer has always had an accent slot — it is why Ember's head
+    /// glow can be per-role — and no document could set it, so every document
+    /// skin's accent was silently its fill. That is the shape of problem this
+    /// whole schema exists to remove.
+    ///
+    /// It is the answer to "can a literal differ per side": literals are one
+    /// colour for everyone by design, and a colour that must flip with the
+    /// side is not a literal, it is a palette entry. Absent means the fill,
+    /// which is exactly what every existing document already gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
 }
 
 /// Colours for every role the renderer can resolve.
@@ -767,6 +780,17 @@ pub(crate) fn validate_palette_hues(palette: &RolePalette, errors: &mut Vec<Skin
             if let Err(error) = parse(&format!("{field}.{part}"), hex) {
                 errors.push(error);
             }
+        }
+        // The accent is deliberately not hue-windowed. It is a signature
+        // element — a glow, a stripe, an eye — and pinning it to the side's
+        // hue would make every skin's signature the same colour as its body.
+        // What stops a gold accent from making a friendly snake read as an
+        // enemy is how much of the body it covers, which is the sampler's
+        // question and not a per-colour one.
+        if let Some(accent) = &pair.accent
+            && let Err(error) = parse(&format!("{field}.accent"), accent)
+        {
+            errors.push(error);
         }
     };
 

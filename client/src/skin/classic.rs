@@ -213,6 +213,7 @@ pub fn classic_frame() -> Frame {
         // A flat skin is its own swatch.
         swatch: fill.to_string(),
         accent: fill.to_string(),
+        extra: Vec::new(),
     };
     Frame {
         friendly: [swatch(BLUE[0]), swatch(BLUE[1])],
@@ -222,7 +223,6 @@ pub fn classic_frame() -> Frame {
         wave_phase_turns: 0.0,
         time_turns: 0.0,
         params: Vec::new(),
-        literals: Vec::new(),
     }
 }
 

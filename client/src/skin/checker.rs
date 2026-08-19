@@ -340,6 +340,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         label: crate::render::roster_label_ink(tones.fill).to_string(),
         swatch: tones.fill.to_string(),
         accent: check_tone(recipe.motion, tones.check, turns),
+        extra: Vec::new(),
     };
 
     let frames: Vec<Frame> = (0..skin_schema::ANIMATION_STEPS)
@@ -364,7 +365,6 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
                 wave_phase_turns: 0.0,
                 time_turns: turns,
                 params: lane_opacities(recipe.motion, turns),
-                literals: Vec::new(),
             }
         })
         .collect();

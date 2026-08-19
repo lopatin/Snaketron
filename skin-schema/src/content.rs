@@ -13,7 +13,6 @@
 //! because the server computes the reference on write and the client verifies
 //! it on read, and a disagreement between the two would look like corruption.
 
-use crate::SkinDoc;
 use serde_json::{Map, Value};
 
 /// The prefix every content-addressed reference carries.
@@ -30,7 +29,12 @@ pub const CONTENT_REF_LENGTH: usize = CONTENT_REF_PREFIX.len() + 64;
 /// parsed from a request body, read back out of storage — carries whatever
 /// order it arrived in, and two orders would hash differently while meaning
 /// the same skin.
-pub fn canonical_bytes(doc: &SkinDoc) -> Result<Vec<u8>, serde_json::Error> {
+///
+/// Generic over the document type on purpose. A reference names *bytes*, and
+/// which schema version produced them is not part of that question — a v2
+/// layer document is stored, fetched, verified and rendered through exactly
+/// the machinery a v1 document uses, and this signature is where that starts.
+pub fn canonical_bytes<T: serde::Serialize>(doc: &T) -> Result<Vec<u8>, serde_json::Error> {
     let value = serde_json::to_value(doc)?;
     let mut out = Vec::new();
     write_canonical(&sorted(value), &mut out);
@@ -38,7 +42,7 @@ pub fn canonical_bytes(doc: &SkinDoc) -> Result<Vec<u8>, serde_json::Error> {
 }
 
 /// The reference a document is known by: `sha256:` plus 64 lowercase hex.
-pub fn content_ref(doc: &SkinDoc) -> Result<String, serde_json::Error> {
+pub fn content_ref<T: serde::Serialize>(doc: &T) -> Result<String, serde_json::Error> {
     Ok(reference_for_bytes(&canonical_bytes(doc)?))
 }
 
@@ -207,6 +211,7 @@ fn sha256(message: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SkinDoc;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

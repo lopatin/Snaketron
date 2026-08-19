@@ -576,6 +576,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
         label: recipe.label.to_string(),
         swatch: recipe.tone.to_string(),
         accent: recipe.tone.to_string(),
+        extra: Vec::new(),
     };
 
     // One baked frame per row, so `frame_index` walking the frames *is* the
@@ -601,7 +602,6 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
             wave_phase_turns: 0.0,
             time_turns: row as f64 / recipe.sheet.rows as f64,
             params: Vec::new(),
-            literals: Vec::new(),
         })
         .collect();
 
@@ -993,6 +993,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#3c8dde".into(),
                         accent: "#3c8dde".into(),
+                        extra: Vec::new(),
                     },
                     Swatch {
                         fill: "#3c8dde".into(),
@@ -1000,6 +1001,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#3c8dde".into(),
                         accent: "#3c8dde".into(),
+                        extra: Vec::new(),
                     },
                 ],
                 enemy: [
@@ -1009,6 +1011,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#de3c3c".into(),
                         accent: "#de3c3c".into(),
+                        extra: Vec::new(),
                     },
                     Swatch {
                         fill: "#de3c3c".into(),
@@ -1016,6 +1019,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#de3c3c".into(),
                         accent: "#de3c3c".into(),
+                        extra: Vec::new(),
                     },
                 ],
                 free_for_all: std::array::from_fn(|_| Swatch {
@@ -1024,12 +1028,12 @@ mod tests {
                     label: "#ffffff".into(),
                     swatch: "#888888".into(),
                     accent: "#888888".into(),
+                    extra: Vec::new(),
                 }),
                 ramp_opacity: 0.2,
                 wave_phase_turns: 0.0,
                 time_turns: 0.0,
                 params: Vec::new(),
-                literals: Vec::new(),
             }],
             1_000.0,
             CompositeConfig {

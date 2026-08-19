@@ -131,6 +131,7 @@ fn ember_composite() -> CompositeSkin {
         swatch: fill.to_string(),
         // The per-role ember: both the head core and the glow are painted in it.
         accent: core.to_string(),
+        extra: Vec::new(),
     };
 
     let frames: Vec<Frame> = (0..skin_schema::ANIMATION_STEPS)
@@ -155,7 +156,6 @@ fn ember_composite() -> CompositeSkin {
                     (HEAD_CORE_RATIO * glow_scale(turns))
                         .clamp(HEAD_CORE_RATIO * 0.5, GLOW_MAX_RADIUS_RATIO),
                 ],
-                literals: Vec::new(),
             }
         })
         .collect();
