@@ -93,7 +93,6 @@ interface SchemaV2 {
 interface Template {
   id: string;
   label: string;
-  help: string;
   document: Document;
 }
 
@@ -180,6 +179,9 @@ const asConstant = (value: unknown): number | null => {
 };
 
 const PREVIEW_CELL = 15;
+/** The template previews: a long horizontal body, drawn small enough to sit in a card. */
+const TEMPLATE_POSE = 'longer_than_head_gradient';
+const TEMPLATE_CELL = 11;
 const PREVIEW_PAD = 6;
 
 /**
@@ -919,8 +921,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           <div className="builder-intro">
             <h1 className="builder-title">Skin Builder</h1>
             <p className="builder-subtitle">
-              Start from one of these. Every one is an ordinary skin — take it
-              apart to see how it works.
+              Start from one of these templates. Mix and match images and effects.
             </p>
           </div>
           <div className="builder-templates">
@@ -932,7 +933,11 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
                 onClick={() => setDocument(template.document)}
               >
                 <strong>{template.label}</strong>
-                <span>{template.help}</span>
+                {/* The skin itself, painted by the real renderer and moving,
+                    because what separates these three is what they *do*. A
+                    sentence describing a travelling shine is a worse
+                    description of a travelling shine than the shine. */}
+                <TemplatePreview template={template} />
               </button>
             ))}
           </div>
@@ -1150,6 +1155,92 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
         </details>
       </main>
     </div>
+  );
+};
+
+/**
+ * One template, painted by the renderer that will paint the real thing.
+ *
+ * Registered as a draft under its own handle rather than described in a
+ * caption: these three differ in how they *move*, and a still swatch or a
+ * sentence about a travelling shine is a poor account of one.
+ */
+const TemplatePreview: React.FC<{ template: Template }> = ({ template }) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const handle = `draft:template-${template.id}`;
+  const [layout, setLayout] = useState({
+    canvasWidth: 320,
+    canvasHeight: 110,
+    cropWidth: 320,
+    cropHeight: 44,
+    offsetX: 0,
+    offsetY: 56,
+  });
+
+  useEffect(() => {
+    const wasm = getWasm();
+    if (!wasm) {
+      return;
+    }
+    try {
+      wasm.registerDraftSkin(handle, JSON.stringify(template.document));
+      const bounds = JSON.parse(
+        wasm.skinFixtureBounds(handle, TEMPLATE_POSE, TEMPLATE_CELL, false),
+      ) as { x: number; y: number; width: number; height: number };
+      setLayout({
+        canvasWidth: Math.ceil(bounds.x + bounds.width + PREVIEW_PAD),
+        canvasHeight: Math.ceil(bounds.y + bounds.height + PREVIEW_PAD),
+        cropWidth: Math.ceil(bounds.width + PREVIEW_PAD * 2),
+        cropHeight: Math.ceil(bounds.height + PREVIEW_PAD * 2),
+        offsetX: Math.round(bounds.x - PREVIEW_PAD),
+        offsetY: Math.round(bounds.y - PREVIEW_PAD),
+      });
+    } catch {
+      // A template that will not compile is a bug caught by its own test, not
+      // something to break the picker over.
+    }
+  }, [handle, template.document]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wasm = getWasm();
+    if (!canvas || !wasm) {
+      return;
+    }
+    let frame = requestAnimationFrame(function loop(now: number) {
+      try {
+        wasm.renderSkinFixture(
+          canvas,
+          handle,
+          TEMPLATE_POSE,
+          'own',
+          TEMPLATE_CELL,
+          false,
+          false,
+          now,
+          false,
+        );
+      } catch {
+        // Leave the last good frame up.
+      }
+      frame = requestAnimationFrame(loop);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [handle, layout.canvasWidth, layout.canvasHeight]);
+
+  return (
+    <span
+      className="builder-template-preview"
+      style={{ height: layout.cropHeight }}
+      aria-hidden="true"
+    >
+      <canvas
+        ref={canvasRef}
+        width={layout.canvasWidth}
+        height={layout.canvasHeight}
+        style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
+      />
+    </span>
   );
 };
 

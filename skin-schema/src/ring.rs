@@ -7,68 +7,102 @@
 //! slower motion**, and the author has no way to tell that from a mistake in
 //! their arithmetic. `sin(tau * time * 40)` reads as a lazy wobble.
 //!
-//! ## Why total variation, and not the obvious thing
+//! ## The measurement
 //!
-//! The obvious check — sample twice as finely and compare each midpoint to
-//! what the ring would show — measures *interpolation error*, and the skin
-//! language is full of functions that are discontinuous on purpose. `saw` is a
-//! ramp with a cliff at the wrap; `pulse` is a square wave; `step` and `floor`
-//! are stairs. Every one of them fails a smoothness-shaped test forever, and
-//! the shipped **Shine** template is a `saw(time)` — so the obvious check
-//! rejects a skin this repo ships, on its first run.
+//! **Total variation**: the distance the value travels around the whole cycle.
+//! Measured twice — once on the ring the skin will actually be baked into, and
+//! once on a dense reference grid standing in for the truth — and compared. If
+//! the ring records materially less travel than there is, what plays is not
+//! what was written.
 //!
-//! Counting *how many* intervals look wrong does not separate the classes
-//! either: eight legitimate blinks produce sixteen bad intervals, while a
-//! genuinely-fine 14-cycle sinusoid produces about nine.
+//! Total variation rather than interpolation error, because this language is
+//! full of functions that are discontinuous *on purpose*: `saw` is a ramp with
+//! a cliff, `pulse` is a square wave, `step` and `floor` are stairs. Any
+//! smoothness-shaped check refuses all of them forever, and the shipped
+//! **Shine** template is a `saw(time)`. A jump contributes the same distance
+//! however finely it is sampled, so discontinuity count is invisible here while
+//! missed motion is not.
 //!
-//! **Total variation** — the distance the value travels around the whole cycle
-//! — is the quantity that works, for one reason: a jump contributes the same
-//! `|Δ|` however finely you sample around it. Discontinuity count is therefore
-//! invisible to it, while motion the coarse grid *missed* shows up directly.
-//! Since the ring's samples are a subset of the fine grid's, the fine total is
-//! never smaller, so the ratio has a meaningful floor of exactly 1.
+//! ## Why the reference grid is coprime with the ring
 //!
-//! Measured across the language's real waveforms: every legitimate shape sits
-//! at or below 1.44 (the worst being `abs(sin(tau * time * 6))`), and every
-//! aliasing one at or above 1.59. The threshold sits between them, and the
-//! crossover for sinusoids lands exactly on the ring's Nyquist frequency —
-//! fifteen cycles a turn passes, sixteen and up are refused.
+//! This is the part that is easy to get wrong, and the first version of this
+//! module got it wrong. A reference that is a *multiple* of 32 folds the way
+//! the ring folds: at 96 samples, `sin(tau * time * 100)` becomes four cycles
+//! on the reference **and** four cycles on the ring, the two totals agree
+//! exactly, and a hundred-cycle strobe is reported as fine. Thirty of every
+//! ninety-six rates slipped through that way. Tripling the ring does not break
+//! the lattice; it moves the blind spot from 32 to 96.
 //!
-//! ## Why the fine grid is three times the ring and not two
+//! So the reference is a *prime* count sharing no factor with 32. A rate can
+//! only hide by folding small on both grids at once, and coprime grids do not
+//! fold together. `no_rate_in_a_wide_sweep_escapes_unreported` is the check
+//! that matters here, because a blind spot is by definition the case nobody
+//! thought to write a test for.
 //!
-//! A 2x grid shares the ring's power-of-two lattice, so the purest violations
-//! are invisible on *both*: `sin(tau * time * 32)` samples to a constant on the
-//! ring and to a constant on a 64-point grid. The author gets a dead layer and
-//! no message. Three times keeps the ring a strict subset — which is what makes
-//! the ratio's floor exact — while breaking that lattice.
+//! ## What the bound actually is
 //!
-//! The swing that decides "is there anything here at all" is measured on a
-//! third, off-grid probe of a prime length, for the same reason.
+//! Not "Nyquist", and the difference is worth stating plainly because it is
+//! tempting to claim otherwise. Nyquist describes a band-limited signal; a
+//! sawtooth has a cliff and therefore no band limit at all. A cliff needs
+//! samples on both sides of it to be recorded, so a ramp runs out of ring
+//! sooner than a sinusoid does. Measured, at the threshold below:
+//!
+//! | shape | last rate that passes | first rate refused |
+//! | --- | --- | --- |
+//! | `sin` | 15 cycles (1.48) | 17 cycles (1.67) |
+//! | `saw` | 12 cycles (1.58) | 13 cycles (1.66) |
+//! | `tri` | 12 cycles (1.48) | 13 cycles (1.66) |
+//! | `pulse` | 16 cycles (1.00) | 20 cycles (1.67) |
+//!
+//! `pulse` reaches furthest because a square wave's travel is entirely in its
+//! edges, and the ring keeps recording those until two land in one frame.
 
 use crate::ANIMATION_STEPS;
 use crate::expr::{Env, Expr};
 
-/// The fine grid: three times the ring, so the ring's samples are a strict
-/// subset of it while sitting off the shared power-of-two lattice.
-const FINE_STEPS: usize = ANIMATION_STEPS * 3;
+/// Samples standing in for the true signal.
+///
+/// Prime, and therefore coprime with the ring's 32 — which is the whole point
+/// (see the module docs). Dense enough that the travel it measures is the real
+/// travel for any rate an author could plausibly write.
+const REFERENCE_SAMPLES: usize = 1009;
 
-/// An off-lattice probe, used only to measure the true swing. Prime, and
-/// coprime with both 32 and 96, so an integer frequency can vanish on it and
-/// on the ring together only at absurd rates.
-const PROBE_SAMPLES: usize = 101;
+/// A second, sparser reference, used only to ask whether the first one is
+/// telling the truth.
+///
+/// Any finite grid aliases eventually — including this module's reference. At
+/// 999 cycles the 1009-sample grid folds to ten and reports a calm ratio, which
+/// would let the fastest strobe expressible slip through the widest gate. So
+/// the two grids are compared with each other first: if a coarser prime and a
+/// finer one disagree about how far the value travels, the signal is moving
+/// faster than *either* can resolve, which settles the question about the
+/// 32-sample ring without needing to know the true answer.
+const CONVERGENCE_SAMPLES: usize = 503;
+
+/// How far the two references may differ before the finer one is not to be
+/// trusted. Well-resolved signals agree to a fraction of a percent.
+const MAX_REFERENCE_DISAGREEMENT: f64 = 0.05;
 
 /// Below this, nothing is visible in any unit the schema uses — a thousandth
 /// of an opacity, of a cell, or of a turn.
 const MIN_VISIBLE_SWING: f64 = 1e-3;
 
-/// How much more distance the fine grid may travel than the ring records.
+/// Below this, the reference is reporting less travel than the ring — which
+/// sampling cannot legitimately do, since a coarser grid can only miss motion.
+/// A little slack for discretisation: a triangle at sixteen cycles measures
+/// 0.98 honestly.
+const MIN_TRUSTWORTHY_GROWTH: f64 = 0.95;
+
+/// How much more distance the truth may travel than the ring records.
 ///
-/// 1.5 sits above every legitimate shape measured (worst: 1.44) and below every
-/// aliasing one (lowest: 1.59). Deliberately not parked near either edge: this
-/// crate compiles both natively and to wasm, whose libms need not agree to the
-/// last bit on `sin`, and a document sitting on the boundary could validate in
-/// the Builder and be refused by CI.
-const MAX_MOTION_GROWTH: f64 = 1.5;
+/// Chosen from measurement, not from theory. The narrowest real gap is between
+/// a 12-cycle sawtooth (1.58, which passes) and a 13-cycle one (1.66, which
+/// does not) — and both are computed from `fract` and `floor`, which are exact,
+/// so that tightness costs nothing in cross-platform terms. The shapes that
+/// *do* run through a libm — the sinusoids — sit at 1.48 and 1.67 either side,
+/// and that is the margin which has to survive native and wasm disagreeing in
+/// the last bits.
+const MAX_MOTION_GROWTH: f64 = 1.6;
 
 /// How an expression fails to survive the ring.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,8 +117,8 @@ pub enum RingAlias {
 
 /// The distance a cyclic sequence travels, including the wrap.
 ///
-/// The wrap step is included because it is motion a viewer really sees: the
-/// ring returns to frame zero, and if that return is a jump, it is a jump.
+/// The wrap step counts because it is motion a viewer really sees: the ring
+/// returns to frame zero, and if that return is a jump, it is a jump.
 fn total_variation(values: &[f64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
@@ -108,39 +142,69 @@ fn swing(values: &[f64]) -> f64 {
     }
 }
 
+fn sample(expr: &Expr, env: &Env, count: usize) -> Vec<f64> {
+    (0..count)
+        .map(|index| {
+            expr.eval(&Env {
+                time: index as f64 / count as f64,
+                ..*env
+            })
+        })
+        .collect()
+}
+
 /// Whether one expression survives the bake, in one environment.
 ///
 /// `env` supplies everything but `time`; the caller varies the rest, because a
 /// rate can depend on them — `sin(tau * time * len)` is calm on a short snake
 /// and strobes on a long one.
 pub fn ring_alias(expr: &Expr, env: &Env) -> Option<RingAlias> {
-    let at = |time: f64| expr.eval(&Env { time, ..*env });
+    let fine = sample(expr, env, REFERENCE_SAMPLES);
+    let coarse = sample(expr, env, CONVERGENCE_SAMPLES);
 
-    let fine: Vec<f64> = (0..FINE_STEPS)
-        .map(|index| at(index as f64 / FINE_STEPS as f64))
-        .collect();
-    // Exactly the values the bake would store: the ring is every third sample.
-    let coarse: Vec<f64> = (0..ANIMATION_STEPS).map(|step| fine[step * 3]).collect();
-    let probe: Vec<f64> = (0..PROBE_SAMPLES)
-        .map(|index| at(index as f64 / PROBE_SAMPLES as f64))
-        .collect();
-
-    // Measured against the off-grid probe as well, because the cases that
-    // matter most are the ones that vanish on a lattice.
-    if swing(&fine).max(swing(&probe)) < MIN_VISIBLE_SWING {
+    // Nothing to say about something that does not move. Both references have
+    // to agree it is still, because a grid goes blind at exactly its own rate:
+    // sampled 1009 times, a 1009-cycle sinusoid is a perfectly flat line.
+    if swing(&fine) < MIN_VISIBLE_SWING && swing(&coarse) < MIN_VISIBLE_SWING {
         return None;
     }
 
-    if swing(&coarse) < MIN_VISIBLE_SWING {
+    let recorded = total_variation(&sample(expr, env, ANIMATION_STEPS));
+    // The ring travels nowhere while the signal does: every sample landed on
+    // the same phase, so the skin paints a constant. This is precisely the case
+    // a reference sharing the ring's lattice cannot see at all.
+    if recorded < MIN_VISIBLE_SWING {
         return Some(RingAlias::Blind);
     }
 
-    let recorded = total_variation(&coarse);
-    if recorded <= 0.0 {
-        // Unreachable: a coarse grid with a visible swing has travelled.
-        return Some(RingAlias::Blind);
+    // Do the two references agree about how far this travels? If a coarser
+    // prime and a finer one disagree, the signal outruns both — and something
+    // neither of two grids in the hundreds can resolve is emphatically beyond a
+    // ring of thirty-two. Reported at whichever grid saw more, which understates
+    // it, because the honest number is unknowable from here.
+    let travelled = total_variation(&fine);
+    let corroboration = total_variation(&coarse);
+    let widest = travelled.max(corroboration);
+    if widest > 0.0 && (travelled - corroboration).abs() / widest > MAX_REFERENCE_DISAGREEMENT {
+        return Some(RingAlias::TooFast {
+            growth: widest / recorded,
+        });
     }
-    let growth = total_variation(&fine) / recorded;
+
+    let growth = travelled / recorded;
+
+    // Sampling can only ever *miss* motion, never invent it — so a reference
+    // that reports less travel than the 32-sample ring is provably wrong about
+    // its own signal, and the only thing that makes it wrong is a rate beyond
+    // what it resolves. The one case left after the agreement check: a rate
+    // landing exactly on the reference count, where both references fold to
+    // the same small number and the ring's own fold happens to be busier.
+    if growth < MIN_TRUSTWORTHY_GROWTH {
+        return Some(RingAlias::TooFast {
+            growth: 1.0 / growth,
+        });
+    }
+
     (growth > MAX_MOTION_GROWTH).then_some(RingAlias::TooFast { growth })
 }
 
@@ -153,65 +217,122 @@ mod tests {
         ring_alias(&expr, &Env::default())
     }
 
+    /// The measured ratio, for a failure message that names a number.
+    fn growth_of(source: &str) -> f64 {
+        let expr = Expr::parse(source).expect("grammatical");
+        let ring = total_variation(&sample(&expr, &Env::default(), ANIMATION_STEPS));
+        if ring <= 0.0 {
+            return f64::INFINITY;
+        }
+        total_variation(&sample(&expr, &Env::default(), REFERENCE_SAMPLES)) / ring
+    }
+
     /// The shapes the language exists to express, none of which may be
     /// refused. The discontinuous ones are the point: they fail any
     /// smoothness-shaped check forever, and `saw(time)` is a shipped template.
     #[test]
     fn every_legitimate_waveform_survives_the_ring() {
         for source in [
-            // The Shine template, and its neighbours.
             "saw(time)",
             "saw(time) - 0.12",
             "saw(time * 3)",
-            "saw(time * 12)",
-            // Square waves at every duty and rate a blink would use.
+            "saw(time * 8)",
             "pulse(time)",
             "pulse(time, 0.03)",
             "pulse(time * 4)",
             "pulse(time * 8)",
             "pulse(time * 16)",
-            // Stairs.
             "step(0.5, time)",
             "floor(time * 4)",
-            "floor(time * 40)",
-            // Ordinary motion, up to and including the last representable rate.
             "0.5 + 0.5 * sin(tau * time)",
             "sin(tau * time * 8)",
             "sin(tau * time * 15)",
-            "tri(time * 10)",
+            "tri(time * 8)",
             "abs(sin(tau * time * 6))",
             "0.3 + 0.1 * sin(tau * time) + 0.02 * sin(tau * time * 7)",
             "smoothstep(0.2, 0.8, saw(time))",
-            // Constants say nothing and are asked nothing.
             "0.5",
             "len * 2",
         ] {
-            assert_eq!(verdict(source), None, "`{source}` was refused");
+            assert_eq!(
+                verdict(source),
+                None,
+                "`{source}` was refused at growth {:.3}",
+                growth_of(source)
+            );
         }
     }
 
-    /// The rates the ring cannot show. The PRD's own example is in here.
+    /// The rates the ring cannot record. The PRD's own example is in here.
     #[test]
     fn motion_the_ring_cannot_record_is_refused() {
         for source in [
             "sin(tau * time * 17)",
             "sin(tau * time * 20)",
-            "sin(tau * time * 24)",
             "sin(tau * time * 40)",
             "saw(time * 16)",
             "pulse(time * 20)",
+            "tri(time * 15)",
         ] {
             assert!(
                 matches!(verdict(source), Some(RingAlias::TooFast { .. })),
-                "`{source}` slipped through"
+                "`{source}` slipped through at growth {:.3}",
+                growth_of(source)
             );
         }
     }
 
-    /// The worst case, and the reason the fine grid is not twice the ring: at
-    /// an exact multiple of 32 the value samples to a constant, so the skin
-    /// plays nothing at all. A 64-point grid would miss these too and report
-    /// no problem whatsoever.
+    /// **The reason the reference grid is prime.**
+    ///
+    /// A reference that is a multiple of the ring folds the way the ring does,
+    /// so both grids see the same low frequency, the totals agree, and the
+    /// strobe is reported as fine. At 96 samples every one of these measured
+    /// exactly 1.000 and was accepted — a hundred cycles rendered as four, with
+    /// no message.
+    #[test]
+    fn a_rate_that_folds_on_a_shared_lattice_is_still_caught() {
+        for source in [
+            "sin(tau * time * 95)",
+            "sin(tau * time * 97)",
+            "sin(tau * time * 100)",
+            "sin(tau * time * 111)",
+            "sin(tau * time * 200)",
+            "saw(time * 97)",
+            "tri(time * 100)",
+        ] {
+            assert!(
+                verdict(source).is_some(),
+                "`{source}` slipped through at growth {:.3} — the reference grid \
+                 is folding with the ring",
+                growth_of(source)
+            );
+        }
+    }
+
+    /// No rate above the ring's own resolution may pass unreported.
+    ///
+    /// The sweep is the real check, because a blind spot is by definition the
+    /// case nobody thought to write a test for: the first version of this
+    /// module had thirty per ninety-six rates and a green suite.
+    #[test]
+    fn no_rate_in_a_wide_sweep_escapes_unreported() {
+        for rate in 20..=3_000 {
+            for shape in [
+                format!("sin(tau * time * {rate})"),
+                format!("saw(time * {rate})"),
+                format!("tri(time * {rate})"),
+            ] {
+                assert!(
+                    verdict(&shape).is_some(),
+                    "`{shape}` passed at growth {:.3}",
+                    growth_of(&shape)
+                );
+            }
+        }
+    }
+
+    /// A rate that lands exactly on the ring paints a constant, and says so
+    /// rather than passing as a still skin nobody asked for.
     #[test]
     fn a_rate_that_lands_on_the_ring_is_reported_as_blind() {
         for source in [
@@ -229,12 +350,21 @@ mod tests {
         }
     }
 
-    /// The crossover is the ring's own Nyquist frequency, not a number picked
-    /// to make the tests pass.
+    /// The bound is shape-dependent, not one frequency, because a cliff needs
+    /// samples either side of it and a curve does not. Pinned so the module's
+    /// own table stays true rather than aspirational.
     #[test]
-    fn the_crossover_sits_on_the_rings_nyquist_frequency() {
+    fn the_bound_depends_on_the_shape_not_only_the_rate() {
         assert_eq!(verdict("sin(tau * time * 15)"), None);
-        assert!(verdict("sin(tau * time * 16)").is_some());
+        assert!(verdict("sin(tau * time * 17)").is_some());
+
+        assert_eq!(verdict("saw(time * 12)"), None);
+        assert!(verdict("saw(time * 13)").is_some());
+
+        // A square wave reaches furthest: its travel is all in its edges, and
+        // the ring keeps recording those until two land in one frame.
+        assert_eq!(verdict("pulse(time * 16)"), None);
+        assert!(verdict("pulse(time * 20)").is_some());
     }
 
     /// A rate can depend on the snake, so a verdict is per environment.

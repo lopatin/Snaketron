@@ -149,9 +149,10 @@ fn covers(body: &LayerBodyV2, s: f64) -> bool {
                 }
                 crate::v2::AnchorV2::Fraction { .. } => true,
             };
-            // A band paints part of each repeat, and which part depends on
-            // where the repeats land — so it is treated as covering wherever
-            // its span does. Text is likewise per cell.
+            // A band and a text run are treated as reaching wherever their
+            // span does; how much of that they actually *cover* is weighed
+            // when their paint is resolved, because a stripe in a lane and a
+            // letter are both mostly gaps.
             reaches && !matches!(source, SourceV2::Image { .. })
         }
     }
@@ -228,14 +229,35 @@ fn paint_of(
                     layer_alpha * strongest.1,
                 )
             }
-            SourceV2::Band { color, alpha, .. } => (
-                resolve(color, pair, doc, time)?,
-                layer_alpha
-                    * alpha
-                        .as_ref()
-                        .map_or(1.0, |expr| scalar(expr, time, s, 1.0))
-                        .clamp(0.0, 1.0),
-            ),
+            SourceV2::Band {
+                color,
+                duty,
+                half_width,
+                alpha,
+                ..
+            } => {
+                // A band is a stripe in a lane, not a coat. It paints `duty` of
+                // each repeat along the body and `2 * half_width` of the way
+                // across it, so treating it as full coverage — which every
+                // other source here legitimately is — would make a checkerboard
+                // read as a solid block of its check colour and refuse every
+                // board skin ever written.
+                //
+                // The same area reasoning as a glyph's ink: what a stretch of
+                // snake *reads* as is what covers it, weighted by how much.
+                let coverage =
+                    (duty.clamp(0.0, 1.0) * 2.0 * scalar(half_width, time, s, 0.0).clamp(0.0, 0.5))
+                        .clamp(0.0, 1.0);
+                (
+                    resolve(color, pair, doc, time)?,
+                    layer_alpha
+                        * coverage
+                        * alpha
+                            .as_ref()
+                            .map_or(1.0, |expr| scalar(expr, time, s, 1.0))
+                            .clamp(0.0, 1.0),
+                )
+            }
             SourceV2::Text { color, scale, .. } => (
                 resolve(color, pair, doc, time)?,
                 // A letter is mostly holes. Every other source here covers the

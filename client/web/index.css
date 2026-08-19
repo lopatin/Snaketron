@@ -7656,8 +7656,11 @@ a.home-social-icon:hover {
 
 .builder-template {
   display: flex;
+  /* The title sits at the top and the snake fills what is left, centred in it:
+     the card is a name and a specimen, and the specimen is the part being
+     chosen between. */
   flex-direction: column;
-  gap: 6px;
+  min-height: 148px;
   border: 2px solid #d1d5db;
   border-radius: 8px;
   background: #fff;
@@ -7667,7 +7670,8 @@ a.home-social-icon:hover {
   font: inherit;
 }
 
-.builder-template:hover {
+.builder-template:hover,
+.builder-template:focus-visible {
   border-color: var(--game-graphite);
 }
 
@@ -7680,10 +7684,22 @@ a.home-social-icon:hover {
   text-transform: uppercase;
 }
 
-.builder-template span {
-  color: rgb(63 63 65 / 56%);
-  font-size: 11px;
-  line-height: 1.5;
+/* The specimen. Full card width, cropped to the snake, and centred in whatever
+   room the title leaves — so three cards of different snake heights still line
+   their bodies up with each other. */
+.builder-template-preview {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: flex-start;
+  overflow: hidden;
+  width: 100%;
+  margin-top: 10px;
+}
+
+.builder-template-preview canvas {
+  display: block;
+  max-width: 100%;
 }
 
 .builder-document {

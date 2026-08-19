@@ -244,7 +244,17 @@ impl LayerSkin {
                     .iter()
                     .any(|(_, expr)| parse_or_zero(expr).inputs().contains(Input::Time))
                 || body_reads_clock(layer.body)
-        }) || doc.layers.iter().any(document_color_animates);
+        }) || doc.layers.iter().any(document_color_animates)
+            // A frame sheet animates without any expression saying so: its rows
+            // *are* moments, and the renderer walks them with the frame's own
+            // clock. Judging only by what reads `time` bakes a single frame and
+            // freezes the sheet on row zero — which looks exactly like a still
+            // texture, and is why this was found by watching rather than by
+            // reading.
+            || doc
+                .textures
+                .iter()
+                .any(|texture| matches!(texture.kind, skin_schema::v2::TextureKindV2::Sheet));
         let steps = if animates { ANIMATION_STEPS } else { 1 };
 
         let mut baker = Baker {
@@ -648,29 +658,28 @@ const GLYPH_CELL_PX: f64 = 16.0;
 /// document's contents — which is exactly the kind of coupling that turns a
 /// later edit into a shifted letter.
 fn build_atlas(doc: &SkinDocV2) -> crate::skin::atlas::Atlas {
-    use crate::skin::atlas::{Atlas, AtlasRegion};
+    use crate::skin::atlas::{Atlas, AtlasRegion, FrameStrip};
 
-    let mut urls: Vec<String> = doc
-        .textures
-        .iter()
-        .map(|texture| texture_url(&texture.content_ref))
-        .collect();
-    let mut regions: Vec<AtlasRegion> = doc
-        .textures
-        .iter()
-        .enumerate()
-        .map(|(index, texture)| AtlasRegion {
+    let mut urls: Vec<String> = Vec::with_capacity(doc.textures.len() + 1);
+    let mut regions: Vec<AtlasRegion> = Vec::with_capacity(doc.textures.len() + 1);
+
+    for (index, texture) in doc.textures.iter().enumerate() {
+        let art = resolve_texture(texture);
+        urls.push(art.url);
+        regions.push(AtlasRegion {
             image: index,
             x: 0.0,
             y: 0.0,
-            // The canonical variant's shape. A tiling texture is the whole
-            // image — it cannot be padded along the axis it repeats on without
-            // putting a gap between every repeat.
-            width: canonical_texture_size(texture.kind).0,
-            height: canonical_texture_size(texture.kind).1,
-            frames: None,
-        })
-        .collect();
+            // The whole image. A tiling texture cannot be padded along the axis
+            // it repeats on without putting a gap between every repeat.
+            width: art.width,
+            height: art.height,
+            // A sheet's rows are moments, not places: the strip moves the
+            // source rectangle down one row per animation step, which is one
+            // `drawImage` with different arguments rather than a second layer.
+            frames: art.rows.map(FrameStrip::rows),
+        });
+    }
 
     urls.push(GLYPH_URL.to_string());
     regions.push(AtlasRegion {
@@ -694,6 +703,61 @@ fn build_atlas(doc: &SkinDocV2) -> crate::skin::atlas::Atlas {
 /// lands closest without oversampling. The other rungs are stored and reachable
 /// — a future device-pixel-aware arena selects a different one here, and
 /// nothing else moves.
+/// One texture's pixels, wherever they come from.
+struct ResolvedTexture {
+    url: String,
+    width: f64,
+    height: f64,
+    /// Frame count, for art whose rows are moments rather than places.
+    rows: Option<usize>,
+}
+
+/// Art the client ships, and its shape.
+///
+/// Declared rather than discovered, for the same reason `skin::sprite` declares
+/// its sheets: the source rectangle is computed before anything has decoded, so
+/// the numbers have to be known without the image. `the_builtin_art_matches_the_files`
+/// checks them against the committed PNGs rather than trusting them.
+fn builtin_texture(name: &str) -> Option<ResolvedTexture> {
+    let (file, width, height, rows) = match name {
+        "stars-and-stripes.v1" => ("stars-and-stripes.v1", 320.0, 308.0, Some(14)),
+        "race-livery.v1" => ("race-livery.v1", 320.0, 320.0, Some(20)),
+        "tiger-live.v1" => ("tiger-live.v1", 320.0, 320.0, Some(20)),
+        "zebra-live.v1" => ("zebra-live.v1", 320.0, 320.0, Some(20)),
+        "jaguar.v1" => ("jaguar.v1", 768.0, 64.0, None),
+        "tiger.v1" => ("tiger.v1", 768.0, 64.0, None),
+        "zebra.v1" => ("zebra.v1", 768.0, 64.0, None),
+        _ => return None,
+    };
+    Some(ResolvedTexture {
+        url: format!("images/skins/{file}.png"),
+        width,
+        height,
+        rows,
+    })
+}
+
+/// Where a document's texture actually comes from.
+fn resolve_texture(texture: &skin_schema::v2::TextureRefV2) -> ResolvedTexture {
+    if let Some(name) = texture
+        .content_ref
+        .strip_prefix(skin_schema::v2::BUILTIN_TEXTURE_PREFIX)
+        && let Some(art) = builtin_texture(name)
+    {
+        return art;
+    }
+
+    let (width, height) = canonical_texture_size(texture.kind);
+    ResolvedTexture {
+        url: texture_url(&texture.content_ref),
+        width,
+        height,
+        // A generated sheet's rows are its declared frame count; the canonical
+        // ladder rung keeps the row height square.
+        rows: matches!(texture.kind, skin_schema::v2::TextureKindV2::Sheet).then_some(20),
+    }
+}
+
 fn texture_url(content_ref: &str) -> String {
     format!("{}/api/textures/by-ref/{content_ref}/32.png", api_origin())
 }
@@ -1208,6 +1272,49 @@ mod tests {
                 "Head highlight",
                 "head-core",
             ]
+        );
+    }
+
+    /// A sheet's rows are moments, so a document wearing one animates even
+    /// though nothing in it mentions the clock. Baking a single frame freezes
+    /// it on row zero, which is indistinguishable from a still texture — the
+    /// failure mode that hides.
+    #[test]
+    fn a_frame_sheet_animates_without_any_expression_saying_so() {
+        let mut doc = upgrade(&classic_v1());
+        doc.textures.push(skin_schema::v2::TextureRefV2 {
+            name: "flag".to_string(),
+            content_ref: format!(
+                "{}stars-and-stripes.v1",
+                skin_schema::v2::BUILTIN_TEXTURE_PREFIX
+            ),
+            kind: skin_schema::v2::TextureKindV2::Sheet,
+        });
+        doc.layers.push(LayerV2 {
+            name: "Flag".to_string(),
+            boost_only: false,
+            omit_on_single_cell: true,
+            opacity: PropExpr("1".to_string()),
+            transform: skin_schema::v2::TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Silhouette,
+                span: skin_schema::v2::SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Image {
+                    texture: "flag".to_string(),
+                    fit: FitV2::Clip,
+                    fade: None,
+                    drift_cells: PropExpr("0".to_string()),
+                },
+            },
+        });
+
+        let skin = LayerSkin::compile(&doc).expect("compiles");
+        assert_eq!(
+            skin.engine.frame_count(),
+            ANIMATION_STEPS,
+            "a sheet needs the whole ring to walk its rows"
         );
     }
 

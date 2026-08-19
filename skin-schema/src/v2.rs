@@ -450,10 +450,36 @@ pub struct HeadCoreV2 {
     pub color: String,
 }
 
+/// Art the client ships, nameable by a document.
+///
+/// A closed list, exactly as `KNOWN_EFFECTS` is: a document chooses from what
+/// the client can draw, and never supplies it. Without this a document could
+/// only wear art somebody had generated and paid for, which makes the shipped
+/// sprite family unreachable to the very editor built to explore it — and
+/// makes the starting templates lie about what a skin can be.
+pub const BUILTIN_TEXTURE_PREFIX: &str = "builtin:";
+pub const BUILTIN_TEXTURES: &[&str] = &[
+    "stars-and-stripes.v1",
+    "race-livery.v1",
+    "tiger-live.v1",
+    "zebra-live.v1",
+    "jaguar.v1",
+    "tiger.v1",
+    "zebra.v1",
+];
+
+/// Whether a reference names art the client already has.
+pub fn is_builtin_texture(reference: &str) -> bool {
+    reference
+        .strip_prefix(BUILTIN_TEXTURE_PREFIX)
+        .is_some_and(|name| BUILTIN_TEXTURES.contains(&name))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextureRefV2 {
     pub name: String,
-    /// A content reference, `sha256:…` — the M3 pipeline's digest.
+    /// Either a content reference (`sha256:…`, the generation pipeline's
+    /// digest) or first-party art the client ships (`builtin:…`).
     #[serde(rename = "ref")]
     pub content_ref: String,
     pub kind: TextureKindV2,
@@ -779,10 +805,20 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
     }
     let mut texture_names = std::collections::BTreeSet::new();
     for (index, texture) in doc.textures.iter().enumerate() {
-        if !crate::content::is_content_ref(&texture.content_ref) {
+        if !crate::content::is_content_ref(&texture.content_ref)
+            && !is_builtin_texture(&texture.content_ref)
+        {
             errors.push(SkinDocError::new(
                 format!("textures[{index}].ref"),
-                "must be a content reference like `sha256:<64 hex digits>`",
+                format!(
+                    "must be a content reference like `sha256:<64 hex digits>`, \
+                     or first-party art the client ships ({})",
+                    BUILTIN_TEXTURES
+                        .iter()
+                        .map(|name| format!("`{BUILTIN_TEXTURE_PREFIX}{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ));
         }
         if !texture_names.insert(texture.name.as_str()) {
@@ -978,12 +1014,12 @@ fn check_expr(field: &str, site: EvalSite, expr: &PropExpr, errors: &mut Vec<Ski
                 field,
                 format!(
                     "this animates faster than the {ANIMATION_STEPS}-step ring \
-                     can show — a skin is baked into {ANIMATION_STEPS} frames a \
-                     cycle, so anything completing more than {} cycles per cycle \
-                     comes out as a different, slower motion than you wrote \
-                     ({detail}). Slow the rate down, or raise the cycle length \
-                     and keep the rate.",
-                    ANIMATION_STEPS / 2
+                     can show — a skin is baked into {ANIMATION_STEPS} frames \
+                     per cycle, so {detail}, and what plays is a different and \
+                     slower motion than the one you wrote. Slow the rate down \
+                     inside the expression. Raising the cycle length will not \
+                     help: it plays the same {ANIMATION_STEPS} frames over a \
+                     longer time rather than giving you more of them."
                 ),
             ));
             break;
@@ -1526,7 +1562,6 @@ fn source_ops(source: &SourceV2, runs: usize, cells: usize) -> usize {
 pub struct Template {
     pub id: String,
     pub label: String,
-    pub help: String,
     pub document: SkinDocV2,
 }
 
@@ -1640,23 +1675,6 @@ pub fn templates() -> Vec<Template> {
         glow
     };
 
-    let mut minimal = base("My skin");
-    minimal.layers = vec![
-        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
-        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
-    ];
-
-    let mut lit = base("Lit");
-    lit.layers = vec![
-        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
-        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
-        glow(10.0, 0.3),
-    ];
-
-    let mut shine = base("Shine");
-    shine
-        .literals
-        .insert("gleam".to_string(), "#ffffff".to_string());
     let stop = |offset: &str, target: ColorTarget, alpha: &str| StopV2 {
         offset: PropExpr(offset.to_string()),
         color: ColorRef {
@@ -1665,11 +1683,12 @@ pub fn templates() -> Vec<Template> {
         },
         alpha: PropExpr(alpha.to_string()),
     };
-    shine.layers = vec![
-        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
-        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+    // A gleam travelling the body, as three stops whose positions read the
+    // clock. `alpha` and the crest's width are what separate a whisper from a
+    // sweep; `easing` reshapes *when* it travels rather than how far.
+    let shine = |name: &str, width: f64, alpha: &str, easing: &str| {
         layer(
-            "Shine",
+            name,
             "1",
             LayerBodyV2::Span {
                 region: RegionV2::Body,
@@ -1680,21 +1699,21 @@ pub fn templates() -> Vec<Template> {
                     axis: GradientAxis::AlongBody,
                     stops: vec![
                         stop(
-                            "saw(time) - 0.12",
+                            &format!("{easing} - {width}"),
                             ColorTarget::Slot {
                                 slot: SlotName::Fill,
                             },
                             "0",
                         ),
                         stop(
-                            "saw(time)",
+                            easing,
                             ColorTarget::Literal {
                                 literal: "gleam".to_string(),
                             },
-                            "0.14",
+                            alpha,
                         ),
                         stop(
-                            "saw(time) + 0.12",
+                            &format!("{easing} + {width}"),
                             ColorTarget::Slot {
                                 slot: SlotName::Fill,
                             },
@@ -1703,32 +1722,140 @@ pub fn templates() -> Vec<Template> {
                     ],
                 },
             },
-        ),
+        )
+    };
+
+    // A board is two lanes of squares half a period out of phase — which is
+    // exactly two band layers, and is how the shipped checkerboards are built.
+    let lane = |name: &str, t_center: f64, phase: f64, period: f64| {
+        let mut lane = layer(
+            name,
+            "1",
+            LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Silhouette,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Band {
+                    color: ColorRef::slot(SlotName::Accent),
+                    period_cells: period,
+                    duty: 0.5,
+                    phase_cells: phase * period,
+                    half_width: PropExpr("0.25".to_string()),
+                    t_center: PropExpr(format!("{t_center}")),
+                    alpha: None,
+                },
+            },
+        );
+        // Half a cell of board on a one-cell snake reads as a smudge, and the
+        // head cap covers most of it anyway.
+        lane.omit_on_single_cell = true;
+        lane
+    };
+
+    let mut classic = base("My skin");
+    classic
+        .literals
+        .insert("gleam".to_string(), "#ffffff".to_string());
+    classic.layers = vec![
+        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
+        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+        // Faint and unhurried: the default snake, lit, with just enough
+        // movement that the preview is obviously alive.
+        shine("Shine", 0.12, "0.1", "saw(time)"),
+        glow(10.0, 0.3),
+    ];
+
+    let mut pattern = base("Pattern");
+    pattern
+        .literals
+        .insert("gleam".to_string(), "#ffffff".to_string());
+    // Harlequin's yellows, worn as a board with Pitlane's two-cell squares.
+    // The check colour is the accent rather than a literal, so it still flips
+    // with the side — a board reads as a board on both teams or it is not a
+    // team skin.
+    for slot in pattern.palette.friendly.iter_mut() {
+        slot.accent = Some("#fbcd82".to_string());
+    }
+    for slot in pattern.palette.enemy.iter_mut() {
+        slot.accent = Some("#f2b75f".to_string());
+    }
+    for slot in pattern.palette.free_for_all.iter_mut() {
+        slot.accent = Some("#f8e9bc".to_string());
+    }
+    pattern.period_ms = 1_400.0;
+    pattern.layers = vec![
+        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
+        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+        lane("Board, upper", -0.25, 0.0, 2.0),
+        lane("Board, lower", 0.25, 0.5, 2.0),
+        // Stronger, faster, and eased: `tri` in place of `saw` makes the crest
+        // sweep down the body and back rather than snapping to the head, and
+        // squaring it holds it at the ends and hurries it through the middle.
+        shine("Shine", 0.16, "0.34", "tri(time) * tri(time)"),
+        glow(10.0, 0.3),
+    ];
+
+    let mut sprite = base("Sprite");
+    sprite.textures.push(TextureRefV2 {
+        name: "flag".to_string(),
+        content_ref: format!("{BUILTIN_TEXTURE_PREFIX}stars-and-stripes.v1"),
+        kind: TextureKindV2::Sheet,
+    });
+    let mut flag = layer(
+        "Flag",
+        "1",
+        LayerBodyV2::Span {
+            region: RegionV2::Body,
+            clip: ClipV2::Silhouette,
+            // Pinned to the head and allowed to end. A flag is a thing with a
+            // top and a bottom; repeating it would stamp a row of little flags,
+            // which is not what a flag looks like.
+            span: SpanV2 {
+                from: AnchorV2::Head,
+                natural: Some(20.0),
+                min: 3.0,
+                priority: 10,
+            },
+            corner: CornerV2::Fan,
+            source: SourceV2::Image {
+                texture: "flag".to_string(),
+                fit: FitV2::Clip,
+                // The fade is what makes ending look intentional rather than
+                // cut off — without it the twentieth cell is a hard vertical
+                // line with the base colour after it.
+                fade: Some(FadeV2 {
+                    lead_cells: 0.0,
+                    trail_cells: 6.0,
+                    steps: 12,
+                }),
+                drift_cells: PropExpr("0".to_string()),
+            },
+        },
+    );
+    flag.omit_on_single_cell = true;
+    sprite.layers = vec![
+        ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
+        ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
+        flag,
         glow(10.0, 0.3),
     ];
 
     vec![
         Template {
-            id: "minimal".to_string(),
-            label: "Minimal".to_string(),
-            help: "A body and an outline. Everything else is yours to add.".to_string(),
-            document: minimal,
+            id: "classic".to_string(),
+            label: "Classic".to_string(),
+            document: classic,
         },
         Template {
-            id: "lit".to_string(),
-            label: "Lit".to_string(),
-            help: "Adds the brightening behind the head that tells players \
-                   which way you are going."
-                .to_string(),
-            document: lit,
+            id: "pattern".to_string(),
+            label: "Pattern".to_string(),
+            document: pattern,
         },
         Template {
-            id: "shine".to_string(),
-            label: "Shine".to_string(),
-            help: "A gleam that travels the length of the snake. Open its \
-                   stops to see how — the position reads the clock."
-                .to_string(),
-            document: shine,
+            id: "sprite".to_string(),
+            label: "Sprite".to_string(),
+            document: sprite,
         },
     ]
 }
@@ -2352,7 +2479,12 @@ mod tests {
             .find(|error| error.field == "layers[1].opacity")
             .expect("the property is named");
         assert!(error.problem.contains("32-step ring"), "{error}");
-        assert!(error.problem.contains("16 cycles"), "{error}");
+        assert!(
+            error
+                .problem
+                .contains("Raising the cycle length will not help"),
+            "the one remedy offered has to be one that works: {error}"
+        );
 
         // An exact multiple of the ring paints nothing at all, and says so
         // rather than passing silently — the case a 2x check cannot see.
