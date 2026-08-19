@@ -609,6 +609,7 @@ const AdminSkins: React.FC = () => {
               <div className="admin-skin-actions">
                 <button
                   type="button"
+                  className="game-shell-button is-primary"
                   disabled={busyId === skin.skinId}
                   onClick={() => void decide(skin, 'published')}
                 >
@@ -616,6 +617,7 @@ const AdminSkins: React.FC = () => {
                 </button>
                 <button
                   type="button"
+                  className="game-shell-button"
                   disabled={busyId === skin.skinId}
                   onClick={() => void decide(skin, 'private')}
                 >
@@ -625,7 +627,7 @@ const AdminSkins: React.FC = () => {
                     and everyone already wearing it. */}
                 <button
                   type="button"
-                  className="is-destructive"
+                  className="game-shell-button is-destructive"
                   disabled={busyId === skin.skinId}
                   onClick={() => void decide(skin, 'disabled')}
                 >

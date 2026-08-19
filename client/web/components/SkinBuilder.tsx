@@ -272,6 +272,7 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
               ))}
               <button
                 type="button"
+                className="game-shell-button"
                 onClick={() =>
                   onChange(
                     field.path,
@@ -285,6 +286,7 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
           ))}
           <button
             type="button"
+            className="game-shell-button"
             onClick={() => onChange(field.path, [...items, {}])}
             data-testid={`builder-add-${field.path}`}
           >
@@ -304,6 +306,10 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
 };
 
 /** The poses a builder needs to see: the main one, plus what catches mistakes. */
+const PREVIEW_CELL = 16;
+/** Breathing room around the painted snake, so a contour is never clipped. */
+const PREVIEW_PAD = 10;
+
 const PREVIEW_POSES: Array<{ pose: string; role: string; label: string }> = [
   { pose: 'longer_than_head_gradient', role: 'own', label: 'Yours' },
   { pose: 'longer_than_head_gradient', role: 'enemy', label: 'As an opponent' },
@@ -419,6 +425,14 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
       />
 
       <main className="builder-main">
+        <div className="builder-intro">
+          <h1 className="builder-title">Skin Builder</h1>
+          <p className="builder-subtitle">
+            Every control here comes from the skin format itself, so the editor
+            can never fall behind what a skin can be.
+          </p>
+        </div>
+
         <div className="builder-preview-strip">
           {PREVIEW_POSES.map((preview) => (
             <BuilderPreview
@@ -444,12 +458,18 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
         {status ? <p className="builder-status" role="status">{status}</p> : null}
 
         <div className="builder-actions">
-          <button type="button" onClick={() => void save()} disabled={saving}>
+          <button
+            type="button"
+            className="game-shell-button is-primary"
+            onClick={() => void save()}
+            disabled={saving}
+          >
             {skin ? 'Save revision' : 'Save skin'}
           </button>
           {skin ? (
             <button
               type="button"
+              className="game-shell-button"
               onClick={() => void requestReview()}
               disabled={problems.length > 0}
             >
@@ -497,6 +517,40 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
   valid,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [layout, setLayout] = useState({
+    canvasWidth: 370,
+    canvasHeight: 150,
+    cropWidth: 370,
+    cropHeight: 60,
+    offsetX: 0,
+    offsetY: 54,
+  });
+
+  // Fixture poses paint at their own arena coordinates rather than at the
+  // origin, so the canvas has to be tall enough to reach the pose and the
+  // wrapper crops back to it. Without this a strip of three previews is mostly
+  // empty space.
+  useEffect(() => {
+    const wasm = getWasm();
+    if (!wasm || !valid) {
+      return;
+    }
+    try {
+      const bounds = JSON.parse(
+        wasm.skinFixtureBounds(handle, pose, PREVIEW_CELL, false),
+      ) as { x: number; y: number; width: number; height: number };
+      setLayout({
+        canvasWidth: Math.ceil(bounds.x + bounds.width + PREVIEW_PAD),
+        canvasHeight: Math.ceil(bounds.y + bounds.height + PREVIEW_PAD),
+        cropWidth: Math.ceil(bounds.width + PREVIEW_PAD * 2),
+        cropHeight: Math.ceil(bounds.height + PREVIEW_PAD * 2),
+        offsetX: Math.round(bounds.x - PREVIEW_PAD),
+        offsetY: Math.round(bounds.y - PREVIEW_PAD),
+      });
+    } catch {
+      // Keep the previous framing; a slightly wrong one beats none.
+    }
+  }, [handle, pose, revision, valid]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -506,7 +560,17 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
     }
     let frame = requestAnimationFrame(function loop(now: number) {
       try {
-        wasm.renderSkinFixture(canvas, handle, pose, role, 16, false, false, now, false);
+        wasm.renderSkinFixture(
+          canvas,
+          handle,
+          pose,
+          role,
+          PREVIEW_CELL,
+          false,
+          false,
+          now,
+          false,
+        );
       } catch {
         // An invalid draft leaves the last good frame up; the problem list
         // beside it is what says why.
@@ -514,11 +578,23 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
       frame = requestAnimationFrame(loop);
     });
     return () => cancelAnimationFrame(frame);
-  }, [handle, pose, role, revision, valid]);
+  }, [handle, pose, role, revision, valid, layout.canvasWidth, layout.canvasHeight]);
 
   return (
     <figure className="builder-preview">
-      <canvas ref={canvasRef} width={370} height={110} role="img" aria-label={label} />
+      <div
+        className="builder-preview-crop"
+        style={{ width: layout.cropWidth, height: layout.cropHeight }}
+      >
+        <canvas
+          ref={canvasRef}
+          width={layout.canvasWidth}
+          height={layout.canvasHeight}
+          style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
+          role="img"
+          aria-label={label}
+        />
+      </div>
       <figcaption>{label}</figcaption>
     </figure>
   );

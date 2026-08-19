@@ -6561,56 +6561,80 @@ a.home-social-icon:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Skins page                                                          */
+/* Skins page and Skin Builder                                         */
+/*                                                                     */
+/* Shares the site's chrome rather than inventing any: cards are the    */
+/* leaderboard's (white, 2px grey rule, rounded), labels are the        */
+/* results card's small letterspaced caps, and every button is a        */
+/* .game-shell-button. Nothing here restyles a control that already     */
+/* exists somewhere else.                                              */
 /* ------------------------------------------------------------------ */
 
-.skins-main {
+.skins-main,
+.builder-main {
   box-sizing: border-box;
   width: 100%;
   min-height: 100svh;
   padding: 128px clamp(24px, 5vw, 96px) calc(120px + var(--ad-route-bottom-reserve));
 }
 
-.skins-intro {
+.skins-intro,
+.builder-intro {
   width: min(100%, 72rem);
-  margin: 0 auto 32px;
+  margin: 0 auto 28px;
 }
 
-.skins-title {
+.skins-title,
+.builder-title {
   margin: 0;
-  font-size: clamp(28px, 4vw, 44px);
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.08em;
   color: var(--game-graphite);
+  font-size: clamp(26px, 4vw, 38px);
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.035em;
+  text-transform: uppercase;
 }
 
-.skins-subtitle {
-  margin: 8px 0 0;
-  max-width: 46ch;
-  color: var(--game-muted);
-  font-size: 14px;
+.skins-subtitle,
+.builder-subtitle {
+  margin: 6px 0 0;
+  max-width: 48ch;
+  color: rgb(63 63 65 / 62%);
+  font-size: 13px;
   line-height: 1.5;
 }
 
-.skins-error {
+.skins-intro-actions {
+  display: flex;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+.skins-error,
+.builder-problems {
   width: min(100%, 72rem);
-  margin: 0 auto 24px;
-  border: 2px solid var(--game-red);
+  margin: 0 auto 20px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
   padding: 10px 14px;
-  color: var(--game-red);
-  font-size: 13px;
+  color: #b91c1c;
+  font-size: 12px;
   font-weight: 700;
 }
 
-/* The two columns the page is organised around: snakes are the main event and
-   get the room a wide horizontal preview needs; bases are a narrower rail. */
+.builder-problems {
+  margin: 16px 0 0;
+  padding-left: 30px;
+}
+
+/* Snakes take the room a wide horizontal preview needs; bases are a rail. */
 .skins-columns {
   display: grid;
   width: min(100%, 72rem);
   margin: 0 auto;
-  gap: clamp(24px, 4vw, 56px);
-  grid-template-columns: minmax(0, 1fr) minmax(0, 20rem);
+  gap: clamp(20px, 3vw, 40px);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 21rem);
   align-items: start;
 }
 
@@ -6622,28 +6646,32 @@ a.home-social-icon:hover {
 
 .skins-column-heading {
   margin: 0 0 4px;
-  font-size: 13px;
+  color: var(--game-graphite);
+  font-size: 12px;
   font-style: italic;
   font-weight: 900;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--game-graphite);
 }
 
 .skins-column-note {
-  margin: 0 0 16px;
-  color: var(--game-muted);
-  font-size: 12px;
+  margin: 0 0 14px;
+  color: rgb(63 63 65 / 56%);
+  font-size: 11.5px;
   line-height: 1.5;
 }
 
+/* One card holding rows divided by rules, exactly as the leaderboard does. */
 .skins-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  margin: 12px 0 0;
+  margin: 10px 0 0;
   padding: 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
   list-style: none;
+  overflow: hidden;
 }
 
 .challenge-row {
@@ -7151,20 +7179,23 @@ a.home-social-icon:hover {
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 16px;
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 12px 16px;
-  transition: box-shadow 120ms ease, transform 120ms ease;
+  border-bottom: 1px solid #e1e3e7;
+  padding: 11px 16px;
+  transition: background-color 140ms ease;
+}
+
+.skins-row:last-child {
+  border-bottom: 0;
 }
 
 .skins-row:hover,
 .skins-row:focus-within {
-  box-shadow: 8px 8px 0 #000;
-  transform: translate(-2px, -2px);
+  background: #f9fafb;
 }
 
 .skins-row.is-equipped {
-  border-color: var(--game-blue);
+  background: #eff6ff;
+  box-shadow: inset 3px 0 0 var(--game-blue);
 }
 
 /* Fixture poses paint at their own arena coordinates, so the canvas is larger
@@ -7180,12 +7211,13 @@ a.home-social-icon:hover {
 
 .skins-base-preview {
   display: flex;
-  gap: 6px;
+  gap: 5px;
 }
 
 .skins-base-preview canvas {
   display: block;
-  border: 1px solid var(--game-rule);
+  border: 1px solid #e1e3e7;
+  border-radius: 3px;
 }
 
 .skins-row-meta {
@@ -7196,207 +7228,70 @@ a.home-social-icon:hover {
 }
 
 .skins-row-name {
-  font-size: 15px;
-  font-weight: 800;
   color: var(--game-graphite);
+  font-size: 14px;
+  font-weight: 900;
   overflow-wrap: anywhere;
+}
+
+.skins-row-byline {
+  color: rgb(63 63 65 / 50%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .skins-row-price {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--game-muted);
-}
-
-.skins-equip-button {
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 7px 16px;
-  font-size: 11px;
-  font-style: italic;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
   font-weight: 900;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.095em;
   text-transform: uppercase;
-  color: var(--game-graphite);
-  cursor: pointer;
 }
 
-.skins-equip-button:hover:not(:disabled) {
-  background: var(--game-graphite);
-  color: var(--game-paper);
+.skins-row-price.is-priced {
+  color: #d49a00;
 }
 
-.skins-equip-button:disabled {
-  cursor: default;
-  opacity: 0.45;
-}
-
+/* Equipped is a state, not an action, so it reads as a marker rather than a
+   button you could press. Mirrors the results card's promoted pill. */
 .skins-equipped-badge {
-  display: inline-block;
-  border: 2px solid var(--game-blue);
-  padding: 7px 16px;
-  font-size: 11px;
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--game-blue);
-}
-
-/* A hovered preview is the only motion on this page; someone who asked the OS
-   for less of it gets the still frame and no lift. */
-@media (prefers-reduced-motion: reduce) {
-  .skins-row {
-    transition: none;
-  }
-
-  .skins-row:hover,
-  .skins-row:focus-within {
-    transform: none;
-  }
-}
-
-/* The base column stacks its rows tighter: a base preview is two small
-   rectangles, not a snake, so it does not need the same row height. */
-.skins-column-bases .skins-row {
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-areas:
-    'preview preview'
-    'meta action';
-  row-gap: 12px;
-}
-
-.skins-column-bases .skins-row-preview {
-  grid-area: preview;
-}
-
-.skins-column-bases .skins-row-meta {
-  grid-area: meta;
-}
-
-.skins-column-bases .skins-row-action {
-  grid-area: action;
-  justify-self: start;
-}
-
-/* Admin: the skin review queue. Sized so a reviewer sees the art first and the
-   metadata second — the art is the part a machine could not check. */
-.admin-skin-queue {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.admin-skin-queue li {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  display: inline-flex;
+  min-height: 32px;
   align-items: center;
-  gap: 16px;
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 10px 14px;
-}
-
-.admin-skin-preview canvas {
-  display: block;
-}
-
-.admin-skin-preview-missing {
-  display: inline-block;
-  padding: 24px 12px;
-  color: var(--game-muted);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.admin-skin-meta {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.admin-skin-meta strong {
-  font-size: 14px;
-  color: var(--game-graphite);
-  overflow-wrap: anywhere;
-}
-
-.admin-skin-meta span {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--game-muted);
-}
-
-.admin-skin-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.admin-skin-actions button {
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 6px 12px;
-  font-size: 11px;
+  border: 1px solid var(--game-blue);
+  border-radius: 5px;
+  background: #eff6ff;
+  padding: 0 13px;
+  color: var(--game-blue);
+  font-size: 9px;
   font-style: italic;
   font-weight: 900;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
-  color: var(--game-graphite);
-  cursor: pointer;
 }
 
-.admin-skin-actions button:hover:not(:disabled) {
-  background: var(--game-graphite);
-  color: var(--game-paper);
-}
+/* ---- Builder ---- */
 
-/* Taking a skin down reaches replays and everyone already wearing it, so it
-   does not look like the button beside it. */
-.admin-skin-actions button.is-destructive {
-  border-color: var(--game-red);
-  color: var(--game-red);
-}
-
-.admin-skin-actions button.is-destructive:hover:not(:disabled) {
-  background: var(--game-red);
-  color: var(--game-paper);
-}
-
-.admin-skin-actions button:disabled {
-  cursor: default;
-  opacity: 0.45;
-}
-
-/* ------------------------------------------------------------------ */
-/* Skin Builder                                                        */
-/* ------------------------------------------------------------------ */
-
-.builder-main {
-  box-sizing: border-box;
-  width: min(100%, 64rem);
-  margin: 0 auto;
-  padding: 128px clamp(24px, 5vw, 64px) calc(120px + var(--ad-route-bottom-reserve));
-}
-
-/* The previews come first and stay put: an editor whose result scrolls out of
-   view while you edit it is a worse editor. */
+/* Not sticky, deliberately: `.home-page` sets `overflow-x: hidden`, which makes
+   it a scroll container, so a sticky child sticks to that rather than to the
+   viewport and simply scrolls away. A strip that claims to stay put and does
+   not is worse than one that plainly scrolls, so this scrolls — and the form
+   below is ordered with the most-changed controls first to compensate. */
 .builder-preview-strip {
-  position: sticky;
-  top: 84px;
-  z-index: 5;
   display: flex;
+  width: min(100%, 72rem);
+  /* Poses crop to different heights, so align on the captions rather than the
+     tops: a row of labels at three different heights reads as a mistake. */
+  align-items: flex-end;
   flex-wrap: wrap;
-  gap: 16px;
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 14px;
+  gap: 18px 24px;
+  margin: 0 auto;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px 16px;
 }
 
 .builder-preview {
@@ -7409,81 +7304,55 @@ a.home-social-icon:hover {
 }
 
 .builder-preview figcaption {
-  margin-top: 4px;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
+  margin-top: 5px;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
   text-transform: uppercase;
-  color: var(--game-muted);
-}
-
-.builder-problems {
-  margin: 16px 0 0;
-  border: 2px solid var(--game-red);
-  padding: 10px 14px 10px 30px;
-  color: var(--game-red);
-  font-size: 12px;
 }
 
 .builder-status {
-  margin: 16px 0 0;
-  color: var(--game-muted);
+  width: min(100%, 72rem);
+  margin: 14px auto 0;
+  color: #16a34a;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 800;
 }
 
 .builder-actions {
   display: flex;
-  gap: 10px;
-  margin: 20px 0 8px;
-}
-
-.builder-actions button {
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 9px 18px;
-  font-size: 11px;
-  font-style: italic;
-  font-weight: 900;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--game-graphite);
-  cursor: pointer;
-}
-
-.builder-actions button:hover:not(:disabled) {
-  background: var(--game-graphite);
-  color: var(--game-paper);
-}
-
-.builder-actions button:disabled {
-  cursor: default;
-  opacity: 0.45;
+  width: min(100%, 72rem);
+  gap: 9px;
+  margin: 16px auto 0;
 }
 
 .builder-form {
   display: flex;
+  width: min(100%, 72rem);
   flex-direction: column;
-  gap: 18px;
-  margin-top: 16px;
+  gap: 14px;
+  margin: 18px auto 0;
 }
 
 .builder-group {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  border: 2px solid #000;
-  padding: 14px 16px 16px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 6px 16px 16px;
 }
 
 .builder-group legend {
-  padding: 0 8px;
+  padding: 0 7px;
+  color: var(--game-graphite);
   font-size: 11px;
   font-style: italic;
   font-weight: 900;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--game-graphite);
 }
 
 .builder-group-optional legend label {
@@ -7495,7 +7364,7 @@ a.home-social-icon:hover {
 
 .builder-help {
   margin: 0;
-  color: var(--game-muted);
+  color: rgb(63 63 65 / 56%);
   font-size: 11px;
   line-height: 1.5;
 }
@@ -7507,31 +7376,41 @@ a.home-social-icon:hover {
 }
 
 .builder-field > span {
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.04em;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
   text-transform: uppercase;
-  color: var(--game-graphite);
 }
 
 .builder-field small {
-  color: var(--game-muted);
+  color: rgb(63 63 65 / 50%);
   font-size: 11px;
-  line-height: 1.4;
+  line-height: 1.45;
 }
 
 .builder-field input[type='text'],
 .builder-field select {
-  border: 2px solid #000;
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
   padding: 7px 9px;
+  color: var(--game-graphite);
   font: inherit;
   font-size: 13px;
 }
 
+.builder-field input[type='text']:focus-visible,
+.builder-field select:focus-visible {
+  border-color: var(--game-blue);
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 1px;
+}
+
 .builder-field input[type='color'] {
-  width: 56px;
-  height: 30px;
-  border: 2px solid #000;
+  width: 52px;
+  height: 28px;
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
   padding: 0;
   background: none;
   cursor: pointer;
@@ -7545,46 +7424,35 @@ a.home-social-icon:hover {
 
 .builder-number-row input[type='range'] {
   flex: 1;
+  accent-color: var(--game-blue);
 }
 
 .builder-number-row output {
   min-width: 4ch;
+  color: var(--game-graphite);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  color: var(--game-muted);
+  font-weight: 700;
 }
 
 .builder-list-item {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  border-left: 3px solid var(--game-rule);
+  border-left: 2px solid #e1e3e7;
   padding-left: 12px;
 }
 
 .builder-list-label {
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--game-muted);
-}
-
-.builder-list-item button,
-.builder-group > button {
-  align-self: flex-start;
-  border: 2px solid #000;
-  background: var(--game-paper);
-  padding: 5px 12px;
-  font-size: 10px;
+  color: rgb(63 63 65 / 50%);
+  font-size: 8.5px;
   font-weight: 900;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.095em;
   text-transform: uppercase;
-  cursor: pointer;
 }
 
-/* Colour pairs read better side by side than stacked. */
+/* A colour and its swatch read better side by side than stacked. */
 .builder-group .builder-field-color {
   flex-direction: row;
   align-items: center;
@@ -7592,24 +7460,149 @@ a.home-social-icon:hover {
 }
 
 .builder-group .builder-field-color > span {
-  min-width: 6rem;
+  min-width: 7rem;
 }
 
-.skins-create-link {
+/* ---- Admin review queue ---- */
+
+/* Sized so a reviewer sees the art first and the metadata second: the art is
+   the part no machine checked. */
+.admin-skin-queue {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  list-style: none;
+  overflow: hidden;
+}
+
+.admin-skin-queue li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid #e1e3e7;
+  padding: 10px 14px;
+}
+
+.admin-skin-queue li:last-child {
+  border-bottom: 0;
+}
+
+.admin-skin-preview canvas {
+  display: block;
+  border-radius: 3px;
+}
+
+.admin-skin-preview-missing {
   display: inline-block;
-  margin-top: 12px;
-  border: 2px solid #000;
-  padding: 7px 16px;
-  font-size: 11px;
-  font-style: italic;
+  padding: 24px 12px;
+  color: rgb(63 63 65 / 50%);
+  font-size: 8.5px;
   font-weight: 900;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.095em;
   text-transform: uppercase;
-  color: var(--game-graphite);
-  text-decoration: none;
 }
 
-.skins-create-link:hover {
-  background: var(--game-graphite);
-  color: var(--game-paper);
+.admin-skin-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.admin-skin-meta strong {
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.admin-skin-meta span {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.admin-skin-actions {
+  display: flex;
+  gap: 7px;
+}
+
+/* Taking a skin down reaches replays and everyone already wearing it, so it
+   must not look like the button beside it. */
+.admin-skin-actions .game-shell-button.is-destructive {
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+
+.admin-skin-actions .game-shell-button.is-destructive:hover:not(:disabled) {
+  border-color: var(--game-red);
+  background: #fef2f2;
+}
+
+/* A base row is two preview rectangles plus a name plus an action, which does
+   not fit across a 21rem rail. Stack the art over the meta rather than letting
+   the name wrap to one letter per line. */
+.skins-column-bases .skins-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'preview preview'
+    'meta action';
+  row-gap: 10px;
+  padding: 13px 16px;
+}
+
+.skins-column-bases .skins-row-preview {
+  grid-area: preview;
+}
+
+.skins-column-bases .skins-row-meta {
+  grid-area: meta;
+  justify-content: center;
+}
+
+.skins-column-bases .skins-row-action {
+  grid-area: action;
+  justify-self: end;
+}
+
+.skins-column-bases .skins-base-preview canvas {
+  width: 100%;
+  height: auto;
+}
+
+.skins-column-bases .skins-base-preview {
+  width: 100%;
+}
+
+.builder-preview-crop {
+  overflow: hidden;
+}
+
+.builder-preview-crop canvas {
+  display: block;
+}
+
+/* A colour pair is two swatches. Left stacked, eight of them sprawl down the
+   page as mostly-empty full-width rows; side by side they read as the pair
+   they are. */
+.builder-group .builder-group {
+  flex-flow: row wrap;
+  align-items: center;
+  gap: 10px 28px;
+  padding-bottom: 12px;
+}
+
+.builder-group .builder-group > legend {
+  flex-basis: 100%;
+}
+
+.builder-group .builder-field-color > span {
+  min-width: 0;
 }

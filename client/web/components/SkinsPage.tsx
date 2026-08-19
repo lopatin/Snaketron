@@ -241,6 +241,8 @@ type Slot = 'snake' | 'base';
 
 interface SkinRowProps {
   entry: CatalogEntry;
+  /** Who made it, for player-authored skins. Built-ins have no byline. */
+  byline?: string;
   slot: Slot;
   isEquipped: boolean;
   canEquip: boolean;
@@ -252,6 +254,7 @@ interface SkinRowProps {
 
 const SkinRow: React.FC<SkinRowProps> = ({
   entry,
+  byline,
   slot,
   isEquipped,
   canEquip,
@@ -286,7 +289,8 @@ const SkinRow: React.FC<SkinRowProps> = ({
 
       <div className="skins-row-meta">
         <span className="skins-row-name">{entry.name}</span>
-        <span className="skins-row-price">
+        {byline ? <span className="skins-row-byline">by {byline}</span> : null}
+        <span className={`skins-row-price${entry.priceBux > 0 ? ' is-priced' : ''}`}>
           {entry.priceBux === 0 ? 'Free' : `${entry.priceBux} BB`}
         </span>
       </div>
@@ -299,7 +303,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
         ) : onBuy ? (
           <button
             type="button"
-            className="skins-equip-button"
+            className="game-shell-button is-primary"
             disabled={isBusy}
             onClick={onBuy}
             data-testid={`skin-buy-${entry.reference}`}
@@ -309,7 +313,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
         ) : (
           <button
             type="button"
-            className="skins-equip-button"
+            className="game-shell-button"
             disabled={isBusy}
             onClick={() => onEquip(entry.reference)}
             data-testid={`skin-equip-${slot}-${entry.reference}`}
@@ -500,9 +504,11 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             Pick how your snake looks to everyone else, and how your side of the
             arena looks to you.
           </p>
-          <Link className="skins-create-link" to="/skins/builder">
-            Make your own
-          </Link>
+          <div className="skins-intro-actions">
+            <Link className="game-shell-button is-primary" to="/skins/builder">
+              Make your own
+            </Link>
+          </div>
         </div>
 
         {error ? (
@@ -525,6 +531,11 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                       slot="snake"
                       isEquipped={entry.reference === equippedSkin}
                       canEquip={Boolean(user)}
+                      byline={
+                        authored.find(
+                          (candidate) => candidate.reference === entry.reference,
+                        )?.creatorUsername ?? undefined
+                      }
                       isBusy={busySlot === 'snake'}
                       onEquip={(reference) => void equip('snake', reference)}
                       onBuy={(() => {
