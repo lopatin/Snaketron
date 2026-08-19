@@ -60,6 +60,16 @@ fn skins_under_test() -> Vec<Box<dyn SnakeSkin>> {
         ParamSkin::from_json(include_str!("../../../skin-schema/skins/classic.skin.json"))
             .expect("the shipped classic document compiles"),
     ));
+    // The v2 vocabulary, which nothing in the catalogue exercises yet: a
+    // travelling gradient, a sliding band, a Boost-reactive layer, a group and
+    // a reshaped glow. These are the paths where "expressions change
+    // arguments, never structure" could quietly stop being true.
+    for doc in crate::skin::docv2::conformance_fixtures() {
+        skins.push(Box::new(
+            crate::skin::docv2::LayerSkin::compile(&doc)
+                .unwrap_or_else(|errors| panic!("fixture `{}` compiles: {errors:?}", doc.id)),
+        ));
+    }
     skins
 }
 
@@ -283,6 +293,105 @@ fn skin_conformance_animation_only_varies_paint_arguments() {
             }
         }
     }
+}
+
+/// The invariance check above only means something if the skins it runs on
+/// actually animate. A fixture that quietly compiled to a still skin would
+/// pass every assertion in this file while testing nothing, so the v2
+/// fixtures are held to the other half of the claim as well: same op
+/// sequence, *different* arguments.
+#[test]
+fn skin_conformance_the_v2_fixtures_really_do_animate() {
+    let pose = |anim_ms: f64| SnakePose {
+        cells: &[(9.0, 4.0), (2.0, 4.0)],
+        cell_size: 10.0,
+        boost_active: false,
+        seed: 0.0,
+        anim_ms,
+        reduced_motion: false,
+        detail_scale: 1.0,
+    };
+    let identity = SkinIdentity {
+        role: SnakeRole::Own,
+        shade_slot: 0,
+    };
+
+    for doc in crate::skin::docv2::conformance_fixtures() {
+        let skin = crate::skin::docv2::LayerSkin::compile(&doc).expect("fixture compiles");
+        // The Boost-reactive fixture varies with the snake rather than the
+        // clock, and is covered by its own check below.
+        if doc.id == "fixture-reactive@1" {
+            continue;
+        }
+        let rest = record(&skin, &pose(0.0), &identity);
+        let later = record(&skin, &pose(900.0), &identity);
+        assert_eq!(
+            rest.shapes(),
+            later.shapes(),
+            "{} changed its op sequence",
+            doc.id
+        );
+        assert_ne!(
+            rest.to_golden(),
+            later.to_golden(),
+            "{} is meant to animate, and paints the same thing at every clock \
+             reading — so every other check on it is testing a still skin",
+            doc.id
+        );
+    }
+}
+
+/// The third binding tier, end to end: a layer reading `boost` has to paint
+/// differently while boosting, at the same op sequence, and *without* the
+/// clock moving. Folding it at compile time would silently pass every other
+/// check in this file.
+#[test]
+fn skin_conformance_a_snake_bound_layer_reacts_without_the_clock() {
+    let pose = |boost_active: bool| SnakePose {
+        cells: &[(9.0, 4.0), (2.0, 4.0)],
+        cell_size: 10.0,
+        boost_active,
+        seed: 0.0,
+        anim_ms: 0.0,
+        reduced_motion: true,
+        detail_scale: 1.0,
+    };
+    let identity = SkinIdentity {
+        role: SnakeRole::Own,
+        shade_slot: 0,
+    };
+
+    let doc = crate::skin::docv2::conformance_fixtures()
+        .into_iter()
+        .find(|doc| doc.id == "fixture-reactive@1")
+        .expect("the reactive fixture exists");
+    let skin = crate::skin::docv2::LayerSkin::compile(&doc).expect("compiles");
+
+    // Compared on the alpha ops alone, deliberately. Boosting also brings the
+    // Boost band into the stack, so whole traces would differ whether or not
+    // the binding worked — a check that passes for the wrong reason is worse
+    // than no check.
+    let alphas = |boost_active: bool| -> Vec<String> {
+        record(&skin, &pose(boost_active), &identity)
+            .to_golden()
+            .lines()
+            .filter(|line| line.starts_with("set_global_alpha"))
+            .map(str::to_string)
+            .collect()
+    };
+
+    let calm = alphas(false);
+    assert!(
+        !calm.is_empty(),
+        "the fixture is meant to set a layer opacity; nothing did"
+    );
+    assert_ne!(
+        calm,
+        alphas(true),
+        "a layer reading `boost` was folded to a constant, so it can never react"
+    );
+    // Reduced motion is on, so nothing here came from the animation clock.
+    assert_eq!(calm, alphas(false), "a still viewer gets a stable picture");
 }
 
 /// Someone who has asked the OS for less motion should get a still picture,

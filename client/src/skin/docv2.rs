@@ -717,6 +717,138 @@ impl SnakeSkin for LayerSkin {
     }
 }
 
+/// Documents that exercise the v2 vocabulary, for the conformance suite.
+///
+/// Every skin the compositor can produce has to satisfy the same rules, and
+/// until v2 skins ship there is nothing in the catalogue that animates a
+/// gradient stop, slides a band, or reacts to Boost. These fixtures are how
+/// those paths get held to the rules — in particular op-count invariance,
+/// which is the property the whole "expressions change arguments, never
+/// structure" design rests on.
+///
+/// Each is built on the converted classic document, so its palette is already
+/// conformant and what each fixture adds is the only thing under test.
+#[cfg(test)]
+pub(crate) fn conformance_fixtures() -> Vec<SkinDocV2> {
+    use skin_schema::v2::{SpanV2, StopV2, TransformV2, upgrade};
+
+    let base = || {
+        let v1: skin_schema::SkinDoc =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
+                .expect("the shipped classic document parses");
+        upgrade(&v1)
+    };
+    let layer = |name: &str, opacity: &str, body: LayerBodyV2| LayerV2 {
+        name: name.to_string(),
+        boost_only: false,
+        omit_on_single_cell: false,
+        opacity: PropExpr(opacity.to_string()),
+        transform: TransformV2::default(),
+        body,
+    };
+    let body_span = |source: SourceV2| LayerBodyV2::Span {
+        region: RegionV2::Body,
+        clip: ClipV2::Silhouette,
+        span: SpanV2::whole(),
+        corner: CornerV2::Fan,
+        source,
+    };
+
+    // The PRD's headline example: a gleam whose crest travels the body once
+    // per cycle, expressed as stop offsets that read the clock.
+    let mut shine = base();
+    shine.id = "fixture-shine@1".to_string();
+    shine.name = "Shine".to_string();
+    shine
+        .literals
+        .insert("gleam".to_string(), "#fff7d6".to_string());
+    let stop = |offset: &str, color: ColorRef, alpha: &str| StopV2 {
+        offset: PropExpr(offset.to_string()),
+        color,
+        alpha: PropExpr(alpha.to_string()),
+    };
+    shine.layers.push(layer(
+        "Shine",
+        "1",
+        body_span(SourceV2::Gradient {
+            axis: GradientAxis::AlongBody,
+            stops: vec![
+                stop("saw(time) - 0.15", ColorRef::slot(SlotName::Fill), "0"),
+                stop(
+                    "saw(time)",
+                    ColorRef {
+                        target: ColorTarget::Literal {
+                            literal: "gleam".to_string(),
+                        },
+                        lighten: None,
+                    },
+                    "0.55",
+                ),
+                stop("saw(time) + 0.15", ColorRef::slot(SlotName::Fill), "0"),
+            ],
+        }),
+    ));
+
+    // A band that both pulses and slides across the body: the geometry moves,
+    // the number of rectangles does not.
+    let mut pulse = base();
+    pulse.id = "fixture-pulse@1".to_string();
+    pulse.name = "Pulse".to_string();
+    pulse.palette.friendly[0].accent = Some("#a8e6ff".to_string());
+    pulse.layers.push(layer(
+        "Pulse band",
+        "0.5 + 0.4 * sin(tau * time)",
+        body_span(SourceV2::Band {
+            color: ColorRef::slot(SlotName::Accent),
+            period_cells: 4.0,
+            duty: 0.5,
+            phase_cells: 0.0,
+            half_width: PropExpr("0.15 + 0.05 * sin(tau * time)".to_string()),
+            t_center: PropExpr("0.2 * sin(tau * time)".to_string()),
+            alpha: Some(PropExpr("0.6 + 0.4 * noise(s, 0)".to_string())),
+        }),
+    ));
+
+    // Reads the snake rather than the clock, so it exercises the third
+    // binding tier — and a still viewer still sees it change with Boost.
+    let mut reactive = base();
+    reactive.id = "fixture-reactive@1".to_string();
+    reactive.name = "Reactive".to_string();
+    reactive.layers.push(layer(
+        "Boost sheen",
+        "mix(0.15, 0.45, boost)",
+        body_span(SourceV2::Solid {
+            color: ColorRef {
+                target: ColorTarget::Slot {
+                    slot: SlotName::Fill,
+                },
+                lighten: Some(PropExpr("0.25".to_string())),
+            },
+        }),
+    ));
+
+    // A group, and a glow whose falloff is not the linear one the renderer
+    // used to impose.
+    let mut grouped = base();
+    grouped.id = "fixture-grouped@1".to_string();
+    grouped.name = "Grouped".to_string();
+    let cap = grouped.layers.remove(3);
+    let highlight = grouped.layers.remove(3);
+    grouped.layers.push(layer(
+        "Head dressing",
+        "0.6",
+        LayerBodyV2::Group {
+            layers: vec![cap, highlight],
+        },
+    ));
+    if let LayerBodyV2::HeadRamp { .. } = grouped.layers[2].body {
+        grouped.layers[2].opacity =
+            PropExpr("0.35 * smoothstep(9, 0, s) * (0.85 + 0.15 * sin(tau * time))".to_string());
+    }
+
+    vec![shine, pulse, reactive, grouped]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +859,16 @@ mod tests {
     fn classic_v1() -> SkinDoc {
         serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
             .expect("the shipped classic document parses")
+    }
+
+    /// Every fixture has to be a document a player could actually have saved.
+    #[test]
+    fn the_conformance_fixtures_are_valid_documents() {
+        for doc in conformance_fixtures() {
+            if let Err(errors) = LayerSkin::compile(&doc) {
+                panic!("fixture `{}` does not compile: {errors:?}", doc.id);
+            }
+        }
     }
 
     fn record(skin: &dyn SnakeSkin, cells: &[(f64, f64)], boost: bool) -> String {

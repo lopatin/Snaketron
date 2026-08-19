@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposed |
+| Status | **In progress.** V0 shipped (schema, converter, compiler, byte-parity gate). Section 14's open questions are resolved — see 14.1–14.3. |
 | Product | Snaketron skins: document schema, client renderer, Skin Builder |
 | Scope | Replaces SkinDoc v1's closed vocabulary with a document form of the layer compositor; replaces the Builder's parameter form (including the entire Animations section) with a layers panel over that model |
 | Depends on | `specs/skin-shading-prd.md` (shipped: the compositor, body space, the expression language), `specs/first-class-skins-prd.md` (shipped M0–M5: storage, equip, review, textures, economy) |
@@ -311,13 +311,33 @@ change what an op paints, never how many ops there are.**
 
 Animatable (paint arguments): layer `opacity`; all five `transform` fields;
 gradient stop `offset` and `alpha`; band `half_width`, `t_center`, `alpha`;
-`head_disc.radius_ratio`; image `drift_cells` rate. All accept expressions;
-the bake places each by its derived tier (fold constants; 32-entry tables for
-`PerStep`; the cell walk for `PerCell`; baked tiles for `PerTexel`). Every
-evaluated result is clamped to the property's legal range before it reaches
-canvas — the same posture `expr::eval` already takes with non-finite values,
-and load-bearing for stop offsets, where `addColorStop` outside `0..1` throws
-rather than clips.
+`head_disc.radius_ratio`; image `drift_cells` rate. All accept expressions.
+Every evaluated result is clamped to the property's legal range before it
+reaches canvas — the same posture `expr::eval` already takes with non-finite
+values, and load-bearing for stop offsets, where `addColorStop` outside
+`0..1` throws rather than clips.
+
+**Where each expression is evaluated is derived, not declared**, and the
+schema names the *site* rather than capping a tier, because the site is what
+decides which inputs are even meaningful:
+
+| Site | What it is | May read |
+| --- | --- | --- |
+| Palette | one colour string per step, shared by every snake | `time` |
+| Snake | once per snake per frame — opacity, transforms, stops, drift | `time`, `len`, `boost`, `seed` |
+| Cell | once per cell or tile — the glow's curve, a band's alpha | everything, incl. `s` |
+| Bounded | a value whose *range* keeps a layer inside the snake | `time` |
+
+Two of these rows are the ones a naive tier reading gets wrong. `boost` and
+`seed` are *constant-tier* — neither changes within a snake-frame — and an
+expression reading them still cannot be folded at registration, because it
+is not constant across snakes; the compiler therefore has a third binding
+tier that evaluates per snake-frame. And **Bounded** exists because a head
+disc's radius or a band's lane is what keeps the layer inside the
+silhouette: that bound has to be checkable before the skin paints, so those
+properties refuse per-snake inputs even though the site is otherwise
+per-snake. Errors name the offending input and say why it is unavailable
+there.
 
 Static (structure and emission count): `type`, `region`, `clip`, span
 anchor/lengths/priority, `corner`, band `period_cells` / `duty` /
@@ -374,10 +394,25 @@ Builder applies when opening a v1 document (section 10):
 
 | v1 | v2 |
 | --- | --- |
-| track `body_lightness`, amplitude a, phase p | on the body ribbon: a lightness overlay layer (solid white, `opacity: "a * sin(tau * (time + p))"` clamped ≥ 0) paired with a black twin for the negative half — or, exactly as the v1 lowering does it today, baked swatch shifts; the converter uses the swatch form for fidelity |
-| track `outline_lightness` | same, on the outline ribbon |
-| track `gradient_opacity` | on the head-ramp layer: `opacity: "base + a * sin(tau * (time + p))"` |
-| wave (cells_per_crest c, amplitude a, speed v) | on the head-ramp layer: per-cell opacity term `a * sin(tau * (s / c - v * time))` — `PerCell` tier, riding the walk the ramp already does |
+| track `body_lightness`, amplitude a, phase p | `lighten: "a * sin(tau * (time + p))"` on the body ribbon's colour reference (and on every other reference to the fill, so the head cap moves with it) |
+| track `outline_lightness` | the same, on the outline ribbon's colour reference |
+| track `gradient_opacity` | folded into the glow's curve, below |
+| wave (cells_per_crest c, amplitude a, speed v) | also folded into the glow's curve |
+
+The glow is the interesting one, because v1 spread it across three places: a
+peak (`max_opacity` and its tracks), a linear falloff the renderer applied,
+and a wave added *after* that falloff. v2 writes the whole thing down:
+
+```
+(1 - s / L) * clamp(max + tracks(time), 0, 1) + a * sin(tau * (s / c - v * time))
+```
+
+That is not a translation loss — it is the point. The falloff stops being a
+shape the renderer knows and becomes something an author can see and change.
+The arithmetic is term-for-term and association-for-association identical to
+the hard-coded version, which a test pins by comparing raw bits at a dozen
+cell distances; that is what lets a converted still document keep painting
+byte-identical pixels.
 
 New things that were impossible, now one layer each:
 
@@ -387,8 +422,10 @@ New things that were impossible, now one layer each:
   body's path at the first corner. Stop offsets travel along arc length,
   which is what a shine means.)
 - **Pulse** — an accent band, `"opacity": "0.5 + 0.5 * sin(tau * time)"`.
-- **Ember flicker** — `"opacity": "0.6 + 0.4 * noise(seed, floor(time * 8))"`,
-  different per snake because `seed` is per-snake.
+- **Ember flicker** — on the glow's curve, `"0.6 + 0.4 * noise(seed, floor(time * 8))"`:
+  different per snake, because `seed` now genuinely is per-snake (14.3).
+  `noise` is confined to the per-cell site, which is the only place it is
+  affordable.
 - **Boost-reactive coat** — `"opacity": "mix(0.7, 1.0, boost)"` on an image
   layer; legal because presence is not changing, only alpha.
 
@@ -546,13 +583,17 @@ boundary.
 
 ## 11. Renderer changes (scoped, additive)
 
-1. `Layer.id: &'static str` → an interned/owned id (`Cow<'static, str>`), so
-   document layers can be named. Mechanical; no behavior change.
-2. **Generalized bindings**: the bake grows one `params: Vec<f64>` table per
-   frame (subsuming `layer_opacity`/`scalars` rather than adding a third
-   mechanism), plus per-cell binding slots evaluated in the existing cell
-   walk. Transform fields and gradient stops read through bindings; static
-   values compile to the fold, so v1-shaped stacks pay nothing new.
+1. `Layer.id: &'static str` → `Cow<'static, str>`, so document layers can be
+   named. Mechanical; no behaviour change.
+2. **Generalized bindings** — a single `Binding` replacing the three ad-hoc
+   mechanisms that had grown alongside each other (`opacity_track`,
+   `radius_track`, and the glow's own `ramp_opacity`/`wave` pair), each of
+   which animated exactly the one property somebody needed at the time. Three
+   variants, which are exactly the three costs: `Const` (folded, free),
+   `Param` (one slot in a per-step table, one lookup), `Snake` (one eval per
+   snake-frame). The frame's two tables collapse into one `params: Vec<f64>`.
+   A constant emits no op at all, which is why adding the mechanism left every
+   existing skin's op stream byte-identical.
 3. **Group flattening and the v1→v2 conversion** in the document compiler.
 4. **Text source lowering** and the bundled glyph atlas.
 5. **Texture-ladder atlas wiring**: atlas URLs chosen from a manifest by cell
@@ -614,8 +655,81 @@ document saved before V4 simply cannot name an image yet.
   Mitigation: templates make the empty state a working skin; system layers
   anchor the mental model; the inspector is still the same schema-driven
   control set the current Builder proved.
-- **Open**: whether `screen`-space layers (the third space in the shading
-  PRD) are exposed to documents at all in this round — deferred until a
-  concrete skin needs one; the schema reserves the field.
-- **Open**: literal *tables* per role (different literals for friendly vs
-  enemy) — deferred; slots cover the cases we know.
+
+### 14.1 Resolved: screen-space layers
+
+**Not exposed, and no field reserved for them.**
+
+The shading PRD's three-space table (body, head, screen) was a design
+sketch; only body space was ever built. `Layer` carries a region, a clip and
+a transform, and the transform acts in body space — there is no `space`
+field in the renderer to lower a document's `space` onto. Reserving the key
+anyway would repeat exactly the mistake that PRD's own non-goals call out
+for conic gradients: *a schema surface with no implementation is worse than
+an absence*, because it reads as a capability, gets authored against, and
+fails at a distance from its cause.
+
+When a concrete skin needs screen space, the renderer gains it first and the
+schema follows. Adding a key to v2 at that point is a backward-compatible
+addition; removing one that shipped is not.
+
+### 14.2 Resolved: per-role literal tables
+
+**Literals stay one colour for everyone. Per-role colour comes from the
+palette, which now has three slots instead of two.**
+
+Building the compiler forced the distinction the original question was
+blurring. Two things wanted to be "a literal":
+
+- a **named colour** — a gold gleam, an ash grey. Its whole point is that it
+  is the same colour whoever wears it. Making it per-role would not answer a
+  need, it would remove the only thing that distinguishes it from a palette
+  entry.
+- a **derived colour** — a lightened fill, which is what v1's brightness
+  tracks become. This one *is* per-role, necessarily: a lightened blue and a
+  lightened red are different colours.
+
+So the table of resolved colours moved from the frame onto the **swatch**,
+which is already per-role. A named literal lands there identical across
+roles and costs nothing; a derived colour lands there different per role,
+which is what it always was. Neither needed a new concept.
+
+That leaves the case the question was really about: *a third colour that
+flips with the side* — a friendly gold trim against an enemy purple one.
+That is not a literal, it is a palette entry, and the renderer has had a
+slot for it since Ember needed a per-role head glow (`ColorSlot::Accent`,
+resolved through `Swatch::accent`). No document could set it, so every
+document skin's accent was silently its fill. `ColorPair` now carries an
+optional `accent`, absent meaning the fill — so nothing that already shipped
+moves, and the answer to "can a colour differ per side" is the mechanism
+that was already there.
+
+The accent is deliberately **not** hue-windowed. A signature element pinned
+to its side's hue is not a signature. What stops a gold accent from making a
+friendly snake read as an enemy is how much of the body it covers, and that
+is the sampler's question (7.3), not a per-colour one.
+
+### 14.3 Decided while building
+
+Three more calls the implementation forced, recorded here because each
+narrows something the earlier sections stated more loosely:
+
+- **A group carries opacity, not a transform.** Opacity flattens exactly —
+  two opacities multiply into one. Two translate/rotate/scale triples do not
+  combine into a third: a rotation between two non-uniform scales is a
+  shear, which the triple cannot express. A group transform would therefore
+  be either a matrix the renderer does not have or an approximation that
+  looks right in the panel and wrong on a corner. Refused with a message
+  that says to put the transform on the layers inside.
+- **The head glow's expression is the whole curve, falloff included** — not
+  a peak the renderer then applies a fixed linear falloff to. Writing the
+  falloff out is what turns the glow from a fixed shape with two knobs into
+  something an author can reshape, and it costs nothing: the converted v1
+  curve is bit-identical to the hard-coded one, which is pinned by a test.
+- **`seed` is now real.** The expression language has always documented it
+  as "stable per snake, so two snakes wearing one skin can differ", and
+  every caller passed zero. Harmless while no author could reach the
+  language; dishonest the moment one can. `SnakePose` carries it, the arena
+  fills it from the snake's index in the state, and still surfaces (roster
+  glyphs, golden traces, contact sheets) pin it to zero so their output stays
+  reproducible.
