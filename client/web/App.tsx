@@ -11,6 +11,9 @@ import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
+import GameResultPage from './components/GameResultPage';
+import OnlinePlayersPanel from './components/OnlinePlayersPanel';
+import ChallengesPanel from './components/ChallengesPanel';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
 import { Leaderboard } from './components/Leaderboard';
@@ -81,6 +84,10 @@ function AppContent() {
   const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
   const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
   const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
+  // The public match page is a landing surface for people arriving from a
+  // shared link, most of whom have no session at all. Floating social chrome
+  // there would be furniture for an account they do not have yet.
+  const isSocialSuppressedRoute = matchPath('/g/:gameId', location.pathname) !== null;
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
   const showRuntimeAnnouncement = config.announcement.enabled
     && config.announcement.message.trim().length > 0
@@ -207,6 +214,11 @@ function AppContent() {
           element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <CustomGameCreator />}
         />
         <Route path="/lobby/:lobbyCode" element={<LobbyInvitePage />} />
+        {/* The permanent public address of a finished match. Deliberately
+            outside ProtectedRoute: a shared link has to open for someone who
+            has never played, and the same path is what the server renders for
+            crawlers. */}
+        <Route path="/g/:gameId" element={<GameResultPage />} />
         <Route
           path="/game/:gameCode"
           element={
@@ -264,6 +276,12 @@ function AppContent() {
           />
         )}
       </AnimatedRoutes>
+      {/* The roster is a lobby-level prompt, not gameplay chrome: it stays off
+          the arena, where the corners belong to the HUD, chat, and (on touch)
+          the steering pad. Challenges follow you everywhere, because one you
+          never see is one that expires. */}
+      <OnlinePlayersPanel enabled={!isGameArenaActive && !isSocialSuppressedRoute} />
+      {!isSocialSuppressedRoute && <ChallengesPanel />}
       <AuthModal
         isOpen={isAuthModalOpen && !isCrazyGamesBuild}
         onClose={() => setIsAuthModalOpen(false)}

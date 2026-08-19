@@ -47,7 +47,7 @@ pub const HIGHLIGHT_CLIP_FORMAT_VERSION: u32 = 1;
 /// Must equal `WS_PROTOCOL_VERSION` / `GAMEPLAY_PROTOCOL_VERSION`: the browser
 /// rejects any clip whose `gameplay_version` differs from the protocol it
 /// speaks, so a clip written under a stale value is silently unplayable.
-pub const GAMEPLAY_REPLAY_VERSION: u16 = 10;
+pub const GAMEPLAY_REPLAY_VERSION: u16 = 11;
 /// Completion scoring is deliberately bounded. Longer archives remain fully
 /// replayable from S3, but an unexpectedly long or event-dense match degrades
 /// to the no-highlight/banner path instead of monopolizing its executor.

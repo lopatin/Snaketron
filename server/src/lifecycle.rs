@@ -13,6 +13,11 @@ const PHASE_STOPPING: u8 = 3;
 /// WebSocket. Keep these stable: clients use them to decide whether a planned
 /// make-before-break handoff is supported.
 ///
+/// Version 11 adds the social layer: a per-region online-player roster and
+/// player-to-player challenges, both server-pushed. It also makes finished
+/// matches publicly addressable, though that surface is HTTP and does not
+/// cross this socket.
+///
 /// Version 10 is the same kind of collision as version 7 above, and is
 /// resolved the same way. Two branches each shipped a wire change and each
 /// independently claimed 9; git merged the constants silently, so 9 would
@@ -31,7 +36,7 @@ const PHASE_STOPPING: u8 = 3;
 /// fail to understand half the messages it receives. This must stay in lockstep
 /// with `GAMEPLAY_PROTOCOL_VERSION` in client/web/constants.ts; the bot and
 /// loadtest clients import this constant directly so they cannot drift at all.
-pub const WS_PROTOCOL_VERSION: u16 = 10;
+pub const WS_PROTOCOL_VERSION: u16 = 11;
 pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "explicit-auth-v1",
     "planned-drain-v1",
@@ -42,6 +47,7 @@ pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "terminal-command-cutoff-v1",
     "stress-matchmaking-pool-v1",
     "ad-break-v1",
+    "social-presence-v1",
 ];
 
 /// A planned task-removal notification. The absolute deadline avoids clients

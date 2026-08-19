@@ -1,5 +1,6 @@
 pub mod ads;
 pub mod api;
+pub mod challenges;
 mod chat_filter;
 pub mod cluster_membership;
 pub mod completion;
@@ -22,6 +23,7 @@ mod otel_metrics;
 pub mod partition_assignment;
 pub mod partition_lease;
 pub mod player_idle;
+pub mod presence;
 pub mod pubsub_manager;
 pub mod recovery;
 pub mod redis_keys;

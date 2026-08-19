@@ -9,7 +9,7 @@ const REQUIRED_CAPABILITIES = [
   'command-outcome-barrier-v1',
   'terminal-command-cutoff-v1',
 ];
-const CURRENT_PROTOCOL_VERSION = 10;
+const CURRENT_PROTOCOL_VERSION = 11;
 
 const RETRYABLE_MATCHMAKING_ADMISSION_REASON =
   'Failed to queue lobby: Failed to add lobby to matchmaking queue';

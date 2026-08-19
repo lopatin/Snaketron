@@ -1717,6 +1717,7 @@ export default function GameArena() {
       <>
         <GameHudShell
           gameState={committedState}
+          shareGameId={routeGameId}
           isVisible={isArenaVisible}
           arenaWidth={panelSize.width}
           currentUserId={user?.id}

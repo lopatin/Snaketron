@@ -11,6 +11,8 @@ import {
   User,
   MatchmakingStatus,
   ClientAdsConfig,
+  ChallengeInbox,
+  RegionRoster,
 } from '../types';
 import {
   OutboundMessage,
@@ -129,6 +131,8 @@ export const lobbyStorageKeyForIdentity = (
   return userId === null ? null : `${LOBBY_STORAGE_KEY}:user:${userId}`;
 };
 const MAX_CHAT_HISTORY = 200;
+/** Stable empty inbox so an un-populated social layer never re-renders consumers. */
+const EMPTY_CHALLENGE_INBOX: ChallengeInbox = { incoming: [], outgoing: [] };
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'ad_break', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
@@ -313,6 +317,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyMembers, setLobbyMembers] = useState<LobbyMember[]>([]);
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
+  // Social layer. The roster stays null until the server sends one, so the
+  // panel can distinguish "not loaded" from "nobody else is here".
+  const [onlinePlayers, setOnlinePlayers] = useState<RegionRoster | null>(null);
+  const [challenges, setChallenges] = useState<ChallengeInbox>(EMPTY_CHALLENGE_INBOX);
+  const [challengeError, setChallengeError] = useState<string | null>(null);
 
   useEffect(() => {
     if (disableChat) {
@@ -3083,6 +3092,98 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     resetLobbyState,
   ]);
 
+  // --- Social layer -------------------------------------------------------
+  //
+  // Both feeds are server-pushed snapshots, never deltas, so every handler is
+  // a plain replace. That is what makes them correct across a socket handoff,
+  // a dropped Pub/Sub hint, and a reconnect without any client-side merge.
+  useEffect(() => {
+    const cleanup = onMessage('OnlinePlayers', (message) => {
+      const roster = message?.data as RegionRoster | undefined;
+      if (!roster || !Array.isArray(roster.players)) {
+        return;
+      }
+      setOnlinePlayers(roster);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const cleanup = onMessage('Challenges', (message) => {
+      const inbox = message?.data as ChallengeInbox | undefined;
+      if (!inbox || !Array.isArray(inbox.incoming) || !Array.isArray(inbox.outgoing)) {
+        return;
+      }
+      setChallenges(inbox);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const cleanup = onMessage('ChallengeFailed', (message) => {
+      const reason = (message?.data as { reason?: unknown } | undefined)?.reason;
+      setChallengeError(typeof reason === 'string' && reason ? reason : 'That challenge could not be sent.');
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // Accepting a challenge is an instruction to join the challenger's lobby.
+  // The server cannot do it on this socket's behalf, so the client completes
+  // the move the same way an invite link does.
+  useEffect(() => {
+    const cleanup = onMessage('ChallengeAccepted', (message) => {
+      const payload = message?.data as { lobby_code?: unknown } | undefined;
+      const lobbyCode = payload?.lobby_code;
+      if (typeof lobbyCode !== 'string' || !lobbyCode) {
+        return;
+      }
+      if (currentLobbyRef.current?.code === lobbyCode) {
+        return;
+      }
+      void joinLobby(lobbyCode).catch((error: unknown) => {
+        console.error('Failed to join the lobby for an accepted challenge:', error);
+        setChallengeError('Could not join that match. Try the lobby code instead.');
+      });
+    });
+    return cleanup;
+  }, [joinLobby, onMessage]);
+
+  // A socket that goes away takes the social feeds with it: leaving them on
+  // screen would offer challenges that cannot be delivered.
+  useEffect(() => {
+    if (isSessionAuthenticated) {
+      return;
+    }
+    setOnlinePlayers(null);
+    setChallenges(EMPTY_CHALLENGE_INBOX);
+  }, [isSessionAuthenticated]);
+
+  const challengePlayer = useCallback((userId: number) => {
+    if (!Number.isSafeInteger(userId) || userId <= 0) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ ChallengePlayer: { user_id: userId } });
+  }, [sendMessage]);
+
+  const respondToChallenge = useCallback((challengeId: string, accept: boolean) => {
+    if (!challengeId) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ RespondToChallenge: { challenge_id: challengeId, accept } });
+  }, [sendMessage]);
+
+  const cancelChallenge = useCallback((challengeId: string) => {
+    if (!challengeId) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ CancelChallenge: { challenge_id: challengeId } });
+  }, [sendMessage]);
+
+  const dismissChallengeError = useCallback(() => setChallengeError(null), []);
+
   const value: WebSocketContextType = {
     isConnected,
     isSessionAuthenticated,
@@ -3110,6 +3211,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clearSessionForAccountChange,
     sendChatMessage,
     updateLobbyPreferences,
+    onlinePlayers,
+    challenges,
+    challengeError,
+    challengePlayer,
+    respondToChallenge,
+    cancelChallenge,
+    dismissChallengeError,
   };
 
   // Expose context for testing

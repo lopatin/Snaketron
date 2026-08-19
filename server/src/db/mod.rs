@@ -221,6 +221,23 @@ pub trait Database: Send + Sync {
             "match history is not supported by this database"
         ))
     }
+    /// The highest game id ever handed out.
+    ///
+    /// Ids come from a monotonic counter, so this is what separates "this
+    /// match is still being played" from "this id was never issued" — the
+    /// durable game row only appears at completion, and a shared link from a
+    /// live match has to resolve to something truthful in the meantime.
+    async fn latest_allocated_game_id(&self) -> Result<Option<i32>> {
+        Ok(None)
+    }
+    /// Read the permanent, publicly shareable summary of one completed game.
+    ///
+    /// This backs the public game page, so it must resolve for the life of the
+    /// product: implementations read the canonical, TTL-free match summary
+    /// rather than the retention-bounded completed-game snapshot.
+    async fn get_public_game_summary(&self, _game_id: i32) -> Result<Option<MatchHistorySummary>> {
+        Ok(None)
+    }
     /// Read the global administrative history projection without loading full
     /// game snapshots.
     async fn get_admin_match_history(

@@ -300,7 +300,7 @@ const receivedMessages = [];
           JSON.stringify({
             Authenticated: {
               task_boot_id: 'ticker-cta-test',
-              protocol_version: 10,
+              protocol_version: 11,
               capabilities: REQUIRED_CAPABILITIES,
               socket_generation: 1,
             },

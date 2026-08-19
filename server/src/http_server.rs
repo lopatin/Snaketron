@@ -24,6 +24,7 @@ use crate::ads::AdsConfig;
 use crate::api::admin;
 use crate::api::auth::{self, AuthState};
 use crate::api::crazygames;
+use crate::api::games as public_games;
 use crate::api::jwt::JwtManager;
 use crate::api::leaderboard::{self, LeaderboardState};
 use crate::api::middleware::{AuthMiddlewareState, admin_middleware, auth_middleware};
@@ -262,6 +263,9 @@ pub async fn install_http_application(
     // Start background task to broadcast user counts to WebSocket clients every 5 seconds
     spawn_user_count_broadcaster(redis.clone(), cancellation_token.clone());
 
+    // Start background task to broadcast the region's online-player roster.
+    spawn_region_roster_broadcaster(redis.clone(), region.clone(), cancellation_token.clone());
+
     // Create auth state for API routes
     let auth_state = AuthState {
         db: db.clone(),
@@ -288,6 +292,10 @@ pub async fn install_http_application(
     // process-global backstop cannot be evaded with spoofed proxy headers;
     // cache-aside still makes ordinary repeat views cheap.
     let replay_read_limiter = rate_limit_layer(600, 60);
+    // Public match pages are cheap single-item reads and are the surface a
+    // crawler or a viral link actually hits, so they get their own budget
+    // rather than sharing the replay backstop.
+    let public_game_read_limiter = rate_limit_layer(3000, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
@@ -364,6 +372,13 @@ pub async fn install_http_application(
         middleware::from_fn_with_state(replay_read_limiter, global_rate_limit_middleware),
     );
 
+    // Permanent public match pages. A link posted anywhere on the internet has
+    // to keep resolving, so these read the canonical TTL-free summary and are
+    // anonymous for the same reason the replay routes are.
+    let public_game_routes = public_games::build_public_game_routes(db.clone()).layer(
+        middleware::from_fn_with_state(public_game_read_limiter, global_rate_limit_middleware),
+    );
+
     // Build protected leaderboard routes (requires authentication)
     let protected_leaderboard_routes = Router::new()
         .route("/api/leaderboard/me", get(leaderboard::get_my_ranking))
@@ -404,6 +419,7 @@ pub async fn install_http_application(
         .merge(leaderboard_routes)
         .merge(news_routes)
         .merge(replay_routes)
+        .merge(public_game_routes)
         .merge(protected_leaderboard_routes)
         .merge(debug_routes)
         .with_state(auth_state);
@@ -1021,6 +1037,43 @@ async fn update_redis_metrics(
     }
 
     Ok(())
+}
+
+/// Broadcast the region's online-player roster whenever it changes.
+///
+/// Every task in a region runs this, which would be N duplicate frames per
+/// tick to every socket. `publish_roster_if_changed` collapses that with a
+/// Redis-side digest compare, so an idle region publishes nothing at all and a
+/// change publishes once cluster-wide.
+fn spawn_region_roster_broadcaster(
+    redis: RedisConnection,
+    region: String,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let registry = crate::presence::PresenceRegistry::new(redis, region.clone());
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    info!("Region roster broadcaster shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    match registry.roster().await {
+                        Ok(roster) => {
+                            if let Err(error) = registry.publish_roster_if_changed(&roster).await {
+                                tracing::debug!(%region, %error, "failed to publish the region roster");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%region, %error, "failed to read the region roster");
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Background task to broadcast user count updates every 5 seconds

@@ -190,3 +190,56 @@ export const FullscreenExitIcon = ({ className = '' }) => (
     />
   </svg>
 );
+
+export const ShareIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <circle cx="18" cy="5" r="2.6" />
+    <circle cx="6" cy="12" r="2.6" />
+    <circle cx="18" cy="19" r="2.6" />
+    <path d="M8.3 10.8 15.7 6.4M8.3 13.2l7.4 4.4" />
+  </svg>
+);
+
+export const LinkIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M10.5 13.5a4 4 0 0 0 5.7 0l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.3 1.3" />
+    <path d="M13.5 10.5a4 4 0 0 0-5.7 0l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.3-1.3" />
+  </svg>
+);
+
+/** Crossed blades: the challenge affordance in the online-players panel. */
+export const ChallengeIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M4 3h3l10.5 10.5" />
+    <path d="M20 3h-3L6.5 13.5" />
+    <path d="m14.5 16.5 2.5-2.5 4 4-2.5 2.5z" />
+    <path d="m9.5 16.5-2.5-2.5-4 4 2.5 2.5z" />
+  </svg>
+);

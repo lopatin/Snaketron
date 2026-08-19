@@ -5470,7 +5470,10 @@ a.home-social-icon:hover {
 
   .home-main {
     align-items: flex-start;
-    padding: 154px 6px calc(112px + var(--ad-route-bottom-reserve));
+    /* Clears the mobile social rail — the online-players strip and the
+       challenges trigger share one row above the region selector and chat
+       dock — so scrolling to the bottom never parks content underneath it. */
+    padding: 154px 6px calc(140px + var(--ad-route-bottom-reserve));
   }
 
   .home-brand-lockup {
@@ -6216,5 +6219,713 @@ a.home-social-icon:hover {
   }
   .skins-qa-tuning {
     position: static;
+  }
+}
+
+/* Online players ------------------------------------------------------------
+   A floating black translucent strip naming everyone online in the region,
+   with a one-click challenge per row.
+
+   Deliberately the app's only dark content surface. It floats over whichever
+   screen you are on rather than sitting inside a page, and the paper-white
+   panel language would read as another page element competing for the same
+   plane. Horizontal and scrollable so a busy region stays one line tall.
+
+   Bottom-anchored chrome must offset by the ad reserve and the safe-area
+   inset, never a raw pixel value, or a live bottom banner covers it. It sits
+   above the z-50/55 banner layer for the same reason, and below the game-over
+   card at 80. */
+.online-players {
+  position: fixed;
+  z-index: 56;
+  /* Shares the bottom rail with the region selector on the left and the chat
+     dock on the right, inset far enough to clear both. Sitting a row higher
+     would put a full-width strip straight across the primary call to action,
+     which is worse than a narrower strip. */
+  right: calc(190px + env(safe-area-inset-right, 0px));
+  bottom: calc(20px + var(--ad-route-bottom-reserve));
+  left: calc(190px + env(safe-area-inset-left, 0px));
+  display: flex;
+  max-width: min(920px, calc(100vw - 40px));
+  align-items: center;
+  gap: 12px;
+  margin: 0 auto;
+  padding: 8px 12px;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 10px;
+  background: rgb(9 12 20 / 72%);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  color: #fff;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 22%);
+}
+
+.online-players-toggle {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgb(255 255 255 / 78%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.online-players-toggle:hover {
+  background: rgb(255 255 255 / 8%);
+  color: #fff;
+}
+
+.online-players-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 2px;
+  background: #22c55e;
+}
+
+.online-players-count {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 12%);
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+
+.online-players-list {
+  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+  /* Thin and dark: a default scrollbar is a light-on-light bar across the
+     bottom of a black panel. */
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 22%) transparent;
+}
+
+.online-players-list::-webkit-scrollbar {
+  height: 5px;
+}
+
+.online-players-list::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+  background: rgb(255 255 255 / 22%);
+}
+
+.online-players-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.online-players-list ul {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.online-player {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  max-width: 240px;
+  padding: 5px 6px 5px 9px;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 7px;
+  background: rgb(255 255 255 / 6%);
+}
+
+.online-player-status {
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: 50%;
+  background: #22c55e;
+}
+
+.online-player-status.is-lobby {
+  background: var(--game-boost);
+}
+
+.online-player-status.is-playing {
+  background: rgb(255 255 255 / 32%);
+}
+
+.online-player-name {
+  overflow: hidden;
+  max-width: 130px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.online-player-activity {
+  color: rgb(255 255 255 / 45%);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.online-player-challenge {
+  display: flex;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 16%);
+  border-radius: 6px;
+  background: rgb(255 255 255 / 8%);
+  color: #fff;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, opacity 150ms ease;
+}
+
+.online-player-challenge:hover:not(:disabled) {
+  border-color: var(--game-blue);
+  background: var(--game-blue);
+}
+
+.online-player-challenge:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.online-player-challenge.is-pending {
+  border-color: var(--game-boost);
+  color: var(--game-boost);
+  opacity: 0.8;
+}
+
+.online-player-challenge-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.online-players-empty,
+.online-players-overflow {
+  margin: 0;
+  color: rgb(255 255 255 / 52%);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.online-players-overflow {
+  padding-left: 8px;
+}
+
+.online-players-error {
+  position: absolute;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid rgb(239 68 68 / 45%);
+  border-radius: 7px;
+  background: rgb(9 12 20 / 92%);
+  color: #fecaca;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.online-players-error button {
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* Collapsed, it hugs the left of its track rather than the viewport edge, so
+   it never drifts under the chat dock. */
+.online-players.is-collapsed {
+  right: auto;
+  max-width: none;
+  padding: 6px 8px;
+}
+
+.online-players :is(button, a):focus-visible {
+  outline: 2px solid #93c5fd;
+  outline-offset: 2px;
+}
+
+/* Challenges dock -----------------------------------------------------------
+   Same trigger/panel shape as lobby and game chat, reusing their classes so
+   the two read as one family, and stacked directly above the chat dock rather
+   than on top of it. Only rendered when something is pending. */
+.challenges-dock {
+  position: fixed;
+  z-index: 57;
+  right: calc(20px + env(safe-area-inset-right, 0px));
+  /* Directly above the chat dock, which owns the bottom-right corner. */
+  bottom: calc(88px + var(--ad-route-bottom-reserve));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.challenges-panel {
+  width: 300px;
+}
+
+.challenges-trigger {
+  min-width: 164px;
+  box-shadow: none;
+}
+
+.challenges-list {
+  display: grid;
+  overflow-y: auto;
+  max-height: 260px;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.challenge-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.challenge-row.is-incoming {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.challenge-row.is-resolved {
+  opacity: 0.6;
+}
+
+.challenge-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.challenge-name {
+  overflow: hidden;
+  color: rgb(0 0 0 / 78%);
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.challenge-detail {
+  color: #6b7280;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+
+.challenge-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+.challenge-action {
+  padding: 5px 9px;
+  border: 2px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: rgb(0 0 0 / 70%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.challenge-action.is-accept:hover {
+  border-color: var(--game-blue);
+  background: #dbeafe;
+}
+
+.challenge-action.is-decline:hover {
+  border-color: #9ca3af;
+  background: #f3f4f6;
+}
+
+.challenge-action:focus-visible {
+  outline: 2px solid var(--game-blue);
+  outline-offset: 2px;
+}
+
+/* Share control -------------------------------------------------------------
+   One button plus a popover holding the permanent link, a copy action, the OS
+   share sheet where there is one, and plain web-intent links. */
+.share-game {
+  position: relative;
+  display: inline-flex;
+}
+
+.share-game-trigger {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 2px solid var(--game-rule);
+  border-radius: 8px;
+  background: #fff;
+  color: rgb(0 0 0 / 70%);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.share-game-trigger:hover,
+.share-game-trigger[aria-expanded='true'] {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.share-game-trigger.is-compact {
+  width: 34px;
+  min-height: 34px;
+  height: 34px;
+  padding: 0;
+  justify-content: center;
+}
+
+.share-game-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.share-game-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 90;
+  display: grid;
+  width: 288px;
+  gap: 10px;
+  padding: 14px;
+  border: 2px solid var(--game-rule);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 16px 40px rgb(0 0 0 / 12%);
+}
+
+.share-game-heading {
+  margin: 0;
+  color: #6b7280;
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.share-game-note {
+  margin: -6px 0 0;
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.share-game-link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.share-game-link {
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 2px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+  color: rgb(0 0 0 / 70%);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* The arena disables text selection globally on touch; a link people are
+     meant to copy by hand has to opt back in. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.share-game-copy,
+.share-game-native {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 2px solid var(--game-rule);
+  border-radius: 6px;
+  background: #fff;
+  color: rgb(0 0 0 / 70%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.share-game-native {
+  width: 100%;
+}
+
+.share-game-copy:hover,
+.share-game-native:hover {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.share-game-targets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.share-game-target {
+  padding: 8px 4px;
+  border: 2px solid #e5e7eb;
+  border-radius: 6px;
+  color: rgb(0 0 0 / 70%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  text-align: center;
+  text-decoration: none;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.share-game-target:hover {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.share-game :is(button, a):focus-visible {
+  outline: 2px solid var(--game-blue);
+  outline-offset: 2px;
+}
+
+/* The in-match share sits in the roster rail; when the match is still live
+   there are no other actions there, so the slot only holds this. */
+.game-roster-share-slot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Public match page ---------------------------------------------------------
+   The landing surface for a shared link. Most people arriving here have never
+   played, so it is a single centered card and one call to action. */
+.game-result-page {
+  display: flex;
+  min-height: 100svh;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px 56px;
+}
+
+.game-result-card {
+  width: min(100%, 560px);
+  padding: 26px;
+  border: 2px solid var(--game-rule);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.game-result-kicker {
+  margin: 0 0 6px;
+  color: #6b7280;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.game-result-headline {
+  margin: 0 0 10px;
+  color: rgb(0 0 0 / 80%);
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.game-result-meta,
+.game-result-status {
+  margin: 0;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.game-result-standings {
+  margin: 22px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.game-result-standings li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #eef2f6;
+  color: rgb(0 0 0 / 72%);
+  font-size: 14px;
+}
+
+.game-result-standings strong {
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.game-result-player {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.game-result-winner {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #eff6ff;
+  color: #2563eb;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.game-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.game-result-cta {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  padding: 0 20px;
+  border: 2px solid var(--game-blue);
+  border-radius: 8px;
+  background: var(--game-blue);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+
+.game-result-cta:hover {
+  background: #2563eb;
+}
+
+@media (max-width: 700px) {
+  /* Phones get the collapsed strip by default: a full roster row would take
+     the whole width that the nickname form and play button need. */
+  /* Two rows is all there is room for on a phone: the region selector and
+     chat dock own the bottom one, and the strip shares the row above with the
+     challenges trigger. Stacking them into a third row would put a floating
+     panel across the play button. */
+  .online-players {
+    /* Just clear of the icon-only challenges trigger sharing this row. */
+    right: calc(78px + env(safe-area-inset-right, 0px));
+    bottom: calc(68px + var(--ad-route-bottom-reserve));
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    padding: 6px 8px;
+  }
+
+  .online-players.is-collapsed {
+    right: auto;
+  }
+
+  .online-player {
+    max-width: 200px;
+  }
+
+  .online-player-activity {
+    display: none;
+  }
+
+  .challenges-dock {
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    bottom: calc(68px + var(--ad-route-bottom-reserve));
+  }
+
+  .challenges-trigger {
+    min-width: 0;
+  }
+
+  /* The label is what the strip needs the width for; the icon plus its badge
+     still says which dock this is. */
+  .challenges-trigger .home-chat-label {
+    display: none;
+  }
+
+  .challenges-panel {
+    width: min(300px, calc(100vw - 24px));
+  }
+
+  .share-game-popover {
+    width: min(288px, calc(100vw - 32px));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .online-players-toggle,
+  .online-player-challenge,
+  .share-game-trigger,
+  .share-game-copy,
+  .share-game-native,
+  .share-game-target,
+  .challenge-action {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .online-players,
+  .online-player,
+  .share-game-popover,
+  .challenge-row {
+    border: 1px solid CanvasText;
   }
 }

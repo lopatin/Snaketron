@@ -16,6 +16,8 @@ const SCORE_CARD_REVEAL_DELAY_MS = 1600;
 
 export interface GameHudShellProps {
   gameState: GameState | null;
+  /** Wire game id, used only for share links. */
+  shareGameId?: number | null;
   isVisible: boolean;
   arenaWidth: number;
   currentUserId?: number;
@@ -31,6 +33,7 @@ export interface GameHudShellProps {
 
 const GameHudShell: React.FC<GameHudShellProps> = ({
   gameState,
+  shareGameId = null,
   isVisible,
   arenaWidth,
   currentUserId,
@@ -86,6 +89,7 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
       <MatchRosterBand
         presentation={presentation}
         isVisible={isVisible}
+        shareGameId={shareGameId}
         onMenu={onMenu}
         onScoreCard={() => setScoreCardOpen((open) => !open)}
         scoreCardOpen={scoreCardOpen}
@@ -114,6 +118,7 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
       <GameOverCard
         open={scoreCardOpen && presentation.isComplete}
         gameId={matchKey}
+        shareGameId={shareGameId}
         presentation={presentation}
         rating={rating}
         highlight={highlight}

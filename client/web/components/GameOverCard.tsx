@@ -10,6 +10,7 @@ import { resolveSnakeSkinColors } from '../utils/snakeSkin';
 import type { MatchRatingState } from '../utils/ratingReveal';
 import type { MatchHighlightState } from '../utils/highlightPresentation';
 import GameOverJewel from './GameOverJewel';
+import ShareGame from './ShareGame';
 import PlayOfTheGame from './PlayOfTheGame';
 import RatingReveal from './RatingReveal';
 
@@ -31,7 +32,10 @@ const FOCUSABLE_SELECTOR = [
 
 export interface GameOverCardProps {
   open: boolean;
+  /** Match identity for React, not the wire id — see `GameHudShell`. */
   gameId?: string;
+  /** The real `u32` game id, which is what a share link addresses. */
+  shareGameId?: number | null;
   presentation: MatchPresentation;
   rating?: MatchRatingState;
   highlight?: MatchHighlightState;
@@ -76,6 +80,7 @@ const MetricLabel: React.FC<MetricLabelProps> = ({
 const GameOverCard: React.FC<GameOverCardProps> = ({
   open,
   gameId,
+  shareGameId = null,
   presentation,
   rating,
   highlight,
@@ -371,6 +376,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
           <button type="button" onClick={onMenu} className="game-shell-button is-menu">
             Main menu
           </button>
+          <ShareGame gameId={shareGameId} headline={presentation.resultSummary} />
           <div className="game-over-replay-actions">
             {inputSurface !== 'touch' && (
               <span className="game-over-shortcut" aria-hidden="true">

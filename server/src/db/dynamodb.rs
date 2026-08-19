@@ -1795,20 +1795,28 @@ impl DynamoDatabase {
         format!("{}:{}", game_id, game_state.start_ms)
     }
 
+    /// Whether anything durable already occupies this game's partition.
+    ///
+    /// Queries the whole `GAME#{id}` partition rather than probing `META`
+    /// alone: the permanent match summary outlives the retention-bounded
+    /// snapshot, and public game links stay valid forever, so reissuing an id
+    /// whose summary still exists would silently repoint a shared link at a
+    /// different match.
     async fn game_item_exists(&self, game_id: i32) -> Result<bool> {
         let response = self
             .client
-            .get_item()
+            .query()
             .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("GAME#{}", game_id)))
-            .key("sk", Self::av_s("META"))
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(":pk", Self::av_s(format!("GAME#{game_id}")))
             .consistent_read(true)
             .projection_expression("pk")
+            .limit(1)
             .send()
             .await
             .context("Failed to check whether a durable game ID is already in use")?;
 
-        Ok(response.item.is_some())
+        Ok(response.items.is_some_and(|items| !items.is_empty()))
     }
 
     fn canonical_fingerprint<T: serde::Serialize>(value: &T) -> Result<String> {
@@ -3625,6 +3633,66 @@ impl Database for DynamoDatabase {
         }
     }
 
+    async fn latest_allocated_game_id(&self) -> Result<Option<i32>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s("COUNTER"))
+            .key("sk", Self::av_s("GAME"))
+            .projection_expression("#counter")
+            .expression_attribute_names("#counter", "counter")
+            .send()
+            .await
+            .context("Failed to read the game id counter")?;
+
+        Ok(response
+            .item
+            .as_ref()
+            .and_then(|item| Self::extract_number(item, "counter")))
+    }
+
+    /// Read the canonical, permanent match summary for one completed game.
+    ///
+    /// Deliberately reads `GAME#{id} / HISTORY` rather than the `META` row:
+    /// the snapshot, replay object, and Play-of-the-Game clip all age out under
+    /// retention, but a shared link to a match must keep resolving forever.
+    async fn get_public_game_summary(&self, game_id: i32) -> Result<Option<MatchHistorySummary>> {
+        if game_id <= 0 {
+            return Ok(None);
+        }
+
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("HISTORY"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read the canonical match summary")?;
+
+        let Some(item) = response.item else {
+            return Ok(None);
+        };
+        // Rows written before summaries became permanent still carry a TTL.
+        // Honor it on read for the same reason `get_game_by_id` does: a row
+        // past its deadline is logically gone even while DynamoDB's reaper
+        // has not caught up.
+        if Self::item_is_expired(&item, Utc::now().timestamp()) {
+            return Ok(None);
+        }
+
+        match Self::history_summary_from_item(&item) {
+            Ok(summary) => Ok(Some(summary)),
+            Err(error) => {
+                warn!(game_id, ?error, "unreadable canonical match summary");
+                Ok(None)
+            }
+        }
+    }
+
     async fn get_recent_completed_games(&self, limit: usize) -> Result<Vec<Game>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -3950,7 +4018,11 @@ impl Database for DynamoDatabase {
                 .table_name(self.main_table())
                 .index_name("GSI2")
                 .key_condition_expression("gsi2pk=:pk")
-                .filter_expression("#ttl > :now")
+                // Canonical summaries are permanent and carry no `ttl` at all;
+                // only rows written before that keep a deadline. Filtering on
+                // `#ttl > :now` alone would hide every new match from the
+                // administrative projection.
+                .filter_expression("attribute_not_exists(#ttl) OR #ttl > :now")
                 .expression_attribute_names("#ttl", "ttl")
                 .expression_attribute_values(":pk", Self::av_s(HISTORY_GSI_PARTITION))
                 .expression_attribute_values(":now", Self::av_n(now))
@@ -4466,6 +4538,11 @@ impl Database for DynamoDatabase {
                         mutations.push(TransactWriteItem::builder().put(split_highlight).build());
                     }
 
+                    // The canonical row deliberately carries NO ttl: it is what
+                    // backs the permanent public game page, and a shared link
+                    // must never rot. Retention still applies to everything
+                    // heavier — the final snapshot, the replay object, and each
+                    // player's private history mirror below all keep their TTL.
                     let canonical_history = Put::builder()
                         .table_name(self.main_table())
                         .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
@@ -4479,7 +4556,6 @@ impl Database for DynamoDatabase {
                             "completionRevision",
                             Self::av_s(completion.revision.to_string()),
                         )
-                        .item("ttl", Self::av_n(summary_ttl))
                         .condition_expression(
                             "attribute_not_exists(pk) AND attribute_not_exists(sk)",
                         )

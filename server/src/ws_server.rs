@@ -3,6 +3,10 @@ use crate::ads::{
     LobbyAdBreakView, MAX_AD_BREAK_PARTICIPANTS, lobby_meets_game_threshold,
 };
 use crate::api::auth::validate_username;
+use crate::challenges::{
+    CHALLENGE_TTL_MS, Challenge, ChallengeInbox, ChallengeState, ChallengeStore, new_challenge_id,
+    now_ms,
+};
 use crate::chat_filter::filter_chat_message;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::{Database, models::RuntimeAdsConfig};
@@ -20,6 +24,7 @@ use crate::matchmaking_manager::{
     MatchmakingManager,
 };
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::presence::{PresenceActivity, PresenceRegistry, RegionRoster};
 use crate::pubsub_manager::PubSubManager;
 use crate::recovery::{
     CommandOutcome, RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes,
@@ -268,6 +273,43 @@ pub enum WSMessage {
         target_region: String,
         ws_url: String,
         lobby_code: String,
+    },
+
+    // === Social layer (protocol 11, capability `social-presence-v1`) ===
+    /// Server -> client: everyone currently online in this connection's region.
+    /// Pushed on authentication and whenever the region roster changes; the
+    /// viewer is always absent from `players`.
+    OnlinePlayers(RegionRoster),
+    /// Client -> server: challenge one online player to a match. The server
+    /// takes the challenger's identity from the connection — only the target
+    /// is client-supplied.
+    ChallengePlayer {
+        user_id: u32,
+    },
+    /// Client -> server: answer a challenge addressed to this user. The server
+    /// enforces that only the target may accept or decline.
+    RespondToChallenge {
+        challenge_id: String,
+        accept: bool,
+    },
+    /// Client -> server: withdraw a challenge this user issued.
+    CancelChallenge {
+        challenge_id: String,
+    },
+    /// Server -> client: the complete challenge state for this user. Always a
+    /// full snapshot rather than a delta, so it is idempotent across a socket
+    /// handoff, a dropped hint, or a reconnect.
+    Challenges(ChallengeInbox),
+    /// Server -> client: an accepted challenge, addressed to both players. The
+    /// client joins `lobby_code` to land in the challenger's lobby.
+    ChallengeAccepted {
+        challenge_id: String,
+        lobby_code: String,
+    },
+    /// Server -> client: a challenge could not be issued, with a reason meant
+    /// to be shown verbatim.
+    ChallengeFailed {
+        reason: String,
     },
     // NicknameUpdated {
     //     username: String,
@@ -538,6 +580,146 @@ enum LobbyMatchHint {
 
 fn refresh_connection_username(metadata: &mut PlayerMetadata, username: String) {
     metadata.username = username;
+}
+
+/// Issue a challenge from this connection, creating the challenger's lobby if
+/// they do not already have one.
+///
+/// Returns the (possibly new) lobby handle and, when a lobby was created here,
+/// its code — the caller sends `LobbyCreated` so the client's lobby state
+/// tracks the one the challenge points at.
+#[allow(clippy::too_many_arguments)]
+async fn issue_challenge(
+    challenger_id: u32,
+    metadata: &PlayerMetadata,
+    target_user_id: u32,
+    lobby: Option<LobbyJoinHandle>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    user_cache: UserCache,
+    redis: &RedisConnection,
+    region: &str,
+    websocket_id: &str,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<(Option<LobbyJoinHandle>, Option<String>)> {
+    if target_user_id == challenger_id {
+        send_challenge_failure(crate::challenges::ChallengeRejection::Self_.reason(), ws_tx)
+            .await?;
+        return Ok((lobby, None));
+    }
+
+    let presence = PresenceRegistry::new(redis.clone(), region.to_string());
+    match presence.is_online(target_user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            send_challenge_failure(
+                crate::challenges::ChallengeRejection::TargetOffline.reason(),
+                ws_tx,
+            )
+            .await?;
+            return Ok((lobby, None));
+        }
+        Err(error) => {
+            warn!(target_user_id, %error, "failed to check challenge target presence");
+            send_challenge_failure("Could not reach that player. Try again.", ws_tx).await?;
+            return Ok((lobby, None));
+        }
+    }
+
+    // Resolve the target's name at send time rather than trusting the roster
+    // frame the client was looking at: nicknames change, and the record is
+    // read back by both sides for the life of the challenge.
+    let target_username = match user_cache.get(target_user_id).await {
+        Ok(Some(user)) => user.username,
+        Ok(None) => {
+            send_challenge_failure(
+                crate::challenges::ChallengeRejection::TargetOffline.reason(),
+                ws_tx,
+            )
+            .await?;
+            return Ok((lobby, None));
+        }
+        Err(error) => {
+            warn!(target_user_id, %error, "failed to resolve a challenge target");
+            send_challenge_failure("Could not reach that player. Try again.", ws_tx).await?;
+            return Ok((lobby, None));
+        }
+    };
+
+    let (lobby, created_code) = match lobby {
+        Some(handle) => (Some(handle), None),
+        None => {
+            let lobby = match lobby_manager
+                .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                .await
+            {
+                Ok(lobby) => lobby,
+                Err(error) => {
+                    warn!(challenger_id, %error, "failed to create a lobby for a challenge");
+                    send_challenge_failure("Could not open a lobby to play in.", ws_tx).await?;
+                    return Ok((None, None));
+                }
+            };
+            match lobby_manager
+                .join_lobby_for_pool(
+                    Some(lobby.lobby_code()),
+                    metadata.user_id,
+                    metadata.username.clone(),
+                    websocket_id.to_string(),
+                    region.to_string(),
+                    None,
+                    metadata.matchmaking_pool,
+                    metadata.distribution,
+                    metadata.supports_ad_break,
+                    metadata.can_show_video_ad,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let code = handle.lobby_code.clone();
+                    (Some(handle), Some(code))
+                }
+                Err(error) => {
+                    warn!(challenger_id, %error, "failed to join a lobby created for a challenge");
+                    send_challenge_failure("Could not open a lobby to play in.", ws_tx).await?;
+                    return Ok((None, None));
+                }
+            }
+        }
+    };
+
+    let Some(handle) = lobby else {
+        return Ok((None, created_code));
+    };
+
+    let created_at_ms = now_ms();
+    let challenge = Challenge {
+        challenge_id: new_challenge_id(challenger_id, target_user_id, created_at_ms),
+        from_user_id: challenger_id,
+        from_username: metadata.username.clone(),
+        to_user_id: target_user_id,
+        to_username: target_username,
+        lobby_code: handle.lobby_code.clone(),
+        state: ChallengeState::Pending,
+        created_at_ms,
+        expires_at_ms: created_at_ms.saturating_add(CHALLENGE_TTL_MS),
+    };
+
+    let store = ChallengeStore::new(redis.clone());
+    match store.issue(challenge).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(rejection)) => {
+            send_challenge_failure(rejection.reason(), ws_tx).await?;
+        }
+        Err(error) => {
+            warn!(challenger_id, target_user_id, %error, "failed to issue a challenge");
+            send_challenge_failure("Could not send that challenge. Try again.", ws_tx).await?;
+        }
+    }
+    // The challenger's own outgoing list is refreshed from the durable record,
+    // so a rejected challenge cannot leave a phantom entry on their screen.
+    let _ = send_challenge_inbox(challenger_id, &store, ws_tx).await;
+
+    Ok((Some(handle), created_code))
 }
 
 async fn handle_guest_nickname_update(
@@ -926,6 +1108,10 @@ async fn handle_websocket_connection(
     // Will be used to track game chat subscription
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
 
+    // Presence lease + challenge delivery, claimed once this connection has an
+    // authenticated identity to be present *as*.
+    let mut social_session: Option<SocialSession> = None;
+
     // Spawn task to forward messages from channel to WebSocket
     let forward_task = tokio::spawn(async move {
         let mut drain_open = true;
@@ -1125,6 +1311,7 @@ async fn handle_websocket_connection(
                                     // Check state before consuming it
                                     let was_in_game = matches!(&state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                     let was_in_lobby = matches!(&state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
+                                    let was_authenticated = matches!(&state, ConnectionState::Authenticated { .. });
                                     if was_in_lobby
                                         && matches!(
                                             &ws_message,
@@ -1187,6 +1374,38 @@ async fn handle_websocket_connection(
                                                 None => entered_game_id.is_some() && !was_in_game,
                                             };
                                             let entering_lobby = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. }) && !was_in_lobby;
+
+                                            // Join the social layer the moment there is an identity to be
+                                            // present as, and keep the roster's activity honest afterwards.
+                                            if let ConnectionState::Authenticated { metadata, .. } = &new_state {
+                                                if !was_authenticated && social_session.is_none() {
+                                                    social_session = start_social_session(
+                                                        metadata,
+                                                        &websocket_id,
+                                                        &region,
+                                                        &redis,
+                                                        &pubsub_manager,
+                                                        &ws_tx,
+                                                    )
+                                                    .await;
+                                                } else if social_session.is_some() {
+                                                    let activity = match &new_state {
+                                                        ConnectionState::Authenticated { game_id: Some(_), .. } => {
+                                                            PresenceActivity::Playing
+                                                        }
+                                                        ConnectionState::Authenticated { lobby_handle: Some(_), .. } => {
+                                                            PresenceActivity::Lobby
+                                                        }
+                                                        _ => PresenceActivity::Idle,
+                                                    };
+                                                    record_presence_activity(
+                                                        social_session.as_ref(),
+                                                        metadata,
+                                                        activity,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
                                             let leaving_lobby = was_in_lobby && !matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
                                             let leaving_game = was_in_game && !matches!(&new_state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                             debug!("State transitioned to: entering_game: {}, entering_lobby: {}, leaving_lobby: {}, leaving_game: {}",
@@ -1554,6 +1773,12 @@ async fn handle_websocket_connection(
     }
     if let Some(handle) = game_chat_handle {
         handle.abort();
+    }
+    // Give up the presence lease and withdraw anything still pending, so this
+    // player leaves the roster immediately instead of at lease expiry and
+    // nobody is left holding an unanswerable invitation.
+    if let Some(session) = social_session.take() {
+        session.close().await;
     }
     forward_task.abort();
 
@@ -4465,6 +4690,121 @@ async fn process_ws_message(
             }
 
             match ws_message {
+                WSMessage::ChallengePlayer {
+                    user_id: target_user_id,
+                } => {
+                    let Ok(challenger_id) = u32::try_from(metadata.user_id) else {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    };
+                    // A challenge is an invitation to the challenger's lobby,
+                    // so there has to be one. Creating it here rather than
+                    // asking the client to sequence CreateLobby first keeps
+                    // the whole exchange a single round trip.
+                    let (lobby, outcome) = issue_challenge(
+                        challenger_id,
+                        &metadata,
+                        target_user_id,
+                        lobby,
+                        lobby_manager,
+                        user_cache.clone(),
+                        redis,
+                        region,
+                        websocket_id.as_str(),
+                        ws_tx,
+                    )
+                    .await?;
+                    if let Some(lobby_code) = outcome {
+                        let created = WSMessage::LobbyCreated { lobby_code };
+                        ws_tx
+                            .send(Message::Text(serde_json::to_string(&created)?.into()))
+                            .await?;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::RespondToChallenge {
+                    challenge_id,
+                    accept,
+                } => {
+                    if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                        let store = ChallengeStore::new(redis.clone());
+                        let state = if accept {
+                            ChallengeState::Accepted
+                        } else {
+                            ChallengeState::Declined
+                        };
+                        match store.resolve(user_id, &challenge_id, state).await {
+                            Ok(Some(challenge)) => {
+                                if accept {
+                                    let accepted = WSMessage::ChallengeAccepted {
+                                        challenge_id: challenge.challenge_id.clone(),
+                                        lobby_code: challenge.lobby_code.clone(),
+                                    };
+                                    ws_tx
+                                        .send(Message::Text(
+                                            serde_json::to_string(&accepted)?.into(),
+                                        ))
+                                        .await?;
+                                }
+                            }
+                            Ok(None) => {
+                                send_challenge_failure(
+                                    "That challenge is no longer available.",
+                                    ws_tx,
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                warn!(user_id, %error, "failed to resolve a challenge");
+                                send_challenge_failure(
+                                    "Could not answer that challenge. Try again.",
+                                    ws_tx,
+                                )
+                                .await?;
+                            }
+                        }
+                        // Whatever happened, the answerer's own view is
+                        // refreshed from the durable record rather than guessed
+                        // at from the outcome.
+                        let _ = send_challenge_inbox(user_id, &store, ws_tx).await;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::CancelChallenge { challenge_id } => {
+                    if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                        let store = ChallengeStore::new(redis.clone());
+                        if let Err(error) = store
+                            .resolve(user_id, &challenge_id, ChallengeState::Cancelled)
+                            .await
+                        {
+                            warn!(user_id, %error, "failed to cancel a challenge");
+                        }
+                        let _ = send_challenge_inbox(user_id, &store, ws_tx).await;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
                 WSMessage::UpdateNickname { nickname } => {
                     let mut metadata = metadata;
                     if let Err(e) = handle_guest_nickname_update(
@@ -5483,6 +5823,334 @@ pub async fn register_server(
 }
 
 /// Subscribe to user count updates from Redis and forward to WebSocket client
+/// Everything one authenticated socket needs to take part in the social layer.
+///
+/// Held for the life of the connection. Dropping it aborts the background
+/// tasks; `close` additionally gives up the presence lease and withdraws the
+/// user's pending challenges, so nobody is left waiting on an answer that can
+/// no longer arrive.
+struct SocialSession {
+    user_id: u32,
+    /// Which connection holds this user's presence lease. A make-before-break
+    /// replacement claims it before this one tears down, and cleanup must not
+    /// undo the newer socket's work.
+    websocket_id: String,
+    presence: PresenceRegistry,
+    challenges: ChallengeStore,
+    /// What the lease should currently assert. Shared with the refresh loop so
+    /// a heartbeat re-states the player's *current* name and activity rather
+    /// than the ones captured when the connection authenticated.
+    intent: Arc<std::sync::Mutex<PresenceIntent>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct PresenceIntent {
+    username: String,
+    is_guest: bool,
+    activity: PresenceActivity,
+    pool: MatchmakingPool,
+}
+
+impl SocialSession {
+    async fn close(mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        // Only the socket that still owns the lease may declare this player
+        // gone. On a planned handoff the replacement already owns it, and
+        // withdrawing challenges here would cancel invitations for a player
+        // who never left.
+        let departed = match self
+            .presence
+            .release(self.user_id, &self.websocket_id)
+            .await
+        {
+            Ok(departed) => departed,
+            Err(error) => {
+                debug!(user_id = self.user_id, %error, "failed to release presence on disconnect");
+                false
+            }
+        };
+        if departed && let Err(error) = self.challenges.withdraw_all(self.user_id).await {
+            debug!(user_id = self.user_id, %error, "failed to withdraw challenges on disconnect");
+        }
+    }
+}
+
+/// Send the region roster with the viewer removed.
+///
+/// A roster frame is published once per region and forwarded by every socket,
+/// so the "not me" filter has to happen here rather than at publish time.
+async fn send_online_players(
+    user_id: u32,
+    roster: RegionRoster,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    let mut roster = roster;
+    roster.players.retain(|player| player.user_id != user_id);
+    let frame = serde_json::to_string(&WSMessage::OnlinePlayers(roster))
+        .context("failed to serialize the online-player roster")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the online-player roster")
+}
+
+/// Send this user's complete challenge state. Always a snapshot: a client that
+/// missed a hint, handed its socket over, or reconnected simply re-renders.
+async fn send_challenge_inbox(
+    user_id: u32,
+    challenges: &ChallengeStore,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    let inbox = challenges
+        .inbox(user_id)
+        .await
+        .context("failed to read the challenge inbox")?;
+    let frame = serde_json::to_string(&WSMessage::Challenges(inbox))
+        .context("failed to serialize the challenge inbox")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the challenge inbox")
+}
+
+/// Bring one authenticated socket into the social layer: claim a presence
+/// lease, send the current roster and challenge state, and keep both live.
+async fn start_social_session(
+    metadata: &PlayerMetadata,
+    websocket_id: &str,
+    region: &str,
+    redis: &RedisConnection,
+    pubsub_manager: &Arc<PubSubManager>,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Option<SocialSession> {
+    let Ok(user_id) = u32::try_from(metadata.user_id) else {
+        return None;
+    };
+    // Stress identities are a separate matchmaking universe and never appear
+    // to real players; giving them a social session would put load-test names
+    // in everyone's roster.
+    if metadata.matchmaking_pool == MatchmakingPool::Stress {
+        return None;
+    }
+
+    let presence = PresenceRegistry::new(redis.clone(), region.to_string());
+    let challenges = ChallengeStore::new(redis.clone());
+
+    if let Err(error) = presence
+        .refresh(
+            user_id,
+            websocket_id,
+            &metadata.username,
+            metadata.is_guest,
+            PresenceActivity::Idle,
+            metadata.matchmaking_pool,
+        )
+        .await
+    {
+        warn!(user_id, %error, "failed to claim a presence lease");
+        return None;
+    }
+
+    match presence.roster().await {
+        Ok(roster) => {
+            if let Err(error) = send_online_players(user_id, roster, ws_tx).await {
+                debug!(user_id, %error, "failed to send the initial roster");
+            }
+        }
+        Err(error) => warn!(user_id, %error, "failed to read the initial roster"),
+    }
+    if let Err(error) = send_challenge_inbox(user_id, &challenges, ws_tx).await {
+        debug!(user_id, %error, "failed to send the initial challenge inbox");
+    }
+
+    let intent = Arc::new(std::sync::Mutex::new(PresenceIntent {
+        username: metadata.username.clone(),
+        is_guest: metadata.is_guest,
+        activity: PresenceActivity::Idle,
+        pool: metadata.matchmaking_pool,
+    }));
+    let mut tasks = Vec::new();
+
+    // Keep the lease alive. A lease rather than a delete-on-disconnect pair is
+    // what makes the roster correct when a task dies without cleaning up.
+    let lease_presence = presence.clone();
+    let lease_intent = intent.clone();
+    let lease_websocket_id = websocket_id.to_string();
+    tasks.push(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            crate::presence::PRESENCE_REFRESH_INTERVAL_MS,
+        ));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let current = match lease_intent.lock() {
+                Ok(intent) => intent.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Err(error) = lease_presence
+                .refresh(
+                    user_id,
+                    &lease_websocket_id,
+                    &current.username,
+                    current.is_guest,
+                    current.activity,
+                    current.pool,
+                )
+                .await
+            {
+                debug!(user_id, %error, "presence lease refresh failed");
+            }
+        }
+    }));
+
+    // Roster fan-out. Loss-tolerant by design: a dropped frame is corrected by
+    // the next roster change, and nothing depends on having seen every one.
+    let roster_tx = ws_tx.clone();
+    let roster_channel = RedisKeys::presence_updates_channel(region);
+    let mut roster_pubsub = (**pubsub_manager).clone();
+    tasks.push(tokio::spawn(async move {
+        let Ok(mut receiver) = roster_pubsub.subscribe_to_channel(&roster_channel).await else {
+            warn!(channel = %roster_channel, "failed to subscribe to region roster updates");
+            return;
+        };
+        loop {
+            let Ok(roster) = receiver.recv::<RegionRoster>().await else {
+                break;
+            };
+            if send_online_players(user_id, roster, &roster_tx)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }));
+
+    // Challenge delivery. The Pub/Sub hint only says "re-read your state"; the
+    // durable records are authoritative and the timer covers a dropped hint,
+    // which is the same durable-key + hint + reconcile shape matchmaking uses.
+    let challenge_tx = ws_tx.clone();
+    let challenge_store = challenges.clone();
+    let notification_channel = RedisKeys::user_notifications_channel(user_id);
+    let mut challenge_pubsub = (**pubsub_manager).clone();
+    tasks.push(tokio::spawn(async move {
+        let receiver = challenge_pubsub
+            .subscribe_to_channel(&notification_channel)
+            .await;
+        let mut reconcile = tokio::time::interval(CHALLENGE_RECONCILE_INTERVAL);
+        reconcile.tick().await;
+        match receiver {
+            Ok(mut receiver) => loop {
+                tokio::select! {
+                    hint = receiver.recv::<String>() => {
+                        if hint.is_err() {
+                            break;
+                        }
+                    }
+                    _ = reconcile.tick() => {}
+                }
+                if send_challenge_inbox(user_id, &challenge_store, &challenge_tx)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            },
+            Err(error) => {
+                // Without the hint channel the feature still works, just at
+                // reconcile latency rather than instantly.
+                warn!(user_id, %error, "challenge hints unavailable; falling back to polling");
+                loop {
+                    reconcile.tick().await;
+                    if send_challenge_inbox(user_id, &challenge_store, &challenge_tx)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }));
+
+    Some(SocialSession {
+        user_id,
+        websocket_id: websocket_id.to_string(),
+        presence,
+        challenges,
+        intent,
+        tasks,
+    })
+}
+
+/// How often a socket re-reads its challenges regardless of hints. Short
+/// enough that a dropped Pub/Sub message is not user-visible as a stuck panel.
+const CHALLENGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Re-assert the presence lease with a new activity, so the roster can say
+/// whether someone is free to play.
+async fn record_presence_activity(
+    session: Option<&SocialSession>,
+    metadata: &PlayerMetadata,
+    activity: PresenceActivity,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let next = PresenceIntent {
+        username: metadata.username.clone(),
+        is_guest: metadata.is_guest,
+        activity,
+        pool: metadata.matchmaking_pool,
+    };
+    // Writing the shared intent first means even a failed refresh converges on
+    // the next heartbeat instead of leaving the roster permanently stale.
+    let unchanged = match session.intent.lock() {
+        Ok(mut current) => {
+            let unchanged = current.username == next.username
+                && current.is_guest == next.is_guest
+                && current.activity == next.activity;
+            *current = next.clone();
+            unchanged
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = next.clone();
+            false
+        }
+    };
+    if unchanged {
+        return;
+    }
+
+    if let Err(error) = session
+        .presence
+        .refresh(
+            session.user_id,
+            &session.websocket_id,
+            &next.username,
+            next.is_guest,
+            next.activity,
+            next.pool,
+        )
+        .await
+    {
+        debug!(user_id = session.user_id, %error, "failed to record presence activity");
+    }
+}
+
+async fn send_challenge_failure(reason: &str, ws_tx: &mpsc::Sender<Message>) -> Result<()> {
+    let frame = serde_json::to_string(&WSMessage::ChallengeFailed {
+        reason: reason.to_string(),
+    })?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before a challenge failure")
+}
+
 async fn subscribe_to_user_count_updates(
     pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
