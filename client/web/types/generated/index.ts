@@ -11,6 +11,7 @@ export * from './ChallengeState';
 export * from './BrowseResponse';
 export * from './CatalogEntry';
 export * from './CheckUsernameResponse';
+export * from './CheckoutToken';
 export * from './ClientAdsConfig';
 export * from './ClientCommandIdentityV2';
 export * from './ClientDistribution';

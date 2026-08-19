@@ -343,6 +343,11 @@ pub async fn install_http_application(
         )
         .route("/api/wallet", get(wallet_api::get_wallet))
         .route(
+            "/api/wallet/xsolla/checkout-token",
+            post(wallet_api::xsolla_checkout_token)
+                .layer(axum::extract::DefaultBodyLimit::max(2 * 1024)),
+        )
+        .route(
             "/api/skins/:skin_id/purchase",
             post(wallet_api::purchase_skin).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
         )
