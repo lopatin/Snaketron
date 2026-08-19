@@ -22,9 +22,11 @@ import type { PublicGameResponse } from '../types/generated';
 import type {
   BrowseResponse,
   Equipment,
+  PurchaseResult,
   SkinKind,
   SkinListResponse,
   SkinSummary,
+  Wallet,
 } from '../types/generated';
 
 /**
@@ -489,6 +491,36 @@ class API {
       method: 'PUT',
       body: JSON.stringify(request),
     });
+  }
+
+  /** Published player-authored skins, newest first. */
+  async browseAuthoredSkins(
+    kind: SkinKind = 'snake',
+    filter: 'published' | 'mine' = 'published',
+  ): Promise<SkinListResponse> {
+    return this.request<SkinListResponse>(`/api/skins/browse?kind=${kind}&filter=${filter}`);
+  }
+
+  /**
+   * Buy a skin.
+   *
+   * `expectedPriceBux` is what the buyer was shown; the server conditions on
+   * it, so a price that moved between the dialog and this call comes back a
+   * 409 rather than charging a surprise.
+   */
+  async purchaseSkin(
+    skinId: number,
+    expectedPriceBux: number,
+    idempotencyKey: string,
+  ): Promise<PurchaseResult> {
+    return this.request<PurchaseResult>(`/api/skins/${skinId}/purchase`, {
+      method: 'POST',
+      body: JSON.stringify({ idempotencyKey, expectedPriceBux }),
+    });
+  }
+
+  async getWallet(): Promise<Wallet> {
+    return this.request<Wallet>('/api/wallet');
   }
 
   /** Create a skin from a document the editor has already compiled. */

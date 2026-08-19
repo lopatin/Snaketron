@@ -5,7 +5,8 @@ import { SocialFooter } from './SocialFooter';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
 import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
-import type { CatalogEntry } from '../types/generated';
+import type { CatalogEntry, SkinSummary } from '../types/generated';
+import { Link } from 'react-router-dom';
 import {
   DEFAULT_SKIN_REF,
   readBasePreference,
@@ -245,6 +246,8 @@ interface SkinRowProps {
   canEquip: boolean;
   isBusy: boolean;
   onEquip: (reference: string) => void;
+  /** Present only for a priced skin the viewer does not own yet. */
+  onBuy?: () => void;
 }
 
 const SkinRow: React.FC<SkinRowProps> = ({
@@ -254,6 +257,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
   canEquip,
   isBusy,
   onEquip,
+  onBuy,
 }) => {
   const [hovered, setHovered] = useState(false);
   const reduceMotion = useMemo(prefersReducedMotion, []);
@@ -292,6 +296,16 @@ const SkinRow: React.FC<SkinRowProps> = ({
           <span className="skins-equipped-badge" data-testid={`skin-equipped-${slot}`}>
             Equipped
           </span>
+        ) : onBuy ? (
+          <button
+            type="button"
+            className="skins-equip-button"
+            disabled={isBusy}
+            onClick={onBuy}
+            data-testid={`skin-buy-${entry.reference}`}
+          >
+            {canEquip ? `Buy · ${entry.priceBux} BB` : 'Sign in to buy'}
+          </button>
         ) : (
           <button
             type="button"
@@ -316,6 +330,9 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   const [equippedSkin, setEquippedSkin] = useState<string>(DEFAULT_SKIN_REF);
   const [equippedBase, setEquippedBase] = useState<string | null>(null);
   const [busySlot, setBusySlot] = useState<Slot | null>(null);
+  /** Player-authored entries, kept beside the merged list so a row can find
+   *  the skin id a purchase needs. */
+  const [authored, setAuthored] = useState<SkinSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -332,12 +349,31 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([api.browseSkins('snake'), api.browseSkins('base')])
-      .then(([snakes, bases]) => {
+    // Built-ins and player-authored skins are two different lists on the
+    // server — one is compiled in, the other is stored — and one list to a
+    // player. Authored skins go first: they are the new thing, and a catalogue
+    // that buries them under nineteen built-ins is not much of a shop window.
+    void Promise.all([
+      api.browseSkins('snake'),
+      api.browseSkins('base'),
+      api.browseAuthoredSkins('snake').catch(() => ({ skins: [], cursor: null })),
+    ])
+      .then(([snakes, bases, authored]) => {
         if (cancelled) {
           return;
         }
-        setSnakeSkins(snakes.skins);
+        setSnakeSkins([
+          ...authored.skins.map(
+            (skin): CatalogEntry => ({
+              reference: skin.reference,
+              name: skin.name,
+              kind: 'snake',
+              priceBux: skin.priceBux,
+            }),
+          ),
+          ...snakes.skins,
+        ]);
+        setAuthored(authored.skins);
         setBaseSkins(bases.skins);
       })
       .catch(() => {
@@ -412,6 +448,36 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
     [equippedBase, equippedSkin, onOpenAuth, user],
   );
 
+  const buy = useCallback(
+    async (skin: SkinSummary) => {
+      if (!user) {
+        onOpenAuth();
+        return;
+      }
+      setError(null);
+      try {
+        // A fresh key per attempt, so a retry of *this* attempt is free and a
+        // second deliberate purchase is a second purchase.
+        const result = await api.purchaseSkin(
+          skin.skinId,
+          skin.priceBux,
+          crypto.randomUUID(),
+        );
+        if (result.outcome === 'purchased' || result.outcome === 'alreadyOwned') {
+          await equip('snake', skin.reference);
+        }
+      } catch (cause) {
+        setError(
+          isApiError(cause)
+            ? cause.message
+            : 'That skin could not be bought right now.',
+        );
+      }
+    },
+    [equip, onOpenAuth, user],
+  );
+
+
   return (
     <div className="home-page skins-page">
       <HomeHeader
@@ -434,6 +500,9 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             Pick how your snake looks to everyone else, and how your side of the
             arena looks to you.
           </p>
+          <Link className="skins-create-link" to="/skins/builder">
+            Make your own
+          </Link>
         </div>
 
         {error ? (
@@ -458,6 +527,16 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                       canEquip={Boolean(user)}
                       isBusy={busySlot === 'snake'}
                       onEquip={(reference) => void equip('snake', reference)}
+                      onBuy={(() => {
+                        const match = authored.find(
+                          (candidate) => candidate.reference === entry.reference,
+                        );
+                        // Built-ins are free and already everyone's; only a
+                        // priced authored skin needs buying.
+                        return match && match.priceBux > 0
+                          ? () => void buy(match)
+                          : undefined;
+                      })()}
                     />
                   ))
                 : null}

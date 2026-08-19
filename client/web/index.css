@@ -7594,3 +7594,22 @@ a.home-social-icon:hover {
 .builder-group .builder-field-color > span {
   min-width: 6rem;
 }
+
+.skins-create-link {
+  display: inline-block;
+  margin-top: 12px;
+  border: 2px solid #000;
+  padding: 7px 16px;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+  text-decoration: none;
+}
+
+.skins-create-link:hover {
+  background: var(--game-graphite);
+  color: var(--game-paper);
+}
