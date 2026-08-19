@@ -23,7 +23,10 @@ installScenarioCaptureNetworkStubs();
 // Capture pages are a recording harness, not a play session, and are held to
 // the same "no app services" rule as the rest of this file.
 if (!isScenarioCaptureMode()) {
-  void analytics.start(() => api.getAnalyticsConsent());
+  void analytics.start({
+    consent: () => api.getAnalyticsConsent(),
+    resolveUserId: () => api.getAuthenticatedUserId(),
+  });
 }
 
 // Kick off WASM initialization; consumers await initWasm()/read getWasm().

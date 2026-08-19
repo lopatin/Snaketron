@@ -18,8 +18,11 @@ GAMEANALYTICS_BUILD=web-1.4.0 \
 npm run build:prod
 ```
 
-Both keys are required together; setting one without the other fails the build
-rather than shipping a bundle that would fail every request at runtime. The
+The game key is exactly 32 alphanumeric characters and the secret exactly 40.
+The SDK refuses to initialize on any other shape — it logs and returns, with no
+failed request to notice — so the build validates both shapes and fails loudly
+rather than producing a release that looks correct and reports nothing. Both
+keys are also required together. The
 secret is not a credential in the usual sense — GameAnalytics' HTML5 SDK signs
 payloads with it in the browser, so it is readable by anyone who opens the
 bundle. Treat it as a public per-game identifier, not a secret to protect, and
@@ -133,11 +136,39 @@ that browser is excluded before the SDK is ever fetched.
 
 ## What is reported
 
-No account identifiers are sent. GameAnalytics' own anonymous per-device id is
-used rather than the Snaketron user id: the metrics that matter here (daily
-players, retention, session length, mode popularity, death causes) do not need
-cross-device identity, and not sending it keeps this integration outside the
-personal-data inventory in `CRAZYGAMES_PRIVACY.md`.
+### Player identity
+
+The durable internal Snaketron user id is sent, so one player on a laptop and a
+phone is one player in GameAnalytics and analytics can be joined against our own
+tables. It reaches GameAnalytics two ways:
+
+| Field | Value |
+| --- | --- |
+| `user_id` (primary) | The Snaketron user id when this browser already holds a session; otherwise GameAnalytics' own device id |
+| `user_id_ext` | Always the Snaketron user id, from the moment it is known |
+
+Two fields, because GameAnalytics only accepts a custom `user_id` *before*
+`initialize` — and that is earlier than `/api/auth/me` can answer. The id is
+therefore read synchronously at boot out of the `sub` claim of the session
+token this browser already stores (`services/sessionIdentity.ts`). Its signature
+is not verified: nothing is authorized by the value, and a browser tampering
+with its own token can only mislabel its own events. Expired tokens are
+rejected, because the session they describe is about to be replaced.
+
+A brand-new visitor has no token yet, so their *first* session is keyed on the
+device id and picks the user id up from the next load onward. `user_id_ext` is
+populated in both cases — including when it duplicates `user_id` — so a query
+against it never has to coalesce two fields.
+
+Guests are reported under their own durable user id like anyone else; the
+account dimension distinguishes them.
+
+Usernames, emails, and CrazyGames identifiers are never sent.
+
+**Operational consequence:** the user id is personal data held by a third party.
+A deletion request under the procedure in `CRAZYGAMES_PRIVACY.md` now also means
+deleting that id from GameAnalytics (their GDPR/data-deletion tooling), not only
+from Snaketron's own records.
 
 **Session dimensions**
 
@@ -180,6 +211,7 @@ funnels, currently a failed WASM initialization.
 | File | Role |
 | --- | --- |
 | `server/src/api/analytics.rs` | `GET /api/analytics/consent`; address matching |
+| `client/web/services/sessionIdentity.ts` | Reads the user id from the session token, before init |
 | `client/web/services/analytics/config.ts` | Build-time keys and distribution scope |
 | `client/web/services/analytics/exclusion.ts` | The three-signal gate (pure decision) |
 | `client/web/services/analytics/events.ts` | Game state → event taxonomy (pure) |

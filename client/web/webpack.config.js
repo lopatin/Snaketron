@@ -36,6 +36,24 @@ if (!isEmbeddedBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gameAnalyticsS
   );
 }
 
+// The SDK requires exactly these shapes and silently refuses to initialize
+// otherwise — it logs and returns, with no failed request to notice. Because
+// the keys are compiled in, a mistyped one would otherwise produce a release
+// that looks correct and reports nothing at all. Fail the build instead.
+const gameAnalyticsKeyShapes = [
+  ['GAMEANALYTICS_GAME_KEY', gameAnalyticsGameKey, /^[A-Za-z0-9]{32}$/, 32],
+  ['GAMEANALYTICS_SECRET_KEY', gameAnalyticsSecretKey, /^[A-Za-z0-9]{40}$/, 40],
+];
+for (const [name, value, shape, length] of gameAnalyticsKeyShapes) {
+  if (value && !shape.test(value)) {
+    throw new Error(
+      `${name} must be exactly ${length} alphanumeric characters (got ${value.length}). `
+      + 'GameAnalytics rejects any other shape without initializing, so this would '
+      + 'build a release that reports nothing.',
+    );
+  }
+}
+
 module.exports = {
   entry: "./bootstrap.ts",
   output: {

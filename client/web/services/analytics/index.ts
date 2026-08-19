@@ -6,7 +6,11 @@
  */
 
 export { analytics, ERROR_SEVERITY } from './gameAnalytics.ts';
-export type { ErrorSeverity, GameAnalyticsSdk } from './gameAnalytics.ts';
+export type {
+  AnalyticsStartOptions,
+  ErrorSeverity,
+  GameAnalyticsSdk,
+} from './gameAnalytics.ts';
 export { ANALYTICS_BUILD_CONFIG, ANALYTICS_SUPPORTED_DISTRIBUTION } from './config.ts';
 export type { AccountDimension, InputDimension } from './config.ts';
 export { queueIntentEvents } from './events.ts';

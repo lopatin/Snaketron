@@ -30,6 +30,7 @@ export const AnalyticsBridge: React.FC = () => {
     }
 
     analytics.setAccountType(user.isGuest ? 'guest' : 'registered');
+    analytics.setPlayerId(String(user.id));
   }, [user]);
 
   useEffect(() => {

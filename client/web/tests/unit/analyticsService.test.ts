@@ -16,6 +16,8 @@ const recorder = () => {
   const calls: string[] = [];
   const sdk: GameAnalyticsSdk = {
     configureBuild: (build) => calls.push(`configureBuild(${build})`),
+    configureUserId: (userId) => calls.push(`configureUserId(${userId})`),
+    setExtUserId: (userId) => calls.push(`extUserId(${userId})`),
     configureAvailableCustomDimensions01: (d) => calls.push(`dims01(${d.join('|')})`),
     configureAvailableCustomDimensions02: (d) => calls.push(`dims02(${d.join('|')})`),
     setEnabledInfoLog: () => {},
@@ -43,6 +45,7 @@ const harness = (options: {
   url?: string;
   storage?: Record<string, string>;
   configured?: boolean;
+  bootUserId?: string | null | (() => string | null);
 } = {}) => {
   const store = new Map<string, string>(Object.entries(options.storage ?? {}));
   const url = new URL(options.url ?? 'https://snaketron.io/');
@@ -68,7 +71,12 @@ const harness = (options: {
     },
   });
 
-  return { rec, store };
+  const bootUserId = options.bootUserId ?? null;
+  const resolveUserId = typeof bootUserId === 'function'
+    ? bootUserId
+    : () => bootUserId;
+
+  return { rec, store, resolveUserId };
 };
 
 const counts: AnalyticsConsent = { excluded: false, reason: null };
@@ -80,8 +88,8 @@ test.afterEach(() => {
 });
 
 test('a counted session initializes once and reports', async () => {
-  const { rec, store } = harness();
-  const decision = await analytics.start(async () => counts);
+  const { rec, store, resolveUserId } = harness();
+  const decision = await analytics.start({ consent: async () => counts, resolveUserId });
 
   assert.deepEqual(decision, { report: true });
   assert.deepEqual(rec.calls, [
@@ -94,7 +102,7 @@ test('a counted session initializes once and reports', async () => {
 
   // Repeat starts are no-ops; a second GameAnalytics session would double
   // every DAU and session-length figure.
-  await analytics.start(async () => counts);
+  await analytics.start({ consent: async () => counts, resolveUserId });
   assert.equal(rec.loads, 1);
 });
 
@@ -103,8 +111,8 @@ test('a counted session initializes once and reports', async () => {
  * fetch the vendor chunk, so there is no SDK present to mis-wire later.
  */
 test('an excluded address never loads the SDK at all', async () => {
-  const { rec, store } = harness();
-  const decision = await analytics.start(async () => excludes);
+  const { rec, store, resolveUserId } = harness();
+  const decision = await analytics.start({ consent: async () => excludes, resolveUserId });
 
   assert.deepEqual(decision, { report: false, reason: 'excludedAddress' });
   assert.equal(rec.loads, 0);
@@ -113,8 +121,8 @@ test('an excluded address never loads the SDK at all', async () => {
 });
 
 test('the URL switch excludes this browser and is remembered', async () => {
-  const { rec, store } = harness({ url: 'https://snaketron.io/?analytics=off' });
-  const decision = await analytics.start(async () => counts);
+  const { rec, store, resolveUserId } = harness({ url: 'https://snaketron.io/?analytics=off' });
+  const decision = await analytics.start({ consent: async () => counts, resolveUserId });
 
   assert.deepEqual(decision, { report: false, reason: 'localOverride' });
   assert.equal(rec.loads, 0, 'a locally excluded browser skips the network too');
@@ -122,12 +130,12 @@ test('the URL switch excludes this browser and is remembered', async () => {
 });
 
 test('an opt-in clears a stored opt-out rather than layering another flag', async () => {
-  const { store } = harness({
+  const { store, resolveUserId } = harness({
     url: 'https://snaketron.io/?analytics=on',
     storage: { [OVERRIDE_STORAGE_KEY]: 'off' },
   });
 
-  assert.deepEqual(await analytics.start(async () => counts), { report: true });
+  assert.deepEqual(await analytics.start({ consent: async () => counts, resolveUserId }), { report: true });
   assert.equal(store.has(OVERRIDE_STORAGE_KEY), false);
 });
 
@@ -139,7 +147,10 @@ test('an opt-in clears a stored opt-out rather than layering another flag', asyn
 test('a failed consent check falls back to the cached verdict', async () => {
   const excluded = harness({ storage: { [ADDRESS_VERDICT_STORAGE_KEY]: 'excluded' } });
   assert.deepEqual(
-    await analytics.start(async () => { throw new Error('offline'); }),
+    await analytics.start({
+      consent: async () => { throw new Error('offline'); },
+      resolveUserId: excluded.resolveUserId,
+    }),
     { report: false, reason: 'excludedAddress' },
   );
   assert.equal(excluded.rec.loads, 0);
@@ -147,18 +158,21 @@ test('a failed consent check falls back to the cached verdict', async () => {
   // A player who has never been excluded is unaffected by the same outage.
   const ordinary = harness();
   assert.deepEqual(
-    await analytics.start(async () => { throw new Error('offline'); }),
+    await analytics.start({
+      consent: async () => { throw new Error('offline'); },
+      resolveUserId: ordinary.resolveUserId,
+    }),
     { report: true },
   );
   assert.equal(ordinary.rec.loads, 1);
 });
 
 test('a bundle with no keys never touches the network or the SDK', async () => {
-  const { rec } = harness({ configured: false });
+  const { rec, resolveUserId } = harness({ configured: false });
   let consentCalls = 0;
 
   assert.deepEqual(
-    await analytics.start(async () => { consentCalls += 1; return counts; }),
+    await analytics.start({ consent: async () => { consentCalls += 1; return counts; }, resolveUserId }),
     { report: false, reason: 'notConfigured' },
   );
   assert.equal(consentCalls, 0);
@@ -171,7 +185,7 @@ test('a bundle with no keys never touches the network or the SDK', async () => {
  * rejects a Complete that arrives before its Start.
  */
 test('events raised before the gate resolves are flushed in order', async () => {
-  const { rec } = harness();
+  const { rec, resolveUserId } = harness();
 
   analytics.setAccountType('registered');
   analytics.trackMatchStart(duel, 'Competitive');
@@ -183,7 +197,7 @@ test('events raised before the gate resolves are flushed in order', async () => 
 
   assert.deepEqual(rec.calls, [], 'nothing reaches an SDK that does not exist yet');
 
-  await analytics.start(async () => counts);
+  await analytics.start({ consent: async () => counts, resolveUserId });
 
   assert.deepEqual(rec.calls, [
     'configureBuild(1.2.3)',
@@ -198,10 +212,10 @@ test('events raised before the gate resolves are flushed in order', async () => 
 });
 
 test('events raised before an exclusion resolves are discarded', async () => {
-  const { rec } = harness();
+  const { rec, resolveUserId } = harness();
 
   analytics.trackMatchStart(duel, 'Competitive');
-  await analytics.start(async () => excludes);
+  await analytics.start({ consent: async () => excludes, resolveUserId });
   analytics.trackMatchEnd(
     { game_type: duel, queue_mode: 'Competitive' },
     { score: 11, isWinner: true },
@@ -216,8 +230,8 @@ test('events raised before an exclusion resolves are discarded', async () => {
  * spectator or a match joined in progress must not report a result either.
  */
 test('a result is only reported for a progression this session opened', async () => {
-  const { rec } = harness();
-  await analytics.start(async () => counts);
+  const { rec, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
   rec.calls.length = 0;
 
   // No Start at all.
@@ -239,8 +253,8 @@ test('a result is only reported for a progression this session opened', async ()
 });
 
 test('a re-rendered match start does not inflate the start count', async () => {
-  const { rec } = harness();
-  await analytics.start(async () => counts);
+  const { rec, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
   rec.calls.length = 0;
 
   analytics.trackMatchStart(duel, 'Competitive');
@@ -251,13 +265,97 @@ test('a re-rendered match start does not inflate the start count', async () => {
 });
 
 /**
+ * The whole point of reading the id out of the session token at boot: the
+ * Snaketron user id becomes GameAnalytics' *primary* identity, which is what
+ * keys retention and the user explorer. That only works before `initialize`,
+ * so the ordering is pinned here rather than left to call order.
+ */
+test('a known player id is configured before the SDK initializes', async () => {
+  const { rec, resolveUserId } = harness({ bootUserId: '4711' });
+  await analytics.start({ consent: async () => counts, resolveUserId });
+
+  assert.deepEqual(rec.calls, [
+    'configureBuild(1.2.3)',
+    'dims01(guest|registered)',
+    'dims02(keyboard|touch)',
+    'configureUserId(4711)',
+    'initialize(GAME)',
+    // Set even though it duplicates the primary id — see below.
+    'extUserId(4711)',
+  ]);
+  assert.ok(
+    rec.calls.indexOf('configureUserId(4711)') < rec.calls.indexOf('initialize(GAME)'),
+    'GameAnalytics ignores a user id configured after initialize',
+  );
+
+  // React re-reporting the same identity is a no-op, not a second call.
+  analytics.setPlayerId('4711');
+  assert.equal(rec.calls.filter((call) => call.startsWith('extUserId')).length, 1);
+});
+
+/**
+ * A brand-new visitor has no session token yet, so their first session is
+ * keyed on GameAnalytics' device id. `user_id_ext` still carries the real id
+ * from the moment the guest session exists, so no events are unattributed —
+ * and because it is set in both cases, a query against `user_id_ext` never has
+ * to coalesce it with `user_id`.
+ */
+test('an id learned after init is attached as an external id', async () => {
+  const { rec, resolveUserId } = harness({ bootUserId: null });
+  await analytics.start({ consent: async () => counts, resolveUserId });
+  rec.calls.length = 0;
+
+  analytics.setPlayerId('9002');
+  assert.deepEqual(rec.calls, ['extUserId(9002)']);
+
+  // Idempotent, and an empty id is never sent — GameAnalytics rejects it.
+  analytics.setPlayerId('9002');
+  analytics.setPlayerId('');
+  assert.deepEqual(rec.calls, ['extUserId(9002)']);
+});
+
+test('an id learned before the gate resolves is applied to that session', async () => {
+  const { rec, resolveUserId } = harness({ bootUserId: null });
+
+  analytics.setPlayerId('313');
+  analytics.trackMatchStart(duel, 'Competitive');
+  await analytics.start({ consent: async () => counts, resolveUserId });
+
+  assert.deepEqual(rec.calls, [
+    'configureBuild(1.2.3)',
+    'dims01(guest|registered)',
+    'dims02(keyboard|touch)',
+    'initialize(GAME)',
+    'extUserId(313)',
+    'progression(1,duel,competitive)',
+  ]);
+});
+
+/** A broken identity lookup costs the session its id, and nothing more. */
+test('a throwing user-id resolver still starts the session', async () => {
+  const { rec, resolveUserId } = harness({
+    bootUserId: () => { throw new Error('storage blocked'); },
+  });
+
+  assert.deepEqual(await analytics.start({ consent: async () => counts, resolveUserId }), {
+    report: true,
+  });
+  assert.deepEqual(rec.calls, [
+    'configureBuild(1.2.3)',
+    'dims01(guest|registered)',
+    'dims02(keyboard|touch)',
+    'initialize(GAME)',
+  ]);
+});
+
+/**
  * The operator's account is only known once `/auth/me` resolves, which can be
  * after the session has already opened. Both halves matter: silence the live
  * SDK, and make the next load in this browser skip it entirely.
  */
 test('an operator signing in stops submission and is remembered', async () => {
-  const { rec, store } = harness();
-  await analytics.start(async () => counts);
+  const { rec, store, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
   rec.calls.length = 0;
 
   analytics.excludeOperator();
@@ -272,8 +370,8 @@ test('an operator signing in stops submission and is remembered', async () => {
 });
 
 test('an SDK that throws is contained rather than breaking the caller', async () => {
-  const { rec } = harness();
-  await analytics.start(async () => counts);
+  const { rec, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
   rec.calls.length = 0;
   rec.sdk.addDesignEvent = () => { throw new Error('vendor exploded'); };
 
@@ -283,12 +381,12 @@ test('an SDK that throws is contained rather than breaking the caller', async ()
 
 /** A gate that never resolves must cost a fixed amount of memory. */
 test('the pre-consent queue is bounded and keeps the newest events', async () => {
-  const { rec } = harness();
+  const { rec, resolveUserId } = harness();
   for (let index = 0; index < 100; index += 1) {
     analytics.trackMilestone(['bulk', `n${index}`]);
   }
 
-  await analytics.start(async () => counts);
+  await analytics.start({ consent: async () => counts, resolveUserId });
 
   const designCalls = rec.calls.filter((call) => call.startsWith('design('));
   assert.equal(designCalls.length, 32);

@@ -71,6 +71,10 @@ export type ErrorSeverity = keyof typeof ERROR_SEVERITY;
  */
 export interface GameAnalyticsSdk {
   configureBuild(build: string): void;
+  /** Must be called before `initialize`; ignored with a warning afterwards. */
+  configureUserId(userId: string): void;
+  /** Adds `user_id_ext` to every event. Valid at any point after init. */
+  setExtUserId(userId: string): void;
   configureAvailableCustomDimensions01(dimensions: string[]): void;
   configureAvailableCustomDimensions02(dimensions: string[]): void;
   setEnabledInfoLog(enabled: boolean): void;
@@ -93,6 +97,18 @@ export type SdkLoader = () => Promise<GameAnalyticsSdk>;
 
 /** Asks the server whether this caller's network is on the exclusion list. */
 export type ConsentLoader = () => Promise<AnalyticsConsent>;
+
+export interface AnalyticsStartOptions {
+  consent: ConsentLoader;
+  /**
+   * The signed-in user id, if this browser already has a session.
+   *
+   * Must be synchronous: GameAnalytics only accepts a custom user id *before*
+   * `initialize`, so anything that needs a round trip would arrive too late to
+   * become the identity the dashboards are keyed on.
+   */
+  resolveUserId?: () => string | null;
+}
 
 const loadRealSdk: SdkLoader = async () => {
   const module = await import(/* webpackChunkName: "gameanalytics" */ 'gameanalytics');
@@ -134,8 +150,15 @@ class GameAnalyticsService {
    */
   private openProgression: string | null = null;
 
+  /**
+   * The Snaketron user id, once known. Kept so that an identity learned before
+   * the gate resolved is still applied to the session it belongs to.
+   */
+  private playerId: string | null = null;
+
   private sdkLoader: SdkLoader = loadRealSdk;
   private consentLoader: ConsentLoader | null = null;
+  private userIdResolver: (() => string | null) | null = null;
   private buildConfig: AnalyticsBuildConfig | null = ANALYTICS_BUILD_CONFIG;
   private supportedDistribution = ANALYTICS_SUPPORTED_DISTRIBUTION;
 
@@ -143,11 +166,12 @@ class GameAnalyticsService {
    * Resolve the exclusion gate and, if this session counts, load and start the
    * SDK. Safe to call repeatedly; only the first call does any work.
    */
-  start = (consentLoader: ConsentLoader): Promise<AnalyticsDecision> => {
+  start = (options: AnalyticsStartOptions): Promise<AnalyticsDecision> => {
     if (this.startup) {
       return this.startup;
     }
-    this.consentLoader = consentLoader;
+    this.consentLoader = options.consent;
+    this.userIdResolver = options.resolveUserId ?? null;
     this.startup = this.resolveAndInitialize().catch((error) => {
       // Unreachable in practice — the body swallows its own failures — but a
       // rejected startup promise would strand every queued event.
@@ -231,6 +255,19 @@ class GameAnalyticsService {
     }
   };
 
+  /**
+   * Ask for the already-signed-in user id, tolerating a resolver that throws.
+   * A broken identity lookup must cost the session its user id, nothing more.
+   */
+  private resolveBootUserId = (): string | null => {
+    try {
+      return this.userIdResolver?.() ?? null;
+    } catch (error) {
+      console.info('Analytics could not resolve the signed-in user:', errorMessage(error));
+      return null;
+    }
+  };
+
   private loadSdk = async (): Promise<GameAnalyticsSdk | null> => {
     const config = this.buildConfig;
     if (!config) {
@@ -242,6 +279,19 @@ class GameAnalyticsService {
       sdk.configureBuild(config.build);
       sdk.configureAvailableCustomDimensions01([...ACCOUNT_DIMENSIONS]);
       sdk.configureAvailableCustomDimensions02([...INPUT_DIMENSIONS]);
+
+      // Make the Snaketron user id GameAnalytics' *primary* identity, which is
+      // what keys retention, funnels, and the user explorer — so one player on
+      // a laptop and a phone is one player. This only works before
+      // `initialize`, and only for a browser that already holds a session; a
+      // brand-new visitor's first session is keyed on GameAnalytics' own
+      // device id and picks the user id up from the next load onward.
+      const bootUserId = this.resolveBootUserId();
+      if (bootUserId) {
+        this.playerId = bootUserId;
+        sdk.configureUserId(bootUserId);
+      }
+
       sdk.initialize(config.gameKey, config.secretKey);
       return sdk;
     } catch (error) {
@@ -272,6 +322,15 @@ class GameAnalyticsService {
   };
 
   private applyDimensions = (sdk: GameAnalyticsSdk): void => {
+    // `user_id_ext` is set even when `configureUserId` already made the same
+    // id primary. The duplication is deliberate: it makes `user_id_ext`
+    // uniformly the Snaketron id on every event, so joining analytics against
+    // our own tables never has to coalesce it with a `user_id` that is
+    // sometimes a device.
+    const player = this.playerId;
+    if (player) {
+      this.invoke((target) => target.setExtUserId(player), sdk);
+    }
     const account = this.accountDimension;
     if (account) {
       this.invoke((target) => target.setCustomDimension01(account), sdk);
@@ -332,6 +391,23 @@ class GameAnalyticsService {
     this.invoke((sdk) => sdk.setCustomDimension01(account));
   };
 
+  /**
+   * Attach the Snaketron user id to this session's events.
+   *
+   * React only learns the account after `/auth/me` resolves, which is normally
+   * after the SDK has initialized and always after a brand-new visitor's guest
+   * session is created — both too late for `configureUserId`. `user_id_ext`
+   * has no such ordering rule, so every event still carries the id even when
+   * the primary identity had to fall back to the device.
+   */
+  setPlayerId = (userId: string): void => {
+    if (!userId || this.playerId === userId) {
+      return;
+    }
+    this.playerId = userId;
+    this.invoke((sdk) => sdk.setExtUserId(userId));
+  };
+
   setInputSurface = (input: InputDimension): void => {
     if (this.inputDimension === input) {
       return;
@@ -358,6 +434,7 @@ class GameAnalyticsService {
     this.sdk = null;
     this.queue = [];
     this.openProgression = null;
+    this.playerId = null;
     if (sdk) {
       try {
         sdk.setEnabledEventSubmission(false);
@@ -473,7 +550,9 @@ class GameAnalyticsService {
     this.accountDimension = null;
     this.inputDimension = null;
     this.openProgression = null;
+    this.playerId = null;
     this.consentLoader = null;
+    this.userIdResolver = null;
     this.sdkLoader = overrides.sdkLoader ?? loadRealSdk;
     this.buildConfig = overrides.buildConfig === undefined
       ? ANALYTICS_BUILD_CONFIG
