@@ -55,6 +55,31 @@ pub fn content_ref_index_partition(content_ref: &str) -> String {
     format!("SKINREF#{content_ref}")
 }
 
+/// The one partition every open review request sits in.
+///
+/// A constant partition would normally be a hot-partition mistake, and here it
+/// deliberately is not: an entry exists only while a request is *open* and is
+/// deleted when it is decided, so the partition holds the queue rather than
+/// every request ever made. If the queue is ever large enough for this to hurt,
+/// the queue itself is the problem.
+pub const REVIEW_QUEUE_PARTITION: &str = "SKIN_REVIEW_QUEUE";
+
+/// The sort key of the marker item that puts a skin in the review queue.
+pub const REVIEW_QUEUE_SORT_KEY: &str = "REVIEWQUEUE";
+
+/// The marker item itself.
+pub fn review_queue_item(skin_id: i32, requested_at_ms: i64) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), string(skin_partition(skin_id)));
+    item.insert("sk".to_string(), string(REVIEW_QUEUE_SORT_KEY));
+    item.insert("skinId".to_string(), number(skin_id));
+    item.insert("requestedAtMs".to_string(), number(requested_at_ms));
+    item.insert("gsi1pk".to_string(), string(REVIEW_QUEUE_PARTITION));
+    // Oldest first when read forward: a review queue is a queue.
+    item.insert("gsi1sk".to_string(), string(sortable(requested_at_ms)));
+    item
+}
+
 /// Build the attribute map for a skin's META item.
 pub fn skin_item(skin: &Skin) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();

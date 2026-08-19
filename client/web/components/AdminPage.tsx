@@ -7,13 +7,17 @@ import {
   isApiError,
 } from '../services/api';
 import type { RuntimeConfig, RuntimeConfigAuditPage, RuntimeConfigRecord } from '../types';
+import type { SkinSummary } from '../types/generated';
 import { MatchHistoryList } from './MatchHistoryList';
+import { getWasm, initWasm } from '../wasm';
+import { ensureAuthoredSkins } from '../utils/authoredSkins';
 
-type AdminSection = 'overview' | 'history' | 'configuration' | 'audit';
+type AdminSection = 'overview' | 'history' | 'skins' | 'configuration' | 'audit';
 
 const SECTION_LABELS: Array<{ id: AdminSection; label: string; compactLabel: string }> = [
   { id: 'overview', label: 'Overview', compactLabel: 'Overview' },
   { id: 'history', label: 'Match history', compactLabel: 'Matches' },
+  { id: 'skins', label: 'Skins', compactLabel: 'Skins' },
   { id: 'configuration', label: 'Configuration', compactLabel: 'Config' },
   { id: 'audit', label: 'Audit', compactLabel: 'Audit' },
 ];
@@ -500,6 +504,206 @@ const AdminAudit: React.FC = () => {
   );
 };
 
+/**
+ * The review queue.
+ *
+ * The validator has already enforced everything structural before a skin gets
+ * here — palettes, contrast, the boost band, budgets. What is left is what a
+ * machine cannot see: what a texture depicts, what a name says, and whether
+ * either is someone else's property. So this view is deliberately about
+ * *looking*, and the two decisions it offers are approve and take down.
+ */
+const AdminSkins: React.FC = () => {
+  const [skins, setSkins] = useState<SkinSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await api.getSkinReviewQueue();
+      setSkins(page.skins);
+    } catch (nextError) {
+      setError(errorMessage(nextError));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const decide = useCallback(
+    async (
+      skin: SkinSummary,
+      publication: 'published' | 'unpublished' | 'disabled' | 'private',
+    ) => {
+      setBusyId(skin.skinId);
+      setError(null);
+      try {
+        await api.setSkinPublication(skin.skinId, publication, {
+          // Approve what was submitted, not whatever the head is now: the
+          // creator may have pushed a revision since asking.
+          revision: publication === 'published'
+            ? skin.pendingRevision ?? undefined
+            : undefined,
+        });
+        await load();
+      } catch (nextError) {
+        setError(errorMessage(nextError));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [load],
+  );
+
+  return (
+    <section className="admin-section" aria-labelledby="admin-skins-title">
+      <div className="admin-section-heading">
+        <div>
+          <p className="admin-eyebrow">Player content</p>
+          <h2 id="admin-skins-title">Skins</h2>
+        </div>
+        <p>
+          Everything structural has already been checked. Look at what the
+          machine cannot: what it depicts, what it says, and whose it is.
+        </p>
+      </div>
+
+      {error ? (
+        <div className="admin-inline-status is-error" role="alert">
+          <span>{error}</span>
+          <button type="button" onClick={() => void load()}>Try again</button>
+        </div>
+      ) : null}
+
+      {loading ? (
+        <div className="admin-inline-status" role="status">Loading the review queue…</div>
+      ) : skins.length === 0 ? (
+        <div className="admin-inline-status">Nothing is waiting for review.</div>
+      ) : (
+        <ul className="admin-skin-queue">
+          {skins.map((skin) => (
+            <li key={skin.skinId} data-testid={`admin-skin-${skin.skinId}`}>
+              <div className="admin-skin-preview">
+                {skin.contentRef ? (
+                  <AdminSkinPreview contentRef={skin.contentRef} name={skin.name} />
+                ) : (
+                  <span className="admin-skin-preview-missing">No preview</span>
+                )}
+              </div>
+              <div className="admin-skin-meta">
+                <strong>{skin.name}</strong>
+                <span>
+                  {skin.creatorUsername ?? `user #${skin.creatorUserId}`}
+                  {' · '}
+                  revision {skin.pendingRevision ?? skin.headRevision}
+                  {' · '}
+                  {skin.publication}
+                </span>
+              </div>
+              <div className="admin-skin-actions">
+                <button
+                  type="button"
+                  disabled={busyId === skin.skinId}
+                  onClick={() => void decide(skin, 'published')}
+                >
+                  Approve
+                </button>
+                <button
+                  type="button"
+                  disabled={busyId === skin.skinId}
+                  onClick={() => void decide(skin, 'private')}
+                >
+                  Reject
+                </button>
+                {/* Distinct from reject on purpose: this one reaches replays
+                    and everyone already wearing it. */}
+                <button
+                  type="button"
+                  className="is-destructive"
+                  disabled={busyId === skin.skinId}
+                  onClick={() => void decide(skin, 'disabled')}
+                >
+                  Take down
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+};
+
+/**
+ * One queued skin, painted by the real renderer.
+ *
+ * A reviewer has to see what players will see, so this fetches and registers
+ * the document exactly the way a match does rather than approximating it from
+ * the skin's metadata.
+ */
+const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
+  contentRef,
+  name,
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      await initWasm();
+      ensureAuthoredSkins({ 0: contentRef });
+      // Registration is a fetch away; poll briefly rather than blocking the
+      // whole queue on one slow document.
+      for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
+        const wasm = getWasm();
+        if (wasm?.authoredSkinIsRegistered(contentRef)) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+      const wasm = getWasm();
+      const canvas = canvasRef.current;
+      if (cancelled || !wasm || !canvas) {
+        return;
+      }
+      try {
+        wasm.renderSkinFixture(
+          canvas,
+          contentRef,
+          'straight_horizontal',
+          'own',
+          12,
+          false,
+          false,
+          640,
+          true,
+        );
+      } catch {
+        // An unpaintable skin is itself review-relevant; the empty tile says so.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [contentRef]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={150}
+      height={70}
+      role="img"
+      aria-label={`${name} preview`}
+    />
+  );
+};
+
 const AdminPage: React.FC = () => {
   const { user } = useAuth();
   const [section, setSection] = useState<AdminSection>('overview');
@@ -542,6 +746,7 @@ const AdminPage: React.FC = () => {
         />
       );
     }
+    if (section === 'skins') return <AdminSkins />;
     if (section === 'audit') return <AdminAudit />;
     return <AdminOverview record={record} />;
   }, [loadConfig, record, section]);

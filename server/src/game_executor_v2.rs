@@ -5249,6 +5249,9 @@ mod tests {
             skin_id: i32,
             revision: Option<u32>
         ) -> ());
+        unused_database_method!(list_skins_awaiting_review(
+            limit: usize
+        ) -> Vec<crate::skin_store::Skin>);
         unused_database_method!(approve_skin_revision(skin_id: i32, revision: u32) -> ());
         unused_database_method!(mark_revision_exposed(
             skin_id: i32,

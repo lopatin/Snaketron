@@ -19,7 +19,13 @@ import type { PlayerLobbyResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
 import type { PublicGameResponse } from '../types/generated';
-import type { BrowseResponse, Equipment, SkinKind } from '../types/generated';
+import type {
+  BrowseResponse,
+  Equipment,
+  SkinKind,
+  SkinListResponse,
+  SkinSummary,
+} from '../types/generated';
 
 /**
  * An equip request.
@@ -482,6 +488,28 @@ class API {
     return this.request<Equipment>('/api/users/me/equipped', {
       method: 'PUT',
       body: JSON.stringify(request),
+    });
+  }
+
+  /** Everything waiting on a reviewer, oldest first. */
+  async getSkinReviewQueue(): Promise<SkinListResponse> {
+    return this.request<SkinListResponse>('/api/admin/skins');
+  }
+
+  /**
+   * Decide a skin.
+   *
+   * Publishing names one revision — by default the one review was asked about,
+   * because the creator's head may have moved since they submitted it.
+   */
+  async setSkinPublication(
+    skinId: number,
+    publication: 'published' | 'unpublished' | 'disabled' | 'private',
+    options: { revision?: number; reason?: string } = {},
+  ): Promise<SkinSummary> {
+    return this.request<SkinSummary>(`/api/admin/skins/${skinId}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ publication, ...options }),
     });
   }
 }

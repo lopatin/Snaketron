@@ -3498,7 +3498,70 @@ impl Database for DynamoDatabase {
             .send()
             .await
             .context("Failed to update the pending review revision")?;
+
+        // The queue is a separate marker item rather than an index entry on the
+        // skin, because the skin's own index slot is already the browse
+        // listing. It exists only while a request is open, which is what keeps
+        // its single partition holding a queue rather than a history.
+        match revision {
+            Some(_) => {
+                self.client
+                    .put_item()
+                    .table_name(self.main_table())
+                    .set_item(Some(skins_dynamo::review_queue_item(
+                        skin_id,
+                        Utc::now().timestamp_millis(),
+                    )))
+                    .send()
+                    .await
+                    .context("Failed to enqueue a skin for review")?;
+            }
+            None => {
+                self.client
+                    .delete_item()
+                    .table_name(self.main_table())
+                    .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+                    .key("sk", Self::av_s(skins_dynamo::REVIEW_QUEUE_SORT_KEY))
+                    .send()
+                    .await
+                    .context("Failed to dequeue a reviewed skin")?;
+            }
+        }
+
         Ok(())
+    }
+
+    async fn list_skins_awaiting_review(&self, limit: usize) -> Result<Vec<Skin>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :queue")
+            .expression_attribute_values(":queue", Self::av_s(skins_dynamo::REVIEW_QUEUE_PARTITION))
+            // Oldest first: the point of a review queue is that waiting longest
+            // gets looked at first.
+            .scan_index_forward(true)
+            .limit(limit.clamp(1, 100) as i32)
+            .send()
+            .await
+            .context("Failed to read the review queue")?;
+
+        let mut skins = Vec::new();
+        for item in response.items.unwrap_or_default() {
+            let Some(AttributeValue::N(skin_id)) = item.get("skinId") else {
+                continue;
+            };
+            let Ok(skin_id) = skin_id.parse::<i32>() else {
+                continue;
+            };
+            // A marker whose skin has since been deleted is skipped rather than
+            // failing the whole queue.
+            if let Some(skin) = self.get_skin(skin_id).await? {
+                skins.push(skin);
+            }
+        }
+        Ok(skins)
     }
 
     async fn approve_skin_revision(&self, skin_id: i32, revision: u32) -> Result<()> {

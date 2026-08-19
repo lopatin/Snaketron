@@ -354,6 +354,7 @@ pub async fn install_http_application(
 
     let admin_routes = Router::new()
         .route("/api/admin/history", get(admin::get_admin_history))
+        .route("/api/admin/skins", get(skins::admin_review_queue))
         .route(
             "/api/admin/skins/:skin_id/status",
             put(skins::admin_set_status).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),

@@ -171,6 +171,9 @@ pub trait Database: Send + Sync {
     /// Ask for a revision to be reviewed, or clear the request.
     async fn set_skin_pending_revision(&self, skin_id: i32, revision: Option<u32>) -> Result<()>;
 
+    /// Everything waiting on a human, oldest first.
+    async fn list_skins_awaiting_review(&self, limit: usize) -> Result<Vec<Skin>>;
+
     /// Mark a revision approved, which is what lets its text render for
     /// anyone but its creator.
     async fn approve_skin_revision(&self, skin_id: i32, revision: u32) -> Result<()>;

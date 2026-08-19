@@ -801,6 +801,29 @@ pub async fn report_skin(
     Ok(response)
 }
 
+/// The review queue: everything waiting on a human, oldest first.
+pub async fn admin_review_queue(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<Response, SkinsApiError> {
+    let skins = state
+        .db
+        .list_skins_awaiting_review(50)
+        .await
+        .map_err(SkinsApiError::Internal)?;
+
+    let mut response = Json(SkinListResponse {
+        skins: skins
+            .iter()
+            .map(|skin| SkinSummary::of(skin, Some(auth_user.user_id)))
+            .collect(),
+        cursor: None,
+    })
+    .into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
 /// Approve, reject, withdraw, or take down a skin.
 pub async fn admin_set_status(
     State(state): State<AuthState>,

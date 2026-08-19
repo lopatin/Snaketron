@@ -7280,3 +7280,96 @@ a.home-social-icon:hover {
   grid-area: action;
   justify-self: start;
 }
+
+/* Admin: the skin review queue. Sized so a reviewer sees the art first and the
+   metadata second — the art is the part a machine could not check. */
+.admin-skin-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.admin-skin-queue li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 10px 14px;
+}
+
+.admin-skin-preview canvas {
+  display: block;
+}
+
+.admin-skin-preview-missing {
+  display: inline-block;
+  padding: 24px 12px;
+  color: var(--game-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.admin-skin-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.admin-skin-meta strong {
+  font-size: 14px;
+  color: var(--game-graphite);
+  overflow-wrap: anywhere;
+}
+
+.admin-skin-meta span {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--game-muted);
+}
+
+.admin-skin-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admin-skin-actions button {
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 6px 12px;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+  cursor: pointer;
+}
+
+.admin-skin-actions button:hover:not(:disabled) {
+  background: var(--game-graphite);
+  color: var(--game-paper);
+}
+
+/* Taking a skin down reaches replays and everyone already wearing it, so it
+   does not look like the button beside it. */
+.admin-skin-actions button.is-destructive {
+  border-color: var(--game-red);
+  color: var(--game-red);
+}
+
+.admin-skin-actions button.is-destructive:hover:not(:disabled) {
+  background: var(--game-red);
+  color: var(--game-paper);
+}
+
+.admin-skin-actions button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
