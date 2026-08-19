@@ -95,6 +95,9 @@ impl SkinRegistry {
                 if let Some(authored) = resolve_authored(id) {
                     return authored;
                 }
+                if let Some(draft) = resolve_draft(id) {
+                    return draft;
+                }
                 self.entries()
                     .into_iter()
                     .find(|skin| skin.id() == id)
@@ -188,6 +191,67 @@ pub fn register_authored_skin(content_ref: &str, document_json: &str) -> Result<
 
     let skin = ParamSkin::from_json(document_json).map_err(|errors| format!("{errors:?}"))?;
     registered.push((content_ref.to_string(), Box::leak(Box::new(skin))));
+    Ok(())
+}
+
+/// A document being edited, compiled under a scratch handle.
+///
+/// Unlike an authored skin, a draft has no content reference: it has not been
+/// stored, so it has no name derived from its bytes. It is registered under a
+/// caller-chosen handle instead, and re-registering replaces it — which is what
+/// makes a live preview show the edit rather than the last thing saved.
+///
+/// Handles are namespaced so they can never be mistaken for, or collide with, a
+/// catalogue id or a content reference.
+pub const DRAFT_HANDLE_PREFIX: &str = "draft:";
+
+fn draft_skins() -> &'static std::sync::Mutex<Vec<(String, &'static ParamSkin)>> {
+    static DRAFTS: OnceLock<std::sync::Mutex<Vec<(String, &'static ParamSkin)>>> = OnceLock::new();
+    DRAFTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn resolve_draft(id: &str) -> Option<&'static dyn SnakeSkin> {
+    if !id.starts_with(DRAFT_HANDLE_PREFIX) {
+        return None;
+    }
+    let registered = draft_skins().lock().ok()?;
+    registered
+        .iter()
+        .find(|(handle, _)| handle == id)
+        .map(|(_, skin)| *skin as &'static dyn SnakeSkin)
+}
+
+/// Compile a draft under `handle`, replacing any previous compilation of it.
+///
+/// Bounded by the same ceiling as authored skins for the same reason: compiled
+/// skins are leaked, so an editor session that recompiled without limit would
+/// leak without limit. Replacing in place means one editing session costs one
+/// slot no matter how many edits it makes.
+pub fn register_draft_skin(handle: &str, document_json: &str) -> Result<(), String> {
+    if !handle.starts_with(DRAFT_HANDLE_PREFIX) {
+        return Err(format!(
+            "a draft handle must start with {DRAFT_HANDLE_PREFIX}"
+        ));
+    }
+
+    let skin = ParamSkin::from_json(document_json).map_err(|errors| format!("{errors:?}"))?;
+    let compiled: &'static ParamSkin = Box::leak(Box::new(skin));
+
+    let mut registered = draft_skins()
+        .lock()
+        .map_err(|_| "the draft registry is poisoned".to_string())?;
+    match registered
+        .iter_mut()
+        .find(|(existing, _)| existing == handle)
+    {
+        Some(slot) => slot.1 = compiled,
+        None => {
+            if registered.len() >= MAX_AUTHORED_SKINS {
+                return Err("too many drafts in this session".to_string());
+            }
+            registered.push((handle.to_string(), compiled));
+        }
+    }
     Ok(())
 }
 

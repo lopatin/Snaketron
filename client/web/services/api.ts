@@ -491,6 +491,32 @@ class API {
     });
   }
 
+  /** Create a skin from a document the editor has already compiled. */
+  async createSkin(request: { name: string; document: unknown; kind?: 'snake' | 'base' }): Promise<SkinSummary> {
+    return this.request<SkinSummary>('/api/skins', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Append a revision, rename, or re-price. */
+  async updateSkin(
+    skinId: number,
+    request: { name?: string; document?: unknown; priceBux?: number },
+  ): Promise<SkinSummary> {
+    return this.request<SkinSummary>(`/api/skins/${skinId}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Ask an admin to look at the current head revision. */
+  async requestSkinPublication(skinId: number): Promise<void> {
+    await this.request<unknown>(`/api/skins/${skinId}/publish-request`, {
+      method: 'POST',
+    });
+  }
+
   /** Everything waiting on a reviewer, oldest first. */
   async getSkinReviewQueue(): Promise<SkinListResponse> {
     return this.request<SkinListResponse>('/api/admin/skins');

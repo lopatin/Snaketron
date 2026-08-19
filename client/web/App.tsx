@@ -17,6 +17,7 @@ import PlayRoute from './components/PlayRoute';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
 import SkinsPage from './components/SkinsPage';
+import SkinBuilder from './components/SkinBuilder';
 import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
@@ -205,6 +206,18 @@ function AppContent() {
               onOpenAuth={handleOpenAuth}
               onOpenAccount={setAccountModalView}
             />
+          }
+        />
+        <Route
+          path="/skins/builder"
+          element={
+            <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+          }
+        />
+        <Route
+          path="/skins/builder/:skinId"
+          element={
+            <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
           }
         />
         <Route path="/profile" element={<Navigate to="/" replace />} />

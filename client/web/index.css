@@ -7373,3 +7373,224 @@ a.home-social-icon:hover {
   cursor: default;
   opacity: 0.45;
 }
+
+/* ------------------------------------------------------------------ */
+/* Skin Builder                                                        */
+/* ------------------------------------------------------------------ */
+
+.builder-main {
+  box-sizing: border-box;
+  width: min(100%, 64rem);
+  margin: 0 auto;
+  padding: 128px clamp(24px, 5vw, 64px) calc(120px + var(--ad-route-bottom-reserve));
+}
+
+/* The previews come first and stay put: an editor whose result scrolls out of
+   view while you edit it is a worse editor. */
+.builder-preview-strip {
+  position: sticky;
+  top: 84px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 14px;
+}
+
+.builder-preview {
+  margin: 0;
+}
+
+.builder-preview canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.builder-preview figcaption {
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-muted);
+}
+
+.builder-problems {
+  margin: 16px 0 0;
+  border: 2px solid var(--game-red);
+  padding: 10px 14px 10px 30px;
+  color: var(--game-red);
+  font-size: 12px;
+}
+
+.builder-status {
+  margin: 16px 0 0;
+  color: var(--game-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.builder-actions {
+  display: flex;
+  gap: 10px;
+  margin: 20px 0 8px;
+}
+
+.builder-actions button {
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 9px 18px;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+  cursor: pointer;
+}
+
+.builder-actions button:hover:not(:disabled) {
+  background: var(--game-graphite);
+  color: var(--game-paper);
+}
+
+.builder-actions button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.builder-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 16px;
+}
+
+.builder-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 2px solid #000;
+  padding: 14px 16px 16px;
+}
+
+.builder-group legend {
+  padding: 0 8px;
+  font-size: 11px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+}
+
+.builder-group-optional legend label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.builder-help {
+  margin: 0;
+  color: var(--game-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.builder-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.builder-field > span {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--game-graphite);
+}
+
+.builder-field small {
+  color: var(--game-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.builder-field input[type='text'],
+.builder-field select {
+  border: 2px solid #000;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.builder-field input[type='color'] {
+  width: 56px;
+  height: 30px;
+  border: 2px solid #000;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.builder-number-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.builder-number-row input[type='range'] {
+  flex: 1;
+}
+
+.builder-number-row output {
+  min-width: 4ch;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--game-muted);
+}
+
+.builder-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-left: 3px solid var(--game-rule);
+  padding-left: 12px;
+}
+
+.builder-list-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--game-muted);
+}
+
+.builder-list-item button,
+.builder-group > button {
+  align-self: flex-start;
+  border: 2px solid #000;
+  background: var(--game-paper);
+  padding: 5px 12px;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+/* Colour pairs read better side by side than stacked. */
+.builder-group .builder-field-color {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.builder-group .builder-field-color > span {
+  min-width: 6rem;
+}

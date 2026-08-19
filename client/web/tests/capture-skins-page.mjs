@@ -54,4 +54,15 @@ await page.screenshot({
 });
 console.log('wrote skins-page-full.png');
 
+// The Builder, opened on a new skin. Its previews animate, so reduced motion
+// (set on the context) is what makes this frame reproducible.
+await page.goto(`${baseUrl}/skins/builder`, { waitUntil: 'networkidle' });
+await page.waitForSelector('.builder-preview canvas');
+await page.waitForTimeout(400);
+await page.screenshot({
+  path: join(outDir, 'skin-builder.png'),
+  fullPage: false,
+});
+console.log('wrote skin-builder.png');
+
 await browser.close();

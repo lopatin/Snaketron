@@ -12,6 +12,7 @@
 
 pub mod color;
 pub mod content;
+pub mod describe;
 pub mod expr;
 
 use color::{ENEMY_HUES, FRIENDLY_HUES, HueWindow, NEUTRAL_CHROMA, Rgb, contrast_ratio};
@@ -49,6 +50,21 @@ pub const READY_CHECK_INK: &str = "#ffffff";
 /// every point in the cycle, and lets the validator check every frame a viewer
 /// can possibly see instead of sampling and hoping.
 pub const ANIMATION_STEPS: usize = 32;
+
+/// Bounds the editor's controls share with the validator.
+///
+/// These were literals inside `validate` until the Skin Builder needed sliders
+/// over the same ranges. Naming them is what stops a control from offering a
+/// value the server then refuses.
+pub const MIN_HEAD_CORE_RATIO: f64 = 0.05;
+pub const MAX_HEAD_CORE_RATIO: f64 = 0.5;
+pub const MIN_ANIMATION_PERIOD_MS: f64 = 120.0;
+pub const MAX_ANIMATION_PERIOD_MS: f64 = 60_000.0;
+pub const MIN_WAVE_CELLS_PER_CREST: f64 = 1.0;
+pub const MAX_WAVE_CELLS_PER_CREST: f64 = 64.0;
+/// Peak deviation for any animated value. A bigger swing stops reading as a
+/// shimmer and starts changing what the skin *is*.
+pub const MAX_ANIMATION_AMPLITUDE: f64 = 0.35;
 
 /// One body colour and its contour.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,7 +416,7 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
         )));
     }
 
-    if !(0.05..=0.5).contains(&doc.head.core_ratio) {
+    if !(MIN_HEAD_CORE_RATIO..=MAX_HEAD_CORE_RATIO).contains(&doc.head.core_ratio) {
         check(Err(SkinDocError::new(
             "head.core_ratio",
             "must be between 0.05 and 0.5 of a cell",
@@ -423,7 +439,7 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
     check(parse("head.gradient.color", &doc.head.gradient.color).map(|_| ()));
 
     if let Some(animation) = &doc.animation {
-        if !(120.0..=60_000.0).contains(&animation.period_ms) {
+        if !(MIN_ANIMATION_PERIOD_MS..=MAX_ANIMATION_PERIOD_MS).contains(&animation.period_ms) {
             check(Err(SkinDocError::new(
                 "animation.period_ms",
                 "must be between 120ms and 60000ms — faster reads as a flicker",
@@ -436,14 +452,16 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
             )));
         }
         if let Some(wave) = &animation.wave {
-            if !(1.0..=64.0).contains(&wave.cells_per_crest) {
+            if !(MIN_WAVE_CELLS_PER_CREST..=MAX_WAVE_CELLS_PER_CREST)
+                .contains(&wave.cells_per_crest)
+            {
                 check(Err(SkinDocError::new(
                     "animation.wave.cells_per_crest",
                     "must be between 1 and 64 cells; below one cell the wave \
                      lands between pixels and reads as noise",
                 )));
             }
-            if !(0.0..=0.35).contains(&wave.amplitude) {
+            if !(0.0..=MAX_ANIMATION_AMPLITUDE).contains(&wave.amplitude) {
                 check(Err(SkinDocError::new(
                     "animation.wave.amplitude",
                     "must be between 0 and 0.35; a bigger swing stops reading \
@@ -460,7 +478,7 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
             }
         }
         for (index, track) in animation.tracks.iter().enumerate() {
-            if !(0.0..=0.35).contains(&track.amplitude) {
+            if !(0.0..=MAX_ANIMATION_AMPLITUDE).contains(&track.amplitude) {
                 check(Err(SkinDocError::new(
                     format!("animation.tracks[{index}].amplitude"),
                     "must be between 0 and 0.35; a bigger swing changes what \
