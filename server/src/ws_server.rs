@@ -5904,16 +5904,40 @@ async fn send_challenge_inbox(
     challenges: &ChallengeStore,
     ws_tx: &mpsc::Sender<Message>,
 ) -> Result<()> {
+    send_challenge_inbox_if_changed(user_id, challenges, ws_tx, &mut None).await
+}
+
+/// Send the snapshot, optionally suppressing one that is byte-identical to the
+/// last.
+///
+/// The reconcile timer runs whether or not anything moved, and every snapshot
+/// the client receives replaces its state and re-renders both social panels.
+/// Passing `Some(last_frame)` makes a quiet inbox cost nothing on the wire and
+/// nothing on the client. `None` always sends, which is what the initial
+/// snapshot and every post-action refresh want.
+async fn send_challenge_inbox_if_changed(
+    user_id: u32,
+    challenges: &ChallengeStore,
+    ws_tx: &mpsc::Sender<Message>,
+    last_frame: &mut Option<String>,
+) -> Result<()> {
     let inbox = challenges
         .inbox(user_id)
         .await
         .context("failed to read the challenge inbox")?;
     let frame = serde_json::to_string(&WSMessage::Challenges(inbox))
         .context("failed to serialize the challenge inbox")?;
-    ws_tx
-        .send(Message::Text(frame.into()))
+    if last_frame.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    let outcome = ws_tx
+        .send(Message::Text(frame.clone().into()))
         .await
-        .context("WebSocket closed before the challenge inbox")
+        .context("WebSocket closed before the challenge inbox");
+    if outcome.is_ok() {
+        *last_frame = Some(frame);
+    }
+    outcome
 }
 
 /// Bring one authenticated socket into the social layer: claim a presence
@@ -6042,6 +6066,7 @@ async fn start_social_session(
             .await;
         let mut reconcile = tokio::time::interval(CHALLENGE_RECONCILE_INTERVAL);
         reconcile.tick().await;
+        let mut last_frame: Option<String> = None;
         match receiver {
             Ok(mut receiver) => loop {
                 tokio::select! {
@@ -6052,9 +6077,14 @@ async fn start_social_session(
                     }
                     _ = reconcile.tick() => {}
                 }
-                if send_challenge_inbox(user_id, &challenge_store, &challenge_tx)
-                    .await
-                    .is_err()
+                if send_challenge_inbox_if_changed(
+                    user_id,
+                    &challenge_store,
+                    &challenge_tx,
+                    &mut last_frame,
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }
@@ -6065,9 +6095,14 @@ async fn start_social_session(
                 warn!(user_id, %error, "challenge hints unavailable; falling back to polling");
                 loop {
                     reconcile.tick().await;
-                    if send_challenge_inbox(user_id, &challenge_store, &challenge_tx)
-                        .await
-                        .is_err()
+                    if send_challenge_inbox_if_changed(
+                        user_id,
+                        &challenge_store,
+                        &challenge_tx,
+                        &mut last_frame,
+                    )
+                    .await
+                    .is_err()
                     {
                         break;
                     }

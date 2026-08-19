@@ -3137,16 +3137,28 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       if (typeof lobbyCode !== 'string' || !lobbyCode) {
         return;
       }
+      // The challenger is already standing in the lobby they issued from.
       if (currentLobbyRef.current?.code === lobbyCode) {
         return;
       }
-      void joinLobby(lobbyCode).catch((error: unknown) => {
+      const enter = async () => {
+        // The server refuses a join while the socket still holds another
+        // lobby, so accepting from inside one has to vacate it first.
+        if (currentLobbyRef.current) {
+          await leaveLobby().catch(() => {
+            // A failed leave is still worth a join attempt: the lobby may
+            // already be gone on the server side.
+          });
+        }
+        await joinLobby(lobbyCode);
+      };
+      void enter().catch((error: unknown) => {
         console.error('Failed to join the lobby for an accepted challenge:', error);
         setChallengeError('Could not join that match. Try the lobby code instead.');
       });
     });
     return cleanup;
-  }, [joinLobby, onMessage]);
+  }, [joinLobby, leaveLobby, onMessage]);
 
   // A socket that goes away takes the social feeds with it: leaving them on
   // screen would offer challenges that cannot be delivered.
