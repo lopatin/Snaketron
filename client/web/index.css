@@ -7019,6 +7019,19 @@ a.home-social-icon:hover {
   margin: 0 22px 18px;
 }
 
+/* The same type as `.game-shell-button`: the checkbox sits on the same card as
+   Main menu and Share, and a label two sizes larger than the buttons beside it
+   reads as a heading rather than a choice. */
+.game-over-rematch-label {
+  color: var(--game-graphite);
+  font-size: 9px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  user-select: none;
+}
+
 .game-over-rematch-blocked {
   margin-left: auto;
   color: #b45309;

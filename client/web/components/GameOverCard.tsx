@@ -404,7 +404,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                 box. Copied rather than shared because the two are the only
                 checkboxes in the app and a component for two call sites would
                 be the wrong abstraction to reach for first. */}
-            <label className="flex items-center gap-3 cursor-pointer group">
+            <label className="flex items-center gap-2 cursor-pointer group">
               <div className="relative">
                 <input
                   type="checkbox"
@@ -414,7 +414,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                   data-testid="rematch-checkbox"
                 />
                 <div
-                  className={`w-6 h-6 border-2 rounded transition-all group-hover:border-gray-400 ${
+                  className={`w-4 h-4 border-2 rounded transition-all group-hover:border-gray-400 ${
                     hasOptedIntoRematch(rematch, currentUserId)
                       ? 'bg-blue-500 border-blue-500'
                       : 'bg-white border-gray-300'
@@ -433,9 +433,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                   )}
                 </div>
               </div>
-              <span className="text-sm font-black uppercase tracking-1 text-black-70 select-none">
-                Rematch
-              </span>
+              <span className="game-over-rematch-label">Rematch</span>
             </label>
             {/* Only ever shown when ticking the box cannot actually produce a
                 game; silence there would read as the feature being broken. */}
