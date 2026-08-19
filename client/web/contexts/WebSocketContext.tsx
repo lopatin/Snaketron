@@ -13,6 +13,7 @@ import {
   ClientAdsConfig,
   ChallengeInbox,
   RegionRoster,
+  RematchState,
 } from '../types';
 import {
   OutboundMessage,
@@ -322,6 +323,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [onlinePlayers, setOnlinePlayers] = useState<RegionRoster | null>(null);
   const [challenges, setChallenges] = useState<ChallengeInbox>(EMPTY_CHALLENGE_INBOX);
   const [challengeError, setChallengeError] = useState<string | null>(null);
+  const [rematchState, setRematchState] = useState<RematchState | null>(null);
 
   useEffect(() => {
     if (disableChat) {
@@ -3201,6 +3203,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
     setOnlinePlayers(null);
     setChallenges(EMPTY_CHALLENGE_INBOX);
+    setRematchState(null);
   }, [isSessionAuthenticated]);
 
   const challengePlayer = useCallback((userId: number) => {
@@ -3228,6 +3231,52 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [sendMessage]);
 
   const dismissChallengeError = useCallback(() => setChallengeError(null), []);
+
+  // Rematch. Server-pushed snapshots again — who is still on the results card,
+  // who has opted in, and the lobby they converge on once enough have.
+  useEffect(() => {
+    const cleanup = onMessage('Rematch', (message) => {
+      const state = message?.data as RematchState | undefined;
+      if (!state || !Array.isArray(state.participants)) {
+        return;
+      }
+      setRematchState(state);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // Everyone but the host converges on the elected lobby. The host is already
+  // standing in it — the server joined them when it elected the lobby.
+  useEffect(() => {
+    const lobbyCode = rematchState?.lobby_code;
+    if (!lobbyCode || !user?.id) {
+      return;
+    }
+    if (rematchState?.host_user_id === user.id) {
+      return;
+    }
+    if (currentLobbyRef.current?.code === lobbyCode) {
+      return;
+    }
+    const enter = async () => {
+      if (currentLobbyRef.current) {
+        await leaveLobby().catch(() => {
+          // Already gone server-side is fine; the join is what matters.
+        });
+      }
+      await joinLobby(lobbyCode);
+    };
+    void enter().catch((error: unknown) => {
+      console.error('Failed to join the rematch lobby:', error);
+    });
+  }, [joinLobby, leaveLobby, rematchState?.lobby_code, rematchState?.host_user_id, user?.id]);
+
+  const setRematchIntent = useCallback((gameId: number, optIn: boolean) => {
+    if (!Number.isSafeInteger(gameId) || gameId <= 0) {
+      return;
+    }
+    sendMessage({ SetRematchIntent: { game_id: gameId, opt_in: optIn } });
+  }, [sendMessage]);
 
   const value: WebSocketContextType = {
     isConnected,
@@ -3260,6 +3309,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     challenges,
     challengeError,
     challengePlayer,
+    rematchState,
+    setRematchIntent,
     respondToChallenge,
     cancelChallenge,
     dismissChallengeError,

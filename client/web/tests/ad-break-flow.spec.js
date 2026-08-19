@@ -57,7 +57,7 @@ test('a missing provider resolves the server-owned break and shows a neutral wai
         socket.send(JSON.stringify({
           Authenticated: {
             task_boot_id: 'ad-break-test',
-            protocol_version: 11,
+            protocol_version: 12,
             capabilities,
             socket_generation: 1,
           },

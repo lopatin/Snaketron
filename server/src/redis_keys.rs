@@ -287,6 +287,21 @@ impl RedisKeys {
         format!("challenge:{{snaketron:ch:{user_id}}}:rate")
     }
 
+    /// Rematch opt-in and presence for one finished game.
+    ///
+    /// Tagged on the game rather than the user: the participant set is fixed
+    /// and shared, so one record serves everybody and every read, prune, and
+    /// election stays inside a single hash slot.
+    pub fn rematch_record(game_id: u32) -> String {
+        format!("rematch:{{snaketron:rm:{game_id}}}:record")
+    }
+
+    /// The lobby elected to host one game's rematch. `SET NX` on this key is
+    /// what makes the election exactly-once across the cluster.
+    pub fn rematch_lobby(game_id: u32) -> String {
+        format!("rematch:{{snaketron:rm:{game_id}}}:lobby")
+    }
+
     /// Per-user loss-tolerant hint channel. Pub/Sub is at-most-once, so this
     /// only ever says "your challenge state moved, re-read it" — the durable
     /// keys above stay authoritative and a periodic reconcile covers a drop.
@@ -637,6 +652,12 @@ mod tests {
             RedisKeys::user_challenge_data(7),
             RedisKeys::user_challenge_rate(7),
         ]);
+        assert_same_slot(&[RedisKeys::rematch_record(42), RedisKeys::rematch_lobby(42)]);
+        assert_ne!(
+            hash_tag(&RedisKeys::rematch_record(42)),
+            hash_tag(&RedisKeys::rematch_record(43)),
+            "rematch records must stay distributed across games"
+        );
         assert_ne!(
             hash_tag(&RedisKeys::user_challenge_index(7)),
             hash_tag(&RedisKeys::user_challenge_index(8)),

@@ -32,6 +32,7 @@ use crate::recovery::{
 };
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
+use crate::rematch::{RematchState, RematchStore};
 use crate::user_cache::UserCache;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -311,6 +312,18 @@ pub enum WSMessage {
     ChallengeFailed {
         reason: String,
     },
+
+    // === Rematch (protocol 12, capability `rematch-v1`) ===
+    /// Client -> server: tick or untick Rematch on the results card. The
+    /// server takes the player's identity from the connection and checks the
+    /// game id against the one this socket actually joined.
+    SetRematchIntent {
+        game_id: u32,
+        opt_in: bool,
+    },
+    /// Server -> client: who is still on the results card, who has opted in,
+    /// and — once enough have — the lobby they all converge on.
+    Rematch(RematchState),
     // NicknameUpdated {
     //     username: String,
     // },
@@ -1387,6 +1400,8 @@ async fn handle_websocket_connection(
                                                         &region,
                                                         &redis,
                                                         &pubsub_manager,
+                                                        &event_router,
+                                                        &db,
                                                         &ws_tx,
                                                     )
                                                     .await;
@@ -1400,10 +1415,15 @@ async fn handle_websocket_connection(
                                                         }
                                                         _ => PresenceActivity::Idle,
                                                     };
+                                                    let seated_game_id = match &new_state {
+                                                        ConnectionState::Authenticated { game_id, .. } => *game_id,
+                                                        ConnectionState::Unauthenticated => None,
+                                                    };
                                                     record_presence_activity(
                                                         social_session.as_ref(),
                                                         metadata,
                                                         activity,
+                                                        seated_game_id,
                                                     )
                                                     .await;
                                                 }
@@ -3259,6 +3279,191 @@ async fn send_recovery_bridge_snapshot(
 /// Load the game's durable terminal state, if one exists. Absence, failure,
 /// malformed data, or a non-terminal record all return `None`: none of those
 /// prove anything about a live game, so callers fall back to normal warm-up.
+/// Everything a rematch needs to know about the match that just ended.
+///
+/// The roster is read from the authoritative terminal state, never from the
+/// client, so a spectator cannot put themselves on the results card. Same two
+/// sources the join path uses: the Redis terminal snapshot first, then the
+/// durable record once persistence has caught up.
+async fn resolve_rematch_context(
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    game_id: u32,
+) -> Option<(Vec<(u32, String)>, common::GameType, common::QueueMode)> {
+    let terminal_state = match event_router.get_stored_snapshot(game_id).await {
+        Ok(Some(state)) if matches!(state.status, GameStatus::Complete { .. }) => Some(state),
+        _ => load_durable_terminal_state(db, game_id).await,
+    }?;
+
+    let mut participants: Vec<(u32, String)> = terminal_state
+        .players
+        .keys()
+        .copied()
+        // Someone removed for inactivity forfeited this match; putting them on
+        // the rematch card would let a player who walked away hold up the
+        // group that stayed.
+        .filter(|user_id| !terminal_state.is_player_idle_kicked(*user_id))
+        .map(|user_id| {
+            let username = terminal_state
+                .usernames
+                .get(&user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("User{user_id}"));
+            (user_id, username)
+        })
+        .collect();
+    participants.sort_by_key(|(user_id, _)| *user_id);
+
+    Some((
+        participants,
+        terminal_state.game_type.clone(),
+        terminal_state.queue_mode,
+    ))
+}
+
+/// Record-then-elect: refresh this socket's view, and if the group is now big
+/// enough and this player is the elected host, stand up the lobby everyone
+/// converges on.
+///
+/// Returns the connection's (possibly new) lobby handle. The error variant
+/// carries it back too — a failure here must not lose a lobby the connection
+/// has already joined.
+#[allow(clippy::too_many_arguments)]
+async fn advance_rematch(
+    game_id: u32,
+    user_id: u32,
+    rematch: &RematchStore,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    metadata: &PlayerMetadata,
+    lobby: Option<LobbyJoinHandle>,
+    region: &str,
+    websocket_id: &str,
+    ws_tx: &mpsc::Sender<Message>,
+) -> std::result::Result<Option<LobbyJoinHandle>, (Option<LobbyJoinHandle>, anyhow::Error)> {
+    let state = match send_rematch_state(game_id, user_id, rematch, event_router, db, ws_tx).await {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(lobby),
+        Err(error) => return Err((lobby, error)),
+    };
+
+    // Everyone else is told to re-read; the record is what they read, so a
+    // dropped hint only costs them the reconcile interval.
+    for participant in &state.participants {
+        if participant.user_id != user_id {
+            rematch.hint(participant.user_id).await;
+        }
+    }
+
+    // Only the elected host stands up the lobby, and only once the count can
+    // actually form a game. `SET NX` settles any disagreement anyway.
+    if state.game_type.is_none()
+        || state.host_user_id != Some(user_id)
+        || state.lobby_code.is_some()
+    {
+        return Ok(lobby);
+    }
+
+    let (lobby, code) = match lobby {
+        Some(handle) => {
+            let code = handle.lobby_code.clone();
+            (Some(handle), code)
+        }
+        None => {
+            let created = match lobby_manager
+                .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                .await
+            {
+                Ok(created) => created,
+                Err(error) => return Err((None, error)),
+            };
+            match lobby_manager
+                .join_lobby_for_pool(
+                    Some(created.lobby_code()),
+                    metadata.user_id,
+                    metadata.username.clone(),
+                    websocket_id.to_string(),
+                    region.to_string(),
+                    None,
+                    metadata.matchmaking_pool,
+                    metadata.distribution,
+                    metadata.supports_ad_break,
+                    metadata.can_show_video_ad,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let code = handle.lobby_code.clone();
+                    (Some(handle), code)
+                }
+                Err(error) => return Err((None, error)),
+            }
+        }
+    };
+
+    let elected = match rematch.elect_lobby(game_id, &code).await {
+        Ok(elected) => elected,
+        Err(error) => return Err((lobby, error)),
+    };
+    if elected == code
+        && let Some(handle) = &lobby
+    {
+        // The client needs to know it holds this lobby, the same way it would
+        // after an explicit CreateLobby.
+        let created = WSMessage::LobbyCreated {
+            lobby_code: handle.lobby_code.clone(),
+        };
+        if let Ok(frame) = serde_json::to_string(&created) {
+            let _ = ws_tx.send(Message::Text(frame.into())).await;
+        }
+    }
+
+    // Re-read so this socket and everyone it hints see the elected lobby.
+    if let Err(error) = send_rematch_state(game_id, user_id, rematch, event_router, db, ws_tx).await
+    {
+        return Err((lobby, error));
+    }
+    for participant in &state.participants {
+        if participant.user_id != user_id {
+            rematch.hint(participant.user_id).await;
+        }
+    }
+
+    Ok(lobby)
+}
+
+/// Read the rematch record and push it to this socket.
+async fn send_rematch_state(
+    game_id: u32,
+    user_id: u32,
+    rematch: &RematchStore,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<Option<RematchState>> {
+    let Some((participants, game_type, queue_mode)) =
+        resolve_rematch_context(event_router, db, game_id).await
+    else {
+        return Ok(None);
+    };
+    if !participants.iter().any(|(id, _)| *id == user_id) {
+        return Ok(None);
+    }
+
+    let state = rematch
+        .state(game_id, &participants, &game_type, queue_mode)
+        .await
+        .context("failed to read the rematch state")?;
+    let frame = serde_json::to_string(&WSMessage::Rematch(state.clone()))
+        .context("failed to serialize the rematch state")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the rematch state")?;
+    Ok(Some(state))
+}
+
 async fn load_durable_terminal_state(db: &Arc<dyn Database>, game_id: u32) -> Option<GameState> {
     let database_game_id = i32::try_from(game_id).ok()?;
     match db.get_game_by_id(database_game_id).await {
@@ -4692,6 +4897,58 @@ async fn process_ws_message(
             }
 
             match ws_message {
+                WSMessage::SetRematchIntent {
+                    game_id: requested_game_id,
+                    opt_in,
+                } => {
+                    // Authorized off the connection, not the payload: this
+                    // socket only holds a game id because `JoinGame` already
+                    // authorized it against the match roster.
+                    if game_id == Some(requested_game_id)
+                        && let Ok(user_id) = u32::try_from(metadata.user_id)
+                    {
+                        let rematch = RematchStore::new(redis.clone());
+                        if let Err(error) =
+                            rematch.set_intent(requested_game_id, user_id, opt_in).await
+                        {
+                            warn!(user_id, requested_game_id, %error, "failed to record a rematch intent");
+                        }
+                        let lobby = match advance_rematch(
+                            requested_game_id,
+                            user_id,
+                            &rematch,
+                            event_router,
+                            db,
+                            lobby_manager,
+                            &metadata,
+                            lobby,
+                            region,
+                            &websocket_id,
+                            ws_tx,
+                        )
+                        .await
+                        {
+                            Ok(lobby) => lobby,
+                            Err((lobby, error)) => {
+                                warn!(user_id, requested_game_id, %error, "failed to advance the rematch");
+                                lobby
+                            }
+                        };
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
                 WSMessage::ChallengePlayer {
                     user_id: target_user_id,
                 } => {
@@ -5851,6 +6108,10 @@ struct PresenceIntent {
     is_guest: bool,
     activity: PresenceActivity,
     pool: MatchmakingPool,
+    /// The game whose results card this socket is sitting on, if any. The
+    /// heartbeat refreshes a rematch presence lease for it, which is what lets
+    /// the other players see who is still there without anyone announcing it.
+    game_id: Option<u32>,
 }
 
 impl SocialSession {
@@ -5952,12 +6213,15 @@ fn social_layer_admits(metadata: &PlayerMetadata) -> bool {
 
 /// Bring one authenticated socket into the social layer: claim a presence
 /// lease, send the current roster and challenge state, and keep both live.
+#[allow(clippy::too_many_arguments)]
 async fn start_social_session(
     metadata: &PlayerMetadata,
     websocket_id: &str,
     region: &str,
     redis: &RedisConnection,
     pubsub_manager: &Arc<PubSubManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
     ws_tx: &mpsc::Sender<Message>,
 ) -> Option<SocialSession> {
     let Ok(user_id) = u32::try_from(metadata.user_id) else {
@@ -5999,6 +6263,7 @@ async fn start_social_session(
         is_guest: metadata.is_guest,
         activity: PresenceActivity::Idle,
         pool: metadata.matchmaking_pool,
+        game_id: None,
     }));
     let mut tasks = Vec::new();
 
@@ -6007,6 +6272,7 @@ async fn start_social_session(
     let lease_presence = presence.clone();
     let lease_intent = intent.clone();
     let lease_websocket_id = websocket_id.to_string();
+    let lease_rematch = RematchStore::new(redis.clone());
     tasks.push(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(
             crate::presence::PRESENCE_REFRESH_INTERVAL_MS,
@@ -6030,6 +6296,11 @@ async fn start_social_session(
                 .await
             {
                 debug!(user_id, %error, "presence lease refresh failed");
+            }
+            if let Some(game_id) = current.game_id
+                && let Err(error) = lease_rematch.touch_presence(game_id, user_id).await
+            {
+                debug!(user_id, game_id, %error, "rematch presence refresh failed");
             }
         }
     }));
@@ -6064,6 +6335,10 @@ async fn start_social_session(
     let challenge_store = challenges.clone();
     let notification_channel = RedisKeys::user_notifications_channel(user_id);
     let mut challenge_pubsub = (**pubsub_manager).clone();
+    let notify_intent = intent.clone();
+    let notify_rematch = RematchStore::new(redis.clone());
+    let notify_event_router = event_router.clone();
+    let notify_db = db.clone();
     tasks.push(tokio::spawn(async move {
         let receiver = challenge_pubsub
             .subscribe_to_channel(&notification_channel)
@@ -6071,17 +6346,48 @@ async fn start_social_session(
         let mut reconcile = tokio::time::interval(CHALLENGE_RECONCILE_INTERVAL);
         reconcile.tick().await;
         let mut last_frame: Option<String> = None;
-        match receiver {
-            Ok(mut receiver) => loop {
-                tokio::select! {
-                    hint = receiver.recv::<String>() => {
-                        if hint.is_err() {
-                            break;
-                        }
+
+        // One channel carries both kinds of nudge, so the payload decides what
+        // to re-read. A reconcile tick re-reads everything, which is what
+        // makes a dropped hint cost latency rather than correctness.
+        let settle = |hint: Option<String>| -> (bool, bool) {
+            match hint.as_deref() {
+                Some("rematch") => (false, true),
+                Some(_) => (true, false),
+                None => (true, true),
+            }
+        };
+
+        // A missing hint channel is a degradation, not a failure: the loop
+        // falls back to pure reconcile polling and says so once.
+        let mut receiver = match receiver {
+            Ok(receiver) => Some(receiver),
+            Err(error) => {
+                warn!(user_id, %error, "social hints unavailable; falling back to polling");
+                None
+            }
+        };
+
+        loop {
+            let hint = match receiver.as_mut() {
+                Some(receiver) => {
+                    tokio::select! {
+                        received = receiver.recv::<String>() => match received {
+                            Ok(payload) => Some(payload),
+                            Err(_) => break,
+                        },
+                        _ = reconcile.tick() => None,
                     }
-                    _ = reconcile.tick() => {}
                 }
-                if send_challenge_inbox_if_changed(
+                None => {
+                    reconcile.tick().await;
+                    None
+                }
+            };
+            let (read_challenges, read_rematch) = settle(hint);
+
+            if read_challenges
+                && send_challenge_inbox_if_changed(
                     user_id,
                     &challenge_store,
                     &challenge_tx,
@@ -6089,27 +6395,28 @@ async fn start_social_session(
                 )
                 .await
                 .is_err()
-                {
-                    break;
-                }
-            },
-            Err(error) => {
-                // Without the hint channel the feature still works, just at
-                // reconcile latency rather than instantly.
-                warn!(user_id, %error, "challenge hints unavailable; falling back to polling");
-                loop {
-                    reconcile.tick().await;
-                    if send_challenge_inbox_if_changed(
+            {
+                break;
+            }
+
+            if read_rematch {
+                let seated_game_id = match notify_intent.lock() {
+                    Ok(intent) => intent.game_id,
+                    Err(poisoned) => poisoned.into_inner().game_id,
+                };
+                if let Some(game_id) = seated_game_id
+                    && send_rematch_state(
+                        game_id,
                         user_id,
-                        &challenge_store,
+                        &notify_rematch,
+                        &notify_event_router,
+                        &notify_db,
                         &challenge_tx,
-                        &mut last_frame,
                     )
                     .await
                     .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
             }
         }
@@ -6134,6 +6441,7 @@ async fn record_presence_activity(
     session: Option<&SocialSession>,
     metadata: &PlayerMetadata,
     activity: PresenceActivity,
+    game_id: Option<u32>,
 ) {
     let Some(session) = session else {
         return;
@@ -6143,6 +6451,7 @@ async fn record_presence_activity(
         is_guest: metadata.is_guest,
         activity,
         pool: metadata.matchmaking_pool,
+        game_id,
     };
     // Writing the shared intent first means even a failed refresh converges on
     // the next heartbeat instead of leaving the roster permanently stale.
@@ -6150,7 +6459,8 @@ async fn record_presence_activity(
         Ok(mut current) => {
             let unchanged = current.username == next.username
                 && current.is_guest == next.is_guest
-                && current.activity == next.activity;
+                && current.activity == next.activity
+                && current.game_id == next.game_id;
             *current = next.clone();
             unchanged
         }

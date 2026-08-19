@@ -71,6 +71,7 @@ import type { OutboundMessage, WSMessageTag, TypedMessage } from './protocol';
 import type {
   Challenge,
   ChallengeInbox,
+  RematchState,
   ClientAdsConfig,
   Direction,
   LobbyAdBreakView,
@@ -78,7 +79,7 @@ import type {
   OnlinePlayer,
   RegionRoster,
 } from './generated';
-export type { Challenge, ChallengeInbox, OnlinePlayer, RegionRoster } from './generated';
+export type { Challenge, ChallengeInbox, OnlinePlayer, RegionRoster, RematchState, RematchParticipant } from './generated';
 export type { OutboundMessage, WSMessageTag, TypedMessage, PayloadOf } from './protocol';
 
 // Leaderboard entry aliases: the components predate the generated names but the
@@ -210,6 +211,9 @@ export interface WebSocketContextType {
   /** Most recent challenge failure, for display; cleared by the next action. */
   challengeError: string | null;
   challengePlayer: (userId: number) => void;
+  /** Live rematch state for the game this socket is in, if any. */
+  rematchState: RematchState | null;
+  setRematchIntent: (gameId: number, optIn: boolean) => void;
   respondToChallenge: (challengeId: string, accept: boolean) => void;
   cancelChallenge: (challengeId: string) => void;
   dismissChallengeError: () => void;

@@ -29,6 +29,7 @@ pub mod recovery;
 pub mod redis_keys;
 pub mod redis_utils;
 pub mod region_cache;
+pub mod rematch;
 pub mod replay;
 pub mod replay_cache;
 pub mod replay_repository;

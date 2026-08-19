@@ -69,6 +69,8 @@ export * from './QueueMode';
 export * from './RecordedGameMessage';
 export * from './RegionMetadata';
 export * from './RegionRoster';
+export * from './RematchParticipant';
+export * from './RematchState';
 export * from './ReplayAnchor';
 export * from './ReplayVisibility';
 export * from './RuntimeAdsConfig';

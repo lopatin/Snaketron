@@ -38,6 +38,25 @@ const ACTIVITY_LABELS: Record<OnlinePlayer['activity'], string> = {
   playing: 'In a match',
 };
 
+/** Chevron that points at what a click will do: down to open, up to close. */
+const Caret: React.FC<{ expanded: boolean }> = ({ expanded }) => (
+  <svg
+    className={`online-players-caret${expanded ? ' is-expanded' : ''}`}
+    viewBox="0 0 12 12"
+    aria-hidden="true"
+    focusable="false"
+  >
+    <path
+      d="M2.5 4.5 6 8l3.5-3.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
 export const OnlinePlayersPanel: React.FC<OnlinePlayersPanelProps> = ({ enabled = true }) => {
   const { user } = useAuth();
   const { onlinePlayers, challenges, challengeError, challengePlayer, dismissChallengeError } =
@@ -146,8 +165,11 @@ export const OnlinePlayersPanel: React.FC<OnlinePlayersPanelProps> = ({ enabled 
         data-testid="online-players-toggle"
       >
         <span className="online-players-dot" aria-hidden="true" />
-        <span className="online-players-region">{regionName}</span>
-        <span className="online-players-count">{othersOnline}</span>
+        <span className="online-players-region">
+          {regionName}
+          {` (${othersOnline})`}
+        </span>
+        <Caret expanded={!isCollapsed} />
       </button>
 
       {!isCollapsed && (
@@ -161,14 +183,11 @@ export const OnlinePlayersPanel: React.FC<OnlinePlayersPanelProps> = ({ enabled 
                 const isSelf = user?.id === player.user_id;
                 const activity = ACTIVITY_LABELS[player.activity];
                 return (
-                  <li key={player.user_id} className="online-player">
-                    <span
-                      className={`online-player-status is-${player.activity}`}
-                      title={activity}
-                      role="img"
-                      aria-label={activity}
-                    />
-                    <span className="online-player-name" title={player.username}>
+                  <li key={player.user_id} className={`online-player is-${player.activity}`}>
+                    {/* Being in the list is what says "online"; the name's own
+                        weight says whether they can play right now. The words
+                        stay available on hover for anyone who wants them. */}
+                    <span className="online-player-name" title={`${player.username} — ${activity}`}>
                       {player.username}
                     </span>
                     {pending ? (

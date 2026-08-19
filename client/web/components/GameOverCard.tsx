@@ -9,8 +9,10 @@ import {
 import { resolveSnakeSkinColors } from '../utils/snakeSkin';
 import type { MatchRatingState } from '../utils/ratingReveal';
 import type { MatchHighlightState } from '../utils/highlightPresentation';
+import type { RematchState } from '../types';
 import GameOverJewel from './GameOverJewel';
 import ShareGame from './ShareGame';
+import RematchPanel from './RematchPanel';
 import PlayOfTheGame from './PlayOfTheGame';
 import RatingReveal from './RatingReveal';
 
@@ -36,6 +38,10 @@ export interface GameOverCardProps {
   gameId?: string;
   /** The real `u32` game id, which is what a share link addresses. */
   shareGameId?: number | null;
+  /** Live rematch state for this match, when the server is offering one. */
+  rematch?: RematchState | null;
+  currentUserId?: number;
+  onRematchToggle?: (optIn: boolean) => void;
   presentation: MatchPresentation;
   rating?: MatchRatingState;
   highlight?: MatchHighlightState;
@@ -81,6 +87,9 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
   open,
   gameId,
   shareGameId = null,
+  rematch = null,
+  currentUserId,
+  onRematchToggle,
   presentation,
   rating,
   highlight,
@@ -371,6 +380,14 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
             </div>
           ))}
         </div>
+
+        {rematch && onRematchToggle && (
+          <RematchPanel
+            state={rematch}
+            currentUserId={currentUserId}
+            onToggle={onRematchToggle}
+          />
+        )}
 
         <footer className="game-over-actions">
           <button type="button" onClick={onMenu} className="game-shell-button is-menu">

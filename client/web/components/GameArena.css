@@ -1861,6 +1861,16 @@
   z-index: 65;
 }
 
+/* ...and above the results card's backdrop, which covers the whole viewport
+   at z-index 80. Chat keeps working after the final whistle — the server
+   never leaves the game scope and never checks status — but while the card
+   was up the panel sat under a scrim that swallowed every click, and a click
+   aimed at it dismissed the card instead. The end of a match is exactly when
+   people want to talk about it. */
+.game-arena-screen .home-lobby-chat {
+  z-index: 85;
+}
+
 .touch-controls__cluster {
   position: fixed;
   display: flex;

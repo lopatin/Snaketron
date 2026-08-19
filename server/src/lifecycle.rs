@@ -13,6 +13,10 @@ const PHASE_STOPPING: u8 = 3;
 /// WebSocket. Keep these stable: clients use them to decide whether a planned
 /// make-before-break handoff is supported.
 ///
+/// Version 12 adds the rematch: an opt-in on the results card that converges
+/// everyone who ticks it onto one lobby, plus the live roster of who is still
+/// looking at that card.
+///
 /// Version 11 adds the social layer: a per-region online-player roster and
 /// player-to-player challenges, both server-pushed. It also makes finished
 /// matches publicly addressable, though that surface is HTTP and does not
@@ -36,7 +40,7 @@ const PHASE_STOPPING: u8 = 3;
 /// fail to understand half the messages it receives. This must stay in lockstep
 /// with `GAMEPLAY_PROTOCOL_VERSION` in client/web/constants.ts; the bot and
 /// loadtest clients import this constant directly so they cannot drift at all.
-pub const WS_PROTOCOL_VERSION: u16 = 11;
+pub const WS_PROTOCOL_VERSION: u16 = 12;
 pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "explicit-auth-v1",
     "planned-drain-v1",
@@ -48,6 +52,7 @@ pub const WS_BASE_CAPABILITIES: &[&str] = &[
     "stress-matchmaking-pool-v1",
     "ad-break-v1",
     "social-presence-v1",
+    "rematch-v1",
 ];
 
 /// A planned task-removal notification. The absolute deadline avoids clients

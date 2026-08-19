@@ -8,6 +8,7 @@ export const DEFAULT_TICK_INTERVAL_MS = 100;
 export const EXECUTOR_POLL_INTERVAL_MS = 10;
 export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // Gameplay protocol version. Predictive simulation requires an exact match:
+// Protocol 12 adds the rematch opt-in on the results card and its live roster.
 // Protocol 11 adds the social layer — the per-region online-player roster and
 // player-to-player challenges, both pushed by the server.
 // Protocol 10 is a merge collision resolved upward: this branch and the
@@ -17,7 +18,7 @@ export const DEFAULT_CUSTOM_GAME_TICK_MS = 100;
 // per-session distribution routing for server-owned advertisement policy.
 // (Protocol 8 changed scoring and physical growth.)
 // Tracks WS_PROTOCOL_VERSION in server/src/lifecycle.rs.
-export const GAMEPLAY_PROTOCOL_VERSION = 11;
+export const GAMEPLAY_PROTOCOL_VERSION = 12;
 export const isGameplayProtocolCompatible = (serverVersion: unknown): boolean =>
   Number(serverVersion) === GAMEPLAY_PROTOCOL_VERSION;
 export const GAMEPLAY_UPDATE_REQUIRED_PREFIX = 'Gameplay update required';

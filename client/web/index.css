@@ -6241,9 +6241,11 @@ a.home-social-icon:hover {
   max-height: min(560px, calc(100svh - 300px));
   display: flex;
   flex-direction: column;
-  padding: 10px 0 4px;
+  padding: 0;
   border: 1px solid rgb(255 255 255 / 12%);
-  background: rgb(9 12 20 / 72%);
+  /* The fill lives on the header and the list separately so the two can sit
+     at different opacities — see below. */
+  background: transparent;
   -webkit-backdrop-filter: blur(10px);
   backdrop-filter: blur(10px);
   color: #fff;
@@ -6267,14 +6269,17 @@ a.home-social-icon:hover {
   padding: 0;
 }
 
+/* Denser than the list beneath it, which is what separates the two without
+   spending a rule on it. */
 .online-players-toggle {
   display: flex;
   flex: none;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px 10px;
+  width: 100%;
+  padding: 9px 10px 9px 12px;
   border: none;
-  background: transparent;
+  background: rgb(9 12 20 / 90%);
   color: rgb(255 255 255 / 72%);
   font-size: 10px;
   font-weight: 800;
@@ -6282,10 +6287,6 @@ a.home-social-icon:hover {
   text-transform: uppercase;
   cursor: pointer;
   transition: color 150ms ease;
-}
-
-.online-players.is-collapsed .online-players-toggle {
-  padding: 10px 12px;
 }
 
 .online-players-toggle:hover {
@@ -6308,16 +6309,24 @@ a.home-social-icon:hover {
   white-space: nowrap;
 }
 
-.online-players-count {
+.online-players-caret {
+  width: 12px;
+  height: 12px;
   flex: none;
-  color: rgb(255 255 255 / 45%);
-  font-variant-numeric: tabular-nums;
+  color: rgb(255 255 255 / 55%);
+  transition: transform 150ms ease;
+}
+
+.online-players-caret.is-expanded {
+  transform: rotate(180deg);
 }
 
 .online-players-list {
   overflow-y: auto;
   flex: 1;
   min-height: 0;
+  padding: 4px 0 6px;
+  background: rgb(9 12 20 / 78%);
   scrollbar-width: thin;
   scrollbar-color: rgb(255 255 255 / 22%) transparent;
 }
@@ -6343,32 +6352,19 @@ a.home-social-icon:hover {
 
 .online-player {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
-  padding: 4px 12px;
+  padding: 3px 12px;
 }
 
 .online-player:hover {
   background: rgb(255 255 255 / 6%);
 }
 
-.online-player-status {
-  width: 5px;
-  height: 5px;
-  border-radius: 2px;
-  background: #22c55e;
-  cursor: help;
-}
-
-.online-player-status.is-lobby {
-  background: var(--game-boost);
-}
-
-.online-player-status.is-playing {
-  background: rgb(255 255 255 / 30%);
-}
-
+/* Presence is membership of the list. Availability is the name's own colour:
+   white can play now, grey is mid-match. No legend needed, and no column
+   spent on a word that repeats for every row. */
 .online-player-name {
   overflow: hidden;
   color: #fff;
@@ -6376,6 +6372,10 @@ a.home-social-icon:hover {
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.online-player.is-playing .online-player-name {
+  color: rgb(255 255 255 / 42%);
 }
 
 /* A link, not a button: no container, and no underline until it is wanted. */
@@ -6931,4 +6931,101 @@ a.home-social-icon:hover {
   background: none;
   color: inherit;
   cursor: pointer;
+}
+
+/* Rematch ------------------------------------------------------------------
+   A checkbox and the answer to the question you actually have while deciding:
+   is anyone else still here, and has anyone else said yes. Sits between the
+   standings and the action footer, so it reads as part of the result rather
+   than as another button. */
+.game-over-rematch {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.game-over-rematch-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+}
+
+.game-over-rematch-toggle input {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  accent-color: var(--game-blue);
+  cursor: pointer;
+}
+
+.game-over-rematch-label {
+  color: rgb(0 0 0 / 78%);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+}
+
+.game-over-rematch-status {
+  margin-left: auto;
+  color: var(--game-blue);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.game-over-rematch-roster {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.game-over-rematch-player {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+}
+
+.game-over-rematch-name {
+  overflow: hidden;
+  color: rgb(0 0 0 / 72%);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.game-over-rematch-verdict {
+  flex: none;
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.game-over-rematch-player.is-in .game-over-rematch-verdict {
+  color: #16a34a;
+}
+
+/* Greyed rather than removed: knowing someone walked away is what tells you
+   the rematch is not going to happen. */
+.game-over-rematch-player.is-gone {
+  opacity: 0.45;
+}
+
+.game-over-rematch-blocked {
+  margin: 0;
+  color: #b45309;
+  font-size: 10px;
+  font-weight: 700;
 }
