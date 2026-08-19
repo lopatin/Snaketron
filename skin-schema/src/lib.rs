@@ -14,6 +14,7 @@ pub mod color;
 pub mod content;
 pub mod describe;
 pub mod expr;
+pub mod v2;
 
 use color::{ENEMY_HUES, FRIENDLY_HUES, HueWindow, NEUTRAL_CHROMA, Rgb, contrast_ratio};
 use serde::{Deserialize, Serialize};
@@ -744,6 +745,64 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
     } else {
         Err(errors)
     }
+}
+
+/// Hue-window and parse checks for a palette, used by `v2::validate_v2`.
+///
+/// Deliberately *not* refactored out of v1's `validate`, whose interleaved
+/// hue/contrast walk is byte-pinned by its own tests: v1 keeps its closed-world
+/// analytic checks, and v2 keeps only the part that is still analytic in an
+/// open world — the windows. Contrast in v2 is the sampler's job, computed
+/// from the composite rather than from the structure.
+pub(crate) fn validate_palette_hues(palette: &RolePalette, errors: &mut Vec<SkinDocError>) {
+    let mut check_pair = |field: &str, pair: &ColorPair, window: Option<(HueWindow, &str)>| {
+        if let Some((window, side)) = window {
+            for (part, hex) in [("fill", &pair.fill), ("outline", &pair.outline)] {
+                if let Err(error) = require_hue(&format!("{field}.{part}"), hex, window, side) {
+                    errors.push(error);
+                }
+            }
+        }
+        for (part, hex) in [("fill", &pair.fill), ("outline", &pair.outline)] {
+            if let Err(error) = parse(&format!("{field}.{part}"), hex) {
+                errors.push(error);
+            }
+        }
+    };
+
+    check_pair(
+        "palette.friendly[0]",
+        &palette.friendly[0],
+        Some((FRIENDLY_HUES, "friendly")),
+    );
+    check_pair(
+        "palette.friendly[1]",
+        &palette.friendly[1],
+        Some((FRIENDLY_HUES, "friendly")),
+    );
+    check_pair(
+        "palette.enemy[0]",
+        &palette.enemy[0],
+        Some((ENEMY_HUES, "enemy")),
+    );
+    check_pair(
+        "palette.enemy[1]",
+        &palette.enemy[1],
+        Some((ENEMY_HUES, "enemy")),
+    );
+    // Free-for-all slots 0 and 1 double as the spectated blue and red sides.
+    check_pair(
+        "palette.free_for_all[0]",
+        &palette.free_for_all[0],
+        Some((FRIENDLY_HUES, "friendly")),
+    );
+    check_pair(
+        "palette.free_for_all[1]",
+        &palette.free_for_all[1],
+        Some((ENEMY_HUES, "enemy")),
+    );
+    check_pair("palette.free_for_all[2]", &palette.free_for_all[2], None);
+    check_pair("palette.free_for_all[3]", &palette.free_for_all[3], None);
 }
 
 /// The ink a label gets when a document does not name one.

@@ -1,0 +1,1635 @@
+//! SkinDoc v2: the layer document.
+//!
+//! `specs/skin-layer-documents-prd.md` in one sentence: v1 described one
+//! fixed layer stack by its parameters, v2 describes the stack itself. A v2
+//! document is a list of layers over the compositor's own vocabulary —
+//! regions, clips, spans, sources, transforms — and **animation is not a
+//! feature of the schema**: any paint-argument property holds an expression
+//! (`crate::expr`), and a property that reads `time` animates. A constant is
+//! just a constant expression.
+//!
+//! Two layers are deliberately *not* in the document: the Boost band and the
+//! head core. They are system-owned — the band pinned outermost in the
+//! contour, the core pinned topmost — because their positions are competitive
+//! information, not style. The document keeps only the core's colour and
+//! radius (the label rules need a flat disc of a known colour), exactly the
+//! authority v1 granted.
+//!
+//! The static/animatable split (PRD section 5.5) is enforced by *types*, not
+//! review: a property that may change an op's arguments is a [`PropExpr`], a
+//! property that would change how many ops exist is a plain number, so an
+//! expression in a static field fails deserialization rather than freezing
+//! quietly.
+
+use crate::expr::{Expr, ExprError, Tier};
+use crate::{
+    BaseTheme, CelebrationTheme, LabelStyle, MAX_ANIMATION_PERIOD_MS, MAX_HEAD_CORE_RATIO,
+    MAX_OUTLINE_EXTRA_PX, MIN_ANIMATION_PERIOD_MS, MIN_HEAD_CORE_RATIO, MIN_OUTLINE_EXTRA_PX,
+    MIN_READY_CHECK_CONTRAST, READY_CHECK_INK, RolePalette, SkinDoc, SkinDocError,
+    color::{Rgb, contrast_ratio},
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// The version this module owns. `crate::SCHEMA_VERSION` stays 1: v1 remains
+/// a valid schema forever, and each version's validator refuses the other's
+/// documents rather than guessing.
+pub const SCHEMA_VERSION_V2: u32 = 2;
+
+/// Stack budget after group flattening. Cost, not taste: each layer is at
+/// least one op per run, and the 200-op ceiling has to survive the worst pose.
+pub const MAX_LAYERS: usize = 24;
+/// Gradient stops are canvas `addColorStop` calls per run per frame.
+pub const MAX_GRADIENT_STOPS: usize = 8;
+pub const MIN_GRADIENT_STOPS: usize = 2;
+/// Texture references per document. Each is an image fetch and a decoded
+/// bitmap held for the life of the skin.
+pub const MAX_TEXTURE_REFS: usize = 4;
+/// One level of grouping. Depth buys little and costs the panel legibility.
+pub const MAX_GROUP_DEPTH: usize = 1;
+/// A text source's content: one glyph per cell, repeating along the span.
+pub const MAX_TEXT_CONTENT_LEN: usize = 24;
+/// The glyph atlas charset. Moderation of *words* is M4's review dimension;
+/// this is only what the atlas can draw.
+pub const TEXT_CHARSET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .!?-";
+
+/// A property that may vary with the animation clock or the body.
+///
+/// Stored as source text and parsed during validation, so a document is
+/// plain JSON end to end and the byte-precise [`ExprError`] carets survive to
+/// the Builder. Deserializes from a bare JSON number too, because "a constant
+/// is just a constant expression" should be true for authors as well as for
+/// the compiler.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PropExpr(pub String);
+
+impl PropExpr {
+    pub fn constant(value: f64) -> Self {
+        Self(format!("{value}"))
+    }
+
+    pub fn parse(&self) -> Result<Expr, ExprError> {
+        Expr::parse(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PropExpr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Number(f64),
+            Text(String),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Number(value) => PropExpr::constant(value),
+            Raw::Text(text) => PropExpr(text),
+        })
+    }
+}
+
+fn expr_zero() -> PropExpr {
+    PropExpr::constant(0.0)
+}
+fn expr_one() -> PropExpr {
+    PropExpr::constant(1.0)
+}
+
+/// Which palette colour a layer paints with, or a named literal from the
+/// envelope. Slots resolve per role, which is what keeps one document
+/// readable as friend and as enemy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorRef {
+    #[serde(flatten)]
+    pub target: ColorTarget,
+    /// Optional lightness modulation, `-1..1`, evaluated per step. This is
+    /// how v1's lightness tracks convert losslessly: the shift bakes into the
+    /// resolved swatch exactly as `shift_lightness` always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lighten: Option<PropExpr>,
+}
+
+impl ColorRef {
+    pub fn slot(slot: SlotName) -> Self {
+        Self {
+            target: ColorTarget::Slot { slot },
+            lighten: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorTarget {
+    Slot { slot: SlotName },
+    Literal { literal: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotName {
+    Fill,
+    Outline,
+    Accent,
+    HeadCore,
+}
+
+/// The transform inside the run affine (`client/src/skin/layer.rs`
+/// documents the composition). All five fields are paint arguments, so all
+/// five animate.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransformV2 {
+    #[serde(default = "expr_zero")]
+    pub translate_s: PropExpr,
+    #[serde(default = "expr_zero")]
+    pub translate_t: PropExpr,
+    #[serde(default = "expr_one")]
+    pub scale_s: PropExpr,
+    #[serde(default = "expr_one")]
+    pub scale_t: PropExpr,
+    #[serde(default = "expr_zero")]
+    pub rotate_turns: PropExpr,
+}
+
+impl Default for TransformV2 {
+    fn default() -> Self {
+        Self {
+            translate_s: expr_zero(),
+            translate_t: expr_zero(),
+            scale_s: expr_one(),
+            scale_t: expr_one(),
+            rotate_turns: expr_zero(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionV2 {
+    Contour,
+    Body,
+    Head,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipV2 {
+    #[default]
+    Silhouette,
+    Cells,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CornerV2 {
+    #[default]
+    Fan,
+    Bisector,
+}
+
+/// Where a span starts. Strings for the anchors that need no number.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorV2 {
+    Whole,
+    Head,
+    Tail,
+    At { at: f64 },
+    Fraction { fraction: f64 },
+}
+
+/// A stretch of body, in cells. All static: span extents decide how many ops
+/// a layer emits, and emission count may never depend on the clock.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpanV2 {
+    pub from: AnchorV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub natural: Option<f64>,
+    #[serde(default)]
+    pub min: f64,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+impl SpanV2 {
+    pub fn whole() -> Self {
+        Self {
+            from: AnchorV2::Whole,
+            natural: None,
+            min: 0.0,
+            priority: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradientAxis {
+    AlongBody,
+    FromStart,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StopV2 {
+    /// Position in the span, `0..1`. Animatable — a travelling shine is a
+    /// stop whose offset reads `time`. Clamped at evaluation: canvas
+    /// `addColorStop` throws outside `0..1` rather than clipping.
+    pub offset: PropExpr,
+    pub color: ColorRef,
+    #[serde(default = "expr_one")]
+    pub alpha: PropExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FitV2 {
+    Clip,
+    Stretch,
+    Tile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cells_per_repeat: Option<f64>,
+    },
+    Cutout {
+        cells_tall: f64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FadeV2 {
+    #[serde(default)]
+    pub lead_cells: f64,
+    #[serde(default)]
+    pub trail_cells: f64,
+    #[serde(default = "default_fade_steps")]
+    pub steps: usize,
+}
+
+fn default_fade_steps() -> usize {
+    12
+}
+
+/// What fills a span. Mirrors `client/src/skin/layer.rs::Source`, with the
+/// procedural `Tiled` surfacing as `band` — the author-facing name for the
+/// stripe/dash/checker element.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SourceV2 {
+    Solid {
+        color: ColorRef,
+    },
+    Gradient {
+        axis: GradientAxis,
+        stops: Vec<StopV2>,
+    },
+    Band {
+        color: ColorRef,
+        /// Static: emission skips repeats outside the painted window, so the
+        /// repeat geometry decides the op count.
+        period_cells: f64,
+        #[serde(default = "default_duty")]
+        duty: f64,
+        #[serde(default)]
+        phase_cells: f64,
+        /// Animatable: the lane's width and position are rectangle arguments.
+        half_width: PropExpr,
+        #[serde(default = "expr_zero")]
+        t_center: PropExpr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alpha: Option<PropExpr>,
+    },
+    Image {
+        /// Names an entry in the envelope's `textures`.
+        texture: String,
+        fit: FitV2,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fade: Option<FadeV2>,
+        #[serde(default = "expr_zero")]
+        drift_cells: PropExpr,
+    },
+    Text {
+        content: String,
+        color: ColorRef,
+        #[serde(default = "default_text_scale")]
+        scale: f64,
+    },
+}
+
+fn default_duty() -> f64 {
+    1.0
+}
+fn default_text_scale() -> f64 {
+    0.8
+}
+
+/// What a head disc is filled with: a colour reference, or the head ramp's
+/// current peak (classic's white head overlay).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DiscPaintV2 {
+    Named(DiscPaintName),
+    Ref(ColorRef),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscPaintName {
+    RampPeak,
+}
+
+/// One layer. Common fields live on the struct; the kind-specific ones live
+/// in the tagged [`LayerBodyV2`], flattened so the JSON reads as one object
+/// with a `type`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayerV2 {
+    pub name: String,
+    #[serde(default)]
+    pub boost_only: bool,
+    #[serde(default)]
+    pub omit_on_single_cell: bool,
+    #[serde(default = "expr_one")]
+    pub opacity: PropExpr,
+    #[serde(default)]
+    pub transform: TransformV2,
+    #[serde(flatten)]
+    pub body: LayerBodyV2,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LayerBodyV2 {
+    /// Authoring structure only: flattened before registration, so the
+    /// runtime never sees a group.
+    Group { layers: Vec<LayerV2> },
+    Ribbon {
+        region: RegionV2,
+        color: ColorRef,
+        /// Static; on a contour ribbon this is the sole source of overhang,
+        /// which is why it may never be an expression.
+        #[serde(default)]
+        extra_px: f64,
+        #[serde(default = "default_true")]
+        joints: bool,
+        #[serde(default)]
+        tail_cap: bool,
+    },
+    Span {
+        region: RegionV2,
+        #[serde(default)]
+        clip: ClipV2,
+        span: SpanV2,
+        #[serde(default)]
+        corner: CornerV2,
+        source: SourceV2,
+    },
+    HeadDisc {
+        paint: DiscPaintV2,
+        radius_ratio: PropExpr,
+    },
+    HeadRamp {
+        /// Hex, not a slot: the ramp builds per-cell colour strings from raw
+        /// channels, the way it always has.
+        color: String,
+        length_cells: f64,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The system head core: position pinned topmost, colour and radius authored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadCoreV2 {
+    pub ratio: f64,
+    pub color: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureRefV2 {
+    pub name: String,
+    /// A content reference, `sha256:…` — the M3 pipeline's digest.
+    #[serde(rename = "ref")]
+    pub content_ref: String,
+    pub kind: TextureKindV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureKindV2 {
+    Coat,
+    Sheet,
+    Overlay,
+}
+
+/// One authored v2 skin.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkinDocV2 {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    pub palette: RolePalette,
+    #[serde(default)]
+    pub labels: LabelStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<BaseTheme>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub celebration: Option<CelebrationTheme>,
+    /// Named colours the layers may reference. A `BTreeMap` so canonical
+    /// bytes are deterministic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub literals: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub textures: Vec<TextureRefV2>,
+    /// One full animation cycle. Meaningful only to expressions that read
+    /// `time`; a still document carries the default harmlessly.
+    #[serde(default = "default_period_ms")]
+    pub period_ms: f64,
+    pub head_core: HeadCoreV2,
+    pub layers: Vec<LayerV2>,
+}
+
+fn default_period_ms() -> f64 {
+    2_000.0
+}
+
+/// Convert a v1 document to the v2 form.
+///
+/// This is the conversion the Builder applies when opening a v1 skin, so it
+/// has one obligation above all: **a still v1 document must convert to a
+/// stack that compiles to byte-identical ops** — the same guarantee the
+/// compositor flip was held to, proven by the same classic trace. Animated
+/// documents convert to the expression forms of their tracks and wave, which
+/// are visually equivalent by construction (`shift_lightness` baked per step
+/// either way) rather than byte-pinned.
+pub fn upgrade(doc: &SkinDoc) -> SkinDocV2 {
+    use std::fmt::Write as _;
+
+    // Sum a target's tracks into one per-step expression, or None when the
+    // target is unmodulated. `track_offset` is `amplitude * sin(tau * (step /
+    // STEPS + phase))`; `time` is exactly `step / STEPS` in the bake, so the
+    // conversion is the same arithmetic with the clock left symbolic.
+    let track_sum = |target: crate::TrackTarget| -> Option<String> {
+        let animation = doc.animation.as_ref()?;
+        let mut sum = String::new();
+        for track in animation.tracks.iter().filter(|t| t.target == target) {
+            if !sum.is_empty() {
+                sum.push_str(" + ");
+            }
+            if track.phase == 0.0 {
+                write!(sum, "{} * sin(tau * time)", track.amplitude).expect("string write");
+            } else {
+                write!(
+                    sum,
+                    "{} * sin(tau * (time + {}))",
+                    track.amplitude, track.phase
+                )
+                .expect("string write");
+            }
+        }
+        (!sum.is_empty()).then_some(sum)
+    };
+
+    let fill_ref = || ColorRef {
+        target: ColorTarget::Slot {
+            slot: SlotName::Fill,
+        },
+        lighten: track_sum(crate::TrackTarget::BodyLightness).map(PropExpr),
+    };
+
+    // The head ramp's opacity carries what v1 split across `max_opacity`, the
+    // gradient-opacity tracks, and the travelling wave. The wave term reads
+    // `s`, which is what makes it travel; its sign convention (crests moving
+    // head-to-tail for positive speeds) is pinned by the compiler's fixture,
+    // not re-derived here.
+    let ramp_opacity = {
+        let mut source = format!("{}", doc.head.gradient.max_opacity);
+        if let Some(tracks) = track_sum(crate::TrackTarget::GradientOpacity) {
+            write!(source, " + {tracks}").expect("string write");
+        }
+        if let Some(wave) = doc.animation.as_ref().and_then(|spec| spec.wave.as_ref()) {
+            write!(
+                source,
+                " + {} * sin(tau * (s / {} - {} * time))",
+                wave.amplitude, wave.cells_per_crest, wave.crests_per_cycle
+            )
+            .expect("string write");
+        }
+        PropExpr(source)
+    };
+
+    let layer = |name: &str, body: LayerBodyV2| LayerV2 {
+        name: name.to_string(),
+        boost_only: false,
+        omit_on_single_cell: false,
+        opacity: expr_one(),
+        transform: TransformV2::default(),
+        body,
+    };
+
+    let mut head_ramp = layer(
+        "Head glow",
+        LayerBodyV2::HeadRamp {
+            color: doc.head.gradient.color.clone(),
+            length_cells: doc.head.gradient.length_cells,
+        },
+    );
+    head_ramp.omit_on_single_cell = true;
+    head_ramp.opacity = ramp_opacity;
+
+    let mut head_cap = layer(
+        "Head cap",
+        LayerBodyV2::HeadDisc {
+            paint: DiscPaintV2::Ref(fill_ref()),
+            radius_ratio: PropExpr::constant(0.5),
+        },
+    );
+    head_cap.omit_on_single_cell = true;
+
+    let mut head_highlight = layer(
+        "Head highlight",
+        LayerBodyV2::HeadDisc {
+            paint: DiscPaintV2::Named(DiscPaintName::RampPeak),
+            radius_ratio: PropExpr::constant(0.5),
+        },
+    );
+    head_highlight.omit_on_single_cell = true;
+
+    SkinDocV2 {
+        schema_version: SCHEMA_VERSION_V2,
+        id: doc.id.clone(),
+        name: doc.name.clone(),
+        palette: doc.palette.clone(),
+        labels: doc.labels.clone(),
+        base: doc.base.clone(),
+        celebration: doc.celebration.clone(),
+        literals: BTreeMap::new(),
+        textures: Vec::new(),
+        period_ms: doc
+            .animation
+            .as_ref()
+            .map_or(default_period_ms(), |spec| spec.period_ms),
+        head_core: HeadCoreV2 {
+            ratio: doc.head.core_ratio,
+            color: doc.head.core_color.clone(),
+        },
+        layers: vec![
+            layer(
+                "Outline",
+                LayerBodyV2::Ribbon {
+                    region: RegionV2::Contour,
+                    color: ColorRef {
+                        target: ColorTarget::Slot {
+                            slot: SlotName::Outline,
+                        },
+                        lighten: track_sum(crate::TrackTarget::OutlineLightness).map(PropExpr),
+                    },
+                    extra_px: doc.outline.extra_px,
+                    joints: true,
+                    tail_cap: false,
+                },
+            ),
+            layer(
+                "Body",
+                LayerBodyV2::Ribbon {
+                    region: RegionV2::Body,
+                    color: fill_ref(),
+                    extra_px: 0.0,
+                    joints: true,
+                    tail_cap: true,
+                },
+            ),
+            head_ramp,
+            head_cap,
+            head_highlight,
+        ],
+    }
+}
+
+/// The tier a property's expression may not exceed, and why it is per
+/// property: an expression is evaluated where the renderer can afford to
+/// evaluate it, and each property has exactly one such place.
+fn tier_cap(property: &str) -> Tier {
+    match property {
+        // The head ramp already walks cells and prices its opacity per cell;
+        // band alpha is evaluated once per emitted tile.
+        "opacity(head_ramp)" | "band.alpha" => Tier::PerCell,
+        // Everything else is baked per step: transforms, stop geometry,
+        // radii, lightness shifts, drift rates, layer opacity.
+        _ => Tier::PerStep,
+    }
+}
+
+/// Validate a v2 document's structure: parses, resolves, and stays inside
+/// every static bound. The composited *outcome* checks (label contrast, side
+/// reading) are the sampler's job — PRD section 7.3, milestone V2.
+pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
+    let mut errors = Vec::new();
+
+    if doc.schema_version != SCHEMA_VERSION_V2 {
+        errors.push(SkinDocError::new(
+            "schema_version",
+            format!(
+                "this is the v{SCHEMA_VERSION_V2} validator; version {} documents are \
+                 checked by their own validator, and unknown versions fall back \
+                 to the classic skin rather than being guessed at",
+                doc.schema_version
+            ),
+        ));
+    }
+    if doc.id.trim().is_empty() {
+        errors.push(SkinDocError::new("id", "a skin needs a catalogue id"));
+    }
+    if doc.name.trim().is_empty() {
+        errors.push(SkinDocError::new("name", "a skin needs a display name"));
+    }
+
+    if !(MIN_ANIMATION_PERIOD_MS..=MAX_ANIMATION_PERIOD_MS).contains(&doc.period_ms) {
+        errors.push(SkinDocError::new(
+            "period_ms",
+            "must be between 120ms and 60000ms — faster reads as a flicker",
+        ));
+    }
+
+    // The palette carries the same hue-window duty it carried in v1. What it
+    // no longer carries is the analytic label-contrast check: v1 could compute
+    // "what sits under the label" from its closed structure, v2 cannot, and
+    // the sampler (PRD 7.3) computes it from the composite instead.
+    crate::validate_palette_hues(&doc.palette, &mut errors);
+
+    for (name, hex) in &doc.literals {
+        if Rgb::parse(hex).is_none() {
+            errors.push(SkinDocError::new(
+                format!("literals.{name}"),
+                format!("`{hex}` is not a 6-digit hex colour like `#3c8dde`"),
+            ));
+        }
+        if name.trim().is_empty() {
+            errors.push(SkinDocError::new("literals", "a literal needs a name"));
+        }
+    }
+
+    if doc.textures.len() > MAX_TEXTURE_REFS {
+        errors.push(SkinDocError::new(
+            "textures",
+            format!("at most {MAX_TEXTURE_REFS} textures per skin"),
+        ));
+    }
+    let mut texture_names = std::collections::BTreeSet::new();
+    for (index, texture) in doc.textures.iter().enumerate() {
+        if !crate::content::is_content_ref(&texture.content_ref) {
+            errors.push(SkinDocError::new(
+                format!("textures[{index}].ref"),
+                "must be a content reference like `sha256:<64 hex digits>`",
+            ));
+        }
+        if !texture_names.insert(texture.name.as_str()) {
+            errors.push(SkinDocError::new(
+                format!("textures[{index}].name"),
+                format!("`{}` is declared twice", texture.name),
+            ));
+        }
+    }
+
+    // The head core: the same authority and the same rules as v1.
+    if !(MIN_HEAD_CORE_RATIO..=MAX_HEAD_CORE_RATIO).contains(&doc.head_core.ratio) {
+        errors.push(SkinDocError::new(
+            "head_core.ratio",
+            "must be between 0.05 and 0.5 of a cell",
+        ));
+    }
+    match Rgb::parse(&doc.head_core.color) {
+        None => errors.push(SkinDocError::new(
+            "head_core.color",
+            format!(
+                "`{}` is not a 6-digit hex colour like `#3c8dde`",
+                doc.head_core.color
+            ),
+        )),
+        Some(core) => {
+            let ready = Rgb::parse(READY_CHECK_INK).expect("the ready check ink is a literal");
+            let ratio = contrast_ratio(core, ready);
+            if ratio < MIN_READY_CHECK_CONTRAST {
+                errors.push(SkinDocError::new(
+                    "head_core.color",
+                    format!(
+                        "the roster's white ready-check only reaches {ratio:.1}:1 \
+                         on this core; keep the core dark enough to read it \
+                         ({MIN_READY_CHECK_CONTRAST}:1 minimum)"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(ink) = &doc.labels.ink
+        && Rgb::parse(ink).is_none()
+    {
+        errors.push(SkinDocError::new(
+            "labels.ink",
+            format!("`{ink}` is not a 6-digit hex colour"),
+        ));
+    }
+    if let Some(swatch) = &doc.labels.swatch
+        && Rgb::parse(swatch).is_none()
+    {
+        errors.push(SkinDocError::new(
+            "labels.swatch",
+            format!("`{swatch}` is not a 6-digit hex colour"),
+        ));
+    }
+
+    // The stack. Flattened count first, then each layer in place.
+    let flattened = count_flattened(&doc.layers);
+    if flattened > MAX_LAYERS {
+        errors.push(SkinDocError::new(
+            "layers",
+            format!(
+                "{flattened} layers after flattening groups; {MAX_LAYERS} is the \
+                 budget the 200-op ceiling can absorb"
+            ),
+        ));
+    }
+    if doc.layers.is_empty() {
+        errors.push(SkinDocError::new(
+            "layers",
+            "a skin with no layers paints nothing; start from a template",
+        ));
+    }
+
+    for (index, layer) in doc.layers.iter().enumerate() {
+        validate_layer(doc, layer, &format!("layers[{index}]"), 0, &mut errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn count_flattened(layers: &[LayerV2]) -> usize {
+    layers
+        .iter()
+        .map(|layer| match &layer.body {
+            LayerBodyV2::Group { layers } => count_flattened(layers),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Parse one expression-valued property and hold it to its tier cap.
+fn check_expr(field: &str, property: &str, expr: &PropExpr, errors: &mut Vec<SkinDocError>) {
+    match expr.parse() {
+        Err(error) => errors.push(SkinDocError::new(field, format!("`{}`: {error}", expr.0))),
+        Ok(parsed) => {
+            let cap = tier_cap(property);
+            if parsed.tier() > cap {
+                let (uses, place) = match cap {
+                    Tier::PerStep => ("`s`, `t` or `noise`", "once per animation step"),
+                    Tier::PerCell => ("`t` or `noise`", "once per cell"),
+                    _ => ("inputs beyond its tier", "at its tier"),
+                };
+                errors.push(SkinDocError::new(
+                    field,
+                    format!(
+                        "reads {uses}, but this property is evaluated {place} — \
+                         the renderer has nowhere cheaper to put it"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn check_color_ref(doc: &SkinDocV2, field: &str, color: &ColorRef, errors: &mut Vec<SkinDocError>) {
+    if let ColorTarget::Literal { literal } = &color.target
+        && !doc.literals.contains_key(literal)
+    {
+        errors.push(SkinDocError::new(
+            field,
+            format!("names literal `{literal}`, which the document does not declare"),
+        ));
+    }
+    if let Some(lighten) = &color.lighten {
+        check_expr(&format!("{field}.lighten"), "lighten", lighten, errors);
+    }
+}
+
+fn validate_layer(
+    doc: &SkinDocV2,
+    layer: &LayerV2,
+    field: &str,
+    depth: usize,
+    errors: &mut Vec<SkinDocError>,
+) {
+    if layer.name.trim().is_empty() {
+        errors.push(SkinDocError::new(
+            format!("{field}.name"),
+            "a layer needs a name; it is how the panel refers to it",
+        ));
+    }
+
+    let opacity_property = match &layer.body {
+        LayerBodyV2::HeadRamp { .. } => "opacity(head_ramp)",
+        _ => "opacity",
+    };
+    check_expr(
+        &format!("{field}.opacity"),
+        opacity_property,
+        &layer.opacity,
+        errors,
+    );
+    for (name, expr) in [
+        ("translate_s", &layer.transform.translate_s),
+        ("translate_t", &layer.transform.translate_t),
+        ("scale_s", &layer.transform.scale_s),
+        ("scale_t", &layer.transform.scale_t),
+        ("rotate_turns", &layer.transform.rotate_turns),
+    ] {
+        check_expr(
+            &format!("{field}.transform.{name}"),
+            "transform",
+            expr,
+            errors,
+        );
+    }
+
+    match &layer.body {
+        LayerBodyV2::Group { layers } => {
+            if depth >= MAX_GROUP_DEPTH {
+                errors.push(SkinDocError::new(
+                    field.to_string(),
+                    "a group inside a group; one level is the limit, for the \
+                     panel's legibility as much as the compiler's",
+                ));
+                return;
+            }
+            if layers.is_empty() {
+                errors.push(SkinDocError::new(
+                    format!("{field}.layers"),
+                    "an empty group should just be removed",
+                ));
+            }
+            for (index, child) in layers.iter().enumerate() {
+                validate_layer(
+                    doc,
+                    child,
+                    &format!("{field}.layers[{index}]"),
+                    depth + 1,
+                    errors,
+                );
+            }
+        }
+        LayerBodyV2::Ribbon {
+            region,
+            color,
+            extra_px,
+            ..
+        } => {
+            check_color_ref(doc, &format!("{field}.color"), color, errors);
+            match region {
+                RegionV2::Contour => {
+                    if !(MIN_OUTLINE_EXTRA_PX..=MAX_OUTLINE_EXTRA_PX).contains(extra_px) {
+                        errors.push(SkinDocError::new(
+                            format!("{field}.extra_px"),
+                            format!(
+                                "must be between {MIN_OUTLINE_EXTRA_PX} and \
+                                 {MAX_OUTLINE_EXTRA_PX}; the contour is the only \
+                                 source of overhang and the roster row is sized \
+                                 for it"
+                            ),
+                        ));
+                    }
+                }
+                _ => {
+                    if *extra_px != 0.0 {
+                        errors.push(SkinDocError::new(
+                            format!("{field}.extra_px"),
+                            "only a contour ribbon may paint beyond the body",
+                        ));
+                    }
+                }
+            }
+        }
+        LayerBodyV2::Span {
+            region,
+            span,
+            source,
+            ..
+        } => {
+            if *region == RegionV2::Contour {
+                errors.push(SkinDocError::new(
+                    format!("{field}.region"),
+                    "spans paint inside the body; the contour belongs to \
+                     ribbons and the Boost band",
+                ));
+            }
+            if span.min < 0.0 || !span.min.is_finite() {
+                errors.push(SkinDocError::new(
+                    format!("{field}.span.min"),
+                    "must be a non-negative length in cells",
+                ));
+            }
+            if let Some(natural) = span.natural
+                && (natural <= 0.0 || !natural.is_finite())
+            {
+                errors.push(SkinDocError::new(
+                    format!("{field}.span.natural"),
+                    "must be a positive length in cells, or omitted for \
+                     `whatever is left`",
+                ));
+            }
+            validate_source(doc, field, source, errors);
+        }
+        LayerBodyV2::HeadDisc {
+            paint,
+            radius_ratio,
+        } => {
+            if let DiscPaintV2::Ref(color) = paint {
+                check_color_ref(doc, &format!("{field}.paint"), color, errors);
+            }
+            check_expr(
+                &format!("{field}.radius_ratio"),
+                "radius_ratio",
+                radius_ratio,
+                errors,
+            );
+        }
+        LayerBodyV2::HeadRamp {
+            color,
+            length_cells,
+        } => {
+            if Rgb::parse(color).is_none() {
+                errors.push(SkinDocError::new(
+                    format!("{field}.color"),
+                    format!("`{color}` is not a 6-digit hex colour"),
+                ));
+            }
+            if !(0.0..=64.0).contains(length_cells) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.length_cells"),
+                    "must be between 0 and 64 cells",
+                ));
+            }
+        }
+    }
+}
+
+fn validate_source(
+    doc: &SkinDocV2,
+    field: &str,
+    source: &SourceV2,
+    errors: &mut Vec<SkinDocError>,
+) {
+    match source {
+        SourceV2::Solid { color } => {
+            check_color_ref(doc, &format!("{field}.source.color"), color, errors);
+        }
+        SourceV2::Gradient { stops, .. } => {
+            if !(MIN_GRADIENT_STOPS..=MAX_GRADIENT_STOPS).contains(&stops.len()) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.stops"),
+                    format!(
+                        "a gradient needs {MIN_GRADIENT_STOPS} to \
+                         {MAX_GRADIENT_STOPS} stops; each is a canvas call per \
+                         run per frame"
+                    ),
+                ));
+            }
+            for (index, stop) in stops.iter().enumerate() {
+                let stop_field = format!("{field}.source.stops[{index}]");
+                check_expr(
+                    &format!("{stop_field}.offset"),
+                    "stop",
+                    &stop.offset,
+                    errors,
+                );
+                check_expr(&format!("{stop_field}.alpha"), "stop", &stop.alpha, errors);
+                check_color_ref(doc, &format!("{stop_field}.color"), &stop.color, errors);
+            }
+        }
+        SourceV2::Band {
+            color,
+            period_cells,
+            duty,
+            phase_cells,
+            half_width,
+            t_center,
+            alpha,
+        } => {
+            check_color_ref(doc, &format!("{field}.source.color"), color, errors);
+            if !(period_cells.is_finite() && *period_cells > 0.0) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.period_cells"),
+                    "must be a positive length in cells; the repeat geometry \
+                     decides the op count, which is why it cannot animate",
+                ));
+            }
+            if !(0.0..=1.0).contains(duty) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.duty"),
+                    "must be between 0 and 1 of each period",
+                ));
+            }
+            if !phase_cells.is_finite() {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.phase_cells"),
+                    "must be a length in cells",
+                ));
+            }
+            check_expr(
+                &format!("{field}.source.half_width"),
+                "band.geometry",
+                half_width,
+                errors,
+            );
+            check_expr(
+                &format!("{field}.source.t_center"),
+                "band.geometry",
+                t_center,
+                errors,
+            );
+            if let Some(alpha) = alpha {
+                check_expr(
+                    &format!("{field}.source.alpha"),
+                    "band.alpha",
+                    alpha,
+                    errors,
+                );
+            }
+        }
+        SourceV2::Image {
+            texture,
+            fit,
+            fade,
+            drift_cells,
+        } => {
+            if !doc.textures.iter().any(|entry| &entry.name == texture) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.texture"),
+                    format!(
+                        "names texture `{texture}`, which the document does not \
+                         declare"
+                    ),
+                ));
+            }
+            if let FitV2::Tile {
+                cells_per_repeat: Some(cells),
+            } = fit
+                && !(cells.is_finite() && *cells > 0.0)
+            {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.fit.cells_per_repeat"),
+                    "must be a positive length in cells",
+                ));
+            }
+            if let FitV2::Cutout { cells_tall } = fit
+                && !(cells_tall.is_finite() && *cells_tall > 0.0)
+            {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.fit.cells_tall"),
+                    "must be a positive height in cells",
+                ));
+            }
+            if let Some(fade) = fade {
+                let sane = fade.lead_cells.is_finite()
+                    && fade.lead_cells >= 0.0
+                    && fade.trail_cells.is_finite()
+                    && fade.trail_cells >= 0.0;
+                if !sane {
+                    errors.push(SkinDocError::new(
+                        format!("{field}.source.fade"),
+                        "fade lengths must be non-negative cells",
+                    ));
+                }
+                let fades = fade.lead_cells > 0.0 || fade.trail_cells > 0.0;
+                if fades && !(1..=64).contains(&fade.steps) {
+                    errors.push(SkinDocError::new(
+                        format!("{field}.source.fade.steps"),
+                        "must be 1 to 64 slices; each is a blit per run",
+                    ));
+                }
+            }
+            check_expr(
+                &format!("{field}.source.drift_cells"),
+                "drift",
+                drift_cells,
+                errors,
+            );
+        }
+        SourceV2::Text {
+            content,
+            color,
+            scale,
+        } => {
+            check_color_ref(doc, &format!("{field}.source.color"), color, errors);
+            if content.is_empty() || content.len() > MAX_TEXT_CONTENT_LEN {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.content"),
+                    format!("must be 1 to {MAX_TEXT_CONTENT_LEN} characters"),
+                ));
+            }
+            if let Some(bad) = content.chars().find(|c| !TEXT_CHARSET.contains(*c)) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.content"),
+                    format!("`{bad}` is not in the glyph set; available: {TEXT_CHARSET}"),
+                ));
+            }
+            if !(0.1..=1.0).contains(scale) {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.scale"),
+                    "must be between 0.1 and 1 of a cell",
+                ));
+            }
+        }
+    }
+}
+
+/// A document of either version, told apart by `schema_version`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AnySkinDoc {
+    V1(SkinDoc),
+    V2(SkinDocV2),
+}
+
+/// Parse and validate a document of either schema version.
+///
+/// Unknown versions are refused with the version named — the caller's
+/// fallback (render classic) is the same one it has always had for a
+/// document it cannot compile.
+pub fn load_any(json: &str) -> Result<AnySkinDoc, Vec<SkinDocError>> {
+    #[derive(Deserialize)]
+    struct Peek {
+        schema_version: u32,
+    }
+    let peek: Peek = serde_json::from_str(json)
+        .map_err(|error| vec![SkinDocError::new("document", error.to_string())])?;
+
+    match peek.schema_version {
+        crate::SCHEMA_VERSION => crate::load(json).map(AnySkinDoc::V1),
+        SCHEMA_VERSION_V2 => {
+            let doc: SkinDocV2 = serde_json::from_str(json)
+                .map_err(|error| vec![SkinDocError::new("document", error.to_string())])?;
+            validate_v2(&doc)?;
+            Ok(AnySkinDoc::V2(doc))
+        }
+        other => Err(vec![SkinDocError::new(
+            "schema_version",
+            format!(
+                "version {other} is not one this build understands (1 or 2); \
+                 falling back to the classic skin instead of guessing"
+            ),
+        )]),
+    }
+}
+
+/// Compile-time exhaustiveness: destructure every v2 struct so a field can
+/// be added but not forgotten. The descriptor (milestone V3) will consume
+/// these the way `describe::exhaustiveness` consumes v1's; until then the
+/// destructuring alone forces the author of a new field to visit this file
+/// and decide what the Builder shows for it.
+#[allow(dead_code)]
+mod exhaustiveness {
+    use super::*;
+
+    fn document(doc: SkinDocV2) {
+        let SkinDocV2 {
+            schema_version: _,
+            id: _,
+            name: _,
+            palette: _,
+            labels: _,
+            base: _,
+            celebration: _,
+            literals: _,
+            textures: _,
+            period_ms: _,
+            head_core: _,
+            layers: _,
+        } = doc;
+    }
+
+    fn layer(layer: LayerV2) {
+        let LayerV2 {
+            name: _,
+            boost_only: _,
+            omit_on_single_cell: _,
+            opacity: _,
+            transform: _,
+            body,
+        } = layer;
+        match body {
+            LayerBodyV2::Group { layers: _ } => {}
+            LayerBodyV2::Ribbon {
+                region: _,
+                color: _,
+                extra_px: _,
+                joints: _,
+                tail_cap: _,
+            } => {}
+            LayerBodyV2::Span {
+                region: _,
+                clip: _,
+                span: _,
+                corner: _,
+                source: _,
+            } => {}
+            LayerBodyV2::HeadDisc {
+                paint: _,
+                radius_ratio: _,
+            } => {}
+            LayerBodyV2::HeadRamp {
+                color: _,
+                length_cells: _,
+            } => {}
+        }
+    }
+
+    fn source(source: SourceV2) {
+        match source {
+            SourceV2::Solid { color: _ } => {}
+            SourceV2::Gradient { axis: _, stops: _ } => {}
+            SourceV2::Band {
+                color: _,
+                period_cells: _,
+                duty: _,
+                phase_cells: _,
+                half_width: _,
+                t_center: _,
+                alpha: _,
+            } => {}
+            SourceV2::Image {
+                texture: _,
+                fit: _,
+                fade: _,
+                drift_cells: _,
+            } => {}
+            SourceV2::Text {
+                content: _,
+                color: _,
+                scale: _,
+            } => {}
+        }
+    }
+
+    fn small_parts(
+        transform: TransformV2,
+        span: SpanV2,
+        stop: StopV2,
+        fade: FadeV2,
+        core: HeadCoreV2,
+        texture: TextureRefV2,
+        color: ColorRef,
+    ) {
+        let TransformV2 {
+            translate_s: _,
+            translate_t: _,
+            scale_s: _,
+            scale_t: _,
+            rotate_turns: _,
+        } = transform;
+        let SpanV2 {
+            from: _,
+            natural: _,
+            min: _,
+            priority: _,
+        } = span;
+        let StopV2 {
+            offset: _,
+            color: _,
+            alpha: _,
+        } = stop;
+        let FadeV2 {
+            lead_cells: _,
+            trail_cells: _,
+            steps: _,
+        } = fade;
+        let HeadCoreV2 { ratio: _, color: _ } = core;
+        let TextureRefV2 {
+            name: _,
+            content_ref: _,
+            kind: _,
+        } = texture;
+        let ColorRef {
+            target: _,
+            lighten: _,
+        } = color;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classic_v1() -> SkinDoc {
+        serde_json::from_str(include_str!("../skins/classic.skin.json"))
+            .expect("the shipped classic document parses")
+    }
+
+    /// The upgraded classic is the author's half of the seven-layer stack
+    /// `document_layers` builds: the boost band and head core are system
+    /// layers, so five remain, in emission order.
+    #[test]
+    fn classic_upgrades_to_the_five_author_layers() {
+        let v2 = upgrade(&classic_v1());
+        assert_eq!(v2.schema_version, SCHEMA_VERSION_V2);
+        let names: Vec<&str> = v2.layers.iter().map(|layer| layer.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Outline", "Body", "Head glow", "Head cap", "Head highlight"]
+        );
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+
+        // Still document: every property is a constant expression.
+        let LayerBodyV2::HeadRamp { .. } = &v2.layers[2].body else {
+            panic!("the third layer is the head ramp");
+        };
+        let ramp_opacity = v2.layers[2].opacity.parse().expect("grammatical");
+        assert_eq!(ramp_opacity.tier(), Tier::Constant);
+    }
+
+    #[test]
+    fn upgrade_round_trips_through_json() {
+        let v2 = upgrade(&classic_v1());
+        let json = serde_json::to_string(&v2).expect("serializes");
+        let back: SkinDocV2 = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, v2);
+
+        match load_any(&json).expect("valid") {
+            AnySkinDoc::V2(doc) => assert_eq!(doc, v2),
+            AnySkinDoc::V1(_) => panic!("a v2 document must load as v2"),
+        }
+    }
+
+    /// The v1 animation vocabulary becomes expressions on the layers it
+    /// always secretly belonged to.
+    #[test]
+    fn v1_tracks_and_wave_convert_to_expressions() {
+        let mut doc = classic_v1();
+        doc.animation = Some(crate::AnimationSpec {
+            period_ms: 1_800.0,
+            tracks: vec![
+                crate::AnimationTrack {
+                    target: crate::TrackTarget::BodyLightness,
+                    amplitude: 0.07,
+                    phase: 0.25,
+                },
+                crate::AnimationTrack {
+                    target: crate::TrackTarget::GradientOpacity,
+                    amplitude: 0.05,
+                    phase: 0.0,
+                },
+            ],
+            wave: Some(crate::WaveSpec {
+                cells_per_crest: 8.0,
+                amplitude: 0.08,
+                crests_per_cycle: 2.0,
+            }),
+        });
+
+        let v2 = upgrade(&doc);
+        assert_eq!(v2.period_ms, 1_800.0);
+
+        let LayerBodyV2::Ribbon { color, .. } = &v2.layers[1].body else {
+            panic!("the second layer is the body ribbon");
+        };
+        let lighten = color.lighten.as_ref().expect("body lightness converted");
+        assert_eq!(lighten.0, "0.07 * sin(tau * (time + 0.25))");
+        assert_eq!(lighten.parse().expect("grammatical").tier(), Tier::PerStep);
+
+        let ramp = v2.layers[2].opacity.parse().expect("grammatical");
+        assert_eq!(
+            v2.layers[2].opacity.0,
+            format!(
+                "{} + 0.05 * sin(tau * time) + 0.08 * sin(tau * (s / 8 - 2 * time))",
+                doc.head.gradient.max_opacity
+            )
+        );
+        // The wave reads `s`, and the ramp is the one place that may.
+        assert_eq!(ramp.tier(), Tier::PerCell);
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+    }
+
+    /// A malformed expression names its property and its byte, because the
+    /// Builder puts a caret there.
+    #[test]
+    fn a_bad_expression_is_rejected_with_its_position() {
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers[0].opacity = PropExpr("1 + nonesuch(2)".to_string());
+        let errors = validate_v2(&v2).expect_err("must fail");
+        let error = errors
+            .iter()
+            .find(|e| e.field == "layers[0].opacity")
+            .expect("the property is named");
+        assert!(error.problem.contains("nonesuch"), "{error}");
+        assert!(error.problem.contains("at byte 4"), "{error}");
+    }
+
+    /// The tier discipline: a per-cell input on a per-step property is an
+    /// error naming what was read and where it would have to be evaluated.
+    #[test]
+    fn a_property_may_not_read_faster_than_its_tier() {
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers[0].opacity = PropExpr("s / len".to_string());
+        let errors = validate_v2(&v2).expect_err("must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "layers[0].opacity" && e.problem.contains("animation step")),
+            "{errors:?}"
+        );
+
+        // The same expression is legal where the renderer walks cells.
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers[2].opacity = PropExpr("0.3 + 0.05 * sin(tau * (s / 8 - time))".to_string());
+        assert!(validate_v2(&v2).is_ok());
+    }
+
+    /// The static/animatable split is a type boundary: an expression where a
+    /// number belongs fails deserialization, so "a band whose period
+    /// animates" is unrepresentable rather than reviewed away.
+    #[test]
+    fn expressions_in_static_fields_are_unrepresentable() {
+        let json = serde_json::json!({
+            "name": "Stripes",
+            "type": "span",
+            "region": "body",
+            "span": { "from": "whole" },
+            "source": {
+                "type": "band",
+                "color": { "slot": "fill" },
+                "period_cells": "2 + sin(tau * time)",
+                "half_width": 0.2
+            }
+        });
+        let error = serde_json::from_value::<LayerV2>(json).expect_err("must fail");
+        assert!(
+            error.to_string().contains("invalid type: string"),
+            "the failure should be a type refusal, not a validation note: {error}"
+        );
+    }
+
+    #[test]
+    fn groups_flatten_for_the_budget_and_may_not_nest() {
+        let mut v2 = upgrade(&classic_v1());
+        let leaf = v2.layers[3].clone();
+        let inner = LayerV2 {
+            name: "Inner".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Group {
+                layers: vec![leaf.clone()],
+            },
+        };
+        v2.layers.push(LayerV2 {
+            name: "Outer".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Group {
+                layers: vec![inner],
+            },
+        });
+        let errors = validate_v2(&v2).expect_err("nested groups must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.problem.contains("group inside a group")),
+            "{errors:?}"
+        );
+
+        // A single level is fine, and its children count toward the budget.
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers.push(LayerV2 {
+            name: "Dressing".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Group {
+                layers: vec![leaf; MAX_LAYERS],
+            },
+        });
+        let errors = validate_v2(&v2).expect_err("the flattened count is over budget");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.problem.contains("after flattening")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn references_must_resolve() {
+        let mut v2 = upgrade(&classic_v1());
+        v2.layers.push(LayerV2 {
+            name: "Gleam".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::default(),
+                span: SpanV2::whole(),
+                corner: CornerV2::default(),
+                source: SourceV2::Solid {
+                    color: ColorRef {
+                        target: ColorTarget::Literal {
+                            literal: "gleam".to_string(),
+                        },
+                        lighten: None,
+                    },
+                },
+            },
+        });
+        let errors = validate_v2(&v2).expect_err("an undeclared literal must fail");
+        assert!(
+            errors.iter().any(|e| e.problem.contains("gleam")),
+            "{errors:?}"
+        );
+
+        v2.literals
+            .insert("gleam".to_string(), "#fff7d6".to_string());
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+
+        // Textures resolve by name against the declaration table, and the
+        // declaration itself must be a content reference.
+        let mut v2 = upgrade(&classic_v1());
+        v2.textures.push(TextureRefV2 {
+            name: "lava".to_string(),
+            content_ref: "not-a-ref".to_string(),
+            kind: TextureKindV2::Coat,
+        });
+        let errors = validate_v2(&v2).expect_err("a malformed ref must fail");
+        assert!(
+            errors.iter().any(|e| e.field == "textures[0].ref"),
+            "{errors:?}"
+        );
+    }
+
+    /// The PRD's shine, verbatim: a whole-body gradient whose crest offset
+    /// travels with `saw(time)`.
+    #[test]
+    fn the_prd_shine_example_validates() {
+        let mut v2 = upgrade(&classic_v1());
+        v2.literals
+            .insert("gleam".to_string(), "#fff7d6".to_string());
+        v2.layers.push(LayerV2 {
+            name: "Shine".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::default(),
+                span: SpanV2::whole(),
+                corner: CornerV2::default(),
+                source: SourceV2::Gradient {
+                    axis: GradientAxis::AlongBody,
+                    stops: vec![
+                        StopV2 {
+                            offset: PropExpr("saw(time) - 0.15".to_string()),
+                            color: ColorRef::slot(SlotName::Fill),
+                            alpha: expr_zero(),
+                        },
+                        StopV2 {
+                            offset: PropExpr("saw(time)".to_string()),
+                            color: ColorRef {
+                                target: ColorTarget::Literal {
+                                    literal: "gleam".to_string(),
+                                },
+                                lighten: None,
+                            },
+                            alpha: PropExpr::constant(0.55),
+                        },
+                        StopV2 {
+                            offset: PropExpr("saw(time) + 0.15".to_string()),
+                            color: ColorRef::slot(SlotName::Fill),
+                            alpha: expr_zero(),
+                        },
+                    ],
+                },
+            },
+        });
+        assert!(validate_v2(&v2).is_ok(), "{:?}", validate_v2(&v2));
+    }
+
+    #[test]
+    fn unknown_versions_are_refused_rather_than_guessed() {
+        let json = serde_json::json!({ "schema_version": 3 }).to_string();
+        let errors = load_any(&json).expect_err("v3 does not exist");
+        assert!(errors[0].problem.contains("version 3"), "{:?}", errors[0]);
+
+        // And a v1 document still loads as v1 through the same door.
+        let v1_json = include_str!("../skins/classic.skin.json");
+        assert!(matches!(
+            load_any(v1_json).expect("classic is valid"),
+            AnySkinDoc::V1(_)
+        ));
+    }
+}
