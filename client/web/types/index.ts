@@ -69,11 +69,17 @@ export type {
 // Typed WebSocket protocol surface derived from the generated WSMessage union.
 import type { OutboundMessage, WSMessageTag, TypedMessage } from './protocol';
 import type {
+  Challenge,
+  ChallengeInbox,
+  RematchState,
   ClientAdsConfig,
   Direction,
   LobbyAdBreakView,
   LobbyMember,
+  OnlinePlayer,
+  RegionRoster,
 } from './generated';
+export type { Challenge, ChallengeInbox, OnlinePlayer, RegionRoster, RematchState, RematchParticipant } from './generated';
 export type { OutboundMessage, WSMessageTag, TypedMessage, PayloadOf } from './protocol';
 
 // Leaderboard entry aliases: the components predate the generated names but the
@@ -205,6 +211,21 @@ export interface WebSocketContextType {
   clearSessionForAccountChange: () => void;
   sendChatMessage: (scope: ChatScope, message: string) => void;
   updateLobbyPreferences: (preferences: LobbyPreferences) => void;
+
+  // Social layer. `null` means the server has not sent a roster yet, which is
+  // different from "nobody is online" and is why the panel can stay hidden
+  // until there is something true to say.
+  onlinePlayers: RegionRoster | null;
+  challenges: ChallengeInbox;
+  /** Most recent challenge failure, for display; cleared by the next action. */
+  challengeError: string | null;
+  challengePlayer: (userId: number) => void;
+  /** Live rematch state for the game this socket is in, if any. */
+  rematchState: RematchState | null;
+  setRematchIntent: (gameId: number, optIn: boolean) => void;
+  respondToChallenge: (challengeId: string, accept: boolean) => void;
+  cancelChallenge: (challengeId: string) => void;
+  dismissChallengeError: () => void;
 }
 
 // Latency Settings Types

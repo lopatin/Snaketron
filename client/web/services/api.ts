@@ -17,6 +17,7 @@ import type { CheckUsernameResponse } from '../types/generated';
 import type { PlayerLobbyResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
+import type { PublicGameResponse } from '../types/generated';
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -315,6 +316,21 @@ class API {
   ): Promise<GameHighlightResponse> {
     return this.request<GameHighlightResponse>(
       `/api/games/${encodeURIComponent(gameId)}/highlight`,
+      { signal },
+    );
+  }
+
+  /**
+   * The permanent public summary of a finished match. Anonymous by design —
+   * this is what a shared link resolves to, and it must work for someone who
+   * has never played.
+   */
+  async getPublicGameSummary(
+    gameId: string,
+    signal?: AbortSignal,
+  ): Promise<PublicGameResponse> {
+    return this.request<PublicGameResponse>(
+      `/api/games/${encodeURIComponent(gameId)}/summary`,
       { signal },
     );
   }

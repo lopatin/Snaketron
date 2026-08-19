@@ -3,6 +3,10 @@ use crate::ads::{
     LobbyAdBreakView, MAX_AD_BREAK_PARTICIPANTS, lobby_meets_game_threshold,
 };
 use crate::api::auth::validate_username;
+use crate::challenges::{
+    CHALLENGE_TTL_MS, Challenge, ChallengeInbox, ChallengeState, ChallengeStore, new_challenge_id,
+    now_ms,
+};
 use crate::chat_filter::filter_chat_message;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::{Database, models::RuntimeAdsConfig};
@@ -20,6 +24,7 @@ use crate::matchmaking_manager::{
     MatchmakingManager,
 };
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::presence::{PresenceActivity, PresenceRegistry, RegionRoster};
 use crate::pubsub_manager::PubSubManager;
 use crate::recovery::{
     CommandOutcome, RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes,
@@ -27,6 +32,7 @@ use crate::recovery::{
 };
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
+use crate::rematch::{RematchState, RematchStore};
 use crate::user_cache::UserCache;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -269,6 +275,55 @@ pub enum WSMessage {
         ws_url: String,
         lobby_code: String,
     },
+
+    // === Social layer (protocol 11, capability `social-presence-v1`) ===
+    /// Server -> client: everyone currently online in this connection's region.
+    /// Pushed on authentication and whenever the region roster changes; the
+    /// viewer is always absent from `players`.
+    OnlinePlayers(RegionRoster),
+    /// Client -> server: challenge one online player to a match. The server
+    /// takes the challenger's identity from the connection — only the target
+    /// is client-supplied.
+    ChallengePlayer {
+        user_id: u32,
+    },
+    /// Client -> server: answer a challenge addressed to this user. The server
+    /// enforces that only the target may accept or decline.
+    RespondToChallenge {
+        challenge_id: String,
+        accept: bool,
+    },
+    /// Client -> server: withdraw a challenge this user issued.
+    CancelChallenge {
+        challenge_id: String,
+    },
+    /// Server -> client: the complete challenge state for this user. Always a
+    /// full snapshot rather than a delta, so it is idempotent across a socket
+    /// handoff, a dropped hint, or a reconnect.
+    Challenges(ChallengeInbox),
+    /// Server -> client: an accepted challenge, addressed to both players. The
+    /// client joins `lobby_code` to land in the challenger's lobby.
+    ChallengeAccepted {
+        challenge_id: String,
+        lobby_code: String,
+    },
+    /// Server -> client: a challenge could not be issued, with a reason meant
+    /// to be shown verbatim.
+    ChallengeFailed {
+        reason: String,
+    },
+
+    // === Rematch (protocol 12, capability `rematch-v1`) ===
+    /// Client -> server: tick or untick Rematch on the results card. The
+    /// server takes the player's identity from the connection and checks the
+    /// game id against the one this socket actually joined.
+    SetRematchIntent {
+        game_id: u32,
+        opt_in: bool,
+    },
+    /// Server -> client: who is still on the results card, who has opted in,
+    /// and — once enough have — the lobby they all converge on.
+    Rematch(RematchState),
     // NicknameUpdated {
     //     username: String,
     // },
@@ -538,6 +593,146 @@ enum LobbyMatchHint {
 
 fn refresh_connection_username(metadata: &mut PlayerMetadata, username: String) {
     metadata.username = username;
+}
+
+/// Issue a challenge from this connection, creating the challenger's lobby if
+/// they do not already have one.
+///
+/// Returns the (possibly new) lobby handle and, when a lobby was created here,
+/// its code — the caller sends `LobbyCreated` so the client's lobby state
+/// tracks the one the challenge points at.
+#[allow(clippy::too_many_arguments)]
+async fn issue_challenge(
+    challenger_id: u32,
+    metadata: &PlayerMetadata,
+    target_user_id: u32,
+    lobby: Option<LobbyJoinHandle>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    user_cache: UserCache,
+    redis: &RedisConnection,
+    region: &str,
+    websocket_id: &str,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<(Option<LobbyJoinHandle>, Option<String>)> {
+    if target_user_id == challenger_id {
+        send_challenge_failure(crate::challenges::ChallengeRejection::Self_.reason(), ws_tx)
+            .await?;
+        return Ok((lobby, None));
+    }
+
+    let presence = PresenceRegistry::new(redis.clone(), region.to_string());
+    match presence.is_online(target_user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            send_challenge_failure(
+                crate::challenges::ChallengeRejection::TargetOffline.reason(),
+                ws_tx,
+            )
+            .await?;
+            return Ok((lobby, None));
+        }
+        Err(error) => {
+            warn!(target_user_id, %error, "failed to check challenge target presence");
+            send_challenge_failure("Could not reach that player. Try again.", ws_tx).await?;
+            return Ok((lobby, None));
+        }
+    }
+
+    // Resolve the target's name at send time rather than trusting the roster
+    // frame the client was looking at: nicknames change, and the record is
+    // read back by both sides for the life of the challenge.
+    let target_username = match user_cache.get(target_user_id).await {
+        Ok(Some(user)) => user.username,
+        Ok(None) => {
+            send_challenge_failure(
+                crate::challenges::ChallengeRejection::TargetOffline.reason(),
+                ws_tx,
+            )
+            .await?;
+            return Ok((lobby, None));
+        }
+        Err(error) => {
+            warn!(target_user_id, %error, "failed to resolve a challenge target");
+            send_challenge_failure("Could not reach that player. Try again.", ws_tx).await?;
+            return Ok((lobby, None));
+        }
+    };
+
+    let (lobby, created_code) = match lobby {
+        Some(handle) => (Some(handle), None),
+        None => {
+            let lobby = match lobby_manager
+                .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                .await
+            {
+                Ok(lobby) => lobby,
+                Err(error) => {
+                    warn!(challenger_id, %error, "failed to create a lobby for a challenge");
+                    send_challenge_failure("Could not open a lobby to play in.", ws_tx).await?;
+                    return Ok((None, None));
+                }
+            };
+            match lobby_manager
+                .join_lobby_for_pool(
+                    Some(lobby.lobby_code()),
+                    metadata.user_id,
+                    metadata.username.clone(),
+                    websocket_id.to_string(),
+                    region.to_string(),
+                    None,
+                    metadata.matchmaking_pool,
+                    metadata.distribution,
+                    metadata.supports_ad_break,
+                    metadata.can_show_video_ad,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let code = handle.lobby_code.clone();
+                    (Some(handle), Some(code))
+                }
+                Err(error) => {
+                    warn!(challenger_id, %error, "failed to join a lobby created for a challenge");
+                    send_challenge_failure("Could not open a lobby to play in.", ws_tx).await?;
+                    return Ok((None, None));
+                }
+            }
+        }
+    };
+
+    let Some(handle) = lobby else {
+        return Ok((None, created_code));
+    };
+
+    let created_at_ms = now_ms();
+    let challenge = Challenge {
+        challenge_id: new_challenge_id(challenger_id, target_user_id, created_at_ms),
+        from_user_id: challenger_id,
+        from_username: metadata.username.clone(),
+        to_user_id: target_user_id,
+        to_username: target_username,
+        lobby_code: handle.lobby_code.clone(),
+        state: ChallengeState::Pending,
+        created_at_ms,
+        expires_at_ms: created_at_ms.saturating_add(CHALLENGE_TTL_MS),
+    };
+
+    let store = ChallengeStore::new(redis.clone());
+    match store.issue(challenge).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(rejection)) => {
+            send_challenge_failure(rejection.reason(), ws_tx).await?;
+        }
+        Err(error) => {
+            warn!(challenger_id, target_user_id, %error, "failed to issue a challenge");
+            send_challenge_failure("Could not send that challenge. Try again.", ws_tx).await?;
+        }
+    }
+    // The challenger's own outgoing list is refreshed from the durable record,
+    // so a rejected challenge cannot leave a phantom entry on their screen.
+    let _ = send_challenge_inbox(challenger_id, &store, ws_tx).await;
+
+    Ok((Some(handle), created_code))
 }
 
 async fn handle_guest_nickname_update(
@@ -926,6 +1121,10 @@ async fn handle_websocket_connection(
     // Will be used to track game chat subscription
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
 
+    // Presence lease + challenge delivery, claimed once this connection has an
+    // authenticated identity to be present *as*.
+    let mut social_session: Option<SocialSession> = None;
+
     // Spawn task to forward messages from channel to WebSocket
     let forward_task = tokio::spawn(async move {
         let mut drain_open = true;
@@ -1187,6 +1386,48 @@ async fn handle_websocket_connection(
                                                 None => entered_game_id.is_some() && !was_in_game,
                                             };
                                             let entering_lobby = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. }) && !was_in_lobby;
+
+                                            // Join the social layer the moment there is an identity to be
+                                            // present as, and keep the roster's activity honest afterwards.
+                                            // A failed claim (a Redis blip at exactly the wrong moment)
+                                            // retries on the next inbound message rather than leaving this
+                                            // connection socially invisible for its whole life.
+                                            if let ConnectionState::Authenticated { metadata, .. } = &new_state {
+                                                if social_session.is_none() && social_layer_admits(metadata) {
+                                                    social_session = start_social_session(
+                                                        metadata,
+                                                        &websocket_id,
+                                                        &region,
+                                                        &redis,
+                                                        &pubsub_manager,
+                                                        &event_router,
+                                                        &db,
+                                                        &ws_tx,
+                                                    )
+                                                    .await;
+                                                } else if social_session.is_some() {
+                                                    let activity = match &new_state {
+                                                        ConnectionState::Authenticated { game_id: Some(_), .. } => {
+                                                            PresenceActivity::Playing
+                                                        }
+                                                        ConnectionState::Authenticated { lobby_handle: Some(_), .. } => {
+                                                            PresenceActivity::Lobby
+                                                        }
+                                                        _ => PresenceActivity::Idle,
+                                                    };
+                                                    let seated_game_id = match &new_state {
+                                                        ConnectionState::Authenticated { game_id, .. } => *game_id,
+                                                        ConnectionState::Unauthenticated => None,
+                                                    };
+                                                    record_presence_activity(
+                                                        social_session.as_ref(),
+                                                        metadata,
+                                                        activity,
+                                                        seated_game_id,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
                                             let leaving_lobby = was_in_lobby && !matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
                                             let leaving_game = was_in_game && !matches!(&new_state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                             debug!("State transitioned to: entering_game: {}, entering_lobby: {}, leaving_lobby: {}, leaving_game: {}",
@@ -1554,6 +1795,12 @@ async fn handle_websocket_connection(
     }
     if let Some(handle) = game_chat_handle {
         handle.abort();
+    }
+    // Give up the presence lease and withdraw anything still pending, so this
+    // player leaves the roster immediately instead of at lease expiry and
+    // nobody is left holding an unanswerable invitation.
+    if let Some(session) = social_session.take() {
+        session.close().await;
     }
     forward_task.abort();
 
@@ -3032,6 +3279,191 @@ async fn send_recovery_bridge_snapshot(
 /// Load the game's durable terminal state, if one exists. Absence, failure,
 /// malformed data, or a non-terminal record all return `None`: none of those
 /// prove anything about a live game, so callers fall back to normal warm-up.
+/// Everything a rematch needs to know about the match that just ended.
+///
+/// The roster is read from the authoritative terminal state, never from the
+/// client, so a spectator cannot put themselves on the results card. Same two
+/// sources the join path uses: the Redis terminal snapshot first, then the
+/// durable record once persistence has caught up.
+async fn resolve_rematch_context(
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    game_id: u32,
+) -> Option<(Vec<(u32, String)>, common::GameType, common::QueueMode)> {
+    let terminal_state = match event_router.get_stored_snapshot(game_id).await {
+        Ok(Some(state)) if matches!(state.status, GameStatus::Complete { .. }) => Some(state),
+        _ => load_durable_terminal_state(db, game_id).await,
+    }?;
+
+    let mut participants: Vec<(u32, String)> = terminal_state
+        .players
+        .keys()
+        .copied()
+        // Someone removed for inactivity forfeited this match; putting them on
+        // the rematch card would let a player who walked away hold up the
+        // group that stayed.
+        .filter(|user_id| !terminal_state.is_player_idle_kicked(*user_id))
+        .map(|user_id| {
+            let username = terminal_state
+                .usernames
+                .get(&user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("User{user_id}"));
+            (user_id, username)
+        })
+        .collect();
+    participants.sort_by_key(|(user_id, _)| *user_id);
+
+    Some((
+        participants,
+        terminal_state.game_type.clone(),
+        terminal_state.queue_mode,
+    ))
+}
+
+/// Record-then-elect: refresh this socket's view, and if the group is now big
+/// enough and this player is the elected host, stand up the lobby everyone
+/// converges on.
+///
+/// Returns the connection's (possibly new) lobby handle. The error variant
+/// carries it back too — a failure here must not lose a lobby the connection
+/// has already joined.
+#[allow(clippy::too_many_arguments)]
+async fn advance_rematch(
+    game_id: u32,
+    user_id: u32,
+    rematch: &RematchStore,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    metadata: &PlayerMetadata,
+    lobby: Option<LobbyJoinHandle>,
+    region: &str,
+    websocket_id: &str,
+    ws_tx: &mpsc::Sender<Message>,
+) -> std::result::Result<Option<LobbyJoinHandle>, (Option<LobbyJoinHandle>, anyhow::Error)> {
+    let state = match send_rematch_state(game_id, user_id, rematch, event_router, db, ws_tx).await {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(lobby),
+        Err(error) => return Err((lobby, error)),
+    };
+
+    // Everyone else is told to re-read; the record is what they read, so a
+    // dropped hint only costs them the reconcile interval.
+    for participant in &state.participants {
+        if participant.user_id != user_id {
+            rematch.hint(participant.user_id).await;
+        }
+    }
+
+    // Only the elected host stands up the lobby, and only once the count can
+    // actually form a game. `SET NX` settles any disagreement anyway.
+    if state.game_type.is_none()
+        || state.host_user_id != Some(user_id)
+        || state.lobby_code.is_some()
+    {
+        return Ok(lobby);
+    }
+
+    let (lobby, code) = match lobby {
+        Some(handle) => {
+            let code = handle.lobby_code.clone();
+            (Some(handle), code)
+        }
+        None => {
+            let created = match lobby_manager
+                .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                .await
+            {
+                Ok(created) => created,
+                Err(error) => return Err((None, error)),
+            };
+            match lobby_manager
+                .join_lobby_for_pool(
+                    Some(created.lobby_code()),
+                    metadata.user_id,
+                    metadata.username.clone(),
+                    websocket_id.to_string(),
+                    region.to_string(),
+                    None,
+                    metadata.matchmaking_pool,
+                    metadata.distribution,
+                    metadata.supports_ad_break,
+                    metadata.can_show_video_ad,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let code = handle.lobby_code.clone();
+                    (Some(handle), code)
+                }
+                Err(error) => return Err((None, error)),
+            }
+        }
+    };
+
+    let elected = match rematch.elect_lobby(game_id, &code).await {
+        Ok(elected) => elected,
+        Err(error) => return Err((lobby, error)),
+    };
+    if elected == code
+        && let Some(handle) = &lobby
+    {
+        // The client needs to know it holds this lobby, the same way it would
+        // after an explicit CreateLobby.
+        let created = WSMessage::LobbyCreated {
+            lobby_code: handle.lobby_code.clone(),
+        };
+        if let Ok(frame) = serde_json::to_string(&created) {
+            let _ = ws_tx.send(Message::Text(frame.into())).await;
+        }
+    }
+
+    // Re-read so this socket and everyone it hints see the elected lobby.
+    if let Err(error) = send_rematch_state(game_id, user_id, rematch, event_router, db, ws_tx).await
+    {
+        return Err((lobby, error));
+    }
+    for participant in &state.participants {
+        if participant.user_id != user_id {
+            rematch.hint(participant.user_id).await;
+        }
+    }
+
+    Ok(lobby)
+}
+
+/// Read the rematch record and push it to this socket.
+async fn send_rematch_state(
+    game_id: u32,
+    user_id: u32,
+    rematch: &RematchStore,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<Option<RematchState>> {
+    let Some((participants, game_type, queue_mode)) =
+        resolve_rematch_context(event_router, db, game_id).await
+    else {
+        return Ok(None);
+    };
+    if !participants.iter().any(|(id, _)| *id == user_id) {
+        return Ok(None);
+    }
+
+    let state = rematch
+        .state(game_id, &participants, &game_type, queue_mode)
+        .await
+        .context("failed to read the rematch state")?;
+    let frame = serde_json::to_string(&WSMessage::Rematch(state.clone()))
+        .context("failed to serialize the rematch state")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the rematch state")?;
+    Ok(Some(state))
+}
+
 async fn load_durable_terminal_state(db: &Arc<dyn Database>, game_id: u32) -> Option<GameState> {
     let database_game_id = i32::try_from(game_id).ok()?;
     match db.get_game_by_id(database_game_id).await {
@@ -4506,6 +4938,173 @@ async fn process_ws_message(
             }
 
             match ws_message {
+                WSMessage::SetRematchIntent {
+                    game_id: requested_game_id,
+                    opt_in,
+                } => {
+                    // Authorized off the connection, not the payload: this
+                    // socket only holds a game id because `JoinGame` already
+                    // authorized it against the match roster.
+                    if game_id == Some(requested_game_id)
+                        && let Ok(user_id) = u32::try_from(metadata.user_id)
+                    {
+                        let rematch = RematchStore::new(redis.clone());
+                        if let Err(error) =
+                            rematch.set_intent(requested_game_id, user_id, opt_in).await
+                        {
+                            warn!(user_id, requested_game_id, %error, "failed to record a rematch intent");
+                        }
+                        let lobby = match advance_rematch(
+                            requested_game_id,
+                            user_id,
+                            &rematch,
+                            event_router,
+                            db,
+                            lobby_manager,
+                            &metadata,
+                            lobby,
+                            region,
+                            &websocket_id,
+                            ws_tx,
+                        )
+                        .await
+                        {
+                            Ok(lobby) => lobby,
+                            Err((lobby, error)) => {
+                                warn!(user_id, requested_game_id, %error, "failed to advance the rematch");
+                                lobby
+                            }
+                        };
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::ChallengePlayer {
+                    user_id: target_user_id,
+                } => {
+                    let Ok(challenger_id) = u32::try_from(metadata.user_id) else {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    };
+                    // A challenge is an invitation to the challenger's lobby,
+                    // so there has to be one. Creating it here rather than
+                    // asking the client to sequence CreateLobby first keeps
+                    // the whole exchange a single round trip.
+                    let (lobby, outcome) = issue_challenge(
+                        challenger_id,
+                        &metadata,
+                        target_user_id,
+                        lobby,
+                        lobby_manager,
+                        user_cache.clone(),
+                        redis,
+                        region,
+                        websocket_id.as_str(),
+                        ws_tx,
+                    )
+                    .await?;
+                    if let Some(lobby_code) = outcome {
+                        let created = WSMessage::LobbyCreated { lobby_code };
+                        ws_tx
+                            .send(Message::Text(serde_json::to_string(&created)?.into()))
+                            .await?;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::RespondToChallenge {
+                    challenge_id,
+                    accept,
+                } => {
+                    if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                        let store = ChallengeStore::new(redis.clone());
+                        let state = if accept {
+                            ChallengeState::Accepted
+                        } else {
+                            ChallengeState::Declined
+                        };
+                        match store.resolve(user_id, &challenge_id, state).await {
+                            Ok(Some(challenge)) => {
+                                if accept {
+                                    let accepted = WSMessage::ChallengeAccepted {
+                                        challenge_id: challenge.challenge_id.clone(),
+                                        lobby_code: challenge.lobby_code.clone(),
+                                    };
+                                    ws_tx
+                                        .send(Message::Text(
+                                            serde_json::to_string(&accepted)?.into(),
+                                        ))
+                                        .await?;
+                                }
+                            }
+                            Ok(None) => {
+                                send_challenge_failure(
+                                    "That challenge is no longer available.",
+                                    ws_tx,
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                warn!(user_id, %error, "failed to resolve a challenge");
+                                send_challenge_failure(
+                                    "Could not answer that challenge. Try again.",
+                                    ws_tx,
+                                )
+                                .await?;
+                            }
+                        }
+                        // Whatever happened, the answerer's own view is
+                        // refreshed from the durable record rather than guessed
+                        // at from the outcome.
+                        let _ = send_challenge_inbox(user_id, &store, ws_tx).await;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::CancelChallenge { challenge_id } => {
+                    if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                        let store = ChallengeStore::new(redis.clone());
+                        if let Err(error) = store
+                            .resolve(user_id, &challenge_id, ChallengeState::Cancelled)
+                            .await
+                        {
+                            warn!(user_id, %error, "failed to cancel a challenge");
+                        }
+                        let _ = send_challenge_inbox(user_id, &store, ws_tx).await;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
                 WSMessage::UpdateNickname { nickname } => {
                     let mut metadata = metadata;
                     if let Err(e) = handle_guest_nickname_update(
@@ -5593,6 +6192,423 @@ pub async fn register_server(
 }
 
 /// Subscribe to user count updates from Redis and forward to WebSocket client
+/// Everything one authenticated socket needs to take part in the social layer.
+///
+/// Held for the life of the connection. Dropping it aborts the background
+/// tasks; `close` additionally gives up the presence lease and withdraws the
+/// user's pending challenges, so nobody is left waiting on an answer that can
+/// no longer arrive.
+struct SocialSession {
+    user_id: u32,
+    /// Which connection holds this user's presence lease. A make-before-break
+    /// replacement claims it before this one tears down, and cleanup must not
+    /// undo the newer socket's work.
+    websocket_id: String,
+    presence: PresenceRegistry,
+    /// What the lease should currently assert. Shared with the refresh loop so
+    /// a heartbeat re-states the player's *current* name and activity rather
+    /// than the ones captured when the connection authenticated.
+    intent: Arc<std::sync::Mutex<PresenceIntent>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct PresenceIntent {
+    username: String,
+    is_guest: bool,
+    activity: PresenceActivity,
+    pool: MatchmakingPool,
+    /// The game whose results card this socket is sitting on, if any. The
+    /// heartbeat refreshes a rematch presence lease for it, which is what lets
+    /// the other players see who is still there without anyone announcing it.
+    game_id: Option<u32>,
+}
+
+impl SocialSession {
+    async fn close(mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        // Only the socket that still owns the lease may drop it. A planned
+        // handoff — and, far more commonly, a second browser tab — leaves the
+        // replacement owning the lease, and this must not delete its presence.
+        //
+        // Nothing is withdrawn here. A disconnect cannot tell "this player
+        // left" from "one of this player's sockets went away", so cancelling
+        // their challenges on it would cancel live invitations for someone
+        // still sitting in another tab. Challenges expire on their own two
+        // minute deadline, and a stale one fails honestly at accept time.
+        if let Err(error) = self
+            .presence
+            .release(self.user_id, &self.websocket_id)
+            .await
+        {
+            debug!(user_id = self.user_id, %error, "failed to release presence on disconnect");
+        }
+    }
+}
+
+/// Send the region roster with the viewer removed.
+///
+/// A roster frame is published once per region and forwarded by every socket,
+/// so the "not me" filter has to happen here rather than at publish time.
+async fn send_online_players(
+    user_id: u32,
+    roster: RegionRoster,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    let mut roster = roster;
+    roster.players.retain(|player| player.user_id != user_id);
+    let frame = serde_json::to_string(&WSMessage::OnlinePlayers(roster))
+        .context("failed to serialize the online-player roster")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the online-player roster")
+}
+
+/// Send this user's complete challenge state. Always a snapshot: a client that
+/// missed a hint, handed its socket over, or reconnected simply re-renders.
+async fn send_challenge_inbox(
+    user_id: u32,
+    challenges: &ChallengeStore,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    send_challenge_inbox_if_changed(user_id, challenges, ws_tx, &mut None).await
+}
+
+/// Send the snapshot, optionally suppressing one that is byte-identical to the
+/// last.
+///
+/// The reconcile timer runs whether or not anything moved, and every snapshot
+/// the client receives replaces its state and re-renders both social panels.
+/// Passing `Some(last_frame)` makes a quiet inbox cost nothing on the wire and
+/// nothing on the client. `None` always sends, which is what the initial
+/// snapshot and every post-action refresh want.
+async fn send_challenge_inbox_if_changed(
+    user_id: u32,
+    challenges: &ChallengeStore,
+    ws_tx: &mpsc::Sender<Message>,
+    last_frame: &mut Option<String>,
+) -> Result<()> {
+    let inbox = challenges
+        .inbox(user_id)
+        .await
+        .context("failed to read the challenge inbox")?;
+    let frame = serde_json::to_string(&WSMessage::Challenges(inbox))
+        .context("failed to serialize the challenge inbox")?;
+    if last_frame.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    let outcome = ws_tx
+        .send(Message::Text(frame.clone().into()))
+        .await
+        .context("WebSocket closed before the challenge inbox");
+    if outcome.is_ok() {
+        *last_frame = Some(frame);
+    }
+    outcome
+}
+
+/// Whether this identity belongs in the social layer at all.
+///
+/// Separate from `start_social_session` because the answer never changes for a
+/// connection: a failed *claim* is worth retrying on the next message, but a
+/// stress identity being ineligible is not. Stress traffic is a separate
+/// matchmaking universe, and putting load-test names in everyone's roster
+/// would be visible to real players.
+fn social_layer_admits(metadata: &PlayerMetadata) -> bool {
+    u32::try_from(metadata.user_id).is_ok() && metadata.matchmaking_pool != MatchmakingPool::Stress
+}
+
+/// Bring one authenticated socket into the social layer: claim a presence
+/// lease, send the current roster and challenge state, and keep both live.
+#[allow(clippy::too_many_arguments)]
+async fn start_social_session(
+    metadata: &PlayerMetadata,
+    websocket_id: &str,
+    region: &str,
+    redis: &RedisConnection,
+    pubsub_manager: &Arc<PubSubManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Option<SocialSession> {
+    let Ok(user_id) = u32::try_from(metadata.user_id) else {
+        return None;
+    };
+
+    let presence = PresenceRegistry::new(redis.clone(), region.to_string());
+    let challenges = ChallengeStore::new(redis.clone());
+
+    if let Err(error) = presence
+        .claim(
+            user_id,
+            websocket_id,
+            &metadata.username,
+            metadata.is_guest,
+            PresenceActivity::Idle,
+            metadata.matchmaking_pool,
+        )
+        .await
+    {
+        warn!(user_id, %error, "failed to claim a presence lease");
+        return None;
+    }
+
+    match presence.roster().await {
+        Ok(roster) => {
+            if let Err(error) = send_online_players(user_id, roster, ws_tx).await {
+                debug!(user_id, %error, "failed to send the initial roster");
+            }
+        }
+        Err(error) => warn!(user_id, %error, "failed to read the initial roster"),
+    }
+    if let Err(error) = send_challenge_inbox(user_id, &challenges, ws_tx).await {
+        debug!(user_id, %error, "failed to send the initial challenge inbox");
+    }
+
+    let intent = Arc::new(std::sync::Mutex::new(PresenceIntent {
+        username: metadata.username.clone(),
+        is_guest: metadata.is_guest,
+        activity: PresenceActivity::Idle,
+        pool: metadata.matchmaking_pool,
+        game_id: None,
+    }));
+    let mut tasks = Vec::new();
+
+    // Keep the lease alive. A lease rather than a delete-on-disconnect pair is
+    // what makes the roster correct when a task dies without cleaning up.
+    let lease_presence = presence.clone();
+    let lease_intent = intent.clone();
+    let lease_websocket_id = websocket_id.to_string();
+    let lease_rematch = RematchStore::new(redis.clone());
+    tasks.push(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            crate::presence::PRESENCE_REFRESH_INTERVAL_MS,
+        ));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let current = match lease_intent.lock() {
+                Ok(intent) => intent.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Err(error) = lease_presence
+                .refresh(
+                    user_id,
+                    &lease_websocket_id,
+                    &current.username,
+                    current.is_guest,
+                    current.activity,
+                    current.pool,
+                )
+                .await
+            {
+                debug!(user_id, %error, "presence lease refresh failed");
+            }
+            if let Some(game_id) = current.game_id
+                && let Err(error) = lease_rematch.touch_presence(game_id, user_id).await
+            {
+                debug!(user_id, game_id, %error, "rematch presence refresh failed");
+            }
+        }
+    }));
+
+    // Roster fan-out. Loss-tolerant by design: a dropped frame is corrected by
+    // the next roster change, and nothing depends on having seen every one.
+    let roster_tx = ws_tx.clone();
+    let roster_channel = RedisKeys::presence_updates_channel(region);
+    let mut roster_pubsub = (**pubsub_manager).clone();
+    tasks.push(tokio::spawn(async move {
+        let Ok(mut receiver) = roster_pubsub.subscribe_to_channel(&roster_channel).await else {
+            warn!(channel = %roster_channel, "failed to subscribe to region roster updates");
+            return;
+        };
+        loop {
+            let Ok(roster) = receiver.recv::<RegionRoster>().await else {
+                break;
+            };
+            if send_online_players(user_id, roster, &roster_tx)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }));
+
+    // Challenge delivery. The Pub/Sub hint only says "re-read your state"; the
+    // durable records are authoritative and the timer covers a dropped hint,
+    // which is the same durable-key + hint + reconcile shape matchmaking uses.
+    let challenge_tx = ws_tx.clone();
+    let challenge_store = challenges.clone();
+    let notification_channel = RedisKeys::user_notifications_channel(user_id);
+    let mut challenge_pubsub = (**pubsub_manager).clone();
+    let notify_intent = intent.clone();
+    let notify_rematch = RematchStore::new(redis.clone());
+    let notify_event_router = event_router.clone();
+    let notify_db = db.clone();
+    tasks.push(tokio::spawn(async move {
+        let receiver = challenge_pubsub
+            .subscribe_to_channel(&notification_channel)
+            .await;
+        let mut reconcile = tokio::time::interval(CHALLENGE_RECONCILE_INTERVAL);
+        reconcile.tick().await;
+        let mut last_frame: Option<String> = None;
+
+        // One channel carries both kinds of nudge, so the payload decides what
+        // to re-read. A reconcile tick re-reads everything, which is what
+        // makes a dropped hint cost latency rather than correctness.
+        let settle = |hint: Option<String>| -> (bool, bool) {
+            match hint.as_deref() {
+                Some("rematch") => (false, true),
+                Some(_) => (true, false),
+                None => (true, true),
+            }
+        };
+
+        // A missing hint channel is a degradation, not a failure: the loop
+        // falls back to pure reconcile polling and says so once.
+        let mut receiver = match receiver {
+            Ok(receiver) => Some(receiver),
+            Err(error) => {
+                warn!(user_id, %error, "social hints unavailable; falling back to polling");
+                None
+            }
+        };
+
+        loop {
+            let hint = match receiver.as_mut() {
+                Some(receiver) => {
+                    tokio::select! {
+                        received = receiver.recv::<String>() => match received {
+                            Ok(payload) => Some(payload),
+                            Err(_) => break,
+                        },
+                        _ = reconcile.tick() => None,
+                    }
+                }
+                None => {
+                    reconcile.tick().await;
+                    None
+                }
+            };
+            let (read_challenges, read_rematch) = settle(hint);
+
+            if read_challenges
+                && send_challenge_inbox_if_changed(
+                    user_id,
+                    &challenge_store,
+                    &challenge_tx,
+                    &mut last_frame,
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            if read_rematch {
+                let seated_game_id = match notify_intent.lock() {
+                    Ok(intent) => intent.game_id,
+                    Err(poisoned) => poisoned.into_inner().game_id,
+                };
+                if let Some(game_id) = seated_game_id
+                    && send_rematch_state(
+                        game_id,
+                        user_id,
+                        &notify_rematch,
+                        &notify_event_router,
+                        &notify_db,
+                        &challenge_tx,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }));
+
+    Some(SocialSession {
+        user_id,
+        websocket_id: websocket_id.to_string(),
+        presence,
+        intent,
+        tasks,
+    })
+}
+
+/// How often a socket re-reads its challenges regardless of hints. Short
+/// enough that a dropped Pub/Sub message is not user-visible as a stuck panel.
+const CHALLENGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Re-assert the presence lease with a new activity, so the roster can say
+/// whether someone is free to play.
+async fn record_presence_activity(
+    session: Option<&SocialSession>,
+    metadata: &PlayerMetadata,
+    activity: PresenceActivity,
+    game_id: Option<u32>,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let next = PresenceIntent {
+        username: metadata.username.clone(),
+        is_guest: metadata.is_guest,
+        activity,
+        pool: metadata.matchmaking_pool,
+        game_id,
+    };
+    // Writing the shared intent first means even a failed refresh converges on
+    // the next heartbeat instead of leaving the roster permanently stale.
+    let unchanged = match session.intent.lock() {
+        Ok(mut current) => {
+            let unchanged = current.username == next.username
+                && current.is_guest == next.is_guest
+                && current.activity == next.activity
+                && current.game_id == next.game_id;
+            *current = next.clone();
+            unchanged
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = next.clone();
+            false
+        }
+    };
+    if unchanged {
+        return;
+    }
+
+    if let Err(error) = session
+        .presence
+        .refresh(
+            session.user_id,
+            &session.websocket_id,
+            &next.username,
+            next.is_guest,
+            next.activity,
+            next.pool,
+        )
+        .await
+    {
+        debug!(user_id = session.user_id, %error, "failed to record presence activity");
+    }
+}
+
+async fn send_challenge_failure(reason: &str, ws_tx: &mpsc::Sender<Message>) -> Result<()> {
+    let frame = serde_json::to_string(&WSMessage::ChallengeFailed {
+        reason: reason.to_string(),
+    })?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before a challenge failure")
+}
+
 async fn subscribe_to_user_count_updates(
     pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,

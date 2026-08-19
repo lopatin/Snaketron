@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { GameState, QueueMode, Rank } from '../types';
+import type { GameState, QueueMode, Rank, RematchState } from '../types';
 import { buildMatchPresentation } from '../utils/gamePresentation';
 import type { MatchRatingState } from '../utils/ratingReveal';
 import type { MatchHighlightState } from '../utils/highlightPresentation';
@@ -16,6 +16,10 @@ const SCORE_CARD_REVEAL_DELAY_MS = 1600;
 
 export interface GameHudShellProps {
   gameState: GameState | null;
+  /** Wire game id, used only for share links. */
+  shareGameId?: number | null;
+  rematch?: RematchState | null;
+  onRematchToggle?: (optIn: boolean) => void;
   isVisible: boolean;
   arenaWidth: number;
   currentUserId?: number;
@@ -31,6 +35,9 @@ export interface GameHudShellProps {
 
 const GameHudShell: React.FC<GameHudShellProps> = ({
   gameState,
+  shareGameId = null,
+  rematch = null,
+  onRematchToggle,
   isVisible,
   arenaWidth,
   currentUserId,
@@ -86,6 +93,7 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
       <MatchRosterBand
         presentation={presentation}
         isVisible={isVisible}
+        shareGameId={shareGameId}
         onMenu={onMenu}
         onScoreCard={() => setScoreCardOpen((open) => !open)}
         scoreCardOpen={scoreCardOpen}
@@ -114,6 +122,10 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
       <GameOverCard
         open={scoreCardOpen && presentation.isComplete}
         gameId={matchKey}
+        shareGameId={shareGameId}
+        rematch={rematch}
+        currentUserId={currentUserId}
+        onRematchToggle={onRematchToggle}
         presentation={presentation}
         rating={rating}
         highlight={highlight}

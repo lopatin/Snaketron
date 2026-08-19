@@ -246,6 +246,9 @@ export default function GameArena() {
     throw new Error('GameArena must be used with a gameId parameter');
   }
   const routeGameId = parseU32GameId(gameId);
+  // Held in a ref so the rematch toggle keeps one identity across renders.
+  const routeGameIdRef = useRef<number | null>(routeGameId);
+  routeGameIdRef.current = routeGameId;
 
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -301,6 +304,8 @@ export default function GameArena() {
     isSessionAuthenticated,
     createLobby,
     leaveLobby,
+    rematchState,
+    setRematchIntent,
   } = useWebSocket();
   const playerId = user?.id ?? 0;
   const queueMode: QueueMode = lobbyPreferences?.competitive ? 'Competitive' : 'Quickmatch';
@@ -408,6 +413,15 @@ export default function GameArena() {
   const stopEngineRef = useRef(stopEngine);
   leaveGameRef.current = leaveGame;
   stopEngineRef.current = stopEngine;
+  const handleRematchToggle = useCallback(
+    (optIn: boolean) => {
+      if (routeGameIdRef.current === null) {
+        return;
+      }
+      setRematchIntent(routeGameIdRef.current, optIn);
+    },
+    [setRematchIntent],
+  );
   const teardownGameSession = useCallback(() => {
     if (gameSessionClosedRef.current) {
       return;
@@ -1763,6 +1777,9 @@ export default function GameArena() {
       <>
         <GameHudShell
           gameState={committedState}
+          shareGameId={routeGameId}
+          rematch={rematchState?.game_id === routeGameId ? rematchState : null}
+          onRematchToggle={handleRematchToggle}
           isVisible={isArenaVisible}
           arenaWidth={panelSize.width}
           currentUserId={user?.id}

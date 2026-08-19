@@ -14,23 +14,23 @@ test('gameplay authentication reports the protocol version and build distributio
     process.env.CRAZYGAMES_BUILD === 'true',
     process.env.ITCH_BUILD === 'true',
   );
-  assert.equal(GAMEPLAY_PROTOCOL_VERSION, 10);
+  assert.equal(GAMEPLAY_PROTOCOL_VERSION, 12);
   assert.equal(CLIENT_DISTRIBUTION, expectedDistribution);
   assert.deepEqual(buildGameplayAuthentication('test-token'), {
     Authenticate: {
       token: 'test-token',
-      protocol_version: 10,
+      protocol_version: 12,
       distribution: expectedDistribution,
     },
   });
 });
 
 test('predictive gameplay requires an exact protocol match', () => {
-  assert.equal(isGameplayProtocolCompatible(10), true);
-  assert.equal(isGameplayProtocolCompatible(9), false);
+  assert.equal(isGameplayProtocolCompatible(12), true);
   assert.equal(isGameplayProtocolCompatible(11), false);
+  assert.equal(isGameplayProtocolCompatible(13), false);
   assert.equal(isGameplayProtocolCompatible(undefined), false);
-  assert.equal(isGameplayProtocolCompatible('10'), true);
+  assert.equal(isGameplayProtocolCompatible('12'), true);
   assert.equal(
     isGameplayUpdateRequiredReason('Gameplay update required: client protocol 9'),
     true,

@@ -10,6 +10,9 @@ import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
+import GameResultPage from './components/GameResultPage';
+import OnlinePlayersPanel from './components/OnlinePlayersPanel';
+import ChallengesPanel from './components/ChallengesPanel';
 import PlayRoute from './components/PlayRoute';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
@@ -85,6 +88,14 @@ function AppContent() {
   const isGameArenaActive = activeGameIdFromPath(location.pathname) !== null;
   const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
   const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
+  // Two kinds of route keep the floating social chrome off screen. The public
+  // match page is a landing surface for people arriving from a shared link,
+  // most of whom have no session at all, so the chrome would be furniture for
+  // an account they do not have yet. The QA harnesses exist to review one
+  // component in isolation, and a roster strip parked over the thing under
+  // review is exactly the noise they are meant to avoid.
+  const isSocialSuppressedRoute =
+    location.pathname.startsWith('/g/') || location.pathname.startsWith('/qa/');
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
   const showRuntimeAnnouncement = config.announcement.enabled
     && config.announcement.message.trim().length > 0
@@ -211,6 +222,11 @@ function AppContent() {
           element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <CustomGameCreator />}
         />
         <Route path="/lobby/:lobbyCode" element={<LobbyInvitePage />} />
+        {/* The permanent public address of a finished match. Deliberately
+            outside ProtectedRoute: a shared link has to open for someone who
+            has never played, and the same path is what the server renders for
+            crawlers. */}
+        <Route path="/g/:gameId" element={<GameResultPage />} />
         <Route
           path="/game/:gameCode"
           element={
@@ -263,6 +279,12 @@ function AppContent() {
           />
         )}
       </AnimatedRoutes>
+      {/* The roster is a lobby-level prompt, not gameplay chrome: it stays off
+          the arena, where the corners belong to the HUD, chat, and (on touch)
+          the steering pad. Challenges follow you everywhere, because one you
+          never see is one that expires. */}
+      <OnlinePlayersPanel enabled={!isGameArenaActive && !isSocialSuppressedRoute} />
+      {!isSocialSuppressedRoute && <ChallengesPanel />}
       <AuthModal
         isOpen={isAuthModalOpen && !isCrazyGamesBuild}
         onClose={() => setIsAuthModalOpen(false)}

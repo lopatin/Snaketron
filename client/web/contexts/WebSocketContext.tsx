@@ -11,6 +11,9 @@ import {
   User,
   MatchmakingStatus,
   ClientAdsConfig,
+  ChallengeInbox,
+  RegionRoster,
+  RematchState,
 } from '../types';
 import {
   OutboundMessage,
@@ -129,6 +132,8 @@ export const lobbyStorageKeyForIdentity = (
   return userId === null ? null : `${LOBBY_STORAGE_KEY}:user:${userId}`;
 };
 const MAX_CHAT_HISTORY = 200;
+/** Stable empty inbox so an un-populated social layer never re-renders consumers. */
+const EMPTY_CHALLENGE_INBOX: ChallengeInbox = { incoming: [], outgoing: [] };
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
 const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'ad_break', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
@@ -313,6 +318,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyMembers, setLobbyMembers] = useState<LobbyMember[]>([]);
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
+  // Social layer. The roster stays null until the server sends one, so the
+  // panel can distinguish "not loaded" from "nobody else is here".
+  const [onlinePlayers, setOnlinePlayers] = useState<RegionRoster | null>(null);
+  const [challenges, setChallenges] = useState<ChallengeInbox>(EMPTY_CHALLENGE_INBOX);
+  const [challengeError, setChallengeError] = useState<string | null>(null);
+  const [rematchState, setRematchState] = useState<RematchState | null>(null);
 
   useEffect(() => {
     if (disableChat) {
@@ -3083,6 +3094,190 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     resetLobbyState,
   ]);
 
+  // --- Social layer -------------------------------------------------------
+  //
+  // Both feeds are server-pushed snapshots, never deltas, so every handler is
+  // a plain replace. That is what makes them correct across a socket handoff,
+  // a dropped Pub/Sub hint, and a reconnect without any client-side merge.
+  useEffect(() => {
+    const cleanup = onMessage('OnlinePlayers', (message) => {
+      const roster = message?.data as RegionRoster | undefined;
+      if (!roster || !Array.isArray(roster.players)) {
+        return;
+      }
+      setOnlinePlayers(roster);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const cleanup = onMessage('Challenges', (message) => {
+      const inbox = message?.data as ChallengeInbox | undefined;
+      if (!inbox || !Array.isArray(inbox.incoming) || !Array.isArray(inbox.outgoing)) {
+        return;
+      }
+      setChallenges(inbox);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // The server creates and joins a lobby on the challenger's behalf when they
+  // challenge from outside one, and announces it with an unsolicited
+  // `LobbyCreated`. Without a standing handler that frame is dropped — the only
+  // other one is the transient handler inside `createLobby` — and the
+  // challenger's own client never learns it is in the lobby its challenge
+  // points at.
+  useEffect(() => {
+    const cleanup = onMessage('LobbyCreated', (message) => {
+      const lobbyCode = (message?.data as { lobby_code?: unknown } | undefined)?.lobby_code;
+      if (typeof lobbyCode !== 'string' || !lobbyCode.trim()) {
+        return;
+      }
+      const normalizedCode = lobbyCode.trim().toUpperCase();
+      // An in-flight createLobby() has its own handler and richer follow-up
+      // (preferences, promise resolution); adopting here as well would be
+      // redundant, so only take frames it is not already handling.
+      if (currentLobbyRef.current?.code === normalizedCode) {
+        return;
+      }
+      const adopted: Lobby = {
+        id: null,
+        code: normalizedCode,
+        hostUserId: user?.id ?? 0,
+        region: '',
+        state: 'waiting',
+      };
+      currentLobbyRef.current = adopted;
+      setCurrentLobby(adopted);
+      persistLobby({ id: null, code: normalizedCode });
+    });
+    return cleanup;
+  }, [onMessage, persistLobby, user?.id]);
+
+  useEffect(() => {
+    const cleanup = onMessage('ChallengeFailed', (message) => {
+      const reason = (message?.data as { reason?: unknown } | undefined)?.reason;
+      setChallengeError(typeof reason === 'string' && reason ? reason : 'That challenge could not be sent.');
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // Accepting a challenge is an instruction to join the challenger's lobby.
+  // The server cannot do it on this socket's behalf, so the client completes
+  // the move the same way an invite link does.
+  useEffect(() => {
+    const cleanup = onMessage('ChallengeAccepted', (message) => {
+      const payload = message?.data as { lobby_code?: unknown } | undefined;
+      const lobbyCode = payload?.lobby_code;
+      if (typeof lobbyCode !== 'string' || !lobbyCode) {
+        return;
+      }
+      // The challenger is already standing in the lobby they issued from.
+      if (currentLobbyRef.current?.code === lobbyCode) {
+        return;
+      }
+      const enter = async () => {
+        // The server refuses a join while the socket still holds another
+        // lobby, so accepting from inside one has to vacate it first.
+        if (currentLobbyRef.current) {
+          await leaveLobby().catch(() => {
+            // A failed leave is still worth a join attempt: the lobby may
+            // already be gone on the server side.
+          });
+        }
+        await joinLobby(lobbyCode);
+      };
+      void enter().catch((error: unknown) => {
+        console.error('Failed to join the lobby for an accepted challenge:', error);
+        setChallengeError('Could not join that match. Try the lobby code instead.');
+      });
+    });
+    return cleanup;
+  }, [joinLobby, leaveLobby, onMessage]);
+
+  // A socket that goes away takes the social feeds with it: leaving them on
+  // screen would offer challenges that cannot be delivered.
+  useEffect(() => {
+    if (isSessionAuthenticated) {
+      return;
+    }
+    setOnlinePlayers(null);
+    setChallenges(EMPTY_CHALLENGE_INBOX);
+    setRematchState(null);
+  }, [isSessionAuthenticated]);
+
+  const challengePlayer = useCallback((userId: number) => {
+    if (!Number.isSafeInteger(userId) || userId <= 0) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ ChallengePlayer: { user_id: userId } });
+  }, [sendMessage]);
+
+  const respondToChallenge = useCallback((challengeId: string, accept: boolean) => {
+    if (!challengeId) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ RespondToChallenge: { challenge_id: challengeId, accept } });
+  }, [sendMessage]);
+
+  const cancelChallenge = useCallback((challengeId: string) => {
+    if (!challengeId) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ CancelChallenge: { challenge_id: challengeId } });
+  }, [sendMessage]);
+
+  const dismissChallengeError = useCallback(() => setChallengeError(null), []);
+
+  // Rematch. Server-pushed snapshots again — who is still on the results card,
+  // who has opted in, and the lobby they converge on once enough have.
+  useEffect(() => {
+    const cleanup = onMessage('Rematch', (message) => {
+      const state = message?.data as RematchState | undefined;
+      if (!state || !Array.isArray(state.participants)) {
+        return;
+      }
+      setRematchState(state);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // Everyone but the host converges on the elected lobby. The host is already
+  // standing in it — the server joined them when it elected the lobby.
+  useEffect(() => {
+    const lobbyCode = rematchState?.lobby_code;
+    if (!lobbyCode || !user?.id) {
+      return;
+    }
+    if (rematchState?.host_user_id === user.id) {
+      return;
+    }
+    if (currentLobbyRef.current?.code === lobbyCode) {
+      return;
+    }
+    const enter = async () => {
+      if (currentLobbyRef.current) {
+        await leaveLobby().catch(() => {
+          // Already gone server-side is fine; the join is what matters.
+        });
+      }
+      await joinLobby(lobbyCode);
+    };
+    void enter().catch((error: unknown) => {
+      console.error('Failed to join the rematch lobby:', error);
+    });
+  }, [joinLobby, leaveLobby, rematchState?.lobby_code, rematchState?.host_user_id, user?.id]);
+
+  const setRematchIntent = useCallback((gameId: number, optIn: boolean) => {
+    if (!Number.isSafeInteger(gameId) || gameId <= 0) {
+      return;
+    }
+    sendMessage({ SetRematchIntent: { game_id: gameId, opt_in: optIn } });
+  }, [sendMessage]);
+
   // Mirrors the server's rule so non-leaders see controls that are already
   // disabled rather than pressing them and collecting an AccessDenied. The
   // server remains authoritative; this only keeps the UI honest.
@@ -3120,6 +3315,15 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clearSessionForAccountChange,
     sendChatMessage,
     updateLobbyPreferences,
+    onlinePlayers,
+    challenges,
+    challengeError,
+    challengePlayer,
+    rematchState,
+    setRematchIntent,
+    respondToChallenge,
+    cancelChallenge,
+    dismissChallengeError,
   };
 
   // Expose context for testing

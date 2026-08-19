@@ -1,6 +1,6 @@
 mod common;
 
-use crate::common::{TestClient, TestEnvironment};
+use crate::common::{TestClient, TestEnvironment, is_unsolicited_push};
 use ::common::{GameType, QueueMode};
 use anyhow::{Context, Result};
 use server::ads::{
@@ -368,7 +368,7 @@ async fn stale_protocol_is_denied_before_any_ad_frames() -> Result<()> {
         loop {
             match client.receive_message().await? {
                 WSMessage::AccessDenied { reason } => return Ok::<_, anyhow::Error>(reason),
-                WSMessage::UserCountUpdate { .. } => {}
+                other if is_unsolicited_push(&other) => {}
                 WSMessage::AdConfiguration(configuration) => {
                     return Err(anyhow::anyhow!(
                         "stale peer received ad configuration before protocol denial: {configuration:?}"

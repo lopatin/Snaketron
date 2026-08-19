@@ -18,6 +18,20 @@ pub struct TestClient {
     next_command_sequence: u64,
 }
 
+/// Frames the server pushes on its own schedule, which can land in the middle
+/// of any request/response exchange.
+///
+/// Every wait loop in the test suite has to skip these. Keeping the list here —
+/// rather than as one-off match arms — is what stops the next unsolicited push
+/// from failing every WebSocket test at once, which is exactly how the social
+/// layer's roster and challenge frames broke them.
+pub fn is_unsolicited_push(message: &WSMessage) -> bool {
+    matches!(
+        message,
+        WSMessage::UserCountUpdate { .. } | WSMessage::OnlinePlayers(_) | WSMessage::Challenges(_)
+    )
+}
+
 impl TestClient {
     pub async fn connect(addr: &str) -> Result<Self> {
         let (ws_stream, _) = connect_async(addr).await?;
@@ -91,7 +105,7 @@ impl TestClient {
                     WSMessage::AdConfiguration(configuration) => {
                         self.ad_configuration = Some(configuration);
                     }
-                    WSMessage::UserCountUpdate { .. } => {}
+                    other if is_unsolicited_push(&other) => {}
                     other => {
                         return Err(anyhow::anyhow!(
                             "Expected Authenticated response, got {:?}",
@@ -108,16 +122,15 @@ impl TestClient {
     /// Create and join an explicit matchmaking lobby.
     ///
     /// `CreateLobby` auto-joins its creator on the server. Requiring the
-    /// `LobbyCreated` response keeps this helper from masking a failed join.
-    /// The periodic user-count broadcast is the only unrelated frame allowed
-    /// to overtake the response.
+    /// `LobbyCreated` response keeps this helper from masking a failed join;
+    /// only unsolicited server pushes may overtake it.
     pub async fn create_lobby(&mut self) -> Result<String> {
         self.send_message(WSMessage::CreateLobby).await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match self.receive_message().await? {
                     WSMessage::LobbyCreated { lobby_code } => return Ok(lobby_code),
-                    WSMessage::UserCountUpdate { .. } => {}
+                    other if is_unsolicited_push(&other) => {}
                     WSMessage::AccessDenied { reason } => {
                         return Err(anyhow::anyhow!("CreateLobby was denied: {reason}"));
                     }

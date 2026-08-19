@@ -200,6 +200,7 @@ const presentation: MatchPresentation = {
 const RatingRevealQA: React.FC = () => {
   const [scenarioId, setScenarioId] = useState('promotion');
   const [replayKey, setReplayKey] = useState(0);
+  const [rematchOptIn, setRematchOptIn] = useState(false);
   const scenario = SCENARIOS.find(({ id }) => id === scenarioId) ?? SCENARIOS[0];
 
   return (
@@ -242,6 +243,28 @@ const RatingRevealQA: React.FC = () => {
       <GameOverCard
         key={`${scenario.id}:${replayKey}`}
         open
+        // A fixture id so the card's share control renders here too; the
+        // harness exists to review the card's real states, and share is one.
+        shareGameId={4242}
+        // Fixture rematch state. The ids match the presentation's players
+        // (`userId: snakeId + 1` above) so the row pills actually render here —
+        // that is the whole thing this harness is for.
+        currentUserId={1}
+        onRematchToggle={setRematchOptIn}
+        rematch={{
+          game_id: 4242,
+          participants: [
+            { user_id: 1, username: 'You', present: true, opted_in: rematchOptIn },
+            { user_id: 2, username: 'Rival', present: true, opted_in: true },
+          ],
+          lobby_code: null,
+          host_user_id: null,
+          // A formable count, so the harness shows the healthy state rather
+          // than the "can't form a match" copy.
+          game_type: { TeamMatch: { per_team: 1 } },
+          queue_mode: 'Quickmatch',
+          expires_at_ms: 0,
+        }}
         presentation={presentation}
         rating={scenario.state ?? undefined}
         onDismiss={() => setReplayKey((key) => key + 1)}

@@ -250,6 +250,70 @@ impl RedisKeys {
         format!("user:{}", user_id)
     }
 
+    // === Social presence and challenges ===
+
+    /// Region roster hash: `user_id` -> serialized `OnlinePlayer`.
+    ///
+    /// Shares a per-region hash tag with the expiry index below so one Lua
+    /// script can prune stale leases and read the surviving roster atomically,
+    /// exactly as the active-server registry does. SCAN is not an option here
+    /// for the same cluster-safety reason documented on that registry.
+    pub fn presence_roster(region: &str) -> String {
+        format!("presence:{{snaketron:presence:{region}}}:roster")
+    }
+
+    /// Region presence expiry index (score = absolute lease deadline in ms).
+    pub fn presence_expiry(region: &str) -> String {
+        format!("presence:{{snaketron:presence:{region}}}:expiry")
+    }
+
+    /// One user's challenge expiry index (score = absolute expiry in ms).
+    ///
+    /// Challenges are stored per participant rather than once per pair: each
+    /// side reads only its own two keys, which keeps every read and prune
+    /// inside a single hash slot even though a challenge spans two users.
+    pub fn user_challenge_index(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:index")
+    }
+
+    /// One user's challenge records: `challenge_id` -> serialized challenge.
+    pub fn user_challenge_data(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:data")
+    }
+
+    /// Rolling count of challenges one user has issued, for rate limiting.
+    /// Shares the user's challenge slot so it can be read alongside them.
+    pub fn user_challenge_rate(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:rate")
+    }
+
+    /// Rematch opt-in and presence for one finished game.
+    ///
+    /// Tagged on the game rather than the user: the participant set is fixed
+    /// and shared, so one record serves everybody and every read, prune, and
+    /// election stays inside a single hash slot.
+    pub fn rematch_record(game_id: u32) -> String {
+        format!("rematch:{{snaketron:rm:{game_id}}}:record")
+    }
+
+    /// The lobby elected to host one game's rematch. `SET NX` on this key is
+    /// what makes the election exactly-once across the cluster.
+    pub fn rematch_lobby(game_id: u32) -> String {
+        format!("rematch:{{snaketron:rm:{game_id}}}:lobby")
+    }
+
+    /// Per-user loss-tolerant hint channel. Pub/Sub is at-most-once, so this
+    /// only ever says "your challenge state moved, re-read it" — the durable
+    /// keys above stay authoritative and a periodic reconcile covers a drop.
+    pub fn user_notifications_channel(user_id: u32) -> String {
+        format!("user:{user_id}:notifications")
+    }
+
+    /// Region-wide roster hint channel, published when the roster digest moves.
+    pub fn presence_updates_channel(region: &str) -> String {
+        format!("presence:{region}:updates")
+    }
+
     // === Presence ===
 
     /// Which lobby a user is currently present in, for resolving a
@@ -591,6 +655,31 @@ mod tests {
             RedisKeys::active_server_metrics(),
             RedisKeys::active_server_metrics_expiry(),
         ]);
+        assert_same_slot(&[
+            RedisKeys::presence_roster("use1"),
+            RedisKeys::presence_expiry("use1"),
+        ]);
+        assert_ne!(
+            hash_tag(&RedisKeys::presence_roster("use1")),
+            hash_tag(&RedisKeys::presence_roster("euw1")),
+            "regions must not share a presence slot"
+        );
+        assert_same_slot(&[
+            RedisKeys::user_challenge_index(7),
+            RedisKeys::user_challenge_data(7),
+            RedisKeys::user_challenge_rate(7),
+        ]);
+        assert_same_slot(&[RedisKeys::rematch_record(42), RedisKeys::rematch_lobby(42)]);
+        assert_ne!(
+            hash_tag(&RedisKeys::rematch_record(42)),
+            hash_tag(&RedisKeys::rematch_record(43)),
+            "rematch records must stay distributed across games"
+        );
+        assert_ne!(
+            hash_tag(&RedisKeys::user_challenge_index(7)),
+            hash_tag(&RedisKeys::user_challenge_index(8)),
+            "challenge stores must stay distributed across users"
+        );
         assert_same_slot(&[
             RedisKeys::matchmaking_active_matches(),
             RedisKeys::matchmaking_game_created_outbox(),

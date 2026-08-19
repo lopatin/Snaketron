@@ -3021,6 +3021,39 @@ button.game-scoreboard-brand {
   line-height: 1.2;
 }
 
+/* The Winner pill's twin, so the two read as one family of row badges. Blue
+   because it is the only forward-looking thing on a card about a match that
+   is over. */
+.game-over-rematch-pill {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border: 1px solid #bfdbfe;
+  border-radius: 3px;
+  background: #eff6ff;
+  color: #2563eb;
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+/* Someone who has closed the card. Stated rather than implied, because it is
+   the reason a rematch is not going to happen. */
+.game-over-left-pill {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border: 1px solid #e5e7eb;
+  border-radius: 3px;
+  background: #f9fafb;
+  color: #9ca3af;
+  font-size: 8px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
 .game-over-winner {
   margin-left: 8px;
   padding: 2px 5px;
@@ -5507,7 +5540,9 @@ a.home-social-icon:hover {
 
   .home-main {
     align-items: flex-start;
-    padding: 154px 6px calc(112px + var(--ad-route-bottom-reserve));
+    /* Clears the challenges dock, which sits above the chat dock on the mobile
+       bottom rail, so scrolling to the bottom never parks content under it. */
+    padding: 154px 6px calc(126px + var(--ad-route-bottom-reserve));
   }
 
   .home-brand-lockup {
@@ -6254,4 +6289,773 @@ a.home-social-icon:hover {
   .skins-qa-tuning {
     position: static;
   }
+}
+
+/* Online players ------------------------------------------------------------
+   A floating column of names for everyone online in the region.
+
+   Black and translucent because it floats over whichever screen you are on;
+   the app's white paper surfaces are page furniture and this is not part of
+   the page. Square corners, no per-name rules or fills: it is a list, and
+   every box drawn around a name is one more thing between the reader and the
+   names. Which margin it sits in is decided at runtime — see
+   utils/panelPlacement.ts. */
+.online-players {
+  position: fixed;
+  z-index: 56;
+  /* Centred in the band between the header and the bottom dock rail, not in
+     the viewport: plain centring puts the panel's lower edge into the
+     challenges dock, which shares this side. */
+  top: calc(50% - 40px);
+  width: 176px;
+  max-height: min(560px, calc(100svh - 300px));
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border: 1px solid rgb(255 255 255 / 12%);
+  /* The fill lives on the header and the list separately so the two can sit
+     at different opacities — see below. */
+  background: transparent;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  color: #fff;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 22%);
+  transform: translateY(-50%);
+}
+
+.online-players.is-right {
+  right: 0;
+  border-right: none;
+}
+
+.online-players.is-left {
+  left: 0;
+  border-left: none;
+}
+
+/* Collapsed it is just the region tag, so it costs a sliver of the margin. */
+.online-players.is-collapsed {
+  width: auto;
+  padding: 0;
+}
+
+/* Denser than the list beneath it, which is what separates the two without
+   spending a rule on it. */
+.online-players-toggle {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px 9px 12px;
+  border: none;
+  background: rgb(9 12 20 / 90%);
+  color: rgb(255 255 255 / 72%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 150ms ease;
+}
+
+.online-players-toggle:hover {
+  color: #fff;
+}
+
+.online-players-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 2px;
+  background: #22c55e;
+}
+
+.online-players-region {
+  overflow: hidden;
+  flex: 1;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.online-players-caret {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  color: rgb(255 255 255 / 55%);
+  transition: transform 150ms ease;
+}
+
+.online-players-caret.is-expanded {
+  transform: rotate(180deg);
+}
+
+.online-players-list {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  padding: 4px 0 6px;
+  background: rgb(9 12 20 / 78%);
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 22%) transparent;
+}
+
+.online-players-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.online-players-list::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 22%);
+}
+
+.online-players-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.online-players-list ul {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.online-player {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 12px;
+}
+
+.online-player:hover {
+  background: rgb(255 255 255 / 6%);
+}
+
+/* Presence is membership of the list. Availability is the name's own colour:
+   white can play now, grey is mid-match. No legend needed, and no column
+   spent on a word that repeats for every row. */
+.online-player-name {
+  overflow: hidden;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.online-player.is-playing .online-player-name {
+  color: rgb(255 255 255 / 42%);
+}
+
+/* A link, not a button: no container, and no underline until it is wanted. */
+.online-player-challenge {
+  padding: 0;
+  border: none;
+  background: none;
+  color: #93c5fd;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-decoration: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+/* Revealed on approach, so a resting list is only names. Keyboard users get
+   it on focus, and coarse pointers — which have no hover — always. */
+.online-player:hover .online-player-challenge,
+.online-player-challenge:focus-visible {
+  opacity: 1;
+}
+
+.online-player-challenge:hover,
+.online-player-challenge:focus-visible {
+  color: #fff;
+  text-decoration: underline;
+}
+
+@media (hover: none) {
+  .online-player-challenge {
+    opacity: 1;
+  }
+}
+
+.online-player-pending {
+  color: rgb(255 255 255 / 40%);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.online-players-empty,
+.online-players-overflow {
+  margin: 0;
+  padding: 2px 12px 6px;
+  color: rgb(255 255 255 / 45%);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.online-players-error {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  border-top: 1px solid rgb(239 68 68 / 35%);
+  color: #fecaca;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.online-players-error button {
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.online-players :is(button, a):focus-visible {
+  outline: 2px solid #93c5fd;
+  outline-offset: -2px;
+}
+
+/* Challenges dock -----------------------------------------------------------
+   Same trigger/panel shape as lobby and game chat, reusing their classes so
+   the two read as one family, and stacked directly above the chat dock rather
+   than on top of it. Only rendered when something is pending. */
+.challenges-dock {
+  position: fixed;
+  z-index: 57;
+  right: calc(20px + env(safe-area-inset-right, 0px));
+  /* Directly above the chat dock, which owns the bottom-right corner. */
+  bottom: calc(88px + var(--ad-route-bottom-reserve));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.challenges-panel {
+  width: 300px;
+}
+
+.challenges-trigger {
+  min-width: 164px;
+  box-shadow: none;
+}
+
+.challenges-list {
+  display: grid;
+  overflow-y: auto;
+  max-height: 260px;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.challenge-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.challenge-row.is-incoming {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.challenge-row.is-resolved {
+  opacity: 0.6;
+}
+
+.challenge-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.challenge-name {
+  overflow: hidden;
+  color: rgb(0 0 0 / 78%);
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.challenge-detail {
+  color: #6b7280;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+
+.challenge-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+.challenge-action {
+  padding: 5px 9px;
+  border: 2px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: rgb(0 0 0 / 70%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.challenge-action.is-accept:hover {
+  border-color: var(--game-blue);
+  background: #dbeafe;
+}
+
+.challenge-action.is-decline:hover {
+  border-color: #9ca3af;
+  background: #f3f4f6;
+}
+
+.challenge-action:focus-visible {
+  outline: 2px solid var(--game-blue);
+  outline-offset: 2px;
+}
+
+/* Share control -------------------------------------------------------------
+   One button plus a popover holding the permanent link, a copy action, the OS
+   share sheet where there is one, and plain web-intent links. */
+.share-game {
+  position: relative;
+  display: inline-flex;
+}
+
+.share-game-trigger {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 2px solid var(--game-rule);
+  border-radius: 8px;
+  background: #fff;
+  color: rgb(0 0 0 / 70%);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.share-game-trigger:hover,
+.share-game-trigger[aria-expanded='true'] {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.share-game-trigger.is-compact {
+  width: 34px;
+  min-height: 34px;
+  height: 34px;
+  padding: 0;
+  justify-content: center;
+}
+
+.share-game-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.share-game-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 90;
+  display: grid;
+  /* Wide enough that the longest network name fits its column without
+     truncating — four equal columns is what makes the row scannable. */
+  width: 320px;
+  gap: 10px;
+  padding: 14px;
+  border: 2px solid var(--game-rule);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 16px 40px rgb(0 0 0 / 12%);
+}
+
+.share-game-heading {
+  margin: 0;
+  color: #6b7280;
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.share-game-note {
+  margin: -6px 0 0;
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.share-game-link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.share-game-link {
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 2px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+  color: rgb(0 0 0 / 70%);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* The arena disables text selection globally on touch; a link people are
+     meant to copy by hand has to opt back in. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.share-game-copy,
+.share-game-native {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 2px solid var(--game-rule);
+  border-radius: 6px;
+  background: #fff;
+  color: rgb(0 0 0 / 70%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.share-game-native {
+  width: 100%;
+}
+
+.share-game-copy:hover,
+.share-game-native:hover {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.share-game-targets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.share-game-target {
+  padding: 8px 2px;
+  font-size: 9px;
+  border: 2px solid #e5e7eb;
+  border-radius: 6px;
+  color: rgb(0 0 0 / 70%);
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  text-align: center;
+  text-decoration: none;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.share-game-target:hover {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.share-game :is(button, a):focus-visible {
+  outline: 2px solid var(--game-blue);
+  outline-offset: 2px;
+}
+
+/* The in-match share sits in the roster rail; when the match is still live
+   there are no other actions there, so the slot only holds this. */
+.game-roster-share-slot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Public match page ---------------------------------------------------------
+   The landing surface for a shared link. Most people arriving here have never
+   played, so it is a single centered card and one call to action. */
+.game-result-page {
+  display: flex;
+  min-height: 100svh;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px 56px;
+}
+
+.game-result-card {
+  width: min(100%, 560px);
+  padding: 26px;
+  border: 2px solid var(--game-rule);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.game-result-kicker {
+  margin: 0 0 6px;
+  color: #6b7280;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.game-result-headline {
+  margin: 0 0 10px;
+  color: rgb(0 0 0 / 80%);
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.game-result-meta,
+.game-result-status {
+  margin: 0;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.game-result-standings {
+  margin: 22px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.game-result-standings li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #eef2f6;
+  color: rgb(0 0 0 / 72%);
+  font-size: 14px;
+}
+
+.game-result-standings strong {
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.game-result-player {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.game-result-winner {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #eff6ff;
+  color: #2563eb;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.game-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.game-result-cta {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  padding: 0 20px;
+  border: 2px solid var(--game-blue);
+  border-radius: 8px;
+  background: var(--game-blue);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+
+.game-result-cta:hover {
+  background: #2563eb;
+}
+
+@media (max-width: 700px) {
+  /* Phones get the collapsed strip by default: a full roster row would take
+     the whole width that the nickname form and play button need. */
+  /* A phone has no margin to float in, so the panel always resolves to "does
+     not fit" and starts as the collapsed region tag. Vertical centring would
+     park that tag in the middle of the form, so on mobile it hangs from the
+     band between the header and the content instead, and opens downward from
+     there. The bottom rail is not an option: the region selector already sits
+     there showing this same region and count. */
+  .online-players {
+    top: calc(88px + env(safe-area-inset-top, 0px));
+    max-height: min(420px, calc(100svh - 220px));
+    transform: none;
+  }
+
+  .challenges-dock {
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    bottom: calc(68px + var(--ad-route-bottom-reserve));
+  }
+
+  .challenges-panel {
+    width: min(300px, calc(100vw - 24px));
+  }
+
+  .share-game-popover {
+    width: min(320px, calc(100vw - 32px));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .online-players-toggle,
+  .online-player-challenge,
+  .share-game-trigger,
+  .share-game-copy,
+  .share-game-native,
+  .share-game-target,
+  .challenge-action {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .online-players,
+  .share-game-popover,
+  .challenge-row {
+    border: 1px solid CanvasText;
+  }
+
+  /* Forced colours drop the translucent fill the panel relies on, so the
+     hover row and the challenge link need marks of their own. */
+  .online-player:hover {
+    background: Highlight;
+  }
+
+  .online-player-challenge {
+    opacity: 1;
+    text-decoration: underline;
+  }
+}
+
+.challenges-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 2px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.challenges-error button {
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* Rematch ------------------------------------------------------------------
+   A checkbox and the answer to the question you actually have while deciding:
+   is anyone else still here, and has anyone else said yes. Sits between the
+   standings and the action footer, so it reads as part of the result rather
+   than as another button. */
+/* One checkbox under the standings, with no container of its own — the
+   control is the same bare label the home form's Competitive checkbox uses,
+   and boxing it here would make it read as a section rather than a choice. */
+.game-over-rematch {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  /* Aligned with the standings block above it — 22px is the card's inset. */
+  margin: 0 22px 18px;
+}
+
+/* Sized with `.game-shell-button`, because the checkbox sits on the same card
+   as Main menu and Share and a label two sizes larger reads as a heading
+   rather than a choice. Upright, though: the italic on those buttons is what
+   marks them as actions, and this is a state. */
+.game-over-rematch-label {
+  color: var(--game-graphite);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  user-select: none;
+}
+
+.game-over-rematch-blocked {
+  margin-left: auto;
+  color: #b45309;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: right;
+}
+
+
+/* Share adopting the shell button: the icon has to come down to the 9px type
+   it now sits beside, and the icon-only form in the HUD rail needs a square
+   footprint rather than the label padding. */
+.game-shell-button .share-game-icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* The shell button centres its content with no gap of its own, which runs the
+   icon straight into the word. */
+.game-shell-button:has(.share-game-icon) {
+  gap: 7px;
+}
+
+.game-shell-button.is-share-icon {
+  width: 32px;
+  padding: 0;
 }
