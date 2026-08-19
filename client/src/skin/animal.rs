@@ -920,6 +920,7 @@ mod tests {
                             .cells,
                         cell_size: 12.0,
                         boost_active: false,
+                        seed: 0.0,
                         detail_scale: 1.0,
                         anim_ms,
                         reduced_motion,

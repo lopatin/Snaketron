@@ -953,6 +953,9 @@ pub fn render_skin_fixture(
         cells: fixture.cells,
         cell_size,
         boost_active,
+        // A contact sheet compares skins, so every cell of it has to be
+        // attributable to the skin rather than to which snake it stood for.
+        seed: 0.0,
         anim_ms,
         reduced_motion,
         // A fixture sheet is a 1x design-review surface, not the arena.
@@ -1211,6 +1214,9 @@ pub fn skin_perf_smoke(
                 cells: &cells,
                 cell_size,
                 boost_active: true,
+                // Each stacked snake gets its own seed, so a skin that varies
+                // per snake is measured paying for that variation.
+                seed: index as f64,
                 // A distinct clock per frame, so an animated skin cannot be
                 // measured on a cached step it would never hit in play.
                 anim_ms: frame as f64 * 16.7,
@@ -2264,6 +2270,13 @@ pub fn render_game_state(
                 cells: &cells,
                 cell_size,
                 boost_active: snake.boost().active,
+                // The snake's position in the state, which is stable for the
+                // life of a match. Deliberately not the snake id: ids are
+                // handed out across a whole cluster, so two snakes in one game
+                // can be thousands apart, and a skin sampling noise at `seed`
+                // would look different every match instead of merely different
+                // per snake. Presentation-only either way.
+                seed: index as f64,
                 anim_ms,
                 reduced_motion,
                 detail_scale: crate::skin::arena_detail_scale(cell_size),

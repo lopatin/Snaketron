@@ -316,6 +316,7 @@ mod tests {
                         cells: &[(3.0, 3.0), (0.0, 3.0)],
                         cell_size: 12.0,
                         boost_active: false,
+                        seed: 0.0,
                         anim_ms,
                         reduced_motion,
                         detail_scale: 1.0,

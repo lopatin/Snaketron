@@ -144,6 +144,20 @@ pub struct SnakePose<'a> {
     pub cells: &'a [(f64, f64)],
     pub cell_size: f64,
     pub boost_active: bool,
+    /// A number that is stable for one snake and differs between snakes.
+    ///
+    /// The expression language has always offered `seed` for exactly this —
+    /// "stable per snake, so two snakes wearing one skin can differ" — and
+    /// until documents could reach the language, every caller passed zero and
+    /// nothing noticed. Exposing expressions to authors makes that dishonest:
+    /// an author who writes `seed` and gets a constant has been sold a
+    /// capability that does not exist.
+    ///
+    /// Only cosmetics may read it, and only through a skin. It is presentation
+    /// state exactly as `anim_ms` is: never in game state, events, snapshots,
+    /// or the sync fingerprint. Static surfaces (roster glyphs, golden traces,
+    /// contact sheets) pin it to zero so their output stays reproducible.
+    pub seed: f64,
     /// Cosmetic animation clock in milliseconds.
     ///
     /// Presentation time only — it never enters game state, events, snapshots,
@@ -187,6 +201,10 @@ impl<'a> SnakePose<'a> {
             cells,
             cell_size,
             boost_active,
+            // A still surface has to be reproducible, and a per-snake seed is
+            // the one input that would make two otherwise identical glyphs
+            // differ. Pinned here rather than left to each caller.
+            seed: 0.0,
             anim_ms: 0.0,
             reduced_motion: true,
             detail_scale: 1.0,

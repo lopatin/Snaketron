@@ -810,7 +810,13 @@ mod tests {
                             ..
                         },
                     ..
-                } => (*period_cells, *duty, *half_width, *t_center, *phase_cells),
+                } => (
+                    *period_cells,
+                    *duty,
+                    half_width.clone(),
+                    t_center.clone(),
+                    *phase_cells,
+                ),
                 other => panic!("{}: a lane is not a tiled span: {other:?}", recipe.id),
             };
             let near = read(lanes[0]);
@@ -870,6 +876,7 @@ mod tests {
                         cell_size: 12.0,
                         detail_scale: 1.0,
                         boost_active: false,
+                        seed: 0.0,
                         anim_ms,
                         reduced_motion,
                     },

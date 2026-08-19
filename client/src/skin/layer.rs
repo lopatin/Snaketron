@@ -41,34 +41,44 @@ use std::borrow::Cow;
 /// It also keeps the cost model honest, because the two cases are exactly the
 /// two costs — a `Param` is one table slot per step and a lookup per frame, a
 /// `Const` is nothing at all.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Binding {
     Const(f64),
-    /// Index into the baked frame's parameter table.
+    /// Index into the baked frame's parameter table. One slot per step,
+    /// resolved with a lookup.
     Param(usize),
+    /// Evaluated once per snake per frame.
+    ///
+    /// The third tier exists because `len`, `boost` and `seed` are constant
+    /// for a whole snake-frame but *not* constant at registration, so neither
+    /// of the other two can carry them: folding freezes a boost-reactive layer
+    /// at "not boosting", and baking into the per-step table would give every
+    /// snake in the match one body length and one seed.
+    Snake(std::sync::Arc<skin_schema::expr::Expr>),
 }
 
 impl Binding {
     pub const ZERO: Self = Self::Const(0.0);
     pub const ONE: Self = Self::Const(1.0);
 
-    /// The value at one baked frame.
+    /// The value at one baked frame, for one snake.
     ///
     /// A `Param` missing from the table falls back rather than panicking.
     /// Registration rejects such a stack, so this is unreachable in practice —
     /// but a cosmetic must never be able to kill a frame, and that rule is
     /// worth more here than a louder failure.
-    pub fn get(&self, params: &[f64], fallback: f64) -> f64 {
+    pub fn get(&self, params: &[f64], env: &skin_schema::expr::Env, fallback: f64) -> f64 {
         match self {
             Binding::Const(value) => *value,
             Binding::Param(index) => params.get(*index).copied().unwrap_or(fallback),
+            Binding::Snake(expr) => expr.eval(env),
         }
     }
 
     pub fn as_const(&self) -> Option<f64> {
         match self {
             Binding::Const(value) => Some(*value),
-            Binding::Param(_) => None,
+            Binding::Param(_) | Binding::Snake(_) => None,
         }
     }
 
@@ -145,7 +155,7 @@ pub enum ColorSlot {
 /// `overhang_px` reads. Both claims are machine-checked rather than asserted:
 /// the recorder replays the transform stack, so the `TransformLiar` skin in
 /// `skin::conformance` fails the overhang check exactly as a real skin would.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayerTransform {
     pub translate: (Binding, Binding),
     pub scale: (Binding, Binding),
@@ -178,13 +188,13 @@ impl LayerTransform {
     }
 
     /// Every binding in this transform, for validation and cost accounting.
-    pub fn bindings(&self) -> [Binding; 5] {
+    pub fn bindings(&self) -> [&Binding; 5] {
         [
-            self.translate.0,
-            self.translate.1,
-            self.scale.0,
-            self.scale.1,
-            self.rotate_turns,
+            &self.translate.0,
+            &self.translate.1,
+            &self.scale.0,
+            &self.scale.1,
+            &self.rotate_turns,
         ]
     }
 }
@@ -577,6 +587,7 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skin_schema::expr::Env;
 
     fn ribbon(region: Region, extra: f64) -> Layer {
         Layer {
@@ -648,7 +659,7 @@ mod tests {
             ..LayerTransform::default()
         };
         assert!(!bound.is_identity());
-        assert_eq!(bound.translate.0.get(&[0.0], 0.0), 0.0);
+        assert_eq!(bound.translate.0.get(&[0.0], &Env::default(), 0.0), 0.0);
     }
 
     /// The neutral constant is what suppresses an op; a bound value never
@@ -658,8 +669,11 @@ mod tests {
     fn a_binding_reads_its_table_and_survives_a_missing_slot() {
         assert!(Binding::ONE.is_const(1.0));
         assert!(!Binding::Param(0).is_const(1.0));
-        assert_eq!(Binding::Param(1).get(&[0.2, 0.7], 1.0), 0.7);
-        assert_eq!(Binding::Param(9).get(&[0.2], 1.0), 1.0);
-        assert_eq!(Binding::Const(0.4).get(&[], 1.0), 0.4);
+        assert_eq!(
+            Binding::Param(1).get(&[0.2, 0.7], &Env::default(), 1.0),
+            0.7
+        );
+        assert_eq!(Binding::Param(9).get(&[0.2], &Env::default(), 1.0), 1.0);
+        assert_eq!(Binding::Const(0.4).get(&[], &Env::default(), 1.0), 0.4);
     }
 }
