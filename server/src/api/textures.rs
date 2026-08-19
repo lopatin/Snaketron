@@ -187,6 +187,9 @@ pub async fn generate(
         .get_generation_job(&job.job_id)
         .await
         .map_err(TexturesApiError::Internal)?;
+    // The read above and the write here are not atomic, so two copies of one
+    // submit can both find nothing and both try to create. The write is
+    // conditional and idempotent, which is what makes the race safe.
     if existing.is_none() {
         state
             .db

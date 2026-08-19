@@ -244,9 +244,21 @@ pub struct JobLedger {
 
 impl JobLedger {
     pub fn new(budget: Budget) -> Self {
+        Self::resume(budget, Spend::default())
+    }
+
+    /// Carry on from what a job has already spent.
+    ///
+    /// The distinction is not cosmetic. A job is persisted with its spend, and
+    /// a worker that crashed mid-flight has its job re-claimed later — so a
+    /// ledger that always starts at zero turns a per-job ceiling into a
+    /// per-*attempt-of-the-job* ceiling, which is precisely the unbounded
+    /// fan-out the budget exists to stop. Every resumption has to inherit what
+    /// was already paid.
+    pub fn resume(budget: Budget, spent: Spend) -> Self {
         Self {
             budget,
-            spend: Spend::default(),
+            spend: spent,
             attempts: 0,
         }
     }
@@ -271,6 +283,16 @@ impl JobLedger {
     pub fn record_attempt(&mut self, usd_micros: u64) {
         self.attempts += 1;
         self.spend.add_call(usd_micros);
+    }
+
+    /// Start a fresh texture within the same job.
+    ///
+    /// `attempts` is per texture and the call count is per job, so a plan
+    /// producing several textures has to reset one and keep the other.
+    /// Sharing a single counter would stop a four-texture plan after three
+    /// attempts *in total* rather than three per texture.
+    pub fn next_texture(&mut self) {
+        self.attempts = 0;
     }
 
     /// Why the job cannot continue, if it cannot.
@@ -513,5 +535,55 @@ mod tests {
         assert!(JobState::Failed.is_terminal());
         assert!(!JobState::Repairing.is_terminal());
         assert_eq!(JobState::parse("thinking"), None);
+    }
+
+    /// A job resumed after a crash has to inherit what it already spent.
+    ///
+    /// Otherwise the per-job ceiling becomes a per-*attempt-of-the-job*
+    /// ceiling: every re-claim hands back a full budget, and a job that keeps
+    /// failing mid-flight bills without limit. That is the exact fan-out this
+    /// module exists to bound, and it would happen quietly.
+    #[test]
+    fn a_resumed_job_carries_the_money_it_has_already_spent() {
+        let budget = Budget::default();
+        let mut fresh = JobLedger::new(budget);
+        assert!(fresh.may_call());
+
+        // Spend the whole per-job call allowance.
+        for _ in 0..budget.max_provider_calls {
+            fresh.record_attempt(40_000);
+        }
+        assert!(!fresh.may_call());
+        let spent = fresh.spend();
+        assert_eq!(spent.provider_calls, budget.max_provider_calls);
+
+        // A worker picking the job back up must not get a second budget.
+        let resumed = JobLedger::resume(budget, spent);
+        assert!(
+            !resumed.may_call(),
+            "a re-claimed job was handed a fresh budget"
+        );
+        assert_eq!(resumed.spend().usd_micros, spent.usd_micros);
+    }
+
+    /// Attempts are per texture; calls are per job. A plan making several
+    /// textures resets one and keeps the other, or it stops after three
+    /// attempts in total rather than three per texture.
+    #[test]
+    fn a_new_texture_resets_its_attempts_but_not_the_jobs_bill() {
+        let budget = Budget::default();
+        let mut ledger = JobLedger::new(budget);
+        for _ in 0..budget.max_attempts_per_texture {
+            ledger.record_attempt(1_000);
+        }
+        assert!(!ledger.may_call(), "this texture is out of attempts");
+
+        ledger.next_texture();
+        assert!(ledger.may_call(), "the next texture gets its own attempts");
+        assert_eq!(
+            ledger.spend().provider_calls,
+            budget.max_attempts_per_texture,
+            "but the job's bill carries over"
+        );
     }
 }

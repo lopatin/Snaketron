@@ -372,6 +372,17 @@ impl DynamoDatabase {
         }
         item.insert("createdAtMs".to_string(), Self::av_n(job.created_at_ms));
         item.insert("updatedAtMs".to_string(), Self::av_n(job.updated_at_ms));
+        // Jobs are working state, not a record: a week is long enough to read
+        // a failure and short enough that the table does not accumulate them.
+        //
+        // Written here rather than only at creation, because updating a job
+        // replaces the whole item — so a lifetime added once at creation is
+        // stripped by the first progress write, and the job becomes permanent.
+        // Anything this function omits is deleted the moment a job moves.
+        item.insert(
+            "ttl".to_string(),
+            Self::av_n(job.created_at_ms / 1_000 + 7 * 24 * 60 * 60),
+        );
 
         if job.state == JobState::Queued {
             item.insert("gsi1pk".to_string(), Self::av_s("GENJOB_QUEUE"));
@@ -4116,23 +4127,30 @@ impl Database for DynamoDatabase {
             .collect())
     }
 
+    /// Enqueue a job, or notice it is already enqueued.
+    ///
+    /// Idempotent, because the job id is derived from who asked, for what, and
+    /// when — so a double-submitted form produces the same id twice on purpose.
+    /// The caller reads first and writes only if it found nothing, but those
+    /// two steps are not atomic: both copies of one submit can read `None` and
+    /// both try to create. The conditional write is what makes that safe, and
+    /// the loser's refusal is the idempotency mechanism *working*. Surfacing it
+    /// would tell a player their double-click broke something.
     async fn create_generation_job(&self, job: &GenerationJob) -> Result<()> {
-        let mut item = Self::generation_job_item(job)?;
-        // Jobs are working state, not a record: a week is long enough to read
-        // a failure and short enough that the table does not accumulate them.
-        item.insert(
-            "ttl".to_string(),
-            Self::av_n(job.created_at_ms / 1_000 + 7 * 24 * 60 * 60),
-        );
-        self.client
+        let item = Self::generation_job_item(job)?;
+        match self
+            .client
             .put_item()
             .table_name(self.main_table())
             .set_item(Some(item))
             .condition_expression("attribute_not_exists(pk)")
             .send()
             .await
-            .context("Failed to create a generation job")?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_conditional_check_failure(&error) => Ok(()),
+            Err(error) => Err(error).context("Failed to create a generation job"),
+        }
     }
 
     async fn get_generation_job(&self, job_id: &str) -> Result<Option<GenerationJob>> {
@@ -4229,26 +4247,46 @@ impl Database for DynamoDatabase {
         Ok(None)
     }
 
+    /// What generation has cost since a moment, across every page of it.
+    ///
+    /// Paginated, and that is the whole point: DynamoDB caps a query page at
+    /// 1 MB, so a single call silently returns a *prefix* once a day's jobs
+    /// exceed it. This total is the circuit breaker on a bill — reading a
+    /// prefix means the ceiling stops halting exactly when the spend is
+    /// highest, which is the failure the breaker was written to prevent.
     async fn generation_spend_since(&self, since_ms: i64) -> Result<u64> {
-        let response = self
-            .client
-            .query()
-            .table_name(self.main_table())
-            .index_name("GSI2")
-            .key_condition_expression("gsi2pk = :spend AND gsi2sk >= :since")
-            .expression_attribute_values(":spend", Self::av_s("GENJOB_SPEND"))
-            .expression_attribute_values(":since", Self::av_s(format!("{since_ms:020}")))
-            .send()
-            .await
-            .context("Failed to total generation spend")?;
+        let mut total: u64 = 0;
+        let mut start_key = None;
+        loop {
+            let response = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI2")
+                .key_condition_expression("gsi2pk = :spend AND gsi2sk >= :since")
+                .expression_attribute_values(":spend", Self::av_s("GENJOB_SPEND"))
+                .expression_attribute_values(":since", Self::av_s(format!("{since_ms:020}")))
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .context("Failed to total generation spend")?;
 
-        Ok(response
-            .items
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|item| Self::extract_i64(item, "spendUsdMicros"))
-            .map(|value| value.max(0) as u64)
-            .sum())
+            total = total.saturating_add(
+                response
+                    .items
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|item| Self::extract_i64(item, "spendUsdMicros"))
+                    .map(|value| value.max(0) as u64)
+                    .sum(),
+            );
+
+            start_key = response.last_evaluated_key;
+            if start_key.is_none() {
+                return Ok(total);
+            }
+        }
     }
 
     async fn purchase_skin(
