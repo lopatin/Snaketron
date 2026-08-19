@@ -194,7 +194,10 @@ await page.goto(`${baseUrl}/skins/builder`, { waitUntil: 'networkidle' });
 await page.waitForSelector('.builder-preview canvas');
 await page.getByRole('button', { name: 'Save skin' }).click();
 await page.waitForSelector('.builder-status');
-await clip('15-builder-saved', '.builder-actions', 14);
+// The whole header, not just the buttons: the confirmation and the fact that
+// "send for review" has appeared are the point of the shot.
+await page.evaluate(() => window.scrollTo(0, 0));
+await clip('15-builder-saved', '.builder-main', 0);
 
 // ---------------------------------------------------------------------------
 // 11. The review queue an admin decides from.
