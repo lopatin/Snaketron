@@ -451,6 +451,11 @@ mod tests {
                 .expect("the shipped classic document parses");
         let mut v2 = skin_schema::v2::upgrade(&v1);
         v2.id = "layered@1".to_string();
+        // A new id does not inherit the shipped document's recorded label
+        // exemption, so the steel free-for-all slot has to earn its contrast
+        // like any other authored skin's would.
+        v2.palette.free_for_all[2].fill = "#93a3b5".to_string();
+        v2.palette.free_for_all[2].outline = "#5d6e81".to_string();
 
         let canonical = String::from_utf8(
             skin_schema::content::canonical_bytes(&serde_json::to_value(&v2).expect("serializes"))

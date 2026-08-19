@@ -49,6 +49,9 @@ pub const MAX_TEXTURE_REFS: usize = 4;
 pub const MAX_GROUP_DEPTH: usize = 1;
 /// A text source's content: one glyph per cell, repeating along the span.
 pub const MAX_TEXT_CONTENT_LEN: usize = 24;
+/// The op ceiling one snake must stay inside, shared with `client::skin::perf`
+/// so the Builder's meter and the renderer's budget cannot drift apart.
+pub const MAX_OPS_PER_SNAKE: usize = 200;
 /// The glyph atlas charset. Moderation of *words* is M4's review dimension;
 /// this is only what the atlas can draw.
 pub const TEXT_CHARSET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .!?-";
@@ -118,8 +121,12 @@ impl ColorRef {
     }
 }
 
+/// Untagged, so a reference reads as `{"slot": "fill"}` rather than
+/// `{"slot": {"slot": "fill"}}`. The two arms carry different keys, so there
+/// is nothing for serde to be ambiguous about — and the document is something
+/// people read and hand-edit, which is worth one attribute.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum ColorTarget {
     Slot { slot: SlotName },
     Literal { literal: String },
@@ -850,6 +857,34 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
         validate_layer(doc, layer, &format!("layers[{index}]"), 0, &mut errors);
     }
 
+    // What the skin actually paints, once the stack is known to be sound.
+    // Structure can only say a colour is legal; this says the composite is
+    // readable, which is the question v1 could answer analytically and v2
+    // cannot.
+    if errors.is_empty() {
+        errors.extend(crate::sampler::check(doc));
+    }
+
+    // Cost last, and only when the stack is otherwise sound: a malformed layer
+    // would be priced on a reading of it that is not the one that would ship,
+    // and "too expensive" is a confusing thing to be told about a skin that is
+    // also invalid.
+    if errors.is_empty() {
+        let predicted = predict_ops(doc);
+        if predicted > MAX_OPS_PER_SNAKE {
+            errors.push(SkinDocError::new(
+                "layers",
+                format!(
+                    "this skin costs about {predicted} drawing operations per \
+                     snake, over the {MAX_OPS_PER_SNAKE} budget. Eight snakes \
+                     share a frame, which is why the budget is per snake rather \
+                     than per skin. Fewer layers, longer band repeats, or fewer \
+                     gradient stops all buy it back."
+                ),
+            ));
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1276,6 +1311,119 @@ fn validate_source(
                 ));
             }
         }
+    }
+}
+
+/// The snake a document's cost is quoted against.
+///
+/// Deliberately the same body `client::skin::perf` measures its census on — a
+/// straight 21-cell snake at the arena's largest cell, boosting — so the
+/// Builder's meter and the shipped budget are talking about the same snake
+/// rather than two plausible ones.
+pub const COST_REFERENCE_CELLS: usize = 21;
+pub const COST_REFERENCE_RUNS: usize = 1;
+
+/// A predicted upper bound on the canvas ops one snake costs.
+///
+/// **An upper bound, not an estimate.** A budget that sometimes under-predicts
+/// is worse than none: it would clear a skin at save time and blow the frame
+/// in a match, where nobody could attribute it. Every term below is the most
+/// the corresponding lowering can emit, so `predicted >= recorded` always — a
+/// property the client pins by recording real skins and comparing.
+///
+/// It is deliberately in this crate rather than beside the renderer, because
+/// the Builder's live meter, the save-time gate and CI all have to reach the
+/// same verdict, and only this crate is compiled into all three.
+pub fn predict_ops(doc: &SkinDocV2) -> usize {
+    let runs = COST_REFERENCE_RUNS;
+    let cells = COST_REFERENCE_CELLS;
+
+    // The two system layers: the Boost band (a contour ribbon, present because
+    // the reference snake is boosting) and the head core (a disc).
+    let mut total = ribbon_ops(runs, true, false) + DISC_OPS;
+
+    for layer in &doc.layers {
+        total += layer_ops(layer, runs, cells);
+    }
+    total
+}
+
+const DISC_OPS: usize = 5;
+
+fn layer_ops(layer: &LayerV2, runs: usize, cells: usize) -> usize {
+    // Opacity that is not the constant 1 emits a set and a reset; a non-identity
+    // transform emits a save, up to three ops, and a restore.
+    let constant_one = layer
+        .opacity
+        .parse()
+        .map(|expr| expr.inputs().is_empty() && expr.eval(&crate::expr::Env::default()) == 1.0)
+        .unwrap_or(false);
+    let mut total = usize::from(!constant_one) * 2;
+    if !layer.transform.is_identity() {
+        total += 5;
+    }
+
+    total
+        + match &layer.body {
+            LayerBodyV2::Group { layers } => layers
+                .iter()
+                .map(|child| layer_ops(child, runs, cells))
+                .sum(),
+            LayerBodyV2::Ribbon {
+                joints, tail_cap, ..
+            } => ribbon_ops(runs, *joints, *tail_cap),
+            LayerBodyV2::HeadRamp { length_cells, .. } => {
+                // One set_fill and one fill_rect per covered cell.
+                2 * (length_cells.max(0.0).ceil() as usize).min(cells)
+            }
+            LayerBodyV2::HeadDisc { .. } => DISC_OPS,
+            LayerBodyV2::Span { source, .. } => {
+                // A span opens and closes one clip.
+                let clip = 4 + runs * 3;
+                clip + source_ops(source, runs, cells)
+            }
+        }
+}
+
+fn ribbon_ops(runs: usize, joints: bool, tail_cap: bool) -> usize {
+    // Colour and width, a stroke and a fill per run, a disc at each joint, and
+    // a capped tail.
+    4 + runs * 3 + usize::from(joints) * runs + usize::from(tail_cap) * 4
+}
+
+fn source_ops(source: &SourceV2, runs: usize, cells: usize) -> usize {
+    let per_run_frame = 3; // save, transform, restore
+    match source {
+        SourceV2::Solid { .. } => 1 + runs,
+        SourceV2::Gradient { stops, .. } => runs * (per_run_frame + 2 + stops.len()),
+        SourceV2::Band {
+            period_cells,
+            alpha,
+            ..
+        } => {
+            // One more repeat than the body strictly holds: a repeat may
+            // straddle either end.
+            let repeats = (cells as f64 / period_cells.max(0.5)).ceil() as usize + 1;
+            1 + repeats * (runs + usize::from(alpha.is_some()) * 2)
+        }
+        SourceV2::Image { fit, fade, .. } => {
+            let repeats = match fit {
+                FitV2::Tile { cells_per_repeat } => {
+                    (cells as f64 / cells_per_repeat.unwrap_or(1.0).max(0.25)).ceil() as usize + 1
+                }
+                _ => 1,
+            };
+            let slices = fade.map_or(1, |fade| {
+                if fade.lead_cells > 0.0 || fade.trail_cells > 0.0 {
+                    fade.steps.max(1) * 2
+                } else {
+                    1
+                }
+            });
+            runs * (per_run_frame + repeats * slices)
+        }
+        // One blit per covered cell, plus its alpha.
+        SourceV2::Text { .. } => runs * per_run_frame + cells * 2,
     }
 }
 

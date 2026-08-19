@@ -736,7 +736,25 @@ pub(crate) fn conformance_fixtures() -> Vec<SkinDocV2> {
         let v1: skin_schema::SkinDoc =
             serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
                 .expect("the shipped classic document parses");
-        upgrade(&v1)
+        let mut doc = upgrade(&v1);
+        // The steel free-for-all slot is the shipped look's one recorded weak
+        // spot: dark enough that the label ink derives to white, and then lit
+        // by the head glow until that white stops reading. The exemption covers
+        // `classic-doc@1` and nothing else, so these fixtures — which are new
+        // skins — have to fix it rather than inherit it.
+        //
+        // Lightened rather than darkened, and that is the interesting part. The
+        // first two attempts darkened it, and each time the sampler refused the
+        // fixtures again: any bright layer over a near-black body washes a white
+        // label out, so darkening buys a little headroom and then loses it to
+        // the next layer. Going the other way flips the derived ink to dark,
+        // and a dark label on a light body only gets *more* readable as
+        // something bright passes over it. The sampler found all three rounds
+        // of this, on fixtures written by someone who had just written the
+        // sampler.
+        doc.palette.free_for_all[2].fill = "#93a3b5".to_string();
+        doc.palette.free_for_all[2].outline = "#5d6e81".to_string();
+        doc
     };
     let layer = |name: &str, opacity: &str, body: LayerBodyV2| LayerV2 {
         name: name.to_string(),
@@ -774,6 +792,12 @@ pub(crate) fn conformance_fixtures() -> Vec<SkinDocV2> {
             axis: GradientAxis::AlongBody,
             stops: vec![
                 stop("saw(time) - 0.15", ColorRef::slot(SlotName::Fill), "0"),
+                // Deliberately restrained. The first draft of this fixture put
+                // the gleam at 0.55, and the sampler refused it: a crest that
+                // travels the whole body visits the two cells where the
+                // carried-food number sits, and a near-white wash there drops
+                // the derived white label to 1.9:1. A shine reads as a shine at
+                // this strength and stays legible at every step.
                 stop(
                     "saw(time)",
                     ColorRef {
@@ -782,7 +806,7 @@ pub(crate) fn conformance_fixtures() -> Vec<SkinDocV2> {
                         },
                         lighten: None,
                     },
-                    "0.55",
+                    "0.14",
                 ),
                 stop("saw(time) + 0.15", ColorRef::slot(SlotName::Fill), "0"),
             ],
@@ -859,6 +883,54 @@ mod tests {
     fn classic_v1() -> SkinDoc {
         serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
             .expect("the shipped classic document parses")
+    }
+
+    /// **The cost model's honesty check.**
+    ///
+    /// `skin_schema::v2::predict_ops` is what the Builder's meter shows and
+    /// what the save-time gate refuses on, and it lives in a crate that cannot
+    /// see the renderer. That is only safe while it genuinely bounds what the
+    /// renderer emits — a prediction that ever came in *under* the truth would
+    /// clear a skin at save time and blow the frame in a match, where nobody
+    /// could attribute it.
+    ///
+    /// So: record the same reference snake `skin::perf` measures its census
+    /// on, and require the prediction to bound it. The upper bound on the
+    /// looseness is the other half — a model that predicted a million would
+    /// also never under-predict, and would be useless as a meter.
+    #[test]
+    fn the_predicted_cost_bounds_what_the_renderer_actually_emits() {
+        let mut documents = conformance_fixtures();
+        documents.push(upgrade(&classic_v1()));
+
+        for doc in documents {
+            let skin = LayerSkin::compile(&doc).expect("fixture compiles");
+            let recorded = record(
+                &skin,
+                &[
+                    (skin_schema::v2::COST_REFERENCE_CELLS as f64 - 1.0, 4.0),
+                    (0.0, 4.0),
+                ],
+                true,
+            )
+            .lines()
+            .count();
+            let predicted = skin_schema::v2::predict_ops(&doc);
+
+            assert!(
+                predicted >= recorded,
+                "{}: predicted {predicted} ops but the renderer emitted \
+                 {recorded}. The model has to bound the truth, or the budget \
+                 clears skins that then blow a frame.",
+                doc.id
+            );
+            assert!(
+                predicted <= recorded * 4 + 24,
+                "{}: predicted {predicted} against {recorded} actual — the \
+                 model is so loose it stops being a meter",
+                doc.id
+            );
+        }
     }
 
     /// Every fixture has to be a document a player could actually have saved.

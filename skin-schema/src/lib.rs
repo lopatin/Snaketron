@@ -13,7 +13,9 @@
 pub mod color;
 pub mod content;
 pub mod describe;
+pub mod describe_v2;
 pub mod expr;
+pub mod sampler;
 pub mod v2;
 
 use color::{ENEMY_HUES, FRIENDLY_HUES, HueWindow, NEUTRAL_CHROMA, Rgb, contrast_ratio};
@@ -239,7 +241,7 @@ pub struct CelebrationTheme {
 /// over by loosening the rule for everyone.
 ///
 /// New skins get the strict rule. This list should never grow.
-const LIT_LABEL_EXEMPT: &[&str] = &["classic-doc@1"];
+pub(crate) const LIT_LABEL_EXEMPT: &[&str] = &["classic-doc@1"];
 
 /// Effect ids the client knows how to draw.
 pub const KNOWN_EFFECTS: &[&str] = &["goal-impact-wave"];
