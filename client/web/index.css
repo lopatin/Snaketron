@@ -6229,10 +6229,11 @@ a.home-social-icon:hover {
   /* Docked bottom-centre rather than under the header: the top of this screen
      is the brand lockup, and a toast there covers it. The left and right
      bottom corners belong to the region selector and the chat trigger, so the
-     centre lane is the one free strip on the page. */
+     centre lane is the one free strip on the page. Raised clear of the social
+     footer that closes the home screen's centre stack. */
   position: fixed;
   right: 0;
-  bottom: calc(24px + var(--ad-route-bottom-reserve));
+  bottom: calc(76px + var(--ad-route-bottom-reserve));
   left: 0;
   z-index: 45;
   display: flex;
