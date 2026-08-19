@@ -31,16 +31,36 @@ type FieldKind =
   | { control: 'color' }
   | { control: 'number'; min: number; max: number; step: number }
   | { control: 'text'; maxLength: number }
-  | { control: 'choice'; options: string[] }
+  | { control: 'choice'; options: ChoiceOption[] }
   | { control: 'group'; children: FieldNode[] }
   | { control: 'optional'; children: FieldNode[] }
-  | { control: 'list'; itemLabel: string; children: FieldNode[] };
+  | {
+      control: 'list';
+      itemLabel: string;
+      /** What one new item starts as, so "add" adds something that works. */
+      itemDefault: unknown;
+      children: FieldNode[];
+    };
+
+/** One selectable value and the words an author reads for it. */
+interface ChoiceOption {
+  value: string;
+  label: string;
+}
 
 interface FieldNode {
   path: string;
   label: string;
   kind: FieldKind;
   help?: string;
+  /**
+   * What to insert when an optional section is switched on.
+   *
+   * Comes from the schema rather than being invented here, because "on" has to
+   * mean a section that validates — being handed an error for switching
+   * Animation on is a worse first move than not offering the switch.
+   */
+  default?: unknown;
 }
 
 type Document = Record<string, unknown>;
@@ -58,17 +78,28 @@ const read = (document: Document, path: string): unknown =>
  * Write a dotted path, returning a new document.
  *
  * Copies down the path rather than mutating, so React sees a changed object and
- * the preview's effect actually re-runs.
+ * the preview's effect re-runs. Arrays are copied *as arrays*: palettes are
+ * arrays of colour pairs, and spreading one into an object turns
+ * `friendly: [a, b]` into `friendly: {0: a, 1: b}`, which the schema then
+ * refuses as "expected an array of length 2" — from a colour picker, which is
+ * not a message anybody could act on.
  */
-const write = (document: Document, path: string, next: unknown): Document => {
+const write = (target: unknown, path: string, next: unknown): unknown => {
   const [head, ...rest] = path.split('.');
+  const container: Record<string, unknown> | unknown[] = Array.isArray(target)
+    ? [...target]
+    : { ...((target as Record<string, unknown> | null) ?? {}) };
+
   if (rest.length === 0) {
-    return { ...document, [head]: next };
+    (container as Record<string, unknown>)[head] = next;
+    return container;
   }
-  const child = document[head];
-  const base: Document =
-    child !== null && typeof child === 'object' ? { ...(child as Document) } : {};
-  return { ...document, [head]: write(base, rest.join('.'), next) };
+
+  const child = (target as Record<string, unknown> | undefined)?.[head];
+  // A numeric next key means the thing being built is an array, not an object.
+  const seed = child ?? (/^\d+$/.test(rest[0]) ? [] : {});
+  (container as Record<string, unknown>)[head] = write(seed, rest.join('.'), next);
+  return container;
 };
 
 /**
@@ -182,7 +213,7 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
       );
     }
     case 'choice': {
-      const value = (read(document, field.path) as string) ?? kind.options[0];
+      const value = (read(document, field.path) as string) ?? kind.options[0]?.value;
       return (
         <label className="builder-field">
           <span>{field.label}</span>
@@ -192,8 +223,8 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
             data-testid={`builder-${field.path}`}
           >
             {kind.options.map((option) => (
-              <option key={option} value={option}>
-                {option}
+              <option key={option.value} value={option.value}>
+                {option.label}
               </option>
             ))}
           </select>
@@ -218,8 +249,12 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
       );
     }
     case 'optional': {
-      const present = read(document, field.path) !== undefined
-        && read(document, field.path) !== null;
+      const current = read(document, field.path);
+      const present = current !== undefined && current !== null;
+      // An optional *scalar* (label ink, say) describes one child sharing its
+      // own path; an optional *section* describes children beneath it.
+      const isScalar =
+        kind.children.length === 1 && kind.children[0].path === field.path;
       return (
         <fieldset className="builder-group builder-group-optional">
           <legend>
@@ -228,7 +263,10 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
                 type="checkbox"
                 checked={present}
                 onChange={(event) =>
-                  onChange(field.path, event.target.checked ? {} : undefined)
+                  onChange(
+                    field.path,
+                    event.target.checked ? (field.default ?? {}) : undefined,
+                  )
                 }
                 data-testid={`builder-toggle-${field.path}`}
               />
@@ -240,7 +278,9 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
             ? kind.children.map((child) => (
                 <Control
                   key={child.path}
-                  field={child}
+                  // A scalar's single child renders the value itself, so it
+                  // must not re-draw the label the legend already carries.
+                  field={isScalar ? { ...child, label: '' } : child}
                   document={document}
                   onChange={onChange}
                 />
@@ -287,7 +327,7 @@ const Control: React.FC<ControlProps> = ({ field, document, onChange }) => {
           <button
             type="button"
             className="game-shell-button"
-            onClick={() => onChange(field.path, [...items, {}])}
+            onClick={() => onChange(field.path, [...items, kind.itemDefault])}
             data-testid={`builder-add-${field.path}`}
           >
             Add {kind.itemLabel.toLowerCase()}
@@ -362,12 +402,14 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
       setProblems([]);
       setRevision((current) => current + 1);
     } catch (cause) {
-      setProblems([String(cause)]);
+      // The validator returns one complaint per line, each already worded for
+      // the person who caused it.
+      setProblems(String(cause).split('\n').filter(Boolean));
     }
   }, [document, handle, schema.length]);
 
   const change = useCallback((path: string, value: unknown) => {
-    setDocument((current) => write(current, path, value));
+    setDocument((current) => write(current, path, value) as Document);
     setStatus(null);
   }, []);
 

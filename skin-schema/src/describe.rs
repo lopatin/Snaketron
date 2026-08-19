@@ -138,7 +138,7 @@ mod exhaustiveness {
     ///
     /// Matched exhaustively so the editor's choice list is the language's own
     /// list rather than a copy that could fall behind it.
-    pub fn track_targets() -> Vec<&'static str> {
+    pub fn track_targets() -> Vec<(&'static str, &'static str)> {
         [
             TrackTarget::BodyLightness,
             TrackTarget::OutlineLightness,
@@ -146,9 +146,9 @@ mod exhaustiveness {
         ]
         .into_iter()
         .map(|target| match target {
-            TrackTarget::BodyLightness => "body_lightness",
-            TrackTarget::OutlineLightness => "outline_lightness",
-            TrackTarget::GradientOpacity => "gradient_opacity",
+            TrackTarget::BodyLightness => ("body_lightness", "Body brightness"),
+            TrackTarget::OutlineLightness => ("outline_lightness", "Outline brightness"),
+            TrackTarget::GradientOpacity => ("gradient_opacity", "Head glow strength"),
         })
         .collect()
     }
@@ -166,6 +166,13 @@ pub struct FieldNode {
     /// Why it exists, shown where an editor has room for help text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub help: Option<String>,
+    /// What to insert when an optional section is switched on.
+    ///
+    /// Supplied here rather than guessed by the editor, because "on" has to
+    /// mean a section that *validates*: switching Animation on and being handed
+    /// an error is a worse first move than not offering the switch at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 /// The control an editor should render.
@@ -183,11 +190,17 @@ pub enum FieldKind {
         step: f64,
     },
     Text {
+        // Renamed explicitly: `rename_all` on an enum renames its *variants*,
+        // not the fields inside them, so without this the editor receives
+        // `max_length` while reading `maxLength` and silently caps nothing.
+        #[serde(rename = "maxLength")]
         max_length: usize,
     },
-    /// One of a fixed set.
+    /// One of a fixed set. Each option carries the value that goes in the
+    /// document and the words an author reads — `gradient_opacity` is a wire
+    /// name, not a label.
     Choice {
-        options: Vec<String>,
+        options: Vec<ChoiceOption>,
     },
     /// A section containing other fields.
     Group {
@@ -199,9 +212,28 @@ pub enum FieldKind {
     },
     /// A repeated section.
     List {
+        #[serde(rename = "itemLabel")]
         item_label: String,
+        /// What one new item starts as. Adding a track that does nothing until
+        /// three sliders are moved is a worse "add" than none.
+        #[serde(rename = "itemDefault")]
+        item_default: serde_json::Value,
         children: Vec<FieldNode>,
     },
+}
+
+/// One selectable value and the words for it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChoiceOption {
+    pub value: String,
+    pub label: String,
+}
+
+fn choice(value: &str, label: &str) -> ChoiceOption {
+    ChoiceOption {
+        value: value.to_string(),
+        label: label.to_string(),
+    }
 }
 
 fn node(path: &str, label: &str, kind: FieldKind) -> FieldNode {
@@ -210,6 +242,7 @@ fn node(path: &str, label: &str, kind: FieldKind) -> FieldNode {
         label: label.to_string(),
         kind,
         help: None,
+        default: None,
     }
 }
 
@@ -219,6 +252,41 @@ fn explained(path: &str, label: &str, kind: FieldKind, help: &str) -> FieldNode 
         label: label.to_string(),
         kind,
         help: Some(help.to_string()),
+        default: None,
+    }
+}
+
+/// An optional section whose default is given before its children, for the
+/// cases where listing the children last reads better.
+fn optional_with_children(
+    path: &str,
+    label: &str,
+    default: serde_json::Value,
+    children: Vec<FieldNode>,
+) -> FieldNode {
+    FieldNode {
+        path: path.to_string(),
+        label: label.to_string(),
+        kind: FieldKind::Optional { children },
+        help: None,
+        default: Some(default),
+    }
+}
+
+/// An optional section, and the validating value that switching it on inserts.
+fn optional(
+    path: &str,
+    label: &str,
+    children: Vec<FieldNode>,
+    help: &str,
+    default: serde_json::Value,
+) -> FieldNode {
+    FieldNode {
+        path: path.to_string(),
+        label: label.to_string(),
+        kind: FieldKind::Optional { children },
+        help: Some(help.to_string()),
+        default: Some(default),
     }
 }
 
@@ -259,29 +327,48 @@ pub fn describe_skin_doc() -> Vec<FieldNode> {
                 children: describe_labels(),
             },
         ),
-        explained(
+        optional(
             "animation",
             "Animation",
-            FieldKind::Optional {
-                children: describe_animation(),
-            },
+            describe_animation(),
             "Varies colour over time. What the snake paints never changes.",
+            // One gentle track, because an animation with nothing in it is
+            // refused outright — "switched on" has to mean something moves.
+            serde_json::json!({
+                "period_ms": 2600.0,
+                "tracks": [
+                    { "target": "gradient_opacity", "amplitude": 0.06, "phase": 0.0 }
+                ]
+            }),
         ),
-        explained(
+        optional(
             "base",
             "Base dressing",
-            FieldKind::Optional {
-                children: describe_base(),
-            },
+            describe_base(),
             "Themes the arena you are looking at. Other players see their own.",
+            // Classic's own dressing: valid by construction, and a familiar
+            // starting point to nudge away from.
+            serde_json::json!({
+                "friendly_zone": "#e6f4fa",
+                "enemy_zone": "#ffe6e6",
+                "friendly_wall": "#7aa8c1",
+                "enemy_wall": "#c18888",
+                "friendly_text": "#c0d8e4",
+                "enemy_text": "#e4c0c0",
+            }),
         ),
-        explained(
+        optional(
             "celebration",
             "Goal celebration",
-            FieldKind::Optional {
-                children: describe_celebration(),
-            },
+            describe_celebration(),
             "Plays for everyone when you score.",
+            serde_json::json!({
+                "effect": "goal-impact-wave",
+                "friendly_accent": "#5299bb",
+                "enemy_accent": "#d45454",
+                "readout_friendly": "#2b6f8c",
+                "readout_enemy": "#a83232",
+            }),
         ),
     ]
 }
@@ -381,20 +468,19 @@ fn describe_outline() -> Vec<FieldNode> {
 
 fn describe_labels() -> Vec<FieldNode> {
     vec![
-        explained(
+        optional(
             "labels.ink",
             "Label ink",
-            FieldKind::Optional {
-                children: vec![node("labels.ink", "Colour", FieldKind::Color)],
-            },
+            vec![node("labels.ink", "Colour", FieldKind::Color)],
             "Carried-food digits. Left alone, it is derived from your fill.",
+            serde_json::json!("#1f2937"),
         ),
-        node(
+        optional(
             "labels.swatch",
             "Swatch",
-            FieldKind::Optional {
-                children: vec![node("labels.swatch", "Colour", FieldKind::Color)],
-            },
+            vec![node("labels.swatch", "Colour", FieldKind::Color)],
+            "One flat colour for menus and scoreboards.",
+            serde_json::json!("#1f2937"),
         ),
     ]
 }
@@ -416,6 +502,12 @@ fn describe_animation() -> Vec<FieldNode> {
             "Tracks",
             FieldKind::List {
                 item_label: "Track".to_string(),
+                // A new track that moves nothing is not an addition.
+                item_default: serde_json::json!({
+                    "target": "body_lightness",
+                    "amplitude": 0.07,
+                    "phase": 0.0
+                }),
                 children: vec![
                     node(
                         "target",
@@ -423,7 +515,7 @@ fn describe_animation() -> Vec<FieldNode> {
                         FieldKind::Choice {
                             options: exhaustiveness::track_targets()
                                 .into_iter()
-                                .map(str::to_string)
+                                .map(|(value, label)| choice(value, label))
                                 .collect(),
                         },
                     ),
@@ -448,40 +540,43 @@ fn describe_animation() -> Vec<FieldNode> {
                 ],
             },
         ),
-        node(
+        optional_with_children(
             "animation.wave",
             "Travelling wave",
-            FieldKind::Optional {
-                children: vec![
-                    node(
-                        "animation.wave.cells_per_crest",
-                        "Cells per crest",
-                        FieldKind::Number {
-                            min: crate::MIN_WAVE_CELLS_PER_CREST,
-                            max: crate::MAX_WAVE_CELLS_PER_CREST,
-                            step: 1.0,
-                        },
-                    ),
-                    node(
-                        "animation.wave.amplitude",
-                        "How far",
-                        FieldKind::Number {
-                            min: 0.0,
-                            max: crate::MAX_ANIMATION_AMPLITUDE,
-                            step: 0.01,
-                        },
-                    ),
-                    node(
-                        "animation.wave.crests_per_cycle",
-                        "Crests per cycle",
-                        FieldKind::Number {
-                            min: -16.0,
-                            max: 16.0,
-                            step: 0.5,
-                        },
-                    ),
-                ],
-            },
+            serde_json::json!({
+                "cells_per_crest": 8.0,
+                "amplitude": 0.08,
+                "crests_per_cycle": 1.0
+            }),
+            vec![
+                node(
+                    "animation.wave.cells_per_crest",
+                    "Cells per crest",
+                    FieldKind::Number {
+                        min: crate::MIN_WAVE_CELLS_PER_CREST,
+                        max: crate::MAX_WAVE_CELLS_PER_CREST,
+                        step: 1.0,
+                    },
+                ),
+                node(
+                    "animation.wave.amplitude",
+                    "How far",
+                    FieldKind::Number {
+                        min: 0.0,
+                        max: crate::MAX_ANIMATION_AMPLITUDE,
+                        step: 0.01,
+                    },
+                ),
+                node(
+                    "animation.wave.crests_per_cycle",
+                    "Crests per cycle",
+                    FieldKind::Number {
+                        min: -16.0,
+                        max: 16.0,
+                        step: 0.5,
+                    },
+                ),
+            ],
         ),
     ]
 }
@@ -503,7 +598,10 @@ fn describe_celebration() -> Vec<FieldNode> {
             "celebration.effect",
             "Effect",
             FieldKind::Choice {
-                options: KNOWN_EFFECTS.iter().map(|id| (*id).to_string()).collect(),
+                options: KNOWN_EFFECTS
+                    .iter()
+                    .map(|id| choice(id, "Goal impact wave"))
+                    .collect(),
             },
             "Which first-party effect plays. A skin picks one; it never ships code.",
         ),
@@ -650,12 +748,17 @@ mod tests {
                 options = Some(choices.clone());
             }
         });
+        let options = options.expect("the effect field is a choice");
         assert_eq!(
-            options.expect("the effect field is a choice"),
-            KNOWN_EFFECTS
+            options
                 .iter()
-                .map(|id| (*id).to_string())
-                .collect::<Vec<_>>()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            KNOWN_EFFECTS.to_vec()
+        );
+        assert!(
+            options.iter().all(|option| option.label != option.value),
+            "an author reads labels, not wire names"
         );
     }
 
@@ -674,8 +777,71 @@ mod tests {
         let options = options.expect("the track target is a choice");
         assert_eq!(options.len(), 3);
         for target in ["body_lightness", "outline_lightness", "gradient_opacity"] {
-            assert!(options.iter().any(|option| option == target));
+            assert!(options.iter().any(|option| option.value == target));
         }
+        assert!(
+            options.iter().all(|option| !option.label.contains('_')),
+            "wire names must not reach an author"
+        );
+    }
+
+    /// Switching a section on must produce a section that validates. Without a
+    /// default the editor would have to invent one, and an invented animation
+    /// with no period is exactly the error a new author should never meet.
+    #[test]
+    fn every_optional_section_carries_a_validating_default() {
+        let mut missing = Vec::new();
+        walk(&describe_skin_doc(), &mut |node| {
+            if matches!(node.kind, FieldKind::Optional { .. }) && node.default.is_none() {
+                missing.push(node.path.clone());
+            }
+        });
+        assert!(
+            missing.is_empty(),
+            "optional sections with no default: {missing:?}"
+        );
+    }
+
+    /// And those defaults have to be real, not merely present.
+    ///
+    /// Scoped honestly: a default section is checked for *structural*
+    /// completeness — every field the validator requires, in range — by
+    /// applying it to the document it was drawn from. Whether a given animation
+    /// also clears label contrast depends on the palette underneath it, which
+    /// is a question only the live editor can answer, and does.
+    #[test]
+    fn every_default_section_is_structurally_complete() {
+        let base: crate::SkinDoc = serde_json::from_str(include_str!("../skins/aurora.skin.json"))
+            .expect("the shipped document parses");
+
+        let mut defaults = std::collections::HashMap::new();
+        walk(&describe_skin_doc(), &mut |node| {
+            if let (FieldKind::Optional { .. }, Some(default)) = (&node.kind, &node.default) {
+                defaults.insert(node.path.clone(), default.clone());
+            }
+        });
+
+        // Each top-level section, applied on its own, still deserializes into a
+        // document and still validates.
+        for path in ["animation", "base", "celebration"] {
+            let mut value = serde_json::to_value(&base).expect("serializes");
+            value[path] = defaults
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} has a default"))
+                .clone();
+            let doc: crate::SkinDoc = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("the {path} default is not a {path}: {error}"));
+            crate::validate(&doc)
+                .unwrap_or_else(|errors| panic!("the {path} default is invalid: {errors:?}"));
+        }
+
+        // The wave nests inside the animation rather than beside it.
+        let mut value = serde_json::to_value(&base).expect("serializes");
+        value["animation"] = defaults["animation"].clone();
+        value["animation"]["wave"] = defaults["animation.wave"].clone();
+        let doc: crate::SkinDoc =
+            serde_json::from_value(value).expect("the wave default is a wave");
+        crate::validate(&doc).expect("the wave default is valid");
     }
 
     #[test]
@@ -684,5 +850,33 @@ mod tests {
         assert!(json.contains("\"control\":\"color\""));
         assert!(json.contains("\"control\":\"number\""));
         assert!(json.contains("\"control\":\"optional\""));
+    }
+
+    /// Field names inside a variant are the editor's contract, and serde does
+    /// *not* camel-case them for free: `rename_all` on an enum renames the
+    /// variants only. Getting this wrong is silent on both sides — the editor
+    /// reads `undefined` and renders a control with no bound — so the exact
+    /// keys are pinned here.
+    #[test]
+    fn variant_fields_reach_the_editor_in_the_case_it_reads() {
+        let json = serde_json::to_string(&describe_skin_doc()).expect("serializes");
+        assert!(
+            json.contains("\"maxLength\""),
+            "the text cap must be camelCase"
+        );
+        assert!(
+            json.contains("\"itemLabel\""),
+            "the list label must be camelCase"
+        );
+        assert!(
+            json.contains("\"itemDefault\""),
+            "the list item default must be camelCase"
+        );
+        assert!(
+            !json.contains("\"max_length\"")
+                && !json.contains("\"item_label\"")
+                && !json.contains("\"item_default\""),
+            "no snake_case variant field may survive into the editor's schema"
+        );
     }
 }

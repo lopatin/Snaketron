@@ -189,9 +189,47 @@ pub fn register_authored_skin(content_ref: &str, document_json: &str) -> Result<
         ));
     }
 
-    let skin = ParamSkin::from_json(document_json).map_err(|errors| format!("{errors:?}"))?;
+    let skin = ParamSkin::from_json(document_json).map_err(readable)?;
     registered.push((content_ref.to_string(), Box::leak(Box::new(skin))));
     Ok(())
+}
+
+/// Turn validator complaints into something a person can act on.
+///
+/// The debug formatting of a `Vec<SkinDocError>` is fine in a test failure and
+/// useless in an editor: an author who has just moved a colour picker should be
+/// told which colour and why, not handed `SkinDocError { field: ... }`.
+fn readable(errors: Vec<skin_schema::SkinDocError>) -> String {
+    errors
+        .iter()
+        .map(|error| format!("{} — {}", pretty_field(&error.field), error.problem))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A field path as the editor labels it, so the message names the control the
+/// author is looking at rather than the path the schema uses.
+fn pretty_field(field: &str) -> String {
+    let labelled = field
+        .replace("palette.friendly[0]", "Friendly (light)")
+        .replace("palette.friendly[1]", "Friendly (dark)")
+        .replace("palette.enemy[0]", "Enemy (light)")
+        .replace("palette.enemy[1]", "Enemy (dark)")
+        .replace("palette.free_for_all[", "Free-for-all slot [")
+        .replace("head.core_ratio", "Head core size")
+        .replace("head.core_color", "Head core colour")
+        .replace("head.gradient", "Head glow")
+        .replace("outline.extra_px", "Outline width")
+        .replace("animation.period_ms", "Animation cycle length")
+        .replace('_', " ");
+    // `Friendly (light).fill` is a path with a label glued on; the reader wants
+    // a phrase.
+    let labelled = labelled.replace('.', " ");
+    if labelled == field {
+        field.to_string()
+    } else {
+        labelled
+    }
 }
 
 /// A document being edited, compiled under a scratch handle.
@@ -234,7 +272,7 @@ pub fn register_draft_skin(handle: &str, document_json: &str) -> Result<(), Stri
         ));
     }
 
-    let skin = ParamSkin::from_json(document_json).map_err(|errors| format!("{errors:?}"))?;
+    let skin = ParamSkin::from_json(document_json).map_err(readable)?;
     let compiled: &'static ParamSkin = Box::leak(Box::new(skin));
 
     let mut registered = draft_skins()
@@ -320,6 +358,30 @@ mod tests {
                 skin.id()
             );
         }
+    }
+
+    /// An author who has just moved a colour picker is told which colour and
+    /// why, not handed the debug formatting of an error vector.
+    #[test]
+    fn validator_complaints_are_written_for_the_person_who_caused_them() {
+        let message = readable(vec![
+            skin_schema::SkinDocError {
+                field: "palette.friendly[0].fill".to_string(),
+                problem: "a teammate must read blue-family".to_string(),
+            },
+            skin_schema::SkinDocError {
+                field: "outline.extra_px".to_string(),
+                problem: "must be between 0 and 4".to_string(),
+            },
+        ]);
+
+        assert!(message.contains("Friendly (light) fill"), "got: {message}");
+        assert!(message.contains("Outline width"), "got: {message}");
+        assert!(
+            !message.contains("SkinDocError") && !message.contains('{'),
+            "no debug formatting may reach an author: {message}"
+        );
+        assert_eq!(message.lines().count(), 2, "one line per complaint");
     }
 
     /// A document registers under the hash of its own bytes and nothing else.

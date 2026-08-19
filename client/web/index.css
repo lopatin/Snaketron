@@ -7193,8 +7193,11 @@ a.home-social-icon:hover {
   background: #f9fafb;
 }
 
+/* Marked by a rule and a badge rather than a tint. The preview canvas paints
+   the arena's own white behind the snake, so any coloured row background shows
+   as a white block around the art — the equipped row was the one place that
+   was visible. */
 .skins-row.is-equipped {
-  background: #eff6ff;
   box-shadow: inset 3px 0 0 var(--game-blue);
 }
 
@@ -7605,4 +7608,51 @@ a.home-social-icon:hover {
 
 .builder-group .builder-field-color > span {
   min-width: 0;
+}
+
+.admin-skin-crop {
+  overflow: hidden;
+  flex: none;
+}
+
+.admin-skin-crop canvas {
+  display: block;
+}
+
+/* Narrow: a wide snake, a name and an action do not fit across a phone. Stack
+   the art over the meta, the same way the base rail already does — a row that
+   squeezes the name column to nothing wraps it one letter per line. */
+@media (max-width: 700px) {
+  .skins-row,
+  .skins-column-bases .skins-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'preview preview'
+      'meta action';
+    row-gap: 10px;
+  }
+
+  .skins-row-preview {
+    grid-area: preview;
+  }
+
+  .skins-row-meta {
+    grid-area: meta;
+    justify-content: center;
+  }
+
+  .skins-row-action {
+    grid-area: action;
+    justify-self: end;
+  }
+
+  .skins-main,
+  .builder-main {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .builder-preview-strip {
+    gap: 14px 18px;
+  }
 }

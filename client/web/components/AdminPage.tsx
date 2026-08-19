@@ -649,45 +649,60 @@ const AdminSkins: React.FC = () => {
  * the document exactly the way a match does rather than approximating it from
  * the skin's metadata.
  */
+const ADMIN_PREVIEW_CELL = 14;
+const ADMIN_PREVIEW_PAD = 8;
+
+/**
+ * One queued skin, painted by the real renderer.
+ *
+ * A reviewer has to see what players will see, so this fetches and registers
+ * the document exactly the way a match does, and frames it the way the browse
+ * page does — a long body, cropped to itself. A thumbnail too small to judge
+ * would defeat the only part of review a machine could not already do.
+ */
 const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
   contentRef,
   name,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [layout, setLayout] = useState({
+    canvasWidth: 320,
+    canvasHeight: 90,
+    cropWidth: 300,
+    cropHeight: 40,
+    offsetX: 0,
+    offsetY: 48,
+  });
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       await initWasm();
-      ensureAuthoredSkins({ 0: contentRef });
-      // Registration is a fetch away; poll briefly rather than blocking the
-      // whole queue on one slow document.
-      for (let attempt = 0; attempt < 20 && !cancelled; attempt += 1) {
-        const wasm = getWasm();
-        if (wasm?.authoredSkinIsRegistered(contentRef)) {
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
+      await ensureAuthoredSkins({ 0: contentRef });
       const wasm = getWasm();
       const canvas = canvasRef.current;
       if (cancelled || !wasm || !canvas) {
         return;
       }
       try {
-        wasm.renderSkinFixture(
-          canvas,
-          contentRef,
-          'straight_horizontal',
-          'own',
-          12,
-          false,
-          false,
-          640,
-          true,
-        );
+        const bounds = JSON.parse(
+          wasm.skinFixtureBounds(
+            contentRef,
+            'longer_than_head_gradient',
+            ADMIN_PREVIEW_CELL,
+            false,
+          ),
+        ) as { x: number; y: number; width: number; height: number };
+        setLayout({
+          canvasWidth: Math.ceil(bounds.x + bounds.width + ADMIN_PREVIEW_PAD),
+          canvasHeight: Math.ceil(bounds.y + bounds.height + ADMIN_PREVIEW_PAD),
+          cropWidth: Math.ceil(bounds.width + ADMIN_PREVIEW_PAD * 2),
+          cropHeight: Math.ceil(bounds.height + ADMIN_PREVIEW_PAD * 2),
+          offsetX: Math.round(bounds.x - ADMIN_PREVIEW_PAD),
+          offsetY: Math.round(bounds.y - ADMIN_PREVIEW_PAD),
+        });
       } catch {
-        // An unpaintable skin is itself review-relevant; the empty tile says so.
+        // Keep the fallback framing.
       }
     })();
     return () => {
@@ -695,16 +710,46 @@ const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
     };
   }, [contentRef]);
 
+  useEffect(() => {
+    const wasm = getWasm();
+    const canvas = canvasRef.current;
+    if (!wasm || !canvas) {
+      return;
+    }
+    try {
+      wasm.renderSkinFixture(
+        canvas,
+        contentRef,
+        'longer_than_head_gradient',
+        'own',
+        ADMIN_PREVIEW_CELL,
+        false,
+        false,
+        640,
+        true,
+      );
+    } catch {
+      // An unpaintable skin is itself review-relevant; the empty tile says so.
+    }
+  }, [contentRef, layout.canvasWidth, layout.canvasHeight]);
+
   return (
-    <canvas
-      ref={canvasRef}
-      width={150}
-      height={70}
-      role="img"
-      aria-label={`${name} preview`}
-    />
+    <div
+      className="admin-skin-crop"
+      style={{ width: layout.cropWidth, height: layout.cropHeight }}
+    >
+      <canvas
+        ref={canvasRef}
+        width={layout.canvasWidth}
+        height={layout.canvasHeight}
+        style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
+        role="img"
+        aria-label={`${name} preview`}
+      />
+    </div>
   );
 };
+
 
 const AdminPage: React.FC = () => {
   const { user } = useAuth();

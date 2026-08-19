@@ -74,14 +74,17 @@ const fetchAndRegister = async (contentRef: string): Promise<void> => {
  * being fetched, or already known to be unavailable is skipped, so the steady
  * state costs one set lookup per player.
  */
-export const ensureAuthoredSkins = (skins: Record<number, string | undefined> | undefined): void => {
+export const ensureAuthoredSkins = (
+  skins: Record<number, string | undefined> | undefined,
+): Promise<void> => {
   if (!skins) {
-    return;
+    return Promise.resolve();
   }
   const wasm = getWasm();
   if (!wasm) {
-    return;
+    return Promise.resolve();
   }
+  const started: Array<Promise<void>> = [];
 
   for (const reference of Object.values(skins)) {
     if (
@@ -103,7 +106,12 @@ export const ensureAuthoredSkins = (skins: Record<number, string | undefined> | 
         inFlight.delete(reference);
       });
     inFlight.set(reference, request);
+    started.push(request);
   }
+
+  // Resolves when everything this call started has landed, so a surface that
+  // paints once — a browse row, a review tile — knows when to paint again.
+  return Promise.all(started).then(() => undefined);
 };
 
 /** Test seam: forget what this module has learned. */

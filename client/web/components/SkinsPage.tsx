@@ -5,6 +5,7 @@ import { SocialFooter } from './SocialFooter';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
 import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
+import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import type { CatalogEntry, SkinSummary } from '../types/generated';
 import { Link } from 'react-router-dom';
 import {
@@ -32,7 +33,20 @@ interface SkinsPageProps {
 
 /** The pose that reads best as "a snake wearing this": long, and horizontal. */
 const SNAKE_PREVIEW_POSE = 'longer_than_head_gradient';
-const SNAKE_PREVIEW_CELL = 16;
+
+/**
+ * How big one cell is drawn in a browse preview.
+ *
+ * Responsive rather than fixed, because the crop is measured in canvas pixels:
+ * scaling the canvas with CSS would scale the drawing but not the negative
+ * margins that crop it, so the snake would slide out of its own window. Drawing
+ * smaller keeps the arithmetic exact at every width.
+ */
+const wideCell = 16;
+const narrowCell = 9;
+
+const previewCellSize = (): number =>
+  typeof window !== 'undefined' && window.innerWidth < 700 ? narrowCell : wideCell;
 /** Breathing room around the painted snake, so a boosting band is never clipped. */
 const PREVIEW_PAD_PX = 10;
 
@@ -79,6 +93,8 @@ interface SnakePreviewProps {
   skinRef: string;
   animate: boolean;
   label: string;
+  /** Changes when the registry gains a document, prompting a repaint. */
+  revision?: number;
 }
 
 /**
@@ -89,8 +105,20 @@ interface SnakePreviewProps {
  * what an animated skin is. The live loop repaints the canvas directly rather
  * than through React state, so hovering costs canvas work and nothing else.
  */
-const SnakePreview: React.FC<SnakePreviewProps> = ({ skinRef, animate, label }) => {
+const SnakePreview: React.FC<SnakePreviewProps> = ({
+  skinRef,
+  animate,
+  label,
+  revision = 0,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [cell, setCell] = useState(previewCellSize);
+
+  useEffect(() => {
+    const onResize = () => setCell(previewCellSize());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
   const [layout, setLayout] = useState<PreviewLayout>(FALLBACK_PREVIEW_LAYOUT);
 
   // Fixture poses are painted at their own arena coordinates, not at the
@@ -108,7 +136,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({ skinRef, animate, label }) 
     }
     try {
       const bounds = JSON.parse(
-        wasm.skinFixtureBounds(skinRef, SNAKE_PREVIEW_POSE, SNAKE_PREVIEW_CELL, false),
+        wasm.skinFixtureBounds(skinRef, SNAKE_PREVIEW_POSE, cell, false),
       ) as { x: number; y: number; width: number; height: number };
       setLayout({
         canvasWidth: Math.ceil(bounds.x + bounds.width + PREVIEW_PAD_PX),
@@ -122,7 +150,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({ skinRef, animate, label }) 
       // A preview at slightly the wrong size beats no preview.
       setLayout(FALLBACK_PREVIEW_LAYOUT);
     }
-  }, [skinRef]);
+  }, [skinRef, revision, cell]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -138,7 +166,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({ skinRef, animate, label }) 
           skinRef,
           SNAKE_PREVIEW_POSE,
           'own',
-          SNAKE_PREVIEW_CELL,
+          cell,
           false,
           false,
           clock,
@@ -172,7 +200,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({ skinRef, animate, label }) 
       frame = requestAnimationFrame(loop);
     });
     return () => cancelAnimationFrame(frame);
-  }, [skinRef, animate, layout.canvasWidth, layout.canvasHeight]);
+  }, [skinRef, animate, revision, cell, layout.canvasWidth, layout.canvasHeight]);
 
   return (
     <div
@@ -241,6 +269,15 @@ type Slot = 'snake' | 'base';
 
 interface SkinRowProps {
   entry: CatalogEntry;
+  /**
+   * What the renderer should resolve for the preview.
+   *
+   * A built-in is painted by its catalogue id, but an authored skin is painted
+   * by the hash of its document — its `skin:<id>` reference means nothing to
+   * the registry, and passing it would silently draw classic for every
+   * player-made skin on the page.
+   */
+  previewRef?: string;
   /** Who made it, for player-authored skins. Built-ins have no byline. */
   byline?: string;
   slot: Slot;
@@ -250,10 +287,13 @@ interface SkinRowProps {
   onEquip: (reference: string) => void;
   /** Present only for a priced skin the viewer does not own yet. */
   onBuy?: () => void;
+  /** Bumped when a document this row was waiting on has compiled. */
+  registryRevision?: number;
 }
 
 const SkinRow: React.FC<SkinRowProps> = ({
   entry,
+  previewRef,
   byline,
   slot,
   isEquipped,
@@ -261,6 +301,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
   isBusy,
   onEquip,
   onBuy,
+  registryRevision = 0,
 }) => {
   const [hovered, setHovered] = useState(false);
   const reduceMotion = useMemo(prefersReducedMotion, []);
@@ -278,12 +319,16 @@ const SkinRow: React.FC<SkinRowProps> = ({
       <div className="skins-row-preview">
         {slot === 'snake' ? (
           <SnakePreview
-            skinRef={entry.reference}
+            skinRef={previewRef ?? entry.reference}
             animate={animate}
+            revision={registryRevision}
             label={`${entry.name} snake skin`}
           />
         ) : (
-          <BasePreview skinRef={entry.reference} label={`${entry.name} base skin`} />
+          <BasePreview
+            skinRef={previewRef ?? entry.reference}
+            label={`${entry.name} base skin`}
+          />
         )}
       </div>
 
@@ -337,6 +382,8 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   /** Player-authored entries, kept beside the merged list so a row can find
    *  the skin id a purchase needs. */
   const [authored, setAuthored] = useState<SkinSummary[]>([]);
+  /** Bumped when an authored document compiles, so still previews repaint. */
+  const [registryRevision, setRegistryRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -389,6 +436,33 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       cancelled = true;
     };
   }, []);
+
+  // Painting an authored skin means having its document. This waits for both
+  // halves — the list, and the wasm module to register into — because the
+  // browse response routinely lands first and there is nothing to register
+  // into yet when it does.
+  useEffect(() => {
+    if (!ready || authored.length === 0) {
+      return;
+    }
+    let cancelled = false;
+    void ensureAuthoredSkins(
+      Object.fromEntries(
+        authored
+          .map((skin, index) => [index, skin.contentRef])
+          .filter(([, reference]) => typeof reference === 'string'),
+      ) as Record<number, string>,
+    ).then(() => {
+      // Rows paint once, so they need telling when a document they were
+      // waiting on has compiled.
+      if (!cancelled) {
+        setRegistryRevision((current) => current + 1);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authored, ready]);
 
   // The account is the authority on what is equipped; local storage is the
   // echo that makes the page correct before the account resolves, and that
@@ -531,11 +605,17 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                       slot="snake"
                       isEquipped={entry.reference === equippedSkin}
                       canEquip={Boolean(user)}
+                      previewRef={
+                        authored.find(
+                          (candidate) => candidate.reference === entry.reference,
+                        )?.contentRef ?? undefined
+                      }
                       byline={
                         authored.find(
                           (candidate) => candidate.reference === entry.reference,
                         )?.creatorUsername ?? undefined
                       }
+                      registryRevision={registryRevision}
                       isBusy={busySlot === 'snake'}
                       onEquip={(reference) => void equip('snake', reference)}
                       onBuy={(() => {
