@@ -13,7 +13,7 @@
 
 use axum::{
     Extension, Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -23,6 +23,7 @@ use tracing::error;
 use crate::api::auth::AuthState;
 use crate::api::middleware::AuthUser;
 use crate::skin_catalog::{self, BASE_REF_PREFIX, CatalogEntry, MAX_SKIN_REF_LENGTH, SkinKind};
+use crate::skin_store::{NewRevision, NewSkin, Publication, Skin, skin_id_reference};
 
 /// How long a browser may reuse the catalogue. Built-ins change only when the
 /// server is redeployed, so this is generous without being able to strand a
@@ -82,6 +83,17 @@ where
 
 #[derive(Debug)]
 pub enum SkinsApiError {
+    /// The caller may not see this, or it does not exist. Deliberately one
+    /// answer for both: skin ids are sequential, so a distinguishable refusal
+    /// would let anyone count the private drafts on the service.
+    NotFound,
+    /// The skin exists but has been taken down. Distinct from not-found on
+    /// purpose — a client holding a cached copy needs to be told to drop it.
+    Gone,
+    AuthRequired,
+    GuestNotAllowed,
+    /// The document did not pass the shared validator.
+    Invalid(Vec<String>),
     /// The reference does not name anything this build can draw. Unlike match
     /// preparation, which quietly falls back to classic rather than refusing a
     /// join, an explicit equip is worth an error: the player is looking at the
@@ -93,6 +105,17 @@ pub enum SkinsApiError {
 impl IntoResponse for SkinsApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            Self::NotFound => (StatusCode::NOT_FOUND, "No such skin".to_string()),
+            Self::Gone => (StatusCode::GONE, "This skin has been removed".to_string()),
+            Self::AuthRequired => (
+                StatusCode::UNAUTHORIZED,
+                "Sign in to see your own skins".to_string(),
+            ),
+            Self::GuestNotAllowed => (
+                StatusCode::FORBIDDEN,
+                "Creating a skin needs a registered account".to_string(),
+            ),
+            Self::Invalid(problems) => (StatusCode::BAD_REQUEST, problems.join("; ")),
             Self::UnknownSkin(reference) => (
                 StatusCode::BAD_REQUEST,
                 format!("{reference} is not a skin this server knows"),
@@ -233,6 +256,434 @@ fn no_store(response: &mut Response) {
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store, must-revalidate, private"),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Player-authored skins
+// ---------------------------------------------------------------------------
+
+/// How long a browser may hold a skin document before asking again.
+///
+/// Deliberately short and revalidating rather than `immutable`, even though the
+/// bytes genuinely never change: this TTL is the moderation propagation bound.
+/// A disabled skin has to stop rendering for people who already fetched it, and
+/// a year-long cache would make the kill switch advisory.
+const DOCUMENT_CACHE_SECONDS: u32 = 300;
+
+/// A skin as the API presents it. Deliberately not the storage struct: the
+/// content references are an implementation detail of resolution, and the
+/// document is served by its own route.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct SkinSummary {
+    pub skin_id: i32,
+    pub reference: String,
+    pub name: String,
+    pub kind: crate::skin_store::SkinKind,
+    pub publication: Publication,
+    pub creator_user_id: i32,
+    pub creator_username: Option<String>,
+    pub price_bux: u32,
+    /// The revision a viewer would render, if any. Absent for a disabled skin
+    /// and for a private draft belonging to someone else.
+    pub content_ref: Option<String>,
+    pub head_revision: u32,
+    pub published_revision: Option<u32>,
+    pub pending_revision: Option<u32>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl SkinSummary {
+    fn of(skin: &Skin, viewer: Option<i32>) -> Self {
+        Self {
+            skin_id: skin.skin_id,
+            reference: skin_id_reference(skin.skin_id),
+            name: skin.name.clone(),
+            kind: skin.kind,
+            publication: skin.publication,
+            creator_user_id: skin.creator_user_id,
+            creator_username: skin.creator_username.clone(),
+            price_bux: skin.price_bux,
+            content_ref: skin.content_ref_for(viewer).map(str::to_string),
+            head_revision: skin.head_revision,
+            published_revision: skin.published_revision,
+            pending_revision: skin.pending_revision,
+            created_at_ms: skin.created_at_ms,
+            updated_at_ms: skin.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct SkinListResponse {
+    pub skins: Vec<SkinSummary>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateSkinRequest {
+    pub name: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The document itself, as JSON. Validated by the same `skin-schema` code
+    /// the Builder runs in wasm, so a document the editor accepted is a
+    /// document this route accepts.
+    pub document: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateSkinRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub price_bux: Option<u32>,
+    #[serde(default)]
+    pub document: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListSkinsQuery {
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `published` (the default, and the only one that needs no account),
+    /// `mine`, or `owned`.
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Longest document worth storing. Generous next to anything the Builder
+/// produces, and small enough that a revision item stays far under DynamoDB's
+/// 400 KB ceiling with room for its metadata.
+const MAX_DOCUMENT_BYTES: usize = 32 * 1024;
+
+const MAX_SKIN_NAME_LENGTH: usize = 40;
+
+/// Validate a document and reduce it to the bytes and reference it will be
+/// stored under. One place, so create and update cannot diverge on what they
+/// accept or on how they name what they accepted.
+fn accept_document(document: &serde_json::Value) -> Result<(String, String, u32), SkinsApiError> {
+    let doc: skin_schema::SkinDoc = serde_json::from_value(document.clone())
+        .map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
+
+    skin_schema::validate(&doc).map_err(|errors| {
+        SkinsApiError::Invalid(
+            errors
+                .into_iter()
+                .map(|error| format!("{}: {}", error.field, error.problem))
+                .collect(),
+        )
+    })?;
+
+    let bytes = skin_schema::content::canonical_bytes(&doc)
+        .map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err(SkinsApiError::Invalid(vec![format!(
+            "document: {} bytes exceeds the {MAX_DOCUMENT_BYTES}-byte limit",
+            bytes.len()
+        )]));
+    }
+
+    let canonical = String::from_utf8(bytes)
+        .map_err(|_| SkinsApiError::Invalid(vec!["document: not valid UTF-8".to_string()]))?;
+    let reference = skin_schema::content::reference_for_bytes(canonical.as_bytes());
+    Ok((canonical, reference, doc.schema_version))
+}
+
+fn accept_name(name: &str) -> Result<String, SkinsApiError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_SKIN_NAME_LENGTH {
+        return Err(SkinsApiError::Invalid(vec![format!(
+            "name: must be between 1 and {MAX_SKIN_NAME_LENGTH} characters"
+        )]));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Create a skin.
+pub async fn create_skin(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Json(request): Json<CreateSkinRequest>,
+) -> Result<Response, SkinsApiError> {
+    // Creating costs storage and puts content in front of other players, so it
+    // needs a durable account. A guest's row can be orphaned by closing a tab.
+    if auth_user.is_guest {
+        return Err(SkinsApiError::GuestNotAllowed);
+    }
+
+    let name = accept_name(&request.name)?;
+    let kind = match request.kind.as_deref() {
+        None | Some("snake") => crate::skin_store::SkinKind::Snake,
+        Some("base") => crate::skin_store::SkinKind::Base,
+        Some(other) => {
+            return Err(SkinsApiError::Invalid(vec![format!(
+                "kind: {other} is not a kind of skin"
+            )]));
+        }
+    };
+    let (document, content_ref, schema_version) = accept_document(&request.document)?;
+
+    let skin = state
+        .db
+        .create_skin(NewSkin {
+            creator_user_id: auth_user.user_id,
+            creator_username: Some(&auth_user.username),
+            kind,
+            name: &name,
+            revision: NewRevision {
+                document: &document,
+                content_ref: &content_ref,
+                texture_refs: &[],
+                validated_schema: schema_version,
+            },
+        })
+        .await
+        .map_err(SkinsApiError::Internal)?;
+
+    let mut response = (
+        StatusCode::CREATED,
+        Json(SkinSummary::of(&skin, Some(auth_user.user_id))),
+    )
+        .into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// Append a revision, rename, or re-price.
+pub async fn update_skin(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(skin_id): Path<i32>,
+    Json(request): Json<UpdateSkinRequest>,
+) -> Result<Response, SkinsApiError> {
+    let skin = load_visible_skin(&state, skin_id, &auth_user).await?;
+    if !skin.may_edit(auth_user.user_id, auth_user.is_admin) {
+        // Same answer as "no such skin": a caller who may not edit it has no
+        // business learning it exists either.
+        return Err(SkinsApiError::NotFound);
+    }
+
+    let name = request.name.as_deref().map(accept_name).transpose()?;
+
+    // A rename on a published skin waits for the next approval. Letting it
+    // through immediately would be a review bypass: get something bland
+    // approved, then rename it to whatever you actually wanted.
+    if name.is_some() && skin.publication == Publication::Published && !auth_user.is_admin {
+        return Err(SkinsApiError::Invalid(vec![
+            "name: a published skin is renamed by its next approved revision".to_string(),
+        ]));
+    }
+
+    if name.is_some() || request.price_bux.is_some() {
+        state
+            .db
+            .update_skin_metadata(skin_id, name.as_deref(), request.price_bux)
+            .await
+            .map_err(SkinsApiError::Internal)?;
+    }
+
+    let updated = match &request.document {
+        None => state
+            .db
+            .get_skin(skin_id)
+            .await
+            .map_err(SkinsApiError::Internal)?
+            .ok_or(SkinsApiError::NotFound)?,
+        Some(document) => {
+            let (document, content_ref, schema_version) = accept_document(document)?;
+            state
+                .db
+                .put_skin_revision(
+                    skin_id,
+                    NewRevision {
+                        document: &document,
+                        content_ref: &content_ref,
+                        texture_refs: &[],
+                        validated_schema: schema_version,
+                    },
+                )
+                .await
+                .map_err(SkinsApiError::Internal)?
+        }
+    };
+
+    let mut response = Json(SkinSummary::of(&updated, Some(auth_user.user_id))).into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// One skin, if the caller may see it.
+pub async fn get_skin(
+    State(state): State<AuthState>,
+    auth_user: Option<Extension<AuthUser>>,
+    Path(skin_id): Path<i32>,
+) -> Result<Response, SkinsApiError> {
+    let viewer = auth_user.as_ref().map(|Extension(user)| user);
+    let skin = state
+        .db
+        .get_skin(skin_id)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or(SkinsApiError::NotFound)?;
+
+    let user_id = viewer.map(|user| user.user_id);
+    let is_admin = viewer.is_some_and(|user| user.is_admin);
+    let holds_grant = match user_id {
+        Some(user_id) => state
+            .db
+            .has_skin_grant(user_id, skin_id)
+            .await
+            .map_err(SkinsApiError::Internal)?,
+        None => false,
+    };
+
+    if !skin.may_view(user_id, is_admin) && !holds_grant {
+        return Err(SkinsApiError::NotFound);
+    }
+
+    let mut response = Json(SkinSummary::of(&skin, user_id)).into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// The render path: one revision's document, by the hash of its bytes.
+///
+/// Anonymous, because a spectator or a replay viewer holding a reference out of
+/// a snapshot has to be able to draw it. Three outcomes matter:
+///
+/// - `200` for anything that was ever published or ever worn in a match;
+/// - `410` when the skin has been disabled, which is what makes moderation
+///   reach warm clients and old replays rather than only new matches;
+/// - `404` for everything else, including private drafts nobody has worn —
+///   uniform, so the route cannot be used to discover what exists.
+pub async fn get_document_by_ref(
+    State(state): State<AuthState>,
+    Path(content_ref): Path<String>,
+) -> Result<Response, SkinsApiError> {
+    if !skin_schema::content::is_content_ref(&content_ref) {
+        return Err(SkinsApiError::NotFound);
+    }
+
+    let Some((skin, revision)) = state
+        .db
+        .resolve_content_ref(&content_ref)
+        .await
+        .map_err(SkinsApiError::Internal)?
+    else {
+        return Err(SkinsApiError::NotFound);
+    };
+
+    if skin.publication == Publication::Disabled {
+        return Err(SkinsApiError::Gone);
+    }
+
+    // Never published and never worn means nobody has a legitimate reason to
+    // hold this reference.
+    let was_public =
+        revision.exposed_at_ms.is_some() || skin.published_revision == Some(revision.revision);
+    if !was_public {
+        return Err(SkinsApiError::NotFound);
+    }
+
+    let mut response = (
+        [(header::CONTENT_TYPE, "application/json")],
+        revision.document,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_str(&format!(
+            "public, max-age={DOCUMENT_CACHE_SECONDS}, must-revalidate"
+        ))
+        .expect("a formatted cache-control header is always valid"),
+    );
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{content_ref}\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("\"skin\"")),
+    );
+    Ok(response)
+}
+
+/// Published skins, or the caller's own.
+pub async fn list_skins(
+    State(state): State<AuthState>,
+    auth_user: Option<Extension<AuthUser>>,
+    Query(query): Query<ListSkinsQuery>,
+) -> Result<Response, SkinsApiError> {
+    let kind = match query.kind.as_deref() {
+        None | Some("snake") => crate::skin_store::SkinKind::Snake,
+        Some("base") => crate::skin_store::SkinKind::Base,
+        Some(other) => {
+            return Err(SkinsApiError::Invalid(vec![format!(
+                "kind: {other} is not a kind of skin"
+            )]));
+        }
+    };
+    let limit = query.limit.unwrap_or(24).clamp(1, 100);
+    let viewer = auth_user.as_ref().map(|Extension(user)| user.user_id);
+
+    let page = match query.filter.as_deref() {
+        Some("mine") => {
+            let Some(user_id) = viewer else {
+                return Err(SkinsApiError::AuthRequired);
+            };
+            state
+                .db
+                .list_skins_by_creator(user_id, query.cursor.as_deref(), limit)
+                .await
+                .map_err(SkinsApiError::Internal)?
+        }
+        _ => state
+            .db
+            .list_published_skins(kind, query.cursor.as_deref(), limit)
+            .await
+            .map_err(SkinsApiError::Internal)?,
+    };
+
+    let mut response = Json(SkinListResponse {
+        skins: page
+            .skins
+            .iter()
+            .map(|skin| SkinSummary::of(skin, viewer))
+            .collect(),
+        cursor: page.cursor,
+    })
+    .into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// Load a skin, refusing anything the caller may not see with the same answer
+/// a nonexistent skin gets.
+async fn load_visible_skin(
+    state: &AuthState,
+    skin_id: i32,
+    auth_user: &AuthUser,
+) -> Result<Skin, SkinsApiError> {
+    let skin = state
+        .db
+        .get_skin(skin_id)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or(SkinsApiError::NotFound)?;
+    if !skin.may_view(Some(auth_user.user_id), auth_user.is_admin) {
+        return Err(SkinsApiError::NotFound);
+    }
+    Ok(skin)
 }
 
 #[cfg(test)]

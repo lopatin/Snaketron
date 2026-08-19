@@ -322,6 +322,16 @@ pub async fn install_http_application(
             "/api/users/me/equipped",
             put(skins::set_equipment).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
         )
+        // A document is capped at 32 KB; the request limit leaves room for the
+        // envelope around it and nothing like enough for anything else.
+        .route(
+            "/api/skins",
+            post(skins::create_skin).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/skins/:skin_id",
+            put(skins::update_skin).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -396,7 +406,20 @@ pub async fn install_http_application(
 
     // Browsing the catalogue needs no account: the Skins page is a shop window
     // as much as a picker, and a logged-out visitor should see what is on offer.
-    let skin_catalog_routes = Router::new().route("/api/skins", get(skins::browse));
+    let skin_catalog_routes = Router::new()
+        .route("/api/skins", get(skins::browse))
+        .route("/api/skins/catalog", get(skins::browse));
+
+    // Reading a skin document needs no account: a spectator or a replay viewer
+    // holding a reference out of a snapshot has to be able to draw it.
+    let skin_document_routes = Router::new()
+        .route(
+            "/api/skins/by-ref/:content_ref",
+            get(skins::get_document_by_ref),
+        )
+        .route("/api/skins/browse", get(skins::list_skins))
+        .route("/api/skins/:skin_id", get(skins::get_skin))
+        .with_state(auth_state.clone());
 
     // Replay and highlight reads are intentionally anonymous. At launch all
     // runtime games, including custom games, are public; no username or lobby
@@ -453,6 +476,7 @@ pub async fn install_http_application(
         .merge(leaderboard_routes)
         .merge(news_routes)
         .merge(skin_catalog_routes)
+        .merge(skin_document_routes)
         .merge(replay_routes)
         .merge(public_game_routes)
         .merge(protected_leaderboard_routes)

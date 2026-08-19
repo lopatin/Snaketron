@@ -1,6 +1,7 @@
 pub mod dynamodb;
 pub mod models;
 pub mod queries;
+pub mod skins_dynamo;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -9,6 +10,10 @@ use std::collections::HashMap;
 
 use crate::completion::{CompletionEffect, CompletionRecordV1, EffectApplyResult};
 use crate::season::Season;
+use crate::skin_store::{
+    GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
+    SkinRevision,
+};
 use common::GameState;
 use models::*;
 
@@ -87,6 +92,89 @@ pub trait Database: Send + Sync {
         selected_skin: Option<Option<&str>>,
         selected_base: Option<Option<&str>>,
     ) -> Result<()>;
+
+    // ---- Player-authored skins -------------------------------------------
+    //
+    // A skin is a stable id plus an append-only chain of immutable revisions
+    // addressed by the hash of their bytes (`crate::skin_store`). Callers pass
+    // documents that a validator has already accepted; storage does not
+    // re-validate, and does not decide who may see what.
+
+    /// Create a skin with its first revision, and grant it to its creator.
+    async fn create_skin(&self, draft: NewSkin<'_>) -> Result<Skin>;
+
+    /// Append a revision and make it the head. Returns the updated skin.
+    async fn put_skin_revision(&self, skin_id: i32, revision: NewRevision<'_>) -> Result<Skin>;
+
+    /// Rename a skin, or re-price it.
+    async fn update_skin_metadata(
+        &self,
+        skin_id: i32,
+        name: Option<&str>,
+        price_bux: Option<u32>,
+    ) -> Result<()>;
+
+    async fn get_skin(&self, skin_id: i32) -> Result<Option<Skin>>;
+    async fn get_skin_revision(&self, skin_id: i32, revision: u32) -> Result<Option<SkinRevision>>;
+
+    /// Find a revision by the hash of its bytes, without knowing its skin.
+    ///
+    /// This is the render path: a client holding only a `sha256:` reference out
+    /// of a match snapshot needs the document and needs to know whether the
+    /// skin it belongs to has been disabled.
+    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Option<(Skin, SkinRevision)>>;
+
+    /// Published skins, newest first.
+    async fn list_published_skins(
+        &self,
+        kind: SkinKind,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage>;
+
+    /// Everything one player has made, newest first.
+    async fn list_skins_by_creator(
+        &self,
+        user_id: i32,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage>;
+
+    /// Move a skin between publication states, recording who did it and why.
+    async fn set_skin_publication(
+        &self,
+        skin_id: i32,
+        publication: Publication,
+        published_revision: Option<u32>,
+        actor_user_id: i32,
+        reason: Option<&str>,
+    ) -> Result<()>;
+
+    /// Ask for a revision to be reviewed, or clear the request.
+    async fn set_skin_pending_revision(&self, skin_id: i32, revision: Option<u32>) -> Result<()>;
+
+    /// Mark a revision approved, which is what lets its text render for
+    /// anyone but its creator.
+    async fn approve_skin_revision(&self, skin_id: i32, revision: u32) -> Result<()>;
+
+    /// Record that a revision has entered a match, the first time it does.
+    ///
+    /// Idempotent: exposure is a one-way fact, and the write is conditional so
+    /// the common case of an already-exposed revision costs nothing.
+    async fn mark_revision_exposed(&self, skin_id: i32, revision: u32, at_ms: i64) -> Result<()>;
+
+    /// Give a player a permanent claim on a skin. Idempotent — a second grant
+    /// for the same skin leaves the first one's terms alone.
+    async fn grant_skin(
+        &self,
+        user_id: i32,
+        skin_id: i32,
+        source: GrantSource,
+        price_paid_bux: u32,
+    ) -> Result<()>;
+
+    async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>>;
+    async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool>;
 
     /// Resolve one verified CrazyGames identity into a durable Snaketron
     /// account. Implementations own the uniqueness/claim transaction; callers

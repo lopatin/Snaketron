@@ -24,6 +24,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use super::models::*;
+use super::skins_dynamo;
 use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
@@ -31,6 +32,10 @@ use crate::completion::{
 };
 use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
 use crate::season::{Season, get_season_at};
+use crate::skin_store::{
+    GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
+    SkinRevision,
+};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -289,7 +294,58 @@ pub async fn dynamodb_client() -> Client {
     Client::new(&config)
 }
 
+/// Whether an SDK error is DynamoDB refusing a write because its condition did
+/// not hold. That is an ordinary outcome for the idempotent writes here — the
+/// grant already exists, the exposure was already recorded — not a failure.
+fn is_conditional_check_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, R>) -> bool {
+    error.code() == Some("ConditionalCheckFailedException")
+}
+
 impl DynamoDatabase {
+    /// Query one of the skin indexes and page the result.
+    ///
+    /// Both listings are the same shape — a partition, newest first, resumable
+    /// — so they share one implementation rather than two that drift.
+    async fn query_skin_index(
+        &self,
+        index: &str,
+        partition_attribute: &str,
+        partition: String,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage> {
+        let limit = limit.clamp(1, 100) as i32;
+        let mut request = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name(index)
+            .key_condition_expression(format!("{partition_attribute} = :partition"))
+            .expression_attribute_values(":partition", Self::av_s(partition))
+            // Newest first: a catalogue nobody has scrolled should open on what
+            // was made most recently.
+            .scan_index_forward(false)
+            .limit(limit);
+        if let Some(key) = cursor.and_then(skins_dynamo::decode_cursor) {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let response = request.send().await.context("Failed to list skins")?;
+        let skins = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| skins_dynamo::skin_from_item(item).ok())
+            .collect();
+        Ok(SkinPage {
+            skins,
+            cursor: response
+                .last_evaluated_key
+                .as_ref()
+                .and_then(skins_dynamo::encode_cursor),
+        })
+    }
+
     pub async fn new() -> Result<Self> {
         let client = dynamodb_client().await;
 
@@ -3078,6 +3134,471 @@ impl Database for DynamoDatabase {
         self.mutate_user_progress(user_id, "mmr", UserProgressMutation::Set(mmr))
             .await?;
         Ok(())
+    }
+
+    // ---- Player-authored skins -------------------------------------------
+
+    async fn create_skin(&self, draft: NewSkin<'_>) -> Result<Skin> {
+        let skin_id = self.generate_id_for_entity("SKIN").await?;
+        let now = Utc::now().timestamp_millis();
+        let skin = Skin {
+            skin_id,
+            kind: draft.kind,
+            creator_user_id: draft.creator_user_id,
+            creator_username: draft.creator_username.map(str::to_string),
+            name: draft.name.to_string(),
+            publication: Publication::Private,
+            pending_revision: None,
+            price_bux: 0,
+            head_revision: 1,
+            published_revision: None,
+            head_content_ref: draft.revision.content_ref.to_string(),
+            published_content_ref: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            published_at_ms: None,
+        };
+
+        // The skin, its first revision, and the creator's own grant land
+        // together: a skin its author does not own would be unequippable by the
+        // only person allowed to wear it.
+        let put_skin = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::skin_item(&skin)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .context("Failed to build skin creation")?;
+        let put_revision = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::revision_item(
+                skin_id,
+                1,
+                &draft.revision,
+                now,
+            )))
+            .build()
+            .context("Failed to build first revision")?;
+        let put_grant = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::grant_item(
+                draft.creator_user_id,
+                skin_id,
+                GrantSource::OwnCreation,
+                0,
+                now,
+            )))
+            .build()
+            .context("Failed to build creator grant")?;
+
+        self.client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_skin).build())
+            .transact_items(TransactWriteItem::builder().put(put_revision).build())
+            .transact_items(TransactWriteItem::builder().put(put_grant).build())
+            .send()
+            .await
+            .context("Failed to create skin")?;
+
+        Ok(skin)
+    }
+
+    async fn put_skin_revision(&self, skin_id: i32, revision: NewRevision<'_>) -> Result<Skin> {
+        let mut skin = self
+            .get_skin(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+        let next = skin.head_revision + 1;
+        let now = Utc::now().timestamp_millis();
+
+        // The revision lands first. A revision nothing points at is harmless
+        // clutter; a head pointing at a revision that does not exist would make
+        // the skin unrenderable for its creator.
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::revision_item(
+                skin_id, next, &revision, now,
+            )))
+            .send()
+            .await
+            .context("Failed to store skin revision")?;
+
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression(
+                "SET headRevision = :revision, headContentRef = :content_ref, \
+                 updatedAtMs = :now",
+            )
+            .condition_expression("headRevision = :expected")
+            .expression_attribute_values(":revision", Self::av_n(next))
+            .expression_attribute_values(":content_ref", Self::av_s(revision.content_ref))
+            .expression_attribute_values(":now", Self::av_n(now))
+            .expression_attribute_values(":expected", Self::av_n(skin.head_revision))
+            .send()
+            .await
+            .context("Failed to advance skin head revision")?;
+
+        skin.head_revision = next;
+        skin.head_content_ref = revision.content_ref.to_string();
+        skin.updated_at_ms = now;
+        Ok(skin)
+    }
+
+    async fn update_skin_metadata(
+        &self,
+        skin_id: i32,
+        name: Option<&str>,
+        price_bux: Option<u32>,
+    ) -> Result<()> {
+        let mut assignments = vec!["updatedAtMs = :now".to_string()];
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":now", Self::av_n(Utc::now().timestamp_millis()));
+
+        if let Some(name) = name {
+            assignments.push("#name = :name".to_string());
+            request = request
+                .expression_attribute_names("#name", "name")
+                .expression_attribute_values(":name", Self::av_s(name));
+        }
+        if let Some(price) = price_bux {
+            assignments.push("priceBux = :price".to_string());
+            request = request.expression_attribute_values(":price", Self::av_n(price));
+        }
+
+        request
+            .update_expression(format!("SET {}", assignments.join(", ")))
+            .send()
+            .await
+            .context("Failed to update skin metadata")?;
+        Ok(())
+    }
+
+    async fn get_skin(&self, skin_id: i32) -> Result<Option<Skin>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read skin")?;
+        response
+            .item
+            .map(|item| skins_dynamo::skin_from_item(&item))
+            .transpose()
+    }
+
+    async fn get_skin_revision(&self, skin_id: i32, revision: u32) -> Result<Option<SkinRevision>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .send()
+            .await
+            .context("Failed to read skin revision")?;
+        response
+            .item
+            .map(|item| skins_dynamo::revision_from_item(&item))
+            .transpose()
+    }
+
+    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Option<(Skin, SkinRevision)>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :reference")
+            .expression_attribute_values(
+                ":reference",
+                Self::av_s(skins_dynamo::content_ref_index_partition(content_ref)),
+            )
+            .limit(1)
+            .send()
+            .await
+            .context("Failed to resolve a skin by content reference")?;
+
+        let Some(item) = response.items.and_then(|items| items.into_iter().next()) else {
+            return Ok(None);
+        };
+        let revision = skins_dynamo::revision_from_item(&item)?;
+        let Some(skin) = self.get_skin(revision.skin_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some((skin, revision)))
+    }
+
+    async fn list_published_skins(
+        &self,
+        kind: SkinKind,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage> {
+        self.query_skin_index(
+            "GSI1",
+            "gsi1pk",
+            skins_dynamo::published_index_partition(kind),
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_skins_by_creator(
+        &self,
+        user_id: i32,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage> {
+        self.query_skin_index(
+            "GSI2",
+            "gsi2pk",
+            skins_dynamo::owner_index_partition(user_id),
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    async fn set_skin_publication(
+        &self,
+        skin_id: i32,
+        publication: Publication,
+        published_revision: Option<u32>,
+        actor_user_id: i32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let skin = self
+            .get_skin(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+
+        let mut assignments = vec![
+            "publication = :publication".to_string(),
+            "updatedAtMs = :now".to_string(),
+        ];
+        let mut removals: Vec<String> = Vec::new();
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":publication", Self::av_s(publication.as_str()))
+            .expression_attribute_values(":now", Self::av_n(now));
+
+        if let Some(revision) = published_revision {
+            let content_ref = self
+                .get_skin_revision(skin_id, revision)
+                .await?
+                .map(|revision| revision.content_ref)
+                .ok_or_else(|| anyhow!("Cannot publish a revision that does not exist"))?;
+            assignments.push("publishedRevision = :published".to_string());
+            assignments.push("publishedContentRef = :published_ref".to_string());
+            assignments.push("publishedAtMs = :now".to_string());
+            request = request
+                .expression_attribute_values(":published", Self::av_n(revision))
+                .expression_attribute_values(":published_ref", Self::av_s(content_ref));
+        }
+
+        // The browse index is sparse: an entry exists only while the skin is
+        // published, so withdrawing one removes it from the listing rather than
+        // leaving something to filter out on every read.
+        if publication.is_browsable() {
+            assignments.push("gsi1pk = :index_pk".to_string());
+            assignments.push("gsi1sk = :index_sk".to_string());
+            request = request
+                .expression_attribute_values(
+                    ":index_pk",
+                    Self::av_s(skins_dynamo::published_index_partition(skin.kind)),
+                )
+                .expression_attribute_values(":index_sk", Self::av_s(format!("{now:020}")));
+        } else {
+            removals.push("gsi1pk".to_string());
+            removals.push("gsi1sk".to_string());
+        }
+
+        let mut expression = format!("SET {}", assignments.join(", "));
+        if !removals.is_empty() {
+            expression.push_str(&format!(" REMOVE {}", removals.join(", ")));
+        }
+
+        request
+            .update_expression(expression)
+            .send()
+            .await
+            .context("Failed to change skin publication")?;
+
+        // Every decision is recorded, with its actor, the way runtime-config
+        // changes are: moderation that leaves no trail is not reviewable.
+        let mut audit = HashMap::new();
+        audit.insert(
+            "pk".to_string(),
+            AttributeValue::S(skins_dynamo::skin_partition(skin_id)),
+        );
+        audit.insert(
+            "sk".to_string(),
+            AttributeValue::S(format!("REVIEW#{now:020}")),
+        );
+        audit.insert(
+            "publication".to_string(),
+            AttributeValue::S(publication.as_str().to_string()),
+        );
+        audit.insert(
+            "actorUserId".to_string(),
+            AttributeValue::N(actor_user_id.to_string()),
+        );
+        audit.insert("atMs".to_string(), AttributeValue::N(now.to_string()));
+        if let Some(reason) = reason {
+            audit.insert("reason".to_string(), AttributeValue::S(reason.to_string()));
+        }
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(audit))
+            .send()
+            .await
+            .context("Failed to record a skin publication decision")?;
+
+        Ok(())
+    }
+
+    async fn set_skin_pending_revision(&self, skin_id: i32, revision: Option<u32>) -> Result<()> {
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk)");
+
+        request = match revision {
+            Some(revision) => request
+                .update_expression("SET pendingRevision = :revision")
+                .expression_attribute_values(":revision", Self::av_n(revision)),
+            None => request.update_expression("REMOVE pendingRevision"),
+        };
+
+        request
+            .send()
+            .await
+            .context("Failed to update the pending review revision")?;
+        Ok(())
+    }
+
+    async fn approve_skin_revision(&self, skin_id: i32, revision: u32) -> Result<()> {
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .update_expression("SET reviewApproved = :approved")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":approved", Self::av_bool(true))
+            .send()
+            .await
+            .context("Failed to approve a skin revision")?;
+        Ok(())
+    }
+
+    async fn mark_revision_exposed(&self, skin_id: i32, revision: u32, at_ms: i64) -> Result<()> {
+        // Conditional on the attribute's absence, so this is a no-op write
+        // after the first match and never moves the recorded moment.
+        let result = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .update_expression("SET exposedAtMs = :at")
+            .condition_expression("attribute_exists(pk) AND attribute_not_exists(exposedAtMs)")
+            .expression_attribute_values(":at", Self::av_n(at_ms))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_conditional_check_failure(&error) => Ok(()),
+            Err(error) => Err(error).context("Failed to record skin exposure"),
+        }
+    }
+
+    async fn grant_skin(
+        &self,
+        user_id: i32,
+        skin_id: i32,
+        source: GrantSource,
+        price_paid_bux: u32,
+    ) -> Result<()> {
+        let result = self
+            .client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::grant_item(
+                user_id,
+                skin_id,
+                source,
+                price_paid_bux,
+                Utc::now().timestamp_millis(),
+            )))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            // Already owned. Ownership is permanent and its terms are
+            // historical, so a repeat grant leaves the original alone.
+            Err(error) if is_conditional_check_failure(&error) => Ok(()),
+            Err(error) => Err(error).context("Failed to grant a skin"),
+        }
+    }
+
+    async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .key_condition_expression("pk = :user AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":user", Self::av_s(format!("USER#{user_id}")))
+            .expression_attribute_values(":prefix", Self::av_s("SKINOWN#"))
+            .send()
+            .await
+            .context("Failed to list skin grants")?;
+
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(skins_dynamo::grant_from_item)
+            .collect())
+    }
+
+    async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s(skins_dynamo::grant_sort_key(skin_id)))
+            .send()
+            .await
+            .context("Failed to check a skin grant")?;
+        Ok(response.item.is_some())
     }
 
     async fn set_user_equipment(

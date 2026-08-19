@@ -5210,6 +5210,59 @@ mod tests {
             selected_skin: Option<Option<&str>>,
             selected_base: Option<Option<&str>>
         ) -> ());
+        unused_database_method!(create_skin(draft: crate::skin_store::NewSkin<'_>) -> crate::skin_store::Skin);
+        unused_database_method!(put_skin_revision(
+            skin_id: i32,
+            revision: crate::skin_store::NewRevision<'_>
+        ) -> crate::skin_store::Skin);
+        unused_database_method!(update_skin_metadata(
+            skin_id: i32,
+            name: Option<&str>,
+            price_bux: Option<u32>
+        ) -> ());
+        unused_database_method!(get_skin(skin_id: i32) -> Option<crate::skin_store::Skin>);
+        unused_database_method!(get_skin_revision(
+            skin_id: i32,
+            revision: u32
+        ) -> Option<crate::skin_store::SkinRevision>);
+        unused_database_method!(resolve_content_ref(
+            content_ref: &str
+        ) -> Option<(crate::skin_store::Skin, crate::skin_store::SkinRevision)>);
+        unused_database_method!(list_published_skins(
+            kind: crate::skin_store::SkinKind,
+            cursor: Option<&str>,
+            limit: usize
+        ) -> crate::skin_store::SkinPage);
+        unused_database_method!(list_skins_by_creator(
+            user_id: i32,
+            cursor: Option<&str>,
+            limit: usize
+        ) -> crate::skin_store::SkinPage);
+        unused_database_method!(set_skin_publication(
+            skin_id: i32,
+            publication: crate::skin_store::Publication,
+            published_revision: Option<u32>,
+            actor_user_id: i32,
+            reason: Option<&str>
+        ) -> ());
+        unused_database_method!(set_skin_pending_revision(
+            skin_id: i32,
+            revision: Option<u32>
+        ) -> ());
+        unused_database_method!(approve_skin_revision(skin_id: i32, revision: u32) -> ());
+        unused_database_method!(mark_revision_exposed(
+            skin_id: i32,
+            revision: u32,
+            at_ms: i64
+        ) -> ());
+        unused_database_method!(grant_skin(
+            user_id: i32,
+            skin_id: i32,
+            source: crate::skin_store::GrantSource,
+            price_paid_bux: u32
+        ) -> ());
+        unused_database_method!(list_skin_grants(user_id: i32) -> Vec<crate::skin_store::SkinGrant>);
+        unused_database_method!(has_skin_grant(user_id: i32, skin_id: i32) -> bool);
         unused_database_method!(resolve_crazygames_account(
             profile: &CrazyGamesProfile,
             guest_candidate_user_id: Option<i32>,

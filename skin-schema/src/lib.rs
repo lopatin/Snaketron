@@ -11,6 +11,7 @@
 //! choice. Validation is where that line is enforced.
 
 pub mod color;
+pub mod content;
 pub mod expr;
 
 use color::{ENEMY_HUES, FRIENDLY_HUES, HueWindow, NEUTRAL_CHROMA, Rgb, contrast_ratio};

@@ -966,6 +966,30 @@ pub fn render_skin_fixture(
     }
 }
 
+/// Compile a player-authored skin document so it can be rendered.
+///
+/// The client fetches documents by content reference for any wearer in a match
+/// it does not already know, and hands them here. Registration verifies that
+/// the bytes hash to the reference they arrived under, so the reference names
+/// the document rather than merely labelling it, and is idempotent — four
+/// players in one skin compile it once.
+///
+/// Returns an error string rather than throwing so the caller can log and carry
+/// on: a skin that will not compile costs its wearer the classic look, never a
+/// frame.
+#[wasm_bindgen(js_name = registerAuthoredSkin)]
+pub fn register_authored_skin(content_ref: &str, document_json: &str) -> Result<(), JsValue> {
+    crate::skin::registry::register_authored_skin(content_ref, document_json)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Whether a content reference has already been compiled this session, so the
+/// client can skip a fetch it does not need.
+#[wasm_bindgen(js_name = authoredSkinIsRegistered)]
+pub fn authored_skin_is_registered(content_ref: &str) -> bool {
+    crate::skin::registry::authored_skin_is_registered(content_ref)
+}
+
 /// Paint one skin's base dressing as a standalone rectangle.
 ///
 /// The Skins page needs to show what a base looks like without running a match,

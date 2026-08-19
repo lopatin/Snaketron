@@ -26,6 +26,9 @@ path = "src/bin/trace_rca.rs"
 test = false
 
 [dependencies]
+# One validator for both sides: the server accepts a document only if the same
+# code the Builder runs in wasm accepts it.
+skin-schema = { path = "../skin-schema" }
 common = { path = "../common" }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
