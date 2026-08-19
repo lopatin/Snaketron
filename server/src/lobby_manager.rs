@@ -1015,6 +1015,49 @@ redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
 return redis.call('ZCARD', KEYS[1])
 "#;
 
+/// Promote a new host, but only while the stored host is still the one this
+/// gateway observed to be absent.
+///
+/// Two gateways can notice the same departed host at the same instant. The
+/// compare-and-set makes the second one a no-op rather than letting it
+/// re-run succession against an already-migrated lobby and hand authority to
+/// a different member. Returns the host that is authoritative afterwards, so
+/// a losing caller adopts the winner's choice instead of its own.
+const MIGRATE_LOBBY_HOST_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return -1
+end
+local stored_host = redis.call('HGET', KEYS[1], 'hostUserId')
+if stored_host ~= ARGV[1] then
+    return tonumber(stored_host)
+end
+redis.call('HSET', KEYS[1], 'hostUserId', ARGV[2])
+return tonumber(ARGV[2])
+"#;
+
+/// Who should lead, given the stored host and the live roster.
+///
+/// `None` means leave the record alone: either the stored host is still here,
+/// or there is nobody to promote.
+///
+/// The successor is the lowest active `user_id`. Every gateway derives the
+/// same answer from the same roster, and unlike a heartbeat timestamp it does
+/// not change as leases refresh, so the choice cannot flap between reads.
+fn lobby_host_successor(
+    stored_host_user_id: i32,
+    members: &BTreeMap<u32, LobbyMember>,
+) -> Option<i32> {
+    let host_is_active = u32::try_from(stored_host_user_id)
+        .is_ok_and(|host_user_id| members.contains_key(&host_user_id));
+    if host_is_active {
+        return None;
+    }
+
+    // An empty roster is a lobby on its way out. Leaving the record alone
+    // keeps authority with the original host if they come back.
+    i32::try_from(members.keys().next().copied()?).ok()
+}
+
 pub fn lobby_membership_valid_until_ms<'a>(
     members: impl IntoIterator<Item = &'a LobbyMember>,
 ) -> Result<i64> {
@@ -1658,10 +1701,13 @@ impl LobbyManager {
         if let Some(lobby_model) = self.get_lobby_metadata(lobby_code).await? {
             let members = self.get_lobby_members(lobby_code).await?;
             let preferences = self.get_lobby_preferences(lobby_code).await?;
+            let host_user_id = self
+                .resolve_effective_host(lobby_code, lobby_model.host_user_id, &members)
+                .await;
             Ok(Some(Lobby {
                 lobby_code: lobby_model.lobby_code,
                 members,
-                host_user_id: lobby_model.host_user_id,
+                host_user_id,
                 state: lobby_model.state,
                 preferences,
                 ad_break: lobby_model.ad_break,
@@ -1669,6 +1715,84 @@ impl LobbyManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// Resolve who actually leads this lobby, migrating the stored host when
+    /// the recorded one is no longer an active member.
+    ///
+    /// Nothing ever rewrote `hostUserId` before leader-gated controls existed,
+    /// so a host who left stranded every remaining member behind a permanently
+    /// unusable mode selector. Succession is resolved on read rather than on
+    /// the leave path because a host can also vanish by simply letting their
+    /// membership lease expire, which no code path observes.
+    ///
+    /// The successor is the lowest active `user_id`: every gateway derives the
+    /// same answer from the same roster, and unlike a heartbeat timestamp it
+    /// does not change as leases refresh, so the choice cannot flap.
+    ///
+    /// A failed migration is not fatal — this returns the stored host and the
+    /// next read tries again.
+    async fn resolve_effective_host(
+        &self,
+        lobby_code: &str,
+        stored_host_user_id: i32,
+        members: &BTreeMap<u32, LobbyMember>,
+    ) -> i32 {
+        let Some(successor) = lobby_host_successor(stored_host_user_id, members) else {
+            return stored_host_user_id;
+        };
+
+        match self
+            .migrate_lobby_host(lobby_code, stored_host_user_id, successor)
+            .await
+        {
+            Ok(Some(host_user_id)) => {
+                if host_user_id == successor {
+                    info!(
+                        "Lobby '{}' host {} is no longer present; promoted {}",
+                        lobby_code, stored_host_user_id, successor
+                    );
+                }
+                host_user_id
+            }
+            // The lobby disappeared underneath us; the caller's snapshot is
+            // already terminal.
+            Ok(None) => stored_host_user_id,
+            Err(error) => {
+                warn!(
+                    lobby_code,
+                    stored_host_user_id,
+                    successor,
+                    "Failed to migrate absent lobby host: {error:#}"
+                );
+                stored_host_user_id
+            }
+        }
+    }
+
+    /// Compare-and-set `hostUserId`. `None` means the lobby no longer exists.
+    async fn migrate_lobby_host(
+        &self,
+        lobby_code: &str,
+        expected_host_user_id: i32,
+        successor_user_id: i32,
+    ) -> Result<Option<i32>> {
+        let mut redis = self.redis.clone();
+        let host_user_id: i64 = Script::new(MIGRATE_LOBBY_HOST_SCRIPT)
+            .key(RedisKeys::lobby_metadata(lobby_code))
+            .arg(expected_host_user_id.to_string())
+            .arg(successor_user_id.to_string())
+            .invoke_async(&mut redis)
+            .await
+            .context("Failed to migrate lobby host")?;
+
+        if host_user_id == -1 {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            i32::try_from(host_user_id).context("Migrated lobby host does not fit a user ID")?,
+        ))
     }
 
     /// Get lobby by code from Redis
@@ -2360,6 +2484,16 @@ impl LobbyManager {
                 .await?;
         }
 
+        // Leaving is explicit intent, so retract the presence record now
+        // rather than waiting out its lease and pointing invites at a lobby
+        // this user has already left.
+        if let Err(error) = self.clear_user_presence(member_user_id, lobby_code).await {
+            warn!(
+                lobby_code,
+                user_id, "Failed to clear user presence on leave: {error:#}"
+            );
+        }
+
         if let Err(e) = self.publish_lobby_update(lobby_code).await {
             warn!(
                 "Failed to publish lobby update after member leave for lobby '{}': {}",
@@ -2993,7 +3127,73 @@ impl LobbyManager {
             _ => return Err(anyhow!("Lobby member lease no longer exists")),
         }
         debug!(lobby_code, expires_at, "Touched lobby member lease");
+
+        // Presence rides the membership lease it describes: renewed by the
+        // same heartbeat, expiring on the same silence. It is deliberately
+        // best-effort — a `/play/<username>` invite going cold is not a reason
+        // to tear down a healthy lobby membership.
+        if let Err(error) = self
+            .publish_user_presence(member.user_id, lobby_code, lease_ttl_ms)
+            .await
+        {
+            warn!(
+                lobby_code,
+                user_id = member.user_id,
+                "Failed to refresh user presence: {error:#}"
+            );
+        }
+
         Ok(())
+    }
+
+    /// Point a user's presence record at the lobby they are currently in.
+    async fn publish_user_presence(
+        &self,
+        user_id: u32,
+        lobby_code: &str,
+        lease_ttl_ms: i64,
+    ) -> Result<()> {
+        let lease_ttl_ms =
+            u64::try_from(lease_ttl_ms).context("Presence lease must be positive")?;
+        self.redis
+            .clone()
+            .pset_ex::<_, _, ()>(RedisKeys::user_presence(user_id), lobby_code, lease_ttl_ms)
+            .await
+            .context("Failed to write user presence")
+    }
+
+    /// Drop a user's presence record, but only while it still points at the
+    /// lobby they are leaving.
+    ///
+    /// A player who leaves one lobby and joins another can have the new
+    /// join's presence write land before the old leave's clear. Comparing
+    /// before deleting stops that late clear from erasing presence for a lobby
+    /// the user is legitimately in.
+    async fn clear_user_presence(&self, user_id: u32, lobby_code: &str) -> Result<()> {
+        const CLEAR_PRESENCE_SCRIPT: &str = r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+        "#;
+
+        let mut redis = self.redis.clone();
+        let _: i64 = Script::new(CLEAR_PRESENCE_SCRIPT)
+            .key(RedisKeys::user_presence(user_id))
+            .arg(lobby_code)
+            .invoke_async(&mut redis)
+            .await
+            .context("Failed to clear user presence")?;
+        Ok(())
+    }
+
+    /// The lobby a user is currently present in, if any.
+    pub async fn get_user_lobby_code(&self, user_id: u32) -> Result<Option<String>> {
+        self.redis
+            .clone()
+            .get::<_, Option<String>>(RedisKeys::user_presence(user_id))
+            .await
+            .context("Failed to read user presence")
     }
 
     /// Update lobby state in Redis
@@ -3147,21 +3347,30 @@ impl LobbyManager {
         Ok(())
     }
 
-    /// Check if a user is the host of a lobby
+    /// Check if a user leads a lobby.
+    ///
+    /// This resolves the *effective* host via [`Self::get_lobby_opt`] rather
+    /// than reading `hostUserId` directly, so authorization agrees with the
+    /// `host_user_id` clients were last shown in a `LobbyUpdate`. Reading the
+    /// raw field would deny every member of a lobby whose host has left but
+    /// whose succession has not been resolved yet.
+    ///
+    /// A lobby that no longer exists has no host, so this is `false` rather
+    /// than an error: the caller's own missing-lobby handling is the better
+    /// place to report that.
     pub async fn is_lobby_host(&self, lobby_code: &str, user_id: i32) -> Result<bool> {
-        if let Some(lobby) = self.get_lobby_metadata(lobby_code).await? {
-            Ok(lobby.host_user_id == user_id)
-        } else {
-            Ok(false)
-        }
+        Ok(self
+            .get_lobby_opt(lobby_code)
+            .await?
+            .is_some_and(|lobby| lobby.host_user_id == user_id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LOBBY_LEASE_CLOCK_SKEW_ALLOWANCE_MS, LobbyMember, MemberValue,
-        lobby_membership_valid_until_ms,
+        BTreeMap, LOBBY_LEASE_CLOCK_SKEW_ALLOWANCE_MS, LobbyMember, MemberValue,
+        lobby_host_successor, lobby_membership_valid_until_ms,
     };
 
     #[test]
@@ -3247,5 +3456,57 @@ mod tests {
         invalid.ts = f64::NAN;
         assert!(lobby_membership_valid_until_ms([&invalid]).is_err());
         assert!(lobby_membership_valid_until_ms(std::iter::empty()).is_err());
+    }
+
+    fn roster(user_ids: &[u32]) -> BTreeMap<u32, LobbyMember> {
+        user_ids
+            .iter()
+            .map(|&user_id| {
+                (
+                    user_id,
+                    LobbyMember {
+                        user_id,
+                        username: format!("user{user_id}"),
+                        ts: 50_000.0,
+                        supports_ad_break: true,
+                        can_show_video_ad: false,
+                        distribution: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Leader-gated controls are only safe because leadership always lands
+    /// somewhere: a lobby whose host left must still be able to pick a mode.
+    #[test]
+    fn host_succession_promotes_only_when_the_stored_host_is_gone() {
+        // Present host: nothing to do, even with lower ids alongside them.
+        assert_eq!(lobby_host_successor(7, &roster(&[3, 7, 9])), None);
+
+        // Absent host: the lowest active id inherits.
+        assert_eq!(lobby_host_successor(7, &roster(&[3, 9])), Some(3));
+        assert_eq!(lobby_host_successor(7, &roster(&[9])), Some(9));
+
+        // The choice is a property of the roster, not of iteration order or
+        // of which gateway happened to observe the departure, so every server
+        // reaches the same answer.
+        assert_eq!(lobby_host_successor(7, &roster(&[9, 3, 5])), Some(3));
+    }
+
+    #[test]
+    fn host_succession_leaves_an_empty_lobby_alone() {
+        // Nobody to promote. Keeping the record means a host who reconnects
+        // into their own draining lobby is still its leader.
+        assert_eq!(lobby_host_successor(7, &roster(&[])), None);
+    }
+
+    /// Host ids come from `i32` while the roster is keyed by `u32`. A stored
+    /// host that cannot be a member id is treated as absent rather than
+    /// panicking or silently matching.
+    #[test]
+    fn host_succession_treats_an_unrepresentable_host_as_absent() {
+        assert_eq!(lobby_host_successor(-1, &roster(&[4])), Some(4));
+        assert_eq!(lobby_host_successor(-1, &roster(&[])), None);
     }
 }

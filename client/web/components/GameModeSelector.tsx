@@ -34,7 +34,7 @@ function GameModeSelector() {
   const { category } = useParams();
   const navigate = useNavigate();
   const { user, login, register } = useAuth();
-  const { currentLobby, createLobby } = useWebSocket();
+  const { currentLobby, isLobbyLeader, createLobby } = useWebSocket();
   const { isConnected, createGame, queueForMatch, queueForMatchMulti } = useGameWebSocket();
   
   const [username, setUsername] = useState('');
@@ -108,6 +108,12 @@ function GameModeSelector() {
   };
 
   const handleStartQueue = async () => {
+    // Same lobby-wide action as the home screen's Start button.
+    if (!isLobbyLeader) {
+      setAuthError('Only the lobby leader can start a match');
+      return;
+    }
+
     if (!username || username.length < 3) {
       setAuthError('Please enter a username (at least 3 characters)');
       return;
@@ -281,10 +287,18 @@ function GameModeSelector() {
             {selectedModes.size > 0 && (
               <button
                 onClick={handleStartQueue}
-                disabled={isAuthenticating || (!user && (!username || username.length < 3))}
+                disabled={
+                  isAuthenticating
+                  || !isLobbyLeader
+                  || (!user && (!username || username.length < 3))
+                }
                 className="w-full mt-4 px-6 py-4 bg-black text-white font-black italic uppercase tracking-1 rounded-lg hover:bg-gray-800 transition-all disabled:bg-gray-400 disabled:cursor-not-allowed"
               >
-                {isAuthenticating ? 'Starting...' : `Start Queue (${selectedModes.size} mode${selectedModes.size > 1 ? 's' : ''})`}
+                {isAuthenticating
+                  ? 'Starting...'
+                  : isLobbyLeader
+                    ? `Start Queue (${selectedModes.size} mode${selectedModes.size > 1 ? 's' : ''})`
+                    : 'Waiting for Leader'}
               </button>
             )}
           </div>

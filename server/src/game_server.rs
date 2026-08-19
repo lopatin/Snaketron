@@ -259,6 +259,8 @@ pub struct GameServer {
     runtime_mode: ServerRuntimeMode,
     /// Membership, assignment, and partition-executor manager.
     executor_cluster: ExecutorClusterHandle,
+    /// Lobby membership, leadership, and presence.
+    lobby_manager: Arc<LobbyManager>,
 }
 
 async fn join_test_service_tasks(
@@ -868,12 +870,18 @@ impl GameServer {
             route_withdrawal_delay,
             runtime_mode,
             executor_cluster,
+            lobby_manager,
         })
     }
 
     /// Get a reference to the database
     pub fn db(&self) -> &Arc<dyn Database> {
         &self.db
+    }
+
+    /// Get a reference to the lobby manager
+    pub fn lobby_manager(&self) -> &Arc<LobbyManager> {
+        &self.lobby_manager
     }
 
     /// Get the cancellation token

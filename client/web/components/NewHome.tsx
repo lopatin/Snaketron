@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { AccountModalView } from './AccountModal';
 import { HomeHeader } from './HomeHeader';
 import { GameStartForm } from './GameStartForm';
@@ -14,6 +14,7 @@ import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { isConnectionReady } from '../utils/connectionBanner';
+import { readHomeNotice, type HomeNotice } from '../utils/homeNotice';
 import { LobbyGameMode } from '../types';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
@@ -25,6 +26,7 @@ interface NewHomeProps {
 
 export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { user, ensurePlayableSession, logout } = useAuth();
   const {
     connectToRegion,
@@ -34,6 +36,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     onMessage,
     currentRegionUrl,
     currentLobby,
+    isLobbyLeader,
     lobbyMembers,
     createLobby,
     leaveLobby,
@@ -48,6 +51,19 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [homeNotice, setHomeNotice] = useState<HomeNotice | null>(null);
+
+  // A redirect here (an invite link that went nowhere, say) can leave a
+  // sentence explaining itself. Consume it once and strip it from history, so
+  // a reload does not re-announce something the player already read.
+  useEffect(() => {
+    const notice = readHomeNotice(location.state);
+    if (!notice) {
+      return;
+    }
+    setHomeNotice(notice);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.pathname, location.state, navigate]);
 
   // Use regions hook for live data
   const {
@@ -107,7 +123,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     nickname: string,
     isCompetitive: boolean
   ) => {
-    if (isLobbyQueued) {
+    if (isLobbyQueued || !isLobbyLeader) {
       return;
     }
 
@@ -230,6 +246,25 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
           onLogout={logout}
         />
 
+        {homeNotice && (
+          <div className="home-notice-dock" role="status" aria-live="polite">
+            <div
+              data-testid="home-notice"
+              className={`home-notice${homeNotice.tone === 'error' ? ' is-error' : ''}`}
+            >
+              <span>{homeNotice.message}</span>
+              <button
+                type="button"
+                aria-label="Dismiss notification"
+                onClick={() => setHomeNotice(null)}
+                className="home-notice-dismiss"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+
         <ConnectionStatusRack
           isReady={isReady}
           regionsLoading={regionsLoading}
@@ -245,6 +280,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
               isLoading={isLoading}
               isAuthenticated={user !== null && !user.isGuest}
               isLobbyQueued={isLobbyQueued}
+              isLobbyLeader={isLobbyLeader}
               lobbyPreferences={lobbyPreferences}
               onPreferencesChange={updateLobbyPreferences}
               onSignInClick={onOpenAuth}

@@ -4311,6 +4311,47 @@ async fn authenticate_ws_connection(
     }
 }
 
+/// Gate a lobby-wide mutation on leadership.
+///
+/// Returns `true` when the caller may proceed. Otherwise an `AccessDenied`
+/// naming `action` has already been queued and the caller must do nothing —
+/// the client mirrors this rule in its UI, so reaching a denial means either a
+/// stale roster or a hand-crafted frame.
+///
+/// A failure to *determine* leadership denies the action. Matchmaking and
+/// preferences are shared state for every member of the lobby, so an
+/// unverifiable request is not safe to admit.
+async fn authorize_lobby_leader(
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    ws_tx: &mpsc::Sender<Message>,
+    lobby_code: &str,
+    user_id: i32,
+    action: &str,
+) -> Result<bool> {
+    let is_host = match lobby_manager.is_lobby_host(lobby_code, user_id).await {
+        Ok(is_host) => is_host,
+        Err(error) => {
+            warn!(
+                lobby_code,
+                user_id, "Failed to resolve lobby leadership: {error:#}"
+            );
+            false
+        }
+    };
+
+    if is_host {
+        return Ok(true);
+    }
+
+    let response = WSMessage::AccessDenied {
+        reason: format!("Only the lobby leader can {action}"),
+    };
+    ws_tx
+        .send(Message::Text(serde_json::to_string(&response)?.into()))
+        .await?;
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: ConnectionState,
@@ -4496,15 +4537,27 @@ async fn process_ws_message(
                 } => {
                     {
                         if let Some(ref lobby_handle) = lobby {
-                            lobby_manager
-                                .set_lobby_preferences(
-                                    &lobby_handle.lobby_code,
-                                    &lobby_manager::LobbyPreferences {
-                                        selected_modes,
-                                        competitive,
-                                    },
-                                )
-                                .await?;
+                            // Preferences are lobby-wide: one member's choice
+                            // decides what every member queues for.
+                            if authorize_lobby_leader(
+                                lobby_manager,
+                                ws_tx,
+                                &lobby_handle.lobby_code,
+                                metadata.user_id,
+                                "change the game mode",
+                            )
+                            .await?
+                            {
+                                lobby_manager
+                                    .set_lobby_preferences(
+                                        &lobby_handle.lobby_code,
+                                        &lobby_manager::LobbyPreferences {
+                                            selected_modes,
+                                            competitive,
+                                        },
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                     Ok(ConnectionState::Authenticated {
@@ -4524,6 +4577,23 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
+                        if !authorize_lobby_leader(
+                            lobby_manager,
+                            ws_tx,
+                            &lobby_handle.lobby_code,
+                            metadata.user_id,
+                            "start matchmaking",
+                        )
+                        .await?
+                        {
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: lobby,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+
                         if let Err(e) = queue_lobby_or_begin_ad_break(
                             &lobby_handle.lobby_code,
                             std::slice::from_ref(&game_type),
@@ -4583,6 +4653,23 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
+                        if !authorize_lobby_leader(
+                            lobby_manager,
+                            ws_tx,
+                            &lobby_handle.lobby_code,
+                            metadata.user_id,
+                            "start matchmaking",
+                        )
+                        .await?
+                        {
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: lobby,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+
                         if let Err(e) = queue_lobby_or_begin_ad_break(
                             &lobby_handle.lobby_code,
                             &game_types,
@@ -4835,6 +4922,29 @@ async fn process_ws_message(
                     // from this authenticated user's exact durable claim.
                     let in_memory_lobby_code =
                         lobby.as_ref().map(|handle| handle.lobby_code.clone());
+
+                    // Cancelling drops the whole lobby out of the queue, so it
+                    // belongs to whoever was allowed to start it. Without the
+                    // handle there is no lobby to check leadership against, and
+                    // the durable-claim path below only ever reaches this
+                    // user's own admission, so that case stays permitted.
+                    if let Some(ref lobby_code) = in_memory_lobby_code
+                        && !authorize_lobby_leader(
+                            lobby_manager,
+                            ws_tx,
+                            lobby_code,
+                            metadata.user_id,
+                            "cancel matchmaking",
+                        )
+                        .await?
+                    {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
                     let mut removal_result = Ok(None);
                     for attempt in 0..2 {
