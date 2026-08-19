@@ -5,6 +5,7 @@ pub mod jwt;
 pub mod leaderboard;
 pub mod middleware;
 pub mod news;
+pub mod players;
 pub mod rate_limit;
 pub mod regions;
 pub mod server;

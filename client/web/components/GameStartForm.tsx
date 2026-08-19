@@ -43,6 +43,13 @@ interface GameStartFormProps {
   isLoading?: boolean;
   isAuthenticated?: boolean;
   isLobbyQueued?: boolean;
+  /**
+   * Whether this player leads the lobby. Only the leader may change the mode
+   * selection or start matchmaking, because both decide what every member of
+   * the lobby queues for. Defaults to `true` so a form rendered outside a
+   * lobby context behaves as it always did.
+   */
+  isLobbyLeader?: boolean;
   lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
   onSignInClick?: () => void;
@@ -57,6 +64,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   isLoading = false,
   isAuthenticated = false,
   isLobbyQueued = false,
+  isLobbyLeader = true,
   lobbyPreferences,
   onPreferencesChange,
   onSignInClick,
@@ -77,7 +85,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   );
   const { sendMessage } = useWebSocket();
   const prevUsernameRef = useRef<string | null>(null);
-  const canEdit = !isLobbyQueued;
+  const canEdit = !isLobbyQueued && isLobbyLeader;
 
   // Debounce nickname validation to avoid showing errors while typing
   const debouncedNickname = useDebouncedValue(nickname, 500);
@@ -113,7 +121,12 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       if (isCompetitive === null) {
         setIsCompetitive(fallbackPreferences.competitive);
       }
-      onPreferencesChange?.(fallbackPreferences);
+      // Seeding from local storage publishes a selection nobody clicked. Only
+      // the leader may do that; for anyone else it would be rejected, and it
+      // would race the leader's real choice on arrival.
+      if (isLobbyLeader) {
+        onPreferencesChange?.(fallbackPreferences);
+      }
     } else if (isCompetitive === null) {
       setIsCompetitive(DEFAULT_LOBBY_PREFERENCES.competitive);
     }
@@ -121,6 +134,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     lobbyPreferences,
     selectedModes,
     isCompetitive,
+    isLobbyLeader,
     setSelectedModes,
     setIsCompetitive,
     onPreferencesChange,
@@ -213,7 +227,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (isLobbyQueued) {
+    if (isLobbyQueued || !isLobbyLeader) {
       return;
     }
 
@@ -223,7 +237,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   };
 
   const isFormValid = selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3;
-  const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading;
+  const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading || !isLobbyLeader;
   // Unlike the Start button this ignores the nickname: a ticker CTA is still
   // useful without one, because it applies the selection and asks for the name.
   const isTickerPlayDisabled = !canEdit || isLoading;
@@ -365,6 +379,17 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
         {/* Game Mode Selector */}
         <div className="mb-8">
+          {/* Disabled controls are only fair if the reason is visible. Shown
+              in place of the mode grid's own spacing so the layout does not
+              shift when leadership changes hands mid-session. */}
+          {!isLobbyLeader && (
+            <p
+              className="mb-3 text-[13px] text-gray-500 text-center"
+              data-testid="leader-only-notice"
+            >
+              Waiting for lobby host to start matchmaking
+            </p>
+          )}
           <div className="grid grid-cols-2 gap-3">
             {gameModes.map((mode) => {
               const isSelected = selectedModes && selectedModes.has(mode.id);
