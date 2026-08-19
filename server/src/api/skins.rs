@@ -374,21 +374,41 @@ const MAX_SKIN_NAME_LENGTH: usize = 40;
 /// Validate a document and reduce it to the bytes and reference it will be
 /// stored under. One place, so create and update cannot diverge on what they
 /// accept or on how they name what they accepted.
+/// Parse, validate and canonicalise a document of either schema version.
+///
+/// Dispatch belongs here rather than at the caller because the *storage* rules
+/// are version-blind — a revision is bytes named by their hash, and which
+/// schema produced them is not part of that question. What differs is the
+/// validator, and `load_any` is the single door that picks the right one.
+///
+/// This read v1 only until the layer schema shipped, which meant a document
+/// from the new Builder was refused at save with a parse error about a field
+/// it does not have.
 fn accept_document(document: &serde_json::Value) -> Result<(String, String, u32), SkinsApiError> {
-    let doc: skin_schema::SkinDoc = serde_json::from_value(document.clone())
+    let json = serde_json::to_string(document)
         .map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
 
-    skin_schema::validate(&doc).map_err(|errors| {
-        SkinsApiError::Invalid(
-            errors
-                .into_iter()
-                .map(|error| format!("{}: {}", error.field, error.problem))
-                .collect(),
-        )
-    })?;
+    let (bytes, schema_version) = match skin_schema::v2::load_any(&json) {
+        Ok(skin_schema::v2::AnySkinDoc::V1(doc)) => (
+            skin_schema::content::canonical_bytes(&doc),
+            doc.schema_version,
+        ),
+        Ok(skin_schema::v2::AnySkinDoc::V2(doc)) => (
+            skin_schema::content::canonical_bytes(&doc),
+            doc.schema_version,
+        ),
+        Err(errors) => {
+            return Err(SkinsApiError::Invalid(
+                errors
+                    .into_iter()
+                    .map(|error| format!("{}: {}", error.field, error.problem))
+                    .collect(),
+            ));
+        }
+    };
 
-    let bytes = skin_schema::content::canonical_bytes(&doc)
-        .map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
+    let bytes =
+        bytes.map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
     if bytes.len() > MAX_DOCUMENT_BYTES {
         return Err(SkinsApiError::Invalid(vec![format!(
             "document: {} bytes exceeds the {MAX_DOCUMENT_BYTES}-byte limit",
@@ -399,7 +419,7 @@ fn accept_document(document: &serde_json::Value) -> Result<(String, String, u32)
     let canonical = String::from_utf8(bytes)
         .map_err(|_| SkinsApiError::Invalid(vec!["document: not valid UTF-8".to_string()]))?;
     let reference = skin_schema::content::reference_for_bytes(canonical.as_bytes());
-    Ok((canonical, reference, doc.schema_version))
+    Ok((canonical, reference, schema_version))
 }
 
 fn accept_name(name: &str) -> Result<String, SkinsApiError> {
@@ -1048,6 +1068,46 @@ mod tests {
         let (again, same_reference, _) = accept_document(&reparsed).expect("still valid");
         assert_eq!(canonical, again);
         assert_eq!(reference, same_reference);
+    }
+
+    /// A layer document saves through the same door.
+    ///
+    /// This route read v1 only until the layer schema shipped, which meant the
+    /// new Builder's Save produced a parse error naming a field the document
+    /// does not have — the editor validated it, the preview painted it, and
+    /// the server refused it. Storage is version-blind by design; only the
+    /// validator differs.
+    #[test]
+    fn a_v2_layer_document_is_accepted_and_named_the_same_way() {
+        let v1: skin_schema::SkinDoc =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
+                .expect("the shipped document parses");
+        let v2 = skin_schema::v2::upgrade(&v1);
+        let document = serde_json::to_value(&v2).expect("serializes");
+
+        let (canonical, reference, schema_version) =
+            accept_document(&document).expect("a converted document is valid");
+
+        assert_eq!(schema_version, skin_schema::v2::SCHEMA_VERSION_V2);
+        assert_eq!(
+            reference,
+            skin_schema::content::reference_for_bytes(canonical.as_bytes()),
+            "a v2 revision is named by its bytes exactly as a v1 one is"
+        );
+
+        // ...and the v2 validator is the one that ran: a stack the layer rules
+        // refuse has to be refused here too.
+        let mut broken = v2.clone();
+        broken.layers.clear();
+        let error = accept_document(&serde_json::to_value(&broken).expect("serializes"))
+            .expect_err("an empty stack paints nothing");
+        let SkinsApiError::Invalid(problems) = error else {
+            panic!("expected a validation error");
+        };
+        assert!(
+            problems.iter().any(|problem| problem.contains("layers")),
+            "{problems:?}"
+        );
     }
 
     /// The validator is the gate, and it is the shared one — a document that

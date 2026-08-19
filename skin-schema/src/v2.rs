@@ -23,7 +23,7 @@
 
 use crate::expr::{Expr, ExprError, Input, Tier};
 use crate::{
-    BaseTheme, CelebrationTheme, ColorPair, LabelStyle, MAX_ANIMATION_PERIOD_MS,
+    ANIMATION_STEPS, BaseTheme, CelebrationTheme, ColorPair, LabelStyle, MAX_ANIMATION_PERIOD_MS,
     MAX_HEAD_CORE_RATIO, MAX_OUTLINE_EXTRA_PX, MIN_ANIMATION_PERIOD_MS, MIN_HEAD_CORE_RATIO,
     MIN_OUTLINE_EXTRA_PX, MIN_READY_CHECK_CONTRAST, READY_CHECK_INK, RolePalette, SkinDoc,
     SkinDocError,
@@ -910,6 +910,7 @@ fn count_flattened(layers: &[LayerV2]) -> usize {
 
 /// Parse one expression-valued property and hold it to its evaluation site.
 fn check_expr(field: &str, site: EvalSite, expr: &PropExpr, errors: &mut Vec<SkinDocError>) {
+    let before = errors.len();
     let parsed = match expr.parse() {
         Err(error) => {
             errors.push(SkinDocError::new(field, format!("`{}`: {error}", expr.0)));
@@ -947,6 +948,92 @@ fn check_expr(field: &str, site: EvalSite, expr: &PropExpr, errors: &mut Vec<Ski
             ),
         ));
     }
+
+    // Whether the animation survives being baked into the ring.
+    //
+    // Gated on reading `time` rather than on the tier, because `time` is
+    // quantized to the ring at *every* tier — the head glow's per-cell curve
+    // reads the same 32-step clock a baked parameter does, and it is the most
+    // visible surface on the snake.
+    //
+    // Skipped when this field already failed, for the reason the cost gate is
+    // withheld from an invalid document: one edit should not produce two
+    // complaints about itself.
+    if errors.len() == before && parsed.inputs().contains(Input::Time) {
+        for env in ring_environments(&parsed) {
+            let Some(alias) = crate::ring::ring_alias(&parsed, &env) else {
+                continue;
+            };
+            let detail = match alias {
+                crate::ring::RingAlias::Blind => {
+                    "the ring samples it at exactly the points where it \
+                     repeats, so it paints as a constant"
+                        .to_string()
+                }
+                crate::ring::RingAlias::TooFast { growth } => {
+                    format!("it moves {growth:.1}x further between frames than the ring records")
+                }
+            };
+            errors.push(SkinDocError::new(
+                field,
+                format!(
+                    "this animates faster than the {ANIMATION_STEPS}-step ring \
+                     can show — a skin is baked into {ANIMATION_STEPS} frames a \
+                     cycle, so anything completing more than {} cycles per cycle \
+                     comes out as a different, slower motion than you wrote \
+                     ({detail}). Slow the rate down, or raise the cycle length \
+                     and keep the rate.",
+                    ANIMATION_STEPS / 2
+                ),
+            ));
+            break;
+        }
+    }
+}
+
+/// The environments a time-reading expression is judged in.
+///
+/// The product runs over only the inputs the expression actually reads, so the
+/// overwhelmingly common time-only case is one environment and one sweep.
+///
+/// Per environment rather than once over their union, because a rate can
+/// depend on the rest: `sin(tau * time * len)` is calm on a short snake and
+/// strobes on a long one, and an expression that is identically zero at one
+/// `s` would otherwise let that dead sample speak for the whole layer.
+fn ring_environments(expr: &Expr) -> Vec<crate::expr::Env> {
+    let inputs = expr.inputs();
+    let axis = |reads: bool, values: &[f64]| -> Vec<f64> {
+        if reads { values.to_vec() } else { vec![0.0] }
+    };
+
+    let mut environments = Vec::new();
+    for s in axis(inputs.contains(Input::S), &[0.0, 2.0, 12.0]) {
+        for t in axis(inputs.contains(Input::T), &[0.0, 0.4]) {
+            // The reference body the cost model prices, and a long one.
+            for len in axis(
+                inputs.contains(Input::Len),
+                &[COST_REFERENCE_CELLS as f64, 64.0],
+            ) {
+                for boost in axis(inputs.contains(Input::Boost), &[0.0, 1.0]) {
+                    // Whole numbers: the arena passes a snake's index in the
+                    // state, not a fraction, so fractional probes would all
+                    // land inside one cell of the noise lattice and test one
+                    // field rather than several.
+                    for seed in axis(inputs.contains(Input::Seed), &[0.0, 1.0, 7.0]) {
+                        environments.push(crate::expr::Env {
+                            s,
+                            t,
+                            len,
+                            time: 0.0,
+                            boost,
+                            seed,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    environments
 }
 
 fn check_color_ref(doc: &SkinDocV2, field: &str, color: &ColorRef, errors: &mut Vec<SkinDocError>) {
@@ -2250,6 +2337,90 @@ mod tests {
             // None of them may inherit the shipped document's exemption, which
             // is only sound because none of them is the shipped document.
             assert_ne!(template.document.id, "classic-doc@1");
+        }
+    }
+
+    /// The ring gate, reached through the validator an author actually hits.
+    #[test]
+    fn an_animation_the_ring_cannot_show_is_refused_at_the_property_that_wrote_it() {
+        let mut doc = upgrade(&classic_v1());
+        doc.layers[1].opacity = PropExpr("0.5 + 0.5 * sin(tau * time * 40)".to_string());
+
+        let errors = validate_v2(&doc).expect_err("a 40-cycle flicker must be refused");
+        let error = errors
+            .iter()
+            .find(|error| error.field == "layers[1].opacity")
+            .expect("the property is named");
+        assert!(error.problem.contains("32-step ring"), "{error}");
+        assert!(error.problem.contains("16 cycles"), "{error}");
+
+        // An exact multiple of the ring paints nothing at all, and says so
+        // rather than passing silently — the case a 2x check cannot see.
+        let mut doc = upgrade(&classic_v1());
+        doc.layers[1].opacity = PropExpr("0.5 + 0.5 * sin(tau * time * 32)".to_string());
+        let errors = validate_v2(&doc).expect_err("a dead layer must be refused");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.problem.contains("paints as a constant")),
+            "{errors:?}"
+        );
+    }
+
+    /// The gate follows the clock, not the tier. The head glow's curve is
+    /// per-cell and reads the same 32-step `time` a baked parameter does — and
+    /// it is the most visible surface on the snake.
+    #[test]
+    fn the_ring_gate_reaches_the_per_cell_glow_too() {
+        let mut doc = upgrade(&classic_v1());
+        doc.layers[2].opacity = PropExpr(
+            "0.3 * smoothstep(9, 0, s) * (0.85 + 0.15 * sin(tau * time * 40))".to_string(),
+        );
+        let errors = validate_v2(&doc).expect_err("the glow aliases just as hard");
+        assert!(
+            errors.iter().any(|error| error.field == "layers[2].opacity"
+                && error.problem.contains("32-step ring")),
+            "{errors:?}"
+        );
+    }
+
+    /// One edit should produce one complaint. The ring check is withheld from
+    /// a field that has already failed, the same way the cost verdict is
+    /// withheld from a document that is already invalid.
+    #[test]
+    fn the_ring_gate_does_not_pile_on_a_property_that_already_failed() {
+        let mut doc = upgrade(&classic_v1());
+        // Illegal input *and* an impossible rate, in one expression.
+        doc.layers[1].opacity = PropExpr("s * sin(tau * time * 40)".to_string());
+
+        let errors = validate_v2(&doc).expect_err("must fail");
+        let about_opacity: Vec<_> = errors
+            .iter()
+            .filter(|error| error.field == "layers[1].opacity")
+            .collect();
+        assert_eq!(about_opacity.len(), 1, "{about_opacity:?}");
+        assert!(about_opacity[0].problem.contains("`s`"), "the input first");
+    }
+
+    /// This rule can knock a *shipped* skin out at runtime, not merely a draft
+    /// at review time: the client upgrades v1 documents and compiles them
+    /// through this validator, and a refusal there falls back to classic
+    /// silently. v1's wave converts to a `crests_per_cycle`-rate sinusoid, so
+    /// that is the exposure — pinned here rather than left to inspection.
+    #[test]
+    fn no_shipped_document_is_anywhere_near_the_ring_bound() {
+        for json in [
+            include_str!("../skins/classic.skin.json"),
+            include_str!("../skins/aurora.skin.json"),
+            include_str!("../skins/tidewave.skin.json"),
+            include_str!("../skins/voltage.skin.json"),
+            include_str!("../skins/lantern.skin.json"),
+        ] {
+            let v1: SkinDoc = serde_json::from_str(json).expect("a shipped document parses");
+            let converted = upgrade(&v1);
+            if let Err(errors) = validate_v2(&converted) {
+                panic!("shipped `{}` stops validating: {errors:?}", v1.id);
+            }
         }
     }
 
