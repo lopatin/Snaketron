@@ -103,12 +103,12 @@ const collectibleBoostStep = (
   body:
     inputSurface === 'touch'
       ? (inputMode === 'toggle'
-          ? 'Collect NOS, then tap the NOS button to toggle boost.'
-          : 'Collect NOS, then hold the NOS button to boost.')
+          ? 'Collect fuel, then tap the Boost button to toggle boost.'
+          : 'Collect fuel, then hold the Boost button to boost.')
       : (inputMode === 'toggle'
-          ? 'Collect NOS, then press Space to toggle boost.'
-          : 'Collect NOS, then hold Space to boost.'),
-  visualLabel: 'A snake collects NOS; its fuel fills and it accelerates.',
+          ? 'Collect fuel, then press Space to toggle boost.'
+          : 'Collect fuel, then hold Space to boost.'),
+  visualLabel: 'A snake collects fuel; its tank fills and it accelerates.',
 });
 
 const teamSteps = (
@@ -179,8 +179,8 @@ const soloSteps = (
     body:
       inputSurface === 'touch'
         ? (inputMode === 'toggle'
-            ? 'Tap the NOS button to toggle unlimited boost.'
-            : 'Hold the NOS button for unlimited boost.')
+            ? 'Tap the Boost button to toggle unlimited boost.'
+            : 'Hold the Boost button for unlimited boost.')
         : (inputMode === 'toggle'
             ? 'Press Space to toggle unlimited boost.'
             : 'Hold Space for unlimited boost.'),

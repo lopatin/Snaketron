@@ -60,7 +60,7 @@ export function GameControlsHint({
             className="boost-input-mode"
             data-testid="boost-input-mode"
             title={isTouch
-              ? 'Checked: boost while the NOS button is held. Unchecked: tap the NOS button to start or stop Boost.'
+              ? 'Checked: boost while the Boost button is held. Unchecked: tap the Boost button to start or stop Boost.'
               : 'Checked: boost while Space is held. Unchecked: press Space to start or stop Boost.'}
           >
             <input
@@ -76,8 +76,8 @@ export function GameControlsHint({
           <span className="sr-only">
             {isTouch
               ? (boostInputMode === 'hold'
-                  ? 'Hold the NOS button to boost'
-                  : 'Tap the NOS button to start or stop boost')
+                  ? 'Hold the Boost button to boost'
+                  : 'Tap the Boost button to start or stop boost')
               : (boostInputMode === 'hold'
                   ? 'Hold the Space key to boost'
                   : 'Press the Space key to start or stop boost')}
