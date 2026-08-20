@@ -344,13 +344,14 @@ impl JobLedger {
 /// local tooling's own philosophy is that a structurally disagreeing source is
 /// re-generated rather than force-repaired, and this is what makes the
 /// re-generation better informed than the first try.
-pub fn retry_prompt(base: &str, failing_axis: &str, ratio: f32) -> String {
+pub fn retry_prompt(base: &str, failing_axis: &str, percentile: f32) -> String {
     format!(
-        "{base}\n\nThe previous attempt did not tile: the {failing_axis} join was {ratio:.2}× \
-         more different than the surrounding texture, and the limit is {:.2}×. Make the \
-         {failing_axis} edges continue into each other exactly — the same shapes and the same \
-         brightness on both sides of the join.",
-        crate::texture::SeamReport::ACCEPTABLE_RATIO
+        "{base}\n\nThe previous attempt did not tile. Its {failing_axis} join stood out more \
+         than {:.0}% of the ordinary steps inside the texture, and anything past {:.0}% is a \
+         line a player will see repeating. Make the {failing_axis} edges continue into each \
+         other exactly — the same shapes and the same brightness on both sides of the join.",
+        percentile * 100.0,
+        crate::texture::SeamReport::ACCEPTABLE_RATIO * 100.0
     )
 }
 
@@ -545,11 +546,11 @@ mod tests {
     /// A retry that carries no information is a retry with the same odds.
     #[test]
     fn a_retry_prompt_tells_the_model_what_went_wrong() {
-        let retry = retry_prompt("Create a seamless leopard print.", "horizontal", 2.4);
+        let retry = retry_prompt("Create a seamless leopard print.", "horizontal", 0.97);
         assert!(retry.starts_with("Create a seamless leopard print."));
         assert!(retry.contains("horizontal"));
-        assert!(retry.contains("2.40"));
-        assert!(retry.contains("1.50"), "and what the limit was");
+        assert!(retry.contains("97%"), "what the join measured");
+        assert!(retry.contains("90%"), "and what the limit was");
     }
 
     #[test]

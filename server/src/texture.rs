@@ -119,27 +119,45 @@ pub struct TextureVariant {
 }
 
 /// What a seam check found, per axis.
+///
+/// The numbers are **percentiles**, not ratios, and the difference is not
+/// cosmetic. A ratio — the join's step over the mean interior step — was tried
+/// first and an adversarial review of the offline tooling established it is not
+/// diagnostic in either direction: a posterised print is mostly flat, so its
+/// mean interior step is tiny and one legitimate stripe edge landing on the
+/// join reads as 1.95; a high-contrast hide has a mean large enough to bury a
+/// real misalignment. Both were measured on shipped files
+/// (`build_coat_textures.py::seam_ratio`).
+///
+/// A percentile asks the only question that matters — *is this join unusual for
+/// this texture?* — and answers it in the texture's own units. 0.5 is a
+/// perfectly ordinary column boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub struct SeamReport {
-    /// Ratio of seam-line difference to the image's own local difference. At
-    /// or below 1.0 the join is invisible against the texture's own noise.
+    /// Where the wrap join ranks among the image's own column steps, 0..1.
     pub horizontal_ratio: f32,
+    /// The same for the join between the last row and the first.
     pub vertical_ratio: f32,
     /// Whether a repair was applied to get here.
     pub repaired: bool,
 }
 
 impl SeamReport {
-    /// The acceptance gate the sprite tooling uses after a repair.
+    /// Where a join stops being an ordinary boundary and starts being a line.
     ///
-    /// Post-repair acceptance is looser than the pre-repair trigger on purpose:
-    /// a repaired join is allowed to be *detectable* by a metric as long as it
-    /// is not visible, and holding it to the stricter number would reject work
-    /// that looks right.
-    pub const ACCEPTABLE_RATIO: f32 = 1.5;
+    /// The offline tooling's own reading of the same metric: "anything above
+    /// ~0.9 is a join that stands out from its own texture and will be visible
+    /// when it repeats". A little slack under that, because a join is allowed
+    /// to be *detectable* by a metric as long as it is not visible, and holding
+    /// art to a stricter number rejects work that looks right.
+    ///
+    /// This was 1.5 while the doc above described a ratio — a threshold no
+    /// percentile could ever reach, so the gate accepted every texture put to
+    /// it. Nothing had been put to it yet, which is why it went unnoticed.
+    pub const ACCEPTABLE_RATIO: f32 = 0.9;
 
     pub fn passes(&self, kind: TextureKind) -> bool {
         let horizontal_ok =
@@ -182,7 +200,7 @@ pub struct TextureError {
 }
 
 impl TextureError {
-    fn new(field: impl Into<String>, problem: impl Into<String>) -> Self {
+    pub fn new(field: impl Into<String>, problem: impl Into<String>) -> Self {
         Self {
             field: field.into(),
             problem: problem.into(),
@@ -510,8 +528,8 @@ mod tests {
     #[test]
     fn an_overlay_is_not_held_to_a_seam_it_does_not_have() {
         let seams = SeamReport {
-            horizontal_ratio: 9.0,
-            vertical_ratio: 9.0,
+            horizontal_ratio: 1.0,
+            vertical_ratio: 1.0,
             repaired: false,
         };
         assert!(seams.passes(TextureKind::Overlay));
@@ -526,8 +544,8 @@ mod tests {
     #[test]
     fn a_join_within_the_gate_passes_for_the_axis_that_needs_it() {
         let repaired = SeamReport {
-            horizontal_ratio: 1.4,
-            vertical_ratio: 1.4,
+            horizontal_ratio: 0.85,
+            vertical_ratio: 0.85,
             repaired: true,
         };
         assert!(repaired.passes(TextureKind::Coat));

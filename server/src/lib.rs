@@ -46,6 +46,7 @@ pub mod skin_store;
 pub mod sync_trace;
 pub mod telemetry;
 pub mod texture;
+pub mod texture_pixels;
 pub mod texture_store;
 pub mod user_cache;
 pub mod wallet;

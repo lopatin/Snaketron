@@ -32,6 +32,31 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// out-of-memory condition with extra steps.
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// How many reference images to actually send.
+///
+/// A cap rather than a preference: every reference is another image uploaded on
+/// every attempt, and past a handful they stop steering and start costing.
+const MAX_REFERENCES: usize = 4;
+
+/// The size to ask a model for, given the size the texture actually needs.
+///
+/// Providers make a handful of fixed sizes; a coat is 768x64 and a sheet is
+/// 320x320, and none of those is on any vendor's menu. This used to be sent
+/// verbatim as `"size": "768x64"`, which no image API accepts — never noticed,
+/// because nothing had ever called it.
+///
+/// So the request asks for the *closest shape the vendor makes*, and the pixel
+/// pass crops a band of the right proportions and mirrors it. Wide targets get
+/// the landscape option because a coat is twelve cells long and horizontal
+/// detail is what it is short of; everything else gets the square.
+fn provider_size(width: u32, height: u32) -> (u32, u32) {
+    if width >= height * 2 {
+        (1536, 1024)
+    } else {
+        (1024, 1024)
+    }
+}
+
 fn client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -123,24 +148,50 @@ impl ImageProvider for OpenAiImages {
         prompt: &str,
         width: u32,
         height: u32,
-        _references: &[Vec<u8>],
+        references: &[Vec<u8>],
     ) -> ProviderOutcome {
-        let body = serde_json::json!({
-            "model": self.model,
-            "prompt": prompt,
-            "size": format!("{width}x{height}"),
-            "n": 1,
-            "response_format": "b64_json",
-        });
+        let (ask_width, ask_height) = provider_size(width, height);
+        let size = format!("{ask_width}x{ask_height}");
 
-        let response = match self
-            .client
-            .post("https://api.openai.com/v1/images/generations")
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-        {
+        // With references this is an *edit*, which is a different endpoint and
+        // a multipart body — the images are files, not JSON. Without them it is
+        // a plain generation.
+        let request = if references.is_empty() {
+            self.client
+                .post("https://api.openai.com/v1/images/generations")
+                .bearer_auth(&self.api_key)
+                .json(&serde_json::json!({
+                    "model": self.model,
+                    "prompt": prompt,
+                    "size": size,
+                    "n": 1,
+                }))
+        } else {
+            let mut form = reqwest::multipart::Form::new()
+                .text("model", self.model.clone())
+                .text("prompt", prompt.to_string())
+                .text("size", size)
+                .text("n", "1");
+            for (index, reference) in references.iter().take(MAX_REFERENCES).enumerate() {
+                let part = reqwest::multipart::Part::bytes(reference.clone())
+                    .file_name(format!("reference-{index}.png"))
+                    .mime_str("image/png");
+                match part {
+                    Ok(part) => form = form.part("image[]", part),
+                    Err(error) => {
+                        return ProviderOutcome::Unavailable {
+                            detail: format!("openai reference rejected: {error}"),
+                        };
+                    }
+                }
+            }
+            self.client
+                .post("https://api.openai.com/v1/images/edits")
+                .bearer_auth(&self.api_key)
+                .multipart(form)
+        };
+
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 return ProviderOutcome::Unavailable {
@@ -345,8 +396,189 @@ impl ImageProvider for OpenRouterImages {
 }
 
 /// Every provider this deployment has keys for, in preference order.
+/// Gemini, which takes prompt and reference images in one ordinary request.
+///
+/// Preferred first when it is configured, and the reason is measured rather
+/// than assumed: on the same tiger-coat prompt it and OpenAI both returned
+/// usable art, and both reach a perfect wrap once the pixel pass mirrors them,
+/// so what separates them is that references are a native part of this
+/// request shape rather than a second endpoint with a different body.
+pub struct GeminiImages {
+    client: reqwest::Client,
+    api_key: String,
+    model: String,
+    usd_micros_per_image: u64,
+}
+
+impl GeminiImages {
+    pub fn from_env() -> Option<Self> {
+        let api_key = std::env::var("SNAKETRON_GEMINI_API_KEY")
+            .or_else(|_| std::env::var("GEMINI_API_KEY"))
+            .ok()?;
+        if api_key.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            client: client().ok()?,
+            api_key,
+            model: std::env::var("SNAKETRON_GEMINI_IMAGE_MODEL")
+                .unwrap_or_else(|_| "gemini-2.5-flash-image".to_string()),
+            usd_micros_per_image: std::env::var("SNAKETRON_GEMINI_IMAGE_USD_MICROS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(39_000),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiCandidate {
+    #[serde(default)]
+    content: Option<GeminiContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiContent {
+    #[serde(default)]
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPart {
+    #[serde(default)]
+    inline_data: Option<GeminiInlineData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiInlineData {
+    data: String,
+}
+
+#[async_trait::async_trait]
+impl ImageProvider for GeminiImages {
+    fn name(&self) -> &'static str {
+        "gemini"
+    }
+
+    async fn generate(
+        &self,
+        prompt: &str,
+        width: u32,
+        height: u32,
+        references: &[Vec<u8>],
+    ) -> ProviderOutcome {
+        // References and the prompt are parts of one message, which is the
+        // whole reason this provider is tried first.
+        let mut parts = vec![serde_json::json!({ "text": prompt })];
+        for reference in references.iter().take(MAX_REFERENCES) {
+            parts.push(serde_json::json!({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64::engine::general_purpose::STANDARD.encode(reference),
+                }
+            }));
+        }
+        let (ask_width, ask_height) = provider_size(width, height);
+        let body = serde_json::json!({
+            "contents": [{ "parts": parts }],
+            "generationConfig": {
+                "imageConfig": {
+                    "aspectRatio": if ask_width > ask_height { "3:2" } else { "1:1" },
+                }
+            }
+        });
+
+        let response = match self
+            .client
+            .post(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                self.model
+            ))
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return ProviderOutcome::Unavailable {
+                    detail: format!("gemini request failed: {error}"),
+                };
+            }
+        };
+
+        let status = response.status();
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                return ProviderOutcome::Unavailable {
+                    detail: format!("gemini response unreadable: {error}"),
+                };
+            }
+        };
+
+        if !status.is_success() {
+            warn!(status = %status, "gemini refused a generation");
+            return if reads_as_refusal(status, &text) {
+                ProviderOutcome::Refused {
+                    reason: "the model declined this prompt".to_string(),
+                }
+            } else {
+                ProviderOutcome::Unavailable {
+                    detail: format!("gemini returned {status}"),
+                }
+            };
+        }
+
+        let parsed: GeminiResponse = match serde_json::from_str(&text) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return ProviderOutcome::Unavailable {
+                    detail: format!("gemini response unparsed: {error}"),
+                };
+            }
+        };
+
+        let encoded = parsed
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.content)
+            .flat_map(|content| content.parts)
+            .find_map(|part| part.inline_data.map(|inline| inline.data));
+        let Some(encoded) = encoded else {
+            // A model answering in words rather than pixels has declined,
+            // even when it does so with a 200.
+            return ProviderOutcome::Refused {
+                reason: "the model returned no image".to_string(),
+            };
+        };
+
+        match decode_image(&encoded) {
+            Ok(png) => ProviderOutcome::Image {
+                png,
+                usd_micros: self.usd_micros_per_image,
+            },
+            Err(detail) => ProviderOutcome::Unavailable {
+                detail: format!("gemini {detail}"),
+            },
+        }
+    }
+}
+
 pub fn configured_providers() -> Vec<Box<dyn ImageProvider>> {
     let mut providers: Vec<Box<dyn ImageProvider>> = Vec::new();
+    // Gemini first: same quality on the prompts this was measured against, and
+    // references ride in the ordinary request instead of a second endpoint.
+    if let Some(gemini) = GeminiImages::from_env() {
+        providers.push(Box::new(gemini));
+    }
     if let Some(openai) = OpenAiImages::from_env() {
         providers.push(Box::new(openai));
     }
