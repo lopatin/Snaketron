@@ -7648,6 +7648,7 @@ a.home-social-icon:hover {
 
 .builder-preview-panel {
   display: flex;
+  position: relative;
   flex: none;
   flex-direction: column;
   gap: 8px;
@@ -7666,9 +7667,11 @@ a.home-social-icon:hover {
    artwork does not reach: the bodies are flush left and vary on the right, so
    a disc at each edge, vertically centred, lands on background almost always
    and on a tail or a head at worst. */
+/* No positioning context of its own: the chevrons sit in the *panel's*
+   corners, and a relative deck would quietly claim them and inset them by the
+   panel's padding as well. */
 .builder-deck {
   display: flex;
-  position: relative;
   min-height: 116px;
   align-items: center;
 }
@@ -7708,7 +7711,7 @@ a.home-social-icon:hover {
   display: grid;
   position: absolute;
   z-index: 2;
-  top: 50%;
+  bottom: 10px;
   width: 26px;
   height: 26px;
   border: 0;
@@ -7724,16 +7727,19 @@ a.home-social-icon:hover {
   line-height: 1;
   padding: 0;
   place-items: center;
-  transform: translateY(-50%);
   transition: background-color 120ms ease;
 }
 
+/* Tucked into the panel's own bottom corners, the same distance from the floor
+   as from the wall. Measured against the panel rather than the slide, because
+   the slide is inset by the panel's padding and "in the corner" means the
+   corner a reader can see. */
 .builder-chevron.is-prev {
-  left: -2px;
+  left: 10px;
 }
 
 .builder-chevron.is-next {
-  right: -2px;
+  right: 10px;
 }
 
 .builder-chevron:hover {
