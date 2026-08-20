@@ -7342,13 +7342,23 @@ a.home-social-icon:hover {
    viewport and simply scrolls away. A strip that claims to stay put and does
    not is worse than one that plainly scrolls, so this scrolls — and the form
    below is ordered with the most-changed controls first to compensate. */
+/* Two rows of three, stated rather than left to wrap order.
+
+   As a wrapping flex row this depended on arithmetic nobody could see: three
+   previews once missed a row by two pixels and dropped one to a line of its
+   own, which reads as a bug rather than a layout. Columns that are explicitly
+   equal cannot do that, and `center` on both axes means a pose that is a
+   different size from its neighbours sits in the middle of its cell instead of
+   dragging the row around it. */
 .builder-preview-strip {
-  display: flex;
+  display: grid;
+  /* The third column is wider because it holds three pictures where the others
+     hold one. Sized so the shapes sit on a single line: wrapping them two-and-
+     one inside their own cell would be the same raggedness one level down. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.35fr);
   width: min(100%, 72rem);
-  /* Poses crop to different heights, so align on the captions rather than the
-     tops: a row of labels at three different heights reads as a mistake. */
-  align-items: flex-end;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-items: center;
   gap: 18px 24px;
   margin: 0 auto;
   border: 2px solid #d1d5db;
@@ -7357,8 +7367,33 @@ a.home-social-icon:hover {
   padding: 14px 16px;
 }
 
+/* Below three columns' worth of room, two; below that, one. The previews keep
+   their drawn size either way — only the arrangement gives. */
+@media (width <= 68rem) {
+  .builder-preview-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (width <= 46rem) {
+  .builder-preview-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .builder-preview {
   margin: 0;
+}
+
+/* The awkward shapes, stacked in the column beside the colours. They are the
+   three the painter has genuinely different branches for, and they are read
+   together, so they are one block rather than three neighbours. */
+.builder-preview-shapes {
+  display: flex;
+  flex-flow: row wrap;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 8px 14px;
 }
 
 .builder-preview canvas {

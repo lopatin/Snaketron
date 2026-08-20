@@ -98,6 +98,15 @@ pub const POSES: &[Pose] = &[
         name: "wide_u_turn",
         cells: &[(0.0, 2.0), (20.0, 2.0), (20.0, 6.0), (0.0, 6.0)],
     },
+    Pose {
+        // Four cells: the length every snake is dealt at spawn
+        // (`DEFAULT_SNAKE_LENGTH` in `common::game_state`). Shorter than the
+        // head glow and shorter than most patterns' repeat, so it is the pose
+        // that answers "what does this look like in the second before anyone
+        // has eaten anything" — which is every player's first sight of it.
+        name: "starting_length",
+        cells: &[(5.0, 3.0), (2.0, 3.0)],
+    },
 ];
 
 /// Arena bodies for the corpse painter, which still consumes untransformed
