@@ -122,7 +122,7 @@ await page.locator('.builder-expression-input').first().fill('0.4 + 0.6 * sin(ta
 await settle(700);
 
 // The cost meter, beside the save it gates.
-await clip('08-cost', '.builder-actions');
+await clip('08-cost', '.builder-cta');
 
 // A word worn along the body.
 await pickTemplate('Classic').catch(() => {});
@@ -137,7 +137,7 @@ const sourceSelect = page
   .first();
 await sourceSelect.selectOption('text');
 await settle(1200);
-await clip('09-text-layer', '.builder-preview-strip');
+await clip('09-text-layer', '.builder-preview-panel');
 await clip('10-text-inspector', '.builder-inspector');
 
 // The document panel: what belongs to the skin rather than to a layer.

@@ -180,21 +180,6 @@ const asConstant = (value: unknown): number | null => {
   return null;
 };
 
-/**
- * The main previews: a body long enough to run the head glow off its end.
- *
- * Small enough that three columns fit the strip at full width, which is what
- * lets the grid below carry the layout instead of wrap order deciding it.
- */
-const PREVIEW_CELL = 13;
-/**
- * The shape previews, three to a column, so they are drawn smaller.
- *
- * These are the awkward bodies rather than the pretty ones, and the point of
- * drawing them small is that they are meant to be scanned together: what you
- * are checking is that a pattern does not fall apart on any of them.
- */
-const SHAPE_CELL = 10;
 /** The template previews: a long horizontal body, drawn small enough to sit in a card. */
 const TEMPLATE_POSE = 'longer_than_head_gradient';
 const TEMPLATE_CELL = 11;
@@ -203,109 +188,72 @@ const PREVIEW_PAD = 6;
 interface Preview {
   pose: string;
   role: string;
+  /** Never shown; this is the accessible name for the canvas. */
   label: string;
 }
 
+interface Slide {
+  id: string;
+  /** The accessible name for the whole slide. */
+  label: string;
+  /**
+   * How wide the slide is in snake cells, gaps included.
+   *
+   * The deck divides the space it actually has by this to get a pixel size, so
+   * a sidebar that is 240px on a laptop and 384px on a monitor draws the same
+   * arrangement at two sizes instead of overflowing at one of them. A fixed
+   * cell size cannot do that: 21 cells at 13px is 273px, which is wider than
+   * the column has ever been.
+   */
+  widthCells: number;
+  previews: Preview[];
+}
+
 /**
- * The colours a skin has to work in, each on a body long enough to judge.
+ * The preview deck: three slides, one question each.
  *
- * Two of the four free-for-all slots are here. Slots 1 and 2 are left out
- * because the roles above already stand for them — a document that paints them
- * differently would be a document whose own snake changes colour depending on
- * the mode, which is not a thing anyone is trying to build. Slots 3 and 4 have
- * no other home, and they are the two with no hue window behind them: a
- * friendly colour is held inside a cool band and an enemy one inside a warm
- * band, so a bad choice there is refused with a message, while a free-for-all
- * colour may be anything, which makes seeing it the only check there is.
+ * A skin has to survive more than one body, and the earlier strip tried to say
+ * so by showing everything at once — which made it wide, made it need captions
+ * to stay legible, and left it competing with the panel it exists to serve. A
+ * deck asks one question per slide instead, and answers it with pictures only.
  *
- * Their captions are the palette control's own words, so the thing an author
- * edits and the thing they are looking at share a name.
+ * Slide one is the colours, on four lengths, because the length is what decides
+ * whether a pattern repeats enough to read and whether the head glow has
+ * anywhere to fall off. Slide two is the awkward geometry — the branches the
+ * painter genuinely treats differently. Slide three is the turn, which needs
+ * the width to itself.
  */
-const COLOUR_PREVIEWS: Preview[] = [
-  { pose: 'longer_than_head_gradient', role: 'own', label: 'Yours' },
-  { pose: 'longer_than_head_gradient', role: 'enemy', label: 'As an opponent' },
-  { pose: 'longer_than_head_gradient', role: 'ffa2', label: 'Free-for-all 3' },
-  { pose: 'longer_than_head_gradient', role: 'ffa3', label: 'Free-for-all 4' },
+const SLIDES: Slide[] = [
+  {
+    id: 'colours',
+    label: 'The four free-for-all colours, on four body lengths',
+    widthCells: 21,
+    previews: [
+      { pose: 'starting_length', role: 'ffa0', label: 'Four cells' },
+      { pose: 'straight_horizontal', role: 'ffa1', label: 'Six cells' },
+      { pose: 'mid_horizontal', role: 'ffa2', label: 'Thirteen cells' },
+      { pose: 'longer_than_head_gradient', role: 'ffa3', label: 'Twenty-one cells' },
+    ],
+  },
+  {
+    id: 'shapes',
+    label: 'The awkward bodies: just spawned, crossing itself, and a zig-zag',
+    // Five cells of stacked bodies, nine of zig-zag, and the gap between.
+    widthCells: 15,
+    previews: [
+      { pose: 'starting_length', role: 'own', label: 'Just spawned' },
+      { pose: 'self_crossing', role: 'own', label: 'Crossing itself' },
+      { pose: 'zigzag', role: 'own', label: 'Zig-zag' },
+    ],
+  },
+  {
+    id: 'turn',
+    label: 'A wide U-turn',
+    widthCells: 21,
+    previews: [{ pose: 'wide_u_turn', role: 'own', label: 'Turning' }],
+  },
 ];
 
-/**
- * The bodies that break things, stacked in one column.
- *
- * A long straight snake is the easy case, and a skin that only ever gets
- * looked at on one will ship with its corners wrong. These are the three
- * shapes the painter has genuinely distinct branches for: the four-cell stub
- * every snake spawns as, shorter than the head glow and most patterns'
- * repeat; a body that crosses itself, where arc length and paint dedup give
- * different answers; and a zig-zag, whose runs are a single cell long.
- */
-const SHAPE_PREVIEWS: Preview[] = [
-  { pose: 'starting_length', role: 'own', label: 'Just spawned' },
-  { pose: 'self_crossing', role: 'own', label: 'Crossing itself' },
-  { pose: 'zigzag', role: 'own', label: 'Zig-zag' },
-];
-
-/** The turning pose, which gets the whole bottom-right cell to itself. */
-const TURN_PREVIEW: Preview = {
-  pose: 'wide_u_turn',
-  role: 'own',
-  label: 'Turning',
-};
-
-/**
- * The box a group of previews shares, big enough for the largest pose in it.
- *
- * Sizing each preview to its own pose is what made the turning one look
- * dropped in from somewhere else: a U-turn is five cells tall and a straight
- * body is one, so its figure came out a third the width and three times the
- * height of its neighbours, and the row grew to fit it while the others sat at
- * the bottom of all that space.
- *
- * One box per group, with each pose centred inside it, means the captions line
- * up because the pictures above them are the same size — not because a
- * flexbox rule is holding them level over content that is not.
- */
-const usePreviewBox = (
-  handle: string,
-  previews: Preview[],
-  cell: number,
-  revision: number,
-  valid: boolean,
-) => {
-  const [box, setBox] = useState({ width: 370, height: 60 });
-  const poses = useMemo(
-    () => [...new Set(previews.map((preview) => preview.pose))].join(','),
-    [previews],
-  );
-
-  useEffect(() => {
-    const wasm = getWasm();
-    if (!wasm || !valid) {
-      return;
-    }
-    let width = 0;
-    let height = 0;
-    for (const pose of poses.split(',')) {
-      try {
-        const bounds = JSON.parse(wasm.skinFixtureBounds(handle, pose, cell, false)) as {
-          width: number;
-          height: number;
-        };
-        width = Math.max(width, bounds.width);
-        height = Math.max(height, bounds.height);
-      } catch {
-        // A pose that will not measure simply does not get a vote on the box.
-      }
-    }
-    if (width > 0 && height > 0) {
-      setBox({
-        width: Math.ceil(width + PREVIEW_PAD * 2),
-        height: Math.ceil(height + PREVIEW_PAD * 2),
-      });
-    }
-  }, [handle, poses, cell, revision, valid]);
-
-  return box;
-};
 
 interface ControlProps {
   field: FieldV2;
@@ -764,20 +712,6 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
 
   const handle = useMemo(() => `draft:${skinId ?? 'new'}`, [skinId]);
   const valid = problems.length === 0;
-  // The turn shares the colour previews' box: it is the tallest pose, so it is
-  // what sets the height every one of them is centred in.
-  const bodyPreviews = useMemo(() => [...COLOUR_PREVIEWS, TURN_PREVIEW], []);
-  const bodyBox = usePreviewBox(handle, bodyPreviews, PREVIEW_CELL, revision, valid);
-  const shapeBox = usePreviewBox(handle, SHAPE_PREVIEWS, SHAPE_CELL, revision, valid);
-  const previewFor = (preview: Preview, box: { width: number; height: number }) => ({
-    handle,
-    pose: preview.pose,
-    role: preview.role,
-    label: preview.label,
-    revision,
-    valid,
-    box,
-  });
 
   useEffect(() => {
     let cancelled = false;
@@ -1086,33 +1020,11 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
       {chrome}
 
       <main className="builder-main">
+        {/* Always the page's own name. Titling it after the template just
+            chosen made the page look like it belonged to that template, and
+            the name is editable in Skin settings anyway. */}
         <div className="builder-intro">
-          <h1 className="builder-title">{(document.name as string) ?? 'Skin Builder'}</h1>
-          <p className="builder-subtitle">
-            Layers paint bottom-up, exactly as they are stacked here.
-          </p>
-        </div>
-
-        {/*
-          Two rows of three, laid out by the grid rather than by wrap order.
-          The colours run down the first two columns in reading order, and the
-          third column is the shapes: the awkward bodies above, the turn below.
-        */}
-        <div className="builder-preview-strip">
-          <BuilderPreview {...previewFor(COLOUR_PREVIEWS[0], bodyBox)} />
-          <BuilderPreview {...previewFor(COLOUR_PREVIEWS[1], bodyBox)} />
-          <div className="builder-preview-shapes">
-            {SHAPE_PREVIEWS.map((preview) => (
-              <BuilderPreview
-                key={`${preview.pose}-${preview.role}`}
-                {...previewFor(preview, shapeBox)}
-                cell={SHAPE_CELL}
-              />
-            ))}
-          </div>
-          <BuilderPreview {...previewFor(COLOUR_PREVIEWS[2], bodyBox)} />
-          <BuilderPreview {...previewFor(COLOUR_PREVIEWS[3], bodyBox)} />
-          <BuilderPreview {...previewFor(TURN_PREVIEW, bodyBox)} />
+          <h1 className="builder-title">Skin Builder</h1>
         </div>
 
         {problems.length > 0 ? (
@@ -1129,35 +1041,15 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           </p>
         ) : null}
 
-        <div className="builder-actions">
-          <button
-            type="button"
-            className="game-shell-button is-primary"
-            onClick={() => void save()}
-            disabled={saving}
-          >
-            {skin ? 'Save revision' : 'Save skin'}
-          </button>
-          {skin ? (
-            <button
-              type="button"
-              className="game-shell-button"
-              onClick={() => void requestReview()}
-              disabled={problems.length > 0}
-            >
-              Send for review
-            </button>
-          ) : null}
-          {cost ? (
-            <p className={`builder-cost${overBudget ? ' is-over' : ''}`}>
-              <span>{`${cost.ops}/${cost.maxOps} draw ops`}</span>
-              <span>{`${cost.layers}/${cost.maxLayers} layers`}</span>
-            </p>
-          ) : null}
-        </div>
-
         <div className="builder-workbench">
-          <aside className="builder-stack" aria-label="Layers">
+          {/* Preview and layers ride together in a column that sticks to the
+              viewport, because both are things you consult *while* editing a
+              field in the pane beside them. A preview you have to scroll back
+              up to is not a preview of what you are currently doing. */}
+          <div className="builder-sidebar">
+            <PreviewDeck handle={handle} revision={revision} valid={valid} />
+
+            <aside className="builder-stack" aria-label="Layers">
             <h2 className="builder-panel-title">Layers</h2>
 
             {schema?.systemLayers
@@ -1239,8 +1131,9 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
                   {`+ ${variant.label}`}
                 </button>
               ))}
-            </div>
-          </aside>
+              </div>
+            </aside>
+          </div>
 
           <section className="builder-inspector" aria-label="Layer settings">
             <h2 className="builder-panel-title">
@@ -1287,6 +1180,55 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           ) : null}
         </details>
       </main>
+
+      {/* Pinned to the viewport rather than sitting at the end of the page.
+          The stack is long and the inspector is longer, so a Save that lives
+          at the bottom of the document is a Save you have to go looking for —
+          and the cost meter beside it is only useful while you are spending. */}
+      <div className="builder-cta">
+        <button
+          type="button"
+          className="game-shell-button"
+          onClick={() => navigate('/skins')}
+        >
+          Back
+        </button>
+
+        <div className="builder-cta-meta">
+          {status ? (
+            <p className="builder-status" role="status">
+              {status}
+            </p>
+          ) : null}
+          {cost ? (
+            <p className={`builder-cost${overBudget ? ' is-over' : ''}`}>
+              <span>{`${cost.ops}/${cost.maxOps} draw ops`}</span>
+              <span>{`${cost.layers}/${cost.maxLayers} layers`}</span>
+            </p>
+          ) : null}
+        </div>
+
+        <div className="builder-cta-actions">
+          {skin ? (
+            <button
+              type="button"
+              className="game-shell-button"
+              onClick={() => void requestReview()}
+              disabled={problems.length > 0}
+            >
+              Send for review
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="game-shell-button is-primary"
+            onClick={() => void save()}
+            disabled={saving}
+          >
+            {skin ? 'Save revision' : 'Save skin'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -1394,13 +1336,12 @@ interface BuilderPreviewProps {
   handle: string;
   pose: string;
   role: string;
+  /** Never drawn. The canvas is a picture, so this is its accessible name. */
   label: string;
   revision: number;
   valid: boolean;
-  /** The box shared by every preview in the group, from `usePreviewBox`. */
-  box: { width: number; height: number };
-  /** Cell size in pixels. The shape column draws smaller than the colours. */
-  cell?: number;
+  /** Cell size in pixels. Each slide picks one that fits the panel. */
+  cell: number;
 }
 
 /**
@@ -1408,6 +1349,10 @@ interface BuilderPreviewProps {
  *
  * A builder needs to see motion — a skin frozen at one frame hides half of what
  * an animation does — so unlike the browse page these never stop.
+ *
+ * It sizes itself to its own pose and nothing else. Slides arrange them, and a
+ * slide knows what it is arranging; making every picture share one box was
+ * only ever needed to hold a row of captions level, and there are no captions.
  */
 const BuilderPreview: React.FC<BuilderPreviewProps> = ({
   handle,
@@ -1416,51 +1361,45 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
   label,
   revision,
   valid,
-  box,
-  cell = PREVIEW_CELL,
+  cell,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [layout, setLayout] = useState({
-    canvasWidth: 370,
-    canvasHeight: 150,
-    cropWidth: 370,
-    cropHeight: 60,
+    canvasWidth: 300,
+    canvasHeight: 120,
+    cropWidth: 300,
+    cropHeight: 40,
     offsetX: 0,
-    offsetY: 54,
+    offsetY: 50,
   });
 
   // Fixture poses paint at their own arena coordinates rather than at the
   // origin, so the canvas has to be tall enough to reach the pose and the
-  // wrapper crops back to it. Without this a strip of previews is mostly
-  // empty space.
+  // wrapper crops back to it. Without this a slide is mostly empty space.
   useEffect(() => {
     const wasm = getWasm();
     if (!wasm || !valid) {
       return;
     }
     try {
-      const bounds = JSON.parse(
-        wasm.skinFixtureBounds(handle, pose, cell, false),
-      ) as { x: number; y: number; width: number; height: number };
-      // Centre this pose in the shared box: the offset is where the crop's
-      // top-left lands in canvas space, so half the slack comes off it.
-      const offsetX = Math.round(bounds.x - (box.width - bounds.width) / 2);
-      const offsetY = Math.round(bounds.y - (box.height - bounds.height) / 2);
+      const bounds = JSON.parse(wasm.skinFixtureBounds(handle, pose, cell, false)) as {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+      };
       setLayout({
-        // The canvas has to reach the far edge of the crop, which centring can
-        // push past the pose itself; anything beyond the drawing is
-        // transparent and shows the strip.
-        canvasWidth: Math.max(1, Math.ceil(offsetX + box.width)),
-        canvasHeight: Math.max(1, Math.ceil(offsetY + box.height)),
-        cropWidth: box.width,
-        cropHeight: box.height,
-        offsetX,
-        offsetY,
+        canvasWidth: Math.ceil(bounds.x + bounds.width + PREVIEW_PAD),
+        canvasHeight: Math.ceil(bounds.y + bounds.height + PREVIEW_PAD),
+        cropWidth: Math.ceil(bounds.width + PREVIEW_PAD * 2),
+        cropHeight: Math.ceil(bounds.height + PREVIEW_PAD * 2),
+        offsetX: Math.round(bounds.x - PREVIEW_PAD),
+        offsetY: Math.round(bounds.y - PREVIEW_PAD),
       });
     } catch {
       // Keep the previous framing; a slightly wrong one beats none.
     }
-  }, [handle, pose, cell, revision, valid, box.width, box.height]);
+  }, [handle, pose, cell, revision, valid]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1470,17 +1409,7 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
     }
     let frame = requestAnimationFrame(function loop(now: number) {
       try {
-        wasm.renderSkinFixture(
-          canvas,
-          handle,
-          pose,
-          role,
-          cell,
-          false,
-          false,
-          now,
-          false,
-        );
+        wasm.renderSkinFixture(canvas, handle, pose, role, cell, false, false, now, false);
       } catch {
         // An invalid draft leaves the last good frame up; the problem list
         // beside it is what says why.
@@ -1491,23 +1420,110 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
   }, [handle, pose, role, cell, revision, valid, layout.canvasWidth, layout.canvasHeight]);
 
   return (
-    <figure className="builder-preview">
-      <div
-        className="builder-preview-crop"
-        style={{ width: layout.cropWidth, height: layout.cropHeight }}
-      >
-        <canvas
-          ref={canvasRef}
-          width={layout.canvasWidth}
-          height={layout.canvasHeight}
-          style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
-          role="img"
-          aria-label={label}
-        />
-      </div>
-      <figcaption>{label}</figcaption>
-    </figure>
+    <span
+      className="builder-preview-crop"
+      style={{ width: layout.cropWidth, height: layout.cropHeight }}
+    >
+      <canvas
+        ref={canvasRef}
+        width={layout.canvasWidth}
+        height={layout.canvasHeight}
+        style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
+        role="img"
+        aria-label={label}
+      />
+    </span>
   );
 };
+
+/**
+ * The preview panel: one slide at a time, with a chevron on each side.
+ *
+ * Nothing here is labelled. The pictures are the content, and a caption under
+ * each one would be a word competing with the thing it describes for the
+ * narrowest column on the page.
+ */
+const PreviewDeck: React.FC<{ handle: string; revision: number; valid: boolean }> = ({
+  handle,
+  revision,
+  valid,
+}) => {
+  const [index, setIndex] = useState(0);
+  const [width, setWidth] = useState(0);
+  const slideRef = useRef<HTMLDivElement | null>(null);
+  const slide = SLIDES[index];
+  const step = (delta: number) => setIndex((at) => (at + delta + SLIDES.length) % SLIDES.length);
+
+  // The panel is whatever the sidebar column gives it, and that changes with
+  // the viewport, so the drawing size is measured rather than assumed.
+  useEffect(() => {
+    const node = slideRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(([entry]) => setWidth(entry.contentRect.width));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  // Floors keep the drawing inside the box; the clamp keeps it legible at one
+  // end and stops it outgrowing the panel's height at the other.
+  const cell = width
+    ? Math.max(
+        6,
+        Math.min(15, Math.floor((width - PREVIEW_PAD * 2 - 2) / slide.widthCells)),
+      )
+    : 10;
+
+  return (
+    <section className="builder-preview-panel" aria-label="Preview">
+      <h2 className="builder-panel-title">Preview</h2>
+      <div className="builder-deck">
+        <button
+          type="button"
+          className="builder-chevron"
+          aria-label="Previous preview"
+          onClick={() => step(-1)}
+        >
+          ‹
+        </button>
+        <div
+          ref={slideRef}
+          className={`builder-slide is-${slide.id}`}
+          role="group"
+          aria-label={slide.label}
+        >
+          {slide.previews.map((preview) => (
+            <BuilderPreview
+              key={`${preview.pose}-${preview.role}`}
+              handle={handle}
+              pose={preview.pose}
+              role={preview.role}
+              label={preview.label}
+              revision={revision}
+              valid={valid}
+              cell={cell}
+            />
+          ))}
+        </div>
+        <button
+          type="button"
+          className="builder-chevron"
+          aria-label="Next preview"
+          onClick={() => step(1)}
+        >
+          ›
+        </button>
+      </div>
+      <div className="builder-dots" aria-hidden="true">
+        {SLIDES.map((each, at) => (
+          <span key={each.id} className={at === index ? 'is-on' : undefined} />
+        ))}
+      </div>
+    </section>
+  );
+};
+
+
 
 export default SkinBuilder;

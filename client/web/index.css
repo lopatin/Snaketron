@@ -7342,58 +7342,126 @@ a.home-social-icon:hover {
    viewport and simply scrolls away. A strip that claims to stay put and does
    not is worse than one that plainly scrolls, so this scrolls — and the form
    below is ordered with the most-changed controls first to compensate. */
-/* Two rows of three, stated rather than left to wrap order.
+/* The sidebar: preview above layers, riding along with the scroll.
 
-   As a wrapping flex row this depended on arithmetic nobody could see: three
-   previews once missed a row by two pixels and dropped one to a line of its
-   own, which reads as a bug rather than a layout. Columns that are explicitly
-   equal cannot do that, and `center` on both axes means a pose that is a
-   different size from its neighbours sits in the middle of its cell instead of
-   dragging the row around it. */
-.builder-preview-strip {
-  display: grid;
-  /* The third column is wider because it holds three pictures where the others
-     hold one. Sized so the shapes sit on a single line: wrapping them two-and-
-     one inside their own cell would be the same raggedness one level down. */
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.35fr);
-  width: min(100%, 72rem);
-  align-items: center;
-  justify-items: center;
-  gap: 18px 24px;
-  margin: 0 auto;
+   Both are things you consult *while* editing a field in the pane beside
+   them, so a preview you have to scroll back up to is not a preview of what
+   you are currently doing. It sticks below the header rather than to the very
+   top, and caps its own height so a long layer stack scrolls inside it
+   instead of pushing the preview off screen. */
+/* `.home-page` clips horizontally, and `overflow-x: hidden` silently coerces
+   `overflow-y` to `auto` — which makes that element the scroll container and
+   leaves `position: sticky` sticking to a box that never scrolls. `clip` does
+   the same clipping without creating a scroll container, so the window stays
+   the scroller and the sidebar can actually travel. Scoped to this page rather
+   than changed on `.home-page`, which every other route also uses. */
+.builder-page {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+.builder-sidebar {
+  display: flex;
+  position: sticky;
+  top: 18px;
+  flex-direction: column;
+  gap: 14px;
+  max-height: calc(100vh - 120px);
+  min-height: 0;
+}
+
+.builder-preview-panel {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 8px;
   border: 2px solid #d1d5db;
   border-radius: 8px;
   background: #fff;
-  padding: 14px 16px;
+  padding: 14px 16px 12px;
 }
 
-/* Below three columns' worth of room, two; below that, one. The previews keep
-   their drawn size either way — only the arrangement gives. */
-@media (width <= 68rem) {
-  .builder-preview-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (width <= 46rem) {
-  .builder-preview-strip {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-.builder-preview {
-  margin: 0;
-}
-
-/* The awkward shapes, stacked in the column beside the colours. They are the
-   three the painter has genuinely different branches for, and they are read
-   together, so they are one block rather than three neighbours. */
-.builder-preview-shapes {
+/* Chevron, picture, chevron. The picture takes the slack so the two arrows
+   stay put between slides — arrows that move as the content changes size read
+   as a different control each time. */
+.builder-deck {
   display: flex;
-  flex-flow: row wrap;
-  align-items: flex-end;
+  min-height: 128px;
+  align-items: center;
+  gap: 4px;
+}
+
+.builder-slide {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
   justify-content: center;
-  gap: 8px 14px;
+}
+
+/* Four lengths, stacked and left-aligned. Aligned left rather than centred
+   because the whole point of the slide is that the bodies are different
+   lengths, and centring them hides that behind a symmetrical outline. */
+.builder-slide.is-colours {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+/* Two short bodies stacked on the left, the zig-zag beside them on the
+   right — it is the tall one, so it spans both rows. */
+.builder-slide.is-shapes {
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  gap: 4px 10px;
+  grid-template-columns: auto auto;
+}
+
+.builder-slide.is-shapes > :nth-child(3) {
+  grid-area: 1 / 2 / 3 / 3;
+}
+
+.builder-chevron {
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--game-graphite);
+  cursor: pointer;
+  flex: none;
+  font-size: 22px;
+  line-height: 1;
+  opacity: 0.45;
+  padding: 8px 6px;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.builder-chevron:hover,
+.builder-chevron:focus-visible {
+  background: #f3f4f6;
+  opacity: 1;
+}
+
+.builder-dots {
+  display: flex;
+  justify-content: center;
+  gap: 5px;
+}
+
+.builder-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #d1d5db;
+}
+
+.builder-dots span.is-on {
+  background: var(--game-graphite);
+}
+
+.builder-preview-crop {
+  display: block;
+  overflow: hidden;
 }
 
 .builder-preview canvas {
@@ -7418,11 +7486,43 @@ a.home-social-icon:hover {
   font-weight: 800;
 }
 
-.builder-actions {
+/* The save banner, pinned to the viewport.
+
+   The stack is long and the inspector is longer, so a Save at the end of the
+   document is one you have to go looking for. `Back` sits opposite it because
+   leaving and committing are the two ways out of this page, and they should
+   not be adjacent enough to hit the wrong one. */
+.builder-cta {
   display: flex;
-  width: min(100%, 72rem);
+  position: fixed;
+  z-index: 20;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 2px solid #d1d5db;
+  background: rgb(255 255 255 / 96%);
+  backdrop-filter: blur(6px);
+  padding: 10px max(16px, calc((100vw - 72rem) / 2));
+}
+
+.builder-cta-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 14px;
+}
+
+.builder-cta-actions {
+  display: flex;
   gap: 9px;
-  margin: 16px auto 0;
+}
+
+/* Room for the banner, so the last control is not permanently under it. */
+.builder-page .builder-main {
+  padding-bottom: 76px;
 }
 
 .builder-form {
@@ -7441,7 +7541,7 @@ a.home-social-icon:hover {
 .builder-workbench {
   display: grid;
   width: min(100%, 72rem);
-  grid-template-columns: minmax(240px, 20rem) 1fr;
+  grid-template-columns: minmax(260px, 23rem) 1fr;
   gap: 18px;
   margin: 18px auto 0;
   align-items: start;
@@ -7452,10 +7552,15 @@ a.home-social-icon:hover {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-height: 0;
   border: 2px solid #d1d5db;
   border-radius: 8px;
   background: #fff;
   padding: 14px 16px 16px;
+}
+
+.builder-stack {
+  overflow-y: auto;
 }
 
 .builder-inspector {

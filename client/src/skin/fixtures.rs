@@ -107,6 +107,14 @@ pub const POSES: &[Pose] = &[
         name: "starting_length",
         cells: &[(5.0, 3.0), (2.0, 3.0)],
     },
+    Pose {
+        // Thirteen cells: long enough that the head glow has run out well
+        // before the tail, short enough to sit beside the four-cell stub
+        // without dwarfing it. It exists so a row of bodies can show a
+        // *progression* of lengths rather than two short ones and a long one.
+        name: "mid_horizontal",
+        cells: &[(14.0, 3.0), (2.0, 3.0)],
+    },
 ];
 
 /// Arena bodies for the corpse painter, which still consumes untransformed
