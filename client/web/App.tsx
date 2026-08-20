@@ -1,16 +1,19 @@
-import React, { useEffect, useState } from 'react';
-import { BrowserRouter, HashRouter, Navigate, Route, matchPath, useLocation } from 'react-router-dom';
+import React, { useCallback, useEffect, useState } from 'react';
+import { BrowserRouter, HashRouter, Navigate, Route, useLocation } from 'react-router-dom';
 import './index.css';
 import { AccountModal } from './components/AccountModal';
 import type { AccountModalView } from './components/AccountModal';
 import AuthModal from './components/AuthModal';
 import CustomGameCreator from './components/CustomGameCreator';
 import GameLobby from './components/GameLobby';
-import GameArena from './components/GameArena';
 import ProtectedRoute from './components/ProtectedRoute';
 import GameModeSelector from './components/GameModeSelector';
 import AnimatedRoutes from './components/AnimatedRoutes';
 import LobbyInvitePage from './components/LobbyInvitePage';
+import GameResultPage from './components/GameResultPage';
+import OnlinePlayersPanel from './components/OnlinePlayersPanel';
+import ChallengesPanel from './components/ChallengesPanel';
+import PlayRoute from './components/PlayRoute';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
 import { Leaderboard } from './components/Leaderboard';
@@ -19,20 +22,98 @@ import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
+import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
+import { CrazyGamesBridge } from './components/CrazyGamesBridge';
+import { CrazyGamesPrivacy } from './components/CrazyGamesPrivacy';
+import {
+  isPlayOfTheGameQaRoute,
+  isScenarioCaptureMode,
+  isScenarioPlayerQaRoute,
+} from './utils/scenarioCaptureMode';
+import { AdminRoute } from './components/AdminRoute';
+import { RuntimeAnnouncement } from './components/RuntimeAnnouncement';
+import { RuntimeConfigProvider, useRuntimeConfig } from './contexts/RuntimeConfigContext';
+import { AdsProvider } from './contexts/AdsContext';
+import { AdBannerLayout } from './components/AdBannerLayout';
+import { PreMatchAdBreak } from './components/PreMatchAdBreak';
+import { isDurableBannerRoute } from './services/ads/bannerPlan';
+import { activeGameIdFromPath } from './services/websocketLifecycle';
+
+const IS_EMBEDDED_BUILD = process.env.ITCH_BUILD === 'true'
+  || process.env.CRAZYGAMES_BUILD === 'true';
+const AdminPage = !IS_EMBEDDED_BUILD
+  ? React.lazy(() => import('./components/AdminPage'))
+  : null;
+
+// Design-review harnesses (post-match rating reveal, rank badges, skins,
+// trailer cards). Only reachable — and only bundled — outside production
+// builds.
+const SkinsQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/SkinsQA'))
+  : null;
+const TrailerCardQA =
+  process.env.NODE_ENV !== 'production'
+    ? React.lazy(() => import('./components/TrailerCardQA'))
+    : null;
+const RatingRevealQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/RatingRevealQA'))
+  : null;
+const RankIconsQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/RankIconsQA'))
+  : null;
+
+const ScenarioPlayerQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/ScenarioPlayerQA'))
+  : null;
+
+const PlayOfTheGameQA = process.env.NODE_ENV !== 'production'
+  ? React.lazy(() => import('./components/PlayOfTheGameQA'))
+  : null;
 
 function AppContent() {
   const location = useLocation();
-  const { user } = useAuth();
+  const {
+    user,
+    crazyGamesSessionStatus,
+    crazyGamesSessionError,
+    retryCrazyGamesSession,
+  } = useAuth();
+  const { isCrazyGamesBuild, showAuthPrompt } = useCrazyGames();
+  const { config } = useRuntimeConfig();
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [accountModalView, setAccountModalView] = useState<AccountModalView | null>(null);
-  const isGameArenaActive = matchPath('/play/:gameId', location.pathname) !== null;
+  // Only a numeric segment is a live match. `/play/<username>` shares the
+  // prefix but is an invite page, and treating it as gameplay would strip the
+  // backdrop and suppress the runtime announcement on an ordinary screen.
+  const isGameArenaActive = activeGameIdFromPath(location.pathname) !== null;
+  const isBannerScreenEligible = isDurableBannerRoute(location.pathname);
+  const isCrazyGamesPrivacyPage = isCrazyGamesBuild && location.pathname === '/privacy';
+  // Two kinds of route keep the floating social chrome off screen. The public
+  // match page is a landing surface for people arriving from a shared link,
+  // most of whom have no session at all, so the chrome would be furniture for
+  // an account they do not have yet. The QA harnesses exist to review one
+  // component in isolation, and a roster strip parked over the thing under
+  // review is exactly the noise they are meant to avoid.
+  const isSocialSuppressedRoute =
+    location.pathname.startsWith('/g/') || location.pathname.startsWith('/qa/');
   const showBackdrop = SHOW_BACKDROP_DURING_GAMEPLAY || !isGameArenaActive;
+  const showRuntimeAnnouncement = config.announcement.enabled
+    && config.announcement.message.trim().length > 0
+    && !isGameArenaActive;
+
+  const handleOpenAuth = useCallback(() => {
+    if (isCrazyGamesBuild) {
+      void showAuthPrompt();
+      return;
+    }
+    setIsAuthModalOpen(true);
+  }, [isCrazyGamesBuild, showAuthPrompt]);
 
   useEffect(() => {
-    if (location.pathname === '/auth') {
+    if (location.pathname === '/auth' && !isCrazyGamesBuild) {
       setIsAuthModalOpen(true);
     }
-  }, [location.pathname]);
+  }, [isCrazyGamesBuild, location.pathname]);
 
   useEffect(() => {
     if (!user || user.isGuest) {
@@ -40,16 +121,68 @@ function AppContent() {
     }
   }, [user]);
 
+  if (
+    isCrazyGamesBuild &&
+    !isCrazyGamesPrivacyPage &&
+    crazyGamesSessionStatus === 'resolving'
+  ) {
+    return (
+      <main className="min-h-screen flex items-center justify-center px-6" aria-busy="true">
+        <div className="max-w-md border-2 border-black bg-white p-8 text-center shadow-[8px_8px_0_#000]">
+          <div
+            className="mx-auto mb-4 h-7 w-7 animate-spin rounded-full border-4 border-black/20 border-t-black"
+            aria-hidden="true"
+          />
+          <h1 className="text-xl font-black uppercase tracking-1">Connecting your account</h1>
+          <p className="mt-3 text-sm text-gray-600">
+            Restoring your Snaketron progress from CrazyGames…
+          </p>
+        </div>
+      </main>
+    );
+  }
+
+  if (
+    isCrazyGamesBuild &&
+    !isCrazyGamesPrivacyPage &&
+    crazyGamesSessionStatus === 'error'
+  ) {
+    return (
+      <main className="min-h-screen flex items-center justify-center px-6">
+        <div className="max-w-md border-2 border-black bg-white p-8 text-center shadow-[8px_8px_0_#000]" role="alert">
+          <h1 className="text-xl font-black uppercase tracking-1">Progress connection failed</h1>
+          <p className="mt-3 text-sm text-gray-600">
+            {crazyGamesSessionError ?? 'Your CrazyGames account could not be connected safely.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => void retryCrazyGamesSession()}
+            className="mt-6 border-2 border-black bg-yellow-300 px-5 py-3 text-sm font-black uppercase tracking-1 hover:bg-yellow-200"
+          >
+            Retry account sync
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className={`app-shell app-route-layout min-h-screen flex flex-col${
+      showRuntimeAnnouncement ? ' has-runtime-announcement' : ''
+    }${isBannerScreenEligible ? ' app-route-layout--banner-safe' : ''}`}>
+      {showRuntimeAnnouncement && <RuntimeAnnouncement />}
       {showBackdrop && <ArenaBackdrop />}
       <MatchmakingBanner />
+      <AdBannerLayout
+        isGameplayActive={isGameArenaActive}
+        isScreenEligible={isBannerScreenEligible}
+      />
       <AnimatedRoutes>
         <Route
           path="/"
           element={
             <NewHome
-              onOpenAuth={() => setIsAuthModalOpen(true)}
+              onOpenAuth={handleOpenAuth}
               onOpenAccount={setAccountModalView}
             />
           }
@@ -59,16 +192,41 @@ function AppContent() {
           path="/leaderboards"
           element={
             <Leaderboard
-              onOpenAuth={() => setIsAuthModalOpen(true)}
+              onOpenAuth={handleOpenAuth}
               onOpenAccount={setAccountModalView}
             />
           }
         />
         <Route path="/profile" element={<Navigate to="/" replace />} />
         <Route path="/history" element={<Navigate to="/" replace />} />
-        <Route path="/game-modes/:category" element={<GameModeSelector />} />
-        <Route path="/custom" element={<CustomGameCreator />} />
+        <Route
+          path="/admin"
+          element={AdminPage ? (
+              <AdminRoute>
+                <React.Suspense fallback={null}>
+                  <AdminPage />
+                </React.Suspense>
+              </AdminRoute>
+          ) : <Navigate to="/" replace />}
+        />
+        <Route
+          path="/privacy"
+          element={isCrazyGamesBuild ? <CrazyGamesPrivacy /> : <Navigate to="/" replace />}
+        />
+        <Route
+          path="/game-modes/:category"
+          element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <GameModeSelector />}
+        />
+        <Route
+          path="/custom"
+          element={isCrazyGamesBuild ? <Navigate to="/" replace /> : <CustomGameCreator />}
+        />
         <Route path="/lobby/:lobbyCode" element={<LobbyInvitePage />} />
+        {/* The permanent public address of a finished match. Deliberately
+            outside ProtectedRoute: a shared link has to open for someone who
+            has never played, and the same path is what the server renders for
+            crawlers. */}
+        <Route path="/g/:gameId" element={<GameResultPage />} />
         <Route
           path="/game/:gameCode"
           element={
@@ -77,17 +235,58 @@ function AppContent() {
             </ProtectedRoute>
           }
         />
-        <Route
-          path="/play/:gameId"
-          element={
-            <ProtectedRoute>
-              <GameArena />
-            </ProtectedRoute>
-          }
-        />
+        {/* Dispatches on the segment: a game id renders the arena, a
+            username renders the invite page. See PlayRoute. */}
+        <Route path="/play/:gameId" element={<PlayRoute />} />
+        {TrailerCardQA && (
+          <Route
+            path="/qa/trailer-card"
+            element={
+              <React.Suspense fallback={null}>
+                <TrailerCardQA />
+              </React.Suspense>
+            }
+          />
+        )}
+        {RatingRevealQA && (
+          <Route
+            path="/qa/rating-reveal"
+            element={
+              <React.Suspense fallback={null}>
+                <RatingRevealQA />
+              </React.Suspense>
+            }
+          />
+        )}
+        {RankIconsQA && (
+          <Route
+            path="/qa/rank-icons"
+            element={
+              <React.Suspense fallback={null}>
+                <RankIconsQA />
+              </React.Suspense>
+            }
+          />
+        )}
+        {SkinsQA && (
+          <Route
+            path="/qa/skins"
+            element={
+              <React.Suspense fallback={null}>
+                <SkinsQA />
+              </React.Suspense>
+            }
+          />
+        )}
       </AnimatedRoutes>
+      {/* The roster is a lobby-level prompt, not gameplay chrome: it stays off
+          the arena, where the corners belong to the HUD, chat, and (on touch)
+          the steering pad. Challenges follow you everywhere, because one you
+          never see is one that expires. */}
+      <OnlinePlayersPanel enabled={!isGameArenaActive && !isSocialSuppressedRoute} />
+      {!isSocialSuppressedRoute && <ChallengesPanel />}
       <AuthModal
-        isOpen={isAuthModalOpen}
+        isOpen={isAuthModalOpen && !isCrazyGamesBuild}
         onClose={() => setIsAuthModalOpen(false)}
       />
       <AccountModal
@@ -99,23 +298,56 @@ function AppContent() {
   );
 }
 
-// The itch.io build is served from a static path with no History-API
+// Embedded static builds are served from deep paths with no History-API
 // fallback, so client routes live in the URL hash there. The regular build
 // keeps clean History-API URLs.
-const Router = process.env.ITCH_BUILD === 'true' ? HashRouter : BrowserRouter;
+const Router = IS_EMBEDDED_BUILD
+  ? HashRouter
+  : BrowserRouter;
 
 function App() {
+  const captureMode = isScenarioCaptureMode();
+  const scenarioQaMode = isScenarioPlayerQaRoute();
+  const potgQaMode = isPlayOfTheGameQaRoute();
+
   return (
     <Router>
-      <AuthProvider>
-        <UIProvider>
-          <LatencyProvider>
-            <WebSocketProvider>
-              <AppContent />
-            </WebSocketProvider>
-          </LatencyProvider>
-        </UIProvider>
-      </AuthProvider>
+      {/* Scenario capture deliberately mounts nothing but the player: the
+          harness runs with no API or socket, and every provider above is a
+          source of non-determinism or of a hanging readiness promise. */}
+      {scenarioQaMode && ScenarioPlayerQA ? (
+        <React.Suspense
+          fallback={captureMode
+            ? <main className="scenario-capture" aria-busy="true" />
+            : null}
+        >
+          <ScenarioPlayerQA captureMode={captureMode} />
+        </React.Suspense>
+      ) : potgQaMode && PlayOfTheGameQA ? (
+        <CrazyGamesProvider>
+          <React.Suspense fallback={null}>
+            <PlayOfTheGameQA />
+          </React.Suspense>
+        </CrazyGamesProvider>
+      ) : (
+        <CrazyGamesProvider>
+          <RuntimeConfigProvider>
+            <AuthProvider>
+              <UIProvider>
+                <LatencyProvider>
+                  <WebSocketProvider>
+                    <AdsProvider>
+                      <CrazyGamesBridge />
+                      <AppContent />
+                      <PreMatchAdBreak />
+                    </AdsProvider>
+                  </WebSocketProvider>
+                </LatencyProvider>
+              </UIProvider>
+            </AuthProvider>
+          </RuntimeConfigProvider>
+        </CrazyGamesProvider>
+      )}
     </Router>
   );
 }

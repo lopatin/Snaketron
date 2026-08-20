@@ -255,7 +255,9 @@ async fn test_solo_game() -> Result<()> {
             Ok(Ok(WSMessage::GameEvent(event))) => {
                 let mut terminal_winning_snake_id = None;
                 match &event.event {
-                    GameEvent::SnakeDied { snake_id: died_id } => {
+                    GameEvent::SnakeDied {
+                        snake_id: died_id, ..
+                    } => {
                         if *died_id == snake_id {
                             println!("Snake (id={}) died at tick {}!", snake_id, event.tick);
                             snake_died = true;
@@ -289,6 +291,7 @@ async fn test_solo_game() -> Result<()> {
                     GameEvent::FoodEaten {
                         snake_id: eating_snake_id,
                         position,
+                        ..
                     } => {
                         if *eating_snake_id == snake_id {
                             println!(

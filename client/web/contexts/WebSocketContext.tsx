@@ -10,6 +10,10 @@ import {
   LobbyState,
   User,
   MatchmakingStatus,
+  ClientAdsConfig,
+  ChallengeInbox,
+  RegionRoster,
+  RematchState,
 } from '../types';
 import {
   OutboundMessage,
@@ -21,10 +25,13 @@ import { record as recordTrace } from '../utils/syncTrace';
 import {
   buildGameplayAuthentication,
   GAMEPLAY_PROTOCOL_VERSION,
+  isGameplayProtocolCompatible,
+  isGameplayUpdateRequiredReason,
 } from '../constants';
 import { getOrCreateAnonId } from '../utils/anonId';
 import { useLatency } from './LatencyContext';
 import { useAuth } from './AuthContext';
+import { useCrazyGames } from './CrazyGamesContext';
 import {
   detectBestRegion,
   fetchRegionMetadata,
@@ -41,7 +48,7 @@ import {
   advanceCandidateGameWatermark,
   authenticationTimeoutMs,
   candidateDeadlineDelayMs,
-  activeGameIdFromPath,
+  activeGameIdFromLocation,
   isCommandOwner,
   isRetryableMatchmakingAdmissionFailure,
   isSnapshotForGame,
@@ -54,6 +61,12 @@ import {
   replacementFailureAction,
   replacementReadyForPromotion,
 } from '../services/websocketLifecycle';
+import { subscribeGameStorage } from '../services/gameStorage';
+import {
+  DISABLED_AD_CONFIGURATION,
+  normalizeAdConfiguration,
+  normalizeLobbyAdBreak,
+} from '../services/ads/config';
 
 interface WebSocketProviderProps {
   children: React.ReactNode;
@@ -108,9 +121,22 @@ declare global {
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
 
 const LOBBY_STORAGE_KEY = 'snaketron:lastLobby';
+const NO_LOBBY_STORAGE_KEY = '__snaketron:no-lobby-storage__';
+
+export const lobbyStorageKeyForIdentity = (
+  isCrazyGamesBuild: boolean,
+  userId: number | null,
+): string | null => {
+  if (!isCrazyGamesBuild) {
+    return LOBBY_STORAGE_KEY;
+  }
+  return userId === null ? null : `${LOBBY_STORAGE_KEY}:user:${userId}`;
+};
 const MAX_CHAT_HISTORY = 200;
+/** Stable empty inbox so an un-populated social layer never re-renders consumers. */
+const EMPTY_CHALLENGE_INBOX: ChallengeInbox = { incoming: [], outgoing: [] };
 const VALID_LOBBY_MODES: LobbyGameMode[] = ['duel', '2v2', 'solo', 'ffa'];
-const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'queued', 'matched'];
+const VALID_LOBBY_STATES: LobbyState[] = ['waiting', 'ad_break', 'queued', 'matched'];
 const MAX_RECOVERY_METRIC_MS = 5 * 60 * 1000;
 // RFC close codes in the 1001-2999 range are reserved for the protocol and
 // servers; browsers reject them when passed to WebSocket.close(). Preserve
@@ -120,6 +146,24 @@ const CLIENT_POLICY_CLOSE_CODE = 4008;
 const CLIENT_FAILURE_CLOSE_CODE = 4011;
 const CLIENT_RESTART_CLOSE_CODE = 4012;
 const CLIENT_RETRY_CLOSE_CODE = 4013;
+const CHAT_MESSAGE_TAGS = new Set([
+  'Chat',
+  'LobbyChatMessage',
+  'GameChatMessage',
+  'LobbyChatHistory',
+  'GameChatHistory',
+]);
+
+const redactChatPayloadForLogging = (message: any): any => {
+  if (
+    message &&
+    typeof message === 'object' &&
+    Object.keys(message).some((key) => CHAT_MESSAGE_TAGS.has(key))
+  ) {
+    return '<chat payload redacted>';
+  }
+  return message;
+};
 
 const isMatchmakingQueueIntent = (message: any): boolean =>
   Boolean(
@@ -229,6 +273,16 @@ const normalizeLobbyPreferences = (payload: any): LobbyPreferences => {
   };
 };
 
+const sameLobbyPreferences = (
+  current: LobbyPreferences | null,
+  next: LobbyPreferences,
+): boolean => Boolean(
+  current &&
+  current.competitive === next.competitive &&
+  current.selectedModes.length === next.selectedModes.length &&
+  current.selectedModes.every((mode, index) => mode === next.selectedModes[index]),
+);
+
 interface StoredLobbyInfo {
   code: string;
   id?: number | null;
@@ -251,6 +305,12 @@ export const useWebSocket = (): WebSocketContextType => {
 };
 
 export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
+  const {
+    isCrazyGamesBuild,
+    inviteParams,
+    isInstantMultiplayer,
+    settings: { disableChat },
+  } = useCrazyGames();
   const storedPreferences = useMemo(() => loadStoredLobbyPreferences(), []);
   const [isConnected, setIsConnected] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number>(0);
@@ -259,10 +319,29 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const [lobbyMembers, setLobbyMembers] = useState<LobbyMember[]>([]);
   const [lobbyChatMessages, setLobbyChatMessages] = useState<ChatMessage[]>([]);
   const [gameChatMessages, setGameChatMessages] = useState<ChatMessage[]>([]);
+  // Social layer. The roster stays null until the server sends one, so the
+  // panel can distinguish "not loaded" from "nobody else is here".
+  const [onlinePlayers, setOnlinePlayers] = useState<RegionRoster | null>(null);
+  const [challenges, setChallenges] = useState<ChallengeInbox>(EMPTY_CHALLENGE_INBOX);
+  const [challengeError, setChallengeError] = useState<string | null>(null);
+  const [rematchState, setRematchState] = useState<RematchState | null>(null);
+
+  useEffect(() => {
+    if (disableChat) {
+      setLobbyChatMessages([]);
+      setGameChatMessages([]);
+    }
+  }, [disableChat]);
   const [lobbyPreferences, setLobbyPreferences] = useState<LobbyPreferences | null>(storedPreferences);
   const [matchmakingStatus, setMatchmakingStatus] = useState<MatchmakingStatus>('idle');
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
+  const [lobbyRestorationComplete, setLobbyRestorationComplete] = useState(false);
   const [serverCapabilities, setServerCapabilities] = useState<ReadonlySet<string>>(new Set());
+  const [adConfiguration, setAdConfiguration] = useState<ClientAdsConfig>(() => ({
+    ...DISABLED_AD_CONFIGURATION,
+    banners: { ...DISABLED_AD_CONFIGURATION.banners },
+    video: { ...DISABLED_AD_CONFIGURATION.video },
+  }));
   const currentLobbyRef = useRef<Lobby | null>(null);
   const desiredLobbyPreferencesRef = useRef<LobbyPreferences | null>(storedPreferences);
   const ws = useRef<WebSocket | null>(null);
@@ -285,7 +364,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const syncRequestTimes = useRef<Map<number, number>>(new Map());
   const isInitializingRef = useRef(false);
   const storedLobbyRef = useRef<StoredLobbyInfo | null>(null);
-  const hasLoadedStoredLobbyRef = useRef(false);
+  const loadedLobbyStorageKeyRef = useRef<string | null>(null);
+  const persistedLobbyStorageKeyRef = useRef<string | null>(null);
   const restoreInProgressRef = useRef(false);
   // QueueForMatch is safe to replay because Redis admission preserves the
   // first physical queue identity. Keep only the one unacknowledged intent
@@ -295,7 +375,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   const gameChatIdRef = useRef<number | null>(null);
   const { settings: latencySettings } = useLatency();
   const latencySettingsRef = useRef(latencySettings);
-  const { user, getToken } = useAuth();
+  const {
+    user,
+    getToken,
+    loading: authLoading,
+    crazyGamesSessionStatus,
+  } = useAuth();
+  const activeLobbyStorageKey = useMemo(
+    () => lobbyStorageKeyForIdentity(isCrazyGamesBuild, user?.id ?? null),
+    [isCrazyGamesBuild, user?.id],
+  );
   const hasEverConnectedRef = useRef(false);
   const authHandshakeRef = useRef(false);
   const lastAuthTokenRef = useRef<string | null>(null);
@@ -325,6 +414,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       desiredLobbyPreferencesRef.current = lobbyPreferences;
     }
   }, [lobbyPreferences]);
+
+  // Account exchange can replace the local snapshot after this provider has
+  // mounted. Adopt that canonical backend value before any lobby/gameplay UI
+  // becomes available instead of writing the stale pre-exchange value back.
+  useEffect(() => subscribeGameStorage((key) => {
+    if (key !== 'lastLobbyPreferences') {
+      return;
+    }
+    const restored = loadStoredLobbyPreferences();
+    if (!restored) {
+      desiredLobbyPreferencesRef.current = null;
+      setLobbyPreferences(null);
+      return;
+    }
+    desiredLobbyPreferencesRef.current = restored;
+    setLobbyPreferences((current) => (
+      sameLobbyPreferences(current, restored) ? current : restored
+    ));
+  }), []);
 
   useEffect(() => {
     if (lobbyPreferences) {
@@ -397,17 +505,43 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, []);
 
   useEffect(() => {
-    if (hasLoadedStoredLobbyRef.current) {
+    if (
+      isCrazyGamesBuild &&
+      (authLoading || crazyGamesSessionStatus === 'resolving' || crazyGamesSessionStatus === 'error')
+    ) {
       return;
     }
 
+    const storageMarker = activeLobbyStorageKey ?? NO_LOBBY_STORAGE_KEY;
+    if (loadedLobbyStorageKeyRef.current === storageMarker) {
+      return;
+    }
+
+    storedLobbyRef.current = null;
+    persistedLobbyStorageKeyRef.current = activeLobbyStorageKey;
+    setLobbyRestorationComplete(false);
+
     if (typeof window === 'undefined') {
-      hasLoadedStoredLobbyRef.current = true;
+      loadedLobbyStorageKeyRef.current = storageMarker;
+      setLobbyRestorationComplete(true);
+      return;
+    }
+
+    if (!activeLobbyStorageKey) {
+      loadedLobbyStorageKeyRef.current = storageMarker;
+      setLobbyRestorationComplete(true);
       return;
     }
 
     try {
-      const raw = window.localStorage.getItem(LOBBY_STORAGE_KEY);
+      if (isInstantMultiplayer || inviteParams?.lobbyCode || inviteParams?.roomCode) {
+        // Platform-directed multiplayer launches always supersede an
+        // unrelated lobby persisted from a prior visit.
+        window.localStorage.removeItem(activeLobbyStorageKey);
+        storedLobbyRef.current = null;
+        return;
+      }
+      const raw = window.localStorage.getItem(activeLobbyStorageKey);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.code === 'string' && parsed.code.trim()) {
@@ -420,14 +554,25 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     } catch (error) {
       console.warn('Failed to load stored lobby info, clearing persisted data', error);
       try {
-        window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+        window.localStorage.removeItem(activeLobbyStorageKey);
       } catch {
         // Ignore removal errors
       }
     } finally {
-      hasLoadedStoredLobbyRef.current = true;
+      loadedLobbyStorageKeyRef.current = storageMarker;
+      if (!storedLobbyRef.current) {
+        setLobbyRestorationComplete(true);
+      }
     }
-  }, []);
+  }, [
+    activeLobbyStorageKey,
+    authLoading,
+    crazyGamesSessionStatus,
+    inviteParams?.lobbyCode,
+    inviteParams?.roomCode,
+    isCrazyGamesBuild,
+    isInstantMultiplayer,
+  ]);
 
   const persistLobby = useCallback((lobby: { id: number | null; code: string }) => {
     storedLobbyRef.current = { id: lobby.id, code: lobby.code.toUpperCase() };
@@ -436,15 +581,20 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
+    if (!activeLobbyStorageKey) {
+      return;
+    }
+
     try {
+      persistedLobbyStorageKeyRef.current = activeLobbyStorageKey;
       window.localStorage.setItem(
-        LOBBY_STORAGE_KEY,
+        activeLobbyStorageKey,
         JSON.stringify({ id: lobby.id, code: lobby.code.toUpperCase() })
       );
     } catch (error) {
       console.warn('Failed to persist lobby info', error);
     }
-  }, []);
+  }, [activeLobbyStorageKey]);
 
   const clearPersistedLobby = useCallback(() => {
     storedLobbyRef.current = null;
@@ -454,11 +604,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     try {
-      window.localStorage.removeItem(LOBBY_STORAGE_KEY);
+      const keys = new Set([
+        activeLobbyStorageKey,
+        persistedLobbyStorageKeyRef.current,
+      ]);
+      for (const key of keys) {
+        if (key) window.localStorage.removeItem(key);
+      }
+      persistedLobbyStorageKeyRef.current = activeLobbyStorageKey;
     } catch (error) {
       console.warn('Failed to clear stored lobby info', error);
     }
-  }, []);
+  }, [activeLobbyStorageKey]);
 
   const resetLobbyState = useCallback(() => {
     clearPendingMatchmakingIntent();
@@ -493,7 +650,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       return;
     }
 
-    console.log('WebSocket message received:', rawMessage);
+    console.log('WebSocket message received:', redactChatPayloadForLogging(rawMessage));
+    if (rawMessage?.AdConfiguration) {
+      setAdConfiguration(normalizeAdConfiguration(rawMessage.AdConfiguration));
+    }
     const gameId = Number(rawMessage?.GameEvent?.game_id);
     if (Number.isSafeInteger(gameId)) {
       const nextWatermark = advanceCandidateGameWatermark(
@@ -577,7 +737,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       }
     }
     if (!messageType) {
-      console.warn('Unexpected WebSocket message shape', rawMessage);
+      console.warn('Unexpected WebSocket message shape', redactChatPayloadForLogging(rawMessage));
       return;
     }
     // `raw` carries the exact frame text so game-event consumers can hand it
@@ -627,7 +787,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     )?.toUpperCase() ?? null;
     const desiredGameId = typeof window === 'undefined'
       ? null
-      : activeGameIdFromPath(window.location.pathname);
+      : activeGameIdFromLocation(window.location);
     if (
       candidate.expectedLobbyCode !== desiredLobbyCode ||
       candidate.expectedGameId !== desiredGameId
@@ -779,7 +939,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clearGameWarmRetryTimeout(candidate);
     candidate.contextRestoreStartedAtMs = Date.now();
     const lobbyCode = currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null;
-    const gameId = typeof window === 'undefined' ? null : activeGameIdFromPath(window.location.pathname);
+    const gameId = typeof window === 'undefined'
+      ? null
+      : activeGameIdFromLocation(window.location);
     candidate.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
     candidate.expectedGameId = gameId;
     candidate.lobbyReady = candidate.expectedLobbyCode === null;
@@ -864,6 +1026,17 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     const accessDeniedReason = typeof rawMessage?.AccessDenied?.reason === 'string'
       ? rawMessage.AccessDenied.reason
       : null;
+    if (
+      slot.role === 'active' &&
+      activeSlotRef.current === slot &&
+      isGameplayUpdateRequiredReason(accessDeniedReason)
+    ) {
+      dispatchRawMessage(slot, rawMessage, rawText);
+      reconnectEnabledRef.current = false;
+      clearAuthenticationTimeout(slot);
+      slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'gameplay protocol mismatch');
+      return;
+    }
     if (
       pendingMatchmakingIntent &&
       messageMatchesPendingIdentity &&
@@ -963,18 +1136,29 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     if (rawMessage?.Authenticated) {
       const nowMs = Date.now();
       const payload = rawMessage.Authenticated;
-      // A protocol or capability mismatch is reported, never enforced. Blocking
-      // here would strand a shipped build that cannot update itself — an
-      // itch.io bundle has no reload-to-upgrade path — so we always play on and
-      // keep the gameplay protocol backwards compatible instead.
-      if (Number(payload?.protocol_version) !== GAMEPLAY_PROTOCOL_VERSION) {
-        console.warn(
-          'Server gameplay protocol differs:',
-          payload?.protocol_version,
-          'client speaks:',
-          GAMEPLAY_PROTOCOL_VERSION,
-          '- continuing anyway',
-        );
+      const serverProtocolVersion = Number(payload?.protocol_version);
+      if (!isGameplayProtocolCompatible(payload?.protocol_version)) {
+        const reason = `Gameplay update required: client protocol ${GAMEPLAY_PROTOCOL_VERSION}, server protocol ${
+          Number.isFinite(serverProtocolVersion) ? serverProtocolVersion : 'unknown'
+        }`;
+        console.error(reason);
+        clearAuthenticationTimeout(slot);
+        if (slot.role === 'candidate') {
+          slot.role = 'retired';
+          candidateSlotRef.current = null;
+          slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'gameplay protocol mismatch');
+          recoverAfterCandidateFailure(slot);
+          return;
+        }
+
+        // Surface the same typed denial an incompatible new server sends to an
+        // old client, then stop reconnecting this build into a deterministic
+        // simulation it cannot reproduce.
+        const denial = { AccessDenied: { reason } };
+        dispatchRawMessage(slot, denial, JSON.stringify(denial));
+        reconnectEnabledRef.current = false;
+        slot.socket.close(CLIENT_POLICY_CLOSE_CODE, 'gameplay protocol mismatch');
+        return;
       }
       slot.capabilities = Array.isArray(payload?.capabilities)
         ? payload.capabilities.filter((value: unknown): value is string => typeof value === 'string')
@@ -1003,7 +1187,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         const lobbyCode = currentLobbyRef.current?.code ?? storedLobbyRef.current?.code ?? null;
         const gameId = typeof window === 'undefined'
           ? null
-          : activeGameIdFromPath(window.location.pathname);
+          : activeGameIdFromLocation(window.location);
         slot.contextRestoreStartedAtMs = nowMs;
         slot.expectedLobbyCode = lobbyCode?.toUpperCase() ?? null;
         slot.expectedGameId = gameId;
@@ -1295,6 +1479,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       setIsConnected(false);
       setAuthHandshakeState(false);
       setServerCapabilities(new Set());
+      setAdConfiguration(normalizeAdConfiguration(null));
       lastAuthTokenRef.current = null;
       clockSync.reset();
       syncRequestTimes.current.clear();
@@ -1480,6 +1665,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     setAuthHandshakeState(false);
     lastAuthTokenRef.current = null;
     setServerCapabilities(new Set());
+    setAdConfiguration(normalizeAdConfiguration(null));
     plannedHandoffStartedAtRef.current = null;
     recoveryStartedAtRef.current = null;
     usableGapStartedAtRef.current = null;
@@ -1562,7 +1748,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       ) {
         try {
           target.socket.send(JSON.stringify(message));
-          console.log('WebSocket message sent:', message, 'generation:', target.generation);
+          const loggedMessage = redactChatPayloadForLogging(message);
+          console.log('WebSocket message sent:', loggedMessage, 'generation:', target.generation);
           return true;
         } catch (error) {
           console.error('Failed to send WebSocket message:', error);
@@ -1674,14 +1861,17 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [authenticateConnection, getToken]);
 
   const sendChatMessage = useCallback((scope: ChatScope, message: string) => {
+    if (disableChat) {
+      return;
+    }
     const trimmed = message.trim();
     if (!trimmed) {
       return;
     }
 
-    console.log(`Sending ${scope} chat message`, trimmed);
+    console.log(`Sending ${scope} chat message`);
     sendMessage({ Chat: trimmed });
-  }, [sendMessage]);
+  }, [disableChat, sendMessage]);
 
   const beginResponseTrackedRequest = useCallback(() => {
     const generation = activeSlotRef.current?.generation;
@@ -1743,6 +1933,32 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     const previous = previousUserRef.current;
     const token = getToken();
     if (
+      isCrazyGamesBuild &&
+      (crazyGamesSessionStatus === 'resolving' || crazyGamesSessionStatus === 'error')
+    ) {
+      const active = activeSlotRef.current;
+      if (
+        currentLobbyRef.current &&
+        active?.role === 'active' &&
+        active.authenticated &&
+        active.socket.readyState === WebSocket.OPEN
+      ) {
+        try {
+          active.socket.send(JSON.stringify('LeaveLobby'));
+        } catch (error) {
+          console.warn('Failed to leave lobby while CrazyGames identity was gated', error);
+        }
+      }
+      clearPendingMatchmakingIntent();
+      resetLobbyState();
+      setAuthHandshakeState(false);
+      lastAuthTokenRef.current = null;
+      disconnect();
+      // Retain previousUserRef so a retry resolving a different portal account
+      // is compared with the identity that actually owned the retired socket.
+      return;
+    }
+    if (
       pendingMatchmakingIntentRef.current &&
       pendingMatchmakingIntentRef.current.authToken !== token
     ) {
@@ -1793,6 +2009,26 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     const tokenChanged = lastAuthTokenRef.current && token !== lastAuthTokenRef.current;
+    const crazyGamesIdentityChanged = Boolean(
+      isCrazyGamesBuild &&
+      previous &&
+      user &&
+      previous.id !== user.id,
+    );
+
+    if (crazyGamesIdentityChanged) {
+      console.log('CrazyGames identity changed, clearing lobby state before reconnecting');
+      previousUserRef.current = user;
+      resetLobbyState();
+      setAuthHandshakeState(false);
+      const url = activeSlotRef.current?.url ?? currentRegionUrl;
+      disconnect();
+      if (url) {
+        reconnectEnabledRef.current = true;
+        connect(url, onConnectCallback.current || undefined);
+      }
+      return;
+    }
 
     // If the auth token changes (guest -> real account, logout, etc.), force a reconnect
     // because the server only accepts authentication during the initial handshake.
@@ -1845,10 +2081,19 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     clearPendingMatchmakingIntent,
     resetLobbyState,
     setAuthHandshakeState,
+    isCrazyGamesBuild,
+    crazyGamesSessionStatus,
   ]);
 
   // Auto-connect to the preferred or closest region on mount
   useEffect(() => {
+    if (
+      isCrazyGamesBuild &&
+      (authLoading || crazyGamesSessionStatus === 'resolving' || crazyGamesSessionStatus === 'error')
+    ) {
+      return;
+    }
+
     let cancelled = false;
     let detectionAttempt = 0;
     let retryTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -1937,7 +2182,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         clearTimeout(retryTimeout);
       }
     };
-  }, [connectToRegion]);
+  }, [
+    authLoading,
+    connectToRegion,
+    crazyGamesSessionStatus,
+    isCrazyGamesBuild,
+  ]);
 
   // Lobby methods
   const createLobby = useCallback(async () => {
@@ -2095,20 +2345,39 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         }
       };
 
-      const handleSuccess = (lobbyId: number | null, hostUserId?: number) => {
+      const handleSuccess = (
+        lobbyId: number | null,
+        hostUserId?: number,
+        authoritativeUpdate?: any,
+      ) => {
         if (settled) {
           return;
         }
         settled = true;
+        const rawState = typeof authoritativeUpdate?.state === 'string'
+          ? authoritativeUpdate.state.trim().toLowerCase()
+          : '';
+        const state: LobbyState = VALID_LOBBY_STATES.includes(rawState as LobbyState)
+          ? rawState as LobbyState
+          : 'waiting';
         const joinedLobby: Lobby = {
           id: lobbyId,
           code: normalizedCode,
           hostUserId: hostUserId ?? 0, // Will be refined by future LobbyUpdate messages
           region: '', // Will be set by LobbyUpdate
-          state: 'waiting',
+          state,
+          adBreak: state === 'ad_break'
+            ? normalizeLobbyAdBreak(authoritativeUpdate?.ad_break)
+            : null,
         };
         currentLobbyRef.current = joinedLobby;
         setCurrentLobby(joinedLobby);
+        if (Array.isArray(authoritativeUpdate?.members)) {
+          setLobbyMembers(authoritativeUpdate.members);
+        }
+        if (authoritativeUpdate?.preferences) {
+          setLobbyPreferences(normalizeLobbyPreferences(authoritativeUpdate.preferences));
+        }
         // console.log('setLobbyPreferences', DEFAULT_LOBBY_PREFERENCES);
         // setLobbyPreferences(DEFAULT_LOBBY_PREFERENCES);
         persistLobby({ id: lobbyId, code: normalizedCode });
@@ -2180,7 +2449,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
         const lobbyId = typeof lobby_id === 'number' && Number.isFinite(lobby_id)
           ? lobby_id
           : null;
-        handleSuccess(lobbyId, host_user_id);
+        handleSuccess(lobbyId, host_user_id, message.data);
       });
 
       // Timeout after 5 seconds
@@ -2271,6 +2540,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
   }, [beginResponseTrackedRequest, onMessage, sendMessage, resetLobbyState]);
 
+  const clearSessionForAccountChange = useCallback(() => {
+    resetLobbyState();
+    setLobbyRestorationComplete(true);
+    setAuthHandshakeState(false);
+    disconnect();
+  }, [disconnect, resetLobbyState, setAuthHandshakeState]);
+
   const updateLobbyPreferences = useCallback(
     (preferences: LobbyPreferences) => {
       // console.log('setLobbyPreferences', preferences);
@@ -2293,6 +2569,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const cleanup = onMessage('LobbyChatMessage', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.LobbyChatMessage ?? message;
       if (!payload || typeof payload.message !== 'string') {
         return;
@@ -2350,7 +2629,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   useEffect(() => {
     return onMessage('AccessDenied', (message: any) => {
@@ -2364,6 +2643,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const cleanup = onMessage('LobbyChatHistory', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.LobbyChatHistory ?? message;
       if (!payload) {
         return;
@@ -2432,7 +2714,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   // Handle lobby updates
   useEffect(() => {
@@ -2479,6 +2761,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       const lobbyState: LobbyState = VALID_LOBBY_STATES.includes(rawState as LobbyState)
         ? (rawState as LobbyState)
         : 'waiting';
+      const adBreak = lobbyState === 'ad_break'
+        ? normalizeLobbyAdBreak(payload.ad_break)
+        : null;
 
       const normalizedPreferences = normalizeLobbyPreferences(payload.preferences);
       // console.log('setLobbyPreferences', normalizedPreferences);
@@ -2504,6 +2789,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
           ...previous,
           hostUserId,
           state: lobbyState,
+          adBreak,
         };
         currentLobbyRef.current = updatedLobby;
         return updatedLobby;
@@ -2532,6 +2818,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
 
   useEffect(() => {
     const cleanup = onMessage('GameChatHistory', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.GameChatHistory ?? message;
       if (!payload) {
         return;
@@ -2600,10 +2889,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   useEffect(() => {
     const cleanup = onMessage('GameChatMessage', (message: any) => {
+      if (disableChat) {
+        return;
+      }
       const payload = message?.data ?? message?.GameChatMessage ?? message;
       if (!payload || typeof payload.message !== 'string') {
         return;
@@ -2661,7 +2953,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     });
 
     return cleanup;
-  }, [onMessage]);
+  }, [disableChat, onMessage]);
 
   useEffect(() => {
     const resetGameChat = (gameId: number | null) => {
@@ -2734,7 +3026,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
   }, [disconnect]);
 
   useEffect(() => {
-    if (!hasLoadedStoredLobbyRef.current) {
+    const expectedStorageMarker = activeLobbyStorageKey ?? NO_LOBBY_STORAGE_KEY;
+    if (loadedLobbyStorageKeyRef.current !== expectedStorageMarker) {
       return;
     }
 
@@ -2743,10 +3036,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     }
 
     if (currentLobby) {
+      setLobbyRestorationComplete(true);
       return;
     }
 
     if (!storedLobbyRef.current || !storedLobbyRef.current.code) {
+      setLobbyRestorationComplete(true);
       return;
     }
 
@@ -2787,12 +3082,215 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
       })
       .finally(() => {
         restoreInProgressRef.current = false;
+        if (!cancelled) {
+          setLobbyRestorationComplete(true);
+        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [isConnected, isSessionAuthenticated, currentLobby, joinLobby, resetLobbyState]);
+  }, [
+    activeLobbyStorageKey,
+    currentLobby,
+    isConnected,
+    isSessionAuthenticated,
+    joinLobby,
+    resetLobbyState,
+  ]);
+
+  // --- Social layer -------------------------------------------------------
+  //
+  // Both feeds are server-pushed snapshots, never deltas, so every handler is
+  // a plain replace. That is what makes them correct across a socket handoff,
+  // a dropped Pub/Sub hint, and a reconnect without any client-side merge.
+  useEffect(() => {
+    const cleanup = onMessage('OnlinePlayers', (message) => {
+      const roster = message?.data as RegionRoster | undefined;
+      if (!roster || !Array.isArray(roster.players)) {
+        return;
+      }
+      setOnlinePlayers(roster);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  useEffect(() => {
+    const cleanup = onMessage('Challenges', (message) => {
+      const inbox = message?.data as ChallengeInbox | undefined;
+      if (!inbox || !Array.isArray(inbox.incoming) || !Array.isArray(inbox.outgoing)) {
+        return;
+      }
+      setChallenges(inbox);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // The server creates and joins a lobby on the challenger's behalf when they
+  // challenge from outside one, and announces it with an unsolicited
+  // `LobbyCreated`. Without a standing handler that frame is dropped — the only
+  // other one is the transient handler inside `createLobby` — and the
+  // challenger's own client never learns it is in the lobby its challenge
+  // points at.
+  useEffect(() => {
+    const cleanup = onMessage('LobbyCreated', (message) => {
+      const lobbyCode = (message?.data as { lobby_code?: unknown } | undefined)?.lobby_code;
+      if (typeof lobbyCode !== 'string' || !lobbyCode.trim()) {
+        return;
+      }
+      const normalizedCode = lobbyCode.trim().toUpperCase();
+      // An in-flight createLobby() has its own handler and richer follow-up
+      // (preferences, promise resolution); adopting here as well would be
+      // redundant, so only take frames it is not already handling.
+      if (currentLobbyRef.current?.code === normalizedCode) {
+        return;
+      }
+      const adopted: Lobby = {
+        id: null,
+        code: normalizedCode,
+        hostUserId: user?.id ?? 0,
+        region: '',
+        state: 'waiting',
+      };
+      currentLobbyRef.current = adopted;
+      setCurrentLobby(adopted);
+      persistLobby({ id: null, code: normalizedCode });
+    });
+    return cleanup;
+  }, [onMessage, persistLobby, user?.id]);
+
+  useEffect(() => {
+    const cleanup = onMessage('ChallengeFailed', (message) => {
+      const reason = (message?.data as { reason?: unknown } | undefined)?.reason;
+      setChallengeError(typeof reason === 'string' && reason ? reason : 'That challenge could not be sent.');
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // Accepting a challenge is an instruction to join the challenger's lobby.
+  // The server cannot do it on this socket's behalf, so the client completes
+  // the move the same way an invite link does.
+  useEffect(() => {
+    const cleanup = onMessage('ChallengeAccepted', (message) => {
+      const payload = message?.data as { lobby_code?: unknown } | undefined;
+      const lobbyCode = payload?.lobby_code;
+      if (typeof lobbyCode !== 'string' || !lobbyCode) {
+        return;
+      }
+      // The challenger is already standing in the lobby they issued from.
+      if (currentLobbyRef.current?.code === lobbyCode) {
+        return;
+      }
+      const enter = async () => {
+        // The server refuses a join while the socket still holds another
+        // lobby, so accepting from inside one has to vacate it first.
+        if (currentLobbyRef.current) {
+          await leaveLobby().catch(() => {
+            // A failed leave is still worth a join attempt: the lobby may
+            // already be gone on the server side.
+          });
+        }
+        await joinLobby(lobbyCode);
+      };
+      void enter().catch((error: unknown) => {
+        console.error('Failed to join the lobby for an accepted challenge:', error);
+        setChallengeError('Could not join that match. Try the lobby code instead.');
+      });
+    });
+    return cleanup;
+  }, [joinLobby, leaveLobby, onMessage]);
+
+  // A socket that goes away takes the social feeds with it: leaving them on
+  // screen would offer challenges that cannot be delivered.
+  useEffect(() => {
+    if (isSessionAuthenticated) {
+      return;
+    }
+    setOnlinePlayers(null);
+    setChallenges(EMPTY_CHALLENGE_INBOX);
+    setRematchState(null);
+  }, [isSessionAuthenticated]);
+
+  const challengePlayer = useCallback((userId: number) => {
+    if (!Number.isSafeInteger(userId) || userId <= 0) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ ChallengePlayer: { user_id: userId } });
+  }, [sendMessage]);
+
+  const respondToChallenge = useCallback((challengeId: string, accept: boolean) => {
+    if (!challengeId) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ RespondToChallenge: { challenge_id: challengeId, accept } });
+  }, [sendMessage]);
+
+  const cancelChallenge = useCallback((challengeId: string) => {
+    if (!challengeId) {
+      return;
+    }
+    setChallengeError(null);
+    sendMessage({ CancelChallenge: { challenge_id: challengeId } });
+  }, [sendMessage]);
+
+  const dismissChallengeError = useCallback(() => setChallengeError(null), []);
+
+  // Rematch. Server-pushed snapshots again — who is still on the results card,
+  // who has opted in, and the lobby they converge on once enough have.
+  useEffect(() => {
+    const cleanup = onMessage('Rematch', (message) => {
+      const state = message?.data as RematchState | undefined;
+      if (!state || !Array.isArray(state.participants)) {
+        return;
+      }
+      setRematchState(state);
+    });
+    return cleanup;
+  }, [onMessage]);
+
+  // Everyone but the host converges on the elected lobby. The host is already
+  // standing in it — the server joined them when it elected the lobby.
+  useEffect(() => {
+    const lobbyCode = rematchState?.lobby_code;
+    if (!lobbyCode || !user?.id) {
+      return;
+    }
+    if (rematchState?.host_user_id === user.id) {
+      return;
+    }
+    if (currentLobbyRef.current?.code === lobbyCode) {
+      return;
+    }
+    const enter = async () => {
+      if (currentLobbyRef.current) {
+        await leaveLobby().catch(() => {
+          // Already gone server-side is fine; the join is what matters.
+        });
+      }
+      await joinLobby(lobbyCode);
+    };
+    void enter().catch((error: unknown) => {
+      console.error('Failed to join the rematch lobby:', error);
+    });
+  }, [joinLobby, leaveLobby, rematchState?.lobby_code, rematchState?.host_user_id, user?.id]);
+
+  const setRematchIntent = useCallback((gameId: number, optIn: boolean) => {
+    if (!Number.isSafeInteger(gameId) || gameId <= 0) {
+      return;
+    }
+    sendMessage({ SetRematchIntent: { game_id: gameId, opt_in: optIn } });
+  }, [sendMessage]);
+
+  // Mirrors the server's rule so non-leaders see controls that are already
+  // disabled rather than pressing them and collecting an AccessDenied. The
+  // server remains authoritative; this only keeps the UI honest.
+  //
+  // Having no lobby counts as leading, because the very next thing the Start
+  // button does is create one with this player as its host.
+  const isLobbyLeader = currentLobby === null
+    || (user?.id !== undefined && currentLobby.hostUserId === user.id);
 
   const value: WebSocketContextType = {
     isConnected,
@@ -2806,7 +3304,10 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     connectToRegion,
     currentRegionUrl,
     latencyMs,
+    adConfiguration,
+    lobbyRestorationComplete,
     currentLobby,
+    isLobbyLeader,
     lobbyMembers,
     lobbyChatMessages,
     gameChatMessages,
@@ -2816,8 +3317,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     createLobby,
     joinLobby,
     leaveLobby,
+    clearSessionForAccountChange,
     sendChatMessage,
     updateLobbyPreferences,
+    onlinePlayers,
+    challenges,
+    challengeError,
+    challengePlayer,
+    rematchState,
+    setRematchIntent,
+    respondToChallenge,
+    cancelChallenge,
+    dismissChallengeError,
   };
 
   // Expose context for testing

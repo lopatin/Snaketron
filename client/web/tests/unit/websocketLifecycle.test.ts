@@ -7,6 +7,7 @@ import {
   PLANNED_HANDOFF_MAX_MS,
   RECONNECT_MAX_MS,
   advanceCandidateGameWatermark,
+  activeGameIdFromLocation,
   activeGameIdFromPath,
   authenticationTimeoutMs,
   candidateDeadlineDelayMs,
@@ -128,8 +129,26 @@ test('jittered reconnects remain inside the two-second bound', () => {
 test('game restoration only accepts a matching fresh snapshot', () => {
   assert.equal(activeGameIdFromPath('/play/42'), 42);
   assert.equal(activeGameIdFromPath('/play/42/details'), 42);
+  assert.equal(activeGameIdFromPath('/play/42?from=invite'), 42);
   assert.equal(activeGameIdFromPath('/play/not-a-number'), null);
   assert.equal(activeGameIdFromPath('/lobby'), null);
+
+  assert.equal(
+    activeGameIdFromLocation({ pathname: '/index.html', hash: '#/play/43' }),
+    43,
+  );
+  assert.equal(
+    activeGameIdFromLocation({ pathname: '/index.html', hash: '#/play/44?from=rematch' }),
+    44,
+  );
+  assert.equal(
+    activeGameIdFromLocation({ pathname: '/play/42', hash: '#/play/45' }),
+    45,
+  );
+  assert.equal(
+    activeGameIdFromLocation({ pathname: '/play/46', hash: '#score-card' }),
+    46,
+  );
 
   const snapshot = {
     GameEvent: {

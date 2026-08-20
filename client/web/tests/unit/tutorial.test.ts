@@ -69,7 +69,7 @@ test('custom games get no tutorial rather than a wrong one', () => {
   );
 });
 
-test('every mode names the boost key, and only collectible modes mention NOS', () => {
+test('every mode names the boost key, and only collectible modes mention fuel', () => {
   for (const queueMode of ['Quickmatch', 'Competitive'] as const) {
     // Every matchmade mode has Boost on the same key.
     for (const mode of ['duel', '2v2', 'ffa', 'solo'] as const) {
@@ -79,13 +79,13 @@ test('every mode names the boost key, and only collectible modes mention NOS', (
     // The three contested modes fuel from pickups on the map...
     for (const mode of ['duel', '2v2', 'ffa'] as const) {
       const text = tutorialContent(mode, queueMode).steps.map((step) => step.body).join(' ');
-      assert.match(text, /NOS/, `${mode} must explain NOS`);
+      assert.match(text, /fuel/i, `${mode} must explain fuel`);
     }
     // ...but a solo tank never empties and has nothing to collect, so telling
     // a solo player to look for canisters would send them hunting for
     // objectives the map does not contain.
     const solo = tutorialContent('solo', queueMode).steps.map((step) => step.body).join(' ');
-    assert.doesNotMatch(solo, /NOS|canister/i, 'solo has no boost pickups');
+    assert.doesNotMatch(solo, /fuel|canister/i, 'solo has no boost pickups');
     assert.match(solo, /unlimited/i, 'solo must say the boost is unlimited');
   }
 });
@@ -161,7 +161,8 @@ test('team copy races to the score limit it is handed, never a baked-in number',
       assert.match(text, new RegExp(`First to ${limit}\\b`));
       assert.match(text, /rival base/);
       // No other target may appear alongside it.
-      const numbers = text.match(/\b\d+\b/g) ?? [];
+      // `+3` is the universal combo cap, not a team score target.
+      const numbers = text.match(/(?<!\+)\b\d+\b/g) ?? [];
       assert.deepEqual(
         numbers.filter((n) => n !== String(limit)),
         [],
@@ -175,7 +176,8 @@ test('a team match with no score limit describes the rule without inventing a nu
   const text = tutorialContent('duel', 'Quickmatch', { scoreLimit: null })
     .steps.map((step) => step.body)
     .join(' ');
-  assert.doesNotMatch(text, /\b\d+\b/);
+  // The universal `+3` combo cap is allowed; no bare team target is.
+  assert.doesNotMatch(text, /(?<!\+)\b\d+\b/);
   assert.match(text, /score target/i);
 });
 
@@ -240,10 +242,18 @@ test('progressive steps stay concise enough to scan one at a time', () => {
   }
 });
 
-test('duel opens with the exact glanceable scoring instruction', () => {
+test('every mode teaches the universal combo rule in its opening instruction', () => {
+  for (const mode of MODES) {
+    const opening = tutorialContent(mode, 'Quickmatch').steps[0];
+    assert.match(opening.body, /food/i);
+    assert.match(opening.body, /\+3/);
+    assert.match(opening.body, /two foods/i);
+    assert.match(opening.body, /drains/i);
+  }
+
   assert.equal(
     tutorialContent('duel', 'Quickmatch').steps[0].body,
-    'Return food to base to score points.',
+    'Two foods start COMBO; reach +3 before it drains; bank.',
   );
 });
 
@@ -251,4 +261,38 @@ test('the persistence key distinguishes ranked from casual for the same mode', (
   assert.notEqual(tutorialKey('duel', 'Quickmatch'), tutorialKey('duel', 'Competitive'));
   assert.equal(tutorialKey('duel', 'Competitive'), 'duel:ranked');
   assert.equal(tutorialKey('duel', 'Quickmatch'), 'duel:casual');
+});
+
+test('touch surfaces teach the d-pad and Boost button instead of keyboard keys', () => {
+  for (const mode of MODES) {
+    for (const inputMode of ['hold', 'toggle'] as const) {
+      const touchCopy = tutorialContent(
+        mode,
+        'Quickmatch',
+        { scoreLimit: 25 },
+        inputMode,
+        'touch',
+      ).steps.map((step) => step.body).join(' ');
+
+      assert.doesNotMatch(touchCopy, /Space/, `${mode}:${inputMode} mentions Space on touch`);
+      assert.doesNotMatch(touchCopy, /arrow keys/i, `${mode}:${inputMode} mentions arrow keys on touch`);
+      assert.match(touchCopy, /Boost button/, `${mode}:${inputMode} must name the Boost button`);
+      if (inputMode === 'hold') {
+        assert.match(touchCopy, /hold the Boost button/i);
+      } else {
+        assert.match(touchCopy, /tap the Boost button/i);
+      }
+    }
+  }
+
+  const touchSolo = tutorialContent('solo', 'Quickmatch', { scoreLimit: null }, 'hold', 'touch');
+  assert.match(touchSolo.steps[0].body, /d-pad/i);
+});
+
+test('the keyboard surface is the default, so existing call sites are unchanged', () => {
+  for (const mode of MODES) {
+    const implicit = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'hold');
+    const explicit = tutorialContent(mode, 'Quickmatch', { scoreLimit: 25 }, 'hold', 'keyboard');
+    assert.deepEqual(implicit, explicit);
+  }
 });

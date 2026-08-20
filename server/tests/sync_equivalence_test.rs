@@ -728,7 +728,8 @@ fn goal_sync_state() -> GameState {
     // Team 0 banks through the goal mouth at x = 9, inside the opening.
     state.arena.snakes[0].body = vec![Position { x: 13, y: 20 }, Position { x: 16, y: 20 }];
     state.arena.snakes[0].direction = Direction::Left;
-    state.arena.snakes[0].food = 6;
+    // One queued growth segment is one carried combo point.
+    state.arena.snakes[0].food = 3;
 
     // Team 1 waits harmlessly deep in its own half.
     state.arena.snakes[1].body = vec![Position { x: 46, y: 20 }, Position { x: 49, y: 20 }];

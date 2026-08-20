@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::season::{get_current_season, get_region};
+use crate::season::{Season, get_region};
 use anyhow::{Result, anyhow};
 use common::{GameState, GameStatus, GameType, QueueMode, TeamId};
 use skillratings::MultiTeamOutcome;
@@ -146,11 +146,12 @@ pub async fn persist_player_mmr(
     db: &dyn Database,
     game_id: u32,
     game_state: &GameState,
+    season: Season,
 ) -> Result<()> {
     // Handle Solo games differently - persist high scores instead of MMR
     if matches!(game_state.game_type, GameType::Solo) {
         info!("Persisting high scores for solo game {}", game_id);
-        persist_solo_high_scores(db, game_id, game_state).await?;
+        persist_solo_high_scores(db, game_id, game_state, season).await?;
         return Ok(());
     }
 
@@ -207,6 +208,7 @@ pub async fn persist_player_mmr(
         game_state,
         mmr_deltas,
         winners,
+        season,
     )
     .await?;
 
@@ -531,8 +533,8 @@ async fn apply_mmr_deltas(
     game_state: &GameState,
     deltas: HashMap<u32, i32>,
     winners: HashSet<u32>,
+    season: Season,
 ) -> Result<()> {
-    let season = get_current_season();
     let region = get_region();
 
     for (user_id, delta) in deltas {
@@ -683,8 +685,8 @@ async fn persist_solo_high_scores(
     db: &dyn Database,
     game_id: u32,
     game_state: &GameState,
+    season: Season,
 ) -> Result<()> {
-    let season = get_current_season();
     let region = get_region();
 
     info!(

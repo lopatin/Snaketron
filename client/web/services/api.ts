@@ -6,9 +6,19 @@ import {
   LeaderboardResponse,
   SeasonsResponse,
   UserRankingResponse,
+  MatchHistoryPage,
+  PublicRuntimeConfig,
+  RuntimeConfig,
+  RuntimeConfigAuditPage,
+  RuntimeConfigRecord,
+  UpdateRuntimeConfigRequest,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
 import { getOrCreateAnonId } from '../utils/anonId';
+import type { PlayerLobbyResponse } from '../types/generated';
+import type { NewsTickerResponse } from '../types/generated';
+import type { HighlightClip } from '../types/generated';
+import type { PublicGameResponse } from '../types/generated';
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -38,8 +48,53 @@ interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
 }
 
+export interface CrazyGamesPreferences {
+  tutorialSeen?: Record<string, boolean>;
+  lobbyPreferences?: {
+    selectedModes: string[];
+    competitive: boolean;
+  };
+  boostInputMode?: 'hold' | 'toggle';
+}
+
+export type CrazyGamesGuestPromotion = 'check' | 'allow' | 'decline';
+
+export type CrazyGamesExchangeResolution = 'created' | 'guestClaimed' | 'returning';
+
+export interface CrazyGamesExchangeUser extends UserInfo {
+  authSource: 'crazygames';
+  avatarUrl?: string | null;
+}
+
+export interface CrazyGamesExchangeResponse {
+  token: string;
+  expiresAt: number;
+  resolution: CrazyGamesExchangeResolution;
+  user: CrazyGamesExchangeUser;
+  preferences: CrazyGamesPreferences;
+}
+
+export type GameHighlightResponse =
+  | { status: 'pending' }
+  | { status: 'ready'; play_of_the_game: HighlightClip }
+  | { status: 'unavailable' };
+export interface AdminHistoryFilters {
+  cursor?: string | null;
+  limit?: number;
+}
+
+// Portal sessions are intentionally isolated from first-party username/
+// password sessions. This key stores only Snaketron's internal JWT; the
+// short-lived CrazyGames token is never persisted.
+export const AUTH_TOKEN_STORAGE_KEY = process.env.CRAZYGAMES_BUILD === 'true'
+  ? 'snaketron:crazygames:session-token'
+  : 'token';
+const IS_CRAZY_GAMES_BUILD = process.env.CRAZYGAMES_BUILD === 'true';
+
 class API {
   private baseURL: string;
+  private crazyGamesMemoryToken: string | null = null;
+  private crazyGamesTokenLoaded = false;
 
   constructor() {
     // Base API host; endpoints below include the /api prefix explicitly
@@ -48,15 +103,71 @@ class API {
   }
 
   private getToken(): string | null {
-    return localStorage.getItem('token');
+    if (!IS_CRAZY_GAMES_BUILD) {
+      return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+    if (this.crazyGamesTokenLoaded) {
+      return this.crazyGamesMemoryToken;
+    }
+    this.crazyGamesTokenLoaded = true;
+    try {
+      this.crazyGamesMemoryToken = sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // In-memory auth still works when an embed blocks Web Storage.
+    }
+    if (this.crazyGamesMemoryToken) {
+      return this.crazyGamesMemoryToken;
+    }
+    // One-time migration from the earlier shared-tab pilot. All new reads and
+    // writes are tab-scoped so another portal account cannot replace this
+    // tab's bearer token.
+    try {
+      const legacyToken = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+      if (legacyToken) {
+        this.crazyGamesMemoryToken = legacyToken;
+        try {
+          sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, legacyToken);
+        } catch {
+          // Memory remains authoritative for this page lifetime.
+        }
+      }
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // Shared storage is optional and is never used as the live CG source.
+    }
+    return this.crazyGamesMemoryToken;
   }
 
   setAuthToken(token: string | null): void {
-    if (token) {
-      localStorage.setItem('token', token);
-    } else {
-      localStorage.removeItem('token');
+    if (!IS_CRAZY_GAMES_BUILD) {
+      if (token) {
+        localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+      } else {
+        localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      }
+      return;
     }
+
+    this.crazyGamesTokenLoaded = true;
+    this.crazyGamesMemoryToken = token;
+    try {
+      if (token) {
+        sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+      } else {
+        sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      }
+    } catch {
+      // Memory remains authoritative until the next full page load.
+    }
+    try {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // Best-effort cleanup of the shared-tab legacy key.
+    }
+  }
+
+  getAuthToken(): string | null {
+    return this.getToken();
   }
 
   // T must be specified by the caller (typically a generated wire DTO). The
@@ -98,6 +209,24 @@ class API {
     return data as T;
   }
 
+  /**
+   * Resolve a `/play/<username>` invite link to the lobby that player is in.
+   *
+   * Anonymous, because the link is followed before the visitor has an account.
+   * A failed request is reported as `notFound` rather than thrown: the caller
+   * always has to explain the outcome to a visitor either way, and there is
+   * nothing useful for them to do differently about a 500.
+   */
+  async getPlayerLobby(username: string): Promise<PlayerLobbyResponse> {
+    try {
+      return await this.request<PlayerLobbyResponse>(
+        `/api/players/${encodeURIComponent(username)}/lobby`,
+      );
+    } catch {
+      return { username, lobbyCode: null, status: 'notFound' };
+    }
+  }
+
   async login(username: string, password: string): Promise<AuthResponse> {
     const data = await this.request<AuthResponse>('/api/auth/login', {
       method: 'POST',
@@ -117,12 +246,42 @@ class API {
   }
 
   async createGuest(nickname: string): Promise<CreateGuestResponse> {
-    const data = await this.request<CreateGuestResponse>('/api/auth/guest', {
+    return this.request<CreateGuestResponse>('/api/auth/guest', {
       method: 'POST',
       body: JSON.stringify({ nickname }),
     });
-    this.setAuthToken(data.token);
-    return data;
+  }
+
+  /**
+   * Exchange a short-lived CrazyGames JWT without ever persisting it. The
+   * optional internal bearer attached by request() lets the server inspect or
+   * promote an eligible guest according to the caller's explicit consent.
+   */
+  async exchangeCrazyGamesToken(
+    token: string,
+    guestPromotion: CrazyGamesGuestPromotion,
+    initialPreferences?: CrazyGamesPreferences,
+  ): Promise<CrazyGamesExchangeResponse> {
+    return this.request<CrazyGamesExchangeResponse>('/api/auth/crazygames/exchange', {
+      method: 'POST',
+      body: JSON.stringify({
+        token,
+        guestPromotion,
+        ...(initialPreferences ? { initialPreferences } : {}),
+      }),
+    });
+  }
+
+  async saveCrazyGamesPreferences(
+    preferences: CrazyGamesPreferences,
+  ): Promise<CrazyGamesPreferences> {
+    const response = await this.request<{ preferences: CrazyGamesPreferences }>(
+      '/api/auth/crazygames/preferences', {
+      method: 'PUT',
+      body: JSON.stringify(preferences),
+      },
+    );
+    return response.preferences;
   }
 
   async checkUsername(username: string): Promise<CheckUsernameResult> {
@@ -149,8 +308,39 @@ class API {
     }
   }
 
-  async getCurrentUser(): Promise<UserInfo> {
-    return this.request<UserInfo>('/api/auth/me');
+  async getCurrentUser(): Promise<UserInfo & { isAdmin?: boolean }> {
+    return this.request<UserInfo & { isAdmin?: boolean }>('/api/auth/me');
+  }
+
+  async getNewsTicker(): Promise<NewsTickerResponse> {
+    return this.request<NewsTickerResponse>('/api/news');
+  }
+
+  /** Public-by-design replay metadata. A bearer is still attached when one is
+   * available, including tab-scoped CrazyGames sessions. */
+  async getGameHighlight(
+    gameId: string,
+    signal?: AbortSignal,
+  ): Promise<GameHighlightResponse> {
+    return this.request<GameHighlightResponse>(
+      `/api/games/${encodeURIComponent(gameId)}/highlight`,
+      { signal },
+    );
+  }
+
+  /**
+   * The permanent public summary of a finished match. Anonymous by design —
+   * this is what a shared link resolves to, and it must work for someone who
+   * has never played.
+   */
+  async getPublicGameSummary(
+    gameId: string,
+    signal?: AbortSignal,
+  ): Promise<PublicGameResponse> {
+    return this.request<PublicGameResponse>(
+      `/api/games/${encodeURIComponent(gameId)}/summary`,
+      { signal },
+    );
   }
 
   async getLeaderboard(
@@ -193,6 +383,72 @@ class API {
     if (region) params.append('region', region);
 
     return this.request<UserRankingResponse>(`/api/leaderboard/me?${params.toString()}`);
+  }
+
+  /**
+   * Any player's ranking in one region. Standing is already public — the
+   * leaderboard publishes the same MMR next to the username — so this needs
+   * no auth. It exists for surfaces that know a user id but are not that
+   * user, such as the Play of the Game caption naming whoever earned it.
+   */
+  async getUserRanking(
+    userId: number,
+    queueMode: 'quickmatch' | 'competitive',
+    gameType: 'solo' | 'duel' | '2v2' | 'ffa',
+    season?: number,
+    region?: string
+  ): Promise<UserRankingResponse> {
+    const params = new URLSearchParams({
+      queue_mode: queueMode,
+      game_type: gameType,
+    });
+
+    if (season !== undefined) params.append('season', season.toString());
+    if (region) params.append('region', region);
+
+    return this.request<UserRankingResponse>(
+      `/api/leaderboard/users/${userId}?${params.toString()}`
+    );
+  }
+
+  async getMatchHistory(cursor?: string | null, limit = 12): Promise<MatchHistoryPage> {
+    const params = new URLSearchParams({ limit: limit.toString() });
+    if (cursor) params.set('cursor', cursor);
+    return this.request<MatchHistoryPage>(`/api/history?${params.toString()}`);
+  }
+
+  async getAdminMatchHistory(filters: AdminHistoryFilters = {}): Promise<MatchHistoryPage> {
+    const params = new URLSearchParams({ limit: String(filters.limit ?? 25) });
+    if (filters.cursor) params.set('cursor', filters.cursor);
+    return this.request<MatchHistoryPage>(`/api/admin/history?${params.toString()}`);
+  }
+
+  async getRuntimeConfig(): Promise<PublicRuntimeConfig> {
+    return this.request<PublicRuntimeConfig>('/api/config');
+  }
+
+  async getAdminRuntimeConfig(): Promise<RuntimeConfigRecord> {
+    return this.request<RuntimeConfigRecord>('/api/admin/config');
+  }
+
+  async updateAdminRuntimeConfig(
+    config: RuntimeConfig,
+    expectedVersion: number,
+  ): Promise<RuntimeConfigRecord> {
+    const request: UpdateRuntimeConfigRequest = { config, expectedVersion };
+    return this.request<RuntimeConfigRecord>('/api/admin/config', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getAdminRuntimeConfigAudit(
+    cursor?: string | null,
+    limit = 20,
+  ): Promise<RuntimeConfigAuditPage> {
+    const params = new URLSearchParams({ limit: limit.toString() });
+    if (cursor) params.set('cursor', cursor);
+    return this.request<RuntimeConfigAuditPage>(`/api/admin/config/audit?${params.toString()}`);
   }
 }
 

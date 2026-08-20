@@ -30,10 +30,18 @@ const ACTOR_ADVANCE_BUCKETS_US: &[f64] = &[
     10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0,
 ];
 const ACTOR_BATCH_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+const COMBO_CHAIN_DEPTH_BUCKETS: &[f64] =
+    &[1.0, 2.0, 3.0, 4.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0];
+const COMBO_REMAINING_WINDOW_BUCKETS_MS: &[f64] = &[
+    0.0, 25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 250.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0,
+    900.0, 1_000.0,
+];
+const POTG_RING_EVICTED_SECONDS_BUCKETS: &[f64] = &[
+    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_200.0, 1_800.0, 3_600.0,
+];
 
 struct OtelMetrics {
     fenced_write_rejections: Counter<u64>,
-    recovery_fingerprint_divergences: Counter<u64>,
     planned_drain_failures: Counter<u64>,
     command_claims: Counter<u64>,
     command_acks: Counter<u64>,
@@ -48,6 +56,10 @@ struct OtelMetrics {
     boost_activations: Counter<u64>,
     boost_manual_stops: Counter<u64>,
     boost_depletions: Counter<u64>,
+    combo_food_collections: Counter<u64>,
+    combo_points_awarded: Counter<u64>,
+    combo_chain_depth: Histogram<u64>,
+    combo_remaining_window_at_collection: Histogram<u64>,
     game_actor_advance_duration: Histogram<u64>,
     game_actor_batch_quanta: Histogram<u64>,
     game_actor_lag: Histogram<u64>,
@@ -89,6 +101,8 @@ struct OtelMetrics {
     games_completed: Counter<u64>,
     game_duration: Histogram<u64>,
     completed_game_players: Counter<u64>,
+    potg_ring_truncated: Counter<u64>,
+    potg_ring_evicted_seconds: Histogram<u64>,
     redis_requests: Counter<u64>,
     redis_errors: Counter<u64>,
     redis_request_latency: Histogram<u64>,
@@ -368,11 +382,6 @@ impl OtelMetrics {
                 "snaketron.fenced_write_rejections",
                 "Rejected writes from stale executor owners",
             ),
-            recovery_fingerprint_divergences: counter(
-                &meter,
-                "snaketron.recovery_fingerprint_divergences",
-                "Recovered states that diverged from their deterministic fingerprint",
-            ),
             planned_drain_failures: counter(
                 &meter,
                 "snaketron.planned_drain_failures",
@@ -442,6 +451,29 @@ impl OtelMetrics {
                 &meter,
                 "snaketron.boost.depletions",
                 "Authoritative Boost state depletions after the final funded quantum",
+            ),
+            combo_food_collections: counter(
+                &meter,
+                "snaketron.combo.food_collections",
+                "Authoritative food collections after a fenced durability boundary",
+            ),
+            combo_points_awarded: counter(
+                &meter,
+                "snaketron.combo.points_awarded",
+                "Authoritative food points awarded after a fenced durability boundary",
+            ),
+            combo_chain_depth: histogram_with_unit(
+                &meter,
+                "snaketron.combo.chain_depth",
+                "Combo chain depth at an authoritative food collection",
+                "1",
+                COMBO_CHAIN_DEPTH_BUCKETS,
+            ),
+            combo_remaining_window_at_collection: histogram(
+                &meter,
+                "snaketron.combo.remaining_window_at_collection",
+                "Combo window remaining immediately before an authoritative food collection",
+                COMBO_REMAINING_WINDOW_BUCKETS_MS,
             ),
             game_actor_advance_duration: histogram_with_unit(
                 &meter,
@@ -657,6 +689,18 @@ impl OtelMetrics {
                 "snaketron.completed_game_players",
                 "Players included in completed games",
             ),
+            potg_ring_truncated: counter(
+                &meter,
+                "snaketron.potg_ring_truncated",
+                "Completed games whose bounded Play-of-the-Game selection ring evicted history",
+            ),
+            potg_ring_evicted_seconds: histogram_with_unit(
+                &meter,
+                "snaketron.ring_evicted_seconds",
+                "Whole-match seconds unavailable to Play-of-the-Game selection after oldest-first eviction",
+                "s",
+                POTG_RING_EVICTED_SECONDS_BUCKETS,
+            ),
             redis_requests: counter(
                 &meter,
                 "snaketron.redis_requests",
@@ -687,10 +731,6 @@ macro_rules! counter_recorder {
 }
 
 counter_recorder!(record_fenced_write_rejection, fenced_write_rejections);
-counter_recorder!(
-    record_recovery_fingerprint_divergence,
-    recovery_fingerprint_divergences
-);
 counter_recorder!(record_planned_drain_failure, planned_drain_failures);
 counter_recorder!(record_command_claims, command_claims);
 counter_recorder!(record_command_acks, command_acks);
@@ -851,6 +891,56 @@ pub(crate) fn record_boost_manual_stop(
     );
 }
 
+fn combo_food_value(points: u32) -> &'static str {
+    match points {
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        _ => "other",
+    }
+}
+
+fn combo_attributes(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    points: u32,
+    boost_active: bool,
+) -> [KeyValue; 5] {
+    [
+        KeyValue::new("game.type", game_type),
+        KeyValue::new("game.queue_mode", queue_mode),
+        KeyValue::new("game.team_side", team_side),
+        // Map unexpected values into one finite fallback instead of allowing a
+        // malformed/replayed event to create an unbounded label vocabulary.
+        KeyValue::new("food.value", combo_food_value(points)),
+        KeyValue::new("boost.active", boost_active),
+    ]
+}
+
+pub(crate) fn record_combo_food_collected(
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+    points: u32,
+    combo_chain: u32,
+    combo_remaining_ms_before: u32,
+    boost_active: bool,
+) {
+    let attributes = combo_attributes(game_type, queue_mode, team_side, points, boost_active);
+    let metrics = metrics();
+    metrics.combo_food_collections.add(1, &attributes);
+    metrics
+        .combo_points_awarded
+        .add(u64::from(points), &attributes);
+    metrics
+        .combo_chain_depth
+        .record(u64::from(combo_chain), &attributes);
+    metrics
+        .combo_remaining_window_at_collection
+        .record(u64::from(combo_remaining_ms_before), &attributes);
+}
+
 pub(crate) fn record_http_request(status_code: u16, latency_ms: u64) {
     let metrics = metrics();
     metrics.http_requests.add(1, &[]);
@@ -902,6 +992,14 @@ pub(crate) fn record_game_completed(duration_ms: u64, players: u64) {
     metrics.games_completed.add(1, &[]);
     metrics.completed_game_players.add(players, &[]);
     metrics.game_duration.record(duration_ms, &[]);
+}
+
+pub(crate) fn record_potg_ring_truncated(evicted_seconds: u64) {
+    let metrics = metrics();
+    metrics.potg_ring_truncated.add(1, &[]);
+    metrics
+        .potg_ring_evicted_seconds
+        .record(evicted_seconds, &[]);
 }
 
 pub(crate) fn record_redis_request(latency_ms: u64, failed: bool) {
@@ -987,9 +1085,24 @@ mod tests {
             1,
             &boost_attributes("2v2", "competitive", Some("team-1"), "1.76-2.00x", None),
         );
+        let combo_metric_attributes = combo_attributes("2v2", "competitive", "team-1", 3, true);
+        instruments
+            .combo_food_collections
+            .add(1, &combo_metric_attributes);
+        instruments
+            .combo_points_awarded
+            .add(3, &combo_metric_attributes);
+        instruments
+            .combo_chain_depth
+            .record(7, &combo_metric_attributes);
+        instruments
+            .combo_remaining_window_at_collection
+            .record(425, &combo_metric_attributes);
         instruments.game_actor_advance_duration.record(730, &[]);
         instruments.game_actor_batch_quanta.record(3, &[]);
         instruments.game_actor_lag.record(50, &[]);
+        instruments.potg_ring_truncated.add(1, &[]);
+        instruments.potg_ring_evicted_seconds.record(17, &[]);
         update_gauges(&GaugeSnapshot {
             live_tasks: 3,
             active_websockets: 7,
@@ -1049,6 +1162,7 @@ mod tests {
         for (name, unit) in [
             ("snaketron.game_actor.advance_duration", "us"),
             ("snaketron.game_actor.batch_quanta", "1"),
+            ("snaketron.ring_evicted_seconds", "s"),
         ] {
             let exported_histogram = metric(name);
             assert_eq!(exported_histogram.unit(), unit);
@@ -1092,6 +1206,60 @@ mod tests {
             data => panic!("Boost manual stops used the wrong aggregation: {data:?}"),
         }
 
+        for (name, expected_value) in [
+            ("snaketron.combo.food_collections", 1),
+            ("snaketron.combo.points_awarded", 3),
+        ] {
+            match metric(name).data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    assert!(sum.is_monotonic());
+                    let points = sum.data_points().collect::<Vec<_>>();
+                    assert_eq!(points.len(), 1);
+                    assert_eq!(points[0].value(), expected_value);
+                    let attributes = points[0].attributes().cloned().collect::<Vec<_>>();
+                    assert_eq!(attributes.len(), 5);
+                    for expected in combo_attributes("2v2", "competitive", "team-1", 3, true) {
+                        assert!(
+                            attributes.contains(&expected),
+                            "{name} missing {expected:?}"
+                        );
+                    }
+                    assert!(attributes.iter().all(|attribute| {
+                        !matches!(
+                            attribute.key.as_str(),
+                            "game.id" | "user.id" | "player.id" | "snake.id"
+                        )
+                    }));
+                }
+                data => panic!("{name} used the wrong aggregation: {data:?}"),
+            }
+        }
+
+        for (name, unit, expected_sum) in [
+            ("snaketron.combo.chain_depth", "1", 7),
+            ("snaketron.combo.remaining_window_at_collection", "ms", 425),
+        ] {
+            let exported_histogram = metric(name);
+            assert_eq!(exported_histogram.unit(), unit);
+            match exported_histogram.data() {
+                AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                    let points = histogram.data_points().collect::<Vec<_>>();
+                    assert_eq!(points.len(), 1);
+                    assert_eq!(points[0].count(), 1);
+                    assert_eq!(points[0].sum(), expected_sum);
+                    let attributes = points[0].attributes().cloned().collect::<Vec<_>>();
+                    assert_eq!(attributes.len(), 5);
+                    for expected in combo_attributes("2v2", "competitive", "team-1", 3, true) {
+                        assert!(
+                            attributes.contains(&expected),
+                            "{name} missing {expected:?}"
+                        );
+                    }
+                }
+                data => panic!("{name} used the wrong aggregation: {data:?}"),
+            }
+        }
+
         for (name, expected) in [
             ("snaketron.live_tasks", 3),
             ("snaketron.active_web_sockets", 7),
@@ -1110,5 +1278,25 @@ mod tests {
         provider
             .shutdown()
             .expect("metric provider should shut down");
+    }
+
+    #[test]
+    fn combo_food_value_attribute_has_a_finite_vocabulary() {
+        for (points, expected) in [(1, "1"), (2, "2"), (3, "3"), (0, "other"), (999, "other")] {
+            assert_eq!(combo_food_value(points), expected);
+        }
+    }
+
+    #[test]
+    fn combo_remaining_window_histogram_covers_the_production_default() {
+        assert_eq!(
+            COMBO_REMAINING_WINDOW_BUCKETS_MS.last().copied(),
+            Some(f64::from(common::DEFAULT_COMBO_WINDOW_MS))
+        );
+        assert!(
+            COMBO_REMAINING_WINDOW_BUCKETS_MS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
     }
 }

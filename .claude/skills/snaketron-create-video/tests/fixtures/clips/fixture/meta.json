@@ -1,0 +1,11 @@
+{
+  "scenario_id": "fixture",
+  "seed": 7,
+  "capture_vfps": 120,
+  "encoded_fps": 30,
+  "duration": 2.0,
+  "events": [
+    { "id": "boost", "master_seconds": 0.4 },
+    { "id": "kill", "master_seconds": 1.0 }
+  ]
+}

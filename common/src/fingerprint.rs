@@ -14,8 +14,13 @@
 //!   activation or turn is detected before it mutates geometry.
 //! - `event_sequence`: client and server count locally-generated events
 //!   differently by design.
-//! - `usernames`, `spectators`, `game_code`, `host_user_id`, `start_ms`:
-//!   cosmetic or static; not gameplay state.
+//! - `recent_crashes`, `recent_goals`, and `last_death_causes`: replicated
+//!   presentation history. Hashing it would turn an expired visual cue into a
+//!   false gameplay divergence; the underlying state transition is hashed.
+//! - `usernames`, `skins`, `spectators`, `game_code`, `host_user_id`,
+//!   `start_ms`: cosmetic or static; not gameplay state. Skins in particular
+//!   must stay out: a player changing how their snake looks can never be
+//!   allowed to make two clients disagree about the game.
 //! - `readiness` and `simulation_epoch_ms`: the pre-match readiness gate.
 //!   Both resolve before tick 1, so hashing them would compare states across
 //!   the window where a `PlayerReady` event is legitimately still in flight
@@ -125,6 +130,8 @@ impl GameState {
             h.write_u32(snake.boost.charge_ms);
             h.write_u8(snake.boost.active as u8);
             h.write_u8(snake.boost.intent as u8);
+            h.write_u32(snake.combo.chain_count);
+            h.write_u32(snake.combo.remaining_ms);
             match snake.team_id {
                 Some(team) => {
                     h.write_u8(1);
@@ -186,6 +193,18 @@ impl GameState {
         for (snake_id, score) in scores {
             h.write_u32(snake_id);
             h.write_u32(score);
+        }
+
+        let mut food_pickups: Vec<(u32, u32)> = self
+            .food_pickups
+            .iter()
+            .map(|(snake_id, count)| (*snake_id, *count))
+            .collect();
+        food_pickups.sort_unstable();
+        h.write_u32(food_pickups.len() as u32);
+        for (snake_id, count) in food_pickups {
+            h.write_u32(snake_id);
+            h.write_u32(count);
         }
 
         match &self.team_scores {
@@ -269,6 +288,9 @@ impl GameState {
             }
             None => h.write_u8(0),
         }
+        h.write_u32(self.properties.combo.window_ms);
+        h.write_u32(self.properties.combo.max_food_value);
+        h.write_u16(self.properties.combo.rules_version);
         h.write_u32(self.properties.player_idle_timeout_ms);
         h.write_u32(self.properties.player_idle_warning_ms);
 
@@ -324,6 +346,34 @@ fn direction_tag(direction: &crate::Direction) -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Cosmetics must be invisible to sync. If a skin choice could change the
+    /// fingerprint, two players wearing different skins would look like a
+    /// desync — and the chaos suite would be right to fail the build.
+    #[test]
+    fn a_players_skin_choice_never_changes_the_fingerprint() {
+        let mut plain = test_state();
+        plain
+            .add_player(7, Some("player".to_string()))
+            .expect("a player joins at tick 0");
+        let baseline = plain.sync_hash();
+
+        let mut dressed = plain.clone();
+        dressed.set_player_skin(7, Some("aurora@1".to_string()));
+        assert_ne!(dressed.skins, plain.skins, "the choice was recorded");
+        assert_eq!(
+            dressed.sync_hash(),
+            baseline,
+            "a skin changed the sync fingerprint"
+        );
+
+        // ...including an id no build has ever heard of.
+        dressed.set_player_skin(7, Some("from-the-future@99".to_string()));
+        assert_eq!(dressed.sync_hash(), baseline);
+
+        dressed.set_player_skin(7, None);
+        assert_eq!(dressed.sync_hash(), baseline);
+    }
     use crate::{
         CommandId, Direction, GameCommand, GameCommandMessage, GameState, GameType, Position,
         QueueMode,
@@ -451,6 +501,36 @@ mod tests {
             }
             assert_ne!(baseline.sync_hash(), changed.sync_hash());
         }
+    }
+
+    #[test]
+    fn hash_detects_combo_state_configuration_and_raw_pickups() {
+        let mut baseline = test_state();
+        baseline.add_player(1, None).unwrap();
+
+        let mut changed = baseline.clone();
+        changed.arena.snakes[0].combo.chain_count = 2;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.arena.snakes[0].combo.remaining_ms = 750;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.properties.combo.window_ms = 1_250;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.properties.combo.max_food_value = 2;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.properties.combo.rules_version += 1;
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
+
+        let mut changed = baseline.clone();
+        changed.food_pickups.insert(0, 1);
+        assert_ne!(baseline.sync_hash(), changed.sync_hash());
     }
 
     #[test]

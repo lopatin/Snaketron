@@ -3,12 +3,19 @@ import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { PlayersOnline } from './PlayersOnline';
+import { NewsTicker } from './NewsTicker';
 import { LobbyPreferences, LobbyGameMode } from '../types';
+import {
+  getTickerPlayPreferences,
+  type NewsTickerPlayAction,
+} from '../utils/newsTicker';
 import {
   DEFAULT_LOBBY_PREFERENCES,
   loadStoredLobbyPreferences,
   persistStoredLobbyPreferences,
 } from '../utils/lobbyPreferencesStorage';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { useInputSurface } from '../hooks/useInputSurface';
 
 const areModeSetsEqual = (a: Set<LobbyGameMode> | null, b: Set<LobbyGameMode> | null) => {
   if (a === b) {
@@ -36,6 +43,13 @@ interface GameStartFormProps {
   isLoading?: boolean;
   isAuthenticated?: boolean;
   isLobbyQueued?: boolean;
+  /**
+   * Whether this player leads the lobby. Only the leader may change the mode
+   * selection or start matchmaking, because both decide what every member of
+   * the lobby queues for. Defaults to `true` so a form rendered outside a
+   * lobby context behaves as it always did.
+   */
+  isLobbyLeader?: boolean;
   lobbyPreferences: LobbyPreferences | null;
   onPreferencesChange?: (preferences: LobbyPreferences) => void;
   onSignInClick?: () => void;
@@ -50,31 +64,42 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   isLoading = false,
   isAuthenticated = false,
   isLobbyQueued = false,
+  isLobbyLeader = true,
   lobbyPreferences,
   onPreferencesChange,
   onSignInClick,
   errorMessage = null,
   playersOnline = null,
 }) => {
-  const [nickname, setNickname] = useState(currentUsername || '');
+  const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
+  const effectiveUsername = currentUsername || '';
+  const [nickname, setNickname] = useState(effectiveUsername);
   const [hasAutoSetNickname, setHasAutoSetNickname] = useState(false);
   const [selectedModes, setSelectedModes] = useState<Set<LobbyGameMode> | null>(null);
   const [isCompetitive, setIsCompetitive] = useState<boolean | null>(null);
   const nicknameInputRef = useRef<HTMLInputElement>(null);
   const lastSubmittedNicknameRef = useRef<string | null>(null);
-  const { user, updateGuestNickname } = useAuth();
+  const { user, updateGuestNickname, crazyGamesSessionStatus } = useAuth();
+  const locksNickname = isAuthenticated || (
+    isCrazyGamesBuild && crazyGamesSessionStatus === 'linked'
+  );
   const { sendMessage } = useWebSocket();
   const prevUsernameRef = useRef<string | null>(null);
-  const canEdit = !isLobbyQueued;
+  const canEdit = !isLobbyQueued && isLobbyLeader;
 
   // Debounce nickname validation to avoid showing errors while typing
   const debouncedNickname = useDebouncedValue(nickname, 500);
   const showNicknameError = debouncedNickname.length > 0 && debouncedNickname.length < 3;
 
-  // Auto-focus on nickname field when component mounts
+  // Auto-focus on nickname field when component mounts. Touch surfaces skip
+  // it: focusing a text input there pops the software keyboard over the home
+  // screen before the player has asked to type anything.
+  const inputSurface = useInputSurface();
   useEffect(() => {
-    nicknameInputRef.current?.focus();
-  }, []);
+    if (!locksNickname && inputSurface !== 'touch') {
+      nicknameInputRef.current?.focus();
+    }
+  }, [locksNickname, inputSurface]);
 
   // Keep local selection state in sync with lobby-wide preferences
   useEffect(() => {
@@ -96,7 +121,12 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       if (isCompetitive === null) {
         setIsCompetitive(fallbackPreferences.competitive);
       }
-      onPreferencesChange?.(fallbackPreferences);
+      // Seeding from local storage publishes a selection nobody clicked. Only
+      // the leader may do that; for anyone else it would be rejected, and it
+      // would race the leader's real choice on arrival.
+      if (isLobbyLeader) {
+        onPreferencesChange?.(fallbackPreferences);
+      }
     } else if (isCompetitive === null) {
       setIsCompetitive(DEFAULT_LOBBY_PREFERENCES.competitive);
     }
@@ -104,6 +134,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     lobbyPreferences,
     selectedModes,
     isCompetitive,
+    isLobbyLeader,
     setSelectedModes,
     setIsCompetitive,
     onPreferencesChange,
@@ -123,7 +154,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   // Sync nickname with currentUsername when it changes (for guest users)
   useEffect(() => {
-    if (!currentUsername) {
+    if (!effectiveUsername) {
       return;
     }
 
@@ -131,12 +162,14 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
       setHasAutoSetNickname(true);
     }
 
-    if (prevUsernameRef.current !== currentUsername) {
-      setNickname(currentUsername);
-      lastSubmittedNicknameRef.current = currentUsername;
-      prevUsernameRef.current = currentUsername;
+    if (prevUsernameRef.current !== effectiveUsername) {
+      setNickname(effectiveUsername);
+      lastSubmittedNicknameRef.current = effectiveUsername === currentUsername
+        ? effectiveUsername
+        : null;
+      prevUsernameRef.current = effectiveUsername;
     }
-  }, [currentUsername, hasAutoSetNickname]);
+  }, [currentUsername, effectiveUsername, hasAutoSetNickname]);
 
   useEffect(() => {
     if (!user || !user.isGuest) {
@@ -194,7 +227,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (isLobbyQueued) {
+    if (isLobbyQueued || !isLobbyLeader) {
       return;
     }
 
@@ -204,7 +237,10 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   };
 
   const isFormValid = selectedModes && selectedModes.size > 0 && nickname.trim().length >= 3;
-  const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading;
+  const startButtonDisabled = isLobbyQueued || !isFormValid || isLoading || !isLobbyLeader;
+  // Unlike the Start button this ignores the nickname: a ticker CTA is still
+  // useful without one, because it applies the selection and asks for the name.
+  const isTickerPlayDisabled = !canEdit || isLoading;
   const startButtonActivating = isLobbyQueued || isLoading;
   const startButtonLabel = isLobbyQueued
     ? 'Finding Match...'
@@ -227,14 +263,53 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
     }
   }, [startButtonDisabled]);
 
+  /**
+   * A ticker CTA is a shortcut through the whole form: it replaces the current
+   * selection with the competitive queue for that mode and immediately starts
+   * matchmaking, rather than leaving the player to press Start themselves.
+   *
+   * Preferences are published before starting so the lobby and the visible
+   * chips agree even if the start attempt fails partway (session creation,
+   * socket handshake, and lobby creation all precede the queue command).
+   */
+  const handleTickerPlay = (action: NewsTickerPlayAction) => {
+    if (isTickerPlayDisabled) {
+      return;
+    }
+
+    const preferences = getTickerPlayPreferences(action);
+    setSelectedModes(new Set(preferences.selectedModes));
+    setIsCompetitive(preferences.competitive);
+    onPreferencesChange?.(preferences);
+
+    const trimmedNickname = nickname.trim();
+    if (trimmedNickname.length < 3) {
+      // The shortcut skips the form, not its one requirement. Apply the
+      // selection anyway and hand over the field that is still owed, which is
+      // exactly the state the Start button's own guard would leave behind.
+      nicknameInputRef.current?.focus();
+      return;
+    }
+
+    onStartGame(
+      preferences.selectedModes,
+      trimmedNickname,
+      preferences.competitive,
+    );
+  };
+
   return (
     <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
       {/* Logo */}
-      <div className="flex flex-col items-center mb-8">
+      <div className="home-brand-lockup">
         <img src="SnaketronLogo.png" alt="Snaketron" className="h-8 w-auto opacity-80" />
         <p className="mt-3 text-xs font-bold italic uppercase tracking-1 text-gray-500">
           Competitive multiplayer Snake
         </p>
+        <NewsTicker
+          onPlay={handleTickerPlay}
+          isPlayDisabled={isTickerPlayDisabled}
+        />
       </div>
 
       <div className="p-8">
@@ -249,33 +324,41 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
             onChange={(e) => setNickname(e.target.value)}
             placeholder="Nickname"
             className={`w-full bg-white px-4 py-3 text-base border-2 rounded-lg transition-colors ${
-              isAuthenticated
+              locksNickname
                 ? 'border-gray-300 cursor-default'
                 : 'border-gray-300 focus:outline-none focus:border-blue-500'
             }`}
-            disabled={isLoading || isAuthenticated}
+            disabled={isLoading || locksNickname}
             minLength={3}
             required
-            readOnly={isAuthenticated}
+            readOnly={locksNickname}
           />
 
           {/* Guest notice + sign-in link. Hidden entirely once the player has
               a real account, since neither half applies to them. */}
-          {!isAuthenticated && (
+          {!locksNickname && (
             <div className="mt-2 px-1 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span className="text-[13px] text-gray-500 whitespace-nowrap">
-                Playing as guest
+                {isCrazyGamesBuild ? 'Playing as CrazyGames guest' : 'Playing as guest'}
               </span>
-              <button
-                type="button"
-                onClick={onSignInClick}
-                className="
-                  text-[13px] whitespace-nowrap text-blue-600 cursor-pointer
-                  hover:underline focus-visible:underline
-                "
-              >
-                Sign in or create account
-              </button>
+              {(!isCrazyGamesBuild || userAccountAvailable) && (
+                <button
+                  type="button"
+                  onClick={onSignInClick}
+                  className="
+                    text-[13px] whitespace-nowrap text-blue-600 cursor-pointer
+                    hover:underline focus-visible:underline
+                  "
+                >
+                  {isCrazyGamesBuild ? 'Sign in with CrazyGames' : 'Sign in or create account'}
+                </button>
+              )}
+            </div>
+          )}
+
+          {locksNickname && isCrazyGamesBuild && crazyGamesSessionStatus === 'linked' && (
+            <div className="mt-2 px-1 text-[13px] font-semibold text-green-700">
+              CrazyGames account linked · progress saves automatically
             </div>
           )}
 
@@ -296,6 +379,17 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
 
         {/* Game Mode Selector */}
         <div className="mb-8">
+          {/* Disabled controls are only fair if the reason is visible. Shown
+              in place of the mode grid's own spacing so the layout does not
+              shift when leadership changes hands mid-session. */}
+          {!isLobbyLeader && (
+            <p
+              className="mb-3 text-[13px] text-gray-500 text-center"
+              data-testid="leader-only-notice"
+            >
+              Waiting for lobby host to start matchmaking
+            </p>
+          )}
           <div className="grid grid-cols-2 gap-3">
             {gameModes.map((mode) => {
               const isSelected = selectedModes && selectedModes.has(mode.id);
@@ -306,6 +400,7 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
                   type="button"
                   onClick={() => toggleMode(mode.id)}
                   disabled={!canEdit || isLoading}
+                  aria-pressed={Boolean(isSelected)}
                   className={`
                     game-mode-choice relative py-4 px-4 rounded-lg font-black uppercase tracking-1 text-base
                     transition-all border-2

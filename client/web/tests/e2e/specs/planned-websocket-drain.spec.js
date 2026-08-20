@@ -9,6 +9,7 @@ const REQUIRED_CAPABILITIES = [
   'command-outcome-barrier-v1',
   'terminal-command-cutoff-v1',
 ];
+const CURRENT_PROTOCOL_VERSION = 12;
 
 const RETRYABLE_MATCHMAKING_ADMISSION_REASON =
   'Failed to queue lobby: Failed to add lobby to matchmaking queue';
@@ -21,6 +22,10 @@ const ANONYMOUS_SOCKET_OBSERVATION_MS = 8_000;
 // The values themselves are pinned by tests/unit/connectionBanner.test.ts.
 const CONNECTION_BANNER_SHOW_DELAY_MS = 800;
 const CONNECTION_BANNER_MIN_VISIBLE_MS = 1_200;
+// This test expires the callout with an explicit snapshot. A long, valid
+// window keeps slow CI from racing the real predictor between UI assertions;
+// unit and engine tests continue to pin the production rule at one second.
+const COMBO_CALLOUT_TEST_WINDOW_MS = 60_000;
 
 const gameState = (tick = 5) => ({
   tick,
@@ -92,6 +97,41 @@ const snapshot = (streamSequence, tick = 5) => ({
     event: { Snapshot: { game_state: gameState(tick) } },
   },
 });
+
+// Solo snake 0 renders at 270 degrees, where the renderer maps grid (x, y) to
+// screen (y, 39 - x). Grid x = 38 is therefore the second row from the top of
+// the screen, and grid y = 20 is its horizontal center: exactly under the
+// callout. Grid (20, 20) renders mid-field, well clear of it.
+const COMBO_HEAD_UNDER_CALLOUT = { x: 38, y: 20 };
+// Same column, ten rows down the screen: several cells clear of the callout's
+// bottom edge and therefore still fully opaque. This pins the fade to the last
+// couple of cells of the approach rather than the whole run-up.
+const COMBO_HEAD_BELOW_CALLOUT = { x: 29, y: 20 };
+const COMBO_HEAD_MID_FIELD = { x: 20, y: 20 };
+
+const comboSnapshot = (streamSequence, tick, chainCount, remainingMs, head) => {
+  const frame = snapshot(streamSequence, tick);
+  const state = frame.GameEvent.event.Snapshot.game_state;
+  state.start_ms = Date.now() - tick * state.properties.tick_duration_ms;
+  state.properties.combo = {
+    window_ms: COMBO_CALLOUT_TEST_WINDOW_MS,
+    max_food_value: 3,
+    rules_version: 1,
+  };
+  state.arena.snakes[0].combo = {
+    chain_count: chainCount,
+    remaining_ms: remainingMs,
+  };
+  if (head) {
+    // Travel along the grid's y axis, which is the screen's x axis, so the
+    // head keeps its distance from the top edge while prediction advances
+    // between snapshots instead of driving into the wall.
+    state.arena.snakes[0].body = [head, { x: head.x, y: head.y + 3 }];
+    state.arena.snakes[0].direction = 'Up';
+  }
+  state.arena.food = [{ x: 24, y: 20 }];
+  return frame;
+};
 
 const boostSnapshot = (streamSequence, tick = 5) => {
   const state = gameState(tick);
@@ -468,7 +508,7 @@ async function establishActiveGame(page, initialFrame = snapshot(10, 5)) {
   await emitServerMessage(page, oldSocketIndex, {
     Authenticated: {
       task_boot_id: 'old-task',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -520,7 +560,7 @@ async function establishAuthenticatedLobby(page) {
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
       task_boot_id: 'lobby-task',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 1,
     },
@@ -572,7 +612,7 @@ async function authenticateCandidate(page, candidateSocketIndex) {
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'new-task',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -603,6 +643,11 @@ test.beforeEach(async ({ page }) => {
         return nativeFetch(input, init);
       } else if (url.endsWith('/api/auth/me')) {
         payload = { id: 7, username: 'drain-tester', mmr: 1000, isGuest: false };
+      } else if (url.endsWith('/api/config')) {
+        payload = {
+          version: 1,
+          announcement: { enabled: false, message: '' },
+        };
       } else if (url.endsWith('/api/regions')) {
         payload = [{
           id: 'test-region',
@@ -614,6 +659,17 @@ test.beforeEach(async ({ page }) => {
         payload = { 'test-region': 1 };
       } else if (url === 'http://snaketron.test/api/health') {
         payload = { status: 'ok' };
+      } else if (url.includes('/api/leaderboard/me?') && window.__ratingFixture) {
+        const fixture = window.__ratingFixture;
+        fixture.requests.push(url);
+        if (fixture.requests.length === 1) {
+          payload = fixture.before;
+        } else {
+          while (!fixture.release) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          payload = fixture.after;
+        }
       } else {
         throw new Error(`Unexpected fetch in planned-drain test: ${url} (${init?.method || 'GET'})`);
       }
@@ -891,6 +947,37 @@ test('an identity acquired on an open anonymous socket still gets a handshake de
   ).toEqual([{ code: 4013, reason: 'authentication timed out' }]);
 });
 
+test('a returning player is auto-readied without mounting the briefing', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      'snaketron:tutorial-seen:v1',
+      JSON.stringify({ 'duel:casual': true }),
+    );
+
+    window.__briefingMountCount = 0;
+    const briefingSelector = '[data-testid="tutorial-modal"][data-variant="briefing"]';
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          if (node.matches(briefingSelector)) {
+            window.__briefingMountCount += 1;
+          }
+          window.__briefingMountCount += node.querySelectorAll(briefingSelector).length;
+        }
+      }
+    }).observe(document, { childList: true, subtree: true });
+  });
+
+  const initialTutorialFrame = tutorialSnapshot();
+  initialTutorialFrame.GameEvent.event.Snapshot.game_state.readiness.ready_user_ids = [8];
+  const socketIndex = await establishActiveGame(page, initialTutorialFrame);
+
+  await expect.poll(() => socketMessages(page, socketIndex, 'PlayerReady')).toHaveLength(1);
+  await expect(page.getByTestId('tutorial-modal')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__briefingMountCount)).toBe(0);
+});
+
 test('the pre-match guide reveals one animated real-arena step at a time', async ({ page }) => {
   await page.addInitScript(() => {
     window.__tutorialScoreReadouts = [];
@@ -954,7 +1041,7 @@ test('the pre-match guide reveals one animated real-arena step at a time', async
   await readyButton.focus();
   await expect.poll(() => modal.getAttribute('data-step'), { timeout: 6_500 }).toBe('2');
   await expect(readyButton).toBeFocused();
-  await expect(modal).toContainText('Collect NOS, then hold Space to boost.');
+  await expect(modal).toContainText('Collect fuel, then hold Space to boost.');
   await expect(canvas).toHaveAttribute('data-scene', 'team-boost');
 
   await page.keyboard.press('Escape');
@@ -1373,7 +1460,7 @@ test('a command with an ambiguous crash send is retried once with its stable ide
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-after-crash',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -1462,6 +1549,82 @@ test('Boost HUD touch control starts and stops the local snake Boost', async ({ 
   const commands = (await socketMessages(page, socketIndex, 'GameCommandV2'))
     .map((message) => message.GameCommandV2.command.command);
   expect(commands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+  ]);
+});
+
+test('mobile Hold recovers after a swallowed release and releases outside the button', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.addInitScript(() => {
+    sessionStorage.setItem('snaketron:forced-input-surface', 'touch');
+  });
+  const socketIndex = await establishActiveGame(page);
+  await emitServerMessage(page, socketIndex, boostSnapshot(11, 6));
+
+  const logicalBoostCommands = async () => {
+    const deliveries = await socketMessages(page, socketIndex, 'GameCommandV2');
+    return [...new Map(deliveries.map((message) => {
+      const envelope = message.GameCommandV2;
+      return [envelope.command_id.sequence, envelope.command.command];
+    })).values()];
+  };
+  const boostButton = page.getByTestId('touch-boost-button');
+  await expect(boostButton).toBeVisible();
+  await expect(boostButton).toBeEnabled();
+
+  await boostButton.dispatchEvent('pointerdown', {
+    pointerId: 11,
+    pointerType: 'touch',
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    bubbles: true,
+    cancelable: true,
+  });
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+  ]);
+
+  // Mobile can background the page without delivering this button's pointerup.
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+  ]);
+
+  // The stale pointer id from the interrupted gesture must not poison Hold.
+  await boostButton.dispatchEvent('pointerdown', {
+    pointerId: 12,
+    pointerType: 'touch',
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    bubbles: true,
+    cancelable: true,
+  });
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
+    { ActivateBoost: { snake_id: 0 } },
+  ]);
+
+  // Capture may be unavailable in an embed; a window-level release is the
+  // fallback when the finger ends outside the physical button.
+  await page.evaluate(() => {
+    window.dispatchEvent(new PointerEvent('pointerup', {
+      pointerId: 12,
+      pointerType: 'touch',
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  await expect.poll(logicalBoostCommands).toEqual([
+    { ActivateBoost: { snake_id: 0 } },
+    { DeactivateBoost: { snake_id: 0 } },
     { ActivateBoost: { snake_id: 0 } },
     { DeactivateBoost: { snake_id: 0 } },
   ]);
@@ -1927,6 +2090,212 @@ test('Boost fuel instrument keeps the Snaketron hierarchy across charge states',
   }
 });
 
+test('Combo callout stays hidden while priming, then drains and re-pops', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
+  const callout = page.getByTestId('combo-callout');
+  const burst = page.getByTestId('combo-callout-burst');
+  const meter = page.getByTestId('combo-callout-meter');
+  const meterFill = page.getByTestId('combo-callout-meter-fill');
+  const announcement = page.getByTestId('combo-callout-announcement');
+  const readMeterGeometry = () => meter.evaluate((track) => {
+    const fill = track.querySelector('[data-testid="combo-callout-meter-fill"]');
+    if (!fill) throw new Error('Combo meter fill is missing');
+    const trackRect = track.getBoundingClientRect();
+    const fillRect = fill.getBoundingClientRect();
+    return {
+      modelRatio: Number(fill.getAttribute('data-fill-ratio')),
+      renderedRatio: fillRect.width / trackRect.width,
+      leftDelta: Math.abs(fillRect.left - trackRect.left),
+      rightGap: trackRect.right - fillRect.right,
+      trackWidth: trackRect.width,
+    };
+  });
+
+  await expect(callout).toHaveCount(1);
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(meter).toHaveCount(0);
+  await expect(meterFill).toHaveCount(0);
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(11, 6, 1, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(meter).toHaveCount(0);
+  await expect(announcement).toHaveText('');
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(12, 7, 2, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(callout).toHaveAttribute('data-active', 'true');
+  await expect(burst).toHaveText(/\+2\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:2');
+  await expect(announcement).toHaveText('Combo active; next food is worth 2 points');
+  await expect(meter).toBeVisible();
+  await expect(meterFill).toHaveCSS('transform-origin', /^0px /);
+  const fullMeter = await readMeterGeometry();
+  expect(fullMeter.modelRatio).toBeGreaterThan(0);
+  expect(Math.abs(fullMeter.renderedRatio - fullMeter.modelRatio)).toBeLessThan(0.03);
+  expect(fullMeter.leftDelta).toBeLessThanOrEqual(1);
+  const buildingBurst = await burst.elementHandle();
+  if (!buildingBurst) throw new Error('building Combo burst is missing');
+
+  // Drive the authoritative timer directly instead of sleeping against the
+  // production one-second window. The right edge retreats while the left edge
+  // stays anchored, making this deterministic even on a busy CI runner.
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(13, 8, 2, COMBO_CALLOUT_TEST_WINDOW_MS / 2),
+  );
+  await expect.poll(async () => {
+    const current = await readMeterGeometry();
+    return current.modelRatio < fullMeter.modelRatio - 0.25
+      && Math.abs(current.renderedRatio - current.modelRatio) < 0.03
+      && current.leftDelta <= 1
+      && current.rightGap > current.trackWidth * 0.2;
+  }).toBe(true);
+
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(14, 9, 3, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(burst).toHaveText(/\+3\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:3');
+  await expect(burst).toHaveClass(/is-maxed/);
+  await expect(announcement).toHaveText(
+    'Combo active; next food is worth 3 points, maximum value',
+  );
+  expect(await buildingBurst.evaluate((element) => element.isConnected)).toBe(false);
+  const firstMaxBurst = await burst.elementHandle();
+  if (!firstMaxBurst) throw new Error('first max Combo burst is missing');
+
+  // The displayed value is already capped, but a later pickup still gets a
+  // fresh keyed burst instead of leaving the previous animation untouched.
+  await emitServerMessage(
+    page,
+    socketIndex,
+    comboSnapshot(15, 10, 4, COMBO_CALLOUT_TEST_WINDOW_MS),
+  );
+  await expect(burst).toHaveText(/\+3\s*Combo!/i);
+  await expect(burst).toHaveAttribute('data-animation-key', '42:4');
+  expect(await firstMaxBurst.evaluate((element) => element.isConnected)).toBe(false);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(meter).toBeHidden();
+
+  await emitServerMessage(page, socketIndex, comboSnapshot(16, 11, 0, 0));
+  await expect(callout).toHaveAttribute('data-active', 'false');
+  await expect(burst).toHaveCount(0);
+  await expect(announcement).toHaveText('');
+});
+
+test('Combo callout fades out of the way of its own head, then returns', async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  const socketIndex = await establishActiveGame(page, comboSnapshot(10, 5, 0, 0));
+  const callout = page.getByTestId('combo-callout');
+  const burst = page.getByTestId('combo-callout-burst');
+
+  // Prediction keeps advancing the head between snapshots, so each poll
+  // re-parks it rather than measuring one frozen frame. That also proves the
+  // fade tracks the head continuously instead of latching once.
+  let streamSequence = 10;
+  let tick = 5;
+  const opacityWithHeadAt = async (head) => {
+    streamSequence += 1;
+    tick += 1;
+    await emitServerMessage(
+      page,
+      socketIndex,
+      comboSnapshot(streamSequence, tick, 2, COMBO_CALLOUT_TEST_WINDOW_MS, head),
+    );
+    await expect(burst).toHaveCount(1);
+    return Number(await callout.evaluate((element) => (
+      window.getComputedStyle(element).opacity
+    )));
+  };
+
+  expect(await opacityWithHeadAt(COMBO_HEAD_MID_FIELD)).toBeGreaterThan(0.95);
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/combo-callout-clear.png`,
+      fullPage: true,
+    });
+  }
+
+  expect(await opacityWithHeadAt(COMBO_HEAD_BELOW_CALLOUT)).toBeGreaterThan(0.95);
+
+  await expect
+    .poll(() => opacityWithHeadAt(COMBO_HEAD_UNDER_CALLOUT))
+    .toBeLessThan(0.35);
+
+  if (process.env.SNAKETRON_VISUAL_DIR) {
+    await page.screenshot({
+      path: `${process.env.SNAKETRON_VISUAL_DIR}/combo-callout-dimmed.png`,
+      fullPage: true,
+    });
+  }
+
+  await expect
+    .poll(() => opacityWithHeadAt(COMBO_HEAD_MID_FIELD))
+    .toBeGreaterThan(0.95);
+});
+
+test('competitive results settle on the persisted regional ranking and remain visible', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__ratingFixture = {
+      before: { rank: 18, mmr: 1000, wins: 4, losses: 2, winRate: 66.7 },
+      after: { rank: 14, mmr: 1025, wins: 5, losses: 2, winRate: 71.4 },
+      requests: [],
+      release: false,
+    };
+  });
+
+  const liveFrame = completedBoostSnapshot(10, 1200);
+  const liveState = liveFrame.GameEvent.event.Snapshot.game_state;
+  liveState.status = { Started: { server_id: 1 } };
+  liveState.queue_mode = 'Competitive';
+  liveState.properties.score_limit = 50;
+  const socketIndex = await establishActiveGame(page, liveFrame);
+
+  await expect.poll(() => page.evaluate(() => window.__ratingFixture.requests.length)).toBe(1);
+  const [baselineUrl] = await page.evaluate(() => window.__ratingFixture.requests);
+  const baselineParams = new URL(baselineUrl).searchParams;
+  expect(Object.fromEntries(baselineParams)).toEqual({
+    queue_mode: 'competitive',
+    game_type: 'duel',
+    region: 'test-region',
+  });
+
+  const finalFrame = completedBoostSnapshot(11, 1201);
+  const finalState = finalFrame.GameEvent.event.Snapshot.game_state;
+  finalState.start_ms = liveState.start_ms;
+  finalState.queue_mode = 'Competitive';
+  finalState.properties.score_limit = 50;
+  await emitServerMessage(page, socketIndex, finalFrame);
+
+  const scoreCard = page.getByTestId('game-over-card');
+  const rating = scoreCard.getByTestId('rating-reveal');
+  await expect(scoreCard).toBeVisible();
+  await expect(rating).toHaveAttribute('data-phase', 'pending');
+  await expect.poll(() => page.evaluate(() => window.__ratingFixture.requests.length)).toBe(2);
+
+  await page.evaluate(() => {
+    window.__ratingFixture.release = true;
+  });
+  await expect(rating).toHaveAttribute('data-phase', 'settled');
+  await expect(rating.getByTestId('rating-reveal-value')).toHaveText('1025');
+  await expect(rating.getByTestId('rating-reveal-delta')).toHaveText('+25');
+  await expect(rating).toBeVisible();
+});
+
 test('Snaketron game shell restores the original scoreboard language and free-floating roster', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 1200 });
   const liveFrame = completedBoostSnapshot(10, 1200);
@@ -2259,6 +2628,12 @@ test('Snaketron game shell restores the original scoreboard language and free-fl
   await emitServerMessage(page, socketIndex, finalFrame);
   const scoreCard = page.getByTestId('game-over-card');
   await expect(scoreCard).toBeVisible();
+  // Let completion effects flush: a Quickmatch result must never mount the
+  // competitive rating placeholder while its score card is open.
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  expect(await scoreCard.getByTestId('rating-reveal').count()).toBe(0);
   await expect(page.getByTestId('game-roster-band').getByRole('button')).toHaveCount(2);
   await expect(page.getByTestId('game-roster-band')
     .getByRole('button', { name: 'Score card' })).toHaveAttribute('aria-expanded', 'true');
@@ -3922,17 +4297,14 @@ test('window blur releases default Hold Boost once', async ({ page }) => {
   ]);
 });
 
-// A shipped build cannot update itself — an itch.io bundle has no
-// reload-to-upgrade path at all — so no protocol disagreement may ever strand
-// the player behind a screen they have no way to act on. Every one of these
-// mismatches has to degrade to a console warning and keep playing.
-test('a mismatched server protocol and missing capabilities still authenticate', async ({ page }) => {
+test('a mismatched server protocol is rejected before deterministic gameplay', async ({ page }) => {
   await page.goto('/');
   await expect.poll(() => page.evaluate(() => (
     window.__wsInstance ? window.__mockSockets.indexOf(window.__wsInstance) : -1
   ))).toBeGreaterThanOrEqual(0);
   const socketIndex = await page.evaluate(() => window.__mockSockets.indexOf(window.__wsInstance));
   await expect.poll(() => socketMessages(page, socketIndex, 'Authenticate')).toHaveLength(1);
+  const joinCountBefore = (await socketMessages(page, socketIndex, 'JoinLobby')).length;
 
   await emitServerMessage(page, socketIndex, {
     Authenticated: {
@@ -3943,34 +4315,31 @@ test('a mismatched server protocol and missing capabilities still authenticate',
     },
   });
 
-  // Reaching JoinLobby proves the handshake was accepted despite both mismatches.
-  await expect.poll(() => socketMessages(page, socketIndex, 'JoinLobby')).toHaveLength(2);
+  await expect.poll(() => page.evaluate(
+    (index) => window.__mockSockets[index].closeCalls,
+    socketIndex,
+  )).toEqual([{ code: 4008, reason: 'gameplay protocol mismatch' }]);
+  expect((await socketMessages(page, socketIndex, 'JoinLobby')).length).toBe(joinCountBefore);
   await expect(page.getByTestId('client-update-required')).toHaveCount(0);
-  expect(await page.evaluate((index) => window.__mockSockets[index].closeCalls, socketIndex))
-    .toEqual([]);
 });
 
-test('a legacy client-update denial no longer strands the player', async ({ page }) => {
+test('an update-required denial closes without reconnecting the incompatible client', async ({ page }) => {
   const socketIndex = await establishAuthenticatedLobby(page);
   const socketCount = await page.evaluate(() => window.__mockSockets.length);
 
   await emitServerMessage(page, socketIndex, {
-    AccessDenied: { reason: 'Client update required' },
+    AccessDenied: {
+      reason: `Gameplay update required: client protocol ${CURRENT_PROTOCOL_VERSION - 1}, server protocol ${CURRENT_PROTOCOL_VERSION}`,
+    },
   });
-  await page.waitForTimeout(250);
 
-  await expect(page.getByTestId('client-update-required')).toHaveCount(0);
-  expect(await page.evaluate((index) => ({
+  await expect.poll(() => page.evaluate((index) => ({
     connected: window.__wsContext?.isConnected,
-    activeSocketIndex: window.__wsInstance
-      ? window.__mockSockets.indexOf(window.__wsInstance)
-      : -1,
     closeCalls: window.__mockSockets[index].closeCalls,
     socketCount: window.__mockSockets.length,
   }), socketIndex)).toEqual({
-    connected: true,
-    activeSocketIndex: socketIndex,
-    closeCalls: [],
+    connected: false,
+    closeCalls: [{ code: 4008, reason: 'gameplay protocol mismatch' }],
     socketCount,
   });
 });
@@ -4033,7 +4402,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, replacementSocketIndex, {
     Authenticated: {
       task_boot_id: 'replacement-lobby-task',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },
@@ -4073,7 +4442,7 @@ test('an unacknowledged matchmaking admission replays only while restored state 
   await emitServerMessage(page, acknowledgedReplacementIndex, {
     Authenticated: {
       task_boot_id: 'acknowledged-replacement-task',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 3,
     },
@@ -4201,7 +4570,7 @@ test('planned lobby handoff replays only after the candidate restores authoritat
   await emitServerMessage(page, candidateSocketIndex, {
     Authenticated: {
       task_boot_id: 'planned-lobby-replacement',
-      protocol_version: 7,
+      protocol_version: CURRENT_PROTOCOL_VERSION,
       capabilities: REQUIRED_CAPABILITIES,
       socket_generation: 2,
     },

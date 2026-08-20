@@ -154,6 +154,11 @@ mod tests {
             revision: uuid::Uuid::new_v4(),
             ended_at_ms: 61_000,
             server_id: 7,
+            season: None,
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: state,
             effects,
         }

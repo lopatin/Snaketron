@@ -14,13 +14,14 @@ use crate::matchmaking_pool::MatchmakingPool;
 use crate::user_cache::UserCache;
 
 use super::jwt::JwtManager;
-use super::middleware::AuthUser;
+use super::middleware::{AuthUser, is_admin_user};
 
 #[derive(Clone)]
 pub struct AuthState {
     pub db: Arc<dyn Database>,
     pub jwt_manager: Arc<JwtManager>,
     pub user_cache: Option<UserCache>,
+    pub crazygames_verifier: Option<Arc<super::crazygames::CrazyGamesJwtVerifier>>,
     /// Optional so tests and any deployment without analytics construct this
     /// unchanged. Emitting is always non-blocking and drops under pressure, so
     /// an auth handler never waits on it.
@@ -85,6 +86,8 @@ pub struct UserInfo {
     pub mmr: i32,
     #[serde(rename = "isGuest")]
     pub is_guest: bool,
+    #[serde(rename = "isAdmin")]
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +125,8 @@ pub struct GuestUserInfo {
     pub mmr: i32,
     #[serde(rename = "isGuest")]
     pub is_guest: bool,
+    #[serde(rename = "isAdmin")]
+    pub is_admin: bool,
     #[serde(rename = "matchmakingPool")]
     pub matchmaking_pool: MatchmakingPool,
 }
@@ -334,11 +339,13 @@ pub async fn register(
         );
     }
 
+    let is_admin = is_admin_user(&user);
     let user_info = UserInfo {
         id: user.id,
         username: user.username,
         mmr: user.mmr,
         is_guest: false,
+        is_admin,
     };
 
     // Generate JWT token
@@ -386,11 +393,13 @@ pub async fn login(
         return Err(anyhow::anyhow!("Invalid username or password").into());
     }
 
+    let is_admin = is_admin_user(&user);
     let user_info = UserInfo {
         id: user.id,
         username: user.username,
         mmr: user.mmr,
         is_guest: false,
+        is_admin,
     };
 
     // Generate JWT token
@@ -444,11 +453,13 @@ pub async fn get_current_user(
         return Err(anyhow::anyhow!("Invalid or expired guest session").into());
     }
 
+    let is_admin = is_admin_user(&user);
     let user_info = UserInfo {
         id: user.id,
         username: user.username,
         mmr: user.mmr,
         is_guest: user.is_guest,
+        is_admin,
     };
 
     // Build response with cache-control headers to prevent caching
@@ -538,6 +549,7 @@ pub async fn create_guest(
         username: user.username.clone(),
         mmr: user.mmr,
         is_guest: true,
+        is_admin: false,
         matchmaking_pool,
     };
 

@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use common::{
-    BoostConfig, GAME_START_COUNTDOWN_MS, GameState, GameType, MATCH_READY_WINDOW_MS,
-    boost_config_for,
-};
+use common::{BoostConfig, GAME_START_COUNTDOWN_MS, GameState, GameType, boost_config_for};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -22,6 +19,7 @@ use crate::matchmaking_manager::{
     MatchmakingManager, QueuedPlayer,
 };
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::player_idle::PlayerIdleConfig;
 
 // --- Configuration Constants ---
 /// Anchors `GameState::start_ms`, which is the match's durable runtime
@@ -1094,16 +1092,7 @@ async fn create_lobby_matches(
         // 0s: 100 MMR
         // 10s: 300 MMR
         // 30s+: unlimited (9999)
-        let max_mmr_diff = if wait_seconds < 10.0 {
-            // Linear interpolation from 100 to 300 over 0-10 seconds
-            100.0 + (wait_seconds / 10.0) * 200.0
-        } else if wait_seconds < 30.0 {
-            // Linear interpolation from 300 to 900 over 10-30 seconds
-            300.0 + ((wait_seconds - 10.0) / 20.0) * 600.0
-        } else {
-            // After 30 seconds, match with anyone
-            9999.0
-        };
+        let max_mmr_diff = calculate_max_mmr_diff(wait_seconds);
 
         // Store the max acceptable MMR difference in the lobby (we'll use this for filtering)
         // For now, we don't modify the lobby's MMR, we'll filter during matching
@@ -1262,6 +1251,39 @@ async fn create_lobby_matches(
 }
 
 /// Allocate an ID and construct all match data without mutating Valkey.
+/// Record a player's chosen skin on the match, after checking it is real.
+///
+/// The choice lives on the player's account, so it is read here rather than
+/// trusted from the client. Anything the catalogue does not recognise — an
+/// old id, a skin from a newer build, a hand-edited value — becomes the
+/// classic look. Cosmetics never block a join, and a lookup failure is not
+/// worth failing a match over either: the player simply appears in the
+/// default skin.
+async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_id: u32) {
+    let requested = match db.get_user_by_id(user_id as i32).await {
+        Ok(Some(user)) => user.selected_skin,
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(
+                user_id,
+                %error,
+                "could not read a player's skin; using the default"
+            );
+            None
+        }
+    };
+
+    let resolved = crate::skin_catalog::resolve_skin_ref(requested.as_deref());
+    if requested.is_some() && !crate::skin_catalog::is_known(requested.as_deref().unwrap_or("")) {
+        tracing::info!(
+            user_id,
+            requested = requested.as_deref().unwrap_or(""),
+            "unknown skin requested; falling back to the default"
+        );
+    }
+    game_state.set_player_skin(user_id, Some(resolved.to_string()));
+}
+
 async fn prepare_game_from_lobbies(
     matchmaking_manager: &mut MatchmakingManager,
     game_type: &GameType,
@@ -1304,6 +1326,7 @@ async fn prepare_game_from_lobbies(
         rng_seed,
         start_ms,
         matchmaking_manager.boost_config(),
+        matchmaking_manager.player_idle_config(),
     )?;
     game_state.is_stress_test = matchmaking_pool == MatchmakingPool::Stress;
 
@@ -1342,6 +1365,7 @@ async fn prepare_game_from_lobbies(
                         Some(member.username.clone()),
                         Some(assignment.team_id),
                     )?;
+                    apply_player_skin(&mut game_state, db, member.user_id).await;
 
                     all_players.push(QueuedPlayer {
                         user_id: member.user_id,
@@ -1388,6 +1412,7 @@ async fn prepare_game_from_lobbies(
                 }
 
                 game_state.add_player(member.user_id, Some(member.username.clone()))?;
+                apply_player_skin(&mut game_state, db, member.user_id).await;
 
                 all_players.push(QueuedPlayer {
                     user_id: member.user_id,
@@ -1408,7 +1433,11 @@ async fn prepare_game_from_lobbies(
     // confirm, and making every stress match idle out the readiness window
     // would measure the gate rather than the runtime.
     if !game_state.is_stress_test {
-        game_state.arm_readiness_gate(Utc::now().timestamp_millis() + MATCH_READY_WINDOW_MS);
+        let ready_deadline_ms = Utc::now()
+            .timestamp_millis()
+            .checked_add(matchmaking_manager.match_ready_window_ms())
+            .context("match readiness deadline overflowed i64")?;
+        game_state.arm_readiness_gate(ready_deadline_ms);
     }
 
     let mut lobby_codes: Vec<String> = combination
@@ -1448,8 +1477,9 @@ fn build_match_game_state(
     rng_seed: Option<u64>,
     start_ms: i64,
     boost_config: &BoostConfig,
+    player_idle_config: PlayerIdleConfig,
 ) -> Result<GameState> {
-    if let Some(mut mode_config) = boost_config_for(&game_type, width, height) {
+    let mut state = if let Some(mut mode_config) = boost_config_for(&game_type, width, height) {
         // Startup configuration owns balance. The mode owns its fuel model and
         // layout: FFA uses the canonical field pads while Solo is unlimited
         // and has no pads. Copying only balance fields prevents a team-shaped
@@ -1467,12 +1497,17 @@ fn build_match_game_state(
             rng_seed,
             start_ms,
             mode_config,
-        )
+        )?
     } else {
-        Ok(GameState::new(
-            width, height, game_type, queue_mode, rng_seed, start_ms,
-        ))
-    }
+        GameState::new(width, height, game_type, queue_mode, rng_seed, start_ms)
+    };
+
+    state.properties.player_idle_timeout_ms = player_idle_config.total_timeout_ms();
+    state.properties.player_idle_warning_ms = player_idle_config.kick_countdown_ms();
+    state
+        .validate_boost_invariants()
+        .context("Configured match state failed validation")?;
+    Ok(state)
 }
 
 async fn create_game_from_lobbies(
@@ -1549,6 +1584,9 @@ mod tests {
                     user_id: *user_id,
                     username: format!("player_{user_id}"),
                     ts: queued_at as f64,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 })
                 .collect(),
             avg_mmr: 1000,
@@ -1557,7 +1595,43 @@ mod tests {
             queued_at,
             requesting_user_id: user_ids[0],
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         }
+    }
+
+    #[test]
+    fn competitive_mmr_expansion_keeps_the_production_boundaries() {
+        assert_eq!(calculate_max_mmr_diff(0.0), 100.0);
+        assert_eq!(calculate_max_mmr_diff(5.0), 200.0);
+        assert!(calculate_max_mmr_diff(9.999) < 300.0);
+        assert_eq!(calculate_max_mmr_diff(10.0), 300.0);
+        assert_eq!(calculate_max_mmr_diff(20.0), 600.0);
+        assert!(calculate_max_mmr_diff(29.999) < 900.0);
+        assert_eq!(calculate_max_mmr_diff(30.0), 9999.0);
+        assert_eq!(calculate_max_mmr_diff(300.0), 9999.0);
+    }
+
+    #[test]
+    fn competitive_mmr_expansion_requires_both_lobbies_to_reach_the_boundary() {
+        const NOW_MS: i64 = 100_000;
+        let mut silver = ffa_lobby("silver", &[1], NOW_MS - 10_000);
+        silver.avg_mmr = 600;
+        silver.queue_mode = QueueMode::Competitive;
+        let mut gold = ffa_lobby("gold", &[2], NOW_MS - 9_999);
+        gold.avg_mmr = 900;
+        gold.queue_mode = QueueMode::Competitive;
+
+        assert!(!are_lobbies_compatible(&silver, &gold, NOW_MS));
+        gold.queued_at = NOW_MS - 10_000;
+        assert!(are_lobbies_compatible(&silver, &gold, NOW_MS));
+
+        silver.avg_mmr = 300;
+        silver.queued_at = NOW_MS - 30_000;
+        gold.avg_mmr = 2_000;
+        gold.queued_at = NOW_MS - 29_999;
+        assert!(!are_lobbies_compatible(&silver, &gold, NOW_MS));
+        gold.queued_at = NOW_MS - 30_000;
+        assert!(are_lobbies_compatible(&silver, &gold, NOW_MS));
     }
 
     fn random_game_id_base() -> u32 {
@@ -1596,6 +1670,7 @@ mod tests {
             speed_milli: 1_750,
             ..BoostConfig::default()
         };
+        let player_idle_config = PlayerIdleConfig::default();
 
         let cases = [
             (60, 40, GameType::TeamMatch { per_team: 1 }, 2, 3, false),
@@ -1613,6 +1688,7 @@ mod tests {
                     Some(7),
                     123,
                     &boost_config,
+                    player_idle_config,
                 )?;
                 for user_id in 1..=player_count {
                     state.add_player(user_id, None)?;
@@ -1648,6 +1724,59 @@ mod tests {
                 state.validate_boost_invariants()?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn default_player_idle_policy_warns_at_ten_seconds_and_kicks_at_twenty() -> Result<()> {
+        let state = build_match_game_state(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            123,
+            &BoostConfig::default(),
+            PlayerIdleConfig::default(),
+        )?;
+
+        assert_eq!(state.properties.player_idle_timeout_ms, 20_000);
+        assert_eq!(state.properties.player_idle_warning_ms, 10_000);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_player_idle_policy_is_snapshotted_into_every_match_branch() -> Result<()> {
+        let player_idle_config = PlayerIdleConfig::new(12_345, 6_789)?;
+        let cases = [
+            (60, 40, GameType::TeamMatch { per_team: 1 }),
+            (40, 40, GameType::FreeForAll { max_players: 4 }),
+            (40, 40, GameType::Solo),
+            (
+                40,
+                40,
+                GameType::Custom {
+                    settings: common::CustomGameSettings::default(),
+                },
+            ),
+        ];
+
+        for (width, height, game_type) in cases {
+            let state = build_match_game_state(
+                width,
+                height,
+                game_type,
+                QueueMode::Quickmatch,
+                Some(7),
+                123,
+                &BoostConfig::default(),
+                player_idle_config,
+            )?;
+
+            assert_eq!(state.properties.player_idle_timeout_ms, 19_134);
+            assert_eq!(state.properties.player_idle_warning_ms, 6_789);
+        }
+
         Ok(())
     }
 
@@ -1954,6 +2083,9 @@ mod tests {
                 user_id: 5,
                 username: "solo_player".to_string(),
                 ts: 100.0,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: None,
             }],
             avg_mmr: 1000,
             game_types: vec![GameType::Solo],
@@ -1961,6 +2093,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 5,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::Solo)
@@ -1982,11 +2115,17 @@ mod tests {
                     user_id: 10,
                     username: "player_one".to_string(),
                     ts: 123.0,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 },
                 LobbyMember {
                     user_id: 11,
                     username: "player_two".to_string(),
                     ts: 124.0,
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 },
             ],
             avg_mmr: 1200,
@@ -1995,6 +2134,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 10,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 1 })
@@ -2029,6 +2169,9 @@ mod tests {
                     user_id,
                     username: format!("player_{user_id}"),
                     ts: f64::from(user_id),
+                    supports_ad_break: true,
+                    can_show_video_ad: false,
+                    distribution: None,
                 })
                 .collect(),
             avg_mmr: 1200,
@@ -2037,6 +2180,7 @@ mod tests {
             queued_at: 0,
             requesting_user_id: 20,
             matchmaking_pool: MatchmakingPool::Public,
+            queue_identity_json: None,
         };
 
         let combo = find_best_lobby_combination(&[lobby], &GameType::TeamMatch { per_team: 2 })

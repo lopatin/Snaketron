@@ -69,11 +69,11 @@ async fn wait_for_player_ready(
     .await?
 }
 
-/// Watch the event stream for `seconds` and report the highest tick observed.
+/// Watch the event stream for `duration` and report the highest tick observed.
 /// A gated match must produce none.
-async fn observe_highest_tick(client: &mut TestClient, seconds: u64) -> Result<u32> {
+async fn observe_highest_tick(client: &mut TestClient, duration: Duration) -> Result<u32> {
     let mut highest = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let deadline = tokio::time::Instant::now() + duration;
     while tokio::time::Instant::now() < deadline {
         match timeout(Duration::from_millis(400), client.receive_message()).await {
             Ok(Ok(WSMessage::GameEvent(event))) => {
@@ -90,6 +90,25 @@ async fn observe_highest_tick(client: &mut TestClient, seconds: u64) -> Result<u
     Ok(highest)
 }
 
+/// Return as soon as the released match produces its first simulated tick.
+/// The timeout remains a failure bound rather than an unconditional sleep.
+async fn wait_for_positive_tick(client: &mut TestClient, seconds: u64) -> Result<u32> {
+    timeout(Duration::from_secs(seconds), async {
+        loop {
+            if let WSMessage::GameEvent(event) = client.receive_message().await? {
+                let mut highest = event.tick;
+                if let GameEvent::Snapshot { game_state } = &event.event {
+                    highest = highest.max(game_state.tick);
+                }
+                if highest > 0 {
+                    return Ok::<u32, anyhow::Error>(highest);
+                }
+            }
+        }
+    })
+    .await?
+}
+
 struct MatchedDuel {
     env: TestEnvironment,
     client1: TestClient,
@@ -98,7 +117,7 @@ struct MatchedDuel {
     user1: u32,
 }
 
-async fn matched_duel(test_name: &str) -> Result<MatchedDuel> {
+async fn matched_duel(test_name: &str, match_ready_window_ms: i64) -> Result<MatchedDuel> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let redis_client = redis::Client::open("redis://localhost:6379/1")?;
@@ -106,7 +125,9 @@ async fn matched_duel(test_name: &str) -> Result<MatchedDuel> {
     let _: () = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut env = TestEnvironment::new(test_name).await?;
+    let mut env = TestEnvironment::new(test_name)
+        .await?
+        .with_match_ready_window_ms(match_ready_window_ms);
     env.add_server().await?;
     env.create_user().await?;
     env.create_user().await?;
@@ -160,7 +181,11 @@ async fn a_match_does_not_start_until_every_player_is_ready() -> Result<()> {
         game_id,
         user1,
         ..
-    } = matched_duel("readiness_gate_holds_the_match").await?;
+    } = matched_duel(
+        "readiness_gate_holds_the_match",
+        ::common::MATCH_READY_WINDOW_MS,
+    )
+    .await?;
 
     let first = wait_for_snapshot_where(&mut client1, "client1", 20, |_| true).await?;
     assert!(
@@ -174,12 +199,10 @@ async fn a_match_does_not_start_until_every_player_is_ready() -> Result<()> {
     assert_eq!(first.players_pending_ready().len(), 2);
     let _ = wait_for_snapshot_where(&mut client2, "client2", 20, |_| true).await?;
 
-    // Everything from here until the second confirmation has to fit inside the
-    // readiness deadline, or the gate resolves on its own and the assertions
-    // below stop meaning anything. The ungated countdown (start_ms + 3s) has
-    // already elapsed by the time the first snapshot arrives, so four seconds
-    // of silence is enough to prove the gate — not the clock — is holding it.
-    let highest_tick = observe_highest_tick(&mut client1, 4).await?;
+    // The pure engine test proves this invariant even with an arbitrarily old
+    // start_ms. Here a short live observation verifies that the WebSocket path
+    // also remains parked without spending seconds on a wall-clock assertion.
+    let highest_tick = observe_highest_tick(&mut client1, Duration::from_millis(500)).await?;
     assert_eq!(
         highest_tick, 0,
         "a match held by the readiness gate must not simulate a single tick"
@@ -192,7 +215,7 @@ async fn a_match_does_not_start_until_every_player_is_ready() -> Result<()> {
         .await?;
     wait_for_player_ready(&mut client1, "client1", user1, 10).await?;
 
-    let still_held = observe_highest_tick(&mut client1, 2).await?;
+    let still_held = observe_highest_tick(&mut client1, Duration::from_millis(500)).await?;
     assert_eq!(
         still_held, 0,
         "one player confirming must not release the gate"
@@ -215,7 +238,7 @@ async fn a_match_does_not_start_until_every_player_is_ready() -> Result<()> {
         "start_ms is the durable runtime game identity and must never move"
     );
 
-    let ticked = observe_highest_tick(&mut client2, 8).await?;
+    let ticked = wait_for_positive_tick(&mut client2, 8).await?;
     assert!(
         ticked > 0,
         "the match must simulate once everyone has confirmed"
@@ -237,7 +260,7 @@ async fn the_readiness_deadline_starts_the_match_without_a_silent_player() -> Re
         mut client2,
         game_id,
         ..
-    } = matched_duel("readiness_deadline_releases_the_match").await?;
+    } = matched_duel("readiness_deadline_releases_the_match", 10_000).await?;
 
     let gated = wait_for_snapshot_where(&mut client1, "client1", 20, |_| true).await?;
     assert!(gated.readiness.is_some());
@@ -248,8 +271,9 @@ async fn the_readiness_deadline_starts_the_match_without_a_silent_player() -> Re
         .send_message(WSMessage::PlayerReady { game_id })
         .await?;
 
-    // MATCH_READY_WINDOW_MS is 15s; allow the countdown plus slack on top.
-    let released = wait_for_snapshot_where(&mut client1, "client1", 30, |state| {
+    // This server arms the ordinary durable deadline with a test-only 10s
+    // window. Production still uses MATCH_READY_WINDOW_MS (15s).
+    let released = wait_for_snapshot_where(&mut client1, "client1", 20, |state| {
         state.readiness.is_none()
     })
     .await?;
@@ -258,7 +282,7 @@ async fn the_readiness_deadline_starts_the_match_without_a_silent_player() -> Re
         "the deadline must stamp an epoch even with a player still missing"
     );
 
-    let ticked = observe_highest_tick(&mut client1, 10).await?;
+    let ticked = wait_for_positive_tick(&mut client1, 8).await?;
     assert!(
         ticked > 0,
         "the match must start once the readiness deadline lapses"
@@ -282,7 +306,11 @@ async fn repeated_readiness_confirmations_are_idempotent() -> Result<()> {
         game_id,
         user1,
         ..
-    } = matched_duel("readiness_confirmations_are_idempotent").await?;
+    } = matched_duel(
+        "readiness_confirmations_are_idempotent",
+        ::common::MATCH_READY_WINDOW_MS,
+    )
+    .await?;
 
     let _ = wait_for_snapshot_where(&mut client1, "client1", 20, |_| true).await?;
     let _ = wait_for_snapshot_where(&mut client2, "client2", 20, |_| true).await?;
@@ -294,7 +322,7 @@ async fn repeated_readiness_confirmations_are_idempotent() -> Result<()> {
     }
     wait_for_player_ready(&mut client1, "client1", user1, 10).await?;
 
-    let still_held = observe_highest_tick(&mut client1, 3).await?;
+    let still_held = observe_highest_tick(&mut client1, Duration::from_millis(500)).await?;
     assert_eq!(
         still_held, 0,
         "five confirmations from one player must not stand in for the other"

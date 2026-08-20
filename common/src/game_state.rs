@@ -7,6 +7,7 @@ use crate::{
     DEFAULT_FOOD_TARGET, DEFAULT_PLAYER_IDLE_TIMEOUT_MS, DEFAULT_PLAYER_IDLE_WARNING_MS,
     DEFAULT_QUICKMATCH_TEAM_SCORE_LIMIT, DEFAULT_TICK_INTERVAL_MS, Direction,
     MAX_BOOST_SPEED_MILLI, NORMAL_SNAKE_SPEED_MILLI, Player, Position, Snake, SnakeBoost,
+    SnakeCombo,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,17 @@ mod sorted_hash_set {
 }
 
 const DEFAULT_SNAKE_LENGTH: usize = 4;
+
+/// Default time available to continue a combo after each food pickup.
+pub const DEFAULT_COMBO_WINDOW_MS: u32 = 1_000;
+/// Food values progress 1, 1, 2, 3 and remain capped at 3 for the chain.
+pub const DEFAULT_COMBO_MAX_FOOD_VALUE: u32 = 3;
+/// Semantic version of the authoritative combo scoring rules.
+pub const COMBO_RULES_VERSION: u16 = 1;
+/// Defensive upper bound for snapshotted tuning. The production default is
+/// one second; the larger ceiling permits experiments without accepting an
+/// effectively permanent meter from malformed state.
+const MAX_COMBO_WINDOW_MS: u32 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FoodAxisDistribution {
@@ -177,6 +189,12 @@ pub enum GameEvent {
     },
     SnakeDied {
         snake_id: u32,
+        /// The collision or scoring transition that ended this life. Older
+        /// durable snapshots/events predate attribution and deserialize as
+        /// `Unknown`; current authoritative simulation always emits a
+        /// concrete cause.
+        #[serde(default)]
+        cause: DeathCause,
     },
     /// Authoritative inactivity removal. This is one atomic replicated state
     /// transition so clients learn both why the player left and that their
@@ -191,6 +209,18 @@ pub enum GameEvent {
     FoodEaten {
         snake_id: u32,
         position: Position,
+        /// Exact score and physical growth awarded by this pickup.
+        #[serde(default = "default_food_eaten_points")]
+        points: u32,
+        /// One-based depth of this pickup in the current uninterrupted chain.
+        #[serde(default = "default_food_eaten_combo_chain")]
+        combo_chain: u32,
+        /// Meter value immediately before this pickup refilled it.
+        #[serde(default)]
+        combo_remaining_ms_before: u32,
+        /// Whether authoritative Boost was active at the instant of pickup.
+        #[serde(default)]
+        boost_active: bool,
     },
     BoostPacketCollected {
         pad_id: u8,
@@ -281,6 +311,38 @@ pub enum GameEvent {
     },
 }
 
+/// Deterministic attribution for a snake death. This records information the
+/// collision pass already knows; it does not change collision semantics.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub enum DeathCause {
+    /// Compatibility value for stored artifacts written before attribution
+    /// was added. New simulation never emits this variant.
+    #[default]
+    Unknown,
+    Wall,
+    OutOfBounds,
+    EnemyBase,
+    SelfCollision,
+    SnakeBody {
+        killer_snake_id: u32,
+    },
+    HeadToHead {
+        other_snake_id: u32,
+    },
+    /// Team-mode banking intentionally resets and respawns the scoring snake.
+    Banked,
+}
+
+fn default_food_eaten_points() -> u32 {
+    1
+}
+
+fn default_food_eaten_combo_chain() -> u32 {
+    1
+}
+
 /// A collision produced by simulation. Recent cues stay in `GameState` for a
 /// short, bounded window so a renderer cannot miss one when prediction catches
 /// up by several ticks in a single frame. Including the tick also lets a
@@ -292,6 +354,8 @@ pub struct SnakeCrash {
     pub tick: u32,
     pub snake_id: u32,
     pub position: Position,
+    #[serde(default)]
+    pub cause: DeathCause,
 }
 
 /// Keep cosmetic crash history slightly longer than the web animation. This
@@ -832,6 +896,62 @@ impl Arena {
     }
 }
 
+/// Combo balance snapshotted into every game so simulation, prediction, and
+/// replay never depend on mutable process configuration.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct ComboConfig {
+    /// Authoritative time restored after every successful food pickup.
+    pub window_ms: u32,
+    /// Highest point/growth value a pickup may reach within one chain.
+    pub max_food_value: u32,
+    /// Selects the semantic interpretation of the fields above.
+    pub rules_version: u16,
+}
+
+impl Default for ComboConfig {
+    fn default() -> Self {
+        Self {
+            window_ms: DEFAULT_COMBO_WINDOW_MS,
+            max_food_value: DEFAULT_COMBO_MAX_FOOD_VALUE,
+            rules_version: COMBO_RULES_VERSION,
+        }
+    }
+}
+
+impl ComboConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.window_ms == 0 || self.window_ms > MAX_COMBO_WINDOW_MS {
+            return Err(anyhow::anyhow!(
+                "Combo window_ms must be in 1..={MAX_COMBO_WINDOW_MS}, got {}",
+                self.window_ms
+            ));
+        }
+        if !(1..=DEFAULT_COMBO_MAX_FOOD_VALUE).contains(&self.max_food_value) {
+            return Err(anyhow::anyhow!(
+                "Combo max_food_value must be in 1..={DEFAULT_COMBO_MAX_FOOD_VALUE}, got {}",
+                self.max_food_value
+            ));
+        }
+        if self.rules_version != COMBO_RULES_VERSION {
+            return Err(anyhow::anyhow!(
+                "unsupported Combo rules version {}, expected {}",
+                self.rules_version,
+                COMBO_RULES_VERSION
+            ));
+        }
+        Ok(())
+    }
+
+    fn food_value_for_chain(&self, chain_count: u32) -> u32 {
+        chain_count
+            .saturating_sub(1)
+            .max(1)
+            .min(self.max_food_value.max(1))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
@@ -847,6 +967,10 @@ pub struct GameProperties {
     pub score_limit: Option<u32>,
     #[serde(default)]
     pub boost: Option<BoostConfig>,
+    /// Combo is universal. A missing historical field receives today's
+    /// default; old per-snake state separately defaults to an inactive meter.
+    #[serde(default)]
+    pub combo: ComboConfig,
     /// Match inactivity policy, snapshotted with the game so every executor
     /// and client resolves the same deadline even across failover.
     #[serde(default = "default_player_idle_timeout_ms")]
@@ -1159,6 +1283,16 @@ pub struct GameState {
     pub recent_crashes: Vec<SnakeCrash>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_goals: Vec<TeamGoal>,
+    /// Most recent death transition for each snake. Unlike `recent_crashes`,
+    /// this match-history field survives respawns and animation-cue expiry so
+    /// post-match presentation can explain what happened. Banking is retained
+    /// as `Banked` (and deliberately hidden by the UI) rather than exposing a
+    /// previous life as though it were the latest one.
+    ///
+    /// This is presentation history, not simulation state, and is therefore
+    /// intentionally excluded from `sync_hash`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_death_causes: HashMap<u32, DeathCause>,
     pub game_type: GameType,
     pub queue_mode: QueueMode,
     /// Server-attested synthetic game marker. Stress games exercise the full
@@ -1183,11 +1317,23 @@ pub struct GameState {
     pub event_sequence: u64,
     // Username mappings by user_id
     pub usernames: HashMap<u32, String>,
+    /// Which skin each player is wearing, by user_id.
+    ///
+    /// Purely cosmetic, and deliberately kept beside `usernames` rather than on
+    /// `Snake`: everything on a snake is fingerprinted, and a skin must never
+    /// be able to make two clients disagree about the game. Absent entries — and
+    /// every state written before skins existed — render as the classic look.
+    #[serde(default)]
+    pub skins: HashMap<u32, String>,
     // Spectators by user_id (do not have snakes/players)
     #[serde(serialize_with = "sorted_hash_set::serialize")]
     pub spectators: HashSet<u32>,
     // Score tracking - snake_id -> score
     pub scores: HashMap<u32, u32>,
+    /// Cumulative successful pellet pickups by snake. Unlike `scores`, this is
+    /// unweighted by combo value and is therefore the progression/XP basis.
+    #[serde(default)]
+    pub food_pickups: HashMap<u32, u32>,
     // Team scores for team games - team_id -> score
     #[cfg_attr(feature = "ts-gen", ts(type = "Record<number, number> | null"))]
     pub team_scores: Option<HashMap<TeamId, u32>>,
@@ -1362,6 +1508,7 @@ impl GameState {
             time_limit_ms,
             score_limit,
             boost,
+            combo: ComboConfig::default(),
             player_idle_timeout_ms: DEFAULT_PLAYER_IDLE_TIMEOUT_MS,
             player_idle_warning_ms: DEFAULT_PLAYER_IDLE_WARNING_MS,
         };
@@ -1413,6 +1560,7 @@ impl GameState {
             arena,
             recent_crashes: Vec::new(),
             recent_goals: Vec::new(),
+            last_death_causes: HashMap::new(),
             game_type: game_type.clone(),
             queue_mode,
             is_stress_test: false,
@@ -1425,8 +1573,10 @@ impl GameState {
             start_ms,
             event_sequence: 0,
             usernames: HashMap::new(),
+            skins: HashMap::new(),
             spectators: HashSet::new(),
             scores: HashMap::new(),
+            food_pickups: HashMap::new(),
             team_scores,
 
             player_xp: HashMap::new(),
@@ -1585,6 +1735,7 @@ impl GameState {
                     snake.speed_milli() == NORMAL_SNAKE_SPEED_MILLI
                         && snake.movement_credit() == 0
                         && snake.boost() == &SnakeBoost::default()
+                        && snake.combo == SnakeCombo::default()
                 });
         }
 
@@ -1622,6 +1773,58 @@ impl GameState {
     /// creation, preventing malformed state from producing permanent speed or
     /// movement divergence.
     pub fn validate_boost_invariants(&self) -> Result<()> {
+        self.properties.combo.validate()?;
+        for (snake_id, snake) in self.arena.snakes.iter().enumerate() {
+            if snake.combo.remaining_ms > self.properties.combo.window_ms {
+                return Err(anyhow::anyhow!(
+                    "snake {snake_id} Combo remaining_ms exceeds the configured window"
+                ));
+            }
+            let inactive = snake.combo.remaining_ms == 0;
+            if inactive != (snake.combo.chain_count == 0) {
+                return Err(anyhow::anyhow!(
+                    "snake {snake_id} Combo chain and timer must be active or inactive together"
+                ));
+            }
+            if !snake.is_alive && snake.combo != SnakeCombo::default() {
+                return Err(anyhow::anyhow!(
+                    "dead snake {snake_id} must have an inactive Combo"
+                ));
+            }
+        }
+        for snake_id in self.food_pickups.keys() {
+            if *snake_id as usize >= self.arena.snakes.len() {
+                return Err(anyhow::anyhow!(
+                    "food pickup count references missing snake {snake_id}"
+                ));
+            }
+        }
+        for (snake_id, cause) in &self.last_death_causes {
+            if *snake_id as usize >= self.arena.snakes.len() {
+                return Err(anyhow::anyhow!(
+                    "last death cause references missing snake {snake_id}"
+                ));
+            }
+            let attributed_snake_id = match cause {
+                DeathCause::SnakeBody { killer_snake_id } => Some(*killer_snake_id),
+                DeathCause::HeadToHead { other_snake_id } => Some(*other_snake_id),
+                DeathCause::Unknown
+                | DeathCause::Wall
+                | DeathCause::OutOfBounds
+                | DeathCause::EnemyBase
+                | DeathCause::SelfCollision
+                | DeathCause::Banked => None,
+            };
+            if attributed_snake_id
+                .is_some_and(|attributed| attributed as usize >= self.arena.snakes.len())
+            {
+                return Err(anyhow::anyhow!(
+                    "last death cause for snake {snake_id} references missing attributed snake {}",
+                    attributed_snake_id.unwrap()
+                ));
+            }
+        }
+
         // A mode is Boost-eligible only on a map that can host its layout, so
         // this asks exactly the question construction answered. Custom games
         // are player-defined and never carry Boost.
@@ -1926,11 +2129,72 @@ impl GameState {
         match event {
             GameEvent::Snapshot { game_state } => game_state.validate_boost_invariants(),
             GameEvent::SnakeTurned { snake_id, .. }
-            | GameEvent::SnakeDied { snake_id }
-            | GameEvent::FoodEaten { snake_id, .. }
             | GameEvent::ScoreUpdated { snake_id, .. }
             | GameEvent::SnakeRespawned { snake_id, .. } => {
                 require_snake(*snake_id)?;
+                Ok(())
+            }
+            GameEvent::SnakeDied { snake_id, cause } => {
+                require_snake(*snake_id)?;
+                match cause {
+                    DeathCause::SnakeBody { killer_snake_id } => {
+                        require_snake(*killer_snake_id)?;
+                    }
+                    DeathCause::HeadToHead { other_snake_id } => {
+                        require_snake(*other_snake_id)?;
+                    }
+                    DeathCause::Unknown
+                    | DeathCause::Wall
+                    | DeathCause::OutOfBounds
+                    | DeathCause::EnemyBase
+                    | DeathCause::SelfCollision
+                    | DeathCause::Banked => {}
+                }
+                Ok(())
+            }
+            GameEvent::FoodEaten {
+                snake_id,
+                position,
+                points,
+                combo_chain,
+                combo_remaining_ms_before,
+                boost_active,
+            } => {
+                let snake = require_snake(*snake_id)?;
+                if !self.combo_event_fields_are_bounded(
+                    *points,
+                    *combo_chain,
+                    *combo_remaining_ms_before,
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "food event has invalid Combo award/context fields"
+                    ));
+                }
+
+                // A predicted client may already have consumed this pellet;
+                // `apply_event` is deliberately idempotent in that case. When
+                // it is still present, however, every telemetry field must
+                // describe this exact pre-pickup state.
+                if self.has_food(position) {
+                    if !snake.is_alive || snake.head().ok() != Some(position) {
+                        return Err(anyhow::anyhow!(
+                            "food event snake {snake_id} is not alive on the pellet"
+                        ));
+                    }
+                    let expected = self.combo_pickup_context(snake);
+                    if expected
+                        != (
+                            *points,
+                            *combo_chain,
+                            *combo_remaining_ms_before,
+                            *boost_active,
+                        )
+                    {
+                        return Err(anyhow::anyhow!(
+                            "food event Combo telemetry does not match authoritative pre-pickup state"
+                        ));
+                    }
+                }
                 Ok(())
             }
             GameEvent::PlayerIdleKicked { user_id, snake_id } => {
@@ -2127,12 +2391,41 @@ impl GameState {
     }
 
     fn remove_food(&mut self, position: &Position) -> bool {
-        if let Some(index) = self.arena.food.iter().position(|p| p == position) {
-            self.arena.food.remove(index);
-            true
+        // A position denotes one pellet even if malformed historical state
+        // contains duplicate Vec entries. Removing every duplicate prevents
+        // that logical pellet from being awarded again on a later quantum.
+        let before = self.arena.food.len();
+        self.arena.food.retain(|candidate| candidate != position);
+        self.arena.food.len() != before
+    }
+
+    fn combo_pickup_context(&self, snake: &Snake) -> (u32, u32, u32, bool) {
+        let combo_remaining_ms_before = snake.combo.remaining_ms;
+        let combo_chain = if combo_remaining_ms_before == 0 {
+            1
         } else {
-            false
-        }
+            snake.combo.chain_count.saturating_add(1).max(1)
+        };
+        let points = self.properties.combo.food_value_for_chain(combo_chain);
+        (
+            points,
+            combo_chain,
+            combo_remaining_ms_before,
+            snake.boost().active,
+        )
+    }
+
+    fn combo_event_fields_are_bounded(
+        &self,
+        points: u32,
+        combo_chain: u32,
+        combo_remaining_ms_before: u32,
+    ) -> bool {
+        combo_chain > 0
+            && combo_remaining_ms_before <= self.properties.combo.window_ms
+            && ((combo_chain == 1 && combo_remaining_ms_before == 0)
+                || (combo_chain > 1 && combo_remaining_ms_before > 0))
+            && points == self.properties.combo.food_value_for_chain(combo_chain)
     }
 
     fn calculate_starting_positions(&self, player_count: usize) -> Vec<(Position, Direction)> {
@@ -2378,15 +2671,17 @@ impl GameState {
 
     /// Food this snake would bank if it reached its own base right now.
     ///
-    /// Each eaten food credits two segments (`GameEvent::FoodEaten`). Those
-    /// segments sit in `snake.food` until `step_forward` extrudes them past
-    /// the starting length, so counting both halves keeps the total stable
-    /// across the ticks a snake spends growing. This is the one definition
+    /// Each awarded combo point is one physical segment. New segments sit in
+    /// `snake.food` until `step_forward` extrudes them past the starting
+    /// length, so counting queued and extruded segments keeps the total stable
+    /// across every growth tick. This is the one definition
     /// behind team scoring, AI base-return decisions, and the carried-food
     /// readout the client renders on each snake.
     pub fn carried_food(&self, snake: &Snake) -> u32 {
         let extra_segments = snake.length().saturating_sub(self.starting_snake_length());
-        ((extra_segments + snake.food as usize) / 2) as u32
+        u32::try_from(extra_segments)
+            .unwrap_or(u32::MAX)
+            .saturating_add(snake.food)
     }
 
     fn respawn_event_for_snake(&self, snake_id: u32) -> Option<GameEvent> {
@@ -2473,6 +2768,7 @@ impl GameState {
                 charge_ms: self.unlimited_boost_capacity_ms().unwrap_or(0),
                 ..Default::default()
             },
+            combo: SnakeCombo::default(),
         };
 
         let snake_id = self.arena.add_snake(snake)?;
@@ -2489,6 +2785,23 @@ impl GameState {
 
     pub fn add_player(&mut self, user_id: u32, username: Option<String>) -> Result<Player> {
         self.add_player_with_team(user_id, username, None)
+    }
+
+    /// Record which skin a player is wearing.
+    ///
+    /// The caller is responsible for having checked the id against the
+    /// catalogue — this is cosmetic state, and an unknown id renders as the
+    /// classic look rather than failing, so the engine does not need to guard
+    /// it. Passing `None` clears any previous choice.
+    pub fn set_player_skin(&mut self, user_id: u32, skin_ref: Option<String>) {
+        match skin_ref {
+            Some(skin_ref) => {
+                self.skins.insert(user_id, skin_ref);
+            }
+            None => {
+                self.skins.remove(&user_id);
+            }
+        }
     }
 
     /// Arm the pre-match readiness gate. Called once at match creation, before
@@ -2718,7 +3031,11 @@ impl GameState {
                 if self.is_player_idle_kicked(*user_id) {
                     return (*user_id, 0);
                 }
-                let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
+                let pickups = self
+                    .food_pickups
+                    .get(&player.snake_id)
+                    .copied()
+                    .unwrap_or(0);
                 let player_team = self
                     .arena
                     .snakes
@@ -2730,7 +3047,7 @@ impl GameState {
                 });
                 (
                     *user_id,
-                    score.saturating_mul(10) + if won { 50 } else { 10 },
+                    pickups.saturating_mul(10) + if won { 50 } else { 10 },
                 )
             })
             .collect()
@@ -2845,6 +3162,14 @@ impl GameState {
         if self.resolve_player_inactivity(post_tick, &mut out) {
             self.tick = post_tick;
             return Ok(out);
+        }
+
+        // Drain before movement/collection so a pickup at this quantum's
+        // boundary sees the precise time that remained when it was reached.
+        // A pickup later below refills to the full configured window and that
+        // fresh meter is therefore not charged for the quantum that earned it.
+        for snake in &mut self.arena.snakes {
+            snake.drain_combo(tick_duration_ms);
         }
 
         for pad in &mut self.arena.boost_pads {
@@ -2969,7 +3294,7 @@ impl GameState {
         }
 
         // Check for collisions
-        let mut crashed_snakes: HashMap<u32, Position> = HashMap::new();
+        let mut crashed_snakes: HashMap<u32, (Position, DeathCause)> = HashMap::new();
         let width = self.arena.width as i16;
         let height = self.arena.height as i16;
         'main_snake_loop: for (snake_id, snake) in self.iter_snakes() {
@@ -2977,7 +3302,7 @@ impl GameState {
             if snake.is_alive && movers.contains(&snake_id) {
                 // Check for wall collisions in team games
                 if self.arena.is_wall_position(head) {
-                    crashed_snakes.insert(snake_id, *head);
+                    crashed_snakes.insert(snake_id, (*head, DeathCause::Wall));
                     continue 'main_snake_loop;
                 }
 
@@ -2985,13 +3310,13 @@ impl GameState {
                 if let Some(team_id) = snake.team_id
                     && self.arena.is_in_enemy_base(head, team_id)
                 {
-                    crashed_snakes.insert(snake_id, *head);
+                    crashed_snakes.insert(snake_id, (*head, DeathCause::EnemyBase));
                     continue 'main_snake_loop;
                 }
 
                 // If not within bounds
                 if !(head.x >= 0 && head.x < width && head.y >= 0 && head.y < height) {
-                    crashed_snakes.insert(snake_id, *head);
+                    crashed_snakes.insert(snake_id, (*head, DeathCause::OutOfBounds));
                     continue 'main_snake_loop;
                 }
 
@@ -2999,7 +3324,25 @@ impl GameState {
                 for (other_snake_id, other_snake) in self.iter_snakes() {
                     let is_self = snake_id == other_snake_id;
                     if other_snake.is_alive && other_snake.contains_point(head, is_self) {
-                        crashed_snakes.insert(snake_id, *head);
+                        let cause = if is_self {
+                            DeathCause::SelfCollision
+                        } else if other_snake.is_head(head)
+                            || (movers.contains(&other_snake_id)
+                                && old_snakes[snake_id as usize].head()? == other_snake.head()?
+                                && old_snakes[other_snake_id as usize].head()? == head)
+                        {
+                            // Equal destination cells and simultaneous head
+                            // swaps are both head-to-head collisions. The
+                            // latter appears as a body intersection after both
+                            // snakes move, so compare their pre-move heads to
+                            // avoid misattributing the trade as two body kills.
+                            DeathCause::HeadToHead { other_snake_id }
+                        } else {
+                            DeathCause::SnakeBody {
+                                killer_snake_id: other_snake_id,
+                            }
+                        };
+                        crashed_snakes.insert(snake_id, (*head, cause));
                         continue 'main_snake_loop;
                     }
                 }
@@ -3011,9 +3354,10 @@ impl GameState {
         // differs between processes (native server vs WASM client), and
         // respawn events consume RNG / emit events whose order must be
         // identical on both sides.
-        let mut crashed_snakes: Vec<(u32, Position)> = crashed_snakes.into_iter().collect();
+        let mut crashed_snakes: Vec<(u32, (Position, DeathCause))> =
+            crashed_snakes.into_iter().collect();
         crashed_snakes.sort_unstable_by_key(|(snake_id, _)| *snake_id);
-        for (snake_id, attempted_head) in crashed_snakes {
+        for (snake_id, (attempted_head, cause)) in crashed_snakes {
             self.arena.snakes[snake_id as usize] = old_snakes[snake_id as usize].clone();
             let crash_position = Position {
                 x: attempted_head.x.clamp(0, width.saturating_sub(1)),
@@ -3023,8 +3367,9 @@ impl GameState {
                 tick: self.tick.saturating_add(1),
                 snake_id,
                 position: crash_position,
+                cause: cause.clone(),
             });
-            self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
+            self.apply_event(GameEvent::SnakeDied { snake_id, cause }, Some(&mut out));
 
             if let GameType::TeamMatch { .. } = &self.game_type
                 && let Some(event) = self.respawn_event_for_snake(snake_id)
@@ -3035,17 +3380,36 @@ impl GameState {
 
         // Eat food
         let mut food_eaten_events: Vec<GameEvent> = Vec::new();
+        let mut claimed_food_positions: HashSet<Position> = HashSet::new();
         for (snake_id, snake) in self.iter_snakes() {
             let head = snake.head()?;
-            if snake.is_alive && self.arena.food.contains(head) {
+            if snake.is_alive
+                && self.arena.food.contains(head)
+                && claimed_food_positions.insert(*head)
+            {
+                let (points, combo_chain, combo_remaining_ms_before, boost_active) =
+                    self.combo_pickup_context(snake);
                 food_eaten_events.push(GameEvent::FoodEaten {
                     snake_id,
                     position: *head,
+                    points,
+                    combo_chain,
+                    combo_remaining_ms_before,
+                    boost_active,
                 });
             }
         }
         for event in food_eaten_events {
+            let GameEvent::FoodEaten { snake_id, .. } = &event else {
+                unreachable!("food collection only creates FoodEaten events")
+            };
+            let snake_id = *snake_id;
+            let old_score = self.scores.get(&snake_id).copied().unwrap_or(0);
             self.apply_event(event, Some(&mut out));
+            let score = self.scores.get(&snake_id).copied().unwrap_or(0);
+            if score != old_score {
+                self.apply_event(GameEvent::ScoreUpdated { snake_id, score }, Some(&mut out));
+            }
         }
 
         // Resolve packets after collision and food from stable pad/snake IDs.
@@ -3194,41 +3558,6 @@ impl GameState {
 
         // Calculate and update scores
         if !movement_only {
-            let mut score_updates: Vec<(u32, u32)> = Vec::new();
-            for (snake_id, snake) in self.iter_snakes() {
-                // Calculate the actual length of the snake
-                let mut length = 0;
-                if snake.body.len() >= 2 {
-                    for i in 0..snake.body.len() - 1 {
-                        let p1 = &snake.body[i];
-                        let p2 = &snake.body[i + 1];
-                        let distance = ((p2.x - p1.x).abs() + (p2.y - p1.y).abs()) as usize;
-                        length += distance;
-                    }
-                    length += 1; // Add 1 for the head
-                } else {
-                    length = snake.body.len();
-                }
-
-                // Score is length minus initial size (2)
-                let score = if snake.is_alive {
-                    length.saturating_sub(2) as u32
-                } else {
-                    self.scores.get(&snake_id).copied().unwrap_or(0)
-                };
-
-                // Collect score updates
-                let old_score = self.scores.get(&snake_id).copied().unwrap_or(0);
-                if score != old_score {
-                    score_updates.push((snake_id, score));
-                }
-            }
-
-            // Apply individual score updates
-            for (snake_id, score) in score_updates {
-                self.apply_event(GameEvent::ScoreUpdated { snake_id, score }, Some(&mut out));
-            }
-
             // Track goal touches as simple score increments in team games
             if let GameType::TeamMatch { .. } = &self.game_type
                 && self.team_scores.is_some()
@@ -3282,7 +3611,13 @@ impl GameState {
                 }
 
                 for snake_id in respawns {
-                    self.apply_event(GameEvent::SnakeDied { snake_id }, Some(&mut out));
+                    self.apply_event(
+                        GameEvent::SnakeDied {
+                            snake_id,
+                            cause: DeathCause::Banked,
+                        },
+                        Some(&mut out),
+                    );
                     if let Some(event) = self.respawn_event_for_snake(snake_id) {
                         self.apply_event(event, Some(&mut out));
                     }
@@ -3353,13 +3688,16 @@ impl GameState {
                                         continue;
                                     }
 
-                                    let score =
-                                        self.scores.get(&player.snake_id).copied().unwrap_or(0);
+                                    let pickups = self
+                                        .food_pickups
+                                        .get(&player.snake_id)
+                                        .copied()
+                                        .unwrap_or(0);
                                     let snake = &self.arena.snakes[player.snake_id as usize];
                                     let is_winner = winning_team
                                         .is_some_and(|team| snake.team_id == Some(team));
 
-                                    let base_xp = score * 10; // 10 XP per food eaten
+                                    let base_xp = pickups.saturating_mul(10);
                                     let bonus_xp = if is_winner { 50 } else { 10 }; // Winner bonus or participation
                                     player_xp_awards.insert(*user_id, base_xp + bonus_xp);
                                 }
@@ -3391,8 +3729,12 @@ impl GameState {
                                     continue;
                                 }
 
-                                let score = self.scores.get(&player.snake_id).copied().unwrap_or(0);
-                                let base_xp = score * 10; // 10 XP per food eaten
+                                let pickups = self
+                                    .food_pickups
+                                    .get(&player.snake_id)
+                                    .copied()
+                                    .unwrap_or(0);
+                                let base_xp = pickups.saturating_mul(10);
                                 player_xp_awards.insert(*user_id, base_xp + 10);
                             }
 
@@ -3545,13 +3887,15 @@ impl GameState {
                 }
             }
 
-            GameEvent::SnakeDied { snake_id } => {
+            GameEvent::SnakeDied { snake_id, cause } => {
+                self.last_death_causes.insert(snake_id, cause);
                 // A dead snake holds nothing — the invariants require a cleared
                 // meter. An unlimited tank is refilled by the *respawn*, which
                 // is where a new life actually begins.
                 if let Ok(snake) = self.get_snake_mut(snake_id) {
                     snake.is_alive = false;
                     snake.reset_boost_and_movement(None);
+                    snake.reset_combo();
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -3566,6 +3910,7 @@ impl GameState {
                     // `None`: an idle removal is permanent, so there is no new
                     // life to hand a full unlimited tank to.
                     snake.reset_boost_and_movement(None);
+                    snake.reset_combo();
                     // Ordinary team deaths preserve a physically-held Boost
                     // intent for respawn. An idle removal is permanent, so no
                     // input latch may survive on the dead snake.
@@ -3581,12 +3926,38 @@ impl GameState {
                 }
             }
 
-            GameEvent::FoodEaten { snake_id, position } => {
-                let removed = self.remove_food(&position);
-                if let Ok(snake) = self.get_snake_mut(snake_id)
-                    && removed
+            GameEvent::FoodEaten {
+                snake_id,
+                position,
+                points,
+                combo_chain,
+                combo_remaining_ms_before,
+                ..
+            } => {
+                // Validate before removal: a malformed direct caller must not
+                // consume a pellet and leave only half of the transition.
+                let valid_context = self.combo_event_fields_are_bounded(
+                    points,
+                    combo_chain,
+                    combo_remaining_ms_before,
+                );
+                if valid_context
+                    && self.arena.snakes.get(snake_id as usize).is_some()
+                    && self.remove_food(&position)
                 {
-                    snake.food += 2; // Each food now adds 2 segments instead of 1
+                    let window_ms = self.properties.combo.window_ms;
+                    if let Ok(snake) = self.get_snake_mut(snake_id) {
+                        // One combo point is one visible segment of growth.
+                        snake.food = snake.food.saturating_add(points);
+                        snake.combo = SnakeCombo {
+                            chain_count: combo_chain,
+                            remaining_ms: window_ms,
+                        };
+                    }
+                    let score = self.scores.entry(snake_id).or_default();
+                    *score = score.saturating_add(points);
+                    let pickups = self.food_pickups.entry(snake_id).or_default();
+                    *pickups = pickups.saturating_add(1);
                 }
             }
 
@@ -3710,6 +4081,7 @@ impl GameState {
                     snake.is_alive = true;
                     snake.food = 0;
                     snake.reset_boost_and_movement(refill);
+                    snake.reset_combo();
                 }
                 self.command_queue
                     .discard_player_commands_for_snake(snake_id);
@@ -3786,6 +4158,20 @@ mod readiness_tests {
         );
         assert!(!state.is_awaiting_readiness());
         assert_eq!(state.simulation_start_ms(), Some(25_000));
+    }
+
+    #[test]
+    fn a_gated_match_never_ticks_even_when_its_original_start_is_far_in_the_past() {
+        let state = gated_duel(2);
+        let mut engine = crate::GameEngine::new_from_state(7, state);
+
+        let events = engine
+            .run_until(1_000_000)
+            .expect("a gated engine should remain runnable");
+
+        assert!(events.is_empty());
+        assert_eq!(engine.get_committed_state().tick, 0);
+        assert!(engine.get_committed_state().is_awaiting_readiness());
     }
 
     /// `start_ms` is the durable runtime game identity: join authorization
@@ -3961,6 +4347,21 @@ mod tests {
         }
     }
 
+    fn assert_death_cause(events: &[(u64, GameEvent)], snake_id: u32, expected: DeathCause) {
+        let actual = events.iter().find_map(|(_, event)| match event {
+            GameEvent::SnakeDied {
+                snake_id: dead_snake_id,
+                cause,
+            } if *dead_snake_id == snake_id => Some(cause.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            actual,
+            Some(expected),
+            "missing or incorrectly attributed death for snake {snake_id}"
+        );
+    }
+
     #[test]
     fn snake_collides_with_itself_after_turning() {
         let mut game = GameState::new(
@@ -3987,6 +4388,7 @@ mod tests {
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
             boost: Default::default(),
+            combo: Default::default(),
         });
 
         let events = game
@@ -3996,9 +4398,10 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 })),
+                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0, .. })),
             "expected snake to die after colliding with itself"
         );
+        assert_death_cause(&events, 0, DeathCause::SelfCollision);
         assert!(!game.arena.snakes[0].is_alive);
     }
 
@@ -4014,6 +4417,7 @@ mod tests {
             speed_milli: NORMAL_SNAKE_SPEED_MILLI,
             movement_credit: 0,
             boost: Default::default(),
+            combo: Default::default(),
         });
 
         // Solo runs a 50ms quantum, so the wall is reached on the quantum that
@@ -4033,8 +4437,9 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 }))
+                .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0, .. }))
         );
+        assert_death_cause(&events, 0, DeathCause::OutOfBounds);
         assert_eq!(game.arena.snakes[0].body[0], Position { x: 0, y: 5 });
         assert_eq!(
             game.recent_crashes,
@@ -4042,6 +4447,7 @@ mod tests {
                 tick: crash_tick,
                 snake_id: 0,
                 position: Position { x: 0, y: 5 },
+                cause: DeathCause::OutOfBounds,
             }]
         );
 
@@ -4073,6 +4479,131 @@ mod tests {
 
         let restored: GameState = serde_json::from_value(json).expect("deserialize old snapshot");
         assert!(restored.recent_crashes.is_empty());
+    }
+
+    #[test]
+    fn legacy_death_events_and_crash_cues_default_to_unknown_cause() {
+        let event: GameEvent = serde_json::from_value(serde_json::json!({
+            "SnakeDied": { "snake_id": 7 }
+        }))
+        .expect("deserialize legacy death event");
+        assert!(matches!(
+            event,
+            GameEvent::SnakeDied {
+                snake_id: 7,
+                cause: DeathCause::Unknown,
+            }
+        ));
+
+        let crash: SnakeCrash = serde_json::from_value(serde_json::json!({
+            "tick": 9,
+            "snake_id": 7,
+            "position": { "x": 3, "y": 4 }
+        }))
+        .expect("deserialize legacy crash cue");
+        assert_eq!(crash.cause, DeathCause::Unknown);
+    }
+
+    #[test]
+    fn legacy_states_default_to_empty_last_death_history() {
+        let state = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let mut json = serde_json::to_value(state).expect("serialize current state");
+        json.as_object_mut()
+            .expect("state object")
+            .remove("last_death_causes");
+
+        let restored: GameState =
+            serde_json::from_value(json).expect("deserialize pre-attribution state");
+        assert!(restored.last_death_causes.is_empty());
+    }
+
+    #[test]
+    fn last_death_history_survives_respawn_and_banked_replaces_the_previous_life() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        let victim_id = game.add_player(1, Some("Victim".into())).unwrap().snake_id;
+        let killer_id = game.add_player(2, Some("Killer".into())).unwrap().snake_id;
+        let body_cause = DeathCause::SnakeBody {
+            killer_snake_id: killer_id,
+        };
+
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id: victim_id,
+                cause: body_cause.clone(),
+            },
+            None,
+        );
+        game.apply_event(
+            GameEvent::SnakeRespawned {
+                snake_id: victim_id,
+                position: Position { x: 20, y: 20 },
+                direction: Direction::Right,
+            },
+            None,
+        );
+        assert_eq!(game.last_death_causes.get(&victim_id), Some(&body_cause));
+
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id: victim_id,
+                cause: DeathCause::Banked,
+            },
+            None,
+        );
+        assert_eq!(
+            game.last_death_causes.get(&victim_id),
+            Some(&DeathCause::Banked),
+            "the latest scoring reset must not expose an earlier life as the latest death"
+        );
+
+        let restored: GameState =
+            serde_json::from_value(serde_json::to_value(&game).expect("serialize death history"))
+                .expect("deserialize death history");
+        assert_eq!(restored.last_death_causes, game.last_death_causes);
+    }
+
+    #[test]
+    fn last_death_history_is_validated_but_excluded_from_the_sync_hash() {
+        let mut baseline = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 2 },
+            QueueMode::Quickmatch,
+            Some(11),
+            0,
+        );
+        baseline.add_player(1, Some("One".into())).unwrap();
+        baseline.add_player(2, Some("Two".into())).unwrap();
+        let mut with_history = baseline.clone();
+        with_history
+            .last_death_causes
+            .insert(0, DeathCause::SnakeBody { killer_snake_id: 1 });
+
+        with_history
+            .validate_boost_invariants()
+            .expect("valid attribution history");
+        assert_eq!(baseline.sync_hash(), with_history.sync_hash());
+
+        with_history.last_death_causes.insert(
+            0,
+            DeathCause::SnakeBody {
+                killer_snake_id: 99,
+            },
+        );
+        assert!(
+            with_history
+                .validate_boost_invariants()
+                .unwrap_err()
+                .to_string()
+                .contains("missing attributed snake")
+        );
     }
 
     fn clockwise(direction: Direction) -> Direction {
@@ -4669,7 +5200,11 @@ mod tests {
             snake.body = vec![Position { x: 5, y: 10 }, Position { x: 2, y: 10 }];
             snake.direction = Direction::Right;
             snake.is_alive = true;
-            snake.food = 2; // carrying one food
+            snake.food = 1; // carrying one awarded point/segment
+            snake.combo = SnakeCombo {
+                chain_count: 2,
+                remaining_ms: 500,
+            };
         }
 
         let events = game.tick_forward(false).expect("tick_forward should work");
@@ -4692,11 +5227,12 @@ mod tests {
 
         let reset_without_crash = events
             .iter()
-            .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0 }));
+            .any(|(_, event)| matches!(event, GameEvent::SnakeDied { snake_id: 0, .. }));
         assert!(
             reset_without_crash && game.recent_crashes.is_empty(),
             "banking food should reset the snake without recording a collision"
         );
+        assert_death_cause(&events, 0, DeathCause::Banked);
 
         let score = game
             .team_scores
@@ -4710,6 +5246,11 @@ mod tests {
         assert_eq!(
             snake.food, 0,
             "snake should not keep carried food after respawn"
+        );
+        assert_eq!(
+            snake.combo,
+            SnakeCombo::default(),
+            "banking starts a new combo life"
         );
     }
 
@@ -4735,7 +5276,7 @@ mod tests {
         snake.body = vec![Position { x: 10, y: 18 }, Position { x: 13, y: 18 }];
         snake.direction = Direction::Left;
         snake.is_alive = true;
-        snake.food = points * 2;
+        snake.food = points;
         game
     }
 
@@ -4877,6 +5418,362 @@ mod tests {
         assert!(restored.recent_goals.is_empty());
     }
 
+    #[test]
+    fn combo_config_is_snapshotted_for_every_game_mode() {
+        let games = [
+            GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0),
+            GameState::new(
+                60,
+                40,
+                GameType::TeamMatch { per_team: 1 },
+                QueueMode::Competitive,
+                None,
+                0,
+            ),
+            GameState::new(
+                40,
+                40,
+                GameType::FreeForAll { max_players: 4 },
+                QueueMode::Quickmatch,
+                None,
+                0,
+            ),
+            GameState::new(
+                30,
+                20,
+                GameType::Custom {
+                    settings: CustomGameSettings::default(),
+                },
+                QueueMode::Quickmatch,
+                None,
+                0,
+            ),
+        ];
+
+        for game in games {
+            assert_eq!(game.properties.combo, ComboConfig::default());
+            game.properties
+                .combo
+                .validate()
+                .expect("valid Combo config");
+        }
+    }
+
+    #[test]
+    fn combo_snapshot_validation_rejects_unsupported_or_denormalized_state() {
+        let baseline = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+
+        let mut invalid = baseline.clone();
+        invalid.properties.combo.max_food_value = 4;
+        assert!(invalid.validate_boost_invariants().is_err());
+
+        let mut invalid = baseline.clone();
+        invalid.properties.combo.rules_version += 1;
+        assert!(invalid.validate_boost_invariants().is_err());
+
+        let mut invalid = baseline;
+        invalid.add_player(1, None).expect("add player");
+        invalid.arena.snakes[0].combo.chain_count = 1;
+        assert!(invalid.validate_boost_invariants().is_err());
+        invalid.arena.snakes[0].combo.remaining_ms = DEFAULT_COMBO_WINDOW_MS + 1;
+        assert!(invalid.validate_boost_invariants().is_err());
+    }
+
+    #[test]
+    fn combo_awards_one_one_two_three_then_caps_and_grows_by_awarded_points() {
+        let mut game = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake = &mut game.arena.snakes[player.snake_id as usize];
+        snake.body = vec![Position { x: 5, y: 5 }, Position { x: 2, y: 5 }];
+        snake.direction = Direction::Right;
+
+        let mut food_events = Vec::new();
+        for expected_points in [1, 1, 2, 3, 3] {
+            let head = *game.arena.snakes[player.snake_id as usize]
+                .head()
+                .expect("head");
+            game.arena.food = vec![Position {
+                x: head.x + 1,
+                y: head.y,
+            }];
+            for _ in 0..2 {
+                food_events.extend(
+                    game.tick_forward(true)
+                        .expect("normal-speed pickup quantum"),
+                );
+            }
+
+            let (_, event) = food_events
+                .iter()
+                .rev()
+                .find(|(_, event)| matches!(event, GameEvent::FoodEaten { .. }))
+                .expect("FoodEaten event");
+            let GameEvent::FoodEaten {
+                points,
+                combo_chain,
+                combo_remaining_ms_before,
+                boost_active,
+                ..
+            } = event
+            else {
+                unreachable!()
+            };
+            assert_eq!(*points, expected_points);
+            assert_eq!(
+                *combo_chain,
+                food_events
+                    .iter()
+                    .filter(|(_, event)| matches!(event, GameEvent::FoodEaten { .. }))
+                    .count() as u32
+            );
+            assert_eq!(
+                *combo_remaining_ms_before,
+                if *combo_chain == 1 {
+                    0
+                } else {
+                    DEFAULT_COMBO_WINDOW_MS - game.normal_movement_interval_ms()
+                }
+            );
+            assert!(!boost_active);
+        }
+
+        let snake = &game.arena.snakes[player.snake_id as usize];
+        let physical_growth =
+            snake.length().saturating_sub(game.starting_snake_length()) as u32 + snake.food;
+        assert_eq!(physical_growth, 10, "1 + 1 + 2 + 3 + 3 physical cells");
+        assert_eq!(game.scores[&player.snake_id], 10);
+        assert_eq!(game.food_pickups[&player.snake_id], 5);
+        assert_eq!(snake.combo.chain_count, 5);
+        assert_eq!(snake.combo.remaining_ms, DEFAULT_COMBO_WINDOW_MS);
+
+        // Combo value affects score/growth, while XP remains one unit per
+        // pellet (plus the existing winner bonus).
+        assert_eq!(game.inactivity_xp_awards(Some(player.snake_id))[&1], 100);
+    }
+
+    #[test]
+    fn combo_expires_after_exactly_one_second_of_authoritative_time() {
+        assert_eq!(DEFAULT_COMBO_WINDOW_MS, 1_000);
+        let mut game = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake = &mut game.arena.snakes[player.snake_id as usize];
+        snake.body = vec![Position { x: 5, y: 5 }, Position { x: 2, y: 5 }];
+        snake.direction = Direction::Right;
+        game.arena.food = vec![Position { x: 6, y: 5 }];
+        game.tick_forward(true).expect("first half-step");
+        game.tick_forward(true).expect("first pickup");
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize]
+                .combo
+                .chain_count,
+            1
+        );
+
+        let tick_duration_ms = game.properties.tick_duration_ms;
+        assert_eq!(DEFAULT_COMBO_WINDOW_MS % tick_duration_ms, 0);
+        let expiry_quanta = DEFAULT_COMBO_WINDOW_MS / tick_duration_ms;
+        for _ in 1..expiry_quanta {
+            game.tick_forward(true).expect("Combo drain quantum");
+        }
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize].combo,
+            SnakeCombo {
+                chain_count: 1,
+                remaining_ms: tick_duration_ms,
+            }
+        );
+
+        game.tick_forward(true).expect("final Combo drain quantum");
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize].combo,
+            SnakeCombo::default()
+        );
+
+        let head = *game.arena.snakes[player.snake_id as usize]
+            .head()
+            .expect("head");
+        game.arena.food = vec![Position {
+            x: head.x + 1,
+            y: head.y,
+        }];
+        game.tick_forward(true).expect("next half-step");
+        let events = game.tick_forward(true).expect("post-expiry pickup");
+        assert!(events.iter().any(|(_, event)| matches!(
+            event,
+            GameEvent::FoodEaten {
+                points: 1,
+                combo_chain: 1,
+                combo_remaining_ms_before: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn combo_state_stays_identical_in_authoritative_and_movement_only_simulation() {
+        let mut authoritative =
+            GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = authoritative.add_player(1, None).expect("add player");
+        let snake = &mut authoritative.arena.snakes[player.snake_id as usize];
+        snake.body = vec![Position { x: 5, y: 5 }, Position { x: 2, y: 5 }];
+        snake.direction = Direction::Right;
+        let mut movement_only = authoritative.clone();
+
+        for _ in 0..4 {
+            let head = *authoritative.arena.snakes[player.snake_id as usize]
+                .head()
+                .expect("head");
+            let food = Position {
+                x: head.x + 1,
+                y: head.y,
+            };
+            authoritative.arena.food = vec![food];
+            movement_only.arena.food = vec![food];
+            for _ in 0..2 {
+                authoritative
+                    .tick_forward(false)
+                    .expect("authoritative quantum");
+                movement_only
+                    .tick_forward(true)
+                    .expect("movement-only quantum");
+            }
+            assert_eq!(authoritative.sync_hash(), movement_only.sync_hash());
+        }
+    }
+
+    #[test]
+    fn one_pellet_can_only_produce_one_successful_food_event() {
+        let mut game = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 1 },
+            QueueMode::Quickmatch,
+            None,
+            0,
+        );
+        game.add_player(1, None).expect("first player");
+        game.add_player(2, None).expect("second player");
+        for snake in &mut game.arena.snakes {
+            snake.body = vec![Position { x: 20, y: 20 }, Position { x: 17, y: 20 }];
+            snake.direction = Direction::Right;
+            snake.movement_credit = 0;
+        }
+        game.arena.food = vec![Position { x: 20, y: 20 }];
+
+        // At 50 ms neither normal-speed snake moves, so this deliberately
+        // exercises simultaneous occupancy without collision resolution
+        // selecting a winner first.
+        let events = game.tick_forward(true).expect("contention quantum");
+        let eaten: Vec<_> = events
+            .iter()
+            .filter(|(_, event)| matches!(event, GameEvent::FoodEaten { .. }))
+            .collect();
+        assert_eq!(eaten.len(), 1);
+        assert!(matches!(
+            &eaten[0].1,
+            GameEvent::FoodEaten { snake_id: 0, .. }
+        ));
+        assert_eq!(game.scores.get(&0), Some(&1));
+        assert_eq!(game.scores.get(&1), None);
+        assert!(game.arena.food.is_empty());
+    }
+
+    #[test]
+    fn death_and_respawn_clear_combo_but_not_cumulative_score_or_pickups() {
+        let mut game = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        let player = game.add_player(1, None).expect("add player");
+        let snake = &mut game.arena.snakes[player.snake_id as usize];
+        snake.combo = SnakeCombo {
+            chain_count: 3,
+            remaining_ms: 700,
+        };
+        game.scores.insert(player.snake_id, 6);
+        game.food_pickups.insert(player.snake_id, 3);
+
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id: player.snake_id,
+                cause: DeathCause::Unknown,
+            },
+            None,
+        );
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize].combo,
+            SnakeCombo::default()
+        );
+        game.apply_event(
+            GameEvent::SnakeRespawned {
+                snake_id: player.snake_id,
+                position: Position { x: 20, y: 20 },
+                direction: Direction::Right,
+            },
+            None,
+        );
+        assert_eq!(
+            game.arena.snakes[player.snake_id as usize].combo,
+            SnakeCombo::default()
+        );
+        assert_eq!(game.scores[&player.snake_id], 6);
+        assert_eq!(game.food_pickups[&player.snake_id], 3);
+    }
+
+    #[test]
+    fn historical_combo_fields_default_to_current_config_and_inactive_state() {
+        let mut game = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, None, 0);
+        game.add_player(1, None).expect("add player");
+        let mut json = serde_json::to_value(game).expect("serialize state");
+        let state = json.as_object_mut().expect("state object");
+        state.remove("food_pickups");
+        state
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("properties")
+            .remove("combo");
+        for snake in state
+            .get_mut("arena")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|arena| arena.get_mut("snakes"))
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("snakes")
+        {
+            snake.as_object_mut().expect("snake").remove("combo");
+        }
+
+        let restored: GameState = serde_json::from_value(json).expect("deserialize old state");
+        assert_eq!(restored.properties.combo, ComboConfig::default());
+        assert!(restored.food_pickups.is_empty());
+        assert!(
+            restored
+                .arena
+                .snakes
+                .iter()
+                .all(|snake| snake.combo == SnakeCombo::default())
+        );
+    }
+
+    #[test]
+    fn historical_food_event_defaults_to_a_first_single_point_pickup() {
+        let event: GameEvent = serde_json::from_value(serde_json::json!({
+            "FoodEaten": {
+                "snake_id": 7,
+                "position": { "x": 3, "y": 4 }
+            }
+        }))
+        .expect("deserialize historical FoodEaten");
+
+        assert!(matches!(
+            event,
+            GameEvent::FoodEaten {
+                snake_id: 7,
+                points: 1,
+                combo_chain: 1,
+                combo_remaining_ms_before: 0,
+                boost_active: false,
+                ..
+            }
+        ));
+    }
+
     /// `carried_food` is the one definition behind team scoring, the AI's
     /// base-return decision, and the number the client draws on each snake, so
     /// it is pinned directly rather than only through the scoring path.
@@ -4912,20 +5809,20 @@ mod tests {
             )
         };
 
-        // Two segments make one food, and it does not matter whether they are
-        // still queued in `food` or already extruded into the body: a snake
+        // One awarded point is one segment, and it does not matter whether it
+        // is still queued in `food` or already extruded into the body: a snake
         // shows the same total across every tick it spends growing.
         assert_eq!(game.carried_food(&at_starting_length(0)), 0);
-        assert_eq!(game.carried_food(&at_starting_length(1)), 0);
-        assert_eq!(game.carried_food(&at_starting_length(2)), 1);
-        assert_eq!(game.carried_food(&at_starting_length(5)), 2);
+        assert_eq!(game.carried_food(&at_starting_length(1)), 1);
+        assert_eq!(game.carried_food(&at_starting_length(2)), 2);
+        assert_eq!(game.carried_food(&at_starting_length(5)), 5);
 
         let mut half_grown = at_starting_length(1);
         half_grown.body[1].x -= 1; // one segment already extruded
         assert_eq!(
             game.carried_food(&half_grown),
-            1,
-            "one queued plus one extruded segment is still one food"
+            2,
+            "queued and extruded awarded segments must both be banked"
         );
 
         // A snake shorter than the starting length floors at zero instead of
@@ -4983,10 +5880,11 @@ mod tests {
 
         assert!(
             events.iter().any(|(_, event)| {
-                matches!(event, GameEvent::SnakeDied { snake_id } if *snake_id == 0)
+                matches!(event, GameEvent::SnakeDied { snake_id, .. } if *snake_id == 0)
             }),
             "snake should die when entering enemy base"
         );
+        assert_death_cause(&events, 0, DeathCause::EnemyBase);
 
         assert!(
             game.arena.snakes[0].is_alive,
@@ -5303,7 +6201,7 @@ mod tests {
         // zeroing it would make every snapshot round trip fail admission.
         game.rng = None;
 
-        // Pin the shipped policy as well as the lower-level tick behavior.
+        // Pin the generic/legacy fallback as well as the lower-level behavior.
         assert_eq!(game.properties.player_idle_timeout_ms, 60_000);
         assert_eq!(game.properties.player_idle_warning_ms, 10_000);
         game
@@ -6427,7 +7325,13 @@ mod tests {
         game.tick_forward(true).expect("latch the held control");
         assert!(game.arena.snakes[snake_id as usize].boost.intent);
 
-        game.apply_event(GameEvent::SnakeDied { snake_id }, None);
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id,
+                cause: DeathCause::Unknown,
+            },
+            None,
+        );
         let respawn = game
             .respawn_event_for_snake(snake_id)
             .expect("respawn event");
@@ -6562,11 +7466,11 @@ mod tests {
         let events = game.tick_forward(true).expect("unequal-speed collision");
         assert!(events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == fast_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == fast_id
         )));
         assert!(!events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == stationary_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == stationary_id
         )));
         assert!(game.arena.snakes[stationary_id as usize].is_alive);
         assert_eq!(
@@ -6600,12 +7504,22 @@ mod tests {
                 .expect("stationary segment collision");
             assert!(events.iter().any(|(_, event)| matches!(
                 event,
-                GameEvent::SnakeDied { snake_id } if *snake_id == fast_id
+                GameEvent::SnakeDied { snake_id, .. } if *snake_id == fast_id
             )));
             assert!(!events.iter().any(|(_, event)| matches!(
                 event,
-                GameEvent::SnakeDied { snake_id } if *snake_id == stationary_id
+                GameEvent::SnakeDied { snake_id, .. } if *snake_id == stationary_id
             )));
+            let expected = if target_y == 15 {
+                DeathCause::HeadToHead {
+                    other_snake_id: stationary_id,
+                }
+            } else {
+                DeathCause::SnakeBody {
+                    killer_snake_id: stationary_id,
+                }
+            };
+            assert_death_cause(&events, fast_id, expected);
         }
     }
 
@@ -6630,11 +7544,12 @@ mod tests {
             normal.movement_credit = 50_000;
 
             let events = game.tick_forward(true).expect("simultaneous collision");
-            for snake_id in [fast_id, normal_id] {
+            for (snake_id, other_snake_id) in [(fast_id, normal_id), (normal_id, fast_id)] {
                 assert!(events.iter().any(|(_, event)| matches!(
                     event,
-                    GameEvent::SnakeDied { snake_id: dead_id } if *dead_id == snake_id
+                    GameEvent::SnakeDied { snake_id: dead_id, .. } if *dead_id == snake_id
                 )));
+                assert_death_cause(&events, snake_id, DeathCause::HeadToHead { other_snake_id });
             }
         }
     }
@@ -6707,7 +7622,9 @@ mod tests {
         let events = food_game.tick_forward(true).expect("boosted food movement");
         assert!(events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::FoodEaten { snake_id, position }
+            GameEvent::FoodEaten {
+                snake_id, position, ..
+            }
                 if *snake_id == food_snake_id && *position == food_position
         )));
         assert!(food_game.arena.snakes[food_snake_id as usize].boost.active);
@@ -6724,8 +7641,9 @@ mod tests {
             .expect("boosted wall collision");
         assert!(wall_events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == wall_snake_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == wall_snake_id
         )));
+        assert_death_cause(&wall_events, wall_snake_id, DeathCause::Wall);
         // Death drains fuel and stops Boost, but the player is still holding
         // the control, so their latched intent survives into the next life.
         assert_eq!(
@@ -6749,8 +7667,9 @@ mod tests {
             .expect("boosted enemy-base collision");
         assert!(enemy_events.iter().any(|(_, event)| matches!(
             event,
-            GameEvent::SnakeDied { snake_id } if *snake_id == enemy_snake_id
+            GameEvent::SnakeDied { snake_id, .. } if *snake_id == enemy_snake_id
         )));
+        assert_death_cause(&enemy_events, enemy_snake_id, DeathCause::EnemyBase);
 
         // Returning carried food through one's own open goal scores, then the
         // ordinary scoring respawn clears Boost and movement phase.
@@ -6759,7 +7678,7 @@ mod tests {
         let score_snake = &mut score_game.arena.snakes[score_snake_id as usize];
         score_snake.body = vec![Position { x: 9, y: 20 }, Position { x: 12, y: 20 }];
         score_snake.direction = Direction::Left;
-        score_snake.food = 2;
+        score_snake.food = 1;
         make_active_mover(score_snake, MAX_BOOST_SPEED_MILLI);
         score_game
             .tick_forward(false)
@@ -6800,7 +7719,13 @@ mod tests {
         });
         assert!(game.has_scheduled_commands(50));
 
-        game.apply_event(GameEvent::SnakeDied { snake_id }, None);
+        game.apply_event(
+            GameEvent::SnakeDied {
+                snake_id,
+                cause: DeathCause::Unknown,
+            },
+            None,
+        );
         let snake = &game.arena.snakes[snake_id as usize];
         assert!(!snake.is_alive);
         assert_eq!(snake.speed_milli, NORMAL_SNAKE_SPEED_MILLI);
@@ -7104,6 +8029,7 @@ mod tests {
         game.apply_event(
             GameEvent::SnakeDied {
                 snake_id: eliminated_snake_id,
+                cause: DeathCause::Unknown,
             },
             None,
         );
@@ -7236,8 +8162,12 @@ mod tests {
         assert!(game.is_complete());
         assert!(!game.completed_by_inactivity);
         assert_eq!(game.player_xp.get(&1), Some(&0));
-        let winner_score = game.scores.get(&winning_snake_id).copied().unwrap_or(0);
-        assert_eq!(game.player_xp.get(&2), Some(&(winner_score * 10 + 50)));
+        let winner_pickups = game
+            .food_pickups
+            .get(&winning_snake_id)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(game.player_xp.get(&2), Some(&(winner_pickups * 10 + 50)));
     }
 
     /// Player inactivity is separate from the score race: a scoreless match

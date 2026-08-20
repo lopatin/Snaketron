@@ -1,14 +1,30 @@
+use crate::ads::{
+    AdBreakResolution, AdsConfig, ClientAdsConfig, ClientDistribution, LobbyAdBreak,
+    LobbyAdBreakView, MAX_AD_BREAK_PARTICIPANTS, lobby_meets_game_threshold,
+};
 use crate::api::auth::validate_username;
+use crate::challenges::{
+    CHALLENGE_TTL_MS, Challenge, ChallengeInbox, ChallengeState, ChallengeStore, new_challenge_id,
+    now_ms,
+};
+use crate::chat_filter::filter_chat_message;
 use crate::cluster_membership::ClusterNamespace;
-use crate::db::Database;
+use crate::db::{Database, models::RuntimeAdsConfig};
 use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::game_executor::StreamEvent;
 use crate::lifecycle::{DrainNotice, TaskLifecycle, WS_PROTOCOL_VERSION};
 use crate::lobby_manager;
-use crate::lobby_manager::{LeaveLobbyResult, LobbyJoinHandle, LobbyMember};
-use crate::matchmaking_manager::{ActiveMatch, MatchmakingManager};
+use crate::lobby_manager::{
+    AdBreakResolutionResult, BeginAdBreakResult, LobbyJoinHandle, LobbyMember, MAX_LOBBY_MEMBERS,
+    lobby_membership_valid_until_ms,
+};
+use crate::matchmaking_manager::{
+    ActiveMatch, LobbyAdmissionRejected, LobbyMembershipFence, MATCHMAKING_GAME_TYPES,
+    MatchmakingManager,
+};
 use crate::matchmaking_pool::MatchmakingPool;
+use crate::presence::{PresenceActivity, PresenceRegistry, RegionRoster};
 use crate::pubsub_manager::PubSubManager;
 use crate::recovery::{
     CommandOutcome, RecoveryEnvelopeV2, ResolvedCommandState, SessionCommandOutcomes,
@@ -16,7 +32,7 @@ use crate::recovery::{
 };
 use crate::redis_keys::RedisKeys;
 use crate::redis_utils::RedisConnection;
-use crate::replication::GameStateReader;
+use crate::rematch::{RematchState, RematchStore};
 use crate::user_cache::UserCache;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -38,21 +54,18 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// The gameplay protocol version a client reports is advisory. No client is
-/// ever turned away for reporting an old, newer, or missing version: a shipped
-/// build cannot update itself — an itch.io bundle has no reload-to-upgrade
-/// path at all — so an "update required" dead end would strand the player with
-/// nothing to do. Every gameplay protocol change must therefore stay backwards
-/// compatible, and a mismatch is only ever logged so a rollout stays visible.
-fn log_client_protocol_version(protocol_version: Option<u16>) {
+/// Deterministic simulation requires both peers to run the same gameplay
+/// rules. In particular, protocol 8 changes scoring and physical growth, so an
+/// older predictive engine cannot safely continue against this server.
+fn validate_client_protocol_version(protocol_version: Option<u16>) -> Result<()> {
     match protocol_version {
-        Some(version) if version == WS_PROTOCOL_VERSION => {}
-        Some(version) => warn!(
-            "Admitting client on gameplay protocol version {version}; this server speaks {WS_PROTOCOL_VERSION}"
-        ),
-        None => warn!(
-            "Admitting legacy client that reported no gameplay protocol version; this server speaks {WS_PROTOCOL_VERSION}"
-        ),
+        Some(version) if version == WS_PROTOCOL_VERSION => Ok(()),
+        Some(version) => Err(anyhow!(
+            "Gameplay update required: client protocol {version}, server protocol {WS_PROTOCOL_VERSION}"
+        )),
+        None => Err(anyhow!(
+            "Gameplay update required: client did not report a protocol version; server protocol {WS_PROTOCOL_VERSION}"
+        )),
     }
 }
 
@@ -101,11 +114,12 @@ fn sanitize_anon_id(anon_id: Option<String>) -> Option<String> {
 #[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-gen", ts(export))]
 pub enum WSMessage {
-    /// Legacy authentication shape. Still honored: it authenticates exactly
-    /// like `Authenticate`, just without a reported protocol version.
+    /// Legacy authentication shape. It remains parseable so the server can
+    /// return an explicit update-required denial instead of a malformed-frame
+    /// error, but it is no longer admitted to deterministic gameplay.
     Token(String),
-    /// Client -> server authentication. The reported version is advisory —
-    /// see `log_client_protocol_version`; it never gates admission.
+    /// Client -> server authentication. The reported version must exactly
+    /// match [`WS_PROTOCOL_VERSION`].
     Authenticate {
         token: String,
         protocol_version: u16,
@@ -117,6 +131,10 @@ pub enum WSMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-gen", ts(optional))]
         anon_id: Option<String>,
+        /// Session build channel. A missing value resolves to a disabled ad
+        /// policy because the client's available SDK is unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        distribution: Option<ClientDistribution>,
     },
     JoinGame(u32),
     LeaveGame,
@@ -187,6 +205,9 @@ pub enum WSMessage {
         #[cfg_attr(feature = "ts-gen", ts(type = "number"))]
         socket_generation: u64,
     },
+    /// Server -> client distribution capability. Live pre-match authorization
+    /// is carried by each lobby break's targeted user IDs.
+    AdConfiguration(ClientAdsConfig),
     /// Client -> server: this player has read the pre-match briefing and is
     /// ready. `game_id` is echoed back for client-side routing only — the
     /// gateway canonicalizes it, and the player's identity, from the
@@ -229,6 +250,12 @@ pub enum WSMessage {
         estimated_wait_seconds: u32,
     },
     QueueLeft,
+    /// Client -> server terminal resolution for the current lobby ad break.
+    /// Every outcome releases this participant; ad blocking is not an error.
+    AdBreakResolved {
+        break_id: String,
+        resolution: AdBreakResolution,
+    },
     UpdateNickname {
         nickname: String,
     },
@@ -283,6 +310,8 @@ pub enum WSMessage {
         host_user_id: i32,
         state: String,
         preferences: lobby_manager::LobbyPreferences,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ad_break: Option<LobbyAdBreakView>,
     },
     UpdateLobbyPreferences {
         selected_modes: Vec<String>,
@@ -293,6 +322,55 @@ pub enum WSMessage {
         ws_url: String,
         lobby_code: String,
     },
+
+    // === Social layer (protocol 11, capability `social-presence-v1`) ===
+    /// Server -> client: everyone currently online in this connection's region.
+    /// Pushed on authentication and whenever the region roster changes; the
+    /// viewer is always absent from `players`.
+    OnlinePlayers(RegionRoster),
+    /// Client -> server: challenge one online player to a match. The server
+    /// takes the challenger's identity from the connection — only the target
+    /// is client-supplied.
+    ChallengePlayer {
+        user_id: u32,
+    },
+    /// Client -> server: answer a challenge addressed to this user. The server
+    /// enforces that only the target may accept or decline.
+    RespondToChallenge {
+        challenge_id: String,
+        accept: bool,
+    },
+    /// Client -> server: withdraw a challenge this user issued.
+    CancelChallenge {
+        challenge_id: String,
+    },
+    /// Server -> client: the complete challenge state for this user. Always a
+    /// full snapshot rather than a delta, so it is idempotent across a socket
+    /// handoff, a dropped hint, or a reconnect.
+    Challenges(ChallengeInbox),
+    /// Server -> client: an accepted challenge, addressed to both players. The
+    /// client joins `lobby_code` to land in the challenger's lobby.
+    ChallengeAccepted {
+        challenge_id: String,
+        lobby_code: String,
+    },
+    /// Server -> client: a challenge could not be issued, with a reason meant
+    /// to be shown verbatim.
+    ChallengeFailed {
+        reason: String,
+    },
+
+    // === Rematch (protocol 12, capability `rematch-v1`) ===
+    /// Client -> server: tick or untick Rematch on the results card. The
+    /// server takes the player's identity from the connection and checks the
+    /// game id against the one this socket actually joined.
+    SetRematchIntent {
+        game_id: u32,
+        opt_in: bool,
+    },
+    /// Server -> client: who is still on the results card, who has opted in,
+    /// and — once enough have — the lobby they all converge on.
+    Rematch(RematchState),
     // NicknameUpdated {
     //     username: String,
     // },
@@ -314,10 +392,36 @@ pub struct PlayerMetadata {
     pub token: String,
     pub is_guest: bool,
     pub matchmaking_pool: MatchmakingPool,
+    /// An ad break is only safe when every lobby member can acknowledge it.
+    /// Keeping this explicit also makes mixed-version durable lobby state fail
+    /// closed during a rolling deployment.
+    pub supports_ad_break: bool,
+    /// Deployment capability resolved from the authenticated distribution.
+    /// Live runtime policy is applied again when matchmaking targets a break.
+    pub can_show_video_ad: bool,
+    pub distribution: Option<ClientDistribution>,
 }
 
 const MAX_CHAT_MESSAGE_LENGTH: usize = 200;
 const CHAT_HISTORY_LIMIT: usize = 200;
+const CHAT_CONTENT_FILTER_VERSION: u8 = 1;
+const REPAIR_LEGACY_CHAT_HISTORY_SCRIPT: &str = r#"
+local replacements = {}
+for i = 1, #ARGV, 2 do
+    replacements[ARGV[i]] = ARGV[i + 1]
+end
+
+local entries = redis.call('LRANGE', KEYS[1], 0, -1)
+local changed = 0
+for index, entry in ipairs(entries) do
+    local replacement = replacements[entry]
+    if replacement then
+        redis.call('LSET', KEYS[1], index - 1, replacement)
+        changed = changed + 1
+    end
+end
+return changed
+"#;
 const LOBBY_STATE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
 const LOBBY_MATCH_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const LOBBY_MATCH_SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -364,6 +468,166 @@ pub struct GameChatBroadcast {
     timestamp_ms: i64,
 }
 
+/// Redis-only envelopes let rolling deployments distinguish messages that
+/// were filtered at ingress from legacy payloads that still need filtering.
+/// The flattened chat fields preserve compatibility with older servers.
+#[derive(Debug, Serialize, Deserialize)]
+struct RedisLobbyChatPayload {
+    #[serde(flatten)]
+    chat: LobbyChatBroadcast,
+    #[serde(default)]
+    content_filter_version: u8,
+}
+
+impl RedisLobbyChatPayload {
+    fn from_filtered(chat: LobbyChatBroadcast) -> Self {
+        Self {
+            chat,
+            content_filter_version: CHAT_CONTENT_FILTER_VERSION,
+        }
+    }
+
+    fn filter_legacy(&mut self) -> bool {
+        // Version zero is the only unfiltered legacy format. Any positive
+        // version has already been sanitized and must not be run through a
+        // non-idempotent detector again during future filter upgrades.
+        if self.content_filter_version == 0 {
+            self.chat.message = filter_chat_message(&self.chat.message);
+            self.content_filter_version = CHAT_CONTENT_FILTER_VERSION;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn into_filtered(mut self) -> LobbyChatBroadcast {
+        self.filter_legacy();
+        self.chat
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RedisGameChatPayload {
+    #[serde(flatten)]
+    chat: GameChatBroadcast,
+    #[serde(default)]
+    content_filter_version: u8,
+}
+
+impl RedisGameChatPayload {
+    fn from_filtered(chat: GameChatBroadcast) -> Self {
+        Self {
+            chat,
+            content_filter_version: CHAT_CONTENT_FILTER_VERSION,
+        }
+    }
+
+    fn filter_legacy(&mut self) -> bool {
+        if self.content_filter_version == 0 {
+            self.chat.message = filter_chat_message(&self.chat.message);
+            self.content_filter_version = CHAT_CONTENT_FILTER_VERSION;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn into_filtered(mut self) -> GameChatBroadcast {
+        self.filter_legacy();
+        self.chat
+    }
+}
+
+#[cfg(test)]
+mod chat_payload_tests {
+    use super::*;
+
+    const RAW_MESSAGE: &str = "so many a^s hole sin this server";
+
+    fn lobby_chat(message: String) -> LobbyChatBroadcast {
+        LobbyChatBroadcast {
+            lobby_code: "ABC123".to_owned(),
+            message_id: "lobby-message".to_owned(),
+            user_id: 7,
+            username: "player".to_owned(),
+            message,
+            timestamp_ms: 1,
+        }
+    }
+
+    fn game_chat(message: String) -> GameChatBroadcast {
+        GameChatBroadcast {
+            game_id: 42,
+            message_id: "game-message".to_owned(),
+            user_id: 7,
+            username: "player".to_owned(),
+            message,
+            timestamp_ms: 1,
+        }
+    }
+
+    #[test]
+    fn current_lobby_and_game_payloads_are_not_filtered_twice() {
+        let filtered = filter_chat_message(RAW_MESSAGE);
+
+        let lobby_json = serde_json::to_string(&RedisLobbyChatPayload::from_filtered(lobby_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let lobby: RedisLobbyChatPayload = serde_json::from_str(&lobby_json).unwrap();
+        assert_eq!(lobby.content_filter_version, CHAT_CONTENT_FILTER_VERSION);
+        assert_eq!(lobby.into_filtered().message, filtered);
+
+        let game_json = serde_json::to_string(&RedisGameChatPayload::from_filtered(game_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let game: RedisGameChatPayload = serde_json::from_str(&game_json).unwrap();
+        assert_eq!(game.content_filter_version, CHAT_CONTENT_FILTER_VERSION);
+        assert_eq!(game.into_filtered().message, filtered);
+
+        let future = RedisLobbyChatPayload {
+            chat: lobby_chat(filtered.clone()),
+            content_filter_version: CHAT_CONTENT_FILTER_VERSION + 1,
+        };
+        assert_eq!(future.into_filtered().message, filtered);
+    }
+
+    #[test]
+    fn legacy_lobby_and_game_payloads_are_filtered_on_read() {
+        let expected = filter_chat_message(RAW_MESSAGE);
+
+        let lobby_json = serde_json::to_string(&lobby_chat(RAW_MESSAGE.to_owned())).unwrap();
+        let lobby: RedisLobbyChatPayload = serde_json::from_str(&lobby_json).unwrap();
+        assert_eq!(lobby.content_filter_version, 0);
+        assert_eq!(lobby.into_filtered().message, expected);
+
+        let game_json = serde_json::to_string(&game_chat(RAW_MESSAGE.to_owned())).unwrap();
+        let game: RedisGameChatPayload = serde_json::from_str(&game_json).unwrap();
+        assert_eq!(game.content_filter_version, 0);
+        assert_eq!(game.into_filtered().message, expected);
+    }
+
+    #[test]
+    fn current_envelopes_remain_readable_by_legacy_servers() {
+        let filtered = filter_chat_message(RAW_MESSAGE);
+
+        let lobby_json = serde_json::to_string(&RedisLobbyChatPayload::from_filtered(lobby_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let legacy_lobby: LobbyChatBroadcast = serde_json::from_str(&lobby_json).unwrap();
+        assert_eq!(legacy_lobby.message, filtered);
+
+        let game_json = serde_json::to_string(&RedisGameChatPayload::from_filtered(game_chat(
+            filtered.clone(),
+        )))
+        .unwrap();
+        let legacy_game: GameChatBroadcast = serde_json::from_str(&game_json).unwrap();
+        assert_eq!(legacy_game.message, filtered);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum LobbyMatchHint {
@@ -374,12 +638,156 @@ enum LobbyMatchHint {
     },
 }
 
+fn refresh_connection_username(metadata: &mut PlayerMetadata, username: String) {
+    metadata.username = username;
+}
+
+/// Issue a challenge from this connection, creating the challenger's lobby if
+/// they do not already have one.
+///
+/// Returns the (possibly new) lobby handle and, when a lobby was created here,
+/// its code — the caller sends `LobbyCreated` so the client's lobby state
+/// tracks the one the challenge points at.
+#[allow(clippy::too_many_arguments)]
+async fn issue_challenge(
+    challenger_id: u32,
+    metadata: &PlayerMetadata,
+    target_user_id: u32,
+    lobby: Option<LobbyJoinHandle>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    user_cache: UserCache,
+    redis: &RedisConnection,
+    region: &str,
+    websocket_id: &str,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<(Option<LobbyJoinHandle>, Option<String>)> {
+    if target_user_id == challenger_id {
+        send_challenge_failure(crate::challenges::ChallengeRejection::Self_.reason(), ws_tx)
+            .await?;
+        return Ok((lobby, None));
+    }
+
+    let presence = PresenceRegistry::new(redis.clone(), region.to_string());
+    match presence.is_online(target_user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            send_challenge_failure(
+                crate::challenges::ChallengeRejection::TargetOffline.reason(),
+                ws_tx,
+            )
+            .await?;
+            return Ok((lobby, None));
+        }
+        Err(error) => {
+            warn!(target_user_id, %error, "failed to check challenge target presence");
+            send_challenge_failure("Could not reach that player. Try again.", ws_tx).await?;
+            return Ok((lobby, None));
+        }
+    }
+
+    // Resolve the target's name at send time rather than trusting the roster
+    // frame the client was looking at: nicknames change, and the record is
+    // read back by both sides for the life of the challenge.
+    let target_username = match user_cache.get(target_user_id).await {
+        Ok(Some(user)) => user.username,
+        Ok(None) => {
+            send_challenge_failure(
+                crate::challenges::ChallengeRejection::TargetOffline.reason(),
+                ws_tx,
+            )
+            .await?;
+            return Ok((lobby, None));
+        }
+        Err(error) => {
+            warn!(target_user_id, %error, "failed to resolve a challenge target");
+            send_challenge_failure("Could not reach that player. Try again.", ws_tx).await?;
+            return Ok((lobby, None));
+        }
+    };
+
+    let (lobby, created_code) = match lobby {
+        Some(handle) => (Some(handle), None),
+        None => {
+            let lobby = match lobby_manager
+                .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                .await
+            {
+                Ok(lobby) => lobby,
+                Err(error) => {
+                    warn!(challenger_id, %error, "failed to create a lobby for a challenge");
+                    send_challenge_failure("Could not open a lobby to play in.", ws_tx).await?;
+                    return Ok((None, None));
+                }
+            };
+            match lobby_manager
+                .join_lobby_for_pool(
+                    Some(lobby.lobby_code()),
+                    metadata.user_id,
+                    metadata.username.clone(),
+                    websocket_id.to_string(),
+                    region.to_string(),
+                    None,
+                    metadata.matchmaking_pool,
+                    metadata.distribution,
+                    metadata.supports_ad_break,
+                    metadata.can_show_video_ad,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let code = handle.lobby_code.clone();
+                    (Some(handle), Some(code))
+                }
+                Err(error) => {
+                    warn!(challenger_id, %error, "failed to join a lobby created for a challenge");
+                    send_challenge_failure("Could not open a lobby to play in.", ws_tx).await?;
+                    return Ok((None, None));
+                }
+            }
+        }
+    };
+
+    let Some(handle) = lobby else {
+        return Ok((None, created_code));
+    };
+
+    let created_at_ms = now_ms();
+    let challenge = Challenge {
+        challenge_id: new_challenge_id(challenger_id, target_user_id, created_at_ms),
+        from_user_id: challenger_id,
+        from_username: metadata.username.clone(),
+        to_user_id: target_user_id,
+        to_username: target_username,
+        lobby_code: handle.lobby_code.clone(),
+        state: ChallengeState::Pending,
+        created_at_ms,
+        expires_at_ms: created_at_ms.saturating_add(CHALLENGE_TTL_MS),
+    };
+
+    let store = ChallengeStore::new(redis.clone());
+    match store.issue(challenge).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(rejection)) => {
+            send_challenge_failure(rejection.reason(), ws_tx).await?;
+        }
+        Err(error) => {
+            warn!(challenger_id, target_user_id, %error, "failed to issue a challenge");
+            send_challenge_failure("Could not send that challenge. Try again.", ws_tx).await?;
+        }
+    }
+    // The challenger's own outgoing list is refreshed from the durable record,
+    // so a rejected challenge cannot leave a phantom entry on their screen.
+    let _ = send_challenge_inbox(challenger_id, &store, ws_tx).await;
+
+    Ok((Some(handle), created_code))
+}
+
 async fn handle_guest_nickname_update(
     db: &Arc<dyn Database>,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
     user_cache: UserCache,
     lobby: &Option<LobbyJoinHandle>,
-    metadata: &PlayerMetadata,
+    metadata: &mut PlayerMetadata,
     ws_tx: &mpsc::Sender<Message>,
     nickname: String,
 ) -> Result<()> {
@@ -405,6 +813,13 @@ async fn handle_guest_nickname_update(
     }
 
     db.update_guest_username(metadata.user_id, &trimmed).await?;
+
+    // The database is authoritative, but this connection's metadata is what
+    // subsequent chat and lobby actions use. Keep it in sync immediately once
+    // the durable rename commits, even if a later cache invalidation or lobby
+    // update notification fails.
+    refresh_connection_username(metadata, trimmed.clone());
+
     user_cache
         .remove_from_redis(metadata.user_id as u32)
         .await?;
@@ -474,7 +889,11 @@ impl JwtVerifier for TestJwtVerifier {
     }
 }
 
-// Connection state machine - simplified to 2 states
+// Connection state machine - simplified to 2 states. Keeping the authenticated
+// fields inline preserves the existing single-owner lobby-handle lifecycle;
+// boxing that handle would complicate detach/close paths for negligible gain
+// at the gateway's connection counts.
+#[allow(clippy::large_enum_variant)]
 enum ConnectionState {
     // Initial state - waiting for authentication
     Unauthenticated,
@@ -551,6 +970,7 @@ struct LobbyUpdateFingerprint {
     host_user_id: i32,
     state: String,
     preferences: lobby_manager::LobbyPreferences,
+    ad_break: Option<LobbyAdBreakView>,
 }
 
 /// Publish the durable lobby snapshot, rather than trusting the at-most-once
@@ -571,7 +991,9 @@ async fn send_authoritative_lobby_update(
             host_user_id: 0,
             state: "deleted".to_owned(),
             preferences: lobby_manager::LobbyPreferences::default(),
+            ad_break: None,
         });
+    let ad_break = lobby.ad_break.as_ref().map(LobbyAdBreak::view);
     let fingerprint = LobbyUpdateFingerprint {
         lobby_code: lobby.lobby_code.clone(),
         members: lobby
@@ -582,6 +1004,7 @@ async fn send_authoritative_lobby_update(
         host_user_id: lobby.host_user_id,
         state: lobby.state.clone(),
         preferences: lobby.preferences.clone(),
+        ad_break: ad_break.clone(),
     };
     if last_sent_update.as_ref() == Some(&fingerprint) {
         return Ok(true);
@@ -592,6 +1015,7 @@ async fn send_authoritative_lobby_update(
         host_user_id: lobby.host_user_id,
         state: lobby.state,
         preferences: lobby.preferences,
+        ad_break,
     };
     let json_msg = serde_json::to_string(&ws_message)?;
     if ws_tx.send(Message::Text(json_msg.into())).await.is_err() {
@@ -613,12 +1037,13 @@ pub async fn handle_websocket(
     pubsub_manager: Arc<PubSubManager>,
     game_bus: Arc<GameBus>,
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
+    event_router: Arc<crate::replication::GameEventRouter>,
     cancellation_token: CancellationToken,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
     region: String,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    ads_config: Arc<AdsConfig>,
 ) {
     info!("New WebSocket connection established");
 
@@ -632,13 +1057,14 @@ pub async fn handle_websocket(
         matchmaking_manager,
         jwt_verifier,
         cancellation_token,
-        replication_manager,
+        event_router,
         redis,
         redis_url,
         lobby_manager,
         region,
         lifecycle,
         cluster_namespace,
+        ads_config,
     )
     .await
     {
@@ -693,13 +1119,14 @@ async fn handle_websocket_connection(
     matchmaking_manager: Arc<Mutex<MatchmakingManager>>,
     jwt_verifier: Arc<dyn JwtVerifier>,
     cancellation_token: CancellationToken,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
+    event_router: Arc<crate::replication::GameEventRouter>,
     redis: RedisConnection,
     redis_url: String,
     lobby_manager: Arc<crate::lobby_manager::LobbyManager>,
     region: String,
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
+    ads_config: Arc<AdsConfig>,
 ) -> Result<()> {
     // Split the WebSocket into send and receive parts using futures_util
     let (mut ws_sink, mut ws_stream) = futures_util::StreamExt::split(ws_stream);
@@ -740,6 +1167,10 @@ async fn handle_websocket_connection(
 
     // Will be used to track game chat subscription
     let mut game_chat_handle: Option<JoinHandle<()>> = None;
+
+    // Presence lease + challenge delivery, claimed once this connection has an
+    // authenticated identity to be present *as*.
+    let mut social_session: Option<SocialSession> = None;
 
     // Spawn task to forward messages from channel to WebSocket
     let forward_task = tokio::spawn(async move {
@@ -910,7 +1341,7 @@ async fn handle_websocket_connection(
                                             )
                                             .await;
                                             let ws_tx_clone = ws_tx.clone();
-                                            let replication_manager_clone = replication_manager.clone();
+                                            let event_router_clone = event_router.clone();
                                             let db_clone = db.clone();
                                             let game_bus_clone = game_bus.clone();
                                             let cluster_namespace_clone = cluster_namespace.clone();
@@ -919,7 +1350,7 @@ async fn handle_websocket_connection(
                                                     resync_game_id,
                                                     user_id,
                                                     ws_tx_clone,
-                                                    replication_manager_clone,
+                                                    event_router_clone,
                                                     db_clone,
                                                     game_bus_clone,
                                                     cluster_namespace_clone,
@@ -977,7 +1408,7 @@ async fn handle_websocket_connection(
                                         &ws_tx,
                                         &game_bus,
                                         &matchmaking_manager,
-                                        &replication_manager,
+                                        &event_router,
                                         &redis,
                                         &redis_url,
                                         &lobby_manager,
@@ -986,6 +1417,8 @@ async fn handle_websocket_connection(
                                         &lifecycle,
                                         socket_generation,
                                         &cluster_namespace,
+                                        &cancellation_token,
+                                        &ads_config,
                                     ).await {
                                         Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby
@@ -1000,6 +1433,48 @@ async fn handle_websocket_connection(
                                                 None => entered_game_id.is_some() && !was_in_game,
                                             };
                                             let entering_lobby = matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. }) && !was_in_lobby;
+
+                                            // Join the social layer the moment there is an identity to be
+                                            // present as, and keep the roster's activity honest afterwards.
+                                            // A failed claim (a Redis blip at exactly the wrong moment)
+                                            // retries on the next inbound message rather than leaving this
+                                            // connection socially invisible for its whole life.
+                                            if let ConnectionState::Authenticated { metadata, .. } = &new_state {
+                                                if social_session.is_none() && social_layer_admits(metadata) {
+                                                    social_session = start_social_session(
+                                                        metadata,
+                                                        &websocket_id,
+                                                        &region,
+                                                        &redis,
+                                                        &pubsub_manager,
+                                                        &event_router,
+                                                        &db,
+                                                        &ws_tx,
+                                                    )
+                                                    .await;
+                                                } else if social_session.is_some() {
+                                                    let activity = match &new_state {
+                                                        ConnectionState::Authenticated { game_id: Some(_), .. } => {
+                                                            PresenceActivity::Playing
+                                                        }
+                                                        ConnectionState::Authenticated { lobby_handle: Some(_), .. } => {
+                                                            PresenceActivity::Lobby
+                                                        }
+                                                        _ => PresenceActivity::Idle,
+                                                    };
+                                                    let seated_game_id = match &new_state {
+                                                        ConnectionState::Authenticated { game_id, .. } => *game_id,
+                                                        ConnectionState::Unauthenticated => None,
+                                                    };
+                                                    record_presence_activity(
+                                                        social_session.as_ref(),
+                                                        metadata,
+                                                        activity,
+                                                        seated_game_id,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
                                             let leaving_lobby = was_in_lobby && !matches!(&new_state, ConnectionState::Authenticated { lobby_handle: Some(_), .. });
                                             let leaving_game = was_in_game && !matches!(&new_state, ConnectionState::Authenticated { game_id: Some(_), .. });
                                             debug!("State transitioned to: entering_game: {}, entering_lobby: {}, leaving_lobby: {}, leaving_game: {}",
@@ -1020,7 +1495,7 @@ async fn handle_websocket_connection(
                                                     }
 
                                                     let ws_tx_clone = ws_tx.clone();
-                                                    let replication_manager_clone = replication_manager.clone();
+                                                    let event_router_clone = event_router.clone();
                                                     let db_clone = db.clone();
                                                     let game_bus_clone = game_bus.clone();
                                                     let cluster_namespace_clone = cluster_namespace.clone();
@@ -1030,7 +1505,7 @@ async fn handle_websocket_connection(
                                                             game_id,
                                                             user_id,
                                                             ws_tx_clone,
-                                                            replication_manager_clone,
+                                                            event_router_clone,
                                                             db_clone,
                                                             game_bus_clone,
                                                             cluster_namespace_clone,
@@ -1090,7 +1565,7 @@ async fn handle_websocket_connection(
 
                                             // Handle lobby state transitions
                                             if entering_lobby
-                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), .. } = &mut new_state {
+                                                && let ConnectionState::Authenticated { lobby_handle: Some(lobby_handle), metadata, .. } = &mut new_state {
                                                 if let Some(handle) = lobby_update_handle.take() {
                                                     handle.abort();
                                                 }
@@ -1101,9 +1576,14 @@ async fn handle_websocket_connection(
                                                     let mut lobby_rx = take_lobby_update_receiver(&mut lobby_handle.rx);
                                                     let lobby_code_for_updates = lobby_handle.lobby_code.clone();
                                                     let lobby_code_for_match = lobby_handle.lobby_code.clone();
+                                                    let lobby_user_id_for_match = metadata.user_id as u32;
+                                                    let lobby_scope_cancellation = lobby_handle.scope_cancellation_token();
                                                     let ws_tx_clone = ws_tx.clone();
                                                     let cancellation_token_clone = cancellation_token.clone();
+                                                    let lobby_scope_for_updates = lobby_scope_cancellation.clone();
                                                     let lobby_manager_clone = lobby_manager.clone();
+                                                    let db_for_ad_break_recovery = db.clone();
+                                                    let matchmaking_for_ad_break_recovery = matchmaking_manager.clone();
 
                                                     lobby_update_handle = Some(tokio::spawn(async move {
                                                         let mut last_sent_update = None;
@@ -1115,9 +1595,12 @@ async fn handle_websocket_connection(
                                                         );
                                                         loop {
                                                             tokio::select! {
-                                                                biased;
                                                                 _ = cancellation_token_clone.cancelled() => {
                                                                     debug!("Lobby update task cancelled for lobby {}", lobby_code_for_updates);
+                                                                    break;
+                                                                }
+                                                                _ = lobby_scope_for_updates.cancelled() => {
+                                                                    debug!("Superseded lobby scope stopped reconciliation for {}", lobby_code_for_updates);
                                                                     break;
                                                                 }
                                                                 update = lobby_rx.recv() => {
@@ -1150,6 +1633,18 @@ async fn handle_websocket_connection(
                                                                     }
                                                                 }
                                                                 _ = reconciliation.tick() => {
+                                                                    if let Err(error) = expire_lobby_ad_break_if_due(
+                                                                        &lobby_code_for_updates,
+                                                                        &db_for_ad_break_recovery,
+                                                                        &lobby_manager_clone,
+                                                                        &matchmaking_for_ad_break_recovery,
+                                                                    ).await {
+                                                                        warn!(
+                                                                            lobby_code = lobby_code_for_updates,
+                                                                            %error,
+                                                                            "Failed to recover an expired lobby ad break"
+                                                                        );
+                                                                    }
                                                                     match send_authoritative_lobby_update(
                                                                         &lobby_manager_clone,
                                                                         &lobby_code_for_updates,
@@ -1179,16 +1674,21 @@ async fn handle_websocket_connection(
                                                     let pubsub_manager_clone_for_match = pubsub_manager.clone();
                                                     let redis_clone_for_match = redis.clone();
                                                     let cancellation_token_clone_for_match = cancellation_token.clone();
+                                                    let lobby_scope_for_match = lobby_scope_cancellation.clone();
 
                                                     lobby_match_handle = Some(tokio::spawn(async move {
-                                                        subscribe_to_lobby_match_notifications(
-                                                            lobby_code_for_match,
-                                                            pubsub_manager_clone_for_match,
-                                                            redis_clone_for_match,
-                                                            ws_tx_clone_for_match,
-                                                            cancellation_token_clone_for_match,
-                                                        )
-                                                        .await;
+                                                        tokio::select! {
+                                                            _ = lobby_scope_for_match.cancelled() => {}
+                                                            _ = subscribe_to_lobby_match_notifications(
+                                                                lobby_code_for_match,
+                                                                lobby_user_id_for_match,
+                                                                pubsub_manager_clone_for_match,
+                                                                redis_clone_for_match,
+                                                                ws_tx_clone_for_match,
+                                                                cancellation_token_clone_for_match,
+                                                                LOBBY_MATCH_RECONCILIATION_INTERVAL,
+                                                            ) => {}
+                                                        }
                                                     }));
 
                                                     // Subscribe to lobby chat
@@ -1196,15 +1696,19 @@ async fn handle_websocket_connection(
                                                     let pubsub_manager_clone = pubsub_manager.clone();
 
                                                     let lobby_code_for_chat = lobby_handle.lobby_code.clone();
+                                                    let lobby_scope_for_chat = lobby_scope_cancellation.clone();
                                                     lobby_chat_handle = Some(tokio::spawn(async move {
-                                                        if let Err(e) = subscribe_to_lobby_chat(
-                                                            lobby_code_for_chat,
-                                                            pubsub_manager_clone,
-                                                            ws_tx_clone,
-                                                        )
-                                                        .await
-                                                        {
-                                                            error!("Lobby chat subscription failed: {}", e);
+                                                        tokio::select! {
+                                                            _ = lobby_scope_for_chat.cancelled() => {}
+                                                            result = subscribe_to_lobby_chat(
+                                                                lobby_code_for_chat,
+                                                                pubsub_manager_clone,
+                                                                ws_tx_clone,
+                                                            ) => {
+                                                                if let Err(e) = result {
+                                                                    error!("Lobby chat subscription failed: {}", e);
+                                                                }
+                                                            }
                                                         }
                                                     }));
 
@@ -1339,6 +1843,12 @@ async fn handle_websocket_connection(
     if let Some(handle) = game_chat_handle {
         handle.abort();
     }
+    // Give up the presence lease and withdraw anything still pending, so this
+    // player leaves the roster immediately instead of at lease expiry and
+    // nobody is left holding an unanswerable invitation.
+    if let Some(session) = social_session.take() {
+        session.close().await;
+    }
     forward_task.abort();
 
     info!("WebSocket connection closed");
@@ -1349,8 +1859,9 @@ async fn publish_lobby_chat_message(
     mut redis: RedisConnection,
     payload: LobbyChatBroadcast,
 ) -> Result<()> {
-    let channel = RedisKeys::lobby_chat_channel(&payload.lobby_code);
-    let history_key = RedisKeys::lobby_chat_history_key(&payload.lobby_code);
+    let payload = RedisLobbyChatPayload::from_filtered(payload);
+    let channel = RedisKeys::lobby_chat_channel(&payload.chat.lobby_code);
+    let history_key = RedisKeys::lobby_chat_history_key(&payload.chat.lobby_code);
     let serialized =
         serde_json::to_string(&payload).context("Failed to serialize lobby chat payload")?;
 
@@ -1375,8 +1886,9 @@ async fn publish_game_chat_message(
     mut redis: RedisConnection,
     payload: GameChatBroadcast,
 ) -> Result<()> {
-    let channel = RedisKeys::game_chat_channel(payload.game_id);
-    let history_key = RedisKeys::game_chat_history_key(payload.game_id);
+    let payload = RedisGameChatPayload::from_filtered(payload);
+    let channel = RedisKeys::game_chat_channel(payload.chat.game_id);
+    let history_key = RedisKeys::game_chat_history_key(payload.chat.game_id);
     let serialized =
         serde_json::to_string(&payload).context("Failed to serialize game chat payload")?;
 
@@ -1399,7 +1911,7 @@ async fn publish_game_chat_message(
 
 #[allow(clippy::too_many_arguments)]
 async fn queue_existing_lobby_for_game_types(
-    lobby_handle: &LobbyJoinHandle,
+    lobby_code: &str,
     game_types: &[common::GameType],
     queue_mode: &common::QueueMode,
     db: &Arc<dyn Database>,
@@ -1407,13 +1919,12 @@ async fn queue_existing_lobby_for_game_types(
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
     requesting_user_id: u32,
     matchmaking_pool: MatchmakingPool,
+    expected_ad_break_id: Option<&str>,
 ) -> Result<()> {
-    if game_types.is_empty() {
-        return Err(anyhow!("Must specify at least one game type to queue"));
-    }
+    validate_matchmaking_game_types(game_types)?;
 
     let lobby_metadata = lobby_manager
-        .get_lobby_metadata(&lobby_handle.lobby_code)
+        .get_lobby_metadata(lobby_code)
         .await
         .context("Failed to load lobby metadata before queueing")?
         .ok_or_else(|| anyhow!("Lobby no longer exists"))?;
@@ -1422,44 +1933,517 @@ async fn queue_existing_lobby_for_game_types(
     }
 
     let members_map = lobby_manager
-        .get_lobby_members(&lobby_handle.lobby_code)
+        .get_lobby_members(lobby_code)
         .await
         .context("Failed to load lobby members before queueing")?;
 
     if members_map.is_empty() {
         return Err(anyhow!("Lobby has no active members to queue"));
     }
+    if members_map.len() > MAX_LOBBY_MEMBERS {
+        return Err(anyhow!("Lobby exceeds the supported member limit"));
+    }
+    if !members_map.contains_key(&requesting_user_id) {
+        return Err(anyhow!(
+            "The requesting user is not an active member of this lobby"
+        ));
+    }
 
-    let members: Vec<LobbyMember> = members_map.into_values().collect();
-    let avg_mmr = compute_lobby_avg_mmr(db, &members, matchmaking_pool).await?;
+    let expected_user_ids: Vec<u32> = members_map.keys().copied().collect();
+    let initial_members: Vec<LobbyMember> = members_map.into_values().collect();
+    let avg_mmr = compute_lobby_avg_mmr(db, &initial_members, matchmaking_pool).await?;
 
-    let mut mm_guard = matchmaking_manager.lock().await;
-    mm_guard
-        .add_lobby_to_queue_in_pool(
-            &lobby_handle.lobby_code,
-            members,
-            avg_mmr,
-            game_types.to_vec(),
-            queue_mode.clone(),
-            requesting_user_id,
-            matchmaking_pool,
-        )
-        .await
-        .context("Failed to add lobby to matchmaking queue")?;
-    drop(mm_guard);
+    // MMR reads may consume most of a short presence lease. Re-snapshot while
+    // holding the admission mutex, and retry only typed membership conflicts;
+    // this keeps the roster fence fresh without making users watch another ad.
+    let mut admitted = false;
+    for attempt in 0..3_u64 {
+        let mut mm_guard = matchmaking_manager.lock().await;
+        let membership_revision = lobby_manager
+            .get_lobby_membership_revision(lobby_code)
+            .await
+            .context("Failed to refresh lobby membership revision")?;
+        let fresh_members_map = lobby_manager
+            .get_lobby_members(lobby_code)
+            .await
+            .context("Failed to refresh lobby members before admission")?;
+        let fresh_user_ids: Vec<u32> = fresh_members_map.keys().copied().collect();
+        if fresh_user_ids != expected_user_ids
+            || !fresh_members_map.contains_key(&requesting_user_id)
+        {
+            return Err(anyhow!(
+                "Lobby membership changed while matchmaking was being prepared"
+            ));
+        }
+        let membership_fence = LobbyMembershipFence {
+            revision: membership_revision,
+            valid_until_ms: lobby_membership_valid_until_ms(fresh_members_map.values())?,
+        };
+        let fresh_members: Vec<LobbyMember> = fresh_members_map.into_values().collect();
+        let admission = mm_guard
+            .add_lobby_to_queue_in_pool_with_membership_fence(
+                lobby_code,
+                fresh_members,
+                avg_mmr,
+                game_types.to_vec(),
+                queue_mode.clone(),
+                requesting_user_id,
+                matchmaking_pool,
+                expected_ad_break_id,
+                membership_fence,
+            )
+            .await;
+        drop(mm_guard);
 
-    if let Err(error) = lobby_manager
-        .publish_lobby_update(&lobby_handle.lobby_code)
-        .await
-    {
+        match admission {
+            Ok(()) => {
+                admitted = true;
+                break;
+            }
+            Err(error)
+                if attempt < 2
+                    && error
+                        .downcast_ref::<LobbyAdmissionRejected>()
+                        .is_some_and(LobbyAdmissionRejected::is_retryable_membership_conflict) =>
+            {
+                tokio::time::sleep(Duration::from_millis(10 * (attempt + 1))).await;
+            }
+            Err(error) => {
+                return Err(error).context("Failed to add lobby to matchmaking queue");
+            }
+        }
+    }
+    if !admitted {
+        return Err(anyhow!(
+            "Lobby membership remained unstable during matchmaking admission"
+        ));
+    }
+
+    if let Err(error) = lobby_manager.publish_lobby_update(lobby_code).await {
         warn!(
-            lobby_code = lobby_handle.lobby_code,
+            lobby_code,
             %error,
             "Failed to publish queued lobby state"
         );
     }
 
     Ok(())
+}
+
+fn validate_matchmaking_game_types(game_types: &[common::GameType]) -> Result<()> {
+    if game_types.is_empty() {
+        return Err(anyhow!("Must specify at least one game type to queue"));
+    }
+    if game_types.len() > MATCHMAKING_GAME_TYPES.len() {
+        return Err(anyhow!(
+            "At most {} game types may be queued",
+            MATCHMAKING_GAME_TYPES.len()
+        ));
+    }
+    for (index, game_type) in game_types.iter().enumerate() {
+        if !MATCHMAKING_GAME_TYPES.contains(game_type) {
+            return Err(anyhow!("Unsupported matchmaking game type"));
+        }
+        if game_types[..index].contains(game_type) {
+            return Err(anyhow!("Duplicate matchmaking game type"));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_lobby_ad_break(
+    ad_break: &LobbyAdBreak,
+    lobby_code: &str,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+) -> Result<()> {
+    let Some(finalization_lease) = lobby_manager
+        .claim_ad_break_finalization(lobby_code, &ad_break.id)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let current_members = lobby_manager
+        .get_lobby_members(lobby_code)
+        .await
+        .context("Failed to reload lobby members after ad break")?;
+    let current_user_ids: Vec<u32> = current_members.keys().copied().collect();
+    if current_user_ids != ad_break.participant_user_ids {
+        lobby_manager
+            .cancel_ad_break(lobby_code, &ad_break.id)
+            .await?;
+        return Err(anyhow!(
+            "Lobby membership changed during the ad break; start matchmaking again"
+        ));
+    }
+
+    let admission = queue_existing_lobby_for_game_types(
+        lobby_code,
+        &ad_break.game_types,
+        &ad_break.queue_mode,
+        db,
+        lobby_manager,
+        matchmaking_manager,
+        ad_break.requesting_user_id,
+        ad_break.matchmaking_pool,
+        Some(&ad_break.id),
+    )
+    .await;
+
+    match admission {
+        Ok(()) => {
+            lobby_manager
+                .clear_ad_break(lobby_code, &ad_break.id)
+                .await?;
+            lobby_manager.publish_lobby_update(lobby_code).await?;
+            finalization_lease.release().await;
+            Ok(())
+        }
+        Err(error) => {
+            if error
+                .downcast_ref::<LobbyAdmissionRejected>()
+                .is_some_and(LobbyAdmissionRejected::is_retryable_membership_conflict)
+            {
+                // Keep the already-resolved break durable. Releasing the
+                // claim lets the one-second reconciler retry with a fresh
+                // roster/lease without showing another ad.
+                finalization_lease.release().await;
+                return Err(error);
+            }
+            // If admission committed but its response was lost, the queue Lua
+            // script already changed state to queued and this compare/cancel
+            // is harmless. Otherwise return the lobby to waiting.
+            let _ = lobby_manager
+                .cancel_ad_break(lobby_code, &ad_break.id)
+                .await;
+            Err(error)
+        }
+    }
+}
+
+async fn expire_lobby_ad_break_if_due(
+    lobby_code: &str,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+) -> Result<bool> {
+    let Some(metadata) = lobby_manager.get_lobby_metadata(lobby_code).await? else {
+        return Ok(false);
+    };
+    let Some(active) = metadata.ad_break else {
+        return Ok(false);
+    };
+    // A crash can occur after the final durable resolution but before queue
+    // admission. Recover that state immediately; only unresolved breaks wait
+    // for the safety deadline authored by the metadata-slot Redis clock.
+    if active.is_resolved() {
+        finalize_lobby_ad_break(&active, lobby_code, db, lobby_manager, matchmaking_manager)
+            .await?;
+        return Ok(true);
+    }
+
+    match lobby_manager
+        .resolve_ad_break(lobby_code, &active.id, 0, AdBreakResolution::TimedOut)
+        .await?
+    {
+        AdBreakResolutionResult::Ready(resolved) => {
+            finalize_lobby_ad_break(
+                &resolved,
+                lobby_code,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+            )
+            .await?;
+            Ok(true)
+        }
+        AdBreakResolutionResult::Pending(_)
+        | AdBreakResolutionResult::NotDue(_)
+        | AdBreakResolutionResult::NoChange(_)
+        | AdBreakResolutionResult::Stale => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_lobby_or_begin_ad_break(
+    lobby_code: &str,
+    game_types: &[common::GameType],
+    queue_mode: &common::QueueMode,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
+    requesting_user_id: u32,
+    matchmaking_pool: MatchmakingPool,
+    ads_config: &Arc<AdsConfig>,
+) -> Result<bool> {
+    // Validate the client-controlled fan-out before eligibility work or an ad
+    // break. Users must never watch an ad for queue families no worker drains.
+    validate_matchmaking_game_types(game_types)?;
+
+    if !ads_config.any_pre_match_video_enabled() || matchmaking_pool != MatchmakingPool::Public {
+        queue_existing_lobby_for_game_types(
+            lobby_code,
+            game_types,
+            queue_mode,
+            db,
+            lobby_manager,
+            matchmaking_manager,
+            requesting_user_id,
+            matchmaking_pool,
+            None,
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    // Runtime policy is strongly consistent and fail-closed for advertising.
+    // A control-plane outage must never delay gameplay or reuse stale ad
+    // authorization, so it falls through directly to normal matchmaking.
+    let runtime_record = match db.get_runtime_config().await {
+        Ok(record) if record.config.ads.enabled => record,
+        Ok(_) => {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+        Err(error) => {
+            warn!(lobby_code, %error, "Runtime ad policy unavailable; skipping ad break");
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+    let runtime_ads = &runtime_record.config.ads;
+
+    for snapshot_attempt in 0..3_u64 {
+        let membership_revision = lobby_manager
+            .get_lobby_membership_revision(lobby_code)
+            .await
+            .context("Failed to load lobby membership fence for ad eligibility")?;
+        let members = lobby_manager
+            .get_lobby_members(lobby_code)
+            .await
+            .context("Failed to load lobby members for ad eligibility")?;
+        if members.is_empty() {
+            return Err(anyhow!("Lobby has no active members to queue"));
+        }
+        if !members.contains_key(&requesting_user_id) {
+            return Err(anyhow!(
+                "The requesting user is not an active member of this lobby"
+            ));
+        }
+        if members.len() > MAX_AD_BREAK_PARTICIPANTS {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+        let membership_valid_until_ms = lobby_membership_valid_until_ms(members.values())?;
+
+        let Some(ad_user_ids) = lobby_video_ad_targets(members.values(), runtime_ads) else {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        };
+
+        let mut users = Vec::with_capacity(members.len());
+        for member in members.values() {
+            match db.get_user_by_id(member.user_id as i32).await {
+                Ok(Some(user)) => users.push(user),
+                Ok(None) => {
+                    // Missing history is treated as a newcomer. Skipping the ad
+                    // is conservative and never blocks matchmaking.
+                    users.clear();
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        lobby_code,
+                        user_id = member.user_id,
+                        %error,
+                        "Could not load ad eligibility; skipping the lobby ad break"
+                    );
+                    users.clear();
+                    break;
+                }
+            }
+        }
+
+        let eligible = users.len() == members.len()
+            && lobby_meets_game_threshold(
+                users.iter().map(|user| &user.games_played),
+                runtime_ads.minimum_games_played,
+            );
+        if !eligible {
+            queue_existing_lobby_for_game_types(
+                lobby_code,
+                game_types,
+                queue_mode,
+                db,
+                lobby_manager,
+                matchmaking_manager,
+                requesting_user_id,
+                matchmaking_pool,
+                None,
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let break_id = uuid::Uuid::new_v4().to_string();
+        let minimum_interval_ms =
+            i64::from(runtime_ads.minimum_interval_minutes).saturating_mul(60_000);
+        match db
+            .try_claim_pre_match_ad_break(
+                &break_id,
+                &ad_user_ids,
+                now_ms,
+                minimum_interval_ms,
+                runtime_record.version,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                queue_existing_lobby_for_game_types(
+                    lobby_code,
+                    game_types,
+                    queue_mode,
+                    db,
+                    lobby_manager,
+                    matchmaking_manager,
+                    requesting_user_id,
+                    matchmaking_pool,
+                    None,
+                )
+                .await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                warn!(lobby_code, %error, "Could not claim ad cooldown; skipping ad break");
+                queue_existing_lobby_for_game_types(
+                    lobby_code,
+                    game_types,
+                    queue_mode,
+                    db,
+                    lobby_manager,
+                    matchmaking_manager,
+                    requesting_user_id,
+                    matchmaking_pool,
+                    None,
+                )
+                .await?;
+                return Ok(false);
+            }
+        }
+        let timeout_ms = i64::try_from(ads_config.ad_break_timeout.as_millis()).unwrap_or(i64::MAX);
+        let requested = LobbyAdBreak {
+            id: break_id,
+            expires_at_ms: now_ms.saturating_add(timeout_ms),
+            participant_user_ids: members.keys().copied().collect(),
+            ad_user_ids,
+            resolutions: BTreeMap::new(),
+            game_types: game_types.to_vec(),
+            queue_mode: queue_mode.clone(),
+            requesting_user_id,
+            matchmaking_pool,
+        };
+        match lobby_manager
+            .begin_ad_break(
+                lobby_code,
+                &requested,
+                membership_revision,
+                membership_valid_until_ms,
+                ads_config.ad_break_timeout,
+            )
+            .await?
+        {
+            BeginAdBreakResult::Active { .. } => {
+                // Every connected lobby session runs the authoritative
+                // one-second reconciliation loop. Avoid retaining one
+                // detached timer task per rapidly-cycled break.
+                return Ok(true);
+            }
+            BeginAdBreakResult::MembershipChanged if snapshot_attempt < 2 => {
+                tokio::time::sleep(Duration::from_millis(10 * (snapshot_attempt + 1))).await;
+            }
+            BeginAdBreakResult::MembershipChanged => {
+                return Err(anyhow!(
+                    "Lobby membership kept changing while matchmaking was preparing; retry shortly"
+                ));
+            }
+        }
+    }
+    unreachable!("bounded lobby snapshot loop always returns")
+}
+
+/// All members must understand the barrier, while only one needs an enabled
+/// video provider. This permits mixed web/CrazyGames/itch lobbies: no-ad
+/// sessions resolve `unavailable`, and ad-enabled sessions use their own
+/// distribution-specific adapter.
+fn lobby_video_ad_targets<'a>(
+    members: impl IntoIterator<Item = &'a LobbyMember>,
+    runtime_ads: &RuntimeAdsConfig,
+) -> Option<Vec<u32>> {
+    let mut targets = Vec::new();
+    for member in members {
+        if !member.supports_ad_break {
+            return None;
+        }
+        let runtime_distribution_enabled = match member.distribution {
+            Some(ClientDistribution::Web) => runtime_ads.distributions.web.enabled,
+            Some(ClientDistribution::CrazyGames) => runtime_ads.distributions.crazygames.enabled,
+            Some(ClientDistribution::Itch) => runtime_ads.distributions.itch.enabled,
+            None => false,
+        };
+        if member.can_show_video_ad && runtime_distribution_enabled {
+            targets.push(member.user_id);
+        }
+    }
+    (!targets.is_empty()).then_some(targets)
 }
 
 async fn compute_lobby_avg_mmr(
@@ -1515,9 +2499,21 @@ async fn load_lobby_chat_history(
         .context("Failed to load lobby chat history")?;
 
     let mut messages = Vec::with_capacity(entries.len());
+    let mut repairs = Vec::new();
     for entry in entries {
-        match serde_json::from_str::<LobbyChatBroadcast>(&entry) {
-            Ok(chat) => messages.push(chat),
+        match serde_json::from_str::<RedisLobbyChatPayload>(&entry) {
+            Ok(mut payload) => {
+                if payload.filter_legacy() {
+                    match serde_json::to_string(&payload) {
+                        Ok(replacement) => repairs.push((entry, replacement)),
+                        Err(error) => warn!(
+                            "Failed to serialize repaired lobby chat history entry for lobby '{}': {}",
+                            lobby_code, error
+                        ),
+                    }
+                }
+                messages.push(payload.chat);
+            }
             Err(e) => {
                 warn!(
                     "Failed to deserialize lobby chat history entry for lobby '{}': {}",
@@ -1525,6 +2521,15 @@ async fn load_lobby_chat_history(
                 );
             }
         }
+    }
+
+    if let Err(error) = repair_legacy_chat_history(&mut redis, &key, &repairs).await {
+        warn!(
+            "Failed to repair {} legacy lobby chat history entries for lobby '{}': {}",
+            repairs.len(),
+            lobby_code,
+            error
+        );
     }
 
     Ok(messages)
@@ -1541,9 +2546,21 @@ async fn load_game_chat_history(
         .context("Failed to load game chat history")?;
 
     let mut messages = Vec::with_capacity(entries.len());
+    let mut repairs = Vec::new();
     for entry in entries {
-        match serde_json::from_str::<GameChatBroadcast>(&entry) {
-            Ok(chat) => messages.push(chat),
+        match serde_json::from_str::<RedisGameChatPayload>(&entry) {
+            Ok(mut payload) => {
+                if payload.filter_legacy() {
+                    match serde_json::to_string(&payload) {
+                        Ok(replacement) => repairs.push((entry, replacement)),
+                        Err(error) => warn!(
+                            "Failed to serialize repaired game chat history entry for game {}: {}",
+                            game_id, error
+                        ),
+                    }
+                }
+                messages.push(payload.chat);
+            }
             Err(e) => {
                 warn!(
                     "Failed to deserialize game chat history entry for game {}: {}",
@@ -1553,7 +2570,38 @@ async fn load_game_chat_history(
         }
     }
 
+    if let Err(error) = repair_legacy_chat_history(&mut redis, &key, &repairs).await {
+        warn!(
+            "Failed to repair {} legacy game chat history entries for game {}: {}",
+            repairs.len(),
+            game_id,
+            error
+        );
+    }
+
     Ok(messages)
+}
+
+async fn repair_legacy_chat_history(
+    redis: &mut RedisConnection,
+    key: &str,
+    repairs: &[(String, String)],
+) -> Result<()> {
+    if repairs.is_empty() {
+        return Ok(());
+    }
+
+    let script = redis::Script::new(REPAIR_LEGACY_CHAT_HISTORY_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation.key(key);
+    for (legacy, replacement) in repairs {
+        invocation.arg(legacy).arg(replacement);
+    }
+    invocation
+        .invoke_async::<i64>(redis)
+        .await
+        .context("Failed to atomically repair legacy chat history")?;
+    Ok(())
 }
 
 fn game_state_records_user(game_state: &GameState, user_id: u32) -> bool {
@@ -1578,7 +2626,7 @@ type CommandOutcomeReplay =
 enum GameSubscriptionInput {
     SocketClosed,
     CommandOutcomes(Option<ResolvedCommandState>),
-    Event(Result<GameEventMessage, broadcast::error::RecvError>),
+    Update(Option<crate::replication::SubscriptionUpdate>),
 }
 
 fn start_command_outcome_replay(
@@ -1603,7 +2651,7 @@ async fn wait_for_command_outcome_replay(
 
 async fn next_game_subscription_input(
     ws_tx: &mpsc::Sender<Message>,
-    rx: &mut crate::replication::FilteredEventReceiver,
+    subscription: &mut crate::replication::GameEventSubscription,
     replay: &mut Option<CommandOutcomeReplay>,
 ) -> GameSubscriptionInput {
     tokio::select! {
@@ -1611,7 +2659,7 @@ async fn next_game_subscription_input(
         outcomes = wait_for_command_outcome_replay(replay) => {
             GameSubscriptionInput::CommandOutcomes(outcomes)
         }
-        event = rx.recv() => GameSubscriptionInput::Event(event),
+        update = subscription.next() => GameSubscriptionInput::Update(update),
     }
 }
 
@@ -1628,7 +2676,7 @@ enum GameJoinAuthorizationError {
 impl std::fmt::Display for GameJoinAuthorizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Warming => formatter.write_str("game replica is warming"),
+            Self::Warming => formatter.write_str("game stream is warming"),
             Self::Denied(reason) => formatter.write_str(reason),
         }
     }
@@ -1725,48 +2773,37 @@ async fn has_durable_recovery_failure(
 }
 
 /// A targeted snapshot request can be missed while no executor owns the
-/// partition. Keep requesting this game through the bounded takeover window.
-async fn wait_for_live_game_after_snapshot_request(
+/// partition, and a just-committed match has no recovery envelope until its
+/// `GameCreated` is consumed and checkpointed. Keep requesting the game and
+/// polling the fenced envelope through the bounded takeover window; the
+/// envelope is the only authoritative state a gateway can read directly.
+async fn wait_for_authoritative_state_after_snapshot_request(
     game_id: u32,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
 ) -> Option<GameState> {
     let partition_id = game_id % PARTITION_COUNT;
     let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
-    let mut next_snapshot_request_at = tokio::time::Instant::now();
-    let mut check_recovery = true;
 
     loop {
-        if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
-            return Some(game_state);
+        // The router coalesces to one publish per game per 500 ms across
+        // every caller on this gateway.
+        if let Err(error) = event_router.request_game_snapshot(game_id).await {
+            warn!(game_id, partition_id, %error, "Failed to request cold-join snapshot");
         }
+
+        match game_bus.get_recovery(cluster_namespace, game_id).await {
+            Ok(Some(envelope)) => return Some(envelope.game_state),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(game_id, %error, "Failed to load recovery during cold-join warm-up");
+            }
+        }
+
         if tokio::time::Instant::now() >= deadline {
             return None;
         }
-
-        let now = tokio::time::Instant::now();
-        if now >= next_snapshot_request_at {
-            next_snapshot_request_at = now + Duration::from_millis(500);
-            match replication_manager.request_game_snapshot(game_id).await {
-                Ok(()) => check_recovery = true,
-                Err(error) => {
-                    warn!(game_id, partition_id, %error, "Failed to request cold-join snapshots");
-                }
-            }
-        }
-
-        if check_recovery {
-            match game_bus.get_recovery(cluster_namespace, game_id).await {
-                Ok(Some(envelope)) => return Some(envelope.game_state),
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(game_id, %error, "Failed to load recovery during cold-join warm-up");
-                }
-            }
-            check_recovery = false;
-        }
-
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -1804,18 +2841,36 @@ fn command_outcomes_for_user(
         .collect()
 }
 
+/// Returns whether the durable `ActiveMatch` roster records this user as a
+/// participant (player or lobby-split spectator). The roster is written
+/// atomically at match commit, so it authorizes matchmade joins without any
+/// game-state read. Legacy and custom games have no roster and fall through
+/// to the recovery envelope.
+fn active_match_records_user(active_match: Option<&ActiveMatch>, user_id: u32) -> bool {
+    active_match.is_some_and(|active_match| {
+        active_match
+            .players
+            .iter()
+            .chain(active_match.spectators.iter())
+            .any(|player| player.user_id == user_id)
+    })
+}
+
 /// Resolve and authorize a JoinGame request before it changes connection state.
 ///
-/// Live games are authoritative in replication memory. Completed games may instead live in the
-/// short Redis reload cache or DynamoDB. Returning success means the requested user was present in
-/// the canonical state from one of those sources; callers may then enable game events and chat.
+/// Gateways hold no game state, so authorization comes from durable sources
+/// only: the `ActiveMatch` roster for matchmade games, the fenced recovery
+/// envelope for anything live, and the short Redis reload cache or DynamoDB
+/// for completed games. Returning success means the requested user was present
+/// in one of those canonical sources; callers may then enable game events and
+/// chat.
 #[allow(clippy::too_many_arguments)]
 async fn authorize_game_join_inner(
     game_id: u32,
     user_id: u32,
     matchmaking_pool: MatchmakingPool,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
@@ -1828,16 +2883,8 @@ async fn authorize_game_join_inner(
         })?;
     validate_game_matchmaking_pool(matchmaking_pool, active_match.as_ref())?;
 
-    if let Some(game_state) = replication_manager.get_game_state_when_ready(game_id).await {
-        if game_state_records_user(&game_state, user_id) {
-            return Ok(());
-        }
-
-        warn!(
-            "Denied live game {} join to user {}: user is not a recorded participant",
-            game_id, user_id
-        );
-        return Err(game_join_denied("This game is unavailable"));
+    if active_match_records_user(active_match.as_ref(), user_id) {
+        return Ok(());
     }
 
     if has_durable_recovery_failure(game_id, game_bus, cluster_namespace).await {
@@ -1846,11 +2893,10 @@ async fn authorize_game_join_inner(
         ));
     }
 
-    // During executor failover the authoritative recovery envelope can be
-    // available before this gateway's replica has consumed the takeover
-    // snapshot. It is sufficient for participant authorization; the event
-    // subscription below still waits for a fresh replica or uses this same
-    // recovery snapshot as its bridge.
+    // The fenced recovery envelope is the authoritative participant record
+    // for live games without a roster (legacy/custom), and for any user the
+    // roster does not list. The event subscription later uses this same
+    // envelope as its bridge snapshot.
     match game_bus.get_recovery(cluster_namespace, game_id).await {
         Ok(Some(envelope)) => {
             if game_state_records_user(&envelope.game_state, user_id) {
@@ -1868,7 +2914,7 @@ async fn authorize_game_join_inner(
         }
     }
 
-    let cached_active_state = match replication_manager.get_stored_snapshot(game_id).await {
+    let cached_active_state = match event_router.get_stored_snapshot(game_id).await {
         Ok(Some(game_state)) if matches!(game_state.status, GameStatus::Complete { .. }) => {
             if game_state_records_user(&game_state, user_id) {
                 return Ok(());
@@ -1939,10 +2985,11 @@ async fn authorize_game_join_inner(
 
     // Repeat the request while waiting: a request written during the lease gap
     // is intentionally not relied upon. This also covers the short interval
-    // after atomic matchmaking commit but before GameCreated is consumed.
-    if let Some(live_game_state) = wait_for_live_game_after_snapshot_request(
+    // after atomic matchmaking commit but before GameCreated is consumed and
+    // its initial envelope checkpointed.
+    if let Some(live_game_state) = wait_for_authoritative_state_after_snapshot_request(
         game_id,
-        replication_manager,
+        event_router,
         game_bus,
         cluster_namespace,
     )
@@ -2052,7 +3099,7 @@ async fn authorize_game_join(
     user_id: u32,
     matchmaking_pool: MatchmakingPool,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
@@ -2064,7 +3111,7 @@ async fn authorize_game_join(
             user_id,
             matchmaking_pool,
             matchmaking_manager,
-            replication_manager,
+            event_router,
             game_bus,
             cluster_namespace,
             db,
@@ -2095,7 +3142,7 @@ async fn notify_durable_active_game_after_auth(
     matchmaking_pool: MatchmakingPool,
     ws_tx: &mpsc::Sender<Message>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
     db: &Arc<dyn Database>,
@@ -2128,7 +3175,7 @@ async fn notify_durable_active_game_after_auth(
         user_id,
         matchmaking_pool,
         matchmaking_manager,
-        replication_manager,
+        event_router,
         game_bus,
         cluster_namespace,
         db,
@@ -2176,6 +3223,78 @@ async fn notify_durable_active_game_after_auth(
     Ok(())
 }
 
+/// Publish a readiness confirmation once the game provably exists.
+///
+/// A hint-driven client can confirm readiness milliseconds after the
+/// matchmaking commit — before the outbox scanner has delivered `GameCreated`
+/// into the partition command stream. Publishing immediately would let the
+/// confirmation precede `GameCreated` in that stream and be quarantined as
+/// targeting an inactive game. The fenced recovery envelope is written by the
+/// same incorporation that creates the actor, so its existence is durable
+/// proof the confirmation can no longer outrun creation. The wait fails open
+/// at its deadline: a confirmation the executor cannot attribute costs the
+/// player nothing worse than waiting out the readiness deadline.
+///
+/// The wait deliberately outlives its socket — a player who confirms and
+/// immediately reconnects has still confirmed — but not its server: it is
+/// bound to the task cancellation token so shutdown cannot be raced by a
+/// publish on a retiring gateway's connections. Abandoning is safe because a
+/// drained client re-joins elsewhere and re-confirms well inside
+/// `MATCH_READY_WINDOW_MS`.
+async fn publish_player_ready_after_game_exists(
+    game_bus: Arc<GameBus>,
+    cluster_namespace: ClusterNamespace,
+    game_id: u32,
+    user_id: u32,
+    cancellation_token: CancellationToken,
+) {
+    let partition_id = game_id % PARTITION_COUNT;
+    let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
+    loop {
+        let recovery = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return,
+            recovery = game_bus.get_recovery(&cluster_namespace, game_id) => recovery,
+        };
+        match recovery {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(game_id, user_id, %error, "Failed to check game existence before readiness");
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                game_id,
+                user_id, "Publishing readiness without game-existence proof after bounded wait"
+            );
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
+    match game_bus
+        .publish_player_ready_unless_completed(&cluster_namespace, partition_id, game_id, &event)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                game_id,
+                user_id, "Readiness arrived after the game completed"
+            );
+        }
+        Err(error) => {
+            warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
+        }
+    }
+}
+
 fn recovery_bridge_snapshot(envelope: &RecoveryEnvelopeV2, user_id: u32) -> GameEventMessage {
     // Despite its historical name, `next_event_stream_sequence` is the last
     // sequence already emitted and checkpointed. The actor increments it
@@ -2204,30 +3323,440 @@ async fn send_recovery_bridge_snapshot(
     ws_tx.send(Message::Text(json.into())).await.is_ok()
 }
 
-async fn send_recovery_bridge_if_available(
+/// Load the game's durable terminal state, if one exists. Absence, failure,
+/// malformed data, or a non-terminal record all return `None`: none of those
+/// prove anything about a live game, so callers fall back to normal warm-up.
+/// Everything a rematch needs to know about the match that just ended.
+///
+/// The roster is read from the authoritative terminal state, never from the
+/// client, so a spectator cannot put themselves on the results card. Same two
+/// sources the join path uses: the Redis terminal snapshot first, then the
+/// durable record once persistence has caught up.
+async fn resolve_rematch_context(
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    game_id: u32,
+) -> Option<(Vec<(u32, String)>, common::GameType, common::QueueMode)> {
+    let terminal_state = match event_router.get_stored_snapshot(game_id).await {
+        Ok(Some(state)) if matches!(state.status, GameStatus::Complete { .. }) => Some(state),
+        _ => load_durable_terminal_state(db, game_id).await,
+    }?;
+
+    let mut participants: Vec<(u32, String)> = terminal_state
+        .players
+        .keys()
+        .copied()
+        // Someone removed for inactivity forfeited this match; putting them on
+        // the rematch card would let a player who walked away hold up the
+        // group that stayed.
+        .filter(|user_id| !terminal_state.is_player_idle_kicked(*user_id))
+        .map(|user_id| {
+            let username = terminal_state
+                .usernames
+                .get(&user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("User{user_id}"));
+            (user_id, username)
+        })
+        .collect();
+    participants.sort_by_key(|(user_id, _)| *user_id);
+
+    Some((
+        participants,
+        terminal_state.game_type.clone(),
+        terminal_state.queue_mode,
+    ))
+}
+
+/// Record-then-elect: refresh this socket's view, and if the group is now big
+/// enough and this player is the elected host, stand up the lobby everyone
+/// converges on.
+///
+/// Returns the connection's (possibly new) lobby handle. The error variant
+/// carries it back too — a failure here must not lose a lobby the connection
+/// has already joined.
+#[allow(clippy::too_many_arguments)]
+async fn advance_rematch(
+    game_id: u32,
+    user_id: u32,
+    rematch: &RematchStore,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    metadata: &PlayerMetadata,
+    lobby: Option<LobbyJoinHandle>,
+    region: &str,
+    websocket_id: &str,
+    ws_tx: &mpsc::Sender<Message>,
+) -> std::result::Result<Option<LobbyJoinHandle>, (Option<LobbyJoinHandle>, anyhow::Error)> {
+    let state = match send_rematch_state(game_id, user_id, rematch, event_router, db, ws_tx).await {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(lobby),
+        Err(error) => return Err((lobby, error)),
+    };
+
+    // Everyone else is told to re-read; the record is what they read, so a
+    // dropped hint only costs them the reconcile interval.
+    for participant in &state.participants {
+        if participant.user_id != user_id {
+            rematch.hint(participant.user_id).await;
+        }
+    }
+
+    // Only the elected host stands up the lobby, and only once the count can
+    // actually form a game. `SET NX` settles any disagreement anyway.
+    if state.game_type.is_none()
+        || state.host_user_id != Some(user_id)
+        || state.lobby_code.is_some()
+    {
+        return Ok(lobby);
+    }
+
+    let (lobby, code) = match lobby {
+        Some(handle) => {
+            let code = handle.lobby_code.clone();
+            (Some(handle), code)
+        }
+        None => {
+            let created = match lobby_manager
+                .create_lobby_for_pool(metadata.user_id, region, metadata.matchmaking_pool)
+                .await
+            {
+                Ok(created) => created,
+                Err(error) => return Err((None, error)),
+            };
+            match lobby_manager
+                .join_lobby_for_pool(
+                    Some(created.lobby_code()),
+                    metadata.user_id,
+                    metadata.username.clone(),
+                    websocket_id.to_string(),
+                    region.to_string(),
+                    None,
+                    metadata.matchmaking_pool,
+                    metadata.distribution,
+                    metadata.supports_ad_break,
+                    metadata.can_show_video_ad,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let code = handle.lobby_code.clone();
+                    (Some(handle), code)
+                }
+                Err(error) => return Err((None, error)),
+            }
+        }
+    };
+
+    let elected = match rematch.elect_lobby(game_id, &code).await {
+        Ok(elected) => elected,
+        Err(error) => return Err((lobby, error)),
+    };
+    if elected == code
+        && let Some(handle) = &lobby
+    {
+        // The client needs to know it holds this lobby, the same way it would
+        // after an explicit CreateLobby.
+        let created = WSMessage::LobbyCreated {
+            lobby_code: handle.lobby_code.clone(),
+        };
+        if let Ok(frame) = serde_json::to_string(&created) {
+            let _ = ws_tx.send(Message::Text(frame.into())).await;
+        }
+    }
+
+    // Re-read so this socket and everyone it hints see the elected lobby.
+    if let Err(error) = send_rematch_state(game_id, user_id, rematch, event_router, db, ws_tx).await
+    {
+        return Err((lobby, error));
+    }
+    for participant in &state.participants {
+        if participant.user_id != user_id {
+            rematch.hint(participant.user_id).await;
+        }
+    }
+
+    Ok(lobby)
+}
+
+/// Read the rematch record and push it to this socket.
+async fn send_rematch_state(
+    game_id: u32,
+    user_id: u32,
+    rematch: &RematchStore,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<Option<RematchState>> {
+    let Some((participants, game_type, queue_mode)) =
+        resolve_rematch_context(event_router, db, game_id).await
+    else {
+        return Ok(None);
+    };
+    if !participants.iter().any(|(id, _)| *id == user_id) {
+        return Ok(None);
+    }
+
+    let state = rematch
+        .state(game_id, &participants, &game_type, queue_mode)
+        .await
+        .context("failed to read the rematch state")?;
+    let frame = serde_json::to_string(&WSMessage::Rematch(state.clone()))
+        .context("failed to serialize the rematch state")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the rematch state")?;
+    Ok(Some(state))
+}
+
+async fn load_durable_terminal_state(db: &Arc<dyn Database>, game_id: u32) -> Option<GameState> {
+    let database_game_id = i32::try_from(game_id).ok()?;
+    match db.get_game_by_id(database_game_id).await {
+        Ok(Some(game)) => {
+            let game_state_json = game.game_state?;
+            match serde_json::from_value::<GameState>(game_state_json) {
+                Ok(game_state) if matches!(game_state.status, GameStatus::Complete { .. }) => {
+                    Some(game_state)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(game_id, %error, "Ignoring malformed durable game state during warm-up");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(error) => {
+            warn!(game_id, %error, "Durable game lookup failed during warm-up");
+            None
+        }
+    }
+}
+
+/// How the join warm-up anchored the socket's first authoritative frame.
+enum FirstFrame {
+    /// A frame was sent; enter the forwarding loop. `live_proven` is false
+    /// when the frame was the recovery-envelope bridge: the command-outcome
+    /// replay (whose `CommandOutcomesComplete` barrier is a make-before-break
+    /// promotion signal) must then wait for the first live event, so a
+    /// candidate socket never retires the old usable socket for a bridge that
+    /// might have no subsequent event stream.
+    Anchored { live_proven: bool },
+    /// The game is durably complete and was fully served; end the task.
+    Served,
+    /// No authoritative frame arrived in the bounded window; the client was
+    /// told to retry (or that the game failed) and the task ends.
+    Unavailable,
+}
+
+/// Produce the socket's first authoritative frame and anchor the subscription.
+///
+/// Order of preference: the durable terminal snapshot (completed reload), the
+/// fenced recovery-envelope bridge (bounded staleness of one checkpoint
+/// interval, anchors contiguous live deltas immediately), then a live
+/// `Snapshot` arriving through the already-registered subscription. If none
+/// arrives inside the bounded window, fall back to the database for terminal
+/// state, else tell the client to retry with `GameWarming`.
+#[allow(clippy::too_many_arguments)]
+async fn anchor_first_frame(
     game_id: u32,
     user_id: u32,
     ws_tx: &mpsc::Sender<Message>,
+    subscription: &mut crate::replication::GameEventSubscription,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
     game_bus: &Arc<GameBus>,
     cluster_namespace: &ClusterNamespace,
-) -> bool {
+) -> FirstFrame {
+    // Completed games have no live event flow to wait for; serve the durable
+    // terminal snapshot immediately.
+    match event_router.get_stored_snapshot(game_id).await {
+        Ok(Some(game_state))
+            if matches!(game_state.status, GameStatus::Complete { .. })
+                && game_state_records_user(&game_state, user_id) =>
+        {
+            send_completed_game_snapshot(
+                ws_tx,
+                game_bus,
+                cluster_namespace,
+                game_id,
+                user_id,
+                &game_state,
+                "stored Redis snapshot",
+            )
+            .await;
+            return FirstFrame::Served;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
+        }
+    }
+
+    // Bridge from the fenced recovery envelope: an immediate first frame with
+    // a trusted watermark. Contiguous live deltas then forward without any
+    // extra snapshot; a lost event in between surfaces as a gap and re-anchors
+    // through the targeted-request path.
     match game_bus.get_recovery(cluster_namespace, game_id).await {
         Ok(Some(envelope))
             if !matches!(envelope.game_state.status, GameStatus::Complete { .. })
                 && game_state_records_user(&envelope.game_state, user_id) =>
         {
-            // Bridge the replica warm-up window immediately from the fenced
-            // recovery envelope, then attach to the live replica. Deliberately
-            // withhold CommandOutcomesComplete until that live subscription
-            // exists: a planned replacement socket treats the barrier as its
-            // promotion signal and must not retire the old usable socket for a
-            // bridge that might have no subsequent event stream.
-            send_recovery_bridge_snapshot(ws_tx, &envelope, user_id).await
+            // Completion persistence can win the race with cleanup of the
+            // preceding active Redis state. The durable terminal record is
+            // the authority for a completed game, so a non-terminal envelope
+            // may bridge only after that record is confirmed absent or
+            // non-terminal — otherwise the client would be stranded on a
+            // stale active frame with no live stream behind it.
+            if let Some(terminal_state) = load_durable_terminal_state(db, game_id).await {
+                send_completed_game_snapshot(
+                    ws_tx,
+                    game_bus,
+                    cluster_namespace,
+                    game_id,
+                    user_id,
+                    &terminal_state,
+                    "database snapshot",
+                )
+                .await;
+                return FirstFrame::Served;
+            }
+            if !send_recovery_bridge_snapshot(ws_tx, &envelope, user_id).await {
+                return FirstFrame::Unavailable;
+            }
+            subscription.anchor(envelope.next_event_stream_sequence);
+            return FirstFrame::Anchored { live_proven: false };
         }
-        Ok(_) => false,
+        Ok(_) => {}
         Err(error) => {
-            warn!(game_id, user_id, %error, "Failed to load recovery during replica warm-up");
-            false
+            warn!(game_id, user_id, %error, "Failed to load recovery during warm-up");
+        }
+    }
+
+    // No envelope yet (creation race or ownership gap). Request a targeted
+    // snapshot and wait for the live stream to anchor us; the subscription
+    // re-paces the request internally while cold.
+    if let Err(error) = event_router.request_game_snapshot(game_id).await {
+        warn!(game_id, %error, "Failed to request warm-up snapshot");
+    }
+    let warmup = tokio::time::timeout(COLD_JOIN_WARMUP_TIMEOUT, async {
+        loop {
+            match subscription.next().await {
+                Some(crate::replication::SubscriptionUpdate::Event(event_msg)) => {
+                    if matches!(event_msg.event, GameEvent::Snapshot { .. }) {
+                        break Some(event_msg);
+                    }
+                    // A zero-seq terminal rejection still reaches the player
+                    // during warm-up; nothing else passes while cold.
+                    let json = serde_json::to_string(&WSMessage::GameEvent(event_msg)).unwrap();
+                    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        break None;
+                    }
+                }
+                Some(crate::replication::SubscriptionUpdate::WentCold) => {}
+                None => break None,
+            }
+        }
+    })
+    .await;
+
+    if let Ok(Some(mut snapshot_event)) = warmup {
+        snapshot_event.user_id = Some(user_id);
+        let terminal = matches!(
+            &snapshot_event.event,
+            GameEvent::Snapshot { game_state }
+                if matches!(game_state.status, GameStatus::Complete { .. })
+        );
+        let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
+        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            return FirstFrame::Unavailable;
+        }
+        if terminal {
+            if send_command_outcomes(
+                ws_tx,
+                game_bus,
+                cluster_namespace,
+                game_id,
+                user_id,
+                Some(TERMINAL_COMMAND_REJECTION_REASON),
+            )
+            .await
+            {
+                info!(game_id, "Warm-up reached terminal state directly");
+            }
+            return FirstFrame::Served;
+        }
+        return FirstFrame::Anchored { live_proven: true };
+    }
+
+    // Nothing live arrived. Durably completed games remain readable from the
+    // database after their Redis grace period.
+    let Ok(database_game_id) = i32::try_from(game_id) else {
+        warn!("Game ID {} is outside the durable database range", game_id);
+        send_game_load_failed(ws_tx, game_id, "This game was not found or has expired").await;
+        return FirstFrame::Unavailable;
+    };
+    match db.get_game_by_id(database_game_id).await {
+        Ok(Some(game)) => {
+            if let Some(game_state_json) = game.game_state {
+                match serde_json::from_value::<GameState>(game_state_json) {
+                    Ok(game_state) if matches!(game_state.status, GameStatus::Complete { .. }) => {
+                        send_completed_game_snapshot(
+                            ws_tx,
+                            game_bus,
+                            cluster_namespace,
+                            game_id,
+                            user_id,
+                            &game_state,
+                            "database snapshot",
+                        )
+                        .await;
+                        return FirstFrame::Served;
+                    }
+                    Ok(_) => {
+                        info!(
+                            game_id,
+                            "Durable game is non-terminal with no live stream; returning retryable warm-up"
+                        );
+                        send_game_warming(ws_tx, game_id).await;
+                        return FirstFrame::Unavailable;
+                    }
+                    Err(e) => {
+                        error!("Failed to deserialize game state from database: {}", e);
+                        send_game_load_failed(
+                            ws_tx,
+                            game_id,
+                            "The saved game data could not be loaded",
+                        )
+                        .await;
+                        return FirstFrame::Unavailable;
+                    }
+                }
+            }
+            info!(
+                game_id,
+                "Durable game has no terminal state and no live stream; returning retryable warm-up"
+            );
+            send_game_warming(ws_tx, game_id).await;
+            FirstFrame::Unavailable
+        }
+        Ok(None) => {
+            // Authorization already proved this game from durable evidence.
+            // Missing completion persistence here is therefore a failover
+            // race, not definitive proof that it expired.
+            info!(
+                game_id,
+                "Authorized game is not yet durable and has no live stream; returning retryable warm-up"
+            );
+            send_game_warming(ws_tx, game_id).await;
+            FirstFrame::Unavailable
+        }
+        Err(e) => {
+            error!("Failed to fetch game {} from database: {}", game_id, e);
+            send_game_warming(ws_tx, game_id).await;
+            FirstFrame::Unavailable
         }
     }
 }
@@ -2237,7 +3766,7 @@ async fn subscribe_to_game_events(
     game_id: u32,
     user_id: u32,
     ws_tx: mpsc::Sender<Message>,
-    replication_manager: Arc<crate::replication::ReplicationManager>,
+    event_router: Arc<crate::replication::GameEventRouter>,
     db: Arc<dyn Database>,
     game_bus: Arc<GameBus>,
     cluster_namespace: ClusterNamespace,
@@ -2247,272 +3776,47 @@ async fn subscribe_to_game_events(
         game_id, user_id
     );
 
-    let mut initial_subscription = replication_manager.subscribe_to_game(game_id).await;
-    if initial_subscription.is_err() {
-        let partition_id = game_id % PARTITION_COUNT;
-        if let Err(error) = replication_manager.request_game_snapshot(game_id).await {
-            warn!(game_id, partition_id, %error, "Failed to request subscription snapshots");
-        }
-        let mut next_snapshot_request_at = tokio::time::Instant::now() + Duration::from_millis(500);
+    // Register the receiver BEFORE any snapshot work: a broadcast receiver
+    // only sees messages sent after it exists, so subscribing first
+    // guarantees no event between first frame and subscription can be
+    // missed; the subscription's continuity rules drop the overlap instead.
+    let mut subscription = event_router.subscribe_to_game(game_id).await;
 
-        let mut recovery_bridge_sent = send_recovery_bridge_if_available(
-            game_id,
-            user_id,
-            &ws_tx,
-            &game_bus,
-            &cluster_namespace,
-        )
-        .await;
-
-        // Completed games intentionally leave replication memory. Avoid
-        // spending the takeover wait on a game that already has its terminal
-        // Redis snapshot.
-        match replication_manager.get_stored_snapshot(game_id).await {
-            Ok(Some(game_state))
-                if matches!(game_state.status, GameStatus::Complete { .. })
-                    && game_state_records_user(&game_state, user_id) =>
-            {
-                send_completed_game_snapshot(
-                    &ws_tx,
-                    &game_bus,
-                    &cluster_namespace,
-                    game_id,
-                    user_id,
-                    &game_state,
-                    "stored Redis snapshot",
-                )
-                .await;
-                return;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(game_id, %error, "Failed to inspect stored snapshot during warm-up");
-            }
-        }
-
-        // Reissue requests throughout the lease gap. A request appended before
-        // the new owner anchors its request reader is not a correctness signal.
-        let deadline = tokio::time::Instant::now() + COLD_JOIN_WARMUP_TIMEOUT;
-        while initial_subscription.is_err() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            initial_subscription = replication_manager.subscribe_to_game(game_id).await;
-            if initial_subscription.is_ok() {
-                break;
-            }
-
-            let now = tokio::time::Instant::now();
-            if now >= next_snapshot_request_at {
-                next_snapshot_request_at = now + Duration::from_millis(500);
-                match replication_manager.request_game_snapshot(game_id).await {
-                    Ok(()) if !recovery_bridge_sent => {
-                        recovery_bridge_sent = send_recovery_bridge_if_available(
-                            game_id,
-                            user_id,
-                            &ws_tx,
-                            &game_bus,
-                            &cluster_namespace,
-                        )
-                        .await;
-                    }
-                    Ok(()) => {}
-                    Err(error) => {
-                        warn!(game_id, partition_id, %error, "Failed to retry subscription snapshots");
-                    }
-                }
-            }
-        }
-    }
-
-    let (game_state, stream_watermark, mut rx) = match initial_subscription {
-        Ok(result) => result,
-        Err(e) => {
-            // Durably completed games are eventually evicted from replication memory. Their
-            // final snapshot remains in Redis briefly, so check that grace-period cache before
-            // the durable database fallback.
-            info!(
-                "Failed to subscribe to game {} from memory, checking stored snapshot: {}",
-                game_id, e
-            );
-
-            match replication_manager.get_stored_snapshot(game_id).await {
-                Ok(Some(game_state))
-                    if matches!(game_state.status, GameStatus::Complete { .. }) =>
-                {
-                    send_completed_game_snapshot(
-                        &ws_tx,
-                        &game_bus,
-                        &cluster_namespace,
-                        game_id,
-                        user_id,
-                        &game_state,
-                        "stored Redis snapshot",
-                    )
-                    .await;
-                    return;
-                }
-                Ok(Some(_)) => {
-                    // During a rolling deploy or a failed terminal cache write, Redis can still
-                    // contain the preceding active snapshot. Prefer the durable completed record
-                    // instead of stranding the client on a stale, non-terminal frame with no live
-                    // subscription.
-                    debug!(
-                        "Ignoring non-complete stored Redis snapshot for game {}, checking database",
-                        game_id
-                    );
-                }
-                Ok(None) => {
-                    debug!("No stored Redis snapshot found for game {}", game_id);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load stored Redis snapshot for game {}, checking database: {}",
-                        game_id, e
-                    );
-                }
-            }
-
-            let Ok(database_game_id) = i32::try_from(game_id) else {
-                warn!("Game ID {} is outside the durable database range", game_id);
-                send_game_load_failed(&ws_tx, game_id, "This game was not found or has expired")
-                    .await;
-                return;
-            };
-
-            match db.get_game_by_id(database_game_id).await {
-                Ok(Some(game)) => {
-                    if let Some(game_state_json) = game.game_state {
-                        match serde_json::from_value::<GameState>(game_state_json) {
-                            Ok(game_state)
-                                if matches!(game_state.status, GameStatus::Complete { .. }) =>
-                            {
-                                send_completed_game_snapshot(
-                                    &ws_tx,
-                                    &game_bus,
-                                    &cluster_namespace,
-                                    game_id,
-                                    user_id,
-                                    &game_state,
-                                    "database snapshot",
-                                )
-                                .await;
-
-                                // Return early - we can't subscribe to future events without memory state
-                                return;
-                            }
-                            Ok(_) => {
-                                info!(
-                                    game_id,
-                                    "Durable game is non-terminal while its replica is unavailable; returning retryable warm-up"
-                                );
-                                send_game_warming(&ws_tx, game_id).await;
-                                return;
-                            }
-                            Err(e) => {
-                                error!("Failed to deserialize game state from database: {}", e);
-                                send_game_load_failed(
-                                    &ws_tx,
-                                    game_id,
-                                    "The saved game data could not be loaded",
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        info!(
-                            game_id,
-                            "Durable game has no terminal state while its replica is unavailable; returning retryable warm-up"
-                        );
-                        send_game_warming(&ws_tx, game_id).await;
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    // Authorization already proved this game from live/recovery
-                    // state. Missing completion persistence here is therefore a
-                    // failover race, not definitive evidence that it expired.
-                    info!(
-                        game_id,
-                        "Authorized game is not yet durable while its replica is unavailable; returning retryable warm-up"
-                    );
-                    send_game_warming(&ws_tx, game_id).await;
-                    return;
-                }
-                Err(e) => {
-                    error!("Failed to fetch game {} from database: {}", game_id, e);
-                    send_game_warming(&ws_tx, game_id).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    if matches!(game_state.status, GameStatus::Complete { .. }) {
-        send_completed_game_snapshot(
-            &ws_tx,
-            &game_bus,
-            &cluster_namespace,
-            game_id,
-            user_id,
-            &game_state,
-            "replication cache",
-        )
-        .await;
-        return;
-    }
-
-    // Send the snapshot, stamped with the replica's transport watermark so
-    // the client's gap detection starts from the right point.
-    let snapshot_event = GameEventMessage {
+    let anchor_result = anchor_first_frame(
         game_id,
-        tick: game_state.tick,
-        sequence: 0,
-        stream_seq: stream_watermark,
-        user_id: Some(user_id),
-        event: GameEvent::Snapshot {
-            game_state: game_state.clone(),
-        },
+        user_id,
+        &ws_tx,
+        &mut subscription,
+        &event_router,
+        &db,
+        &game_bus,
+        &cluster_namespace,
+    )
+    .await;
+    let mut live_proven = match anchor_result {
+        FirstFrame::Anchored { live_proven } => live_proven,
+        FirstFrame::Served | FirstFrame::Unavailable => return,
     };
-    let json = serde_json::to_string(&WSMessage::GameEvent(snapshot_event)).unwrap();
-    if let Err(e) = ws_tx.try_send(Message::Text(json.into())) {
-        match e {
-            mpsc::error::TrySendError::Full(msg) => {
-                warn!(
-                    "WebSocket send channel full (capacity 1024) for game {}, blocking send",
-                    game_id
-                );
-                if ws_tx.send(msg).await.is_err() {
-                    error!(
-                        "WebSocket send channel closed for game {}, stopping event subscription",
-                        game_id
-                    );
-                    return;
-                }
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                debug!(
-                    "WebSocket send channel closed for game {}, stopping event subscription",
-                    game_id
-                );
-                return;
-            }
-        }
-    }
 
     // Loading recovery outcomes can take several bounded Redis attempts. Keep
     // that I/O concurrent with the live broadcast receiver so a fresh
     // snapshot never stalls CommandScheduled delivery. The replay result still
     // returns through this one forwarding loop, which preserves socket order.
-    let mut command_outcome_replay = Some(start_command_outcome_replay(
-        game_bus.clone(),
-        cluster_namespace.clone(),
-        game_id,
-        user_id,
-    ));
+    // A bridge-anchored socket starts the replay only once the first live
+    // event proves the stream flows (see `FirstFrame::Anchored`).
+    let mut command_outcome_replay = live_proven.then(|| {
+        start_command_outcome_replay(
+            game_bus.clone(),
+            cluster_namespace.clone(),
+            game_id,
+            user_id,
+        )
+    });
 
     loop {
         let input =
-            next_game_subscription_input(&ws_tx, &mut rx, &mut command_outcome_replay).await;
+            next_game_subscription_input(&ws_tx, &mut subscription, &mut command_outcome_replay)
+                .await;
         let event_msg = match input {
             GameSubscriptionInput::SocketClosed => {
                 debug!(
@@ -2536,117 +3840,34 @@ async fn subscribe_to_game_events(
                 }
                 continue;
             }
-            GameSubscriptionInput::Event(Ok(event_msg)) => event_msg,
-            GameSubscriptionInput::Event(Err(
-                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
+            GameSubscriptionInput::Update(Some(crate::replication::SubscriptionUpdate::Event(
+                event_msg,
+            ))) => event_msg,
+            GameSubscriptionInput::Update(Some(
+                crate::replication::SubscriptionUpdate::WentCold,
             )) => {
-                // Any barrier for the old snapshot is now stale. Dropping the
-                // in-flight future cancels its Redis read; only the replay
-                // paired with the replacement snapshot may emit a barrier.
+                // The subscription lost continuity (gap or broadcast lag) and
+                // already paced a targeted snapshot request; nothing is
+                // forwarded until the fresh snapshot re-anchors the client.
+                // Any barrier for the previous snapshot is now stale, and
+                // dropping the in-flight future cancels its Redis read; only
+                // the replay paired with the replacement snapshot may emit a
+                // barrier.
                 drop(command_outcome_replay.take());
-
-                // This connection fell behind the broadcast and lost events.
-                // Recover by sending a fresh snapshot (with its watermark) so
-                // the client re-anchors instead of silently diverging.
-                warn!(
-                    "Event forwarder for game {} (user {}) lagged, {} events lost; resyncing client with fresh snapshot",
-                    game_id, user_id, skipped
-                );
-                match replication_manager.subscribe_to_game(game_id).await {
-                    Ok((state, watermark, new_rx)) => {
-                        rx = new_rx;
-                        let terminal = matches!(state.status, GameStatus::Complete { .. });
-                        let resync = GameEventMessage {
-                            game_id,
-                            tick: state.tick,
-                            sequence: 0,
-                            stream_seq: watermark,
-                            user_id: Some(user_id),
-                            event: GameEvent::Snapshot { game_state: state },
-                        };
-                        let json = serde_json::to_string(&WSMessage::GameEvent(resync)).unwrap();
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                            debug!(
-                                "WebSocket send channel closed for game {} during lag resync",
-                                game_id
-                            );
-                            return;
-                        }
-                        if terminal {
-                            if !send_command_outcomes(
-                                &ws_tx,
-                                &game_bus,
-                                &cluster_namespace,
-                                game_id,
-                                user_id,
-                                Some(TERMINAL_COMMAND_REJECTION_REASON),
-                            )
-                            .await
-                            {
-                                return;
-                            }
-                            info!(
-                                game_id,
-                                "Lag resync reached terminal state after durable outcome replay"
-                            );
-                            return;
-                        }
-                        command_outcome_replay = Some(start_command_outcome_replay(
-                            game_bus.clone(),
-                            cluster_namespace.clone(),
-                            game_id,
-                            user_id,
-                        ));
-                        continue;
-                    }
-                    Err(e) => {
-                        // Game likely completed and was evicted mid-lag.
-                        error!(
-                            "Failed to resubscribe to game {} after lag: {}; ending subscription",
-                            game_id, e
-                        );
-                        return;
-                    }
-                }
+                continue;
             }
-            GameSubscriptionInput::Event(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+            GameSubscriptionInput::Update(None) => {
                 drop(command_outcome_replay.take());
-                // Broadcaster dropped. If the game is still live in the
-                // replica, hand the client one last authoritative snapshot so
-                // it can at least resync via RequestResync; either way, log
-                // loudly — a silent exit here is how ghost games are born.
-                if let Some(state) = replication_manager.get_game_state(game_id).await {
-                    let terminal = matches!(state.status, GameStatus::Complete { .. });
-                    error!(
-                        "Event broadcaster closed for live game {} (user {}); sending final snapshot",
-                        game_id, user_id
-                    );
-                    let final_snapshot = GameEventMessage {
-                        game_id,
-                        tick: state.tick,
-                        sequence: 0,
-                        stream_seq: replication_manager.get_stream_seq(game_id).await,
-                        user_id: Some(user_id),
-                        event: GameEvent::Snapshot { game_state: state },
-                    };
-                    let json =
-                        serde_json::to_string(&WSMessage::GameEvent(final_snapshot)).unwrap();
-                    let _ = ws_tx.send(Message::Text(json.into())).await;
-                    let _ = send_command_outcomes(
-                        &ws_tx,
-                        &game_bus,
-                        &cluster_namespace,
-                        game_id,
-                        user_id,
-                        terminal.then_some(TERMINAL_COMMAND_REJECTION_REASON),
-                    )
-                    .await;
-                } else {
-                    info!(
-                        "Event broadcaster closed for game {} (game evicted); ending subscription",
-                        game_id
-                    );
-                }
+                // The game's channel is gone. Terminal teardown always
+                // delivers the terminal snapshot first (handled below), so
+                // reaching this arm means the reader worker failed — which is
+                // task-fatal — or the terminal frame raced this receiver.
+                // Log loudly; the client's liveness watchdog and
+                // RequestResync path recover the session.
+                warn!(
+                    game_id,
+                    user_id, "Game event channel closed; ending subscription"
+                );
                 return;
             }
         };
@@ -2718,7 +3939,12 @@ async fn subscribe_to_game_events(
             break;
         }
 
-        if is_snapshot {
+        if is_snapshot || !live_proven {
+            // Every snapshot restarts the replay so its barrier pairs with
+            // the newest frontier. The first live event after a bridge anchor
+            // also starts it: live delivery is now proven, so the
+            // make-before-break promotion signal may flow.
+            live_proven = true;
             command_outcome_replay = Some(start_command_outcome_replay(
                 game_bus.clone(),
                 cluster_namespace.clone(),
@@ -3064,58 +4290,134 @@ async fn send_game_warming(ws_tx: &mpsc::Sender<Message>, game_id: u32) {
     }
 }
 
-fn unsent_lobby_match(mapped_game_id: Option<u32>, last_sent_game_id: Option<u32>) -> Option<u32> {
-    mapped_game_id.filter(|game_id| Some(*game_id) != last_sent_game_id)
+fn next_lobby_match(
+    active_game_id: Option<u32>,
+    pending_game_id: Option<u32>,
+    last_sent_game_id: Option<u32>,
+    retry_unacknowledged: bool,
+) -> Option<u32> {
+    let mapped_game_id = active_game_id.or(pending_game_id)?;
+    let is_unacknowledged = pending_game_id == Some(mapped_game_id);
+    (Some(mapped_game_id) != last_sent_game_id || (retry_unacknowledged && is_unacknowledged))
+        .then_some(mapped_game_id)
+}
+
+fn parse_lobby_match_mapping(
+    raw_game_id: Option<String>,
+    mapping_key: &str,
+    lobby_code: &str,
+    user_id: u32,
+) -> Option<u32> {
+    raw_game_id.and_then(|raw_game_id| match raw_game_id.parse::<u32>() {
+        Ok(game_id) => Some(game_id),
+        Err(error) => {
+            error!(
+                lobby_code,
+                user_id,
+                mapping_key,
+                raw_game_id,
+                %error,
+                "Ignoring malformed durable lobby match mapping"
+            );
+            None
+        }
+    })
+}
+
+/// A successful, participant-authorized `JoinGame` is the delivery
+/// acknowledgement. Compare-delete prevents a delayed acknowledgement for an
+/// earlier round from consuming a newer assignment written to the same key.
+async fn acknowledge_lobby_match_handoff(
+    redis: &RedisConnection,
+    lobby_code: &str,
+    user_id: u32,
+    game_id: u32,
+) -> Result<bool> {
+    let pending_mapping_key = RedisKeys::matchmaking_lobby_user_pending_game(lobby_code, user_id);
+    let mut redis = redis.clone();
+    let acknowledged: i32 = redis::Script::new(
+        r#"
+        local value_type = redis.call('TYPE', KEYS[1])
+        if type(value_type) == 'table' then value_type = value_type.ok end
+        if value_type ~= 'none' and value_type ~= 'string' then return -1 end
+        if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+        redis.call('DEL', KEYS[1])
+        return 1
+        "#,
+    )
+    .key(&pending_mapping_key)
+    .arg(game_id)
+    .invoke_async(&mut redis)
+    .await
+    .context("failed to acknowledge lobby match handoff")?;
+    match acknowledged {
+        1 => Ok(true),
+        0 => Ok(false),
+        -1 => Err(anyhow::anyhow!(
+            "lobby match handoff has an unexpected Redis type"
+        )),
+        other => Err(anyhow::anyhow!(
+            "unexpected lobby match handoff acknowledgement result {other}"
+        )),
+    }
 }
 
 async fn reconcile_lobby_match(
     lobby_code: &str,
+    user_id: u32,
     redis: &mut RedisConnection,
     ws_tx: &mpsc::Sender<Message>,
     last_sent_game_id: &mut Option<u32>,
+    retry_unacknowledged: bool,
 ) -> bool {
-    let mapping_key = RedisKeys::matchmaking_lobby_active_game(lobby_code);
-    let raw_game_id: Option<String> = match redis.get(&mapping_key).await {
-        Ok(game_id) => game_id,
-        Err(error) => {
-            warn!(
-                lobby_code,
-                %error,
-                "Failed to reconcile durable lobby match mapping"
-            );
-            return true;
-        }
-    };
-    let mapped_game_id = match raw_game_id {
-        Some(raw_game_id) => match raw_game_id.parse::<u32>() {
-            Ok(game_id) => Some(game_id),
+    let active_mapping_key = RedisKeys::matchmaking_lobby_active_game(lobby_code);
+    let pending_mapping_key = RedisKeys::matchmaking_lobby_user_pending_game(lobby_code, user_id);
+    let (raw_active_game_id, raw_pending_game_id): (Option<String>, Option<String>) =
+        match redis::cmd("MGET")
+            .arg(&active_mapping_key)
+            .arg(&pending_mapping_key)
+            .query_async(redis)
+            .await
+        {
+            Ok(game_ids) => game_ids,
             Err(error) => {
-                error!(
+                warn!(
                     lobby_code,
-                    mapping_key,
-                    raw_game_id,
+                    user_id,
                     %error,
-                    "Ignoring malformed durable lobby match mapping"
+                    "Failed to reconcile durable lobby match mappings"
                 );
                 return true;
             }
-        },
-        None => None,
-    };
-    let Some(game_id) = unsent_lobby_match(mapped_game_id, *last_sent_game_id) else {
+        };
+    let active_game_id =
+        parse_lobby_match_mapping(raw_active_game_id, &active_mapping_key, lobby_code, user_id);
+    let pending_game_id = parse_lobby_match_mapping(
+        raw_pending_game_id,
+        &pending_mapping_key,
+        lobby_code,
+        user_id,
+    );
+    let Some(game_id) = next_lobby_match(
+        active_game_id,
+        pending_game_id,
+        *last_sent_game_id,
+        retry_unacknowledged,
+    ) else {
         return true;
     };
 
     let message = match serde_json::to_string(&WSMessage::JoinGame(game_id)) {
         Ok(message) => message,
         Err(error) => {
-            error!(lobby_code, game_id, %error, "Failed to serialize lobby match join");
+            error!(lobby_code, user_id, game_id, %error, "Failed to serialize lobby match join");
             return true;
         }
     };
     if let Err(error) = ws_tx.send(Message::Text(message.into())).await {
         debug!(
             lobby_code,
+            user_id,
             game_id,
             %error,
             "WebSocket closed while forwarding durable lobby match"
@@ -3126,7 +4428,7 @@ async fn reconcile_lobby_match(
     *last_sent_game_id = Some(game_id);
     info!(
         lobby_code,
-        game_id, "Forwarded durable lobby match to WebSocket"
+        user_id, game_id, "Forwarded durable lobby match to WebSocket"
     );
     true
 }
@@ -3137,10 +4439,12 @@ async fn reconcile_lobby_match(
 /// WebSocket itself remains healthy.
 async fn subscribe_to_lobby_match_notifications(
     lobby_code: String,
+    user_id: u32,
     pubsub_manager: Arc<PubSubManager>,
     redis: impl Into<RedisConnection>,
     ws_tx: mpsc::Sender<Message>,
     cancellation_token: CancellationToken,
+    reconciliation_interval: Duration,
 ) {
     let mut redis = redis.into();
     let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
@@ -3165,11 +4469,20 @@ async fn subscribe_to_lobby_match_notifications(
         };
 
         info!(lobby_code, channel, "Subscribed to lobby match hints");
-        if !reconcile_lobby_match(&lobby_code, &mut redis, &ws_tx, &mut last_sent_game_id).await {
+        if !reconcile_lobby_match(
+            &lobby_code,
+            user_id,
+            &mut redis,
+            &ws_tx,
+            &mut last_sent_game_id,
+            false,
+        )
+        .await
+        {
             return;
         }
 
-        let mut reconciliation = tokio::time::interval(LOBBY_MATCH_RECONCILIATION_INTERVAL);
+        let mut reconciliation = tokio::time::interval(reconciliation_interval);
         reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The immediate durable read above already covers the interval's first tick.
         reconciliation.tick().await;
@@ -3180,9 +4493,11 @@ async fn subscribe_to_lobby_match_notifications(
                 _ = reconciliation.tick() => {
                     if !reconcile_lobby_match(
                         &lobby_code,
+                        user_id,
                         &mut redis,
                         &ws_tx,
                         &mut last_sent_game_id,
+                        true,
                     ).await {
                         return;
                     }
@@ -3198,9 +4513,11 @@ async fn subscribe_to_lobby_match_notifications(
                             );
                             if !reconcile_lobby_match(
                                 &lobby_code,
+                                user_id,
                                 &mut redis,
                                 &ws_tx,
                                 &mut last_sent_game_id,
+                                false,
                             ).await {
                                 return;
                             }
@@ -3241,13 +4558,14 @@ async fn subscribe_to_game_chat(
         .context("Failed to subscribe to game chat channel")?;
 
     loop {
-        let chat_payload: GameChatBroadcast = match receiver.recv().await {
+        let chat_payload: RedisGameChatPayload = match receiver.recv().await {
             Ok(payload) => payload,
             Err(e) => {
                 warn!("Failed to receive game chat payload: {}", e);
                 break;
             }
         };
+        let chat_payload = chat_payload.into_filtered();
 
         let ws_message = WSMessage::GameChatMessage {
             game_id: chat_payload.game_id,
@@ -3294,13 +4612,14 @@ async fn subscribe_to_lobby_chat(
         .context("Failed to subscribe to lobby chat channel")?;
 
     loop {
-        let chat_payload: LobbyChatBroadcast = match receiver.recv().await {
+        let chat_payload: RedisLobbyChatPayload = match receiver.recv().await {
             Ok(payload) => payload,
             Err(e) => {
                 warn!("Failed to receive lobby chat payload: {}", e);
                 break;
             }
         };
+        let chat_payload = chat_payload.into_filtered();
 
         let ws_message = WSMessage::LobbyChatMessage {
             lobby_code: chat_payload.lobby_code.clone(),
@@ -3332,25 +4651,37 @@ async fn subscribe_to_lobby_chat(
     Ok(())
 }
 
-/// Shared admission path for both authentication shapes. `protocol_version` is
-/// `None` for the legacy `Token` shape and is never a reason to refuse the
-/// connection — see `log_client_protocol_version`.
+/// Shared admission path for both authentication shapes. A legacy `Token` has
+/// no version and receives the same explicit update-required denial as any
+/// other incompatible predictive client.
 #[allow(clippy::too_many_arguments)]
 async fn authenticate_ws_connection(
     jwt_token: String,
     protocol_version: Option<u16>,
+    distribution: Option<ClientDistribution>,
     jwt_verifier: &Arc<dyn JwtVerifier>,
     db: &Arc<dyn Database>,
     ws_tx: &mpsc::Sender<Message>,
     game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     websocket_id: &str,
     lifecycle: &TaskLifecycle,
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
+    ads_config: &AdsConfig,
 ) -> Result<ConnectionState> {
-    log_client_protocol_version(protocol_version);
+    if let Err(error) = validate_client_protocol_version(protocol_version) {
+        warn!(%error, "Rejecting incompatible gameplay client");
+        let denial = WSMessage::AccessDenied {
+            reason: error.to_string(),
+        };
+        ws_tx
+            .send(Message::Text(serde_json::to_string(&denial)?.into()))
+            .await
+            .context("WebSocket closed before protocol mismatch denial")?;
+        return Ok(ConnectionState::Unauthenticated);
+    }
     debug!("Received WebSocket authentication request");
     match jwt_verifier.verify(&jwt_token).await {
         Ok(user_token) => {
@@ -3381,18 +4712,46 @@ async fn authenticate_ws_connection(
                 ));
             }
 
+            // Distribution routing entered the protocol in v9. Do not let an
+            // older shape accidentally inherit a provider based on a default
+            // or on its account's authentication method.
+            let distribution = protocol_version
+                .is_some_and(|version| version >= 9)
+                .then_some(distribution)
+                .flatten();
+            let client_ads_config = ads_config.client_config(distribution);
+            let supports_ad_break = protocol_version.is_some_and(|version| version >= 9);
+
             let metadata = PlayerMetadata {
                 user_id: user_token.user_id,
                 username: user.username.clone(),
                 token: jwt_token.clone(),
                 is_guest: user.is_guest,
                 matchmaking_pool: database_pool,
+                supports_ad_break,
+                can_show_video_ad: supports_ad_break
+                    && client_ads_config.enabled
+                    && client_ads_config.video.pre_match,
+                distribution,
             };
 
             info!(
                 "User authenticated: {} (id: {})",
                 metadata.username, metadata.user_id
             );
+
+            // Do not emit a new enum variant until the peer has advertised a
+            // protocol that can decode it. This keeps legacy strict-Serde
+            // clients compatible even when ads are globally disabled.
+            if metadata.supports_ad_break {
+                ws_tx
+                    .send(Message::Text(
+                        serde_json::to_string(&WSMessage::AdConfiguration(client_ads_config))?
+                            .into(),
+                    ))
+                    .await
+                    .context("WebSocket closed before advertisement configuration")?;
+            }
 
             let authenticated = WSMessage::Authenticated {
                 task_boot_id: lifecycle.task_boot_id().to_owned(),
@@ -3410,7 +4769,7 @@ async fn authenticate_ws_connection(
                     metadata.matchmaking_pool,
                     ws_tx,
                     matchmaking_manager,
-                    replication_manager,
+                    event_router,
                     game_bus,
                     cluster_namespace,
                     db,
@@ -3431,6 +4790,47 @@ async fn authenticate_ws_connection(
     }
 }
 
+/// Gate a lobby-wide mutation on leadership.
+///
+/// Returns `true` when the caller may proceed. Otherwise an `AccessDenied`
+/// naming `action` has already been queued and the caller must do nothing —
+/// the client mirrors this rule in its UI, so reaching a denial means either a
+/// stale roster or a hand-crafted frame.
+///
+/// A failure to *determine* leadership denies the action. Matchmaking and
+/// preferences are shared state for every member of the lobby, so an
+/// unverifiable request is not safe to admit.
+async fn authorize_lobby_leader(
+    lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
+    ws_tx: &mpsc::Sender<Message>,
+    lobby_code: &str,
+    user_id: i32,
+    action: &str,
+) -> Result<bool> {
+    let is_host = match lobby_manager.is_lobby_host(lobby_code, user_id).await {
+        Ok(is_host) => is_host,
+        Err(error) => {
+            warn!(
+                lobby_code,
+                user_id, "Failed to resolve lobby leadership: {error:#}"
+            );
+            false
+        }
+    };
+
+    if is_host {
+        return Ok(true);
+    }
+
+    let response = WSMessage::AccessDenied {
+        reason: format!("Only the lobby leader can {action}"),
+    };
+    ws_tx
+        .send(Message::Text(serde_json::to_string(&response)?.into()))
+        .await?;
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: ConnectionState,
@@ -3441,7 +4841,7 @@ async fn process_ws_message(
     ws_tx: &mpsc::Sender<Message>,
     game_bus: &Arc<GameBus>,
     matchmaking_manager: &Arc<Mutex<MatchmakingManager>>,
-    replication_manager: &Arc<crate::replication::ReplicationManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
     redis: &RedisConnection,
     _redis_url: &str,
     lobby_manager: &Arc<crate::lobby_manager::LobbyManager>,
@@ -3450,6 +4850,8 @@ async fn process_ws_message(
     lifecycle: &TaskLifecycle,
     socket_generation: u64,
     cluster_namespace: &ClusterNamespace,
+    cancellation_token: &CancellationToken,
+    ads_config: &Arc<AdsConfig>,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -3486,10 +4888,19 @@ async fn process_ws_message(
         }
         ConnectionState::Authenticated { .. } => "Authenticated",
     };
-    debug!(
-        "Processing message: {:?} in state: {}",
-        ws_message, state_str
-    );
+    match &ws_message {
+        WSMessage::Chat(_)
+        | WSMessage::LobbyChatMessage { .. }
+        | WSMessage::GameChatMessage { .. }
+        | WSMessage::LobbyChatHistory { .. }
+        | WSMessage::GameChatHistory { .. } => {
+            debug!("Processing chat-bearing message: <redacted> in state: {state_str}")
+        }
+        _ => debug!(
+            "Processing message: {:?} in state: {}",
+            ws_message, state_str
+        ),
+    }
 
     match state {
         ConnectionState::Unauthenticated => {
@@ -3498,16 +4909,18 @@ async fn process_ws_message(
                     authenticate_ws_connection(
                         jwt_token,
                         None,
+                        None,
                         jwt_verifier,
                         db,
                         ws_tx,
                         game_bus,
                         matchmaking_manager,
-                        replication_manager,
+                        event_router,
                         websocket_id,
                         lifecycle,
                         socket_generation,
                         cluster_namespace,
+                        ads_config,
                     )
                     .await
                 }
@@ -3515,6 +4928,7 @@ async fn process_ws_message(
                     token: jwt_token,
                     protocol_version,
                     anon_id,
+                    distribution,
                 } => {
                     // Validated at the boundary so a malformed or unbounded
                     // client string can never reach an analytics event.
@@ -3535,16 +4949,18 @@ async fn process_ws_message(
                     authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
+                        distribution,
                         jwt_verifier,
                         db,
                         ws_tx,
                         game_bus,
                         matchmaking_manager,
-                        replication_manager,
+                        event_router,
                         websocket_id,
                         lifecycle,
                         socket_generation,
                         cluster_namespace,
+                        ads_config,
                     )
                     .await
                 }
@@ -3573,14 +4989,194 @@ async fn process_ws_message(
             game_id,
             websocket_id,
         } => {
+            // Replacement transports and failed exact-presence heartbeats
+            // cancel the lobby scope. A retained handle is not authorization:
+            // normalize it before any inbound lobby mutation or chat action.
+            let mut lobby = lobby;
+            if lobby
+                .as_ref()
+                .is_some_and(|handle| handle.scope_cancellation_token().is_cancelled())
+                && let Some(handle) = lobby.take()
+            {
+                handle.detach_transport();
+            }
+
             match ws_message {
+                WSMessage::SetRematchIntent {
+                    game_id: requested_game_id,
+                    opt_in,
+                } => {
+                    // Authorized off the connection, not the payload: this
+                    // socket only holds a game id because `JoinGame` already
+                    // authorized it against the match roster.
+                    if game_id == Some(requested_game_id)
+                        && let Ok(user_id) = u32::try_from(metadata.user_id)
+                    {
+                        let rematch = RematchStore::new(redis.clone());
+                        if let Err(error) =
+                            rematch.set_intent(requested_game_id, user_id, opt_in).await
+                        {
+                            warn!(user_id, requested_game_id, %error, "failed to record a rematch intent");
+                        }
+                        let lobby = match advance_rematch(
+                            requested_game_id,
+                            user_id,
+                            &rematch,
+                            event_router,
+                            db,
+                            lobby_manager,
+                            &metadata,
+                            lobby,
+                            region,
+                            &websocket_id,
+                            ws_tx,
+                        )
+                        .await
+                        {
+                            Ok(lobby) => lobby,
+                            Err((lobby, error)) => {
+                                warn!(user_id, requested_game_id, %error, "failed to advance the rematch");
+                                lobby
+                            }
+                        };
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::ChallengePlayer {
+                    user_id: target_user_id,
+                } => {
+                    let Ok(challenger_id) = u32::try_from(metadata.user_id) else {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    };
+                    // A challenge is an invitation to the challenger's lobby,
+                    // so there has to be one. Creating it here rather than
+                    // asking the client to sequence CreateLobby first keeps
+                    // the whole exchange a single round trip.
+                    let (lobby, outcome) = issue_challenge(
+                        challenger_id,
+                        &metadata,
+                        target_user_id,
+                        lobby,
+                        lobby_manager,
+                        user_cache.clone(),
+                        redis,
+                        region,
+                        websocket_id.as_str(),
+                        ws_tx,
+                    )
+                    .await?;
+                    if let Some(lobby_code) = outcome {
+                        let created = WSMessage::LobbyCreated { lobby_code };
+                        ws_tx
+                            .send(Message::Text(serde_json::to_string(&created)?.into()))
+                            .await?;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::RespondToChallenge {
+                    challenge_id,
+                    accept,
+                } => {
+                    if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                        let store = ChallengeStore::new(redis.clone());
+                        let state = if accept {
+                            ChallengeState::Accepted
+                        } else {
+                            ChallengeState::Declined
+                        };
+                        match store.resolve(user_id, &challenge_id, state).await {
+                            Ok(Some(challenge)) => {
+                                if accept {
+                                    let accepted = WSMessage::ChallengeAccepted {
+                                        challenge_id: challenge.challenge_id.clone(),
+                                        lobby_code: challenge.lobby_code.clone(),
+                                    };
+                                    ws_tx
+                                        .send(Message::Text(
+                                            serde_json::to_string(&accepted)?.into(),
+                                        ))
+                                        .await?;
+                                }
+                            }
+                            Ok(None) => {
+                                send_challenge_failure(
+                                    "That challenge is no longer available.",
+                                    ws_tx,
+                                )
+                                .await?;
+                            }
+                            Err(error) => {
+                                warn!(user_id, %error, "failed to resolve a challenge");
+                                send_challenge_failure(
+                                    "Could not answer that challenge. Try again.",
+                                    ws_tx,
+                                )
+                                .await?;
+                            }
+                        }
+                        // Whatever happened, the answerer's own view is
+                        // refreshed from the durable record rather than guessed
+                        // at from the outcome.
+                        let _ = send_challenge_inbox(user_id, &store, ws_tx).await;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
+                WSMessage::CancelChallenge { challenge_id } => {
+                    if let Ok(user_id) = u32::try_from(metadata.user_id) {
+                        let store = ChallengeStore::new(redis.clone());
+                        if let Err(error) = store
+                            .resolve(user_id, &challenge_id, ChallengeState::Cancelled)
+                            .await
+                        {
+                            warn!(user_id, %error, "failed to cancel a challenge");
+                        }
+                        let _ = send_challenge_inbox(user_id, &store, ws_tx).await;
+                    }
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
+
                 WSMessage::UpdateNickname { nickname } => {
+                    let mut metadata = metadata;
                     if let Err(e) = handle_guest_nickname_update(
                         db,
                         lobby_manager,
                         user_cache.clone(),
                         &lobby,
-                        &metadata,
+                        &mut metadata,
                         ws_tx,
                         nickname,
                     )
@@ -3604,15 +5200,27 @@ async fn process_ws_message(
                 } => {
                     {
                         if let Some(ref lobby_handle) = lobby {
-                            lobby_manager
-                                .set_lobby_preferences(
-                                    &lobby_handle.lobby_code,
-                                    &lobby_manager::LobbyPreferences {
-                                        selected_modes,
-                                        competitive,
-                                    },
-                                )
-                                .await?;
+                            // Preferences are lobby-wide: one member's choice
+                            // decides what every member queues for.
+                            if authorize_lobby_leader(
+                                lobby_manager,
+                                ws_tx,
+                                &lobby_handle.lobby_code,
+                                metadata.user_id,
+                                "change the game mode",
+                            )
+                            .await?
+                            {
+                                lobby_manager
+                                    .set_lobby_preferences(
+                                        &lobby_handle.lobby_code,
+                                        &lobby_manager::LobbyPreferences {
+                                            selected_modes,
+                                            competitive,
+                                        },
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                     Ok(ConnectionState::Authenticated {
@@ -3632,8 +5240,25 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
-                        if let Err(e) = queue_existing_lobby_for_game_types(
-                            lobby_handle,
+                        if !authorize_lobby_leader(
+                            lobby_manager,
+                            ws_tx,
+                            &lobby_handle.lobby_code,
+                            metadata.user_id,
+                            "start matchmaking",
+                        )
+                        .await?
+                        {
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: lobby,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+
+                        if let Err(e) = queue_lobby_or_begin_ad_break(
+                            &lobby_handle.lobby_code,
                             std::slice::from_ref(&game_type),
                             &queue_mode,
                             db,
@@ -3641,6 +5266,7 @@ async fn process_ws_message(
                             matchmaking_manager,
                             metadata.user_id as u32,
                             metadata.matchmaking_pool,
+                            ads_config,
                         )
                         .await
                         {
@@ -3690,8 +5316,25 @@ async fn process_ws_message(
                     );
 
                     if let Some(ref lobby_handle) = lobby {
-                        if let Err(e) = queue_existing_lobby_for_game_types(
-                            lobby_handle,
+                        if !authorize_lobby_leader(
+                            lobby_manager,
+                            ws_tx,
+                            &lobby_handle.lobby_code,
+                            metadata.user_id,
+                            "start matchmaking",
+                        )
+                        .await?
+                        {
+                            return Ok(ConnectionState::Authenticated {
+                                metadata,
+                                lobby_handle: lobby,
+                                game_id,
+                                websocket_id,
+                            });
+                        }
+
+                        if let Err(e) = queue_lobby_or_begin_ad_break(
+                            &lobby_handle.lobby_code,
                             &game_types,
                             &queue_mode,
                             db,
@@ -3699,6 +5342,7 @@ async fn process_ws_message(
                             matchmaking_manager,
                             metadata.user_id as u32,
                             metadata.matchmaking_pool,
+                            ads_config,
                         )
                         .await
                         {
@@ -3738,6 +5382,92 @@ async fn process_ws_message(
                         websocket_id,
                     })
                 }
+                WSMessage::AdBreakResolved {
+                    break_id,
+                    resolution,
+                } => {
+                    if let (Some(lobby_handle), Ok(user_id)) =
+                        (lobby.as_ref(), u32::try_from(metadata.user_id))
+                    {
+                        match lobby_manager
+                            .resolve_ad_break(
+                                &lobby_handle.lobby_code,
+                                &break_id,
+                                user_id,
+                                resolution,
+                            )
+                            .await
+                        {
+                            Ok(AdBreakResolutionResult::Ready(ad_break)) => {
+                                if let Err(error) = finalize_lobby_ad_break(
+                                    &ad_break,
+                                    &lobby_handle.lobby_code,
+                                    db,
+                                    lobby_manager,
+                                    matchmaking_manager,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        lobby_code = lobby_handle.lobby_code,
+                                        break_id,
+                                        %error,
+                                        "Failed to finalize resolved lobby ad break"
+                                    );
+                                }
+                            }
+                            Ok(AdBreakResolutionResult::Pending(ad_break)) => {
+                                debug!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id,
+                                    resolved = ad_break.resolutions.len(),
+                                    participants = ad_break.participant_user_ids.len(),
+                                    "Lobby ad break is still waiting for participants"
+                                );
+                            }
+                            Ok(AdBreakResolutionResult::NotDue(_)) => {
+                                // Only the internal timeout sentinel can
+                                // produce this result; client ACKs never do.
+                            }
+                            Ok(AdBreakResolutionResult::NoChange(_)) => {
+                                debug!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id, "Ignored duplicate lobby ad-break resolution"
+                                );
+                            }
+                            Ok(AdBreakResolutionResult::Stale) => {
+                                debug!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id,
+                                    user_id,
+                                    "Ignored stale or non-participant ad-break resolution"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    lobby_code = lobby_handle.lobby_code,
+                                    break_id,
+                                    user_id,
+                                    %error,
+                                    "Failed to record lobby ad-break resolution"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            break_id,
+                            user_id = metadata.user_id,
+                            "Ignored ad-break resolution outside a valid lobby session"
+                        );
+                    }
+
+                    Ok(ConnectionState::Authenticated {
+                        metadata,
+                        lobby_handle: lobby,
+                        game_id,
+                        websocket_id,
+                    })
+                }
                 WSMessage::JoinGame(requested_game_id) => {
                     info!(
                         "User {} ({}) joining game {}",
@@ -3767,7 +5497,7 @@ async fn process_ws_message(
                         user_id,
                         metadata.matchmaking_pool,
                         matchmaking_manager,
-                        replication_manager,
+                        event_router,
                         game_bus,
                         cluster_namespace,
                         db,
@@ -3784,6 +5514,32 @@ async fn process_ws_message(
                             game_id: None,
                             websocket_id,
                         });
+                    }
+
+                    if let Some(lobby_handle) = lobby.as_ref() {
+                        match acknowledge_lobby_match_handoff(
+                            redis,
+                            &lobby_handle.lobby_code,
+                            user_id,
+                            requested_game_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => debug!(
+                                lobby_code = lobby_handle.lobby_code,
+                                user_id,
+                                game_id = requested_game_id,
+                                "Acknowledged lobby match handoff"
+                            ),
+                            Ok(false) => {}
+                            Err(error) => warn!(
+                                lobby_code = lobby_handle.lobby_code,
+                                user_id,
+                                game_id = requested_game_id,
+                                %error,
+                                "Authorized game join but could not acknowledge its lobby handoff"
+                            ),
+                        }
                     }
 
                     Ok(ConnectionState::Authenticated {
@@ -3819,49 +5575,112 @@ async fn process_ws_message(
                         metadata.username, metadata.user_id
                     );
 
+                    let authenticated_user_id =
+                        u32::try_from(metadata.user_id).context("User ID must be non-negative")?;
+
                     // Queue admission is lobby-authoritative. Remove only the
                     // exact currently admitted lobby identity; there is no
-                    // secondary per-player queue to reconcile.
+                    // secondary per-player queue to reconcile. If a gateway
+                    // restart lost the in-memory handle, recover authority
+                    // from this authenticated user's exact durable claim.
+                    let in_memory_lobby_code =
+                        lobby.as_ref().map(|handle| handle.lobby_code.clone());
+
+                    // Cancelling drops the whole lobby out of the queue, so it
+                    // belongs to whoever was allowed to start it. Without the
+                    // handle there is no lobby to check leadership against, and
+                    // the durable-claim path below only ever reaches this
+                    // user's own admission, so that case stays permitted.
+                    if let Some(ref lobby_code) = in_memory_lobby_code
+                        && !authorize_lobby_leader(
+                            lobby_manager,
+                            ws_tx,
+                            lobby_code,
+                            metadata.user_id,
+                            "cancel matchmaking",
+                        )
+                        .await?
+                    {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
                     let mut matchmaking_manager = matchmaking_manager.lock().await;
-                    if let Some(lobby_handle) = &lobby {
-                        let lobby_code = lobby_handle.lobby_code.clone();
-                        match matchmaking_manager
-                            .remove_lobby_from_all_queues_by_code(&lobby_code)
-                            .await
-                        {
-                            Ok(removed) => {
-                                if removed {
-                                    crate::analytics::sink::record_queue_left(
-                                        &lobby_code,
-                                        metadata.user_id,
-                                    );
-                                    info!(
-                                        lobby_code = lobby_code,
-                                        "Removed lobby from matchmaking queues after cancel"
-                                    );
-                                } else {
-                                    info!(
-                                        lobby_code = lobby_code,
-                                        "Lobby was not present in matchmaking queues on cancel"
-                                    );
+                    let mut removal_result = Ok(None);
+                    for attempt in 0..2 {
+                        removal_result = match in_memory_lobby_code.as_deref() {
+                            Some(lobby_code) => match matchmaking_manager
+                                .remove_lobby_from_all_queues_by_code_for_user(
+                                    lobby_code,
+                                    authenticated_user_id,
+                                )
+                                .await
+                            {
+                                Ok(true) => Ok(Some(lobby_code.to_owned())),
+                                Ok(false) => {
+                                    matchmaking_manager
+                                        .remove_lobby_from_queue_for_user_claim(
+                                            authenticated_user_id,
+                                        )
+                                        .await
                                 }
-                                if let Err(error) =
-                                    lobby_manager.publish_lobby_update(&lobby_code).await
-                                {
-                                    warn!(
-                                        lobby_code = lobby_code,
-                                        %error,
-                                        "Failed to publish reconciled lobby state after cancel"
-                                    );
-                                }
+                                Err(error) => Err(error),
+                            },
+                            None => {
+                                matchmaking_manager
+                                    .remove_lobby_from_queue_for_user_claim(authenticated_user_id)
+                                    .await
                             }
-                            Err(e) => {
-                                error!(
-                                    lobby_code = lobby_code,
-                                    error = %e,
-                                    "Failed to remove lobby from matchmaking queues on cancel"
+                        };
+                        if removal_result.is_ok() {
+                            break;
+                        }
+                        if attempt == 0 {
+                            warn!("Retrying ambiguous lobby matchmaking cancellation");
+                        }
+                    }
+                    match removal_result {
+                        Ok(Some(lobby_code)) => {
+                            // Only this arm means the lobby was genuinely in a
+                            // queue and left it; the Ok(None) arm below is a
+                            // cancel with nothing to cancel.
+                            crate::analytics::sink::record_queue_left(
+                                &lobby_code,
+                                authenticated_user_id as i32,
+                            );
+                            info!(
+                                lobby_code,
+                                "Removed lobby from matchmaking queues after cancel"
+                            );
+                            if let Err(error) =
+                                lobby_manager.publish_lobby_update(&lobby_code).await
+                            {
+                                warn!(
+                                    lobby_code,
+                                    %error,
+                                    "Failed to publish reconciled lobby state after cancel"
                                 );
                             }
+                        }
+                        Ok(None) => {
+                            info!("No authorized lobby queue identity was present on cancel");
+                        }
+                        Err(error) => {
+                            error!(
+                                %error,
+                                "Failed to remove lobby from matchmaking queues on cancel"
+                            );
+                            let response = WSMessage::AccessDenied {
+                                reason: format!(
+                                    "Could not confirm queue cancellation; retry: {error}"
+                                ),
+                            };
+                            ws_tx
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await?;
                         }
                     }
 
@@ -3923,6 +5742,9 @@ async fn process_ws_message(
                                     region.to_string(),
                                     None,
                                     metadata.matchmaking_pool,
+                                    metadata.distribution,
+                                    metadata.supports_ad_break,
+                                    metadata.can_show_video_ad,
                                 )
                                 .await
                             {
@@ -4074,6 +5896,9 @@ async fn process_ws_message(
                             region.to_string(),
                             preferences,
                             metadata.matchmaking_pool,
+                            metadata.distribution,
+                            metadata.supports_ad_break,
+                            metadata.can_show_video_ad,
                         )
                         .await
                     {
@@ -4114,32 +5939,7 @@ async fn process_ws_message(
                     if let Some(mut lobby_handle) = lobby {
                         let lobby_code = lobby_handle.lobby_code.clone();
                         match lobby_handle.close().await {
-                            Ok(result) => {
-                                if let LeaveLobbyResult::LobbyDeleted = result {
-                                    let mut mm = matchmaking_manager.lock().await;
-                                    match mm.remove_lobby_from_all_queues_by_code(&lobby_code).await
-                                    {
-                                        Ok(true) => {
-                                            info!(
-                                                "Removed empty lobby {} from matchmaking queues",
-                                                lobby_code
-                                            );
-                                        }
-                                        Ok(false) => {
-                                            info!(
-                                                "Lobby {} was not present in matchmaking queues",
-                                                lobby_code
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to remove lobby {} from matchmaking queues: {}",
-                                                lobby_code, e
-                                            );
-                                        }
-                                    }
-                                }
-
+                            Ok(_) => {
                                 let response = WSMessage::LeftLobby;
                                 let json_msg = serde_json::to_string(&response)?;
                                 ws_tx.send(Message::Text(json_msg.into())).await?;
@@ -4210,6 +6010,16 @@ async fn process_ws_message(
                         });
                     }
 
+                    let filtered_message = filter_chat_message(trimmed);
+                    if filtered_message.trim().is_empty() {
+                        return Ok(ConnectionState::Authenticated {
+                            metadata,
+                            lobby_handle: lobby,
+                            game_id,
+                            websocket_id,
+                        });
+                    }
+
                     let mut publish_error = false;
                     if let Some(current_game_id) = game_id {
                         let payload = GameChatBroadcast {
@@ -4217,7 +6027,7 @@ async fn process_ws_message(
                             message_id: uuid::Uuid::new_v4().to_string(),
                             user_id: metadata.user_id,
                             username: metadata.username.clone(),
-                            message: trimmed.to_string(),
+                            message: filtered_message,
                             timestamp_ms: Utc::now().timestamp_millis(),
                         };
 
@@ -4234,7 +6044,7 @@ async fn process_ws_message(
                             message_id: uuid::Uuid::new_v4().to_string(),
                             user_id: metadata.user_id,
                             username: metadata.username.clone(),
-                            message: trimmed.to_string(),
+                            message: filtered_message,
                             timestamp_ms: Utc::now().timestamp_millis(),
                         };
 
@@ -4292,31 +6102,17 @@ async fn process_ws_message(
                                 "Discarding untrusted game id on a readiness confirmation"
                             );
                         }
-                        let partition_id = game_id % PARTITION_COUNT;
-                        let event = StreamEvent::PlayerReadySubmitted { game_id, user_id };
-                        // A dropped confirmation costs the player nothing worse
-                        // than waiting out the readiness deadline, so unlike a
-                        // gameplay command this must not tear down the socket.
-                        match game_bus
-                            .publish_player_ready_unless_completed(
-                                cluster_namespace,
-                                partition_id,
-                                game_id,
-                                &event,
-                            )
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                debug!(
-                                    game_id,
-                                    user_id, "Readiness arrived after the game completed"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(game_id, user_id, %error, "Failed to publish readiness confirmation");
-                            }
-                        }
+                        // Runs detached: the game-existence wait below must not
+                        // stall this connection's message loop, and a dropped
+                        // confirmation costs the player nothing worse than
+                        // waiting out the readiness deadline.
+                        tokio::spawn(publish_player_ready_after_game_exists(
+                            game_bus.clone(),
+                            cluster_namespace.clone(),
+                            game_id,
+                            user_id,
+                            cancellation_token.clone(),
+                        ));
                     } else {
                         warn!(
                             user_id = metadata.user_id,
@@ -4467,6 +6263,423 @@ pub async fn register_server(
 }
 
 /// Subscribe to user count updates from Redis and forward to WebSocket client
+/// Everything one authenticated socket needs to take part in the social layer.
+///
+/// Held for the life of the connection. Dropping it aborts the background
+/// tasks; `close` additionally gives up the presence lease and withdraws the
+/// user's pending challenges, so nobody is left waiting on an answer that can
+/// no longer arrive.
+struct SocialSession {
+    user_id: u32,
+    /// Which connection holds this user's presence lease. A make-before-break
+    /// replacement claims it before this one tears down, and cleanup must not
+    /// undo the newer socket's work.
+    websocket_id: String,
+    presence: PresenceRegistry,
+    /// What the lease should currently assert. Shared with the refresh loop so
+    /// a heartbeat re-states the player's *current* name and activity rather
+    /// than the ones captured when the connection authenticated.
+    intent: Arc<std::sync::Mutex<PresenceIntent>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct PresenceIntent {
+    username: String,
+    is_guest: bool,
+    activity: PresenceActivity,
+    pool: MatchmakingPool,
+    /// The game whose results card this socket is sitting on, if any. The
+    /// heartbeat refreshes a rematch presence lease for it, which is what lets
+    /// the other players see who is still there without anyone announcing it.
+    game_id: Option<u32>,
+}
+
+impl SocialSession {
+    async fn close(mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        // Only the socket that still owns the lease may drop it. A planned
+        // handoff — and, far more commonly, a second browser tab — leaves the
+        // replacement owning the lease, and this must not delete its presence.
+        //
+        // Nothing is withdrawn here. A disconnect cannot tell "this player
+        // left" from "one of this player's sockets went away", so cancelling
+        // their challenges on it would cancel live invitations for someone
+        // still sitting in another tab. Challenges expire on their own two
+        // minute deadline, and a stale one fails honestly at accept time.
+        if let Err(error) = self
+            .presence
+            .release(self.user_id, &self.websocket_id)
+            .await
+        {
+            debug!(user_id = self.user_id, %error, "failed to release presence on disconnect");
+        }
+    }
+}
+
+/// Send the region roster with the viewer removed.
+///
+/// A roster frame is published once per region and forwarded by every socket,
+/// so the "not me" filter has to happen here rather than at publish time.
+async fn send_online_players(
+    user_id: u32,
+    roster: RegionRoster,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    let mut roster = roster;
+    roster.players.retain(|player| player.user_id != user_id);
+    let frame = serde_json::to_string(&WSMessage::OnlinePlayers(roster))
+        .context("failed to serialize the online-player roster")?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before the online-player roster")
+}
+
+/// Send this user's complete challenge state. Always a snapshot: a client that
+/// missed a hint, handed its socket over, or reconnected simply re-renders.
+async fn send_challenge_inbox(
+    user_id: u32,
+    challenges: &ChallengeStore,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Result<()> {
+    send_challenge_inbox_if_changed(user_id, challenges, ws_tx, &mut None).await
+}
+
+/// Send the snapshot, optionally suppressing one that is byte-identical to the
+/// last.
+///
+/// The reconcile timer runs whether or not anything moved, and every snapshot
+/// the client receives replaces its state and re-renders both social panels.
+/// Passing `Some(last_frame)` makes a quiet inbox cost nothing on the wire and
+/// nothing on the client. `None` always sends, which is what the initial
+/// snapshot and every post-action refresh want.
+async fn send_challenge_inbox_if_changed(
+    user_id: u32,
+    challenges: &ChallengeStore,
+    ws_tx: &mpsc::Sender<Message>,
+    last_frame: &mut Option<String>,
+) -> Result<()> {
+    let inbox = challenges
+        .inbox(user_id)
+        .await
+        .context("failed to read the challenge inbox")?;
+    let frame = serde_json::to_string(&WSMessage::Challenges(inbox))
+        .context("failed to serialize the challenge inbox")?;
+    if last_frame.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    let outcome = ws_tx
+        .send(Message::Text(frame.clone().into()))
+        .await
+        .context("WebSocket closed before the challenge inbox");
+    if outcome.is_ok() {
+        *last_frame = Some(frame);
+    }
+    outcome
+}
+
+/// Whether this identity belongs in the social layer at all.
+///
+/// Separate from `start_social_session` because the answer never changes for a
+/// connection: a failed *claim* is worth retrying on the next message, but a
+/// stress identity being ineligible is not. Stress traffic is a separate
+/// matchmaking universe, and putting load-test names in everyone's roster
+/// would be visible to real players.
+fn social_layer_admits(metadata: &PlayerMetadata) -> bool {
+    u32::try_from(metadata.user_id).is_ok() && metadata.matchmaking_pool != MatchmakingPool::Stress
+}
+
+/// Bring one authenticated socket into the social layer: claim a presence
+/// lease, send the current roster and challenge state, and keep both live.
+#[allow(clippy::too_many_arguments)]
+async fn start_social_session(
+    metadata: &PlayerMetadata,
+    websocket_id: &str,
+    region: &str,
+    redis: &RedisConnection,
+    pubsub_manager: &Arc<PubSubManager>,
+    event_router: &Arc<crate::replication::GameEventRouter>,
+    db: &Arc<dyn Database>,
+    ws_tx: &mpsc::Sender<Message>,
+) -> Option<SocialSession> {
+    let Ok(user_id) = u32::try_from(metadata.user_id) else {
+        return None;
+    };
+
+    let presence = PresenceRegistry::new(redis.clone(), region.to_string());
+    let challenges = ChallengeStore::new(redis.clone());
+
+    if let Err(error) = presence
+        .claim(
+            user_id,
+            websocket_id,
+            &metadata.username,
+            metadata.is_guest,
+            PresenceActivity::Idle,
+            metadata.matchmaking_pool,
+        )
+        .await
+    {
+        warn!(user_id, %error, "failed to claim a presence lease");
+        return None;
+    }
+
+    match presence.roster().await {
+        Ok(roster) => {
+            if let Err(error) = send_online_players(user_id, roster, ws_tx).await {
+                debug!(user_id, %error, "failed to send the initial roster");
+            }
+        }
+        Err(error) => warn!(user_id, %error, "failed to read the initial roster"),
+    }
+    if let Err(error) = send_challenge_inbox(user_id, &challenges, ws_tx).await {
+        debug!(user_id, %error, "failed to send the initial challenge inbox");
+    }
+
+    let intent = Arc::new(std::sync::Mutex::new(PresenceIntent {
+        username: metadata.username.clone(),
+        is_guest: metadata.is_guest,
+        activity: PresenceActivity::Idle,
+        pool: metadata.matchmaking_pool,
+        game_id: None,
+    }));
+    let mut tasks = Vec::new();
+
+    // Keep the lease alive. A lease rather than a delete-on-disconnect pair is
+    // what makes the roster correct when a task dies without cleaning up.
+    let lease_presence = presence.clone();
+    let lease_intent = intent.clone();
+    let lease_websocket_id = websocket_id.to_string();
+    let lease_rematch = RematchStore::new(redis.clone());
+    tasks.push(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            crate::presence::PRESENCE_REFRESH_INTERVAL_MS,
+        ));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let current = match lease_intent.lock() {
+                Ok(intent) => intent.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Err(error) = lease_presence
+                .refresh(
+                    user_id,
+                    &lease_websocket_id,
+                    &current.username,
+                    current.is_guest,
+                    current.activity,
+                    current.pool,
+                )
+                .await
+            {
+                debug!(user_id, %error, "presence lease refresh failed");
+            }
+            if let Some(game_id) = current.game_id
+                && let Err(error) = lease_rematch.touch_presence(game_id, user_id).await
+            {
+                debug!(user_id, game_id, %error, "rematch presence refresh failed");
+            }
+        }
+    }));
+
+    // Roster fan-out. Loss-tolerant by design: a dropped frame is corrected by
+    // the next roster change, and nothing depends on having seen every one.
+    let roster_tx = ws_tx.clone();
+    let roster_channel = RedisKeys::presence_updates_channel(region);
+    let mut roster_pubsub = (**pubsub_manager).clone();
+    tasks.push(tokio::spawn(async move {
+        let Ok(mut receiver) = roster_pubsub.subscribe_to_channel(&roster_channel).await else {
+            warn!(channel = %roster_channel, "failed to subscribe to region roster updates");
+            return;
+        };
+        loop {
+            let Ok(roster) = receiver.recv::<RegionRoster>().await else {
+                break;
+            };
+            if send_online_players(user_id, roster, &roster_tx)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }));
+
+    // Challenge delivery. The Pub/Sub hint only says "re-read your state"; the
+    // durable records are authoritative and the timer covers a dropped hint,
+    // which is the same durable-key + hint + reconcile shape matchmaking uses.
+    let challenge_tx = ws_tx.clone();
+    let challenge_store = challenges.clone();
+    let notification_channel = RedisKeys::user_notifications_channel(user_id);
+    let mut challenge_pubsub = (**pubsub_manager).clone();
+    let notify_intent = intent.clone();
+    let notify_rematch = RematchStore::new(redis.clone());
+    let notify_event_router = event_router.clone();
+    let notify_db = db.clone();
+    tasks.push(tokio::spawn(async move {
+        let receiver = challenge_pubsub
+            .subscribe_to_channel(&notification_channel)
+            .await;
+        let mut reconcile = tokio::time::interval(CHALLENGE_RECONCILE_INTERVAL);
+        reconcile.tick().await;
+        let mut last_frame: Option<String> = None;
+
+        // One channel carries both kinds of nudge, so the payload decides what
+        // to re-read. A reconcile tick re-reads everything, which is what
+        // makes a dropped hint cost latency rather than correctness.
+        let settle = |hint: Option<String>| -> (bool, bool) {
+            match hint.as_deref() {
+                Some("rematch") => (false, true),
+                Some(_) => (true, false),
+                None => (true, true),
+            }
+        };
+
+        // A missing hint channel is a degradation, not a failure: the loop
+        // falls back to pure reconcile polling and says so once.
+        let mut receiver = match receiver {
+            Ok(receiver) => Some(receiver),
+            Err(error) => {
+                warn!(user_id, %error, "social hints unavailable; falling back to polling");
+                None
+            }
+        };
+
+        loop {
+            let hint = match receiver.as_mut() {
+                Some(receiver) => {
+                    tokio::select! {
+                        received = receiver.recv::<String>() => match received {
+                            Ok(payload) => Some(payload),
+                            Err(_) => break,
+                        },
+                        _ = reconcile.tick() => None,
+                    }
+                }
+                None => {
+                    reconcile.tick().await;
+                    None
+                }
+            };
+            let (read_challenges, read_rematch) = settle(hint);
+
+            if read_challenges
+                && send_challenge_inbox_if_changed(
+                    user_id,
+                    &challenge_store,
+                    &challenge_tx,
+                    &mut last_frame,
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            if read_rematch {
+                let seated_game_id = match notify_intent.lock() {
+                    Ok(intent) => intent.game_id,
+                    Err(poisoned) => poisoned.into_inner().game_id,
+                };
+                if let Some(game_id) = seated_game_id
+                    && send_rematch_state(
+                        game_id,
+                        user_id,
+                        &notify_rematch,
+                        &notify_event_router,
+                        &notify_db,
+                        &challenge_tx,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }));
+
+    Some(SocialSession {
+        user_id,
+        websocket_id: websocket_id.to_string(),
+        presence,
+        intent,
+        tasks,
+    })
+}
+
+/// How often a socket re-reads its challenges regardless of hints. Short
+/// enough that a dropped Pub/Sub message is not user-visible as a stuck panel.
+const CHALLENGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Re-assert the presence lease with a new activity, so the roster can say
+/// whether someone is free to play.
+async fn record_presence_activity(
+    session: Option<&SocialSession>,
+    metadata: &PlayerMetadata,
+    activity: PresenceActivity,
+    game_id: Option<u32>,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let next = PresenceIntent {
+        username: metadata.username.clone(),
+        is_guest: metadata.is_guest,
+        activity,
+        pool: metadata.matchmaking_pool,
+        game_id,
+    };
+    // Writing the shared intent first means even a failed refresh converges on
+    // the next heartbeat instead of leaving the roster permanently stale.
+    let unchanged = match session.intent.lock() {
+        Ok(mut current) => {
+            let unchanged = current.username == next.username
+                && current.is_guest == next.is_guest
+                && current.activity == next.activity
+                && current.game_id == next.game_id;
+            *current = next.clone();
+            unchanged
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = next.clone();
+            false
+        }
+    };
+    if unchanged {
+        return;
+    }
+
+    if let Err(error) = session
+        .presence
+        .refresh(
+            session.user_id,
+            &session.websocket_id,
+            &next.username,
+            next.is_guest,
+            next.activity,
+            next.pool,
+        )
+        .await
+    {
+        debug!(user_id = session.user_id, %error, "failed to record presence activity");
+    }
+}
+
+async fn send_challenge_failure(reason: &str, ws_tx: &mpsc::Sender<Message>) -> Result<()> {
+    let frame = serde_json::to_string(&WSMessage::ChallengeFailed {
+        reason: reason.to_string(),
+    })?;
+    ws_tx
+        .send(Message::Text(frame.into()))
+        .await
+        .context("WebSocket closed before a challenge failure")
+}
+
 async fn subscribe_to_user_count_updates(
     pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
@@ -4514,6 +6727,8 @@ struct LobbyUpdatePayload {
     host_user_id: i32,
     state: String,
     preferences: lobby_manager::LobbyPreferences,
+    #[serde(default)]
+    ad_break: Option<LobbyAdBreakView>,
 }
 
 /// Subscribe to lobby updates and forward to WebSocket client
@@ -4550,6 +6765,7 @@ async fn subscribe_to_lobby_updates(
                     host_user_id,
                     state,
                     preferences,
+                    ad_break,
                 } = update;
 
                 let ws_message = WSMessage::LobbyUpdate {
@@ -4558,6 +6774,7 @@ async fn subscribe_to_lobby_updates(
                     host_user_id,
                     state,
                     preferences,
+                    ad_break,
                 };
 
                 let json_msg = match serde_json::to_string(&ws_message) {
@@ -4784,20 +7001,25 @@ fn ensure_custom_game_access(matchmaking_pool: MatchmakingPool) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_protocol_tests {
     use super::{
-        CommandOutcomeReplay, GameJoinAuthorizationError, GameSubscriptionInput,
-        TERMINAL_COMMAND_REJECTION_REASON, WSMessage, abort_and_join_game_event_forwarder,
+        CommandOutcomeReplay, GameChatBroadcast, GameJoinAuthorizationError, GameSubscriptionInput,
+        PlayerMetadata, TERMINAL_COMMAND_REJECTION_REASON, WSMessage,
+        abort_and_join_game_event_forwarder, acknowledge_lobby_match_handoff,
         canonical_command_identity, command_outcomes_for_user, ensure_custom_game_access,
-        game_join_denied, game_join_failure_message, log_client_protocol_version,
-        missing_game_join_failure, next_game_subscription_input, next_outbound_message,
-        queue_planned_drain_notice, recovery_bridge_snapshot, require_game_command_publication,
-        sanitize_anon_id, send_command_outcomes_from_resolved,
-        send_completed_game_snapshot_from_resolved, send_recovery_bridge_snapshot,
-        slow_command_publish_wait_ms, snapshot_requires_command_outcomes,
-        subscribe_to_lobby_match_notifications, take_lobby_update_receiver, unsent_lobby_match,
-        validate_game_matchmaking_pool,
+        game_join_denied, game_join_failure_message, load_game_chat_history,
+        lobby_video_ad_targets, missing_game_join_failure, next_game_subscription_input,
+        next_lobby_match, next_outbound_message, publish_game_chat_message,
+        queue_planned_drain_notice, recovery_bridge_snapshot, refresh_connection_username,
+        repair_legacy_chat_history, require_game_command_publication, sanitize_anon_id,
+        send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
+        send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
+        snapshot_requires_command_outcomes, subscribe_to_game_chat,
+        subscribe_to_lobby_match_notifications, take_lobby_update_receiver,
+        validate_client_protocol_version, validate_game_matchmaking_pool,
     };
+    use crate::ads::ClientDistribution;
+    use crate::db::models::RuntimeAdsConfig;
     use crate::lifecycle::{DrainNotice, WS_PROTOCOL_VERSION};
-    use crate::lobby_manager::{Lobby, LobbyPreferences};
+    use crate::lobby_manager::{Lobby, LobbyMember, LobbyPreferences};
     use crate::matchmaking_manager::{ActiveMatch, MatchStatus};
     use crate::matchmaking_pool::MatchmakingPool;
     use crate::pubsub_manager::PubSubManager;
@@ -4806,7 +7028,7 @@ mod lifecycle_protocol_tests {
         SessionCommandOutcomes, SessionCommandRejectionFence,
     };
     use crate::redis_keys::RedisKeys;
-    use crate::redis_utils::create_connection_manager;
+    use crate::redis_utils::{RedisConnection, create_connection_manager};
     use common::{
         ClientCommandIdentityV2, GameEvent, GameEventMessage, GameState, GameStatus, GameType,
         QueueMode,
@@ -4818,6 +7040,69 @@ mod lifecycle_protocol_tests {
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
+
+    fn ad_capability_member(
+        user_id: u32,
+        distribution: Option<ClientDistribution>,
+        supports_ad_break: bool,
+        can_show_video_ad: bool,
+    ) -> LobbyMember {
+        LobbyMember {
+            user_id,
+            username: format!("player-{user_id}"),
+            ts: 1.0,
+            supports_ad_break,
+            can_show_video_ad,
+            distribution,
+        }
+    }
+
+    #[test]
+    fn mixed_distribution_lobby_runs_only_when_someone_can_show_video() {
+        let web = ad_capability_member(1, Some(ClientDistribution::Web), true, true);
+        let itch = ad_capability_member(2, Some(ClientDistribution::Itch), true, true);
+        let runtime_ads = RuntimeAdsConfig {
+            enabled: true,
+            distributions: crate::db::models::RuntimeAdsDistributionsConfig {
+                web: crate::db::models::RuntimeDistributionAdsConfig { enabled: true },
+                crazygames: crate::db::models::RuntimeDistributionAdsConfig { enabled: true },
+                itch: crate::db::models::RuntimeDistributionAdsConfig { enabled: false },
+            },
+            ..RuntimeAdsConfig::default()
+        };
+        assert_eq!(
+            lobby_video_ad_targets([&web, &itch], &runtime_ads),
+            Some(vec![1])
+        );
+
+        let another_no_ad_build =
+            ad_capability_member(3, Some(ClientDistribution::Itch), true, false);
+        assert!(lobby_video_ad_targets([&itch, &another_no_ad_build], &runtime_ads).is_none());
+
+        let legacy = ad_capability_member(4, None, false, false);
+        assert!(lobby_video_ad_targets([&web, &legacy], &runtime_ads).is_none());
+        assert!(lobby_video_ad_targets(std::iter::empty(), &runtime_ads).is_none());
+    }
+
+    #[test]
+    fn successful_guest_rename_refreshes_same_socket_identity() {
+        let mut metadata = PlayerMetadata {
+            user_id: 7,
+            username: "Guest1234".to_owned(),
+            token: "session-token".to_owned(),
+            is_guest: true,
+            matchmaking_pool: MatchmakingPool::Public,
+            supports_ad_break: true,
+            can_show_video_ad: false,
+            distribution: Some(ClientDistribution::Web),
+        };
+
+        refresh_connection_username(&mut metadata, "CrazyPlayer".to_owned());
+
+        assert_eq!(metadata.username, "CrazyPlayer");
+        assert_eq!(metadata.user_id, 7);
+        assert_eq!(metadata.token, "session-token");
+    }
 
     #[test]
     fn slow_command_publish_logging_uses_a_strict_one_second_threshold() {
@@ -4902,6 +7187,7 @@ mod lifecycle_protocol_tests {
             host_user_id: 7,
             state: "open".to_owned(),
             preferences: LobbyPreferences::default(),
+            ad_break: None,
         };
         updates
             .send(initial)
@@ -4927,6 +7213,7 @@ mod lifecycle_protocol_tests {
             host_user_id: 7,
             state: "open".to_owned(),
             preferences: LobbyPreferences::default(),
+            ad_break: None,
         };
         updates
             .send(next)
@@ -4984,11 +7271,12 @@ mod lifecycle_protocol_tests {
     }
 
     #[test]
-    fn authentication_request_reports_an_advisory_protocol_version() {
+    fn authentication_request_reports_the_required_protocol_version() {
         let value = serde_json::to_value(WSMessage::Authenticate {
             token: "jwt".to_owned(),
             protocol_version: WS_PROTOCOL_VERSION,
             anon_id: None,
+            distribution: Some(ClientDistribution::Web),
         })
         .unwrap();
         assert_eq!(value["Authenticate"]["token"], "jwt");
@@ -4999,6 +7287,7 @@ mod lifecycle_protocol_tests {
         // Absent rather than null, so the frame a version-less client sends is
         // byte-identical to the one this server produces.
         assert!(value["Authenticate"].get("anon_id").is_none());
+        assert_eq!(value["Authenticate"]["distribution"], "web");
     }
 
     /// The analytics identifier is additive in both directions: a client that
@@ -5066,22 +7355,41 @@ mod lifecycle_protocol_tests {
         assert_eq!(sanitize_anon_id(Some("a".repeat(100_000))), None);
     }
 
-    /// A stale, newer, or version-less client must never be refused: a shipped
-    /// build (an itch.io bundle above all) cannot update itself, so refusing it
-    /// would strand the player. Reporting a version only produces a log line.
     #[test]
-    fn every_reported_protocol_version_is_admitted() {
-        log_client_protocol_version(Some(WS_PROTOCOL_VERSION));
-        log_client_protocol_version(Some(WS_PROTOCOL_VERSION.saturating_sub(1)));
-        log_client_protocol_version(Some(WS_PROTOCOL_VERSION.saturating_add(1)));
-        log_client_protocol_version(Some(0));
-        log_client_protocol_version(None);
+    fn authentication_request_can_omit_distribution() {
+        let value: WSMessage = serde_json::from_value(serde_json::json!({
+            "Authenticate": {
+                "token": "jwt",
+                "protocol_version": WS_PROTOCOL_VERSION
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            value,
+            WSMessage::Authenticate {
+                distribution: None,
+                ..
+            }
+        ));
     }
 
-    /// The legacy version-less shape still authenticates rather than being
-    /// answered with a denial the player cannot act on.
     #[test]
-    fn the_legacy_token_shape_is_still_accepted() {
+    fn only_the_exact_gameplay_protocol_is_admitted() {
+        assert!(validate_client_protocol_version(Some(WS_PROTOCOL_VERSION)).is_ok());
+        for version in [
+            WS_PROTOCOL_VERSION.saturating_sub(1),
+            WS_PROTOCOL_VERSION.saturating_add(1),
+            0,
+        ] {
+            let error = validate_client_protocol_version(Some(version)).unwrap_err();
+            assert!(error.to_string().contains("Gameplay update required"));
+        }
+        let error = validate_client_protocol_version(None).unwrap_err();
+        assert!(error.to_string().contains("did not report"));
+    }
+
+    #[test]
+    fn the_legacy_token_shape_remains_parseable_for_an_explicit_denial() {
         let value = serde_json::to_value(WSMessage::Token("jwt".to_owned())).unwrap();
         assert_eq!(value["Token"], "jwt");
 
@@ -5178,7 +7486,8 @@ mod lifecycle_protocol_tests {
     async fn pending_outcome_replay_does_not_block_live_game_events() {
         let (ws_tx, _ws_rx) = mpsc::channel(2);
         let (events_tx, events_rx) = broadcast::channel(2);
-        let mut events = crate::replication::FilteredEventReceiver::new(events_rx, 0, 42);
+        let mut events = crate::replication::GameEventSubscription::for_test(events_rx, 42);
+        events.anchor(4);
         let (release_tx, release_rx) = oneshot::channel();
         let mut replay: Option<CommandOutcomeReplay> = Some(Box::pin(async move {
             release_rx.await.expect("test replay release was dropped");
@@ -5197,7 +7506,7 @@ mod lifecycle_protocol_tests {
         };
         events_tx
             .send(live_event)
-            .expect("filtered receiver should remain subscribed");
+            .expect("subscription should remain attached");
 
         let input = timeout(
             Duration::from_secs(1),
@@ -5207,8 +7516,9 @@ mod lifecycle_protocol_tests {
         .expect("a pending Redis replay blocked a ready live event");
         assert!(matches!(
             input,
-            GameSubscriptionInput::Event(Ok(event))
-                if event.game_id == 42 && event.stream_seq == 5
+            GameSubscriptionInput::Update(Some(crate::replication::SubscriptionUpdate::Event(
+                event
+            ))) if event.game_id == 42 && event.stream_seq == 5
         ));
 
         release_tx.send(()).expect("replay future disappeared");
@@ -5298,18 +7608,36 @@ mod lifecycle_protocol_tests {
 
     #[test]
     fn lobby_match_reconciliation_covers_commit_before_subscribe() {
-        assert_eq!(unsent_lobby_match(Some(42), None), Some(42));
+        assert_eq!(next_lobby_match(Some(42), Some(42), None, false), Some(42));
+        assert_eq!(next_lobby_match(None, Some(42), None, false), Some(42));
     }
 
     #[test]
-    fn lobby_match_reconciliation_deduplicates_hints_and_allows_play_again() {
-        assert_eq!(unsent_lobby_match(Some(42), Some(42)), None);
-        assert_eq!(unsent_lobby_match(Some(43), Some(42)), Some(43));
-        assert_eq!(unsent_lobby_match(None, Some(42)), None);
+    fn lobby_match_reconciliation_retries_until_ack_and_allows_play_again() {
+        assert_eq!(
+            next_lobby_match(Some(42), Some(42), Some(42), false),
+            None,
+            "push hints must be deduplicated"
+        );
+        assert_eq!(
+            next_lobby_match(None, Some(42), Some(42), true),
+            Some(42),
+            "periodic reconciliation must retry an unacknowledged handoff after active cleanup"
+        );
+        assert_eq!(
+            next_lobby_match(Some(42), None, Some(42), true),
+            None,
+            "acknowledged active matches must stay deduplicated"
+        );
+        assert_eq!(
+            next_lobby_match(Some(43), Some(43), Some(42), false),
+            Some(43)
+        );
+        assert_eq!(next_lobby_match(None, None, Some(42), true), None);
     }
 
     #[tokio::test]
-    async fn live_lobby_listener_recovers_committed_and_missed_hints_once() {
+    async fn live_lobby_listener_survives_active_cleanup_until_member_acknowledges() {
         let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
         let client = Client::open(redis_url).unwrap();
         let (pubsub_tx, _pubsub_rx) = broadcast::channel(128);
@@ -5319,10 +7647,17 @@ mod lifecycle_protocol_tests {
         let pubsub_redis = create_connection_manager(client.clone(), pubsub_tx.clone())
             .await
             .unwrap();
+        let ack_redis = RedisConnection::from(
+            create_connection_manager(client.clone(), pubsub_tx.clone())
+                .await
+                .unwrap(),
+        );
         let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx));
         let mut control = client.get_multiplexed_async_connection().await.unwrap();
         let lobby_code = format!("LISTENER-{}", uuid::Uuid::new_v4());
+        let user_id = 77_u32;
         let mapping_key = RedisKeys::matchmaking_lobby_active_game(&lobby_code);
+        let pending_key = RedisKeys::matchmaking_lobby_user_pending_game(&lobby_code, user_id);
         let channel = RedisKeys::matchmaking_lobby_notification_channel(&lobby_code);
         let first_game_id = 42_001_u32;
         let second_game_id = 42_002_u32;
@@ -5333,14 +7668,20 @@ mod lifecycle_protocol_tests {
             .set::<_, _, ()>(&mapping_key, first_game_id)
             .await
             .unwrap();
+        control
+            .set::<_, _, ()>(&pending_key, first_game_id)
+            .await
+            .unwrap();
         let (ws_tx, mut ws_rx) = mpsc::channel(8);
         let cancellation = CancellationToken::new();
         let listener = tokio::spawn(subscribe_to_lobby_match_notifications(
-            lobby_code,
+            lobby_code.clone(),
+            user_id,
             pubsub_manager,
             redis,
             ws_tx,
             cancellation.clone(),
+            Duration::from_millis(100),
         ));
 
         let first = timeout(Duration::from_secs(2), ws_rx.recv())
@@ -5351,6 +7692,11 @@ mod lifecycle_protocol_tests {
             decode_ws_message(first),
             WSMessage::JoinGame(game_id) if game_id == first_game_id
         ));
+        assert!(
+            acknowledge_lobby_match_handoff(&ack_redis, &lobby_code, user_id, first_game_id)
+                .await
+                .unwrap()
+        );
 
         let duplicate_hint = serde_json::json!({
             "type": "MatchFound",
@@ -5371,13 +7717,18 @@ mod lifecycle_protocol_tests {
             "duplicate hints must not forward a second JoinGame"
         );
 
-        // Deliberately publish no hint for the later game. The periodic
-        // durable read is the recovery path for an at-most-once Pub/Sub loss.
-        control
-            .set::<_, _, ()>(&mapping_key, second_game_id)
+        // Deliberately publish no hint for the later game, then simulate a
+        // short round completing before the listener's next five-second read.
+        // The admission lock is gone; only the per-member handoff remains.
+        redis::pipe()
+            .atomic()
+            .set(&mapping_key, second_game_id)
+            .set(&pending_key, second_game_id)
+            .del(&mapping_key)
+            .query_async::<()>(&mut control)
             .await
             .unwrap();
-        let second = timeout(Duration::from_secs(6), ws_rx.recv())
+        let second = timeout(Duration::from_secs(1), ws_rx.recv())
             .await
             .expect("periodic reconciliation did not recover the missed hint")
             .expect("listener closed before periodic reconciliation");
@@ -5385,11 +7736,35 @@ mod lifecycle_protocol_tests {
             decode_ws_message(second),
             WSMessage::JoinGame(game_id) if game_id == second_game_id
         ));
+
+        assert!(
+            !acknowledge_lobby_match_handoff(&ack_redis, &lobby_code, user_id, first_game_id)
+                .await
+                .unwrap(),
+            "a delayed acknowledgement must not consume the newer round"
+        );
+        assert!(
+            acknowledge_lobby_match_handoff(&ack_redis, &lobby_code, user_id, second_game_id)
+                .await
+                .unwrap()
+        );
+        control
+            .publish::<_, _, ()>(
+                &channel,
+                serde_json::json!({
+                    "type": "MatchFound",
+                    "game_id": second_game_id,
+                    "partition_id": 2,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
         assert!(
             timeout(Duration::from_millis(250), ws_rx.recv())
                 .await
                 .is_err(),
-            "periodic reads must not repeat the same JoinGame"
+            "an acknowledged handoff must not repeat JoinGame on later hints"
         );
 
         cancellation.cancel();
@@ -5397,7 +7772,154 @@ mod lifecycle_protocol_tests {
             .await
             .expect("listener ignored cancellation")
             .expect("listener task panicked");
-        control.del::<_, ()>(&mapping_key).await.unwrap();
+        control
+            .del::<_, ()>((mapping_key, pending_key))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_game_chat_envelope_persists_replays_and_forwards_live() {
+        let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
+        let client = Client::open(redis_url).unwrap();
+        let (pubsub_tx, _pubsub_rx) = broadcast::channel(128);
+        let redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_redis = create_connection_manager(client.clone(), pubsub_tx.clone())
+            .await
+            .unwrap();
+        let pubsub_manager = Arc::new(PubSubManager::new(pubsub_redis, pubsub_tx));
+        let mut control = client.get_multiplexed_async_connection().await.unwrap();
+        let game_id = uuid::Uuid::new_v4().as_u128() as u32;
+        let history_key = RedisKeys::game_chat_history_key(game_id);
+        let channel = RedisKeys::game_chat_channel(game_id);
+        control.del::<_, ()>(&history_key).await.unwrap();
+
+        let filtered_message = "so many ******** sin this server";
+        let message_id = "game-chat-filter-regression";
+        publish_game_chat_message(
+            redis.clone().into(),
+            GameChatBroadcast {
+                game_id,
+                message_id: message_id.to_owned(),
+                user_id: 7,
+                username: "player".to_owned(),
+                message: filtered_message.to_owned(),
+                timestamp_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored_entries: Vec<String> = control.lrange(&history_key, 0, -1).await.unwrap();
+        let stored = stored_entries
+            .last()
+            .expect("published game chat should be retained");
+        let stored_json: serde_json::Value = serde_json::from_str(stored).unwrap();
+        assert_eq!(stored_json["game_id"], game_id);
+        assert_eq!(stored_json["message"], filtered_message);
+        assert_eq!(stored_json["content_filter_version"], 1);
+
+        let legacy_message_id = "legacy-game-chat-filter-regression";
+        let legacy_entry = serde_json::json!({
+            "game_id": game_id,
+            "message_id": legacy_message_id,
+            "user_id": 7,
+            "username": "legacy-player",
+            "message": "fuck",
+            "timestamp_ms": 2,
+        })
+        .to_string();
+        control
+            .rpush::<_, _, ()>(&history_key, legacy_entry)
+            .await
+            .unwrap();
+
+        let history = load_game_chat_history(redis.clone().into(), game_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].message, filtered_message);
+        assert_eq!(history[1].message_id, legacy_message_id);
+        assert_eq!(history[1].message, "****");
+
+        let repaired_entries: Vec<String> = control.lrange(&history_key, 0, -1).await.unwrap();
+        let repaired_legacy = repaired_entries
+            .iter()
+            .map(|entry| serde_json::from_str::<serde_json::Value>(entry).unwrap())
+            .find(|entry| entry["message_id"] == legacy_message_id)
+            .expect("legacy game chat should remain after atomic read repair");
+        assert_eq!(repaired_legacy["message"], "****");
+        assert_eq!(repaired_legacy["content_filter_version"], 1);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel(4);
+        let listener = tokio::spawn(subscribe_to_game_chat(game_id, pubsub_manager, ws_tx));
+
+        let live = timeout(Duration::from_secs(2), async {
+            loop {
+                control.publish::<_, _, ()>(&channel, stored).await.unwrap();
+                if let Ok(Some(message)) = timeout(Duration::from_millis(50), ws_rx.recv()).await {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("game chat subscriber did not forward the current envelope");
+        assert!(matches!(
+            decode_ws_message(live),
+            WSMessage::GameChatMessage {
+                game_id: delivered_game_id,
+                message_id: delivered_message_id,
+                message,
+                ..
+            } if delivered_game_id == game_id
+                && delivered_message_id == message_id
+                && message == filtered_message
+        ));
+
+        listener.abort();
+        let _ = listener.await;
+        control.del::<_, ()>(&history_key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_chat_read_repair_compares_current_entries_before_replacing() {
+        let redis_url = "redis://127.0.0.1:6379/1?protocol=resp3";
+        let client = Client::open(redis_url).unwrap();
+        let (pubsub_tx, _pubsub_rx) = broadcast::channel(8);
+        let redis = create_connection_manager(client.clone(), pubsub_tx)
+            .await
+            .unwrap();
+        let mut control = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!(
+            "chat-history-repair-race:{}",
+            uuid::Uuid::new_v4().as_u128()
+        );
+        control.del::<_, ()>(&key).await.unwrap();
+        control
+            .rpush::<_, _, ()>(&key, &["legacy-a", "legacy-b"])
+            .await
+            .unwrap();
+        control.expire::<_, ()>(&key, 120).await.unwrap();
+
+        let stale_repairs = vec![
+            ("legacy-a".to_owned(), "filtered-a".to_owned()),
+            ("legacy-b".to_owned(), "filtered-b".to_owned()),
+        ];
+        control.rpush::<_, _, ()>(&key, "current-c").await.unwrap();
+        control.ltrim::<_, ()>(&key, -2, -1).await.unwrap();
+
+        let mut repair_redis = redis.into();
+        repair_legacy_chat_history(&mut repair_redis, &key, &stale_repairs)
+            .await
+            .unwrap();
+
+        let repaired: Vec<String> = control.lrange(&key, 0, -1).await.unwrap();
+        assert_eq!(repaired, ["filtered-b", "current-c"]);
+        let ttl: i64 = control.ttl(&key).await.unwrap();
+        assert!(ttl > 0, "read repair should preserve the existing TTL");
+        control.del::<_, ()>(&key).await.unwrap();
     }
 
     #[test]

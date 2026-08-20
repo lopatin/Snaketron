@@ -6,7 +6,38 @@ use ::common::{
 };
 use anyhow::Result;
 use server::ws_server::WSMessage;
-use tokio::time::{Duration, timeout};
+use std::ffi::OsString;
+use tokio::time::{Duration, Instant, timeout};
+
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: every test in this integration-test process holds TEST_LOCK
+        // for its complete lifetime, including all server background tasks.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        // SAFETY: the guard is dropped while the test still holds TEST_LOCK,
+        // after its server task tree has stopped.
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 /// Wait for a JoinGame message, skipping unrelated messages (e.g. UserCountUpdate).
 async fn wait_for_join_game(client: &mut TestClient, label: &str) -> Result<u32> {
@@ -47,6 +78,8 @@ async fn wait_for_snapshot(client: &mut TestClient, label: &str) -> Result<WSMes
 
 #[tokio::test]
 async fn test_simple_game() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+
     // Initialize tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -325,7 +358,7 @@ async fn test_simple_game() -> Result<()> {
             continue;
         };
         match &event.event {
-            GameEvent::SnakeDied { snake_id } => {
+            GameEvent::SnakeDied { snake_id, .. } => {
                 if *snake_id == snake1_id && snake1_death_tick.is_none() {
                     println!(
                         "Snake 1 (id={}) died at tick {}! Initial direction was {:?}",
@@ -428,5 +461,30 @@ async fn test_simple_game() -> Result<()> {
     }
 
     env.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_mode_shutdown_exercises_planned_handoff() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let _shutdown_deadline = ScopedEnvVar::set("SNAKETRON_SHUTDOWN_DEADLINE_MS", "750");
+    let _route_withdrawal = ScopedEnvVar::set("SNAKETRON_ROUTE_WITHDRAWAL_MS", "0");
+
+    let mut env = TestEnvironment::new("production_mode_shutdown").await?;
+    env.add_production_mode_server().await?;
+
+    let started = Instant::now();
+    env.shutdown().await?;
+    let elapsed = started.elapsed();
+    println!("production planned-handoff shutdown completed in {elapsed:?}");
+
+    // The runtime-mode unit test proves production dispatch cannot select the
+    // fast test teardown. This integration path verifies the real handoff
+    // implementation still respects its configured global safety bound.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "configured production shutdown deadline was not respected: {elapsed:?}"
+    );
+
     Ok(())
 }

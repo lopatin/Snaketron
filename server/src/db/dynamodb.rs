@@ -3,28 +3,39 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::create_table::{CreateTableError, CreateTableOutput};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, ConditionCheck,
     CreateGlobalSecondaryIndexAction, Delete, GlobalSecondaryIndex, GlobalSecondaryIndexUpdate,
-    KeySchemaElement, KeyType, Projection, ProjectionType, Put, ReturnValue, ScalarAttributeType,
-    TableStatus, TimeToLiveSpecification, TimeToLiveStatus, TransactWriteItem, Update,
+    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, Put, ReturnValue,
+    ScalarAttributeType, TableStatus, TimeToLiveSpecification, TimeToLiveStatus, TransactWriteItem,
+    Update,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::{collections::HashMap, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use super::models::*;
 use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
-    CompletionEffect, CompletionRecordV1, EffectApplyResult, canonical_json_bytes,
+    CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
+    canonical_json_bytes, match_history_summary,
 };
-use crate::season::Season;
+use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
+use crate::season::{Season, get_season_at};
 
 pub struct DynamoDatabase {
     client: Client,
     table_prefix: String,
+    replay_store: Option<Arc<dyn ReplayStore>>,
 }
 
 const COMPLETED_GAME_RETENTION_DAYS_ENV: &str = "SNAKETRON_COMPLETED_GAME_RETENTION_DAYS";
@@ -34,7 +45,208 @@ const DYNAMODB_CONTROL_PLANE_MAX_ATTEMPTS: usize = 30;
 const DYNAMODB_CONTROL_PLANE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMPLETION_RANKING_MAX_ATTEMPTS: usize = 16;
 const GUEST_UPGRADE_MAX_ATTEMPTS: usize = 8;
+const CRAZYGAMES_IDENTITY_MAX_ATTEMPTS: usize = 8;
 const DYNAMODB_RUNTIME_MAX_ATTEMPTS: u32 = 5;
+const HISTORY_PAGE_DEFAULT_LIMIT: usize = 20;
+const HISTORY_PAGE_MAX_LIMIT: usize = 50;
+const PAGE_CURSOR_MAX_BYTES: usize = 2_048;
+const HISTORY_GSI_PARTITION: &str = "MATCH_HISTORY";
+const RUNTIME_CONFIG_PK: &str = "CONFIG#RUNTIME";
+const RUNTIME_CONFIG_CURRENT_SK: &str = "CURRENT";
+const RUNTIME_CONFIG_SCHEMA_VERSION_V1: u16 = 1;
+const MAX_PRE_MATCH_AD_BREAK_USERS: usize = 4;
+const MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES: usize = 36;
+
+const fn runtime_config_schema_version_v1() -> u16 {
+    RUNTIME_CONFIG_SCHEMA_VERSION_V1
+}
+
+const fn default_ad_interval_minutes_v1() -> u16 {
+    10
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RuntimeAdsConfigV1 {
+    // Kept only to decode schema-v1 rows. It must never authorize a pre-match
+    // ad when the record is upconverted.
+    post_match_enabled: bool,
+    minimum_interval_minutes: u16,
+}
+
+impl Default for RuntimeAdsConfigV1 {
+    fn default() -> Self {
+        Self {
+            post_match_enabled: false,
+            minimum_interval_minutes: default_ad_interval_minutes_v1(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RuntimeConfigV1 {
+    announcement: RuntimeAnnouncementConfig,
+    ads: RuntimeAdsConfigV1,
+    history: RuntimeHistoryConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeConfigRecordV1 {
+    #[serde(default = "runtime_config_schema_version_v1")]
+    schema_version: u16,
+    version: u64,
+    config: RuntimeConfigV1,
+    updated_by: Option<RuntimeConfigActor>,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DynamoPageCursor {
+    version: u8,
+    scope: String,
+    pk: String,
+    sk: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gsi2pk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gsi2sk: Option<String>,
+}
+const RECENT_COMPLETED_GAMES_PAGE_SIZE: usize = 100;
+const MAX_DYNAMODB_REPLAY_METADATA_BYTES: usize = 8 * 1024;
+const MAX_DYNAMODB_HIGHLIGHT_BYTES: usize = 256 * 1024;
+const SPLIT_HIGHLIGHT_SORT_KEY: &str = "HIGHLIGHT";
+/// Keep the two largest JSON attributes well below DynamoDB's 400 KiB item
+/// ceiling. The remaining 200 KiB covers attribute names and game metadata.
+/// A valid highlight that would cross this budget is written to a separate
+/// item by the same completion transaction.
+const MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES: usize = 200 * 1024;
+
+#[derive(Debug)]
+struct PersistableReplayArtifacts {
+    replay_object_json: Option<String>,
+    play_of_the_game_json: Option<String>,
+    split_play_of_the_game_json: Option<String>,
+}
+
+/// Materialize replay artifacts before the DynamoDB transaction. Object keys
+/// and gzip bytes are deterministic/content-addressed, so retrying these
+/// writes is idempotent while the transaction remains the durable metadata
+/// boundary.
+async fn prepare_replay_artifacts(
+    replay_store: Option<&dyn ReplayStore>,
+    completion: &CompletionRecordV1,
+) -> Result<PersistableReplayArtifacts> {
+    if completion.recording_journal.is_some() {
+        return Err(anyhow!(
+            "PersistGame received an unmaterialized replay journal reference"
+        ));
+    }
+    let replay_object = match &completion.recording {
+        Some(recording) => {
+            let replay_store = replay_store.ok_or_else(|| {
+                anyhow!(
+                    "completion {} contains a replay recording, but {} is not configured",
+                    completion.revision,
+                    crate::replay_store::REPLAY_S3_BUCKET_ENV
+                )
+            })?;
+            let serialized;
+            let recording_bytes = match &completion.recording_canonical_bytes {
+                Some(bytes) => bytes.as_slice(),
+                None => {
+                    // Compatibility path for inline completion records written
+                    // before journal-only materialization. New PersistGame
+                    // records arrive with bytes produced on the bounded
+                    // blocking materializer pool.
+                    serialized = canonical_json_bytes(recording)
+                        .context("Failed to serialize deterministic game recording")?;
+                    serialized.as_slice()
+                }
+            };
+            let metadata = replay_store
+                .put_recording(completion.game_id, recording_bytes)
+                .await
+                .context("Failed to upload completed-game recording before persistence")?;
+            replay_store
+                .validate_reference(&metadata)
+                .context("Replay store returned an invalid durable reference")?;
+            if metadata.game_id != completion.game_id {
+                return Err(anyhow!(
+                    "replay store returned metadata for game {} while persisting game {}",
+                    metadata.game_id,
+                    completion.game_id
+                ));
+            }
+            Some(metadata)
+        }
+        None => None,
+    };
+    let replay_object_json = replay_object
+        .map(|metadata| -> Result<String> {
+            let metadata_json = String::from_utf8(canonical_json_bytes(&metadata)?)
+                .context("Canonical replay metadata was not UTF-8 JSON")?;
+            if metadata_json.len() > MAX_DYNAMODB_REPLAY_METADATA_BYTES {
+                return Err(anyhow!(
+                    "replay metadata is {} bytes, exceeding the {} byte DynamoDB limit",
+                    metadata_json.len(),
+                    MAX_DYNAMODB_REPLAY_METADATA_BYTES
+                ));
+            }
+            Ok(metadata_json)
+        })
+        .transpose()?;
+
+    let final_state_bytes = canonical_json_bytes(&completion.final_state)
+        .context("Failed to size completed game state")?
+        .len();
+    let (play_of_the_game_json, split_play_of_the_game_json) = match &completion.play_of_the_game {
+        Some(clip) => {
+            let json = String::from_utf8(canonical_json_bytes(clip)?)
+                .context("Canonical Play-of-the-Game JSON was not UTF-8")?;
+            if json.len() > MAX_DYNAMODB_HIGHLIGHT_BYTES {
+                warn!(
+                    game_id = completion.game_id,
+                    highlight_bytes = json.len(),
+                    max_highlight_bytes = MAX_DYNAMODB_HIGHLIGHT_BYTES,
+                    "Omitting oversized Play-of-the-Game from DynamoDB"
+                );
+                (None, None)
+            } else if final_state_bytes.saturating_add(json.len())
+                > MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES
+            {
+                debug!(
+                    game_id = completion.game_id,
+                    final_state_bytes,
+                    highlight_bytes = json.len(),
+                    combined_budget = MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES,
+                    "Writing Play-of-the-Game to a split DynamoDB item"
+                );
+                (None, Some(json))
+            } else {
+                (Some(json), None)
+            }
+        }
+        None => (None, None),
+    };
+
+    Ok(PersistableReplayArtifacts {
+        replay_object_json,
+        play_of_the_game_json,
+        split_play_of_the_game_json,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CrazyGamesIdentityRecord {
+    user_id: i32,
+    provider_user_id: String,
+    username: String,
+    avatar_url: String,
+    profile_iat: i64,
+}
 
 #[derive(Clone, Copy)]
 enum UserProgressMutation {
@@ -81,6 +293,21 @@ impl DynamoDatabase {
     pub async fn new() -> Result<Self> {
         let client = dynamodb_client().await;
 
+        let replay_store = match ReplayStoreConfig::from_env()? {
+            Some(config) => {
+                info!(
+                    bucket = %config.bucket,
+                    prefix = %config.key_prefix,
+                    "Durable replay recording storage enabled"
+                );
+                Some(Arc::new(S3ReplayStore::new(config).await?) as Arc<dyn ReplayStore>)
+            }
+            None => {
+                info!("Durable replay recording storage is not configured");
+                None
+            }
+        };
+
         let table_prefix =
             std::env::var("DYNAMODB_TABLE_PREFIX").unwrap_or_else(|_| "snaketron".to_string());
 
@@ -92,6 +319,7 @@ impl DynamoDatabase {
         let db = Self {
             client,
             table_prefix,
+            replay_store,
         };
 
         // Ensure all required tables exist
@@ -727,10 +955,35 @@ impl DynamoDatabase {
             Self::extract_optional_datetime(item, "createdAt")?.unwrap_or_else(Utc::now);
         let last_activity =
             Self::extract_optional_datetime(item, "lastActivity")?.unwrap_or(created_at);
+        let replay_object = match Self::extract_string(item, "replayObject") {
+            Some(value) => {
+                let metadata: ReplayObjectMetadata = serde_json::from_str(&value)
+                    .context("Invalid replayObject JSON on game metadata row")?;
+                metadata
+                    .validate()
+                    .context("Invalid replayObject metadata on game row")?;
+                if metadata.game_id != game_id as u32 {
+                    return Err(anyhow!(
+                        "game {game_id} contains a replay reference for game {}",
+                        metadata.game_id
+                    ));
+                }
+                Some(metadata)
+            }
+            None => None,
+        };
+        let play_of_the_game = Self::extract_string(item, "playOfTheGame")
+            .map(|value| {
+                serde_json::from_str::<common::HighlightClip>(&value)
+                    .context("Invalid playOfTheGame JSON on game metadata row")
+            })
+            .transpose()?;
 
         Ok(Game {
             id: game_id,
             server_id: Self::extract_number(item, "serverId"),
+            season: Self::extract_number(item, "season")
+                .and_then(|season| Season::try_from(season).ok()),
             game_type: Self::extract_string(item, "gameType")
                 .and_then(|value| serde_json::from_str(&value).ok())
                 .unwrap_or(json!({})),
@@ -744,7 +997,58 @@ impl DynamoDatabase {
                 .unwrap_or_else(|| "matchmaking".to_string()),
             is_private: Self::extract_bool(item, "isPrivate").unwrap_or(false),
             game_code: Self::extract_string(item, "gameCode"),
+            replay_object,
+            play_of_the_game,
+            news_eligible: Self::extract_bool(item, "newsEligible") == Some(true)
+                && Self::extract_bool(item, "isPrivate") == Some(false)
+                && Self::extract_string(item, "gameCode").is_none(),
         })
+    }
+
+    async fn hydrate_split_game_highlight(
+        &self,
+        game_id: i32,
+        game_item: &mut HashMap<String, AttributeValue>,
+    ) -> Result<()> {
+        if Self::extract_bool(game_item, "playOfTheGameSplit") != Some(true) {
+            return Ok(());
+        }
+        if Self::extract_string(game_item, "playOfTheGame").is_some() {
+            return Err(anyhow!(
+                "game {game_id} marks a split highlight but also embeds one"
+            ));
+        }
+        let expected_revision = Self::extract_string(game_item, "completionRevision")
+            .context("Split-highlight game row is missing completionRevision")?;
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s(SPLIT_HIGHLIGHT_SORT_KEY))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to load split Play-of-the-Game item")?;
+        let split = response
+            .item
+            .context("Game metadata references a missing split Play-of-the-Game item")?;
+        if Self::item_is_expired(&split, Utc::now().timestamp()) {
+            return Err(anyhow!(
+                "Game metadata references an expired split Play-of-the-Game item"
+            ));
+        }
+        if Self::extract_string(&split, "completionRevision").as_deref()
+            != Some(expected_revision.as_str())
+        {
+            return Err(anyhow!(
+                "Split Play-of-the-Game revision does not match game metadata"
+            ));
+        }
+        let json = Self::extract_string(&split, "playOfTheGame")
+            .context("Split Play-of-the-Game item is missing its payload")?;
+        game_item.insert("playOfTheGame".into(), Self::av_s(json));
+        Ok(())
     }
 
     fn completed_game_retention_days(configured_value: Option<&str>) -> i64 {
@@ -758,24 +1062,761 @@ impl DynamoDatabase {
         Self::extract_i64(item, "ttl").is_some_and(|ttl| ttl <= now_epoch_seconds)
     }
 
-    fn runtime_game_identity(game_id: i32, game_state: &common::GameState) -> String {
-        format!("{}:{}", game_id, game_state.start_ms)
+    fn bounded_page_limit(limit: usize) -> usize {
+        if limit == 0 {
+            HISTORY_PAGE_DEFAULT_LIMIT
+        } else {
+            limit.min(HISTORY_PAGE_MAX_LIMIT)
+        }
     }
 
-    async fn game_item_exists(&self, game_id: i32) -> Result<bool> {
+    fn history_sort_key(ended_at_ms: i64, game_id: u32) -> Result<String> {
+        let ended_at_ms = u64::try_from(ended_at_ms)
+            .context("Match history timestamps must be non-negative epoch milliseconds")?;
+        Ok(format!("HISTORY#{ended_at_ms:020}#GAME#{game_id:010}"))
+    }
+
+    fn retention_ttl_seconds(ended_at_ms: i64, retention_days: u16) -> Result<i64> {
+        if ended_at_ms < 0 {
+            return Err(anyhow!(
+                "Retention timestamps must be non-negative epoch milliseconds"
+            ));
+        }
+        let expiry_ms = ended_at_ms.saturating_add(
+            i64::from(retention_days).saturating_mul(SECONDS_PER_DAY.saturating_mul(1_000)),
+        );
+        // DynamoDB TTL is second-granular. Round up so the millisecond-level
+        // snapshot availability field never outlives the stored snapshot.
+        Ok(expiry_ms.saturating_add(999) / 1_000)
+    }
+
+    fn encode_page_cursor(scope: &str, item: &HashMap<String, AttributeValue>) -> Result<String> {
+        let cursor = DynamoPageCursor {
+            version: 1,
+            scope: scope.to_string(),
+            pk: Self::extract_string(item, "pk")
+                .ok_or_else(|| anyhow!("history item is missing pk"))?,
+            sk: Self::extract_string(item, "sk")
+                .ok_or_else(|| anyhow!("history item is missing sk"))?,
+            gsi2pk: Self::extract_string(item, "gsi2pk"),
+            gsi2sk: Self::extract_string(item, "gsi2sk"),
+        };
+        Ok(hex::encode(
+            serde_json::to_vec(&cursor).context("Failed to serialize page cursor")?,
+        ))
+    }
+
+    fn decode_page_cursor(
+        raw: &str,
+        expected_scope: &str,
+        cursor_name: &str,
+    ) -> Result<DynamoPageCursor> {
+        let invalid = |detail: &str| anyhow!("invalid {cursor_name} cursor: {detail}");
+        if raw.is_empty() || raw.len() > PAGE_CURSOR_MAX_BYTES {
+            return Err(invalid("token length is invalid"));
+        }
+        let bytes = hex::decode(raw).map_err(|_| invalid("token encoding is invalid"))?;
+        let cursor: DynamoPageCursor =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("token payload is invalid"))?;
+        if cursor.version != 1 || cursor.scope != expected_scope {
+            return Err(invalid("token scope is invalid"));
+        }
+        Ok(cursor)
+    }
+
+    fn cursor_key(cursor: &DynamoPageCursor) -> HashMap<String, AttributeValue> {
+        let mut key = HashMap::from([
+            ("pk".to_string(), Self::av_s(&cursor.pk)),
+            ("sk".to_string(), Self::av_s(&cursor.sk)),
+        ]);
+        if let Some(gsi2pk) = &cursor.gsi2pk {
+            key.insert("gsi2pk".to_string(), Self::av_s(gsi2pk));
+        }
+        if let Some(gsi2sk) = &cursor.gsi2sk {
+            key.insert("gsi2sk".to_string(), Self::av_s(gsi2sk));
+        }
+        key
+    }
+
+    fn history_summary_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<MatchHistorySummary> {
+        let summary = Self::extract_string(item, "summaryJson")
+            .ok_or_else(|| anyhow!("match history row is missing summaryJson"))?;
+        let value: JsonValue = serde_json::from_str(&summary)
+            .context("Match history row contains invalid summaryJson")?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(JsonValue::as_u64)
+            .and_then(|version| u16::try_from(version).ok())
+            .ok_or_else(|| anyhow!("match history row has an invalid schemaVersion"))?;
+        match schema_version {
+            // Keep this dispatch explicit so a future schema can be upconverted
+            // without changing or rewriting retained immutable version-1 rows.
+            MATCH_HISTORY_SCHEMA_VERSION => serde_json::from_value(value)
+                .context("Match history row contains an invalid version-1 summary"),
+            version => Err(anyhow!(
+                "match history row uses unsupported schemaVersion {version}"
+            )),
+        }
+    }
+
+    fn runtime_config_record_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<RuntimeConfigRecord> {
+        let record = Self::extract_string(item, "recordJson")
+            .ok_or_else(|| anyhow!("runtime config row is missing recordJson"))?;
+        let value: JsonValue =
+            serde_json::from_str(&record).context("Runtime config row is corrupt")?;
+        let schema_version = match value.get("schemaVersion") {
+            Some(value) => value
+                .as_u64()
+                .and_then(|version| u16::try_from(version).ok())
+                .ok_or_else(|| anyhow!("runtime config row has an invalid schemaVersion"))?,
+            // Records written before schemaVersion was persisted have the v1
+            // shape and must follow the same safe upconversion path.
+            None => RUNTIME_CONFIG_SCHEMA_VERSION_V1,
+        };
+        let record = match schema_version {
+            RUNTIME_CONFIG_SCHEMA_VERSION_V1 => {
+                let legacy: RuntimeConfigRecordV1 = serde_json::from_value(value)
+                    .context("Runtime config row contains an invalid version-1 record")?;
+                if legacy.schema_version != RUNTIME_CONFIG_SCHEMA_VERSION_V1 {
+                    return Err(anyhow!(
+                        "runtime config row uses unsupported schemaVersion {}",
+                        legacy.schema_version
+                    ));
+                }
+                let RuntimeConfigV1 {
+                    announcement,
+                    ads: legacy_ads,
+                    history,
+                } = legacy.config;
+                let RuntimeAdsConfigV1 {
+                    post_match_enabled: _,
+                    minimum_interval_minutes,
+                } = legacy_ads;
+                // The interval has equivalent cooldown meaning. The old
+                // post-match switch intentionally does not enable any new
+                // pre-match policy or distribution.
+                let ads = RuntimeAdsConfig {
+                    minimum_interval_minutes,
+                    ..RuntimeAdsConfig::default()
+                };
+                RuntimeConfigRecord {
+                    schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+                    version: legacy.version,
+                    config: RuntimeConfig {
+                        announcement,
+                        ads,
+                        history,
+                    },
+                    updated_by: legacy.updated_by,
+                    updated_at_ms: legacy.updated_at_ms,
+                }
+            }
+            RUNTIME_CONFIG_SCHEMA_VERSION => serde_json::from_value(value)
+                .context("Runtime config row contains an invalid version-2 record")?,
+            version => {
+                return Err(anyhow!(
+                    "runtime config row uses unsupported schemaVersion {version}"
+                ));
+            }
+        };
+        record
+            .config
+            .validate()
+            .map_err(|error| anyhow!("runtime config row is invalid: {error}"))?;
+        Ok(record)
+    }
+
+    /// Resolve source privacy before completion persistence. A new runtime
+    /// match can use its server-owned state as the fallback. Existing metadata
+    /// must explicitly attest public visibility; an already-completed legacy
+    /// row must carry the newer durable proof or fail closed.
+    fn source_game_item_is_news_eligible(
+        item: Option<&HashMap<String, AttributeValue>>,
+        new_game_fallback: bool,
+    ) -> bool {
+        let Some(item) = item else {
+            return new_game_fallback;
+        };
+        if Self::extract_string(item, "status").as_deref() == Some("complete") {
+            return Self::extract_bool(item, "newsEligible") == Some(true)
+                && Self::extract_bool(item, "isPrivate") == Some(false)
+                && Self::extract_string(item, "gameCode").is_none();
+        }
+        Self::extract_bool(item, "isPrivate") == Some(false)
+            && Self::extract_string(item, "gameCode").is_none()
+    }
+
+    /// Public attribution requires affirmative completion provenance. Missing
+    /// legacy fields and non-terminal rows fail closed.
+    fn completed_game_item_is_news_eligible(
+        item: Option<&HashMap<String, AttributeValue>>,
+    ) -> bool {
+        item.is_some_and(|item| {
+            Self::extract_bool(item, "newsEligible") == Some(true)
+                && Self::extract_bool(item, "isPrivate") == Some(false)
+                && Self::extract_string(item, "gameCode").is_none()
+                && Self::extract_string(item, "status").as_deref() == Some("complete")
+        })
+    }
+
+    fn new_game_state_is_news_eligible(game_state: &common::GameState) -> bool {
+        !game_state.is_stress_test
+            && game_state.game_code.is_none()
+            && !matches!(game_state.game_type, common::GameType::Custom { .. })
+    }
+
+    async fn completed_game_is_news_eligible(&self, game_id: u32) -> Result<bool> {
         let response = self
             .client
             .get_item()
             .table_name(self.main_table())
-            .key("pk", Self::av_s(format!("GAME#{}", game_id)))
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
             .key("sk", Self::av_s("META"))
             .consistent_read(true)
+            .projection_expression("isPrivate, gameCode, newsEligible, #status")
+            .expression_attribute_names("#status", "status")
+            .send()
+            .await
+            .context("Failed to read completed-game privacy provenance")?;
+
+        Ok(Self::completed_game_item_is_news_eligible(
+            response.item.as_ref(),
+        ))
+    }
+
+    async fn source_game_is_news_eligible(
+        &self,
+        game_id: i32,
+        new_game_fallback: bool,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("isPrivate, gameCode, newsEligible, #status")
+            .expression_attribute_names("#status", "status")
+            .send()
+            .await
+            .context("Failed to read source-game privacy metadata")?;
+
+        Ok(Self::source_game_item_is_news_eligible(
+            response.item.as_ref(),
+            new_game_fallback,
+        ))
+    }
+
+    fn recent_completed_games_page_limit(remaining: usize) -> Option<i32> {
+        (remaining > 0).then(|| {
+            i32::try_from(remaining.min(RECENT_COMPLETED_GAMES_PAGE_SIZE))
+                .expect("recent completed-game page size fits in i32")
+        })
+    }
+
+    fn recent_completed_games_from_items(
+        items: Vec<HashMap<String, AttributeValue>>,
+        now_epoch_seconds: i64,
+    ) -> Result<Vec<Game>> {
+        items
+            .into_iter()
+            .filter(|item| !Self::item_is_expired(item, now_epoch_seconds))
+            .map(|item| {
+                let game_id = Self::extract_number(&item, "id")
+                    .context("Recent completed game is missing a valid id")?;
+                Self::game_from_item(game_id, &item)
+            })
+            .collect()
+    }
+
+    fn append_recent_completed_games_from_items(
+        games: &mut Vec<Game>,
+        items: Vec<HashMap<String, AttributeValue>>,
+        now_epoch_seconds: i64,
+        limit: usize,
+    ) -> Result<()> {
+        let remaining = limit.saturating_sub(games.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let mut accepted = Self::recent_completed_games_from_items(items, now_epoch_seconds)?;
+        accepted.truncate(remaining);
+        games.append(&mut accepted);
+        Ok(())
+    }
+
+    fn high_score_entry_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Option<HighScoreEntry> {
+        let stored_season = Self::extract_number(item, "season")?;
+        Some(HighScoreEntry {
+            game_id: Self::extract_string(item, "gameId")?,
+            user_id: Self::extract_number(item, "userId")?,
+            username: Self::extract_string(item, "username")?,
+            score: Self::extract_number(item, "score")?,
+            region: Self::extract_string(item, "region")?,
+            game_type: Self::extract_string(item, "gameType")?,
+            season: Season::try_from(stored_season).ok()?,
+            timestamp: Self::extract_string(item, "timestamp")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))?,
+            news_eligible: Self::extract_bool(item, "newsEligible") == Some(true),
+        })
+    }
+
+    /// Sort key of a user's ranking *pointer* — the item that makes "what is
+    /// this user's standing on this ladder?" a keyed read.
+    ///
+    /// The ladder rows are keyed `MMR#{inverted}#USER#{id}` so the partition
+    /// sorts by rating, which means a user cannot be looked up by key at all.
+    /// The pointer duplicates the row's fields under a second, user-addressed
+    /// sort key. `"MMR#" < "USER#"`, so every pointer sorts after every ladder
+    /// row and a top-N leaderboard query never reaches them.
+    fn ranking_pointer_sk(user_id: i32) -> String {
+        format!("USER#{}", user_id)
+    }
+
+    /// A pointer recording that a user has *no* row on this ladder.
+    ///
+    /// Without it, every unranked visitor to the leaderboard would re-run the
+    /// legacy full-partition scan on each request, since a miss is otherwise
+    /// indistinguishable from "not yet migrated".
+    fn absent_ranking_pointer(pk: &str, user_id: i32) -> HashMap<String, AttributeValue> {
+        // Deliberately carries no `userId`, so a tombstone can never parse as
+        // a ranking even if the `absent` flag is ever dropped.
+        HashMap::from([
+            ("pk".to_string(), Self::av_s(pk)),
+            (
+                "sk".to_string(),
+                Self::av_s(Self::ranking_pointer_sk(user_id)),
+            ),
+            ("absent".to_string(), Self::av_bool(true)),
+            ("updatedAt".to_string(), Self::av_s(Utc::now().to_rfc3339())),
+        ])
+    }
+
+    /// Store a pointer discovered by the legacy scan, without ever overwriting
+    /// one that already exists.
+    ///
+    /// The condition is what makes this safe to run on a read path: a scan
+    /// racing a concurrent `upsert_ranking` must not be able to roll the
+    /// user's counters back to the values it happened to observe.
+    async fn backfill_ranking_pointer(&self, item: HashMap<String, AttributeValue>) {
+        let result = self
+            .client
+            .put_item()
+            .table_name(self.rankings_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+
+        // A lost race is the expected outcome, not an error, and any other
+        // failure only costs the next reader one more scan.
+        if let Err(err) = result
+            && err.code() != Some("ConditionalCheckFailedException")
+        {
+            debug!("Ranking pointer backfill did not apply: {:?}", err);
+        }
+    }
+
+    fn user_ranking_from_items<'a>(
+        items: impl IntoIterator<Item = &'a HashMap<String, AttributeValue>>,
+        user_id: i32,
+        queue_mode: &str,
+        game_type: &str,
+        region: &str,
+        season: Season,
+    ) -> Option<RankingEntry> {
+        let item = items
+            .into_iter()
+            .find(|item| Self::extract_number(item, "userId") == Some(user_id))?;
+
+        Some(RankingEntry {
+            user_id: Self::extract_number(item, "userId").unwrap_or(user_id),
+            username: Self::extract_string(item, "username").unwrap_or_default(),
+            mmr: Self::extract_number(item, "mmr").unwrap_or(1000),
+            games_played: Self::extract_number(item, "gamesPlayed").unwrap_or(0),
+            wins: Self::extract_number(item, "wins").unwrap_or(0),
+            losses: Self::extract_number(item, "losses").unwrap_or(0),
+            region: Self::extract_string(item, "region").unwrap_or_else(|| region.to_string()),
+            queue_mode: Self::extract_string(item, "queueMode")
+                .unwrap_or_else(|| queue_mode.to_string()),
+            game_type: Self::extract_string(item, "gameType")
+                .unwrap_or_else(|| game_type.to_string()),
+            season: Self::extract_number(item, "season")
+                .map(|stored_season| stored_season as Season)
+                .unwrap_or(season),
+            updated_at: Self::extract_string(item, "updatedAt")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+        })
+    }
+
+    /// Reduce a leaderboard to one row per player, keeping the strongest.
+    ///
+    /// A player owns one ranking row per region they have played a ranked game
+    /// in, each holding the rating they carried at the time. The global ladder
+    /// therefore returns the same player once per region, which both duplicates
+    /// them in the standings and pushes real competitors off the page. The
+    /// surviving row is the highest-rated one, which is the row the global
+    /// board already surfaced for that player before the collapse.
+    ///
+    /// Expects MMR-descending input, which every caller sorts beforehand.
+    fn collapse_ranking_rows_per_user(entries: &mut Vec<RankingEntry>) {
+        let mut seen: HashSet<i32> = HashSet::with_capacity(entries.len());
+        entries.retain(|entry| seen.insert(entry.user_id));
+    }
+
+    /// Read the cross-region season partition until it can supply `limit`
+    /// distinct players.
+    ///
+    /// The index is sorted by the same inverted-MMR sort key as the base
+    /// table, so pages arrive strongest-first and the first row seen for a
+    /// player is the one that survives [`Self::collapse_ranking_rows_per_user`].
+    /// Paging matters because duplicates and DynamoDB's 1 MiB page ceiling both
+    /// cost rows a single query would have counted toward the requested limit.
+    async fn query_global_ranking_pages(
+        &self,
+        game_type_season: &str,
+        season: Season,
+        limit: usize,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>> {
+        const MAX_PAGES: usize = 20;
+
+        let page_size = i32::try_from(limit).unwrap_or(i32::MAX);
+        let mut items: Vec<HashMap<String, AttributeValue>> = Vec::new();
+        let mut distinct_users: HashSet<i32> = HashSet::new();
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+
+        for _ in 0..MAX_PAGES {
+            let mut request = self
+                .client
+                .query()
+                .table_name(self.rankings_table())
+                .index_name("GameTypeSeasonIndex")
+                .key_condition_expression("gameTypeSeason = :gts")
+                .expression_attribute_values(":gts", Self::av_s(game_type_season))
+                .limit(page_size);
+            if let Some(key) = &last_evaluated_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to query global leaderboard index")?;
+
+            for item in response.items.unwrap_or_default() {
+                if let Some(entry) = Self::leaderboard_entry_from_item(&item, season) {
+                    distinct_users.insert(entry.user_id);
+                }
+                items.push(item);
+            }
+
+            last_evaluated_key = response.last_evaluated_key;
+            if last_evaluated_key.is_none() || distinct_users.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(items)
+    }
+
+    /// Parse a leaderboard row only when its durable numeric season exactly
+    /// matches the requested partition. This is a second line of defense for
+    /// scan fallbacks and prevents Season 1 from admitting Season 10 rows.
+    fn leaderboard_entry_from_item(
+        item: &HashMap<String, AttributeValue>,
+        requested_season: Season,
+    ) -> Option<RankingEntry> {
+        let stored_season = Self::extract_number(item, "season")?;
+        let stored_season = Season::try_from(stored_season).ok()?;
+        if stored_season != requested_season {
+            return None;
+        }
+
+        Some(RankingEntry {
+            user_id: Self::extract_number(item, "userId")?,
+            username: Self::extract_string(item, "username")?,
+            mmr: Self::extract_number(item, "mmr")?,
+            games_played: Self::extract_number(item, "gamesPlayed")?,
+            wins: Self::extract_number(item, "wins")?,
+            losses: Self::extract_number(item, "losses")?,
+            region: Self::extract_string(item, "region")?,
+            queue_mode: Self::extract_string(item, "queueMode")?,
+            game_type: Self::extract_string(item, "gameType")
+                .unwrap_or_else(|| "unknown".to_string()),
+            season: stored_season,
+            updated_at: Self::extract_string(item, "updatedAt")
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+        })
+    }
+
+    fn unique_public_high_score_leader(
+        ordered_head: &[Option<HighScoreEntry>],
+    ) -> Option<HighScoreEntry> {
+        let leader = ordered_head.first()?.as_ref()?;
+        if !leader.news_eligible {
+            return None;
+        }
+        if let Some(runner_up) = ordered_head.get(1) {
+            let runner_up = runner_up.as_ref()?;
+            if leader.score <= runner_up.score {
+                return None;
+            }
+        }
+        Some(leader.clone())
+    }
+
+    fn high_score_matches_sort_key(
+        item: &HashMap<String, AttributeValue>,
+        entry: &HighScoreEntry,
+    ) -> bool {
+        if !(0..=99_999_999).contains(&entry.score) {
+            return false;
+        }
+        let inverted = 99_999_999_i64 - i64::from(entry.score);
+        let expected_legacy = format!("SCORE#{inverted:08}#GAME#{}", entry.game_id);
+        let expected_completion = format!("{expected_legacy}#USER#{}", entry.user_id);
+        Self::extract_string(item, "sk")
+            .is_some_and(|sort_key| sort_key == expected_legacy || sort_key == expected_completion)
+    }
+
+    fn legacy_high_score_source_item_is_news_eligible(
+        item: Option<&HashMap<String, AttributeValue>>,
+        entry: &HighScoreEntry,
+    ) -> bool {
+        let Some(item) = item else {
+            return false;
+        };
+        if Self::extract_string(item, "status").as_deref() != Some("complete")
+            || Self::extract_bool(item, "isPrivate") != Some(false)
+            || Self::extract_string(item, "gameCode").is_some()
+        {
+            return false;
+        }
+        let Some(state) = Self::extract_string(item, "gameState")
+            .and_then(|value| serde_json::from_str::<common::GameState>(&value).ok())
+        else {
+            return false;
+        };
+        if state.is_stress_test
+            || state.game_code.is_some()
+            || !matches!(state.game_type, common::GameType::Solo)
+            || !matches!(state.status, common::GameStatus::Complete { .. })
+        {
+            return false;
+        }
+        let Ok(user_id) = u32::try_from(entry.user_id) else {
+            return false;
+        };
+        let Some(player) = state.players.get(&user_id) else {
+            return false;
+        };
+        state.scores.get(&player.snake_id).copied() == u32::try_from(entry.score).ok()
+            && state.usernames.get(&user_id) == Some(&entry.username)
+    }
+
+    /// Upgrade an old unmarked score only while its retained source snapshot
+    /// can still prove the exact public result. Missing/expired source games
+    /// remain ineligible rather than turning uncertainty into a headline.
+    async fn backfill_legacy_high_score_news_eligibility(
+        &self,
+        item: &HashMap<String, AttributeValue>,
+        entry: &HighScoreEntry,
+    ) -> Result<bool> {
+        if item.contains_key("newsEligible") {
+            return Ok(entry.news_eligible);
+        }
+        let Ok(game_id) = entry.game_id.parse::<i32>() else {
+            return Ok(false);
+        };
+        let source = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .projection_expression("isPrivate, gameCode, gameState, #status")
+            .expression_attribute_names("#status", "status")
+            .send()
+            .await
+            .context("Failed to verify a legacy high-score source")?;
+        if !Self::legacy_high_score_source_item_is_news_eligible(source.item.as_ref(), entry) {
+            return Ok(false);
+        }
+
+        let Some(pk) = Self::extract_string(item, "pk") else {
+            return Ok(false);
+        };
+        let Some(sk) = Self::extract_string(item, "sk") else {
+            return Ok(false);
+        };
+        let response = self
+            .client
+            .update_item()
+            .table_name(self.high_scores_table())
+            .key("pk", Self::av_s(pk))
+            .key("sk", Self::av_s(sk))
+            .update_expression("SET newsEligible = if_not_exists(newsEligible, :news_eligible)")
+            .expression_attribute_values(":news_eligible", Self::av_bool(true))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await
+            .context("Failed to backfill legacy high-score provenance")?;
+
+        Ok(response
+            .attributes
+            .as_ref()
+            .and_then(|attributes| Self::extract_bool(attributes, "newsEligible"))
+            == Some(true))
+    }
+
+    async fn query_global_news_high_score_snapshot(
+        &self,
+        game_type: &str,
+        season: Season,
+    ) -> Result<NewsHighScoreSnapshot> {
+        let partition = format!("{game_type}#{season}");
+        // No filter is applied: these must be the actual first two rows so a
+        // private or malformed top row cannot promote the next public score.
+        // One bounded read is enough to prove a unique leader and cannot walk
+        // an append-only season partition looking for eligible rows.
+        let response = self
+            .client
+            .query()
+            .table_name(self.high_scores_table())
+            .index_name("GameTypeSeasonIndex")
+            .key_condition_expression("gameTypeSeason = :partition")
+            .expression_attribute_values(":partition", Self::av_s(&partition))
+            .scan_index_forward(true)
+            .limit(2)
+            .send()
+            .await
+            .context("Failed to query ordered global news high scores")?;
+        let mut ordered_head = Vec::with_capacity(2);
+        for (index, item) in response
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            let mut parsed = Self::high_score_entry_from_item(&item).filter(|entry| {
+                entry.game_type == game_type
+                    && entry.season == season
+                    && Self::high_score_matches_sort_key(&item, entry)
+            });
+            if index == 0
+                && let Some(entry) = parsed.as_mut()
+                && !entry.news_eligible
+                && self
+                    .backfill_legacy_high_score_news_eligibility(&item, entry)
+                    .await?
+            {
+                entry.news_eligible = true;
+            }
+            ordered_head.push(parsed);
+        }
+
+        Ok(NewsHighScoreSnapshot {
+            leader: Self::unique_public_high_score_leader(&ordered_head),
+            coverage: NewsLeaderboardCoverage::OrderedGlobalIndex,
+        })
+    }
+
+    fn validate_pre_match_ad_break_claim(
+        break_id: &str,
+        user_ids: &[u32],
+        now_ms: i64,
+        minimum_interval_ms: i64,
+        policy_version: u64,
+    ) -> Result<i64> {
+        if break_id.is_empty()
+            || break_id.len() > MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES
+            || break_id.chars().any(char::is_control)
+        {
+            return Err(anyhow!(
+                "pre-match ad break ID must be 1 to {MAX_DYNAMODB_CLIENT_REQUEST_TOKEN_BYTES} bytes and contain no control characters"
+            ));
+        }
+        if user_ids.is_empty() || user_ids.len() > MAX_PRE_MATCH_AD_BREAK_USERS {
+            return Err(anyhow!(
+                "pre-match ad break must target between 1 and {MAX_PRE_MATCH_AD_BREAK_USERS} users"
+            ));
+        }
+        for (index, user_id) in user_ids.iter().enumerate() {
+            if *user_id == 0 || *user_id > i32::MAX as u32 {
+                return Err(anyhow!("pre-match ad break contains an invalid user ID"));
+            }
+            if user_ids[..index].contains(user_id) {
+                return Err(anyhow!("pre-match ad break contains a duplicate user ID"));
+            }
+        }
+        if now_ms < 0 {
+            return Err(anyhow!("pre-match ad break timestamp must not be negative"));
+        }
+        if minimum_interval_ms <= 0 {
+            return Err(anyhow!(
+                "pre-match ad break minimum interval must be positive"
+            ));
+        }
+        if policy_version == 0 {
+            return Err(anyhow!(
+                "pre-match ad break policy version must be positive"
+            ));
+        }
+        now_ms
+            .checked_sub(minimum_interval_ms)
+            .ok_or_else(|| anyhow!("pre-match ad break cooldown cutoff overflow"))
+    }
+
+    fn transaction_cancellation_is_conditional(error: &TransactWriteItemsError) -> bool {
+        match error {
+            TransactWriteItemsError::TransactionCanceledException(cancelled) => cancelled
+                .cancellation_reasons()
+                .iter()
+                .any(|reason| reason.code() == Some("ConditionalCheckFailed")),
+            _ => false,
+        }
+    }
+
+    fn runtime_game_identity(game_id: i32, game_state: &common::GameState) -> String {
+        format!("{}:{}", game_id, game_state.start_ms)
+    }
+
+    /// Whether anything durable already occupies this game's partition.
+    ///
+    /// Queries the whole `GAME#{id}` partition rather than probing `META`
+    /// alone: the permanent match summary outlives the retention-bounded
+    /// snapshot, and public game links stay valid forever, so reissuing an id
+    /// whose summary still exists would silently repoint a shared link at a
+    /// different match.
+    async fn game_item_exists(&self, game_id: i32) -> Result<bool> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(":pk", Self::av_s(format!("GAME#{game_id}")))
+            .consistent_read(true)
             .projection_expression("pk")
+            .limit(1)
             .send()
             .await
             .context("Failed to check whether a durable game ID is already in use")?;
 
-        Ok(response.item.is_some())
+        Ok(response.items.is_some_and(|items| !items.is_empty()))
     }
 
     fn canonical_fingerprint<T: serde::Serialize>(value: &T) -> Result<String> {
@@ -946,7 +1987,7 @@ impl DynamoDatabase {
         }))
     }
 
-    async fn completion_user_target(&self, user_id: u32) -> Result<(String, bool)> {
+    async fn completion_user_target(&self, user_id: u32) -> Result<(String, bool, bool)> {
         let response = self
             .client
             .get_item()
@@ -954,7 +1995,7 @@ impl DynamoDatabase {
             .key("pk", Self::av_s(format!("USER#{user_id}")))
             .key("sk", Self::av_s("META"))
             .consistent_read(true)
-            .projection_expression("username, isGuest")
+            .projection_expression("username, isGuest, authProvider")
             .send()
             .await
             .context("Failed to read completion effect user")?;
@@ -963,10 +2004,10 @@ impl DynamoDatabase {
             .ok_or_else(|| anyhow!("user {user_id} disappeared before completion effect"))?;
         let username = Self::extract_string(&item, "username")
             .ok_or_else(|| anyhow!("user {user_id} has no username"))?;
-        Ok((
-            username,
-            Self::extract_bool(&item, "isGuest").unwrap_or(false),
-        ))
+        let is_guest = Self::extract_bool(&item, "isGuest").unwrap_or(false);
+        let uses_username_mirror = !is_guest
+            && Self::extract_string(&item, "authProvider").as_deref() != Some("crazygames");
+        Ok((username, is_guest, uses_username_mirror))
     }
 
     fn user_progress_value(user: &User, field: &str) -> Result<i32> {
@@ -1015,7 +2056,7 @@ impl DynamoDatabase {
                 .with_context(|| format!("Failed to build canonical {field} mutation"))?;
             let mut mutations = vec![TransactWriteItem::builder().update(main_update).build()];
 
-            if !user.is_guest {
+            if !user.is_guest && user.auth_provider.as_deref() != Some("crazygames") {
                 let mirror_update = Update::builder()
                     .table_name(self.usernames_table())
                     .key("username", Self::av_s(&user.username))
@@ -1062,6 +2103,321 @@ impl DynamoDatabase {
         unreachable!("user progress mutation attempt loop always returns")
     }
 
+    fn crazygames_identity_pk(provider_user_id: &str) -> String {
+        let digest = Sha256::digest(provider_user_id.as_bytes());
+        format!("IDENTITY#CRAZYGAMES#{}", hex::encode(digest))
+    }
+
+    async fn get_crazygames_identity(
+        &self,
+        provider_user_id: &str,
+    ) -> Result<Option<CrazyGamesIdentityRecord>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(Self::crazygames_identity_pk(provider_user_id)),
+            )
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read CrazyGames identity mapping")?;
+
+        let Some(item) = response.item else {
+            return Ok(None);
+        };
+        let stored_provider_user_id = Self::extract_string(&item, "providerUserId")
+            .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?;
+        if stored_provider_user_id != provider_user_id {
+            return Err(anyhow!(
+                "CrazyGames identity hash collision or corrupt mapping"
+            ));
+        }
+        Ok(Some(CrazyGamesIdentityRecord {
+            user_id: Self::extract_number(&item, "userId")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+            provider_user_id: stored_provider_user_id,
+            username: Self::extract_string(&item, "username")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+            avatar_url: Self::extract_string(&item, "profilePictureUrl")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+            profile_iat: Self::extract_i64(&item, "profileIat")
+                .ok_or_else(|| anyhow!("CrazyGames identity mapping is corrupt"))?,
+        }))
+    }
+
+    async fn get_crazygames_preferences_with_version(
+        &self,
+        user_id: i32,
+    ) -> Result<(CrazyGamesPreferences, i64)> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("PREFERENCES#CRAZYGAMES"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read CrazyGames preferences")?;
+
+        let Some(item) = response.item else {
+            return Ok((CrazyGamesPreferences::default(), 0));
+        };
+        let preferences = Self::extract_string(&item, "preferences")
+            .ok_or_else(|| anyhow!("CrazyGames preferences are corrupt"))
+            .and_then(|value| {
+                serde_json::from_str(&value).context("CrazyGames preferences are corrupt")
+            })?;
+        let version = Self::extract_i64(&item, "version")
+            .ok_or_else(|| anyhow!("CrazyGames preferences are corrupt"))?;
+        Ok((preferences, version))
+    }
+
+    fn crazygames_preferences_put(
+        &self,
+        user_id: i32,
+        preferences: &CrazyGamesPreferences,
+        version: i64,
+        expected_version: Option<i64>,
+    ) -> Result<Put> {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        item.insert("sk".to_string(), Self::av_s("PREFERENCES#CRAZYGAMES"));
+        item.insert("schemaVersion".to_string(), Self::av_n(1));
+        item.insert("version".to_string(), Self::av_n(version));
+        item.insert(
+            "preferences".to_string(),
+            Self::av_s(
+                serde_json::to_string(preferences)
+                    .context("Failed to serialize CrazyGames preferences")?,
+            ),
+        );
+        item.insert("updatedAt".to_string(), Self::av_s(Utc::now().to_rfc3339()));
+
+        let mut put = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(item));
+        if let Some(expected_version) = expected_version {
+            put = put
+                .condition_expression("attribute_not_exists(pk) OR #version=:expected_version")
+                .expression_attribute_names("#version", "version")
+                .expression_attribute_values(":expected_version", Self::av_n(expected_version));
+        }
+        put.build()
+            .context("Failed to build CrazyGames preferences write")
+    }
+
+    fn crazygames_identity_put(
+        &self,
+        profile: &CrazyGamesProfile,
+        user_id: i32,
+        now: DateTime<Utc>,
+    ) -> Result<Put> {
+        let mut item = HashMap::new();
+        item.insert(
+            "pk".to_string(),
+            Self::av_s(Self::crazygames_identity_pk(&profile.provider_user_id)),
+        );
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("provider".to_string(), Self::av_s("crazygames"));
+        item.insert(
+            "providerUserId".to_string(),
+            Self::av_s(&profile.provider_user_id),
+        );
+        item.insert("userId".to_string(), Self::av_n(user_id));
+        item.insert("username".to_string(), Self::av_s(&profile.username));
+        item.insert(
+            "profilePictureUrl".to_string(),
+            Self::av_s(&profile.avatar_url),
+        );
+        item.insert("profileIat".to_string(), Self::av_n(profile.profile_iat));
+        item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
+        item.insert(
+            "lastAuthenticatedAt".to_string(),
+            Self::av_s(now.to_rfc3339()),
+        );
+
+        Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build CrazyGames identity mapping")
+    }
+
+    fn new_crazygames_user_put(
+        &self,
+        profile: &CrazyGamesProfile,
+        user_id: i32,
+        now: DateTime<Utc>,
+    ) -> Result<Put> {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("gsi1pk".to_string(), Self::av_s("USER"));
+        item.insert("gsi1sk".to_string(), Self::av_s(now.to_rfc3339()));
+        item.insert("id".to_string(), Self::av_n(user_id));
+        item.insert("username".to_string(), Self::av_s(&profile.username));
+        item.insert("passwordHash".to_string(), Self::av_s(""));
+        item.insert("mmr".to_string(), Self::av_n(1000));
+        item.insert("rankedMmr".to_string(), Self::av_n(1000));
+        item.insert("casualMmr".to_string(), Self::av_n(1000));
+        item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
+        item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
+        item.insert("isGuest".to_string(), Self::av_bool(false));
+        item.insert("isStressTest".to_string(), Self::av_bool(false));
+        item.insert("authProvider".to_string(), Self::av_s("crazygames"));
+        item.insert(
+            "crazyGamesUserId".to_string(),
+            Self::av_s(&profile.provider_user_id),
+        );
+        item.insert(
+            "profilePictureUrl".to_string(),
+            Self::av_s(&profile.avatar_url),
+        );
+        item.insert("profileIat".to_string(), Self::av_n(profile.profile_iat));
+
+        Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build CrazyGames user")
+    }
+
+    async fn update_crazygames_profile_if_newer(
+        &self,
+        current: &CrazyGamesIdentityRecord,
+        profile: &CrazyGamesProfile,
+    ) -> Result<CrazyGamesIdentityRecord> {
+        let mut observed = current.clone();
+        let mut last_error = None;
+        for attempt in 0..CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+            if profile.profile_iat <= observed.profile_iat {
+                return Ok(observed);
+            }
+
+            let identity_update = Update::builder()
+                .table_name(self.main_table())
+                .key(
+                    "pk",
+                    Self::av_s(Self::crazygames_identity_pk(&profile.provider_user_id)),
+                )
+                .key("sk", Self::av_s("META"))
+                .update_expression(concat!(
+                    "SET username=:username, profilePictureUrl=:avatar, ",
+                    "profileIat=:profile_iat, lastAuthenticatedAt=:now"
+                ))
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND providerUserId=:provider_user_id AND ",
+                    "(attribute_not_exists(profileIat) OR profileIat<:profile_iat)"
+                ))
+                .expression_attribute_values(":username", Self::av_s(&profile.username))
+                .expression_attribute_values(":avatar", Self::av_s(&profile.avatar_url))
+                .expression_attribute_values(":profile_iat", Self::av_n(profile.profile_iat))
+                .expression_attribute_values(
+                    ":provider_user_id",
+                    Self::av_s(&profile.provider_user_id),
+                )
+                .expression_attribute_values(":now", Self::av_s(Utc::now().to_rfc3339()))
+                .build()
+                .context("Failed to build CrazyGames identity profile update")?;
+            let user_update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{}", observed.user_id)))
+                .key("sk", Self::av_s("META"))
+                .update_expression(
+                    "SET username=:username, profilePictureUrl=:avatar, profileIat=:profile_iat",
+                )
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND authProvider=:provider AND ",
+                    "crazyGamesUserId=:provider_user_id AND ",
+                    "(attribute_not_exists(profileIat) OR profileIat<:profile_iat)"
+                ))
+                .expression_attribute_values(":username", Self::av_s(&profile.username))
+                .expression_attribute_values(":avatar", Self::av_s(&profile.avatar_url))
+                .expression_attribute_values(":profile_iat", Self::av_n(profile.profile_iat))
+                .expression_attribute_values(":provider", Self::av_s("crazygames"))
+                .expression_attribute_values(
+                    ":provider_user_id",
+                    Self::av_s(&profile.provider_user_id),
+                )
+                .build()
+                .context("Failed to build CrazyGames user profile update")?;
+
+            match self
+                .client
+                .transact_write_items()
+                .transact_items(TransactWriteItem::builder().update(identity_update).build())
+                .transact_items(TransactWriteItem::builder().update(user_update).build())
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    return Ok(CrazyGamesIdentityRecord {
+                        user_id: observed.user_id,
+                        provider_user_id: profile.provider_user_id.clone(),
+                        username: profile.username.clone(),
+                        avatar_url: profile.avatar_url.clone(),
+                        profile_iat: profile.profile_iat,
+                    });
+                }
+                Err(error) => {
+                    observed = self
+                        .get_crazygames_identity(&profile.provider_user_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("CrazyGames identity mapping disappeared"))?;
+                    if observed.profile_iat >= profile.profile_iat {
+                        return Ok(observed);
+                    }
+                    last_error =
+                        Some(anyhow!(error).context("Failed to update CrazyGames profile"));
+                    if attempt + 1 < CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+                        let exponent = attempt.min(6) as u32;
+                        sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to update CrazyGames profile")))
+    }
+
+    async fn load_crazygames_account(
+        &self,
+        identity: CrazyGamesIdentityRecord,
+        resolution: CrazyGamesAccountResolution,
+    ) -> Result<CrazyGamesAccount> {
+        let user = self
+            .get_user_by_id(identity.user_id)
+            .await?
+            .ok_or_else(|| anyhow!("CrazyGames identity mapping points to a missing user"))?;
+        if user.is_guest
+            || user.auth_provider.as_deref() != Some("crazygames")
+            || user.crazygames_user_id.as_deref() != Some(&identity.provider_user_id)
+        {
+            return Err(anyhow!("CrazyGames identity mapping is corrupt"));
+        }
+        let (preferences, _) = self
+            .get_crazygames_preferences_with_version(identity.user_id)
+            .await?;
+        Ok(CrazyGamesAccount {
+            user,
+            profile: CrazyGamesProfile {
+                provider_user_id: identity.provider_user_id,
+                username: identity.username,
+                avatar_url: identity.avatar_url,
+                profile_iat: identity.profile_iat,
+            },
+            resolution,
+            preferences,
+        })
+    }
+
     async fn transact_completion_effect(
         &self,
         completion: &CompletionRecordV1,
@@ -1078,7 +2434,12 @@ impl DynamoDatabase {
             1,
             self.completion_revision_anchor(completion, &record_hash)?,
         );
-        if !matches!(effect, CompletionEffect::PersistGame { .. }) {
+        // XP/MMR are allowed to settle while replay-backed PersistGame is
+        // retrying (for example during an S3 outage). Their immutable record
+        // anchor + effect marker already fence conflicting revisions.
+        // High-score publication alone depends on the completed game row;
+        // UpdateRanking carries its narrower MMR-effect dependency below.
+        if matches!(effect, CompletionEffect::InsertHighScore { .. }) {
             mutations.insert(2, self.game_completion_revision_guard(completion)?);
             mutations.insert(
                 3,
@@ -1369,6 +2730,7 @@ impl Database for DynamoDatabase {
         username_item.insert("rankedMmr".to_string(), Self::av_n(1000));
         username_item.insert("casualMmr".to_string(), Self::av_n(1000));
         username_item.insert("xp".to_string(), Self::av_n(0));
+        username_item.insert("gamesPlayed".to_string(), Self::av_n(0));
 
         // This will fail if username already exists
         self.client
@@ -1393,6 +2755,7 @@ impl Database for DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
@@ -1413,10 +2776,16 @@ impl Database for DynamoDatabase {
             ranked_mmr: 1000,
             casual_mmr: 1000,
             xp: 0,
+            games_played: 0,
             created_at: now,
             is_guest: false,
             guest_token: None,
             is_stress_test: false,
+            auth_provider: None,
+            crazygames_user_id: None,
+            profile_picture_url: None,
+            profile_iat: None,
+            selected_skin: None,
         })
     }
 
@@ -1445,6 +2814,7 @@ impl Database for DynamoDatabase {
         item.insert("rankedMmr".to_string(), Self::av_n(1000));
         item.insert("casualMmr".to_string(), Self::av_n(1000));
         item.insert("xp".to_string(), Self::av_n(0));
+        item.insert("gamesPlayed".to_string(), Self::av_n(0));
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(true));
         item.insert("isStressTest".to_string(), Self::av_bool(is_stress_test));
@@ -1471,10 +2841,16 @@ impl Database for DynamoDatabase {
             ranked_mmr: 1000,
             casual_mmr: 1000,
             xp: 0,
+            games_played: 0,
             created_at: now,
             is_guest: true,
             guest_token: Some(guest_token.to_string()),
             is_stress_test,
+            auth_provider: None,
+            crazygames_user_id: None,
+            profile_picture_url: None,
+            profile_iat: None,
+            selected_skin: None,
         })
     }
 
@@ -1508,6 +2884,7 @@ impl Database for DynamoDatabase {
             username_item.insert("rankedMmr".to_string(), Self::av_n(guest.ranked_mmr));
             username_item.insert("casualMmr".to_string(), Self::av_n(guest.casual_mmr));
             username_item.insert("xp".to_string(), Self::av_n(guest.xp));
+            username_item.insert("gamesPlayed".to_string(), Self::av_n(guest.games_played));
 
             let username_put = Put::builder()
                 .table_name(self.usernames_table())
@@ -1539,7 +2916,9 @@ impl Database for DynamoDatabase {
                     "(attribute_not_exists(isStressTest) OR isStressTest=:not_stress) AND ",
                     "username=:old_username AND passwordHash=:old_password_hash AND ",
                     "mmr=:mmr AND rankedMmr=:ranked_mmr AND ",
-                    "casualMmr=:casual_mmr AND xp=:xp"
+                    "casualMmr=:casual_mmr AND xp=:xp AND ",
+                    "(gamesPlayed=:games_played OR ",
+                    "(attribute_not_exists(gamesPlayed) AND :games_played=:zero))"
                 ))
                 .expression_attribute_values(":username", Self::av_s(username))
                 .expression_attribute_values(":password_hash", Self::av_s(password_hash))
@@ -1552,6 +2931,8 @@ impl Database for DynamoDatabase {
                 .expression_attribute_values(":ranked_mmr", Self::av_n(guest.ranked_mmr))
                 .expression_attribute_values(":casual_mmr", Self::av_n(guest.casual_mmr))
                 .expression_attribute_values(":xp", Self::av_n(guest.xp))
+                .expression_attribute_values(":games_played", Self::av_n(guest.games_played))
+                .expression_attribute_values(":zero", Self::av_n(0))
                 .build()
                 .context("Failed to build in-place guest account upgrade")?;
 
@@ -1639,6 +3020,7 @@ impl Database for DynamoDatabase {
                     ranked_mmr: Self::extract_number(&item, "rankedMmr").unwrap_or(1000),
                     casual_mmr: Self::extract_number(&item, "casualMmr").unwrap_or(1000),
                     xp: Self::extract_number(&item, "xp").unwrap_or(0),
+                    games_played: Self::extract_number(&item, "gamesPlayed").unwrap_or(0),
                     created_at: Self::extract_string(&item, "createdAt")
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
@@ -1646,6 +3028,11 @@ impl Database for DynamoDatabase {
                     is_guest: Self::extract_bool(&item, "isGuest").unwrap_or(false),
                     guest_token: Self::extract_string(&item, "guestToken"),
                     is_stress_test: Self::extract_bool(&item, "isStressTest").unwrap_or(false),
+                    auth_provider: Self::extract_string(&item, "authProvider"),
+                    crazygames_user_id: Self::extract_string(&item, "crazyGamesUserId"),
+                    profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
+                    profile_iat: Self::extract_i64(&item, "profileIat"),
+                    selected_skin: Self::extract_string(&item, "selectedSkin"),
                 };
                 Ok(Some(user))
             }
@@ -1719,6 +3106,311 @@ impl Database for DynamoDatabase {
         Ok(new_xp)
     }
 
+    async fn resolve_crazygames_account(
+        &self,
+        profile: &CrazyGamesProfile,
+        guest_candidate_user_id: Option<i32>,
+        guest_promotion: CrazyGamesGuestPromotion,
+        initial_preferences: Option<&CrazyGamesPreferences>,
+    ) -> Result<CrazyGamesAccountOutcome> {
+        // Browser preferences are safe to import only when the caller proves
+        // ownership of an eligible guest through its internal bearer token.
+        // A newly created provider identity may be opening a browser last used
+        // by another linked account, so it must start from its own empty
+        // canonical snapshot instead of inheriting unscoped local state.
+        let guest_preferences = initial_preferences.cloned().unwrap_or_default();
+        let mut guest_candidate_user_id = match guest_promotion {
+            CrazyGamesGuestPromotion::Check | CrazyGamesGuestPromotion::Allow => {
+                guest_candidate_user_id
+            }
+            CrazyGamesGuestPromotion::Decline => None,
+        };
+        let mut last_error = None;
+
+        for attempt in 0..CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+            if let Some(current) = self
+                .get_crazygames_identity(&profile.provider_user_id)
+                .await?
+            {
+                let current = self
+                    .update_crazygames_profile_if_newer(&current, profile)
+                    .await?;
+                return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                    self.load_crazygames_account(current, CrazyGamesAccountResolution::Returning)
+                        .await?,
+                )));
+            }
+
+            if let Some(candidate_id) = guest_candidate_user_id {
+                let eligible = self
+                    .get_user_by_id(candidate_id)
+                    .await?
+                    .is_some_and(|user| user.is_guest && !user.is_stress_test);
+                if eligible {
+                    if guest_promotion == CrazyGamesGuestPromotion::Check {
+                        // Close the most useful race window before reporting
+                        // consent: a concurrent first launch may have created
+                        // the identity while we inspected the guest. Both
+                        // reads are strongly consistent, and this branch does
+                        // not write the guest, identity, or preferences.
+                        if let Some(current) = self
+                            .get_crazygames_identity(&profile.provider_user_id)
+                            .await?
+                        {
+                            let current = self
+                                .update_crazygames_profile_if_newer(&current, profile)
+                                .await?;
+                            return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                self.load_crazygames_account(
+                                    current,
+                                    CrazyGamesAccountResolution::Returning,
+                                )
+                                .await?,
+                            )));
+                        }
+                        return Ok(CrazyGamesAccountOutcome::GuestLinkConsentRequired);
+                    }
+
+                    let now = Utc::now();
+                    let identity_put = self.crazygames_identity_put(profile, candidate_id, now)?;
+                    let user_update = Update::builder()
+                        .table_name(self.main_table())
+                        .key("pk", Self::av_s(format!("USER#{candidate_id}")))
+                        .key("sk", Self::av_s("META"))
+                        .update_expression(concat!(
+                            "SET username=:username, isGuest=:not_guest, ",
+                            "isStressTest=:not_stress, authProvider=:provider, ",
+                            "crazyGamesUserId=:provider_user_id, ",
+                            "profilePictureUrl=:avatar, profileIat=:profile_iat ",
+                            "REMOVE guestToken"
+                        ))
+                        .condition_expression(concat!(
+                            "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                            "isGuest=:guest AND ",
+                            "(attribute_not_exists(isStressTest) OR isStressTest=:not_stress)"
+                        ))
+                        .expression_attribute_values(":username", Self::av_s(&profile.username))
+                        .expression_attribute_values(":not_guest", Self::av_bool(false))
+                        .expression_attribute_values(":not_stress", Self::av_bool(false))
+                        .expression_attribute_values(":guest", Self::av_bool(true))
+                        .expression_attribute_values(":provider", Self::av_s("crazygames"))
+                        .expression_attribute_values(
+                            ":provider_user_id",
+                            Self::av_s(&profile.provider_user_id),
+                        )
+                        .expression_attribute_values(":avatar", Self::av_s(&profile.avatar_url))
+                        .expression_attribute_values(
+                            ":profile_iat",
+                            Self::av_n(profile.profile_iat),
+                        )
+                        .build()
+                        .context("Failed to build CrazyGames guest claim")?;
+                    let preferences_put =
+                        self.crazygames_preferences_put(candidate_id, &guest_preferences, 1, None)?;
+                    let result = self
+                        .client
+                        .transact_write_items()
+                        .client_request_token(uuid::Uuid::new_v4().to_string())
+                        .transact_items(TransactWriteItem::builder().put(identity_put).build())
+                        .transact_items(TransactWriteItem::builder().update(user_update).build())
+                        .transact_items(TransactWriteItem::builder().put(preferences_put).build())
+                        .send()
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            let identity = self
+                                .get_crazygames_identity(&profile.provider_user_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow!("CrazyGames identity claim committed without mapping")
+                                })?;
+                            info!(
+                                "Claimed public guest {} for a verified CrazyGames identity",
+                                candidate_id
+                            );
+                            return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                self.load_crazygames_account(
+                                    identity,
+                                    CrazyGamesAccountResolution::GuestClaimed,
+                                )
+                                .await?,
+                            )));
+                        }
+                        Err(error) => {
+                            if let Some(winner) = self
+                                .get_crazygames_identity(&profile.provider_user_id)
+                                .await?
+                            {
+                                let winner = self
+                                    .update_crazygames_profile_if_newer(&winner, profile)
+                                    .await?;
+                                return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                    self.load_crazygames_account(
+                                        winner,
+                                        CrazyGamesAccountResolution::Returning,
+                                    )
+                                    .await?,
+                                )));
+                            }
+                            if !self
+                                .get_user_by_id(candidate_id)
+                                .await?
+                                .is_some_and(|user| user.is_guest && !user.is_stress_test)
+                            {
+                                // A concurrent password registration won. Never
+                                // attach CrazyGames to that unrelated account.
+                                guest_candidate_user_id = None;
+                            }
+                            last_error = Some(anyhow!(error).context(
+                                "Failed to atomically claim guest for CrazyGames identity",
+                            ));
+                        }
+                    }
+                } else {
+                    guest_candidate_user_id = None;
+                }
+            }
+
+            if guest_candidate_user_id.is_none() {
+                let user_id = self.generate_id_for_entity("USER").await?;
+                let now = Utc::now();
+                let identity_put = self.crazygames_identity_put(profile, user_id, now)?;
+                let user_put = self.new_crazygames_user_put(profile, user_id, now)?;
+                let preferences_put = self.crazygames_preferences_put(
+                    user_id,
+                    &CrazyGamesPreferences::default(),
+                    1,
+                    None,
+                )?;
+                let result = self
+                    .client
+                    .transact_write_items()
+                    .client_request_token(uuid::Uuid::new_v4().to_string())
+                    .transact_items(TransactWriteItem::builder().put(identity_put).build())
+                    .transact_items(TransactWriteItem::builder().put(user_put).build())
+                    .transact_items(TransactWriteItem::builder().put(preferences_put).build())
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => {
+                        let identity = self
+                            .get_crazygames_identity(&profile.provider_user_id)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow!("CrazyGames account creation committed without mapping")
+                            })?;
+                        info!(
+                            "Created user {} for a verified CrazyGames identity",
+                            user_id
+                        );
+                        return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                            self.load_crazygames_account(
+                                identity,
+                                CrazyGamesAccountResolution::Created,
+                            )
+                            .await?,
+                        )));
+                    }
+                    Err(error) => {
+                        if let Some(winner) = self
+                            .get_crazygames_identity(&profile.provider_user_id)
+                            .await?
+                        {
+                            let winner = self
+                                .update_crazygames_profile_if_newer(&winner, profile)
+                                .await?;
+                            return Ok(CrazyGamesAccountOutcome::Resolved(Box::new(
+                                self.load_crazygames_account(
+                                    winner,
+                                    CrazyGamesAccountResolution::Returning,
+                                )
+                                .await?,
+                            )));
+                        }
+                        last_error = Some(
+                            anyhow!(error)
+                                .context("Failed to atomically create CrazyGames account"),
+                        );
+                    }
+                }
+            }
+
+            if attempt + 1 < CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+                let exponent = attempt.min(6) as u32;
+                sleep(Duration::from_millis(1_u64 << exponent)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to resolve CrazyGames identity")))
+    }
+
+    async fn save_crazygames_preferences(
+        &self,
+        user_id: i32,
+        preferences: &CrazyGamesPreferences,
+    ) -> Result<CrazyGamesPreferences> {
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| anyhow!("User not found"))?;
+        if user.is_guest || user.auth_provider.as_deref() != Some("crazygames") {
+            return Err(anyhow!("User is not linked to CrazyGames"));
+        }
+
+        let mut last_error = None;
+        for attempt in 0..CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+            let (current, version) = self
+                .get_crazygames_preferences_with_version(user_id)
+                .await?;
+            let merged = current.merge(preferences);
+            let preference_put =
+                self.crazygames_preferences_put(user_id, &merged, version + 1, Some(version))?;
+            let user_check = ConditionCheck::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("META"))
+                .condition_expression(concat!(
+                    "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                    "authProvider=:provider AND isGuest=:not_guest"
+                ))
+                .expression_attribute_values(":provider", Self::av_s("crazygames"))
+                .expression_attribute_values(":not_guest", Self::av_bool(false))
+                .build()
+                .context("Failed to build CrazyGames preference owner check")?;
+            match self
+                .client
+                .transact_write_items()
+                .transact_items(
+                    TransactWriteItem::builder()
+                        .condition_check(user_check)
+                        .build(),
+                )
+                .transact_items(TransactWriteItem::builder().put(preference_put).build())
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(merged),
+                Err(error) => {
+                    let current_user = self.get_user_by_id(user_id).await?;
+                    if !current_user.is_some_and(|user| {
+                        !user.is_guest && user.auth_provider.as_deref() == Some("crazygames")
+                    }) {
+                        return Err(anyhow!("User is not linked to CrazyGames"));
+                    }
+                    last_error = Some(
+                        anyhow!(error).context("Failed to atomically save CrazyGames preferences"),
+                    );
+                    if attempt + 1 < CRAZYGAMES_IDENTITY_MAX_ATTEMPTS {
+                        let exponent = attempt.min(6) as u32;
+                        sleep(Duration::from_millis(1_u64 << exponent)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to save CrazyGames preferences")))
+    }
+
     async fn update_user_mmr_by_mode(
         &self,
         user_id: i32,
@@ -1752,6 +3444,55 @@ impl Database for DynamoDatabase {
         }
 
         Ok(mmr_map)
+    }
+
+    async fn get_users_are_guests(&self, user_ids: &[i32]) -> Result<HashMap<i32, bool>> {
+        // One batched read per page of a public roster: BatchGetItem caps at
+        // 100 keys, and duplicate keys in one request are rejected outright.
+        const BATCH_GET_LIMIT: usize = 100;
+
+        let mut unique_ids: Vec<i32> = user_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        let mut guest_flags = HashMap::with_capacity(unique_ids.len());
+        for chunk in unique_ids.chunks(BATCH_GET_LIMIT) {
+            let mut keys = KeysAndAttributes::builder();
+            for user_id in chunk {
+                keys = keys.keys(HashMap::from([
+                    ("pk".to_string(), Self::av_s(format!("USER#{user_id}"))),
+                    ("sk".to_string(), Self::av_s("META")),
+                ]));
+            }
+            let keys = keys
+                // Aliased rather than inlined: attribute names in a projection
+                // are checked against DynamoDB's reserved-word list, and this
+                // read must not start failing on a name that LocalStack allows.
+                .projection_expression("#id, #is_guest")
+                .expression_attribute_names("#id", "id")
+                .expression_attribute_names("#is_guest", "isGuest")
+                .build()
+                .context("Failed to build guest-status batch keys")?;
+
+            let response = self
+                .client
+                .batch_get_item()
+                .request_items(self.main_table(), keys)
+                .send()
+                .await
+                .context("Failed to batch read guest status")?;
+
+            let responses = response.responses.unwrap_or_default();
+            for item in responses.get(&self.main_table()).into_iter().flatten() {
+                // An account with no stored flag predates guests and is a
+                // registered account; a missing ID is left out entirely.
+                if let Some(user_id) = Self::extract_number(item, "id") {
+                    guest_flags.insert(user_id, Self::extract_bool(item, "isGuest") == Some(true));
+                }
+            }
+        }
+
+        Ok(guest_flags)
     }
 
     // Game operations
@@ -1860,7 +3601,11 @@ impl Database for DynamoDatabase {
                 );
                 Ok(None)
             }
-            Some(item) => Ok(Some(Self::game_from_item(game_id, &item)?)),
+            Some(mut item) => {
+                self.hydrate_split_game_highlight(game_id, &mut item)
+                    .await?;
+                Ok(Some(Self::game_from_item(game_id, &item)?))
+            }
             None => Ok(None),
         }
     }
@@ -1886,6 +3631,116 @@ impl Database for DynamoDatabase {
             }
             None => Ok(None),
         }
+    }
+
+    async fn latest_allocated_game_id(&self) -> Result<Option<i32>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s("COUNTER"))
+            .key("sk", Self::av_s("GAME"))
+            .projection_expression("#counter")
+            .expression_attribute_names("#counter", "counter")
+            .send()
+            .await
+            .context("Failed to read the game id counter")?;
+
+        Ok(response
+            .item
+            .as_ref()
+            .and_then(|item| Self::extract_number(item, "counter")))
+    }
+
+    /// Read the canonical, permanent match summary for one completed game.
+    ///
+    /// Deliberately reads `GAME#{id} / HISTORY` rather than the `META` row:
+    /// the snapshot, replay object, and Play-of-the-Game clip all age out under
+    /// retention, but a shared link to a match must keep resolving forever.
+    async fn get_public_game_summary(&self, game_id: i32) -> Result<Option<MatchHistorySummary>> {
+        if game_id <= 0 {
+            return Ok(None);
+        }
+
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GAME#{game_id}")))
+            .key("sk", Self::av_s("HISTORY"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read the canonical match summary")?;
+
+        let Some(item) = response.item else {
+            return Ok(None);
+        };
+        // Rows written before summaries became permanent still carry a TTL.
+        // Honor it on read for the same reason `get_game_by_id` does: a row
+        // past its deadline is logically gone even while DynamoDB's reaper
+        // has not caught up.
+        if Self::item_is_expired(&item, Utc::now().timestamp()) {
+            return Ok(None);
+        }
+
+        match Self::history_summary_from_item(&item) {
+            Ok(summary) => Ok(Some(summary)),
+            Err(error) => {
+                warn!(game_id, ?error, "unreadable canonical match summary");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn get_recent_completed_games(&self, limit: usize) -> Result<Vec<Game>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut games = Vec::with_capacity(limit.min(RECENT_COMPLETED_GAMES_PAGE_SIZE));
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+        let now_epoch_seconds = Utc::now().timestamp();
+
+        while games.len() < limit {
+            let remaining = limit - games.len();
+            let page_limit = Self::recent_completed_games_page_limit(remaining)
+                .expect("remaining recent-game count is positive");
+            let mut request = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI1")
+                .key_condition_expression(
+                    "gsi1pk = :game_partition AND begins_with(gsi1sk, :complete_prefix)",
+                )
+                .expression_attribute_values(":game_partition", Self::av_s("GAME"))
+                .expression_attribute_values(":complete_prefix", Self::av_s("complete#"))
+                .scan_index_forward(false)
+                .limit(page_limit);
+            if let Some(key) = &last_evaluated_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to query recent completed games")?;
+            let next_key = response.last_evaluated_key;
+            Self::append_recent_completed_games_from_items(
+                &mut games,
+                response.items.unwrap_or_default(),
+                now_epoch_seconds,
+                limit,
+            )?;
+
+            let Some(next_key) = next_key else {
+                break;
+            };
+            last_evaluated_key = Some(next_key);
+        }
+
+        Ok(games)
     }
 
     async fn update_game_status(&self, game_id: i32, status: &str) -> Result<()> {
@@ -1926,6 +3781,7 @@ impl Database for DynamoDatabase {
         }
 
         let ended_at = Utc::now();
+        let season = get_season_at(ended_at);
         let created_at =
             DateTime::<Utc>::from_timestamp_millis(game_state.start_ms).unwrap_or(ended_at);
         let configured_retention = std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV).ok();
@@ -1956,13 +3812,32 @@ impl Database for DynamoDatabase {
         } else {
             "matchmaking"
         };
+        let news_eligible = match self
+            .source_game_is_news_eligible(
+                game_id,
+                Self::new_game_state_is_news_eligible(game_state),
+            )
+            .await
+        {
+            Ok(eligible) => eligible,
+            Err(error) => {
+                warn!(
+                    game_id,
+                    %error,
+                    "Could not verify completed-game source for public news; failing closed"
+                );
+                false
+            }
+        };
 
         let mut update_expression = concat!(
             "SET gsi1pk = :gsi1pk, gsi1sk = :gsi1sk, id = :id, ",
             "serverId = :server_id, gameType = :game_type, gameState = :game_state, ",
             "#status = :status, endedAt = :ended_at, lastActivity = :last_activity, ",
             "createdAt = :created_at, gameMode = :game_mode, ",
-            "isPrivate = :is_private, runtimeIdentity = :runtime_identity, #ttl = :ttl"
+            "isPrivate = if_not_exists(isPrivate, :is_private), ",
+            "runtimeIdentity = :runtime_identity, season = :season, ",
+            "newsEligible = :news_eligible, #ttl = :ttl"
         )
         .to_string();
 
@@ -2001,7 +3876,9 @@ impl Database for DynamoDatabase {
             .expression_attribute_values(":last_activity", Self::av_s(ended_at.to_rfc3339()))
             .expression_attribute_values(":created_at", Self::av_s(created_at.to_rfc3339()))
             .expression_attribute_values(":game_mode", Self::av_s(game_mode))
+            .expression_attribute_values(":season", Self::av_n(season))
             .expression_attribute_values(":runtime_identity", Self::av_s(runtime_identity))
+            .expression_attribute_values(":news_eligible", Self::av_bool(news_eligible))
             .expression_attribute_values(
                 ":is_private",
                 Self::av_bool(game_state.game_code.is_some()),
@@ -2024,12 +3901,422 @@ impl Database for DynamoDatabase {
         Ok(())
     }
 
+    async fn get_match_history(
+        &self,
+        user_id: i32,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        let limit = Self::bounded_page_limit(limit);
+        let target = limit.saturating_add(1);
+        let scope = format!("history:user:{user_id}");
+        let expected_pk = format!("USER#{user_id}");
+        let mut exclusive_start_key = match cursor {
+            Some(raw) => {
+                let cursor = Self::decode_page_cursor(raw, &scope, "history")?;
+                if cursor.pk != expected_pk
+                    || !cursor.sk.starts_with("HISTORY#")
+                    || cursor.gsi2pk.is_some()
+                    || cursor.gsi2sk.is_some()
+                {
+                    return Err(anyhow!("invalid history cursor: token key is invalid"));
+                }
+                Some(Self::cursor_key(&cursor))
+            }
+            None => None,
+        };
+        let now = Utc::now().timestamp();
+        let mut rows: Vec<(MatchHistorySummary, HashMap<String, AttributeValue>)> = Vec::new();
+
+        while rows.len() < target {
+            let remaining = target.saturating_sub(rows.len()).max(1);
+            let mut query = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .key_condition_expression("pk=:pk AND begins_with(sk, :history)")
+                .filter_expression("#ttl > :now")
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":pk", Self::av_s(&expected_pk))
+                .expression_attribute_values(":history", Self::av_s("HISTORY#"))
+                .expression_attribute_values(":now", Self::av_n(now))
+                .projection_expression("pk, sk, summaryJson, #ttl")
+                .consistent_read(true)
+                .scan_index_forward(false)
+                .limit(i32::try_from(remaining).unwrap_or(i32::MAX));
+            if let Some(key) = exclusive_start_key.take() {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let response = query
+                .send()
+                .await
+                .context("Failed to query player match history")?;
+            for item in response.items.unwrap_or_default() {
+                if !Self::item_is_expired(&item, now) {
+                    match Self::history_summary_from_item(&item) {
+                        Ok(summary) => rows.push((summary, item)),
+                        Err(error) => warn!(
+                            ?error,
+                            pk = ?Self::extract_string(&item, "pk"),
+                            sk = ?Self::extract_string(&item, "sk"),
+                            "skipping unreadable player match history row"
+                        ),
+                    }
+                }
+            }
+            exclusive_start_key = response.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+
+        let next_cursor = if rows.len() > limit {
+            Some(Self::encode_page_cursor(&scope, &rows[limit - 1].1)?)
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok(MatchHistoryPage {
+            entries: rows.into_iter().map(|(summary, _)| summary).collect(),
+            next_cursor,
+        })
+    }
+
+    async fn get_admin_match_history(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        let limit = Self::bounded_page_limit(limit);
+        let target = limit.saturating_add(1);
+        let scope = "history:admin";
+        let mut exclusive_start_key = match cursor {
+            Some(raw) => {
+                let cursor = Self::decode_page_cursor(raw, scope, "history")?;
+                if !cursor.pk.starts_with("GAME#")
+                    || cursor.sk != "HISTORY"
+                    || cursor.gsi2pk.as_deref() != Some(HISTORY_GSI_PARTITION)
+                    || !cursor
+                        .gsi2sk
+                        .as_deref()
+                        .is_some_and(|key| key.starts_with("HISTORY#"))
+                {
+                    return Err(anyhow!("invalid history cursor: token key is invalid"));
+                }
+                Some(Self::cursor_key(&cursor))
+            }
+            None => None,
+        };
+        let now = Utc::now().timestamp();
+        let mut rows: Vec<(MatchHistorySummary, HashMap<String, AttributeValue>)> = Vec::new();
+
+        while rows.len() < target {
+            let remaining = target.saturating_sub(rows.len()).max(1);
+            let mut query = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI2")
+                .key_condition_expression("gsi2pk=:pk")
+                // Canonical summaries are permanent and carry no `ttl` at all;
+                // only rows written before that keep a deadline. Filtering on
+                // `#ttl > :now` alone would hide every new match from the
+                // administrative projection.
+                .filter_expression("attribute_not_exists(#ttl) OR #ttl > :now")
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":pk", Self::av_s(HISTORY_GSI_PARTITION))
+                .expression_attribute_values(":now", Self::av_n(now))
+                .projection_expression("pk, sk, gsi2pk, gsi2sk, summaryJson, #ttl")
+                .scan_index_forward(false)
+                .limit(i32::try_from(remaining).unwrap_or(i32::MAX));
+            if let Some(key) = exclusive_start_key.take() {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let response = query
+                .send()
+                .await
+                .context("Failed to query administrative match history")?;
+            for item in response.items.unwrap_or_default() {
+                if !Self::item_is_expired(&item, now) {
+                    match Self::history_summary_from_item(&item) {
+                        Ok(summary) => rows.push((summary, item)),
+                        Err(error) => warn!(
+                            ?error,
+                            pk = ?Self::extract_string(&item, "pk"),
+                            sk = ?Self::extract_string(&item, "sk"),
+                            "skipping unreadable administrative match history row"
+                        ),
+                    }
+                }
+            }
+            exclusive_start_key = response.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+
+        let next_cursor = if rows.len() > limit {
+            Some(Self::encode_page_cursor(scope, &rows[limit - 1].1)?)
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok(MatchHistoryPage {
+            entries: rows.into_iter().map(|(summary, _)| summary).collect(),
+            next_cursor,
+        })
+    }
+
+    async fn get_runtime_config(&self) -> Result<RuntimeConfigRecord> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(RUNTIME_CONFIG_PK))
+            .key("sk", Self::av_s(RUNTIME_CONFIG_CURRENT_SK))
+            .consistent_read(true)
+            .projection_expression("recordJson")
+            .send()
+            .await
+            .context("Failed to read runtime config")?;
+        match response.item {
+            Some(item) => Self::runtime_config_record_from_item(&item),
+            None => Ok(RuntimeConfigRecord::default()),
+        }
+    }
+
+    async fn update_runtime_config(
+        &self,
+        expected_version: u64,
+        config: &RuntimeConfig,
+        actor: &RuntimeConfigActor,
+    ) -> Result<RuntimeConfigRecord> {
+        config
+            .validate()
+            .map_err(|error| anyhow!("invalid runtime config: {error}"))?;
+        let version = expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("runtime config version overflow"))?;
+        let record = RuntimeConfigRecord {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            version,
+            config: config.clone(),
+            updated_by: Some(actor.clone()),
+            updated_at_ms: Utc::now().timestamp_millis(),
+        };
+        let record_json =
+            serde_json::to_string(&record).context("Failed to serialize runtime config record")?;
+        let config_json =
+            serde_json::to_string(config).context("Failed to serialize runtime config")?;
+
+        let mut current = Put::builder()
+            .table_name(self.main_table())
+            .item("pk", Self::av_s(RUNTIME_CONFIG_PK))
+            .item("sk", Self::av_s(RUNTIME_CONFIG_CURRENT_SK))
+            .item("version", Self::av_n(version))
+            .item("configJson", Self::av_s(&config_json))
+            .item("recordJson", Self::av_s(&record_json))
+            .item("updatedAtMs", Self::av_n(record.updated_at_ms))
+            .item("updatedByUserId", Self::av_n(actor.user_id))
+            .item("updatedByUsername", Self::av_s(&actor.username));
+        if expected_version == 0 {
+            current = current
+                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
+        } else {
+            current = current
+                .condition_expression("#version=:expected")
+                .expression_attribute_names("#version", "version")
+                .expression_attribute_values(":expected", Self::av_n(expected_version));
+        }
+        let current = current
+            .build()
+            .context("Failed to build runtime config update")?;
+
+        let audit = Put::builder()
+            .table_name(self.main_table())
+            .item("pk", Self::av_s(RUNTIME_CONFIG_PK))
+            .item("sk", Self::av_s(format!("AUDIT#{version:020}")))
+            .item("version", Self::av_n(version))
+            .item("configJson", Self::av_s(config_json))
+            .item("recordJson", Self::av_s(record_json))
+            .item("updatedAtMs", Self::av_n(record.updated_at_ms))
+            .item("updatedByUserId", Self::av_n(actor.user_id))
+            .item("updatedByUsername", Self::av_s(&actor.username))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build runtime config audit write")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(current).build())
+            .transact_items(TransactWriteItem::builder().put(audit).build())
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(record),
+            Err(error) => {
+                if let Ok(observed) = self.get_runtime_config().await {
+                    // DynamoDB may commit a transaction even when the client
+                    // loses the response. Treat that exact durable record as
+                    // success so retry semantics remain idempotent.
+                    if observed == record {
+                        return Ok(observed);
+                    }
+                    if observed.version != expected_version {
+                        return Err(anyhow!(
+                            "runtime config version conflict: expected {}, current {}",
+                            expected_version,
+                            observed.version
+                        ));
+                    }
+                }
+                Err(error).context("Failed to atomically update runtime config")
+            }
+        }
+    }
+
+    async fn get_runtime_config_audit(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<RuntimeConfigAuditPage> {
+        let limit = Self::bounded_page_limit(limit);
+        let target = limit.saturating_add(1);
+        let scope = "config-audit";
+        let mut exclusive_start_key = match cursor {
+            Some(raw) => {
+                let cursor = Self::decode_page_cursor(raw, scope, "config audit")?;
+                if cursor.pk != RUNTIME_CONFIG_PK
+                    || !cursor.sk.starts_with("AUDIT#")
+                    || cursor.gsi2pk.is_some()
+                    || cursor.gsi2sk.is_some()
+                {
+                    return Err(anyhow!("invalid config audit cursor: token key is invalid"));
+                }
+                Some(Self::cursor_key(&cursor))
+            }
+            None => None,
+        };
+        let mut rows: Vec<(RuntimeConfigRecord, HashMap<String, AttributeValue>)> = Vec::new();
+        while rows.len() < target {
+            let remaining = target.saturating_sub(rows.len()).max(1);
+            let mut query = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .key_condition_expression("pk=:pk AND begins_with(sk, :audit)")
+                .expression_attribute_values(":pk", Self::av_s(RUNTIME_CONFIG_PK))
+                .expression_attribute_values(":audit", Self::av_s("AUDIT#"))
+                .projection_expression("pk, sk, recordJson")
+                .consistent_read(true)
+                .scan_index_forward(false)
+                .limit(i32::try_from(remaining).unwrap_or(i32::MAX));
+            if let Some(key) = exclusive_start_key.take() {
+                query = query.set_exclusive_start_key(Some(key));
+            }
+            let response = query
+                .send()
+                .await
+                .context("Failed to query runtime config audit")?;
+            for item in response.items.unwrap_or_default() {
+                rows.push((Self::runtime_config_record_from_item(&item)?, item));
+            }
+            exclusive_start_key = response.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+
+        let next_cursor = if rows.len() > limit {
+            Some(Self::encode_page_cursor(scope, &rows[limit - 1].1)?)
+        } else {
+            None
+        };
+        rows.truncate(limit);
+        Ok(RuntimeConfigAuditPage {
+            entries: rows.into_iter().map(|(record, _)| record).collect(),
+            next_cursor,
+        })
+    }
+
+    async fn try_claim_pre_match_ad_break(
+        &self,
+        break_id: &str,
+        user_ids: &[u32],
+        now_ms: i64,
+        minimum_interval_ms: i64,
+        policy_version: u64,
+    ) -> Result<bool> {
+        let cutoff_ms = Self::validate_pre_match_ad_break_claim(
+            break_id,
+            user_ids,
+            now_ms,
+            minimum_interval_ms,
+            policy_version,
+        )?;
+        let mut updates = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            let update = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("USER#{user_id}")))
+                .key("sk", Self::av_s("AD#PRE_MATCH"))
+                .update_expression(concat!(
+                    "SET #last_break_at=:now, #break_id=:break_id, ",
+                    "#policy_version=:policy_version"
+                ))
+                .condition_expression(concat!(
+                    "attribute_not_exists(#last_break_at) OR ",
+                    "#last_break_at<=:cutoff OR #break_id=:break_id"
+                ))
+                .expression_attribute_names("#last_break_at", "lastBreakAtMs")
+                .expression_attribute_names("#break_id", "breakId")
+                .expression_attribute_names("#policy_version", "policyVersion")
+                .expression_attribute_values(":now", Self::av_n(now_ms))
+                .expression_attribute_values(":cutoff", Self::av_n(cutoff_ms))
+                .expression_attribute_values(":break_id", Self::av_s(break_id))
+                .expression_attribute_values(":policy_version", Self::av_n(policy_version))
+                .build()
+                .context("Failed to build pre-match ad-break cooldown claim")?;
+            updates.push(TransactWriteItem::builder().update(update).build());
+        }
+
+        match self
+            .client
+            .transact_write_items()
+            .client_request_token(break_id)
+            .set_transact_items(Some(updates))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("Failed to claim pre-match ad-break cooldown"),
+        }
+    }
+
     async fn apply_completion_effect(
         &self,
         completion: &CompletionRecordV1,
         effect: &CompletionEffect,
     ) -> Result<EffectApplyResult> {
         completion.validate_effect(effect)?;
+
+        let replay_artifacts = if matches!(effect, CompletionEffect::PersistGame { .. }) {
+            Some(
+                prepare_replay_artifacts(self.replay_store.as_deref(), completion)
+                    .await
+                    .context("Failed to prepare completed-game replay artifacts")?,
+            )
+        } else {
+            None
+        };
 
         let max_attempts = if matches!(
             effect,
@@ -2044,19 +4331,38 @@ impl Database for DynamoDatabase {
         for attempt in 0..max_attempts {
             let mutations = match effect {
                 CompletionEffect::PersistGame { .. } => {
+                    let replay_artifacts = replay_artifacts
+                        .as_ref()
+                        .expect("persist-game replay artifacts were prepared above");
                     let ended_at = DateTime::<Utc>::from_timestamp_millis(completion.ended_at_ms)
                         .ok_or_else(|| anyhow!("invalid completion timestamp"))?;
                     let created_at =
                         DateTime::<Utc>::from_timestamp_millis(completion.final_state.start_ms)
                             .unwrap_or(ended_at);
-                    let retention_days = Self::completed_game_retention_days(
-                        std::env::var(COMPLETED_GAME_RETENTION_DAYS_ENV)
-                            .ok()
-                            .as_deref(),
-                    );
-                    let ttl = ended_at
-                        .timestamp()
-                        .saturating_add(retention_days.saturating_mul(SECONDS_PER_DAY));
+                    let history_config = match self.get_runtime_config().await {
+                        Ok(runtime_config) => runtime_config.config.history,
+                        Err(error) => {
+                            warn!(
+                                ?error,
+                                "failed to read runtime config for completed game; using default history retention"
+                            );
+                            RuntimeHistoryConfig::default()
+                        }
+                    };
+                    let snapshot_ttl = Self::retention_ttl_seconds(
+                        completion.ended_at_ms,
+                        history_config.snapshot_retention_days,
+                    )?;
+                    let summary_ttl = Self::retention_ttl_seconds(
+                        completion.ended_at_ms,
+                        history_config.summary_retention_days,
+                    )?;
+                    let summary =
+                        match_history_summary(completion, history_config.snapshot_retention_days)?;
+                    let summary_json = serde_json::to_string(&summary)
+                        .context("Failed to serialize immutable match history summary")?;
+                    let history_sk =
+                        Self::history_sort_key(completion.ended_at_ms, completion.game_id)?;
                     let state_json = serde_json::to_string(&completion.final_state)
                         .context("Failed to serialize immutable final game state")?;
                     let game_type_json =
@@ -2070,6 +4376,25 @@ impl Database for DynamoDatabase {
                     } else {
                         "matchmaking"
                     };
+                    let news_eligible = match self
+                        .source_game_is_news_eligible(
+                            completion.game_id as i32,
+                            Self::new_game_state_is_news_eligible(&completion.final_state),
+                        )
+                        .await
+                    {
+                        Ok(eligible) => eligible,
+                        Err(error) => {
+                            // Result persistence is mandatory; public news is
+                            // optional and must fail closed under uncertainty.
+                            warn!(
+                                game_id = completion.game_id,
+                                %error,
+                                "Could not verify completion source for public news; failing closed"
+                            );
+                            false
+                        }
+                    };
                     let runtime_identity = Self::runtime_game_identity(
                         completion.game_id as i32,
                         &completion.final_state,
@@ -2079,12 +4404,39 @@ impl Database for DynamoDatabase {
                         "SET gsi1pk=:gsi1pk, gsi1sk=:gsi1sk, id=:id, serverId=:server, ",
                         "gameType=:game_type, gameState=:game_state, #status=:status, ",
                         "endedAt=:ended, lastActivity=:ended, createdAt=:created, ",
-                        "gameMode=:mode, isPrivate=:private, runtimeIdentity=:runtime, ",
-                        "completionRevision=:revision, #ttl=:ttl"
+                        "gameMode=:mode, isPrivate=if_not_exists(isPrivate,:private), ",
+                        "runtimeIdentity=:runtime, completionRevision=:revision, ",
+                        "newsEligible=:news_eligible, #ttl=:ttl"
                     )
                     .to_string();
                     if completion.final_state.game_code.is_some() {
                         expression.push_str(", gameCode=:game_code");
+                    }
+                    if completion.season.is_some() {
+                        expression.push_str(", season=:season");
+                    }
+                    if replay_artifacts.replay_object_json.is_some() {
+                        expression.push_str(", replayObject=:replay_object");
+                    }
+                    if replay_artifacts.play_of_the_game_json.is_some() {
+                        expression.push_str(", playOfTheGame=:play_of_the_game");
+                    }
+                    if replay_artifacts.split_play_of_the_game_json.is_some() {
+                        expression.push_str(", playOfTheGameSplit=:play_of_the_game_split");
+                    }
+                    let mut removals = Vec::with_capacity(3);
+                    if replay_artifacts.replay_object_json.is_none() {
+                        removals.push("replayObject");
+                    }
+                    if replay_artifacts.play_of_the_game_json.is_none() {
+                        removals.push("playOfTheGame");
+                    }
+                    if replay_artifacts.split_play_of_the_game_json.is_none() {
+                        removals.push("playOfTheGameSplit");
+                    }
+                    if !removals.is_empty() {
+                        expression.push_str(" REMOVE ");
+                        expression.push_str(&removals.join(", "));
                     }
 
                     let mut update = Update::builder()
@@ -2126,12 +4478,34 @@ impl Database for DynamoDatabase {
                             ":revision",
                             Self::av_s(completion.revision.to_string()),
                         )
-                        .expression_attribute_values(":ttl", Self::av_n(ttl));
+                        .expression_attribute_values(":news_eligible", Self::av_bool(news_eligible))
+                        .expression_attribute_values(":ttl", Self::av_n(snapshot_ttl));
                     if let Some(game_code) = &completion.final_state.game_code {
                         update =
                             update.expression_attribute_values(":game_code", Self::av_s(game_code));
                     }
-                    vec![
+                    if let Some(season) = completion.season {
+                        update = update.expression_attribute_values(":season", Self::av_n(season));
+                    }
+                    if let Some(replay_object) = &replay_artifacts.replay_object_json {
+                        update = update.expression_attribute_values(
+                            ":replay_object",
+                            Self::av_s(replay_object),
+                        );
+                    }
+                    if let Some(play_of_the_game) = &replay_artifacts.play_of_the_game_json {
+                        update = update.expression_attribute_values(
+                            ":play_of_the_game",
+                            Self::av_s(play_of_the_game),
+                        );
+                    }
+                    if replay_artifacts.split_play_of_the_game_json.is_some() {
+                        update = update.expression_attribute_values(
+                            ":play_of_the_game_split",
+                            Self::av_bool(true),
+                        );
+                    }
+                    let mut mutations = vec![
                         TransactWriteItem::builder()
                             .update(
                                 update
@@ -2139,12 +4513,102 @@ impl Database for DynamoDatabase {
                                     .context("Failed to build completed-game update")?,
                             )
                             .build(),
-                    ]
+                    ];
+                    if let Some(play_of_the_game) = &replay_artifacts.split_play_of_the_game_json {
+                        let split_highlight = Put::builder()
+                            .table_name(self.main_table())
+                            .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+                            .item("sk", Self::av_s(SPLIT_HIGHLIGHT_SORT_KEY))
+                            .item("gameId", Self::av_n(completion.game_id))
+                            .item("playOfTheGame", Self::av_s(play_of_the_game))
+                            .item(
+                                "completionRevision",
+                                Self::av_s(completion.revision.to_string()),
+                            )
+                            .item("ttl", Self::av_n(snapshot_ttl))
+                            .condition_expression(
+                                "attribute_not_exists(pk) OR completionRevision=:revision",
+                            )
+                            .expression_attribute_values(
+                                ":revision",
+                                Self::av_s(completion.revision.to_string()),
+                            )
+                            .build()
+                            .context("Failed to build split Play-of-the-Game item")?;
+                        mutations.push(TransactWriteItem::builder().put(split_highlight).build());
+                    }
+
+                    // The canonical row deliberately carries NO ttl: it is what
+                    // backs the permanent public game page, and a shared link
+                    // must never rot. Retention still applies to everything
+                    // heavier — the final snapshot, the replay object, and each
+                    // player's private history mirror below all keep their TTL.
+                    let canonical_history = Put::builder()
+                        .table_name(self.main_table())
+                        .item("pk", Self::av_s(format!("GAME#{}", completion.game_id)))
+                        .item("sk", Self::av_s("HISTORY"))
+                        .item("gsi2pk", Self::av_s(HISTORY_GSI_PARTITION))
+                        .item("gsi2sk", Self::av_s(&history_sk))
+                        .item("gameId", Self::av_n(completion.game_id))
+                        .item("endedAtMs", Self::av_n(completion.ended_at_ms))
+                        .item("summaryJson", Self::av_s(&summary_json))
+                        .item(
+                            "completionRevision",
+                            Self::av_s(completion.revision.to_string()),
+                        )
+                        .condition_expression(
+                            "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                        )
+                        .build()
+                        .context("Failed to build canonical match history write")?;
+                    mutations.push(TransactWriteItem::builder().put(canonical_history).build());
+
+                    if !completion.final_state.is_stress_test {
+                        for player in &summary.players {
+                            let user_history = Put::builder()
+                                .table_name(self.main_table())
+                                .item("pk", Self::av_s(format!("USER#{}", player.user_id)))
+                                .item("sk", Self::av_s(&history_sk))
+                                .item("gameId", Self::av_n(completion.game_id))
+                                .item("endedAtMs", Self::av_n(completion.ended_at_ms))
+                                .item("summaryJson", Self::av_s(&summary_json))
+                                .item(
+                                    "completionRevision",
+                                    Self::av_s(completion.revision.to_string()),
+                                )
+                                .item("ttl", Self::av_n(summary_ttl))
+                                .condition_expression(
+                                    "attribute_not_exists(pk) AND attribute_not_exists(sk)",
+                                )
+                                .build()
+                                .context("Failed to build player match history write")?;
+                            mutations.push(TransactWriteItem::builder().put(user_history).build());
+                        }
+                    }
+
+                    // This durable v8+ completion counter is the advertisement
+                    // eligibility source of truth. Keeping it in this replay-safe
+                    // transaction makes each newly claimed completion count once.
+                    for user_id in completion.final_state.players.keys() {
+                        let progress_update = Update::builder()
+                            .table_name(self.main_table())
+                            .key("pk", Self::av_s(format!("USER#{user_id}")))
+                            .key("sk", Self::av_s("META"))
+                            .update_expression("ADD gamesPlayed :one")
+                            .condition_expression("attribute_exists(pk) AND attribute_exists(sk)")
+                            .expression_attribute_values(":one", Self::av_n(1))
+                            .build()
+                            .context("Failed to build games-played update")?;
+                        mutations
+                            .push(TransactWriteItem::builder().update(progress_update).build());
+                    }
+                    debug_assert!(mutations.len() + 2 <= 100);
+                    mutations
                 }
                 CompletionEffect::AddXp {
                     user_id, amount, ..
                 } => {
-                    let (current_username, is_guest) =
+                    let (current_username, is_guest, uses_username_mirror) =
                         self.completion_user_target(*user_id).await?;
                     let main_update = Update::builder()
                         .table_name(self.main_table())
@@ -2162,7 +4626,7 @@ impl Database for DynamoDatabase {
                         .context("Failed to build idempotent XP update")?;
                     let mut mutations =
                         vec![TransactWriteItem::builder().update(main_update).build()];
-                    if !is_guest {
+                    if uses_username_mirror {
                         let mirror_update = Update::builder()
                             .table_name(self.usernames_table())
                             .key("username", Self::av_s(current_username))
@@ -2182,7 +4646,7 @@ impl Database for DynamoDatabase {
                     queue_mode,
                     ..
                 } => {
-                    let (current_username, is_guest) =
+                    let (current_username, is_guest, uses_username_mirror) =
                         self.completion_user_target(*user_id).await?;
                     let field = match queue_mode {
                         common::QueueMode::Competitive => "rankedMmr",
@@ -2204,7 +4668,7 @@ impl Database for DynamoDatabase {
                         .context("Failed to build idempotent MMR update")?;
                     let mut mutations =
                         vec![TransactWriteItem::builder().update(main_update).build()];
-                    if !is_guest {
+                    if uses_username_mirror {
                         let mirror_update = Update::builder()
                             .table_name(self.usernames_table())
                             .key("username", Self::av_s(current_username))
@@ -2309,6 +4773,28 @@ impl Database for DynamoDatabase {
                     item.insert("season".into(), Self::av_n(season));
                     item.insert("updatedAt".into(), Self::av_s(&now));
 
+                    // Same row under the user-addressed sort key, so
+                    // `get_user_ranking` stays a keyed read. Written in this
+                    // transaction rather than after it: the guards above make
+                    // the ladder write conditional, and a pointer applied
+                    // outside those guards could describe a state the ladder
+                    // rejected. Unconditional, so it also clears any "no
+                    // ranking here" tombstone a reader left behind.
+                    let mut pointer = item.clone();
+                    pointer.insert(
+                        "sk".into(),
+                        Self::av_s(Self::ranking_pointer_sk(*user_id as i32)),
+                    );
+                    // Ladder rows are the only rows the GSI should surface; a
+                    // pointer in GameTypeSeasonIndex would double every global
+                    // leaderboard.
+                    pointer.remove("gameTypeSeason");
+                    let pointer_write = Put::builder()
+                        .table_name(self.rankings_table())
+                        .set_item(Some(pointer))
+                        .build()
+                        .context("Failed to build ranking pointer effect")?;
+
                     let mut ranking_mutations = match existing {
                         None => {
                             let put = Put::builder()
@@ -2392,6 +4878,7 @@ impl Database for DynamoDatabase {
                             }
                         }
                     };
+                    ranking_mutations.push(TransactWriteItem::builder().put(pointer_write).build());
                     ranking_mutations.insert(
                         0,
                         TransactWriteItem::builder()
@@ -2410,6 +4897,20 @@ impl Database for DynamoDatabase {
                     season,
                     ..
                 } => {
+                    let news_eligible = match self
+                        .completed_game_is_news_eligible(completion.game_id)
+                        .await
+                    {
+                        Ok(eligible) => eligible,
+                        Err(error) => {
+                            warn!(
+                                game_id = completion.game_id,
+                                %error,
+                                "Could not verify high-score source for public news; failing closed"
+                            );
+                            false
+                        }
+                    };
                     let game_type_string = Self::game_type_to_string(game_type);
                     let inverted = 99_999_999_i64 - i64::from(*score);
                     let pk = format!("SCORE#{game_type_string}#{season}#{region}");
@@ -2442,6 +4943,7 @@ impl Database for DynamoDatabase {
                             "completionRevision",
                             Self::av_s(completion.revision.to_string()),
                         )
+                        .item("newsEligible", Self::av_bool(news_eligible))
                         .condition_expression(
                             "attribute_not_exists(pk) AND attribute_not_exists(sk)",
                         )
@@ -2695,28 +5197,57 @@ impl Database for DynamoDatabase {
         item.insert("season".to_string(), Self::av_n(season));
         item.insert("updatedAt".to_string(), Self::av_s(now.to_rfc3339()));
 
-        // Delete old entry if MMR changed (SK will be different)
+        // The pointer is the same row under a user-addressed sort key. It is
+        // what makes `get_user_ranking` a keyed read, including the one this
+        // method just performed to derive the counters above.
+        let mut pointer = item.clone();
+        pointer.insert(
+            "sk".to_string(),
+            Self::av_s(Self::ranking_pointer_sk(user_id)),
+        );
+        // Ladder rows are the only rows the GSI should surface; a pointer in
+        // GameTypeSeasonIndex would double every global leaderboard.
+        pointer.remove("gameTypeSeason");
+
+        let ladder_row = Put::builder()
+            .table_name(self.rankings_table())
+            .set_item(Some(item))
+            .build()
+            .context("Failed to build ranking row write")?;
+        let pointer_row = Put::builder()
+            .table_name(self.rankings_table())
+            .set_item(Some(pointer))
+            .build()
+            .context("Failed to build ranking pointer write")?;
+
+        // Row, pointer, and the retired row move together. Applied separately,
+        // a crash between them would leave the pointer disagreeing with the
+        // ladder about a user's counters, and the next match would replay the
+        // increment off whichever one it happened to read.
+        let mut mutations = vec![
+            TransactWriteItem::builder().put(ladder_row).build(),
+            TransactWriteItem::builder().put(pointer_row).build(),
+        ];
+
+        // Retire the previous entry when a new MMR gave it a different SK.
         if let Some(prev_mmr) = old_mmr
             && prev_mmr != mmr
         {
             let old_inverted = 99999999 - prev_mmr.clamp(0, 99999999);
             let old_sk = format!("MMR#{:08}#USER#{}", old_inverted, user_id);
 
-            self.client
-                .delete_item()
+            let retired = Delete::builder()
                 .table_name(self.rankings_table())
                 .key("pk", Self::av_s(&pk))
                 .key("sk", Self::av_s(&old_sk))
-                .send()
-                .await
-                .ok(); // Ignore errors
+                .build()
+                .context("Failed to build retired ranking row delete")?;
+            mutations.push(TransactWriteItem::builder().delete(retired).build());
         }
 
-        // Insert new entry
         self.client
-            .put_item()
-            .table_name(self.rankings_table())
-            .set_item(Some(item))
+            .transact_write_items()
+            .set_transact_items(Some(mutations))
             .send()
             .await
             .context("Failed to upsert ranking")?;
@@ -2758,12 +5289,17 @@ impl Database for DynamoDatabase {
                     queue_mode_str, game_type_str, reg, season_str
                 );
 
+                // `begins_with` is load-bearing, not defensive: each user also
+                // has a `USER#{id}` pointer in this partition, and a ladder
+                // shorter than `limit` would otherwise page into the pointers
+                // and list every player twice.
                 let response = self
                     .client
                     .query()
                     .table_name(self.rankings_table())
-                    .key_condition_expression("pk = :pk")
+                    .key_condition_expression("pk = :pk AND begins_with(sk, :mmr_prefix)")
                     .expression_attribute_values(":pk", Self::av_s(&pk))
+                    .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
                     .limit(limit as i32)
                     .send()
                     .await
@@ -2774,31 +5310,25 @@ impl Database for DynamoDatabase {
                 // Prefer the GameTypeSeasonIndex to query all regions in a single partition
                 let game_type_season =
                     format!("{}#{}#{}", queue_mode_str, game_type_str, season_str);
-                let mut gsi_items: Vec<HashMap<String, AttributeValue>> = Vec::new();
-
-                match self
-                    .client
-                    .query()
-                    .table_name(self.rankings_table())
-                    .index_name("GameTypeSeasonIndex")
-                    .key_condition_expression("gameTypeSeason = :gts")
-                    .expression_attribute_values(":gts", Self::av_s(&game_type_season))
-                    .limit(limit as i32)
-                    .send()
+                let gsi_items = match self
+                    .query_global_ranking_pages(&game_type_season, season, limit)
                     .await
                 {
-                    Ok(response) => {
-                        gsi_items = response.items.unwrap_or_default();
+                    Ok(items) => {
+                        // A successful empty query is authoritative for a new
+                        // season. Only an unavailable index justifies scanning.
+                        Some(items)
                     }
                     Err(err) => {
                         warn!(
                             "Falling back to scan for global rankings (GameTypeSeasonIndex not available?): {:?}",
                             err
                         );
+                        None
                     }
-                }
+                };
 
-                if !gsi_items.is_empty() {
+                if let Some(gsi_items) = gsi_items {
                     gsi_items
                 } else {
                     // Fallback: scan across all regions for the requested season
@@ -2812,9 +5342,17 @@ impl Database for DynamoDatabase {
                             .client
                             .scan()
                             .table_name(self.rankings_table())
-                            .filter_expression("begins_with(pk, :prefix) AND contains(pk, :season)")
+                            // `begins_with(sk, ...)` excludes the per-user
+                            // `USER#{id}` pointers, which carry the same
+                            // attributes and would otherwise list twice.
+                            .filter_expression(concat!(
+                                "begins_with(pk, :prefix) AND #season = :season ",
+                                "AND begins_with(sk, :mmr_prefix)"
+                            ))
+                            .expression_attribute_names("#season", "season")
                             .expression_attribute_values(":prefix", Self::av_s(&pk_prefix))
-                            .expression_attribute_values(":season", Self::av_s(&season_str))
+                            .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
+                            .expression_attribute_values(":season", Self::av_n(season))
                             .limit((target_items - items.len()) as i32);
 
                         if let Some(ref lek) = last_evaluated_key {
@@ -2840,16 +5378,24 @@ impl Database for DynamoDatabase {
                 }
             }
         } else {
-            // Scan all game types and regions for a season
+            // Scan all game types and regions for a season. `begins_with(sk,
+            // ...)` excludes the per-user `USER#{id}` pointers, which carry the
+            // same attributes and would otherwise list twice.
             let response = self
                 .client
                 .scan()
                 .table_name(self.rankings_table())
-                .filter_expression("begins_with(pk, :prefix)")
+                .filter_expression(concat!(
+                    "begins_with(pk, :prefix) AND #season = :season ",
+                    "AND begins_with(sk, :mmr_prefix)"
+                ))
+                .expression_attribute_names("#season", "season")
                 .expression_attribute_values(
                     ":prefix",
-                    Self::av_s(format!("RANKING#{}", queue_mode_str)),
+                    Self::av_s(format!("RANKING#{}#", queue_mode_str)),
                 )
+                .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
+                .expression_attribute_values(":season", Self::av_n(season))
                 .limit(limit as i32)
                 .send()
                 .await
@@ -2861,31 +5407,12 @@ impl Database for DynamoDatabase {
         // Parse results into RankingEntry
         let mut entries: Vec<RankingEntry> = items
             .into_iter()
-            .filter_map(|item| {
-                Some(RankingEntry {
-                    user_id: Self::extract_number(&item, "userId")?,
-                    username: Self::extract_string(&item, "username")?,
-                    mmr: Self::extract_number(&item, "mmr")?,
-                    games_played: Self::extract_number(&item, "gamesPlayed")?,
-                    wins: Self::extract_number(&item, "wins")?,
-                    losses: Self::extract_number(&item, "losses")?,
-                    region: Self::extract_string(&item, "region")?,
-                    queue_mode: Self::extract_string(&item, "queueMode")?,
-                    game_type: Self::extract_string(&item, "gameType")
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    season: Self::extract_number(&item, "season")
-                        .map(|s| s as Season)
-                        .unwrap_or(season),
-                    updated_at: Self::extract_string(&item, "updatedAt")
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(Utc::now),
-                })
-            })
+            .filter_map(|item| Self::leaderboard_entry_from_item(&item, season))
             .collect();
 
         // Sort by MMR descending (in case we scanned multiple regions)
         entries.sort_by_key(|e| std::cmp::Reverse(e.mmr));
+        Self::collapse_ranking_rows_per_user(&mut entries);
         entries.truncate(limit);
 
         Ok(entries)
@@ -2913,49 +5440,96 @@ impl Database for DynamoDatabase {
             queue_mode_str, game_type_str, region, season
         );
 
-        // Query all rankings for this PK and filter in memory for the user
-        // We can't use filter on sk since it's a key attribute
-        let response = self
+        // Fast path: one keyed read of the user's pointer. This is the only
+        // path that should ever execute in steady state.
+        let pointer = self
             .client
-            .query()
+            .get_item()
             .table_name(self.rankings_table())
-            .key_condition_expression("pk = :pk")
-            .expression_attribute_values(":pk", Self::av_s(&pk))
+            .key("pk", Self::av_s(&pk))
+            .key("sk", Self::av_s(Self::ranking_pointer_sk(user_id)))
+            // A single small item, so strong consistency costs ~1 RCU and
+            // keeps the read-modify-write in `upsert_ranking` correct.
             .consistent_read(true)
             .send()
             .await
-            .context("Failed to query rankings")?;
+            .context("Failed to read ranking pointer")?;
 
-        let items = response.items.unwrap_or_default();
+        if let Some(item) = pointer.item {
+            if Self::extract_bool(&item, "absent") == Some(true) {
+                return Ok(None);
+            }
+            return Ok(Self::user_ranking_from_items(
+                std::iter::once(&item),
+                user_id,
+                queue_mode_str,
+                &game_type_str,
+                region,
+                season,
+            ));
+        }
 
-        // Filter in memory for the specific user
-        let user_item = items
-            .iter()
-            .find(|item| Self::extract_number(item, "userId") == Some(user_id));
+        // Migration path, taken at most once per user per ladder: rows written
+        // before pointers existed can only be found by walking the partition.
+        // A ranking partition can exceed DynamoDB's 1 MiB response page, so
+        // keep following LastEvaluatedKey until the user is found or the
+        // partition is genuinely exhausted.
+        let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut request = self
+                .client
+                .query()
+                .table_name(self.rankings_table())
+                .key_condition_expression("pk = :pk AND begins_with(sk, :mmr_prefix)")
+                .filter_expression("#user_id = :user_id_number OR #user_id = :user_id_string")
+                .expression_attribute_names("#user_id", "userId")
+                .expression_attribute_values(":pk", Self::av_s(&pk))
+                .expression_attribute_values(":mmr_prefix", Self::av_s("MMR#"))
+                .expression_attribute_values(":user_id_number", Self::av_n(user_id))
+                .expression_attribute_values(":user_id_string", Self::av_s(user_id.to_string()))
+                .consistent_read(true);
+            if let Some(key) = &last_evaluated_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
 
-        let item = match user_item {
-            Some(item) => item,
-            None => return Ok(None),
-        };
-        Ok(Some(RankingEntry {
-            user_id: Self::extract_number(item, "userId").unwrap_or(user_id),
-            username: Self::extract_string(item, "username").unwrap_or_default(),
-            mmr: Self::extract_number(item, "mmr").unwrap_or(1000),
-            games_played: Self::extract_number(item, "gamesPlayed").unwrap_or(0),
-            wins: Self::extract_number(item, "wins").unwrap_or(0),
-            losses: Self::extract_number(item, "losses").unwrap_or(0),
-            region: Self::extract_string(item, "region").unwrap_or(region.to_string()),
-            queue_mode: Self::extract_string(item, "queueMode")
-                .unwrap_or(queue_mode_str.to_string()),
-            game_type: Self::extract_string(item, "gameType").unwrap_or(game_type_str.clone()),
-            season: Self::extract_number(item, "season")
-                .map(|s| s as Season)
-                .unwrap_or(season),
-            updated_at: Self::extract_string(item, "updatedAt")
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
-        }))
+            let response = request.send().await.context("Failed to query rankings")?;
+            if let Some(item) = response
+                .items
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|item| Self::extract_number(item, "userId") == Some(user_id))
+            {
+                let entry = Self::user_ranking_from_items(
+                    std::iter::once(item),
+                    user_id,
+                    queue_mode_str,
+                    &game_type_str,
+                    region,
+                    season,
+                );
+
+                // Promote the row we just paid for, so no later request has to
+                // repeat this scan.
+                let mut promoted = item.clone();
+                promoted.insert(
+                    "sk".to_string(),
+                    Self::av_s(Self::ranking_pointer_sk(user_id)),
+                );
+                self.backfill_ranking_pointer(promoted).await;
+
+                return Ok(entry);
+            }
+
+            let Some(next_key) = response.last_evaluated_key else {
+                // Record the absence too — otherwise every unranked player on
+                // the leaderboard page re-scans this partition on every load.
+                self.backfill_ranking_pointer(Self::absent_ranking_pointer(&pk, user_id))
+                    .await;
+                return Ok(None);
+            };
+            last_evaluated_key = Some(next_key);
+        }
     }
 
     async fn insert_high_score(
@@ -3005,6 +5579,8 @@ impl Database for DynamoDatabase {
             .item("season", Self::av_n(season))
             .item("gameTypeSeason", Self::av_s(&game_type_season))
             .item("timestamp", Self::av_s(&timestamp))
+            // This legacy API cannot verify the source game's privacy.
+            .item("newsEligible", Self::av_bool(false))
             .send()
             .await
             .context("Failed to insert high score")?;
@@ -3068,6 +5644,7 @@ impl Database for DynamoDatabase {
                             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&Utc))
                             .unwrap_or_else(Utc::now),
+                        news_eligible: Self::extract_bool(&item, "newsEligible") == Some(true),
                     };
                     debug!(
                         "Parsed high score entry - user: {}, score: {}, game_id: {}",
@@ -3117,6 +5694,7 @@ impl Database for DynamoDatabase {
                                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(Utc::now),
+                            news_eligible: Self::extract_bool(&item, "newsEligible") == Some(true),
                         };
                         Some(entry)
                     })
@@ -3191,6 +5769,7 @@ impl Database for DynamoDatabase {
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(Utc::now),
+                    news_eligible: Self::extract_bool(&item, "newsEligible") == Some(true),
                 };
                 Some(entry)
             })
@@ -3204,6 +5783,31 @@ impl Database for DynamoDatabase {
             entries.len()
         );
         Ok(entries)
+    }
+
+    async fn get_news_high_score_snapshot(
+        &self,
+        game_type: &common::GameType,
+        season: Season,
+    ) -> Result<NewsHighScoreSnapshot> {
+        self.create_high_scores_table_if_not_exists().await?;
+        let game_type = Self::game_type_to_string(game_type);
+        match self
+            .query_global_news_high_score_snapshot(&game_type, season)
+            .await
+        {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Withholding Solo-leader claims and using a bounded sample because GameTypeSeasonIndex is unavailable"
+                );
+                Ok(NewsHighScoreSnapshot {
+                    leader: None,
+                    coverage: NewsLeaderboardCoverage::BoundedSample,
+                })
+            }
+        }
     }
 }
 
@@ -3547,6 +6151,94 @@ impl DynamoDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay_store::InMemoryReplayStore;
+    use common::{
+        GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameRecordingV1, GameState,
+        GameStatus, GameType, HighlightClip, HighlightConfig, HighlightPresentation,
+        HighlightReason, HighlightScoreBreakdown, HighlightWindow, QueueMode, ReplayAnchor,
+        ReplayVisibility,
+    };
+
+    fn completion_with_recording(game_id: u32) -> CompletionRecordV1 {
+        let mut final_state = GameState::new(
+            20,
+            20,
+            GameType::Solo,
+            QueueMode::Quickmatch,
+            Some(7),
+            1_000,
+        );
+        final_state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let recording = GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            visibility: ReplayVisibility::Public,
+            anchors: vec![ReplayAnchor {
+                tick: final_state.tick,
+                sequence: 0,
+                state: final_state.clone(),
+            }],
+            messages: Vec::new(),
+            end_tick: final_state.tick,
+            end_sync_hash: final_state.sync_hash(),
+        };
+        let completion = CompletionRecordV1 {
+            schema_version: crate::completion::COMPLETION_SCHEMA_VERSION,
+            game_id,
+            partition_id: 3,
+            revision: uuid::Uuid::new_v4(),
+            ended_at_ms: 2_000,
+            server_id: 9,
+            season: Some(1),
+            recording: Some(recording),
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
+            final_state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+        completion.validate().unwrap();
+        completion
+    }
+
+    fn completion_with_highlight(game_id: u32, star_name_bytes: usize) -> CompletionRecordV1 {
+        let mut completion = completion_with_recording(game_id);
+        completion.recording = None;
+        let anchor = completion.final_state.clone();
+        let mut breakdown = HighlightScoreBreakdown::default();
+        breakdown.total = 125;
+        breakdown.max_chain = 8;
+        completion.play_of_the_game = Some(HighlightClip {
+            clip_format_version: common::HIGHLIGHT_CLIP_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            star_user_id: 1,
+            star_snake_id: 0,
+            star_name: "S".repeat(star_name_bytes),
+            reason: HighlightReason::ComboFrenzy { max_chain: 8 },
+            score: 125,
+            breakdown,
+            window: HighlightWindow {
+                start_tick: anchor.tick,
+                end_tick: anchor.tick,
+                focus_tick: anchor.tick,
+            },
+            anchor: anchor.clone(),
+            messages: Vec::new(),
+            end_sync_hash: anchor.sync_hash(),
+            presentation: HighlightPresentation {
+                rotation: 0,
+                follow_snake_id: 0,
+                segments: Vec::new(),
+            },
+            config: HighlightConfig::default(),
+        });
+        completion.validate().unwrap();
+        completion
+    }
 
     #[test]
     fn runtime_dynamodb_standard_retry_policy_is_capped_at_five_attempts() {
@@ -3601,6 +6293,108 @@ mod tests {
             Some(ended_at)
         );
         assert_eq!(game.game_state, Some(json!({ "tick": 42 })));
+        assert_eq!(game.season, None, "legacy rows have no proven season");
+        assert!(game.replay_object.is_none());
+        assert!(game.play_of_the_game.is_none());
+        assert!(!game.news_eligible, "legacy rows must fail closed");
+
+        item.insert("season".to_string(), DynamoDatabase::av_n(7));
+        item.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        item.insert("newsEligible".to_string(), DynamoDatabase::av_bool(true));
+        let current = DynamoDatabase::game_from_item(123, &item).unwrap();
+        assert_eq!(current.season, Some(7));
+        assert!(current.news_eligible);
+
+        item.insert("season".to_string(), DynamoDatabase::av_n(-1));
+        assert_eq!(
+            DynamoDatabase::game_from_item(123, &item).unwrap().season,
+            None
+        );
+    }
+
+    #[test]
+    fn game_from_item_parses_replay_metadata_strictly() {
+        let metadata = ReplayObjectMetadata {
+            format_version: crate::replay_store::REPLAY_OBJECT_FORMAT_VERSION,
+            game_id: 123,
+            object_key: "recordings/v1/games/0000000123.replay.json.gz".into(),
+            uncompressed_sha256: "a".repeat(64),
+            compressed_sha256: "b".repeat(64),
+            uncompressed_bytes: 100,
+            compressed_bytes: 50,
+        };
+        let mut item = HashMap::new();
+        item.insert(
+            "replayObject".to_string(),
+            DynamoDatabase::av_s(serde_json::to_string(&metadata).unwrap()),
+        );
+        let game = DynamoDatabase::game_from_item(123, &item).unwrap();
+        assert_eq!(game.replay_object, Some(metadata));
+
+        item.insert("replayObject".to_string(), DynamoDatabase::av_s("not-json"));
+        assert!(DynamoDatabase::game_from_item(123, &item).is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_artifacts_upload_deterministically_before_metadata_persistence() {
+        let completion = completion_with_recording(123);
+        let store = InMemoryReplayStore::new();
+
+        let first = prepare_replay_artifacts(Some(&store), &completion)
+            .await
+            .unwrap();
+        let second = prepare_replay_artifacts(Some(&store), &completion)
+            .await
+            .unwrap();
+
+        assert_eq!(first.replay_object_json, second.replay_object_json);
+        assert_eq!(store.object_count().await, 1);
+        let metadata: ReplayObjectMetadata =
+            serde_json::from_str(first.replay_object_json.as_deref().unwrap()).unwrap();
+        let stored = store.get_recording(&metadata).await.unwrap().unwrap();
+        assert_eq!(
+            stored.bytes,
+            canonical_json_bytes(completion.recording.as_ref().unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_without_configured_store_fails_loudly() {
+        let error = prepare_replay_artifacts(None, &completion_with_recording(124))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::replay_store::REPLAY_S3_BUCKET_ENV)
+        );
+    }
+
+    #[tokio::test]
+    async fn highlights_split_before_the_game_item_budget_and_only_drop_at_response_cap() {
+        let normal = prepare_replay_artifacts(None, &completion_with_highlight(125, 16))
+            .await
+            .unwrap();
+        assert!(normal.play_of_the_game_json.is_some());
+        assert!(normal.split_play_of_the_game_json.is_none());
+
+        let split = prepare_replay_artifacts(
+            None,
+            &completion_with_highlight(126, MAX_DYNAMODB_STATE_AND_HIGHLIGHT_BYTES),
+        )
+        .await
+        .unwrap();
+        assert!(split.play_of_the_game_json.is_none());
+        assert!(split.split_play_of_the_game_json.is_some());
+
+        let oversized = prepare_replay_artifacts(
+            None,
+            &completion_with_highlight(127, MAX_DYNAMODB_HIGHLIGHT_BYTES),
+        )
+        .await
+        .unwrap();
+        assert!(oversized.play_of_the_game_json.is_none());
+        assert!(oversized.split_play_of_the_game_json.is_none());
     }
 
     #[test]
@@ -3616,6 +6410,580 @@ mod tests {
 
         let item_without_ttl = HashMap::new();
         assert!(!DynamoDatabase::item_is_expired(&item_without_ttl, 101));
+    }
+
+    #[test]
+    fn history_sort_keys_order_epoch_millis_then_padded_game_id() {
+        let first = DynamoDatabase::history_sort_key(1_000, 99).unwrap();
+        let same_millisecond_later_game = DynamoDatabase::history_sort_key(1_000, 100).unwrap();
+        let later_millisecond = DynamoDatabase::history_sort_key(1_001, 1).unwrap();
+
+        assert_eq!(first, "HISTORY#00000000000000001000#GAME#0000000099");
+        assert!(first < same_millisecond_later_game);
+        assert!(same_millisecond_later_game < later_millisecond);
+    }
+
+    #[test]
+    fn history_cursor_is_opaque_and_scope_bound() {
+        let item = HashMap::from([
+            ("pk".to_string(), DynamoDatabase::av_s("USER#7")),
+            (
+                "sk".to_string(),
+                DynamoDatabase::av_s("HISTORY#00000000000000001000#GAME#0000000001"),
+            ),
+        ]);
+        let encoded = DynamoDatabase::encode_page_cursor("history:user:7", &item).unwrap();
+        assert!(!encoded.contains("USER#7"));
+        let decoded =
+            DynamoDatabase::decode_page_cursor(&encoded, "history:user:7", "history").unwrap();
+        assert_eq!(decoded.pk, "USER#7");
+        assert!(DynamoDatabase::decode_page_cursor(&encoded, "history:user:8", "history").is_err());
+    }
+
+    #[test]
+    fn history_summary_reader_dispatches_by_schema_version() {
+        let mut item = HashMap::from([(
+            "summaryJson".to_string(),
+            DynamoDatabase::av_s(
+                serde_json::json!({
+                    "schemaVersion": MATCH_HISTORY_SCHEMA_VERSION,
+                    "gameId": 42,
+                    "startedAtMs": 1_000,
+                    "endedAtMs": 2_000,
+                    "durationMs": 1_000,
+                    "mode": "duel",
+                    "modeLabel": "Duel",
+                    "queueMode": "competitive",
+                    "isPrivate": false,
+                    "isStressTest": false,
+                    "completedByInactivity": false,
+                    "players": [],
+                    "winnerUserIds": [],
+                    "snapshotAvailableUntilMs": 3_000
+                })
+                .to_string(),
+            ),
+        )]);
+
+        assert_eq!(
+            DynamoDatabase::history_summary_from_item(&item)
+                .unwrap()
+                .game_id,
+            42
+        );
+
+        item.insert(
+            "summaryJson".to_string(),
+            DynamoDatabase::av_s(r#"{"schemaVersion":2}"#),
+        );
+        assert!(
+            DynamoDatabase::history_summary_from_item(&item)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schemaVersion 2")
+        );
+    }
+
+    #[test]
+    fn runtime_config_reader_rejects_future_schema_versions() {
+        let mut value = serde_json::to_value(RuntimeConfigRecord::default()).unwrap();
+        value["schemaVersion"] = serde_json::json!(RUNTIME_CONFIG_SCHEMA_VERSION + 1);
+        let item = HashMap::from([(
+            "recordJson".to_string(),
+            DynamoDatabase::av_s(value.to_string()),
+        )]);
+
+        assert!(
+            DynamoDatabase::runtime_config_record_from_item(&item)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported schemaVersion")
+        );
+    }
+
+    #[test]
+    fn completed_game_news_provenance_requires_explicit_public_terminal_row() {
+        let mut public = HashMap::new();
+        public.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        public.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        public.insert("newsEligible".to_string(), DynamoDatabase::av_bool(true));
+        assert!(DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &public
+        )));
+
+        let mut private = public.clone();
+        private.insert("isPrivate".to_string(), DynamoDatabase::av_bool(true));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &private
+        )));
+
+        let mut code_gated = public.clone();
+        code_gated.insert("gameCode".to_string(), DynamoDatabase::av_s("SECRET"));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &code_gated
+        )));
+
+        let mut legacy = public.clone();
+        legacy.remove("newsEligible");
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &legacy
+        )));
+
+        let mut unfinished = public.clone();
+        unfinished.insert("status".to_string(), DynamoDatabase::av_s("started"));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(Some(
+            &unfinished
+        )));
+        assert!(!DynamoDatabase::completed_game_item_is_news_eligible(None));
+    }
+
+    #[test]
+    fn source_game_news_provenance_preserves_private_metadata_and_legacy_uncertainty() {
+        assert!(DynamoDatabase::source_game_item_is_news_eligible(
+            None, true
+        ));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            None, false
+        ));
+
+        let mut waiting_public = HashMap::new();
+        waiting_public.insert("status".to_string(), DynamoDatabase::av_s("waiting"));
+        waiting_public.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        assert!(DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&waiting_public),
+            false
+        ));
+
+        let mut waiting_private = waiting_public.clone();
+        waiting_private.insert("isPrivate".to_string(), DynamoDatabase::av_bool(true));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&waiting_private),
+            true
+        ));
+
+        let mut code_gated = waiting_public.clone();
+        code_gated.insert("gameCode".to_string(), DynamoDatabase::av_s("SECRET"));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&code_gated),
+            true
+        ));
+
+        let mut completed_legacy = waiting_public.clone();
+        completed_legacy.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        assert!(!DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&completed_legacy),
+            true
+        ));
+
+        let mut completed_verified = completed_legacy.clone();
+        completed_verified.insert("newsEligible".to_string(), DynamoDatabase::av_bool(true));
+        assert!(DynamoDatabase::source_game_item_is_news_eligible(
+            Some(&completed_verified),
+            false
+        ));
+    }
+
+    #[test]
+    fn legacy_score_backfill_requires_an_exact_public_source_result() {
+        let score_item = high_score_item("42", 2_000, false);
+        let entry = DynamoDatabase::high_score_entry_from_item(&score_item).unwrap();
+        let user_id = u32::try_from(entry.user_id).unwrap();
+        let mut state = common::GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            1,
+        );
+        let player = state
+            .add_player(user_id, Some(entry.username.clone()))
+            .unwrap();
+        state.scores.insert(player.snake_id, 2_000);
+        state.status = common::GameStatus::Complete {
+            winning_snake_id: Some(player.snake_id),
+        };
+
+        let mut source = HashMap::new();
+        source.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+        source.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        source.insert(
+            "gameState".to_string(),
+            DynamoDatabase::av_s(serde_json::to_string(&state).unwrap()),
+        );
+        assert!(
+            DynamoDatabase::legacy_high_score_source_item_is_news_eligible(Some(&source), &entry)
+        );
+
+        source.insert("isPrivate".to_string(), DynamoDatabase::av_bool(true));
+        assert!(
+            !DynamoDatabase::legacy_high_score_source_item_is_news_eligible(Some(&source), &entry)
+        );
+
+        source.insert("isPrivate".to_string(), DynamoDatabase::av_bool(false));
+        let mut wrong_score = entry;
+        wrong_score.score += 1;
+        assert!(
+            !DynamoDatabase::legacy_high_score_source_item_is_news_eligible(
+                Some(&source),
+                &wrong_score
+            )
+        );
+    }
+
+    #[test]
+    fn recent_completed_game_page_limit_is_bounded_without_capping_the_total() {
+        assert_eq!(DynamoDatabase::recent_completed_games_page_limit(0), None);
+        assert_eq!(
+            DynamoDatabase::recent_completed_games_page_limit(1),
+            Some(1)
+        );
+        assert_eq!(
+            DynamoDatabase::recent_completed_games_page_limit(
+                RECENT_COMPLETED_GAMES_PAGE_SIZE + 56
+            ),
+            Some(RECENT_COMPLETED_GAMES_PAGE_SIZE as i32)
+        );
+        assert_eq!(
+            DynamoDatabase::recent_completed_games_page_limit(56),
+            Some(56)
+        );
+    }
+
+    #[test]
+    fn recent_completed_games_exclude_expired_rows_and_preserve_query_order() {
+        fn completed_item(
+            id: i32,
+            ended_at: &str,
+            ttl: Option<i64>,
+        ) -> HashMap<String, AttributeValue> {
+            let mut item = HashMap::new();
+            item.insert("id".to_string(), DynamoDatabase::av_n(id));
+            item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+            item.insert("endedAt".to_string(), DynamoDatabase::av_s(ended_at));
+            if let Some(ttl) = ttl {
+                item.insert("ttl".to_string(), DynamoDatabase::av_n(ttl));
+            }
+            item
+        }
+
+        let items = vec![
+            completed_item(30, "2026-08-14T12:03:00+00:00", None),
+            completed_item(20, "2026-08-14T12:02:00+00:00", Some(99)),
+            completed_item(10, "2026-08-14T12:01:00+00:00", Some(101)),
+        ];
+
+        let games = DynamoDatabase::recent_completed_games_from_items(items, 100).unwrap();
+
+        assert_eq!(
+            games.iter().map(|game| game.id).collect::<Vec<_>>(),
+            vec![30, 10]
+        );
+    }
+
+    #[test]
+    fn recent_completed_games_fill_the_accepted_limit_across_filtered_pages() {
+        fn completed_item(id: i32, ttl: Option<i64>) -> HashMap<String, AttributeValue> {
+            let mut item = HashMap::new();
+            item.insert("id".to_string(), DynamoDatabase::av_n(id));
+            item.insert("status".to_string(), DynamoDatabase::av_s("complete"));
+            if let Some(ttl) = ttl {
+                item.insert("ttl".to_string(), DynamoDatabase::av_n(ttl));
+            }
+            item
+        }
+
+        let mut games = Vec::new();
+        DynamoDatabase::append_recent_completed_games_from_items(
+            &mut games,
+            vec![completed_item(30, None), completed_item(20, Some(99))],
+            100,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            games.iter().map(|game| game.id).collect::<Vec<_>>(),
+            vec![30]
+        );
+
+        DynamoDatabase::append_recent_completed_games_from_items(
+            &mut games,
+            vec![completed_item(10, None), completed_item(9, None)],
+            100,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            games.iter().map(|game| game.id).collect::<Vec<_>>(),
+            vec![30, 10]
+        );
+    }
+
+    fn ranking_item(user_id: i32, mmr: i32) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("userId".to_string(), DynamoDatabase::av_n(user_id));
+        item.insert(
+            "username".to_string(),
+            DynamoDatabase::av_s(format!("player-{user_id}")),
+        );
+        item.insert("mmr".to_string(), DynamoDatabase::av_n(mmr));
+        item.insert("gamesPlayed".to_string(), DynamoDatabase::av_n(20));
+        item.insert("wins".to_string(), DynamoDatabase::av_n(12));
+        item.insert("losses".to_string(), DynamoDatabase::av_n(8));
+        item.insert("region".to_string(), DynamoDatabase::av_s("test"));
+        item.insert("queueMode".to_string(), DynamoDatabase::av_s("ranked"));
+        item.insert("gameType".to_string(), DynamoDatabase::av_s("duel"));
+        item.insert("season".to_string(), DynamoDatabase::av_n(0));
+        item.insert(
+            "updatedAt".to_string(),
+            DynamoDatabase::av_s("2026-08-14T12:00:00Z"),
+        );
+        item
+    }
+
+    #[test]
+    fn leaderboard_rows_require_an_exact_numeric_season() {
+        let mut season_one = ranking_item(1, 1_500);
+        season_one.insert("season".to_string(), DynamoDatabase::av_n(1));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&season_one, 1).is_some());
+
+        let mut season_ten = ranking_item(10, 1_900);
+        season_ten.insert("season".to_string(), DynamoDatabase::av_n(10));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&season_ten, 1).is_none());
+
+        let mut legacy = ranking_item(2, 1_400);
+        legacy.remove("season");
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&legacy, 1).is_none());
+
+        let mut invalid = ranking_item(3, 1_300);
+        invalid.insert("season".to_string(), DynamoDatabase::av_n(-1));
+        assert!(DynamoDatabase::leaderboard_entry_from_item(&invalid, 1).is_none());
+    }
+
+    fn high_score_item(
+        game_id: &str,
+        score: i32,
+        news_eligible: bool,
+    ) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::new();
+        item.insert("gameId".to_string(), DynamoDatabase::av_s(game_id));
+        item.insert("userId".to_string(), DynamoDatabase::av_n(score));
+        item.insert(
+            "username".to_string(),
+            DynamoDatabase::av_s(format!("player-{score}")),
+        );
+        item.insert("score".to_string(), DynamoDatabase::av_n(score));
+        let inverted = (99_999_999_i64 - i64::from(score)).max(0);
+        item.insert(
+            "sk".to_string(),
+            DynamoDatabase::av_s(format!("SCORE#{inverted:08}#GAME#{game_id}")),
+        );
+        item.insert("region".to_string(), DynamoDatabase::av_s("test"));
+        item.insert("gameType".to_string(), DynamoDatabase::av_s("solo"));
+        item.insert("season".to_string(), DynamoDatabase::av_n(0));
+        item.insert(
+            "timestamp".to_string(),
+            DynamoDatabase::av_s("2026-08-14T12:00:00Z"),
+        );
+        item.insert(
+            "newsEligible".to_string(),
+            DynamoDatabase::av_bool(news_eligible),
+        );
+        item
+    }
+
+    #[test]
+    fn user_ranking_search_can_find_a_match_on_a_later_page() {
+        let pages = [
+            vec![ranking_item(1, 1_500), ranking_item(2, 1_400)],
+            vec![ranking_item(42, 1_300)],
+        ];
+
+        let entry = pages.iter().find_map(|page| {
+            DynamoDatabase::user_ranking_from_items(page, 42, "ranked", "duel", "test", 0)
+        });
+
+        assert_eq!(entry.map(|entry| entry.user_id), Some(42));
+    }
+
+    #[test]
+    fn ordered_score_head_requires_a_public_strictly_greater_top() {
+        let private_top =
+            DynamoDatabase::high_score_entry_from_item(&high_score_item("private", 2_000, false));
+        let public_runner_up =
+            DynamoDatabase::high_score_entry_from_item(&high_score_item("public", 1_900, true));
+        assert!(
+            DynamoDatabase::unique_public_high_score_leader(&[
+                private_top,
+                public_runner_up.clone()
+            ])
+            .is_none()
+        );
+
+        let tied = DynamoDatabase::high_score_entry_from_item(&high_score_item("tie", 1_900, true));
+        assert!(
+            DynamoDatabase::unique_public_high_score_leader(&[public_runner_up, tied]).is_none()
+        );
+
+        let top = DynamoDatabase::high_score_entry_from_item(&high_score_item("top", 2_000, true));
+        let runner_up =
+            DynamoDatabase::high_score_entry_from_item(&high_score_item("runner", 1_900, true));
+        assert_eq!(
+            DynamoDatabase::unique_public_high_score_leader(&[top.clone(), runner_up.clone()])
+                .map(|entry| entry.game_id),
+            Some("top".to_string())
+        );
+        assert!(DynamoDatabase::unique_public_high_score_leader(&[runner_up, top]).is_none());
+        assert!(DynamoDatabase::unique_public_high_score_leader(&[None]).is_none());
+    }
+
+    #[test]
+    fn news_score_value_must_match_its_ordering_key() {
+        let mut item = high_score_item("top", 2_000, true);
+        let entry = DynamoDatabase::high_score_entry_from_item(&item).unwrap();
+        assert!(DynamoDatabase::high_score_matches_sort_key(&item, &entry));
+
+        item.insert(
+            "sk".to_string(),
+            DynamoDatabase::av_s("SCORE#99999999#GAME#top"),
+        );
+        assert!(!DynamoDatabase::high_score_matches_sort_key(&item, &entry));
+
+        let mut wrong_game = high_score_item("top", 2_000, true);
+        wrong_game.insert(
+            "sk".to_string(),
+            DynamoDatabase::av_s("SCORE#99997999#GAME#some-other-game"),
+        );
+        assert!(!DynamoDatabase::high_score_matches_sort_key(
+            &wrong_game,
+            &entry
+        ));
+
+        let mut out_of_range = entry;
+        out_of_range.score = 100_000_000;
+        assert!(!DynamoDatabase::high_score_matches_sort_key(
+            &high_score_item("top", 2_000, true),
+            &out_of_range
+        ));
+    }
+
+    #[test]
+    fn runtime_config_reader_safely_upconverts_version_one() {
+        let item = HashMap::from([(
+            "recordJson".to_string(),
+            DynamoDatabase::av_s(
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "version": 17,
+                    "config": {
+                        "announcement": {
+                            "enabled": true,
+                            "message": "Maintenance soon"
+                        },
+                        "ads": {
+                            "postMatchEnabled": true,
+                            "minimumIntervalMinutes": 22
+                        },
+                        "history": {
+                            "snapshotRetentionDays": 45,
+                            "summaryRetentionDays": 400
+                        }
+                    },
+                    "updatedBy": {
+                        "userId": 7,
+                        "username": "operator"
+                    },
+                    "updatedAtMs": 123456
+                })
+                .to_string(),
+            ),
+        )]);
+
+        let record = DynamoDatabase::runtime_config_record_from_item(&item).unwrap();
+
+        assert_eq!(record.schema_version, RUNTIME_CONFIG_SCHEMA_VERSION);
+        assert_eq!(record.version, 17);
+        assert!(record.config.announcement.enabled);
+        assert_eq!(record.config.announcement.message, "Maintenance soon");
+        assert_eq!(record.config.history.snapshot_retention_days, 45);
+        assert_eq!(record.config.history.summary_retention_days, 400);
+        assert_eq!(record.config.ads.minimum_interval_minutes, 22);
+        assert_eq!(record.config.ads.minimum_games_played, 1);
+        assert!(!record.config.ads.enabled);
+        assert!(!record.config.ads.distributions.web.enabled);
+        assert!(!record.config.ads.distributions.crazygames.enabled);
+        assert!(!record.config.ads.distributions.itch.enabled);
+        assert_eq!(record.updated_by.unwrap().username, "operator");
+        assert_eq!(record.updated_at_ms, 123456);
+    }
+
+    #[test]
+    fn pre_match_ad_break_claim_validation_is_strict() {
+        assert_eq!(
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "12345678-1234-1234-1234-123456789012",
+                &[1, 2, 3, 4],
+                100_000,
+                60_000,
+                9,
+            )
+            .unwrap(),
+            40_000
+        );
+
+        for invalid in [
+            DynamoDatabase::validate_pre_match_ad_break_claim("", &[1], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "12345678-1234-1234-1234-1234567890123",
+                &[1],
+                100,
+                10,
+                1,
+            ),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim(
+                "break",
+                &[1, 2, 3, 4, 5],
+                100,
+                10,
+                1,
+            ),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1, 1], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[0], 100, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], -1, 10, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], 100, 0, 1),
+            DynamoDatabase::validate_pre_match_ad_break_claim("break", &[1], 100, 10, 0),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[test]
+    fn only_conditional_transaction_cancellation_is_an_ineligible_claim() {
+        use aws_sdk_dynamodb::types::CancellationReason;
+        use aws_sdk_dynamodb::types::error::TransactionCanceledException;
+
+        let cancelled = |code: &str| {
+            TransactWriteItemsError::TransactionCanceledException(
+                TransactionCanceledException::builder()
+                    .cancellation_reasons(CancellationReason::builder().code(code).build())
+                    .build(),
+            )
+        };
+
+        assert!(DynamoDatabase::transaction_cancellation_is_conditional(
+            &cancelled("ConditionalCheckFailed")
+        ));
+        assert!(!DynamoDatabase::transaction_cancellation_is_conditional(
+            &cancelled("TransactionConflict")
+        ));
+    }
+
+    #[test]
+    fn news_scores_with_missing_timestamps_fail_closed() {
+        let mut score = high_score_item("score", 2_000, true);
+        score.remove("timestamp");
+        assert!(DynamoDatabase::high_score_entry_from_item(&score).is_none());
     }
 
     #[test]

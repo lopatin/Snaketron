@@ -44,6 +44,7 @@ async fn isolated_state() -> Result<(AuthState, Arc<dyn Database>, Arc<JwtManage
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: None,
+        crazygames_verifier: None,
     };
     Ok((state, db, jwt_manager))
 }

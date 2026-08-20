@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use common::{ClientCommandIdentityV2, GameCommandMessage, GameEventMessage};
 use futures_util::{SinkExt, StreamExt};
+use server::ads::{ClientAdsConfig, ClientDistribution};
 use server::lifecycle::WS_PROTOCOL_VERSION;
 use server::ws_server::WSMessage;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -12,8 +13,23 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 pub struct TestClient {
     ws: WebSocketStream<MaybeTlsStream<TokioTcpStream>>,
     pub user_id: Option<i32>,
+    pub ad_configuration: Option<ClientAdsConfig>,
     command_session_id: String,
     next_command_sequence: u64,
+}
+
+/// Frames the server pushes on its own schedule, which can land in the middle
+/// of any request/response exchange.
+///
+/// Every wait loop in the test suite has to skip these. Keeping the list here —
+/// rather than as one-off match arms — is what stops the next unsolicited push
+/// from failing every WebSocket test at once, which is exactly how the social
+/// layer's roster and challenge frames broke them.
+pub fn is_unsolicited_push(message: &WSMessage) -> bool {
+    matches!(
+        message,
+        WSMessage::UserCountUpdate { .. } | WSMessage::OnlinePlayers(_) | WSMessage::Challenges(_)
+    )
 }
 
 impl TestClient {
@@ -22,6 +38,7 @@ impl TestClient {
         Ok(TestClient {
             ws: ws_stream,
             user_id: None,
+            ad_configuration: None,
             command_session_id: uuid::Uuid::new_v4().to_string(),
             next_command_sequence: 1,
         })
@@ -35,11 +52,50 @@ impl TestClient {
     }
 
     pub async fn authenticate_with_token(&mut self, token: &str) -> Result<()> {
+        self.authenticate_with_protocol(token, WS_PROTOCOL_VERSION)
+            .await
+    }
+
+    pub async fn authenticate_for_distribution(
+        &mut self,
+        user_id: i32,
+        distribution: ClientDistribution,
+    ) -> Result<()> {
+        self.authenticate_with_protocol_and_distribution(
+            &user_id.to_string(),
+            WS_PROTOCOL_VERSION,
+            Some(distribution),
+        )
+        .await?;
+        self.user_id = Some(user_id);
+        Ok(())
+    }
+
+    pub async fn authenticate_with_protocol(
+        &mut self,
+        token: &str,
+        protocol_version: u16,
+    ) -> Result<()> {
+        self.authenticate_with_protocol_and_distribution(
+            token,
+            protocol_version,
+            (protocol_version >= 9).then_some(ClientDistribution::Web),
+        )
+        .await
+    }
+
+    pub async fn authenticate_with_protocol_and_distribution(
+        &mut self,
+        token: &str,
+        protocol_version: u16,
+        distribution: Option<ClientDistribution>,
+    ) -> Result<()> {
         // Send the exact token string and wait for the server-side verification
         // boundary. Merely writing a token is not authentication.
         self.send_message(WSMessage::Authenticate {
             token: token.to_string(),
-            protocol_version: WS_PROTOCOL_VERSION,
+            protocol_version,
+            distribution,
             // Analytics-only and optional; integration clients send none.
             anon_id: None,
         })
@@ -48,7 +104,10 @@ impl TestClient {
             loop {
                 match self.receive_message().await? {
                     WSMessage::Authenticated { .. } => return Ok(()),
-                    WSMessage::UserCountUpdate { .. } => {}
+                    WSMessage::AdConfiguration(configuration) => {
+                        self.ad_configuration = Some(configuration);
+                    }
+                    other if is_unsolicited_push(&other) => {}
                     other => {
                         return Err(anyhow::anyhow!(
                             "Expected Authenticated response, got {:?}",
@@ -65,16 +124,15 @@ impl TestClient {
     /// Create and join an explicit matchmaking lobby.
     ///
     /// `CreateLobby` auto-joins its creator on the server. Requiring the
-    /// `LobbyCreated` response keeps this helper from masking a failed join.
-    /// The periodic user-count broadcast is the only unrelated frame allowed
-    /// to overtake the response.
+    /// `LobbyCreated` response keeps this helper from masking a failed join;
+    /// only unsolicited server pushes may overtake it.
     pub async fn create_lobby(&mut self) -> Result<String> {
         self.send_message(WSMessage::CreateLobby).await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match self.receive_message().await? {
                     WSMessage::LobbyCreated { lobby_code } => return Ok(lobby_code),
-                    WSMessage::UserCountUpdate { .. } => {}
+                    other if is_unsolicited_push(&other) => {}
                     WSMessage::AccessDenied { reason } => {
                         return Err(anyhow::anyhow!("CreateLobby was denied: {reason}"));
                     }

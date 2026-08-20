@@ -464,6 +464,11 @@ async fn reacquisition_fences_old_token_events_checkpoints_and_acks() -> Result<
             revision: uuid::Uuid::new_v4(),
             ended_at_ms: now,
             server_id: 1,
+            season: Some(0),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: final_state.clone(),
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };
@@ -741,7 +746,8 @@ async fn game_created_checkpoint_and_index_precede_ack() -> Result<()> {
 
         let token = CancellationToken::new();
         let bus = streams_bus(token.clone()).await?;
-        // These correctness paths require a real executor partition (0..10).
+        // These correctness paths require a real executor partition
+        // (0..PARTITION_COUNT).
         // Give each such test a fixed, distinct partition so parallel tests
         // cannot delete one another's shared partition stream.
         let partition = 7;
@@ -1330,6 +1336,11 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             revision: uuid::Uuid::new_v4(),
             ended_at_ms: now,
             server_id: 42,
+            season: Some(1),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: final_state.clone(),
             effects: vec![
                 CompletionEffect::PersistGame { id: "game".into() },
@@ -1379,6 +1390,10 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
         let user_spectator_key = RedisKeys::matchmaking_user_active_game(202);
         let lobby_a_key = RedisKeys::matchmaking_lobby_active_game("LOBBY-A");
         let lobby_b_key = RedisKeys::matchmaking_lobby_active_game("LOBBY-B");
+        let lobby_a_metadata_key = RedisKeys::lobby_metadata("LOBBY-A");
+        let lobby_b_metadata_key = RedisKeys::lobby_metadata("LOBBY-B");
+        let player_handoff_key = RedisKeys::matchmaking_lobby_user_pending_game("LOBBY-A", 101);
+        let spectator_handoff_key = RedisKeys::matchmaking_lobby_user_pending_game("LOBBY-B", 202);
         let game_value = game_id.to_string();
         let _: () = redis
             .hset(
@@ -1392,8 +1407,13 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             &user_spectator_key,
             &lobby_a_key,
             &lobby_b_key,
+            &player_handoff_key,
+            &spectator_handoff_key,
         ] {
             let _: () = redis.set(key, &game_value).await?;
+        }
+        for key in [&lobby_a_metadata_key, &lobby_b_metadata_key] {
+            let _: () = redis.hset(key, "state", "matched").await?;
         }
         let _: () = redis
             .sadd(namespace.active_games(partition), game_id)
@@ -1471,6 +1491,20 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
         ] {
             assert_eq!(redis.get::<_, Option<String>>(key).await?, None);
         }
+        for key in [&lobby_a_metadata_key, &lobby_b_metadata_key] {
+            assert_eq!(
+                redis.hget::<_, _, Option<String>>(key, "state").await?,
+                Some("waiting".to_owned())
+            );
+            assert!(redis.pttl::<_, i64>(key).await? > 0);
+        }
+        for handoff_key in [&player_handoff_key, &spectator_handoff_key] {
+            assert_eq!(
+                redis.get::<_, Option<String>>(handoff_key).await?,
+                Some(game_value.clone()),
+                "terminal cleanup must not erase an unacknowledged member handoff"
+            );
+        }
         assert_eq!(
             redis
                 .hget::<_, _, Option<String>>(&active_matches_key, game_id.to_string())
@@ -1538,6 +1572,9 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
         ] {
             let _: () = redis.set(key, newer_game_id).await?;
         }
+        for key in [&lobby_a_metadata_key, &lobby_b_metadata_key] {
+            let _: () = redis.hset(key, "state", "matched").await?;
+        }
         assert!(
             !bus.commit_completion_record_fenced(
                 &guard,
@@ -1556,6 +1593,13 @@ async fn fenced_completion_cleans_matchmaking_and_notifies_exactly_once() -> Res
             &lobby_b_key,
         ] {
             assert_eq!(redis.get::<_, u32>(key).await?, newer_game_id);
+        }
+        for key in [&lobby_a_metadata_key, &lobby_b_metadata_key] {
+            assert_eq!(
+                redis.hget::<_, _, Option<String>>(key, "state").await?,
+                Some("matched".to_owned()),
+                "old completion cleanup must not reset a newer lobby mapping"
+            );
         }
         assert_eq!(
             redis

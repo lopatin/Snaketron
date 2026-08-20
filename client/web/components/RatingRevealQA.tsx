@@ -1,0 +1,278 @@
+import React, { useState } from 'react';
+import type { MatchPresentation } from '../utils/gamePresentation';
+import {
+  buildRatingReveal,
+  type MatchRatingState,
+  type RatingSnapshot,
+} from '../utils/ratingReveal';
+import GameOverCard from './GameOverCard';
+
+/**
+ * Dev-only design-review harness for the post-match rating reveal
+ * (`/qa/rating-reveal`, excluded from production routing). Renders the real
+ * GameOverCard with fixture data and replays each reveal scenario on demand,
+ * because the real card only exists for the seconds after a live match ends.
+ */
+
+const snapshot = (
+  mmr: number,
+  wins: number,
+  losses: number,
+): RatingSnapshot => ({ mmr, wins, losses });
+
+const SCENARIOS: Array<{ id: string; label: string; state: MatchRatingState | null }> = [
+  {
+    id: 'promotion',
+    label: 'Win · tier promotion',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1190, 9, 4),
+        snapshot(1215, 10, 4),
+      ),
+    },
+  },
+  {
+    id: 'gain',
+    label: 'Win · no movement',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1228, 12, 7),
+        snapshot(1246, 13, 7),
+      ),
+    },
+  },
+  {
+    id: 'loss',
+    label: 'Loss · no movement',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1246, 13, 8),
+        snapshot(1229, 13, 9),
+      ),
+    },
+  },
+  {
+    id: 'demotion',
+    label: 'Loss · demotion',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1206, 13, 10),
+        snapshot(1187, 13, 11),
+      ),
+    },
+  },
+  {
+    id: 'big-swing',
+    label: 'Win · big climb',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'ffa',
+        snapshot(1862, 40, 22),
+        snapshot(1911, 41, 22),
+      ),
+    },
+  },
+  {
+    // The elite tiers were re-sliced from four divisions to three, so their
+    // internal boundaries are the ones that moved; this crosses one.
+    id: 'elite-division-up',
+    label: 'Win · Platinum I → II',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1620, 18, 11),
+        snapshot(1650, 19, 11),
+      ),
+    },
+  },
+  {
+    id: 'draw',
+    label: 'Draw · ±0',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal(
+        'Competitive',
+        'duel',
+        snapshot(1246, 13, 8),
+        snapshot(1246, 13, 8),
+      ),
+    },
+  },
+  {
+    id: 'placement',
+    label: 'First rated match',
+    state: {
+      phase: 'ready',
+      reveal: buildRatingReveal('Competitive', 'duel', null, snapshot(1020, 1, 0)),
+    },
+  },
+  {
+    id: 'quickmatch',
+    label: 'Quickmatch · no rating',
+    state: null,
+  },
+  { id: 'pending', label: 'Pending · tallying', state: { phase: 'pending' } },
+  // Quickmatch, solo, and custom matches render the card without a rating band.
+  { id: 'none', label: 'No rating (solo/custom)', state: null },
+];
+
+const fixturePresentation: MatchPresentation = {
+  modeLabel: 'Competitive Duel',
+  isTeamGame: true,
+  isSoloGame: false,
+  isComplete: true,
+  timeLabel: 'First to 25',
+  timeValue: '03:41',
+  scoreLimit: 25,
+  elapsedMs: 221_000,
+  timeTaken: '03:41',
+  pointsPerMinute: 6.8,
+  actionsPerMinute: 31.2,
+  spectatorCount: 0,
+  players: [0, 1].map((snakeId) => ({
+    snakeId,
+    userId: snakeId + 1,
+    name: snakeId === 0 ? 'You' : 'Rival',
+    isCurrentPlayer: snakeId === 0,
+    isAlive: snakeId === 0,
+    isIdleKicked: false,
+    teamId: snakeId,
+    skin: {
+      snake_index: snakeId,
+      team_id: snakeId,
+      team_member_slot: 0,
+      snake_count: 2,
+      is_team_game: true,
+      local_snake_id: 0,
+      local_team_id: 0,
+    },
+    score: snakeId === 0 ? 25 : 19,
+    finalLength: snakeId === 0 ? 27 : 21,
+    foodHeld: 0,
+    xpGained: snakeId === 0 ? 140 : 95,
+    actionCount: 115,
+    isWinner: snakeId === 0,
+    deathAttribution: snakeId === 1 ? 'Demolished by You' : null,
+    isReady: null,
+  })),
+  currentPlayer: null,
+  sides: [],
+  soloScore: 25,
+  resultTitle: 'Victory',
+  resultSummary: 'Your side got there first.',
+  resultTone: 'victory',
+  resultArtwork: 'azure-cut',
+  isAwaitingReadiness: false,
+  readyDeadlineMs: null,
+  pendingReadyCount: 0,
+};
+
+const presentation: MatchPresentation = {
+  ...fixturePresentation,
+  currentPlayer: fixturePresentation.players[0],
+  sides: fixturePresentation.players.map((player, index) => ({
+    teamId: index,
+    label: index === 0 ? 'Your team' : 'Opponents',
+    color: index === 0 ? '#3C8DDE' : '#EF5A5A',
+    score: player.score,
+    players: [player],
+    isCurrentSide: index === 0,
+    isWinner: index === 0,
+  })),
+};
+
+const RatingRevealQA: React.FC = () => {
+  const [scenarioId, setScenarioId] = useState('promotion');
+  const [replayKey, setReplayKey] = useState(0);
+  const [rematchOptIn, setRematchOptIn] = useState(false);
+  const scenario = SCENARIOS.find(({ id }) => id === scenarioId) ?? SCENARIOS[0];
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: '#F7F9FB' }}>
+      <div
+        style={{
+          position: 'fixed',
+          top: 10,
+          left: 10,
+          zIndex: 200,
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: 6,
+          maxWidth: 380,
+        }}
+      >
+        {SCENARIOS.map(({ id, label }) => (
+          <button
+            key={id}
+            type="button"
+            data-testid={`qa-scenario-${id}`}
+            onClick={() => {
+              setScenarioId(id);
+              setReplayKey((key) => key + 1);
+            }}
+            style={{
+              padding: '5px 9px',
+              border: '1px solid #172033',
+              background: id === scenario.id ? '#172033' : '#fff',
+              color: id === scenario.id ? '#fff' : '#172033',
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <GameOverCard
+        key={`${scenario.id}:${replayKey}`}
+        open
+        // A fixture id so the card's share control renders here too; the
+        // harness exists to review the card's real states, and share is one.
+        shareGameId={4242}
+        // Fixture rematch state. The ids match the presentation's players
+        // (`userId: snakeId + 1` above) so the row pills actually render here —
+        // that is the whole thing this harness is for.
+        currentUserId={1}
+        onRematchToggle={setRematchOptIn}
+        rematch={{
+          game_id: 4242,
+          participants: [
+            { user_id: 1, username: 'You', present: true, opted_in: rematchOptIn },
+            { user_id: 2, username: 'Rival', present: true, opted_in: true },
+          ],
+          lobby_code: null,
+          host_user_id: null,
+          // A formable count, so the harness shows the healthy state rather
+          // than the "can't form a match" copy.
+          game_type: { TeamMatch: { per_team: 1 } },
+          queue_mode: 'Quickmatch',
+          expires_at_ms: 0,
+        }}
+        presentation={presentation}
+        rating={scenario.state ?? undefined}
+        onDismiss={() => setReplayKey((key) => key + 1)}
+        onMenu={() => undefined}
+        onPlayAgain={() => setReplayKey((key) => key + 1)}
+      />
+    </div>
+  );
+};
+
+export default RatingRevealQA;

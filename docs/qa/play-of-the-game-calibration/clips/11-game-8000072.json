@@ -1,0 +1,5713 @@
+{
+  "clip_format_version": 1,
+  "gameplay_version": 12,
+  "game_id": 8000072,
+  "star_user_id": 10001,
+  "star_snake_id": 1,
+  "star_name": "Corpus Bot 2",
+  "reason": {
+    "ComboFrenzy": {
+      "max_chain": 5
+    }
+  },
+  "score": 193,
+  "breakdown": {
+    "total": 193,
+    "focus_tick": 1321,
+    "kills": 0,
+    "boosted_cutoff_kills": 0,
+    "trap_kills": 0,
+    "banked_points": 14,
+    "max_chain": 5,
+    "pickups": 5,
+    "demolition_points": 0,
+    "banking_points": 84,
+    "combo_points": 109
+  },
+  "window": {
+    "start_tick": 1201,
+    "end_tick": 1381,
+    "focus_tick": 1321
+  },
+  "anchor": {
+    "tick": 1200,
+    "status": {
+      "Started": {
+        "server_id": 1
+      }
+    },
+    "arena": {
+      "width": 60,
+      "height": 40,
+      "snakes": [
+        {
+          "body": [
+            {
+              "x": 14,
+              "y": 35
+            },
+            {
+              "x": 14,
+              "y": 32
+            }
+          ],
+          "direction": "Down",
+          "is_alive": true,
+          "food": 0,
+          "team_id": 0,
+          "speed_milli": 1500,
+          "movement_credit": 50000,
+          "boost": {
+            "charge_ms": 2900,
+            "active": true,
+            "intent": true
+          },
+          "combo": {
+            "chain_count": 0,
+            "remaining_ms": 0
+          }
+        },
+        {
+          "body": [
+            {
+              "x": 35,
+              "y": 16
+            },
+            {
+              "x": 28,
+              "y": 16
+            }
+          ],
+          "direction": "Right",
+          "is_alive": true,
+          "food": 0,
+          "team_id": 1,
+          "speed_milli": 1000,
+          "movement_credit": 0,
+          "boost": {
+            "charge_ms": 0,
+            "active": false,
+            "intent": true
+          },
+          "combo": {
+            "chain_count": 3,
+            "remaining_ms": 800
+          }
+        }
+      ],
+      "food": [
+        {
+          "x": 29,
+          "y": 37
+        },
+        {
+          "x": 34,
+          "y": 37
+        },
+        {
+          "x": 14,
+          "y": 36
+        },
+        {
+          "x": 24,
+          "y": 9
+        },
+        {
+          "x": 30,
+          "y": 3
+        },
+        {
+          "x": 29,
+          "y": 4
+        },
+        {
+          "x": 30,
+          "y": 1
+        },
+        {
+          "x": 44,
+          "y": 3
+        },
+        {
+          "x": 35,
+          "y": 11
+        },
+        {
+          "x": 18,
+          "y": 8
+        }
+      ],
+      "boost_pads": [
+        {
+          "id": 0,
+          "position": {
+            "x": 14,
+            "y": 4
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 1,
+          "position": {
+            "x": 14,
+            "y": 34
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": 1358
+        },
+        {
+          "id": 2,
+          "position": {
+            "x": 44,
+            "y": 4
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 3,
+          "position": {
+            "x": 44,
+            "y": 34
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 4,
+          "position": {
+            "x": 26,
+            "y": 12
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 5,
+          "position": {
+            "x": 33,
+            "y": 12
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 6,
+          "position": {
+            "x": 37,
+            "y": 16
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 7,
+          "position": {
+            "x": 37,
+            "y": 23
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 8,
+          "position": {
+            "x": 33,
+            "y": 27
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 9,
+          "position": {
+            "x": 26,
+            "y": 27
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 10,
+          "position": {
+            "x": 22,
+            "y": 23
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 11,
+          "position": {
+            "x": 22,
+            "y": 16
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        }
+      ],
+      "team_zone_config": {
+        "end_zone_depth": 10,
+        "goal_width": 9
+      }
+    },
+    "last_death_causes": {
+      "0": "Banked",
+      "1": "Banked"
+    },
+    "game_type": {
+      "TeamMatch": {
+        "per_team": 1
+      }
+    },
+    "queue_mode": "Competitive",
+    "is_stress_test": false,
+    "properties": {
+      "available_food_target": 10,
+      "tick_duration_ms": 50,
+      "time_limit_ms": null,
+      "score_limit": 50,
+      "boost": {
+        "speed_milli": 1500,
+        "capacity_ms": 3000,
+        "packet_charge_ms": 750,
+        "pad_respawn_ms": 8000,
+        "spot_layout_version": 3,
+        "rules_version": 2,
+        "unlimited": false
+      },
+      "combo": {
+        "window_ms": 2000,
+        "max_food_value": 3,
+        "rules_version": 1
+      },
+      "player_idle_timeout_ms": 60000,
+      "player_idle_warning_ms": 10000
+    },
+    "command_queue": {
+      "queue": [],
+      "active_ids": [],
+      "tombstone_ids": []
+    },
+    "players": {
+      "10000": {
+        "user_id": 10000,
+        "snake_id": 0
+      },
+      "10001": {
+        "user_id": 10001,
+        "snake_id": 1
+      }
+    },
+    "rng": null,
+    "game_code": null,
+    "host_user_id": null,
+    "start_ms": 0,
+    "event_sequence": 408,
+    "usernames": {
+      "10000": "Corpus Bot 1",
+      "10001": "Corpus Bot 2"
+    },
+    "skins": {},
+    "spectators": [],
+    "scores": {
+      "1": 46,
+      "0": 36
+    },
+    "food_pickups": {
+      "0": 28,
+      "1": 33
+    },
+    "team_scores": {
+      "0": 36,
+      "1": 42
+    },
+    "player_xp": {},
+    "player_action_counts": {
+      "10001": 79,
+      "10000": 82
+    },
+    "player_last_activity_ticks": {
+      "10001": 1198,
+      "10000": 1198
+    },
+    "idle_kicked_user_ids": [],
+    "completed_by_inactivity": false,
+    "readiness": null,
+    "simulation_epoch_ms": null
+  },
+  "messages": [
+    {
+      "tick": 1200,
+      "sequence": 1608,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 601
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1200,
+              "user_id": 10000,
+              "sequence_number": 601
+            },
+            "command_id_server": {
+              "tick": 1200,
+              "user_id": 10000,
+              "sequence_number": 1200
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1200,
+      "sequence": 1609,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 601
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1200,
+              "user_id": 10001,
+              "sequence_number": 601
+            },
+            "command_id_server": {
+              "tick": 1200,
+              "user_id": 10001,
+              "sequence_number": 1201
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1201,
+      "sequence": 1610,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 0,
+          "position": {
+            "x": 14,
+            "y": 36
+          },
+          "points": 1,
+          "combo_chain": 1,
+          "combo_remaining_ms_before": 0,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1201,
+      "sequence": 1611,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 0,
+          "score": 37
+        }
+      }
+    },
+    {
+      "tick": 1202,
+      "sequence": 1612,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 30,
+            "y": 4
+          }
+        }
+      }
+    },
+    {
+      "tick": 1202,
+      "sequence": 1613,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 602
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1202,
+              "user_id": 10000,
+              "sequence_number": 602
+            },
+            "command_id_server": {
+              "tick": 1202,
+              "user_id": 10000,
+              "sequence_number": 1202
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1202,
+      "sequence": 1614,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 602
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1202,
+              "user_id": 10001,
+              "sequence_number": 602
+            },
+            "command_id_server": {
+              "tick": 1202,
+              "user_id": 10001,
+              "sequence_number": 1203
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1204,
+      "sequence": 1615,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 1204,
+      "sequence": 1616,
+      "event": {
+        "BoostPacketCollected": {
+          "pad_id": 6,
+          "snake_id": 1,
+          "charge_ms_after": 750,
+          "respawn_at_tick": 1364
+        }
+      }
+    },
+    {
+      "tick": 1204,
+      "sequence": 1617,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 603
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1204,
+              "user_id": 10000,
+              "sequence_number": 603
+            },
+            "command_id_server": {
+              "tick": 1204,
+              "user_id": 10000,
+              "sequence_number": 1204
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1204,
+      "sequence": 1618,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 603
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1204,
+              "user_id": 10001,
+              "sequence_number": 603
+            },
+            "command_id_server": {
+              "tick": 1204,
+              "user_id": 10001,
+              "sequence_number": 1205
+            },
+            "command": {
+              "ActivateBoost": {
+                "snake_id": 1
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1206,
+      "sequence": 1619,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 604
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1206,
+              "user_id": 10000,
+              "sequence_number": 604
+            },
+            "command_id_server": {
+              "tick": 1206,
+              "user_id": 10000,
+              "sequence_number": 1206
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1206,
+      "sequence": 1620,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 604
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1206,
+              "user_id": 10001,
+              "sequence_number": 604
+            },
+            "command_id_server": {
+              "tick": 1206,
+              "user_id": 10001,
+              "sequence_number": 1207
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1208,
+      "sequence": 1621,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 605
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1208,
+              "user_id": 10000,
+              "sequence_number": 605
+            },
+            "command_id_server": {
+              "tick": 1208,
+              "user_id": 10000,
+              "sequence_number": 1208
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1208,
+      "sequence": 1622,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 605
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1208,
+              "user_id": 10001,
+              "sequence_number": 605
+            },
+            "command_id_server": {
+              "tick": 1208,
+              "user_id": 10001,
+              "sequence_number": 1209
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1210,
+      "sequence": 1623,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 606
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1210,
+              "user_id": 10000,
+              "sequence_number": 606
+            },
+            "command_id_server": {
+              "tick": 1210,
+              "user_id": 10000,
+              "sequence_number": 1210
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1210,
+      "sequence": 1624,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 606
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1210,
+              "user_id": 10001,
+              "sequence_number": 606
+            },
+            "command_id_server": {
+              "tick": 1210,
+              "user_id": 10001,
+              "sequence_number": 1211
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1212,
+      "sequence": 1625,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 607
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1212,
+              "user_id": 10000,
+              "sequence_number": 607
+            },
+            "command_id_server": {
+              "tick": 1212,
+              "user_id": 10000,
+              "sequence_number": 1212
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1212,
+      "sequence": 1626,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 607
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1212,
+              "user_id": 10001,
+              "sequence_number": 607
+            },
+            "command_id_server": {
+              "tick": 1212,
+              "user_id": 10001,
+              "sequence_number": 1213
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1214,
+      "sequence": 1627,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 608
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1214,
+              "user_id": 10000,
+              "sequence_number": 608
+            },
+            "command_id_server": {
+              "tick": 1214,
+              "user_id": 10000,
+              "sequence_number": 1214
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1214,
+      "sequence": 1628,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 608
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1214,
+              "user_id": 10001,
+              "sequence_number": 608
+            },
+            "command_id_server": {
+              "tick": 1214,
+              "user_id": 10001,
+              "sequence_number": 1215
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1216,
+      "sequence": 1629,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 609
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1216,
+              "user_id": 10000,
+              "sequence_number": 609
+            },
+            "command_id_server": {
+              "tick": 1216,
+              "user_id": 10000,
+              "sequence_number": 1216
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1216,
+      "sequence": 1630,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 609
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1216,
+              "user_id": 10001,
+              "sequence_number": 609
+            },
+            "command_id_server": {
+              "tick": 1216,
+              "user_id": 10001,
+              "sequence_number": 1217
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1218,
+      "sequence": 1631,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 610
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1218,
+              "user_id": 10000,
+              "sequence_number": 610
+            },
+            "command_id_server": {
+              "tick": 1218,
+              "user_id": 10000,
+              "sequence_number": 1218
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1218,
+      "sequence": 1632,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 610
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1218,
+              "user_id": 10001,
+              "sequence_number": 610
+            },
+            "command_id_server": {
+              "tick": 1218,
+              "user_id": 10001,
+              "sequence_number": 1219
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1220,
+      "sequence": 1633,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 611
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1220,
+              "user_id": 10000,
+              "sequence_number": 611
+            },
+            "command_id_server": {
+              "tick": 1220,
+              "user_id": 10000,
+              "sequence_number": 1220
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1220,
+      "sequence": 1634,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 611
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1220,
+              "user_id": 10001,
+              "sequence_number": 611
+            },
+            "command_id_server": {
+              "tick": 1220,
+              "user_id": 10001,
+              "sequence_number": 1221
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1222,
+      "sequence": 1635,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 0,
+          "position": {
+            "x": 29,
+            "y": 37
+          },
+          "points": 1,
+          "combo_chain": 2,
+          "combo_remaining_ms_before": 950,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1222,
+      "sequence": 1636,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 0,
+          "score": 38
+        }
+      }
+    },
+    {
+      "tick": 1222,
+      "sequence": 1637,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 19,
+            "y": 23
+          }
+        }
+      }
+    },
+    {
+      "tick": 1222,
+      "sequence": 1638,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 612
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1222,
+              "user_id": 10000,
+              "sequence_number": 612
+            },
+            "command_id_server": {
+              "tick": 1222,
+              "user_id": 10000,
+              "sequence_number": 1222
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1222,
+      "sequence": 1639,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 612
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1222,
+              "user_id": 10001,
+              "sequence_number": 612
+            },
+            "command_id_server": {
+              "tick": 1222,
+              "user_id": 10001,
+              "sequence_number": 1223
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1223,
+      "sequence": 1640,
+      "event": {
+        "TeamScoreUpdated": {
+          "team_id": 1,
+          "score": 46
+        }
+      }
+    },
+    {
+      "tick": 1223,
+      "sequence": 1641,
+      "event": {
+        "SnakeDied": {
+          "snake_id": 1,
+          "cause": "Banked"
+        }
+      }
+    },
+    {
+      "tick": 1223,
+      "sequence": 1642,
+      "event": {
+        "SnakeRespawned": {
+          "snake_id": 1,
+          "position": {
+            "x": 51,
+            "y": 20
+          },
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 1224,
+      "sequence": 1643,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 613
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1224,
+              "user_id": 10000,
+              "sequence_number": 613
+            },
+            "command_id_server": {
+              "tick": 1224,
+              "user_id": 10000,
+              "sequence_number": 1224
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1224,
+      "sequence": 1644,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 613
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1224,
+              "user_id": 10001,
+              "sequence_number": 613
+            },
+            "command_id_server": {
+              "tick": 1224,
+              "user_id": 10001,
+              "sequence_number": 1225
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1226,
+      "sequence": 1645,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 614
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1226,
+              "user_id": 10000,
+              "sequence_number": 614
+            },
+            "command_id_server": {
+              "tick": 1226,
+              "user_id": 10000,
+              "sequence_number": 1226
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1226,
+      "sequence": 1646,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 614
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1226,
+              "user_id": 10001,
+              "sequence_number": 614
+            },
+            "command_id_server": {
+              "tick": 1226,
+              "user_id": 10001,
+              "sequence_number": 1227
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1228,
+      "sequence": 1647,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 615
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1228,
+              "user_id": 10000,
+              "sequence_number": 615
+            },
+            "command_id_server": {
+              "tick": 1228,
+              "user_id": 10000,
+              "sequence_number": 1228
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1228,
+      "sequence": 1648,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 615
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1228,
+              "user_id": 10001,
+              "sequence_number": 615
+            },
+            "command_id_server": {
+              "tick": 1228,
+              "user_id": 10001,
+              "sequence_number": 1229
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1229,
+      "sequence": 1649,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 0,
+          "position": {
+            "x": 34,
+            "y": 37
+          },
+          "points": 2,
+          "combo_chain": 3,
+          "combo_remaining_ms_before": 1650,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1229,
+      "sequence": 1650,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 0,
+          "score": 40
+        }
+      }
+    },
+    {
+      "tick": 1230,
+      "sequence": 1651,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 12,
+            "y": 21
+          }
+        }
+      }
+    },
+    {
+      "tick": 1230,
+      "sequence": 1652,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 616
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1230,
+              "user_id": 10000,
+              "sequence_number": 616
+            },
+            "command_id_server": {
+              "tick": 1230,
+              "user_id": 10000,
+              "sequence_number": 1230
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1230,
+      "sequence": 1653,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 616
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1230,
+              "user_id": 10001,
+              "sequence_number": 616
+            },
+            "command_id_server": {
+              "tick": 1230,
+              "user_id": 10001,
+              "sequence_number": 1231
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1232,
+      "sequence": 1654,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Up"
+        }
+      }
+    },
+    {
+      "tick": 1232,
+      "sequence": 1655,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 617
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1232,
+              "user_id": 10000,
+              "sequence_number": 617
+            },
+            "command_id_server": {
+              "tick": 1232,
+              "user_id": 10000,
+              "sequence_number": 1232
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1232,
+      "sequence": 1656,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 617
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1232,
+              "user_id": 10001,
+              "sequence_number": 617
+            },
+            "command_id_server": {
+              "tick": 1232,
+              "user_id": 10001,
+              "sequence_number": 1233
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1234,
+      "sequence": 1657,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 618
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1234,
+              "user_id": 10000,
+              "sequence_number": 618
+            },
+            "command_id_server": {
+              "tick": 1234,
+              "user_id": 10000,
+              "sequence_number": 1234
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1234,
+      "sequence": 1658,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 618
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1234,
+              "user_id": 10001,
+              "sequence_number": 618
+            },
+            "command_id_server": {
+              "tick": 1234,
+              "user_id": 10001,
+              "sequence_number": 1235
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1236,
+      "sequence": 1659,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 619
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1236,
+              "user_id": 10000,
+              "sequence_number": 619
+            },
+            "command_id_server": {
+              "tick": 1236,
+              "user_id": 10000,
+              "sequence_number": 1236
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1236,
+      "sequence": 1660,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 619
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1236,
+              "user_id": 10001,
+              "sequence_number": 619
+            },
+            "command_id_server": {
+              "tick": 1236,
+              "user_id": 10001,
+              "sequence_number": 1237
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1238,
+      "sequence": 1661,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 620
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1238,
+              "user_id": 10000,
+              "sequence_number": 620
+            },
+            "command_id_server": {
+              "tick": 1238,
+              "user_id": 10000,
+              "sequence_number": 1238
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1238,
+      "sequence": 1662,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 620
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1238,
+              "user_id": 10001,
+              "sequence_number": 620
+            },
+            "command_id_server": {
+              "tick": 1238,
+              "user_id": 10001,
+              "sequence_number": 1239
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1239,
+      "sequence": 1663,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 1,
+          "direction": "Up"
+        }
+      }
+    },
+    {
+      "tick": 1240,
+      "sequence": 1664,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 621
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1240,
+              "user_id": 10000,
+              "sequence_number": 621
+            },
+            "command_id_server": {
+              "tick": 1240,
+              "user_id": 10000,
+              "sequence_number": 1240
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1240,
+      "sequence": 1665,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 621
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1240,
+              "user_id": 10001,
+              "sequence_number": 621
+            },
+            "command_id_server": {
+              "tick": 1240,
+              "user_id": 10001,
+              "sequence_number": 1241
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1242,
+      "sequence": 1666,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 622
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1242,
+              "user_id": 10000,
+              "sequence_number": 622
+            },
+            "command_id_server": {
+              "tick": 1242,
+              "user_id": 10000,
+              "sequence_number": 1242
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1242,
+      "sequence": 1667,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 622
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1242,
+              "user_id": 10001,
+              "sequence_number": 622
+            },
+            "command_id_server": {
+              "tick": 1242,
+              "user_id": 10001,
+              "sequence_number": 1243
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1244,
+      "sequence": 1668,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 623
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1244,
+              "user_id": 10000,
+              "sequence_number": 623
+            },
+            "command_id_server": {
+              "tick": 1244,
+              "user_id": 10000,
+              "sequence_number": 1244
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1244,
+      "sequence": 1669,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 623
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1244,
+              "user_id": 10001,
+              "sequence_number": 623
+            },
+            "command_id_server": {
+              "tick": 1244,
+              "user_id": 10001,
+              "sequence_number": 1245
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1246,
+      "sequence": 1670,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 624
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1246,
+              "user_id": 10000,
+              "sequence_number": 624
+            },
+            "command_id_server": {
+              "tick": 1246,
+              "user_id": 10000,
+              "sequence_number": 1246
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1246,
+      "sequence": 1671,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 624
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1246,
+              "user_id": 10001,
+              "sequence_number": 624
+            },
+            "command_id_server": {
+              "tick": 1246,
+              "user_id": 10001,
+              "sequence_number": 1247
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1248,
+      "sequence": 1672,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 625
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1248,
+              "user_id": 10000,
+              "sequence_number": 625
+            },
+            "command_id_server": {
+              "tick": 1248,
+              "user_id": 10000,
+              "sequence_number": 1248
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1248,
+      "sequence": 1673,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 625
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1248,
+              "user_id": 10001,
+              "sequence_number": 625
+            },
+            "command_id_server": {
+              "tick": 1248,
+              "user_id": 10001,
+              "sequence_number": 1249
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1249,
+      "sequence": 1674,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 1250,
+      "sequence": 1675,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 626
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1250,
+              "user_id": 10000,
+              "sequence_number": 626
+            },
+            "command_id_server": {
+              "tick": 1250,
+              "user_id": 10000,
+              "sequence_number": 1250
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1250,
+      "sequence": 1676,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 626
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1250,
+              "user_id": 10001,
+              "sequence_number": 626
+            },
+            "command_id_server": {
+              "tick": 1250,
+              "user_id": 10001,
+              "sequence_number": 1251
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1252,
+      "sequence": 1677,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 627
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1252,
+              "user_id": 10000,
+              "sequence_number": 627
+            },
+            "command_id_server": {
+              "tick": 1252,
+              "user_id": 10000,
+              "sequence_number": 1252
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1252,
+      "sequence": 1678,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 627
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1252,
+              "user_id": 10001,
+              "sequence_number": 627
+            },
+            "command_id_server": {
+              "tick": 1252,
+              "user_id": 10001,
+              "sequence_number": 1253
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1254,
+      "sequence": 1679,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 628
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1254,
+              "user_id": 10000,
+              "sequence_number": 628
+            },
+            "command_id_server": {
+              "tick": 1254,
+              "user_id": 10000,
+              "sequence_number": 1254
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1254,
+      "sequence": 1680,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 628
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1254,
+              "user_id": 10001,
+              "sequence_number": 628
+            },
+            "command_id_server": {
+              "tick": 1254,
+              "user_id": 10001,
+              "sequence_number": 1255
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1256,
+      "sequence": 1681,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 629
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1256,
+              "user_id": 10000,
+              "sequence_number": 629
+            },
+            "command_id_server": {
+              "tick": 1256,
+              "user_id": 10000,
+              "sequence_number": 1256
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1256,
+      "sequence": 1682,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 629
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1256,
+              "user_id": 10001,
+              "sequence_number": 629
+            },
+            "command_id_server": {
+              "tick": 1256,
+              "user_id": 10001,
+              "sequence_number": 1257
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1258,
+      "sequence": 1683,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 630
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1258,
+              "user_id": 10000,
+              "sequence_number": 630
+            },
+            "command_id_server": {
+              "tick": 1258,
+              "user_id": 10000,
+              "sequence_number": 1258
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1258,
+      "sequence": 1684,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 630
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1258,
+              "user_id": 10001,
+              "sequence_number": 630
+            },
+            "command_id_server": {
+              "tick": 1258,
+              "user_id": 10001,
+              "sequence_number": 1259
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1260,
+      "sequence": 1685,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 631
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1260,
+              "user_id": 10000,
+              "sequence_number": 631
+            },
+            "command_id_server": {
+              "tick": 1260,
+              "user_id": 10000,
+              "sequence_number": 1260
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1260,
+      "sequence": 1686,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 631
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1260,
+              "user_id": 10001,
+              "sequence_number": 631
+            },
+            "command_id_server": {
+              "tick": 1260,
+              "user_id": 10001,
+              "sequence_number": 1261
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1262,
+      "sequence": 1687,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 632
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1262,
+              "user_id": 10000,
+              "sequence_number": 632
+            },
+            "command_id_server": {
+              "tick": 1262,
+              "user_id": 10000,
+              "sequence_number": 1262
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1262,
+      "sequence": 1688,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 632
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1262,
+              "user_id": 10001,
+              "sequence_number": 632
+            },
+            "command_id_server": {
+              "tick": 1262,
+              "user_id": 10001,
+              "sequence_number": 1263
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1264,
+      "sequence": 1689,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 633
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1264,
+              "user_id": 10000,
+              "sequence_number": 633
+            },
+            "command_id_server": {
+              "tick": 1264,
+              "user_id": 10000,
+              "sequence_number": 1264
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1264,
+      "sequence": 1690,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 633
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1264,
+              "user_id": 10001,
+              "sequence_number": 633
+            },
+            "command_id_server": {
+              "tick": 1264,
+              "user_id": 10001,
+              "sequence_number": 1265
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1266,
+      "sequence": 1691,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 634
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1266,
+              "user_id": 10000,
+              "sequence_number": 634
+            },
+            "command_id_server": {
+              "tick": 1266,
+              "user_id": 10000,
+              "sequence_number": 1266
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1266,
+      "sequence": 1692,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 634
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1266,
+              "user_id": 10001,
+              "sequence_number": 634
+            },
+            "command_id_server": {
+              "tick": 1266,
+              "user_id": 10001,
+              "sequence_number": 1267
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1267,
+      "sequence": 1693,
+      "event": {
+        "BoostPacketCollected": {
+          "pad_id": 2,
+          "snake_id": 1,
+          "charge_ms_after": 3000,
+          "respawn_at_tick": 1427
+        }
+      }
+    },
+    {
+      "tick": 1268,
+      "sequence": 1694,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 635
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1268,
+              "user_id": 10000,
+              "sequence_number": 635
+            },
+            "command_id_server": {
+              "tick": 1268,
+              "user_id": 10000,
+              "sequence_number": 1268
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1268,
+      "sequence": 1695,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 635
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1268,
+              "user_id": 10001,
+              "sequence_number": 635
+            },
+            "command_id_server": {
+              "tick": 1268,
+              "user_id": 10001,
+              "sequence_number": 1269
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1270,
+      "sequence": 1696,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 1,
+          "position": {
+            "x": 44,
+            "y": 3
+          },
+          "points": 1,
+          "combo_chain": 1,
+          "combo_remaining_ms_before": 0,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1270,
+      "sequence": 1697,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 1,
+          "score": 47
+        }
+      }
+    },
+    {
+      "tick": 1270,
+      "sequence": 1698,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 21,
+            "y": 9
+          }
+        }
+      }
+    },
+    {
+      "tick": 1270,
+      "sequence": 1699,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 636
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1270,
+              "user_id": 10000,
+              "sequence_number": 636
+            },
+            "command_id_server": {
+              "tick": 1270,
+              "user_id": 10000,
+              "sequence_number": 1270
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1270,
+      "sequence": 1700,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 636
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1270,
+              "user_id": 10001,
+              "sequence_number": 636
+            },
+            "command_id_server": {
+              "tick": 1270,
+              "user_id": 10001,
+              "sequence_number": 1271
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1271,
+      "sequence": 1701,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 1,
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 1272,
+      "sequence": 1702,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 637
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1272,
+              "user_id": 10000,
+              "sequence_number": 637
+            },
+            "command_id_server": {
+              "tick": 1272,
+              "user_id": 10000,
+              "sequence_number": 1272
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1272,
+      "sequence": 1703,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 637
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1272,
+              "user_id": 10001,
+              "sequence_number": 637
+            },
+            "command_id_server": {
+              "tick": 1272,
+              "user_id": 10001,
+              "sequence_number": 1273
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1274,
+      "sequence": 1704,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 638
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1274,
+              "user_id": 10000,
+              "sequence_number": 638
+            },
+            "command_id_server": {
+              "tick": 1274,
+              "user_id": 10000,
+              "sequence_number": 1274
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1274,
+      "sequence": 1705,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 638
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1274,
+              "user_id": 10001,
+              "sequence_number": 638
+            },
+            "command_id_server": {
+              "tick": 1274,
+              "user_id": 10001,
+              "sequence_number": 1275
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1276,
+      "sequence": 1706,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 639
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1276,
+              "user_id": 10000,
+              "sequence_number": 639
+            },
+            "command_id_server": {
+              "tick": 1276,
+              "user_id": 10000,
+              "sequence_number": 1276
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1276,
+      "sequence": 1707,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 639
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1276,
+              "user_id": 10001,
+              "sequence_number": 639
+            },
+            "command_id_server": {
+              "tick": 1276,
+              "user_id": 10001,
+              "sequence_number": 1277
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1278,
+      "sequence": 1708,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 640
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1278,
+              "user_id": 10000,
+              "sequence_number": 640
+            },
+            "command_id_server": {
+              "tick": 1278,
+              "user_id": 10000,
+              "sequence_number": 1278
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1278,
+      "sequence": 1709,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 640
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1278,
+              "user_id": 10001,
+              "sequence_number": 640
+            },
+            "command_id_server": {
+              "tick": 1278,
+              "user_id": 10001,
+              "sequence_number": 1279
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1280,
+      "sequence": 1710,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 641
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1280,
+              "user_id": 10000,
+              "sequence_number": 641
+            },
+            "command_id_server": {
+              "tick": 1280,
+              "user_id": 10000,
+              "sequence_number": 1280
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1280,
+      "sequence": 1711,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 641
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1280,
+              "user_id": 10001,
+              "sequence_number": 641
+            },
+            "command_id_server": {
+              "tick": 1280,
+              "user_id": 10001,
+              "sequence_number": 1281
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1282,
+      "sequence": 1712,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 642
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1282,
+              "user_id": 10000,
+              "sequence_number": 642
+            },
+            "command_id_server": {
+              "tick": 1282,
+              "user_id": 10000,
+              "sequence_number": 1282
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1282,
+      "sequence": 1713,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 642
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1282,
+              "user_id": 10001,
+              "sequence_number": 642
+            },
+            "command_id_server": {
+              "tick": 1282,
+              "user_id": 10001,
+              "sequence_number": 1283
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1284,
+      "sequence": 1714,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 643
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1284,
+              "user_id": 10000,
+              "sequence_number": 643
+            },
+            "command_id_server": {
+              "tick": 1284,
+              "user_id": 10000,
+              "sequence_number": 1284
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1284,
+      "sequence": 1715,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 643
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1284,
+              "user_id": 10001,
+              "sequence_number": 643
+            },
+            "command_id_server": {
+              "tick": 1284,
+              "user_id": 10001,
+              "sequence_number": 1285
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1286,
+      "sequence": 1716,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 644
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1286,
+              "user_id": 10000,
+              "sequence_number": 644
+            },
+            "command_id_server": {
+              "tick": 1286,
+              "user_id": 10000,
+              "sequence_number": 1286
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1286,
+      "sequence": 1717,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 644
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1286,
+              "user_id": 10001,
+              "sequence_number": 644
+            },
+            "command_id_server": {
+              "tick": 1286,
+              "user_id": 10001,
+              "sequence_number": 1287
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1288,
+      "sequence": 1718,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 645
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1288,
+              "user_id": 10000,
+              "sequence_number": 645
+            },
+            "command_id_server": {
+              "tick": 1288,
+              "user_id": 10000,
+              "sequence_number": 1288
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1288,
+      "sequence": 1719,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 645
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1288,
+              "user_id": 10001,
+              "sequence_number": 645
+            },
+            "command_id_server": {
+              "tick": 1288,
+              "user_id": 10001,
+              "sequence_number": 1289
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1289,
+      "sequence": 1720,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 1,
+          "position": {
+            "x": 30,
+            "y": 3
+          },
+          "points": 1,
+          "combo_chain": 2,
+          "combo_remaining_ms_before": 1050,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1289,
+      "sequence": 1721,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 1,
+          "score": 48
+        }
+      }
+    },
+    {
+      "tick": 1290,
+      "sequence": 1722,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 42,
+            "y": 11
+          }
+        }
+      }
+    },
+    {
+      "tick": 1290,
+      "sequence": 1723,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 646
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1290,
+              "user_id": 10000,
+              "sequence_number": 646
+            },
+            "command_id_server": {
+              "tick": 1290,
+              "user_id": 10000,
+              "sequence_number": 1290
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1290,
+      "sequence": 1724,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 646
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1290,
+              "user_id": 10001,
+              "sequence_number": 646
+            },
+            "command_id_server": {
+              "tick": 1290,
+              "user_id": 10001,
+              "sequence_number": 1291
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1291,
+      "sequence": 1725,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 1,
+          "direction": "Down"
+        }
+      }
+    },
+    {
+      "tick": 1291,
+      "sequence": 1726,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 1,
+          "position": {
+            "x": 29,
+            "y": 4
+          },
+          "points": 2,
+          "combo_chain": 3,
+          "combo_remaining_ms_before": 1900,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1291,
+      "sequence": 1727,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 1,
+          "score": 50
+        }
+      }
+    },
+    {
+      "tick": 1292,
+      "sequence": 1728,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 38,
+            "y": 16
+          }
+        }
+      }
+    },
+    {
+      "tick": 1292,
+      "sequence": 1729,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 647
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1292,
+              "user_id": 10000,
+              "sequence_number": 647
+            },
+            "command_id_server": {
+              "tick": 1292,
+              "user_id": 10000,
+              "sequence_number": 1292
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1292,
+      "sequence": 1730,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 647
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1292,
+              "user_id": 10001,
+              "sequence_number": 647
+            },
+            "command_id_server": {
+              "tick": 1292,
+              "user_id": 10001,
+              "sequence_number": 1293
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1294,
+      "sequence": 1731,
+      "event": {
+        "TeamScoreUpdated": {
+          "team_id": 0,
+          "score": 40
+        }
+      }
+    },
+    {
+      "tick": 1294,
+      "sequence": 1732,
+      "event": {
+        "SnakeDied": {
+          "snake_id": 0,
+          "cause": "Banked"
+        }
+      }
+    },
+    {
+      "tick": 1294,
+      "sequence": 1733,
+      "event": {
+        "SnakeRespawned": {
+          "snake_id": 0,
+          "position": {
+            "x": 8,
+            "y": 20
+          },
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 1294,
+      "sequence": 1734,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 648
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1294,
+              "user_id": 10000,
+              "sequence_number": 648
+            },
+            "command_id_server": {
+              "tick": 1294,
+              "user_id": 10000,
+              "sequence_number": 1294
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1294,
+      "sequence": 1735,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 648
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1294,
+              "user_id": 10001,
+              "sequence_number": 648
+            },
+            "command_id_server": {
+              "tick": 1294,
+              "user_id": 10001,
+              "sequence_number": 1295
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1296,
+      "sequence": 1736,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 649
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1296,
+              "user_id": 10000,
+              "sequence_number": 649
+            },
+            "command_id_server": {
+              "tick": 1296,
+              "user_id": 10000,
+              "sequence_number": 1296
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1296,
+      "sequence": 1737,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 649
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1296,
+              "user_id": 10001,
+              "sequence_number": 649
+            },
+            "command_id_server": {
+              "tick": 1296,
+              "user_id": 10001,
+              "sequence_number": 1297
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1298,
+      "sequence": 1738,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 650
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1298,
+              "user_id": 10000,
+              "sequence_number": 650
+            },
+            "command_id_server": {
+              "tick": 1298,
+              "user_id": 10000,
+              "sequence_number": 1298
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1298,
+      "sequence": 1739,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 650
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1298,
+              "user_id": 10001,
+              "sequence_number": 650
+            },
+            "command_id_server": {
+              "tick": 1298,
+              "user_id": 10001,
+              "sequence_number": 1299
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1300,
+      "sequence": 1740,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 651
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1300,
+              "user_id": 10000,
+              "sequence_number": 651
+            },
+            "command_id_server": {
+              "tick": 1300,
+              "user_id": 10000,
+              "sequence_number": 1300
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1300,
+      "sequence": 1741,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 651
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1300,
+              "user_id": 10001,
+              "sequence_number": 651
+            },
+            "command_id_server": {
+              "tick": 1300,
+              "user_id": 10001,
+              "sequence_number": 1301
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1302,
+      "sequence": 1742,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 652
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1302,
+              "user_id": 10000,
+              "sequence_number": 652
+            },
+            "command_id_server": {
+              "tick": 1302,
+              "user_id": 10000,
+              "sequence_number": 1302
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1302,
+      "sequence": 1743,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 652
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1302,
+              "user_id": 10001,
+              "sequence_number": 652
+            },
+            "command_id_server": {
+              "tick": 1302,
+              "user_id": 10001,
+              "sequence_number": 1303
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1304,
+      "sequence": 1744,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Down"
+        }
+      }
+    },
+    {
+      "tick": 1304,
+      "sequence": 1745,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 0,
+          "position": {
+            "x": 12,
+            "y": 21
+          },
+          "points": 1,
+          "combo_chain": 1,
+          "combo_remaining_ms_before": 0,
+          "boost_active": false
+        }
+      }
+    },
+    {
+      "tick": 1304,
+      "sequence": 1746,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 0,
+          "score": 41
+        }
+      }
+    },
+    {
+      "tick": 1304,
+      "sequence": 1747,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 31,
+            "y": 11
+          }
+        }
+      }
+    },
+    {
+      "tick": 1304,
+      "sequence": 1748,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 653
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1304,
+              "user_id": 10000,
+              "sequence_number": 653
+            },
+            "command_id_server": {
+              "tick": 1304,
+              "user_id": 10000,
+              "sequence_number": 1304
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1304,
+      "sequence": 1749,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 653
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1304,
+              "user_id": 10001,
+              "sequence_number": 653
+            },
+            "command_id_server": {
+              "tick": 1304,
+              "user_id": 10001,
+              "sequence_number": 1305
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1306,
+      "sequence": 1750,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 1306,
+      "sequence": 1751,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 654
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1306,
+              "user_id": 10000,
+              "sequence_number": 654
+            },
+            "command_id_server": {
+              "tick": 1306,
+              "user_id": 10000,
+              "sequence_number": 1306
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1306,
+      "sequence": 1752,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 654
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1306,
+              "user_id": 10001,
+              "sequence_number": 654
+            },
+            "command_id_server": {
+              "tick": 1306,
+              "user_id": 10001,
+              "sequence_number": 1307
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1308,
+      "sequence": 1753,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 655
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1308,
+              "user_id": 10000,
+              "sequence_number": 655
+            },
+            "command_id_server": {
+              "tick": 1308,
+              "user_id": 10000,
+              "sequence_number": 1308
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1308,
+      "sequence": 1754,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 655
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1308,
+              "user_id": 10001,
+              "sequence_number": 655
+            },
+            "command_id_server": {
+              "tick": 1308,
+              "user_id": 10001,
+              "sequence_number": 1309
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1309,
+      "sequence": 1755,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 1,
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 1310,
+      "sequence": 1756,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 656
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1310,
+              "user_id": 10000,
+              "sequence_number": 656
+            },
+            "command_id_server": {
+              "tick": 1310,
+              "user_id": 10000,
+              "sequence_number": 1310
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1310,
+      "sequence": 1757,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 656
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1310,
+              "user_id": 10001,
+              "sequence_number": 656
+            },
+            "command_id_server": {
+              "tick": 1310,
+              "user_id": 10001,
+              "sequence_number": 1311
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1312,
+      "sequence": 1758,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 657
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1312,
+              "user_id": 10000,
+              "sequence_number": 657
+            },
+            "command_id_server": {
+              "tick": 1312,
+              "user_id": 10000,
+              "sequence_number": 1312
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1312,
+      "sequence": 1759,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 657
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1312,
+              "user_id": 10001,
+              "sequence_number": 657
+            },
+            "command_id_server": {
+              "tick": 1312,
+              "user_id": 10001,
+              "sequence_number": 1313
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1314,
+      "sequence": 1760,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 658
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1314,
+              "user_id": 10000,
+              "sequence_number": 658
+            },
+            "command_id_server": {
+              "tick": 1314,
+              "user_id": 10000,
+              "sequence_number": 1314
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1314,
+      "sequence": 1761,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 658
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1314,
+              "user_id": 10001,
+              "sequence_number": 658
+            },
+            "command_id_server": {
+              "tick": 1314,
+              "user_id": 10001,
+              "sequence_number": 1315
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1316,
+      "sequence": 1762,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 659
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1316,
+              "user_id": 10000,
+              "sequence_number": 659
+            },
+            "command_id_server": {
+              "tick": 1316,
+              "user_id": 10000,
+              "sequence_number": 1316
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1316,
+      "sequence": 1763,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 659
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1316,
+              "user_id": 10001,
+              "sequence_number": 659
+            },
+            "command_id_server": {
+              "tick": 1316,
+              "user_id": 10001,
+              "sequence_number": 1317
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1318,
+      "sequence": 1764,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 660
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1318,
+              "user_id": 10000,
+              "sequence_number": 660
+            },
+            "command_id_server": {
+              "tick": 1318,
+              "user_id": 10000,
+              "sequence_number": 1318
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1318,
+      "sequence": 1765,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 660
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1318,
+              "user_id": 10001,
+              "sequence_number": 660
+            },
+            "command_id_server": {
+              "tick": 1318,
+              "user_id": 10001,
+              "sequence_number": 1319
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1319,
+      "sequence": 1766,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 1,
+          "position": {
+            "x": 38,
+            "y": 16
+          },
+          "points": 3,
+          "combo_chain": 4,
+          "combo_remaining_ms_before": 600,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1319,
+      "sequence": 1767,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 1,
+          "score": 53
+        }
+      }
+    },
+    {
+      "tick": 1320,
+      "sequence": 1768,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Down"
+        }
+      }
+    },
+    {
+      "tick": 1320,
+      "sequence": 1769,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 39,
+            "y": 16
+          }
+        }
+      }
+    },
+    {
+      "tick": 1320,
+      "sequence": 1770,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 661
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1320,
+              "user_id": 10000,
+              "sequence_number": 661
+            },
+            "command_id_server": {
+              "tick": 1320,
+              "user_id": 10000,
+              "sequence_number": 1320
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Down"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1320,
+      "sequence": 1771,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 661
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1320,
+              "user_id": 10001,
+              "sequence_number": 661
+            },
+            "command_id_server": {
+              "tick": 1320,
+              "user_id": 10001,
+              "sequence_number": 1321
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1321,
+      "sequence": 1772,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 1,
+          "position": {
+            "x": 39,
+            "y": 16
+          },
+          "points": 3,
+          "combo_chain": 5,
+          "combo_remaining_ms_before": 1900,
+          "boost_active": true
+        }
+      }
+    },
+    {
+      "tick": 1321,
+      "sequence": 1773,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 1,
+          "score": 56
+        }
+      }
+    },
+    {
+      "tick": 1322,
+      "sequence": 1774,
+      "event": {
+        "FoodEaten": {
+          "snake_id": 0,
+          "position": {
+            "x": 19,
+            "y": 23
+          },
+          "points": 1,
+          "combo_chain": 2,
+          "combo_remaining_ms_before": 1100,
+          "boost_active": false
+        }
+      }
+    },
+    {
+      "tick": 1322,
+      "sequence": 1775,
+      "event": {
+        "ScoreUpdated": {
+          "snake_id": 0,
+          "score": 42
+        }
+      }
+    },
+    {
+      "tick": 1322,
+      "sequence": 1776,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 39,
+            "y": 0
+          }
+        }
+      }
+    },
+    {
+      "tick": 1322,
+      "sequence": 1777,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 662
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1322,
+              "user_id": 10000,
+              "sequence_number": 662
+            },
+            "command_id_server": {
+              "tick": 1322,
+              "user_id": 10000,
+              "sequence_number": 1322
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1322,
+      "sequence": 1778,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 662
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1322,
+              "user_id": 10001,
+              "sequence_number": 662
+            },
+            "command_id_server": {
+              "tick": 1322,
+              "user_id": 10001,
+              "sequence_number": 1323
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1324,
+      "sequence": 1779,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 1324,
+      "sequence": 1780,
+      "event": {
+        "FoodSpawned": {
+          "position": {
+            "x": 45,
+            "y": 8
+          }
+        }
+      }
+    },
+    {
+      "tick": 1324,
+      "sequence": 1781,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 663
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1324,
+              "user_id": 10000,
+              "sequence_number": 663
+            },
+            "command_id_server": {
+              "tick": 1324,
+              "user_id": 10000,
+              "sequence_number": 1324
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1324,
+      "sequence": 1782,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 663
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1324,
+              "user_id": 10001,
+              "sequence_number": 663
+            },
+            "command_id_server": {
+              "tick": 1324,
+              "user_id": 10001,
+              "sequence_number": 1325
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1326,
+      "sequence": 1783,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Up"
+        }
+      }
+    },
+    {
+      "tick": 1326,
+      "sequence": 1784,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 664
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1326,
+              "user_id": 10000,
+              "sequence_number": 664
+            },
+            "command_id_server": {
+              "tick": 1326,
+              "user_id": 10000,
+              "sequence_number": 1326
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Left"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1326,
+      "sequence": 1785,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 664
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1326,
+              "user_id": 10001,
+              "sequence_number": 664
+            },
+            "command_id_server": {
+              "tick": 1326,
+              "user_id": 10001,
+              "sequence_number": 1327
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1328,
+      "sequence": 1786,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 1328,
+      "sequence": 1787,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 665
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1328,
+              "user_id": 10000,
+              "sequence_number": 665
+            },
+            "command_id_server": {
+              "tick": 1328,
+              "user_id": 10000,
+              "sequence_number": 1328
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1328,
+      "sequence": 1788,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 665
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1328,
+              "user_id": 10001,
+              "sequence_number": 665
+            },
+            "command_id_server": {
+              "tick": 1328,
+              "user_id": 10001,
+              "sequence_number": 1329
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1330,
+      "sequence": 1789,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Up"
+        }
+      }
+    },
+    {
+      "tick": 1330,
+      "sequence": 1790,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 666
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1330,
+              "user_id": 10000,
+              "sequence_number": 666
+            },
+            "command_id_server": {
+              "tick": 1330,
+              "user_id": 10000,
+              "sequence_number": 1330
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1330,
+      "sequence": 1791,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 666
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1330,
+              "user_id": 10001,
+              "sequence_number": 666
+            },
+            "command_id_server": {
+              "tick": 1330,
+              "user_id": 10001,
+              "sequence_number": 1331
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1332,
+      "sequence": 1792,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 667
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1332,
+              "user_id": 10000,
+              "sequence_number": 667
+            },
+            "command_id_server": {
+              "tick": 1332,
+              "user_id": 10000,
+              "sequence_number": 1332
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1332,
+      "sequence": 1793,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 667
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1332,
+              "user_id": 10001,
+              "sequence_number": 667
+            },
+            "command_id_server": {
+              "tick": 1332,
+              "user_id": 10001,
+              "sequence_number": 1333
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1334,
+      "sequence": 1794,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 1334,
+      "sequence": 1795,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 668
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1334,
+              "user_id": 10000,
+              "sequence_number": 668
+            },
+            "command_id_server": {
+              "tick": 1334,
+              "user_id": 10000,
+              "sequence_number": 1334
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1334,
+      "sequence": 1796,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 668
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1334,
+              "user_id": 10001,
+              "sequence_number": 668
+            },
+            "command_id_server": {
+              "tick": 1334,
+              "user_id": 10001,
+              "sequence_number": 1335
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1336,
+      "sequence": 1797,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Up"
+        }
+      }
+    },
+    {
+      "tick": 1336,
+      "sequence": 1798,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 669
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1336,
+              "user_id": 10000,
+              "sequence_number": 669
+            },
+            "command_id_server": {
+              "tick": 1336,
+              "user_id": 10000,
+              "sequence_number": 1336
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1336,
+      "sequence": 1799,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 669
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1336,
+              "user_id": 10001,
+              "sequence_number": 669
+            },
+            "command_id_server": {
+              "tick": 1336,
+              "user_id": 10001,
+              "sequence_number": 1337
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1338,
+      "sequence": 1800,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10000,
+            "client_game_session_id": "calibration-8000072-10000",
+            "sequence": 670
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1338,
+              "user_id": 10000,
+              "sequence_number": 670
+            },
+            "command_id_server": {
+              "tick": 1338,
+              "user_id": 10000,
+              "sequence_number": 1338
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 0,
+                "direction": "Up"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1338,
+      "sequence": 1801,
+      "event": {
+        "CommandScheduledV2": {
+          "command_id": {
+            "game_id": 8000072,
+            "user_id": 10001,
+            "client_game_session_id": "calibration-8000072-10001",
+            "sequence": 670
+          },
+          "command_message": {
+            "command_id_client": {
+              "tick": 1338,
+              "user_id": 10001,
+              "sequence_number": 670
+            },
+            "command_id_server": {
+              "tick": 1338,
+              "user_id": 10001,
+              "sequence_number": 1339
+            },
+            "command": {
+              "Turn": {
+                "snake_id": 1,
+                "direction": "Right"
+              }
+            }
+          },
+          "deduplicated_replay": false
+        }
+      }
+    },
+    {
+      "tick": 1339,
+      "sequence": 1802,
+      "event": {
+        "TeamScoreUpdated": {
+          "team_id": 1,
+          "score": 56
+        }
+      }
+    },
+    {
+      "tick": 1339,
+      "sequence": 1803,
+      "event": {
+        "SnakeDied": {
+          "snake_id": 1,
+          "cause": "Banked"
+        }
+      }
+    },
+    {
+      "tick": 1339,
+      "sequence": 1804,
+      "event": {
+        "SnakeRespawned": {
+          "snake_id": 1,
+          "position": {
+            "x": 51,
+            "y": 20
+          },
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 1339,
+      "sequence": 1805,
+      "event": {
+        "XPAwarded": {
+          "player_xp": {
+            "10001": 430,
+            "10000": 340
+          }
+        }
+      }
+    },
+    {
+      "tick": 1339,
+      "sequence": 1806,
+      "event": {
+        "StatusUpdated": {
+          "status": {
+            "Complete": {
+              "winning_snake_id": 1
+            }
+          }
+        }
+      }
+    }
+  ],
+  "end_sync_hash": "14170390008602050888",
+  "presentation": {
+    "rotation": 90,
+    "follow_snake_id": 1,
+    "segments": [
+      {
+        "until_tick": 1281,
+        "time_scale": 1.0
+      },
+      {
+        "until_tick": 1351,
+        "time_scale": 0.5
+      },
+      {
+        "until_tick": 1381,
+        "time_scale": 1.0
+      }
+    ]
+  },
+  "config": {
+    "rules_version": 2,
+    "minimum_score": 120,
+    "elimination": 90,
+    "mutual_trade": 60,
+    "boosted_kill": 40,
+    "cutoff": 30,
+    "proximity": 20,
+    "trap": 30,
+    "laden_per_point": 4,
+    "laden_cap": 50,
+    "teammate_kill": -80,
+    "banked_per_point": 6,
+    "big_carry": 50,
+    "combo_step": 21,
+    "nick_of_time": 10,
+    "boosted_pickup": 5,
+    "feeding_frenzy": 20,
+    "death": -60
+  }
+}

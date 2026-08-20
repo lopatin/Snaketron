@@ -12,12 +12,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-mod app;
-mod render;
-mod replay;
-mod views;
-
-use app::{App, AppCommand};
+use terminal::app::{App, AppCommand};
 
 fn main() -> Result<()> {
     // Initialize logging

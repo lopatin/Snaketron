@@ -8,6 +8,7 @@
 //! - one JSON file under `failures/` for every non-completed session.
 
 use serde::{Deserialize, Serialize};
+use server::game_executor::PARTITION_COUNT;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Write as _};
@@ -868,7 +869,7 @@ pub struct AggregateMetrics {
     pub command_counts_by_unix_second: BTreeMap<u64, u64>,
     /// First-seen authoritative command schedules grouped by executor partition
     /// and the load generator's receipt second.
-    /// Game IDs map to partitions with `game_id % 10`.
+    /// Game IDs map to partitions with `game_id % PARTITION_COUNT`.
     #[serde(default)]
     pub scheduled_command_counts_by_partition_and_unix_second: BTreeMap<u32, BTreeMap<u64, u64>>,
     /// Sum of first-seen accepted/scheduled outcomes keyed by original send
@@ -1153,7 +1154,7 @@ pub fn aggregate_report(run: &LoadTestRun) -> AggregateReport {
             for (second, count) in &session.metrics.scheduled_command_counts_by_unix_second {
                 if let Some(game_id) = session.game_id {
                     let partition_total = scheduled_command_counts_by_partition_and_unix_second
-                        .entry(game_id % 10)
+                        .entry(game_id % PARTITION_COUNT)
                         .or_default()
                         .entry(*second)
                         .or_default();
@@ -2160,7 +2161,7 @@ mod tests {
             session_id: "s1".to_owned(),
             user_id: 1,
             game_id: 21,
-            partition_id: 1,
+            partition_id: 21 % PARTITION_COUNT,
             client_game_session_id: "game-s1".to_owned(),
             command_sequence: 3,
             sent_at_unix_ms: 10_000,
@@ -2246,7 +2247,7 @@ mod tests {
             session_id: "s2".to_owned(),
             user_id: 2,
             game_id: 32,
-            partition_id: 2,
+            partition_id: 32 % PARTITION_COUNT,
             client_game_session_id: "game-s2".to_owned(),
             command_sequence: 4,
             sent_at_unix_ms: 10_001,
@@ -2403,8 +2404,8 @@ mod tests {
                 .metrics
                 .scheduled_command_counts_by_partition_and_unix_second,
             BTreeMap::from([
-                (1, BTreeMap::from([(10, 3), (11, 3)])),
-                (2, BTreeMap::from([(10, 1)])),
+                (21 % PARTITION_COUNT, BTreeMap::from([(10, 3), (11, 3)])),
+                (32 % PARTITION_COUNT, BTreeMap::from([(10, 1)])),
             ])
         );
         assert_eq!(
@@ -2480,8 +2481,10 @@ mod tests {
             Some(&serde_json::json!(6))
         );
         assert_eq!(
-            report_json
-                .pointer("/metrics/scheduled_command_counts_by_partition_and_unix_second/1/11"),
+            report_json.pointer(&format!(
+                "/metrics/scheduled_command_counts_by_partition_and_unix_second/{}/11",
+                21 % PARTITION_COUNT,
+            )),
             Some(&serde_json::json!(3))
         );
         assert_eq!(

@@ -1,4 +1,4 @@
-use crate::{Direction, GameState, GameType, Position, Snake, TeamId};
+use crate::{Direction, GameCommand, GameState, GameType, Position, Snake, TeamId};
 use std::collections::{HashSet, VecDeque};
 
 /// Determines if a user_id represents an AI player
@@ -109,6 +109,29 @@ pub fn calculate_ai_move(
     } else {
         Some(best_direction)
     }
+}
+
+/// Choose the command issued by the production bot for one decision cycle.
+///
+/// Keeping this policy beside [`calculate_ai_move`] gives offline simulations
+/// the exact same Boost-first behavior as the networked bot binary. The
+/// caller owns cadence and transport identity, just as the live bot does.
+pub fn calculate_ai_command(game_state: &GameState, snake_id: u32) -> Option<GameCommand> {
+    let snake = game_state.arena.snakes.get(snake_id as usize)?;
+    if !snake.is_alive {
+        return None;
+    }
+    if game_state.properties.boost.is_some() && snake.boost().charge_ms > 0 && !snake.boost().active
+    {
+        return Some(GameCommand::ActivateBoost { snake_id });
+    }
+
+    let direction =
+        calculate_ai_move(game_state, snake_id, snake.direction).unwrap_or(snake.direction);
+    Some(GameCommand::Turn {
+        snake_id,
+        direction,
+    })
 }
 
 fn get_new_position(pos: &Position, direction: Direction) -> Position {

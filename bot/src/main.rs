@@ -3,11 +3,12 @@ use chrono::Utc;
 use clap::Parser;
 use common::{
     ClientCommandIdentityV2, GameCommand, GameEngine, GameEvent, GameEventMessage, GameState,
-    GameStatus, GameType, QueueMode, calculate_ai_move,
+    GameStatus, GameType, QueueMode, calculate_ai_command,
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
+use server::ads::AdBreakResolution;
 use server::lifecycle::WS_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
 use server::ws_server::WSMessage;
 use std::pin::Pin;
@@ -50,6 +51,23 @@ struct Args {
     /// Queue mode: quickmatch | competitive
     #[arg(long, default_value = "quickmatch")]
     queue_mode: String,
+
+    /// Server-derived stress admission key. Bots are always placed in the
+    /// trusted synthetic pool so their games are never written to the
+    /// production replay corpus.
+    #[arg(long)]
+    stress_test_key: String,
+}
+
+struct BotRunConfig {
+    idx: usize,
+    total_games: usize,
+    base_url: Url,
+    ws_url: Url,
+    game_type: GameType,
+    queue_mode: QueueMode,
+    http_client: Client,
+    stress_test_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,17 +140,19 @@ async fn main() -> Result<()> {
         let queue_mode = queue_mode.clone();
         let http_client = http_client.clone();
         let games = args.games;
+        let stress_test_key = args.stress_test_key.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(err) = run_bot(
+            if let Err(err) = run_bot(BotRunConfig {
                 idx,
-                games,
+                total_games: games,
                 base_url,
                 ws_url,
                 game_type,
                 queue_mode,
                 http_client,
-            )
+                stress_test_key,
+            })
             .await
             {
                 error!("Bot {} failed: {:#}", idx + 1, err);
@@ -148,22 +168,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_bot(
-    idx: usize,
-    total_games: usize,
-    base_url: Url,
-    ws_url: Url,
-    game_type: GameType,
-    queue_mode: QueueMode,
-    http_client: Client,
-) -> Result<()> {
+async fn run_bot(config: BotRunConfig) -> Result<()> {
+    let BotRunConfig {
+        idx,
+        total_games,
+        base_url,
+        ws_url,
+        game_type,
+        queue_mode,
+        http_client,
+        stress_test_key,
+    } = config;
     let (status_tx, status_rx) = watch::channel::<String>(String::from("starting"));
     let logger = tokio::spawn(log_progress(idx, status_rx));
 
     // Generate nickname under 20 characters: "bot" + bot number + last 8 chars of UUID
     let uuid_suffix = &Uuid::new_v4().simple().to_string()[24..32];
     let nickname = format!("bot{}-{}", idx + 1, uuid_suffix);
-    let guest = create_guest(&http_client, &base_url, &nickname).await?;
+    let guest = create_guest(&http_client, &base_url, &nickname, &stress_test_key).await?;
     let user_id = guest.user.id as u32;
     info!(
         "Bot {} authenticated as {} (user_id {})",
@@ -374,6 +396,7 @@ where
             token: token.to_owned(),
             protocol_version: CLIENT_PROTOCOL_VERSION,
             anon_id: None,
+            distribution: None,
         },
     )
     .await?;
@@ -459,7 +482,8 @@ where
 fn is_benign_setup_message(message: &WSMessage) -> bool {
     matches!(
         message,
-        WSMessage::UserCountUpdate { .. }
+        WSMessage::AdConfiguration(_)
+            | WSMessage::UserCountUpdate { .. }
             | WSMessage::LobbyUpdate { .. }
             | WSMessage::LobbyChatHistory { .. }
             | WSMessage::Pong { .. }
@@ -511,6 +535,20 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     match ws_msg {
+        WSMessage::LobbyUpdate {
+            state,
+            ad_break: Some(ad_break),
+            ..
+        } if state == "ad_break" => {
+            send_ws(
+                ws_writer,
+                WSMessage::AdBreakResolved {
+                    break_id: ad_break.id,
+                    resolution: AdBreakResolution::Unavailable,
+                },
+            )
+            .await?;
+        }
         WSMessage::JoinGame(id) => {
             info!("Bot {} matched to game {}", idx + 1, id);
             *game_id = Some(id);
@@ -740,7 +778,7 @@ where
         return Ok(());
     }
 
-    let command = choose_bot_command(predicted_state, snake_id)
+    let command = calculate_ai_command(predicted_state, snake_id)
         .expect("a living snake should always produce a bot command");
     let command_msg = engine.process_local_command(command)?;
     match &command_msg.command {
@@ -768,24 +806,6 @@ where
     Ok(())
 }
 
-fn choose_bot_command(game_state: &GameState, snake_id: u32) -> Option<GameCommand> {
-    let snake = game_state.arena.snakes.get(snake_id as usize)?;
-    if !snake.is_alive {
-        return None;
-    }
-    if game_state.properties.boost.is_some() && snake.boost().charge_ms > 0 && !snake.boost().active
-    {
-        return Some(GameCommand::ActivateBoost { snake_id });
-    }
-
-    let direction =
-        calculate_ai_move(game_state, snake_id, snake.direction).unwrap_or(snake.direction);
-    Some(GameCommand::Turn {
-        snake_id,
-        direction,
-    })
-}
-
 async fn send_ws<S>(ws_writer: &mut S, msg: WSMessage) -> Result<()>
 where
     S: Sink<Message> + Unpin,
@@ -796,7 +816,12 @@ where
     Ok(())
 }
 
-async fn create_guest(client: &Client, base_url: &Url, nickname: &str) -> Result<GuestResponse> {
+async fn create_guest(
+    client: &Client,
+    base_url: &Url,
+    nickname: &str,
+    stress_test_key: &str,
+) -> Result<GuestResponse> {
     // Determine the API URL based on the host
     let api_url = if let Some(host) = base_url.host_str() {
         match host {
@@ -821,6 +846,7 @@ async fn create_guest(client: &Client, base_url: &Url, nickname: &str) -> Result
 
     let response = client
         .post(endpoint)
+        .header(server::api::auth::STRESS_TEST_KEY_HEADER, stress_test_key)
         .json(&serde_json::json!({ "nickname": nickname }))
         .send()
         .await
@@ -1175,7 +1201,7 @@ mod tests {
             pad.charge_ms
         );
         assert!(matches!(
-            choose_bot_command(&game, player.snake_id),
+            calculate_ai_command(&game, player.snake_id),
             Some(GameCommand::ActivateBoost { snake_id }) if snake_id == player.snake_id
         ));
     }
@@ -1195,7 +1221,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if token == "test-token"
             ));
             send_ws(

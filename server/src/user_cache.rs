@@ -15,9 +15,10 @@ const EXPIRATION_SECONDS: u64 = 3600; // 1 hour
 // write atomic so that late guest fill can never restore the stale identity.
 const PUT_USER_SCRIPT: &str = r#"
 local cached = redis.call('GET', KEYS[1])
-if cached and ARGV[2] == '1' then
-    local decoded_ok, cached_user = pcall(cjson.decode, cached)
-    if decoded_ok then
+if cached then
+    local cached_ok, cached_user = pcall(cjson.decode, cached)
+    local incoming_ok, incoming_user = pcall(cjson.decode, ARGV[1])
+    if cached_ok and ARGV[2] == '1' then
         local cached_is_guest = cached_user['is_guest']
         if cached_is_guest == nil then
             cached_is_guest = cached_user['isGuest']
@@ -25,6 +26,23 @@ if cached and ARGV[2] == '1' then
         if cached_is_guest == false then
             redis.call('EXPIRE', KEYS[1], ARGV[3])
             return 0
+        end
+    end
+
+    -- Profile metadata from a verified CrazyGames JWT is ordered by its iat.
+    -- A cache miss can read the old profile just before a newer exchange
+    -- commits, then reach Redis after the newer account has been written
+    -- through. Never let that stale non-guest fill restore the old identity.
+    if cached_ok and incoming_ok then
+        local cached_provider = cached_user['auth_provider'] or cached_user['authProvider']
+        local incoming_provider = incoming_user['auth_provider'] or incoming_user['authProvider']
+        if cached_provider == 'crazygames' and incoming_provider == 'crazygames' then
+            local cached_iat = cached_user['profile_iat'] or cached_user['profileIat'] or -1
+            local incoming_iat = incoming_user['profile_iat'] or incoming_user['profileIat'] or -1
+            if tonumber(cached_iat) > tonumber(incoming_iat) then
+                redis.call('EXPIRE', KEYS[1], ARGV[3])
+                return 0
+            end
         end
     end
 end
@@ -243,6 +261,63 @@ mod tests {
         let cached: serde_json::Value = serde_json::from_str(&cached)?;
         assert_eq!(cached["username"], "Player42");
         assert_eq!(cached["is_guest"], false);
+
+        redis.del::<_, ()>(&key).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_crazygames_profile_fill_cannot_replace_newer_profile() -> Result<()> {
+        let client = RedisClient::open("redis://127.0.0.1:6379/15?protocol=resp3", None)?;
+        let mut redis = client.get_managed_connection().await?;
+        let key = format!(
+            "test:user-cache-crazygames-profile:{}",
+            uuid::Uuid::new_v4()
+        );
+
+        assert_eq!(
+            script_put(
+                &mut redis,
+                &key,
+                json!({
+                    "id": 42,
+                    "username": "New.Name",
+                    "is_guest": false,
+                    "auth_provider": "crazygames",
+                    "profile_iat": 200,
+                    "profile_picture_url": "https://images.crazygames.com/new.png"
+                }),
+                false,
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            script_put(
+                &mut redis,
+                &key,
+                json!({
+                    "id": 42,
+                    "username": "Old.Name",
+                    "is_guest": false,
+                    "auth_provider": "crazygames",
+                    "profile_iat": 100,
+                    "profile_picture_url": "https://images.crazygames.com/old.png"
+                }),
+                false,
+            )
+            .await?,
+            0
+        );
+
+        let cached: String = redis.get(&key).await?;
+        let cached: serde_json::Value = serde_json::from_str(&cached)?;
+        assert_eq!(cached["username"], "New.Name");
+        assert_eq!(cached["profile_iat"], 200);
+        assert_eq!(
+            cached["profile_picture_url"],
+            "https://images.crazygames.com/new.png"
+        );
 
         redis.del::<_, ()>(&key).await?;
         Ok(())

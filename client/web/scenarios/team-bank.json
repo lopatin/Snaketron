@@ -1,0 +1,47 @@
+{
+  "format_version": 1,
+  "id": "team-bank",
+  "world": {
+    "game_type": { "TeamMatch": { "per_team": 1 } },
+    "queue_mode": "Quickmatch",
+    "rng_seed": null,
+    "overrides": {
+      "player_idle_timeout_ms": 600000
+    }
+  },
+  "pose": {
+    "snakes": [
+      {
+        "user_id": 1,
+        "name": "BANKER",
+        "team_id": 0,
+        "body": [{ "x": 11, "y": 20 }, { "x": 15, "y": 20 }],
+        "direction": "Left",
+        "food": 14,
+        "boost_charge_ms": 3000
+      },
+      {
+        "user_id": 2,
+        "name": "DEFENDER",
+        "team_id": 1,
+        "body": [{ "x": 45, "y": 10 }, { "x": 49, "y": 10 }],
+        "direction": "Left"
+      }
+    ],
+    "food": [],
+    "team_scores": [[0, 0], [1, 0]],
+    "start_tick": 0
+  },
+  "commands": [],
+  "run_ticks": 12,
+  "presentation": {
+    "camera": { "Follow": { "snake_id": 0 } },
+    "default_time_scale": 1.0,
+    "star_snake_id": 0,
+    "addons": { "combo_callout": false, "boost_meter": true }
+  },
+  "expect": [
+    { "SnakeDead": { "snake_id": 0, "at_tick": 4 } },
+    { "FinalSyncHash": "0x27e337dfa6cde7c2" }
+  ]
+}

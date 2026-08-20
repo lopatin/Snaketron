@@ -16,13 +16,15 @@ services:
       - DEBUG=0
       - PERSISTENCE=0
       - AWS_DEFAULT_REGION=us-east-1
+      - SNAKETRON_REPLAY_S3_BUCKET=snaketron-replays-dev
+      - SNAKETRON_REPLAY_S3_PREFIX=recordings
       - DOCKER_HOST=unix:///var/run/docker.sock
     ports:
       - "4566:4566"
     volumes:
       - "./localstack-data:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"
-      - "./localstack-init.sh:/etc/localstack/init/ready.d/init-dynamodb.sh"
+      - "./localstack-init.sh:/etc/localstack/init/ready.d/init-snaketron.sh"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
@@ -58,6 +60,17 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       DYNAMODB_TABLE_PREFIX: snaketron
+      # Private durable replay object storage (LocalStack in development).
+      SNAKETRON_REPLAY_S3_BUCKET: snaketron-replays-dev
+      SNAKETRON_REPLAY_S3_PREFIX: recordings
+      SNAKETRON_REPLAY_S3_FORCE_PATH_STYLE: "true"
+      SNAKETRON_REPLAY_S3_STORAGE_CLASS: STANDARD
+      # Recent verified recordings are cached in Valkey; cache failures fall
+      # back to the private replay bucket.
+      SNAKETRON_REPLAY_CACHE_PREFIX: snaketron:replay-cache
+      SNAKETRON_REPLAY_CACHE_TTL_SECONDS: "3600"
+      SNAKETRON_REPLAY_CACHE_MAX_BYTES: "8388608"
+      SNAKETRON_REPLAY_CACHE_TIMEOUT_MS: "250"
       # Keep completed games loadable from DynamoDB for 30 days.
       SNAKETRON_COMPLETED_GAME_RETENTION_DAYS: 30
       # Server configuration
@@ -67,6 +80,17 @@ services:
       SNAKETRON_ENV: dev
       # New team matches snapshot this once at creation (valid range 1.000-2.000).
       SNAKETRON_BOOST_SPEED_MULTIPLIER: "1.500"
+      # New multiplayer matches warn after 10s idle, then kick after a 10s countdown.
+      SNAKETRON_PLAYER_IDLE_GRACE_MS: "${SNAKETRON_PLAYER_IDLE_GRACE_MS:-10000}"
+      SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS: "${SNAKETRON_PLAYER_IDLE_COUNTDOWN_MS:-10000}"
+      # Advertisement policy is resolved by the server at startup and is off by default.
+      # Each distribution remains disabled until it names a provider. Its
+      # placement-specific switches then inherit that distribution's enabled state.
+      SNAKETRON_ADS_ENABLED: "false"
+      SNAKETRON_ADS_WEB_PROVIDER: "none"
+      SNAKETRON_ADS_CRAZYGAMES_PROVIDER: "none"
+      SNAKETRON_ADS_ITCH_PROVIDER: "none"
+      SNAKETRON_AD_BREAK_TIMEOUT_SECONDS: "120"
       # Logging
       RUST_LOG: info,server=debug
       # Replay directory (using volume)

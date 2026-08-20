@@ -22,13 +22,19 @@ interface UseGameEngineReturn {
   connectionStale: boolean;
   sendCommand: (command: Command) => boolean;
   processServerEvent: (event: QueuedGameEvent) => Promise<boolean>;
-  /** Render predicted state, injecting score effects between field and snakes. */
+  /** Render predicted state with cosmetic layers below and above the snakes. */
   renderTo: (
     canvas: HTMLCanvasElement,
     cellSize: number,
     rotation: number,
     localUserId: number | undefined,
+    /** Presentation clock for animated skins; never simulation time. */
+    animMs: number,
+    reducedMotion: boolean,
+    /** The viewer's skin, which dresses their snake and their bases. */
+    localSkinRef: string | undefined,
     drawCelebration: () => void,
+    drawPostSnakes: () => void,
   ) => void;
   /** Read compact crash and goal history from the same predicted state used by renderTo. */
   readPredictedVisualState: () => {
@@ -323,14 +329,22 @@ export const useGameEngine = ({
       cellSize: number,
       rotation: number,
       localUserId: number | undefined,
+      animMs: number,
+      reducedMotion: boolean,
+      localSkinRef: string | undefined,
       drawCelebration: () => void,
+      drawPostSnakes: () => void,
     ) => {
       engineRef.current?.render(
         canvas,
         cellSize,
         rotation,
         localUserId,
+        animMs,
+        reducedMotion,
+        localSkinRef,
         drawCelebration,
+        drawPostSnakes,
       );
     },
     [],
@@ -397,6 +411,10 @@ export const useGameEngine = ({
       // Parse and send to server. The command envelope contains only u32
       // fields (CommandId tick/user_id/sequence_number), so JSON.parse is
       // lossless here — unlike the inbound event path with its u64 hashes.
+      if (!commandMessageJson) {
+        console.error('WASM engine did not return a command envelope');
+        return false;
+      }
       const commandMessage: GameCommandMessage = JSON.parse(commandMessageJson);
       console.log('Command message from engine:', commandMessage, 'at', Date.now());
 

@@ -74,6 +74,29 @@ pub trait Database: Send + Sync {
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP
 
+    /// Resolve one verified CrazyGames identity into a durable Snaketron
+    /// account. Implementations own the uniqueness/claim transaction; callers
+    /// must never construct an account from unverified portal profile data.
+    /// Initial browser preferences may be imported only when an eligible
+    /// authenticated guest is actually claimed with explicit permission; a
+    /// newly created provider identity must not inherit unscoped state from a
+    /// shared browser. A consent check is read-only and returns a typed outcome
+    /// when an eligible guest could be claimed.
+    async fn resolve_crazygames_account(
+        &self,
+        profile: &CrazyGamesProfile,
+        guest_candidate_user_id: Option<i32>,
+        guest_promotion: CrazyGamesGuestPromotion,
+        initial_preferences: Option<&CrazyGamesPreferences>,
+    ) -> Result<CrazyGamesAccountOutcome>;
+    /// Save the CrazyGames-linked user's preference snapshot. Implementations
+    /// must reject users which are not linked to CrazyGames.
+    async fn save_crazygames_preferences(
+        &self,
+        user_id: i32,
+        preferences: &CrazyGamesPreferences,
+    ) -> Result<CrazyGamesPreferences>;
+
     // MMR operations for ranked/casual queues
     async fn update_user_mmr_by_mode(
         &self,
@@ -82,6 +105,12 @@ pub trait Database: Send + Sync {
         queue_mode: &common::QueueMode,
     ) -> Result<i32>; // Returns new MMR
     async fn get_user_mmrs(&self, user_ids: &[i32]) -> Result<HashMap<i32, (i32, i32)>>; // Returns (ranked_mmr, casual_mmr) for each user
+
+    /// Guest status for a batch of accounts, for callers rendering rosters of
+    /// public names. Display names are not unique across guests, so a name
+    /// alone cannot identify an account; only the ID can. IDs with no account
+    /// are absent from the map rather than defaulted.
+    async fn get_users_are_guests(&self, user_ids: &[i32]) -> Result<HashMap<i32, bool>>;
 
     // Ranking/leaderboard operations
     async fn upsert_ranking(
@@ -130,6 +159,19 @@ pub trait Database: Send + Sync {
         season: Season,
         limit: usize,
     ) -> Result<Vec<HighScoreEntry>>;
+    /// Return a global Solo snapshot for news. Backends must opt into leader
+    /// claims by proving their read is globally ordered and by inspecting the
+    /// actual top row before applying public-attribution filters.
+    async fn get_news_high_score_snapshot(
+        &self,
+        _game_type: &common::GameType,
+        _season: Season,
+    ) -> Result<NewsHighScoreSnapshot> {
+        Ok(NewsHighScoreSnapshot {
+            leader: None,
+            coverage: NewsLeaderboardCoverage::BoundedSample,
+        })
+    }
 
     // Game operations
     /// Allocate a globally unique game ID from durable storage.
@@ -146,6 +188,14 @@ pub trait Database: Send + Sync {
     ) -> Result<i32>;
     async fn get_game_by_id(&self, game_id: i32) -> Result<Option<Game>>;
     async fn get_game_by_code(&self, game_code: &str) -> Result<Option<Game>>;
+    /// Return the newest durable completed games first.
+    ///
+    /// Backends that do not provide a completion index safely expose no recent
+    /// games instead of blocking unrelated server features on this optional
+    /// read model.
+    async fn get_recent_completed_games(&self, _limit: usize) -> Result<Vec<Game>> {
+        Ok(Vec::new())
+    }
     async fn update_game_status(&self, game_id: i32, status: &str) -> Result<()>;
     /// Persist the final authoritative state for a completed runtime game.
     ///
@@ -158,6 +208,83 @@ pub trait Database: Send + Sync {
         server_id: i32,
         game_state: &GameState,
     ) -> Result<()>;
+    /// Read one user's compact match history. Implementations must use the
+    /// supplied authenticated user ID as the partition scope and treat cursors
+    /// as opaque, scope-bound continuation tokens.
+    async fn get_match_history(
+        &self,
+        _user_id: i32,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        Err(anyhow::anyhow!(
+            "match history is not supported by this database"
+        ))
+    }
+    /// The highest game id ever handed out.
+    ///
+    /// Ids come from a monotonic counter, so this is what separates "this
+    /// match is still being played" from "this id was never issued" — the
+    /// durable game row only appears at completion, and a shared link from a
+    /// live match has to resolve to something truthful in the meantime.
+    async fn latest_allocated_game_id(&self) -> Result<Option<i32>> {
+        Ok(None)
+    }
+    /// Read the permanent, publicly shareable summary of one completed game.
+    ///
+    /// This backs the public game page, so it must resolve for the life of the
+    /// product: implementations read the canonical, TTL-free match summary
+    /// rather than the retention-bounded completed-game snapshot.
+    async fn get_public_game_summary(&self, _game_id: i32) -> Result<Option<MatchHistorySummary>> {
+        Ok(None)
+    }
+    /// Read the global administrative history projection without loading full
+    /// game snapshots.
+    async fn get_admin_match_history(
+        &self,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<MatchHistoryPage> {
+        Err(anyhow::anyhow!(
+            "administrative match history is not supported by this database"
+        ))
+    }
+    /// Missing configuration intentionally resolves to safe defaults so test
+    /// and alternate database implementations fail closed for ads.
+    async fn get_runtime_config(&self) -> Result<RuntimeConfigRecord> {
+        Ok(RuntimeConfigRecord::default())
+    }
+    async fn update_runtime_config(
+        &self,
+        _expected_version: u64,
+        _config: &RuntimeConfig,
+        _actor: &RuntimeConfigActor,
+    ) -> Result<RuntimeConfigRecord> {
+        Err(anyhow::anyhow!(
+            "runtime configuration updates are not supported by this database"
+        ))
+    }
+    async fn get_runtime_config_audit(
+        &self,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<RuntimeConfigAuditPage> {
+        Err(anyhow::anyhow!(
+            "runtime configuration audit is not supported by this database"
+        ))
+    }
+    /// Atomically reserve one pre-match ad-break opportunity for every
+    /// targeted user. Alternate database implementations fail closed for ads.
+    async fn try_claim_pre_match_ad_break(
+        &self,
+        _break_id: &str,
+        _user_ids: &[u32],
+        _now_ms: i64,
+        _minimum_interval_ms: i64,
+        _policy_version: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     /// Apply one immutable completion effect with its idempotency marker in
     /// the same database transaction as the mutation.
     async fn apply_completion_effect(

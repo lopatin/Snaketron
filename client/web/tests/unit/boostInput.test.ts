@@ -343,17 +343,40 @@ test('a rejected Boost edge is not resent until the player supplies a new edge',
 test('Hold pointer edges start and stop Boost while its synthesized click is inert', () => {
   const controller = new BoostInputController('hold');
 
-  assert.deepEqual(controller.handlePointerDown(context()), {
+  assert.deepEqual(controller.handlePointerDown(11, context()), {
     preventDefault: true,
     command: 'ActivateBoost',
   });
-  assert.equal(controller.handlePointerDown(context({ intent: true })).command, null);
   assert.equal(controller.handleButtonPress(context({ intent: true, active: true })).command, null);
-  assert.deepEqual(controller.handlePointerUp(context({ intent: true, active: true })), {
+  assert.deepEqual(controller.handlePointerUp(11, context({ intent: true, active: true })), {
     preventDefault: true,
     command: 'DeactivateBoost',
   });
-  assert.equal(controller.handlePointerUp(context()).command, null);
+  assert.equal(controller.handlePointerUp(11, context()).command, null);
+});
+
+// Touch surfaces render two physical Boost buttons (the arena meter and the
+// mobile NOS button). Holds are counted: the level a player is expressing
+// ends when the LAST finger lifts, never when the first one does.
+test('a second button joining a Hold keeps Boost until the last release', () => {
+  const controller = new BoostInputController('hold');
+
+  assert.equal(controller.handlePointerDown(11, context()).command, 'ActivateBoost');
+  assert.equal(
+    controller.handlePointerDown(12, context({ intent: true, active: true })).command,
+    null,
+    'a second button joining the hold publishes nothing new',
+  );
+  assert.equal(
+    controller.handlePointerUp(11, context({ intent: true, active: true })).command,
+    null,
+    'the first release must not end a hold another button still expresses',
+  );
+  assert.deepEqual(controller.handlePointerUp(12, context({ intent: true, active: true })), {
+    preventDefault: true,
+    command: 'DeactivateBoost',
+  });
+  assert.equal(controller.handlePointerUp(12, context()).command, null);
 });
 
 // The pointer equivalent of the disconnect case: the press is recorded even
@@ -361,7 +384,7 @@ test('Hold pointer edges start and stop Boost while its synthesized click is ine
 test('a pointer hold started while disconnected still releases cleanly', () => {
   const controller = new BoostInputController('hold');
 
-  assert.deepEqual(controller.handlePointerDown(context({ interactionActive: false })), {
+  assert.deepEqual(controller.handlePointerDown(11, context({ interactionActive: false })), {
     preventDefault: true,
     command: null,
   });
@@ -370,7 +393,32 @@ test('a pointer hold started while disconnected still releases cleanly', () => {
     'ActivateBoost',
   );
   assert.equal(
-    controller.handlePointerUp(context({ intent: true, active: true })).command,
+    controller.handlePointerUp(11, context({ intent: true, active: true })).command,
+    'DeactivateBoost',
+  );
+});
+
+// Mobile can hide the page or disable a button without delivering that
+// button's release. The binding uses controller ownership to distinguish a
+// live pointer from its stale cached id when play resumes.
+test('a safety release invalidates stale pointer ownership for the next Hold', () => {
+  const controller = new BoostInputController('hold');
+
+  assert.equal(controller.handlePointerDown(11, context()).command, 'ActivateBoost');
+  assert.equal(controller.isPointerHeld(11), true);
+  assert.equal(
+    controller.releaseHeld(context({ intent: true, active: true })).command,
+    'DeactivateBoost',
+  );
+  assert.equal(controller.isPointerHeld(11), false);
+
+  assert.equal(
+    controller.handlePointerDown(12, context({ intent: false, active: false })).command,
+    'ActivateBoost',
+  );
+  assert.equal(controller.isPointerHeld(12), true);
+  assert.equal(
+    controller.handlePointerUp(12, context({ intent: true, active: true })).command,
     'DeactivateBoost',
   );
 });
@@ -378,8 +426,8 @@ test('a pointer hold started while disconnected still releases cleanly', () => {
 test('Toggle pointer edges are inert and click changes the durable level', () => {
   const controller = new BoostInputController('toggle');
 
-  assert.equal(controller.handlePointerDown(context()).command, null);
-  assert.equal(controller.handlePointerUp(context()).command, null);
+  assert.equal(controller.handlePointerDown(11, context()).command, null);
+  assert.equal(controller.handlePointerUp(11, context()).command, null);
   assert.equal(controller.handleButtonPress(context()).command, 'ActivateBoost');
   assert.equal(
     controller.handleButtonPress(context({ intent: true, active: true })).command,
@@ -421,7 +469,7 @@ test('explicit teardown stops a latched Boost exactly once', () => {
   );
 
   const pending = new BoostInputController('hold');
-  pending.handlePointerDown(context());
+  pending.handlePointerDown(11, context());
   assert.equal(
     pending.teardown(context({ intent: true, interactionActive: false })).command,
     'DeactivateBoost',
@@ -429,8 +477,8 @@ test('explicit teardown stops a latched Boost exactly once', () => {
   );
 
   const deferredRelease = new BoostInputController('hold');
-  deferredRelease.handlePointerDown(context());
-  deferredRelease.handlePointerUp(context({ intent: true, interactionActive: false }));
+  deferredRelease.handlePointerDown(11, context());
+  deferredRelease.handlePointerUp(11, context({ intent: true, interactionActive: false }));
   assert.equal(
     deferredRelease.teardown(context({ intent: true, interactionActive: false })).command,
     'DeactivateBoost',

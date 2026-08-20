@@ -12,7 +12,7 @@ pub mod test_environment;
 #[allow(unused_imports)]
 pub use mock_jwt::MockJwtVerifier;
 #[allow(unused_imports)]
-pub use test_client::TestClient;
+pub use test_client::{TestClient, is_unsolicited_push};
 #[allow(unused_imports)]
 pub use test_environment::TestEnvironment;
 

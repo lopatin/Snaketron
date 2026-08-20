@@ -2,6 +2,7 @@ import React, { useId, useRef, useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
 import { FormEventHandler, JoinGameModalProps } from '../types';
+import { gameStorage } from '../services/gameStorage';
 import {
   getLobbyCodeValidationError,
   normalizeLobbyCodeInput,
@@ -13,7 +14,7 @@ const generateGuestNickname = (): string =>
 
 const guestNickname = (): string => {
   try {
-    const savedNickname = window.localStorage.getItem('savedUsername')?.trim();
+    const savedNickname = gameStorage.getItem('savedUsername')?.trim();
     if (savedNickname && savedNickname.length >= 3) {
       return savedNickname;
     }
@@ -55,7 +56,7 @@ const joinErrorMessage = (error: unknown): string => {
 };
 
 function JoinGameModal({ isOpen, onClose }: JoinGameModalProps) {
-  const { user, createGuest, loading: isAuthLoading } = useAuth();
+  const { user, ensurePlayableSession, loading: isAuthLoading } = useAuth();
   const { isConnected, joinLobby } = useWebSocket();
   const [codeInput, setCodeInput] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -97,8 +98,8 @@ function JoinGameModal({ isOpen, onClose }: JoinGameModalProps) {
     try {
       if (!user) {
         setJoinStatus('creating-guest');
-        await createGuest(guestNickname());
       }
+      await ensurePlayableSession(guestNickname());
 
       setJoinStatus('joining');
       await joinLobby(lobbyCode);

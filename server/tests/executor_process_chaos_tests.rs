@@ -53,8 +53,8 @@ const OPERATION_TIMEOUT: Duration = DEFAULT_COORDINATION_OPERATION_TIMEOUT;
 const RENEW_INTERVAL: Duration = Duration::from_millis(200);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_RETENTION: Duration = Duration::from_secs(60);
-const RECOVERABLE_REPLACEMENT_DELAY: Duration = Duration::from_secs(30);
-const EXPIRED_REPLACEMENT_DELAY: Duration = Duration::from_secs(31);
+const RECOVERABLE_REPLACEMENT_AGE: Duration = Duration::from_secs(30);
+const EXPIRED_REPLACEMENT_ADDITIONAL_AGE: Duration = Duration::from_secs(31);
 const PARTITION: u32 = 7;
 
 #[derive(Debug, Clone, Copy)]
@@ -376,18 +376,24 @@ async fn acquire_lease_while_coordinating(
     let mut renew = tokio::time::interval(RENEW_INTERVAL);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            acquired = store.try_acquire(partition, boot_id) => {
-                if let Some(guard) = acquired? {
-                    return Ok(guard);
+        // Lease acquisition mutates Redis. Never cancel this future after it
+        // may have dispatched: Redis could create the lease while the client
+        // drops its response, orphaning the unknown token for a full TTL.
+        let acquire = store.try_acquire(partition, boot_id);
+        tokio::pin!(acquire);
+        let acquired = loop {
+            tokio::select! {
+                result = &mut acquire => break result?,
+                _ = renew.tick() => {
+                    ensure!(
+                        coordinator.renew(coordinator_token).await?,
+                        "successor lost its coordinator term before partition takeover"
+                    );
                 }
             }
-            _ = renew.tick() => {
-                ensure!(
-                    coordinator.renew(coordinator_token).await?,
-                    "successor lost its coordinator term before partition takeover"
-                );
-            }
+        };
+        if let Some(guard) = acquired {
+            return Ok(guard);
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
@@ -867,9 +873,25 @@ async fn assert_successor_assignment(
     Ok(())
 }
 
+fn game_id_for_seed(seed: u32) -> u32 {
+    // Keep the ID in `PARTITION` while reserving one additional partition
+    // stride for the retention scenario's derived `expired_game_id`.
+    const MAX_BUCKET: u32 = (u32::MAX - PARTITION - PARTITION_COUNT) / PARTITION_COUNT;
+    let bucket = seed % (MAX_BUCKET + 1);
+    bucket * PARTITION_COUNT + PARTITION
+}
+
 fn unique_game_id() -> u32 {
-    let raw = Uuid::new_v4().as_u128() as u32 % 100_000_000;
-    raw * PARTITION_COUNT + PARTITION
+    game_id_for_seed(Uuid::new_v4().as_u128() as u32)
+}
+
+#[test]
+fn generated_game_ids_preserve_partition_and_derived_id_headroom() {
+    for seed in [0, 1, 85_899_345, 100_000_000, u32::MAX] {
+        let game_id = game_id_for_seed(seed);
+        assert_eq!(game_id % PARTITION_COUNT, PARTITION);
+        assert!(game_id.checked_add(PARTITION_COUNT).is_some());
+    }
 }
 
 async fn run_fault_scenario(redis_url: &str, fault: Fault) -> Result<()> {
@@ -954,14 +976,25 @@ async fn run_fault_scenario(redis_url: &str, fault: Fault) -> Result<()> {
         )
         .await?;
         let assigned = successor.wait_for_event("ASSIGNED").await?;
-        assert_successor_assignment(&mut redis, &namespace, &successor_id, &assigned).await?;
+        let assignment_elapsed = fault_started.elapsed();
+        // Read RECOVERED and sample the product latency before performing the
+        // observer's Redis-heavy assignment audit. The worker continues in
+        // parallel, so doing that audit here can leave an already-emitted
+        // RECOVERED event sitting in the pipe and misreport observer delay as
+        // executor takeover time. The assignment is still fully checked below.
+        let successor_ready = successor.wait_for_event("READY").await?;
+        ensure!(successor_ready.boot_id == successor_id.to_string());
+        let lease_elapsed = fault_started.elapsed();
         let recovered = successor.wait_for_event("RECOVERED").await?;
         ensure!(recovered.boot_id == successor_id.to_string());
+        let recovery_elapsed = fault_started.elapsed();
         ensure!(
-            fault_started.elapsed() < Duration::from_secs(5),
-            "{} takeover exceeded five seconds: {:?}",
+            recovery_elapsed < Duration::from_secs(5),
+            "{} takeover exceeded five seconds: {:?} (assignment {:?}, partition lease {:?})",
             fault.label(),
-            fault_started.elapsed()
+            recovery_elapsed,
+            assignment_elapsed,
+            lease_elapsed
         );
         assert_successor_state(
             &mut redis,
@@ -1053,11 +1086,71 @@ async fn checkpoint_then_sigkill(
     Ok(stream_id)
 }
 
+async fn assert_checkpoint_retention(
+    redis: &mut redis::aio::ConnectionManager,
+    namespace: &ClusterNamespace,
+    game_id: u32,
+) -> Result<()> {
+    let expected_ms = i64::try_from(RECOVERY_RETENTION.as_millis())?;
+    for key in [
+        namespace.recovery(game_id),
+        RedisKeys::game_snapshot(game_id),
+    ] {
+        let ttl_ms: i64 = redis.pttl(&key).await?;
+        ensure!(
+            ttl_ms <= expected_ms && ttl_ms > expected_ms - 15_000,
+            "checkpoint key {key} did not carry the configured 60-second retention: {ttl_ms}ms"
+        );
+    }
+    Ok(())
+}
+
+/// Advance one test-owned Redis TTL as though `elapsed` passed. Production
+/// still writes the real lease and recovery expirations; only the isolated
+/// acceptance-test keys are aged without making CI idle.
+async fn advance_key_age(
+    redis: &mut redis::aio::ConnectionManager,
+    key: &str,
+    elapsed: Duration,
+) -> Result<i64> {
+    let elapsed_ms = i64::try_from(elapsed.as_millis())?;
+    redis::Script::new(
+        r#"
+        local ttl = redis.call('PTTL', KEYS[1])
+        local elapsed = tonumber(ARGV[1])
+        if ttl <= 0 then return ttl end
+        if ttl <= elapsed then
+            redis.call('DEL', KEYS[1])
+            return 0
+        end
+        local remaining = ttl - elapsed
+        redis.call('PEXPIRE', KEYS[1], remaining)
+        return remaining
+        "#,
+    )
+    .key(key)
+    .arg(elapsed_ms)
+    .invoke_async(redis)
+    .await
+    .map_err(Into::into)
+}
+
+async fn advance_checkpoint_age(
+    redis: &mut redis::aio::ConnectionManager,
+    namespace: &ClusterNamespace,
+    game_id: u32,
+    elapsed: Duration,
+) -> Result<[i64; 2]> {
+    let recovery_ttl = advance_key_age(redis, &namespace.recovery(game_id), elapsed).await?;
+    let snapshot_ttl = advance_key_age(redis, &RedisKeys::game_snapshot(game_id), elapsed).await?;
+    Ok([recovery_ttl, snapshot_ttl])
+}
+
 /// Exercise the acceptance matrix's configured 60-second recovery retention at
-/// its two documented sole-task replacement boundaries. Both incumbents checkpoint a live game and
-/// then receive real SIGKILL. One replacement process starts after 30 seconds;
-/// the other namespace has no replacement at all until its checkpoint is more
-/// than 61 seconds old.
+/// its two documented sole-task replacement boundaries. Both incumbents
+/// checkpoint a live game and then receive real SIGKILL. Their actual Redis
+/// TTLs are advanced through the 30-second and 61-second states so the test
+/// preserves those boundaries without idling for a real minute.
 async fn run_recovery_retention_scenario(redis_url: &str) -> Result<()> {
     let recover_namespace =
         ClusterNamespace::new(format!("process-chaos-retain-{}", Uuid::new_v4()))?;
@@ -1102,6 +1195,7 @@ async fn run_recovery_retention_scenario(redis_url: &str) -> Result<()> {
             recovered_state.clone(),
         )
         .await?;
+        assert_checkpoint_retention(&mut redis, &recover_namespace, recovered_game_id).await?;
         // Command streams are regional rather than cluster-namespace scoped.
         // The first command is already durably checkpointed and ACKed, so
         // remove its isolated harness stream before creating the independent
@@ -1118,10 +1212,43 @@ async fn run_recovery_retention_scenario(redis_url: &str) -> Result<()> {
             expired_state,
         )
         .await?;
+        assert_checkpoint_retention(&mut redis, &expire_namespace, expired_game_id).await?;
         let bus = game_bus(redis_url).await?;
 
+        // The dead incumbents cannot renew their partition leases while these
+        // checkpoint TTLs age. Advance those leases by the same first interval
+        // so successor acquisition observes the same state as a real 30s wait.
+        let recover_lease_ttl = advance_key_age(
+            &mut redis,
+            &recover_namespace.partition_lease(PARTITION),
+            RECOVERABLE_REPLACEMENT_AGE,
+        )
+        .await?;
+        let expire_lease_ttl = advance_key_age(
+            &mut redis,
+            &expire_namespace.partition_lease(PARTITION),
+            RECOVERABLE_REPLACEMENT_AGE,
+        )
+        .await?;
+        ensure!(recover_lease_ttl <= 0 && expire_lease_ttl <= 0);
+
         // Neither SIGKILLed process released or renewed its incumbent token.
-        tokio::time::sleep(RECOVERABLE_REPLACEMENT_DELAY).await;
+        let recover_ttls = advance_checkpoint_age(
+            &mut redis,
+            &recover_namespace,
+            recovered_game_id,
+            RECOVERABLE_REPLACEMENT_AGE,
+        )
+        .await?;
+        let expire_ttls = advance_checkpoint_age(
+            &mut redis,
+            &expire_namespace,
+            expired_game_id,
+            RECOVERABLE_REPLACEMENT_AGE,
+        )
+        .await?;
+        ensure!(recover_ttls.into_iter().all(|ttl| ttl > 0));
+        ensure!(expire_ttls.into_iter().all(|ttl| ttl > 0));
         ensure!(
             bus.get_recovery(&recover_namespace, recovered_game_id)
                 .await?
@@ -1163,8 +1290,24 @@ async fn run_recovery_retention_scenario(redis_url: &str) -> Result<()> {
             serde_json::to_value(&recovered.game_state)? == serde_json::to_value(&recovered_state)?,
             "30-second replacement changed the authoritative game state"
         );
+        assert_checkpoint_retention(&mut redis, &recover_namespace, recovered_game_id).await?;
 
-        tokio::time::sleep(EXPIRED_REPLACEMENT_DELAY).await;
+        let refreshed_ttls = advance_checkpoint_age(
+            &mut redis,
+            &recover_namespace,
+            recovered_game_id,
+            EXPIRED_REPLACEMENT_ADDITIONAL_AGE,
+        )
+        .await?;
+        let expired_ttls = advance_checkpoint_age(
+            &mut redis,
+            &expire_namespace,
+            expired_game_id,
+            EXPIRED_REPLACEMENT_ADDITIONAL_AGE,
+        )
+        .await?;
+        ensure!(refreshed_ttls.into_iter().all(|ttl| ttl > 0));
+        ensure!(expired_ttls.into_iter().all(|ttl| ttl == 0));
         ensure!(
             bus.get_recovery(&recover_namespace, recovered_game_id)
                 .await?

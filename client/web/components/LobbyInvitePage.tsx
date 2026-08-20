@@ -14,7 +14,7 @@ const LobbyInvitePage: React.FC = () => {
   const { lobbyCode: rawCode } = useParams<{ lobbyCode: string }>();
   const lobbyCode = (rawCode ?? '').toUpperCase();
   const navigate = useNavigate();
-  const { user, createGuest, loading: authLoading, getToken } = useAuth();
+  const { user, ensurePlayableSession, loading: authLoading, getToken } = useAuth();
   const { isConnected, joinLobby, waitForSessionReady } = useWebSocket();
 
   const inFlightRef = useRef(false);
@@ -30,16 +30,11 @@ const LobbyInvitePage: React.FC = () => {
   }, [user]);
 
   const ensureAuthenticatedSession = useCallback(async () => {
-    let activeUser = latestUserRef.current;
-    let resolvedToken: string | null = getToken();
-
-    if (!activeUser) {
-      setStatusMessage('Creating guest profile…');
-      const { user: guestUser, token } = await createGuest(generateGuestNickname(lobbyCode));
-      latestUserRef.current = guestUser;
-      activeUser = guestUser;
-      resolvedToken = token;
-    }
+    setStatusMessage(latestUserRef.current ? 'Verifying player session…' : 'Creating player profile…');
+    const { user: activeUser, token: resolvedToken } = await ensurePlayableSession(
+      generateGuestNickname(lobbyCode),
+    );
+    latestUserRef.current = activeUser;
 
     setStatusMessage('Authenticating session…');
     const token = resolvedToken ?? getToken();
@@ -48,7 +43,12 @@ const LobbyInvitePage: React.FC = () => {
     }
 
     await waitForSessionReady();
-  }, [createGuest, getToken, lobbyCode, waitForSessionReady]);
+  }, [
+    ensurePlayableSession,
+    getToken,
+    lobbyCode,
+    waitForSessionReady,
+  ]);
 
   useEffect(() => {
     if (hasSucceededRef.current) {

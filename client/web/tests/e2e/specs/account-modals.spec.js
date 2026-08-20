@@ -18,7 +18,41 @@ test.beforeEach(async ({ page }) => {
 
       let payload;
       if (url.endsWith('/api/auth/me')) {
-        payload = { id: 7, username: 'ModalTester', mmr: 1234, isGuest: false };
+        payload = { id: 7, username: 'ModalTester', mmr: 1234, isGuest: false, isAdmin: false };
+      } else if (url.endsWith('/api/config')) {
+        payload = {
+          version: 1,
+          announcement: { enabled: false, message: '' },
+        };
+      } else if (url.includes('/api/history?')) {
+        payload = {
+          entries: [{
+            schemaVersion: 1,
+            gameId: 99,
+            startedAtMs: 1_725_000_000_000,
+            endedAtMs: 1_725_000_125_000,
+            durationMs: 125_000,
+            mode: 'duel',
+            modeLabel: 'Duel',
+            queueMode: 'competitive',
+            isPrivate: false,
+            isStressTest: false,
+            completedByInactivity: false,
+            players: [{
+              userId: 7,
+              username: 'ModalTester',
+              teamId: null,
+              score: 4321,
+              teamScore: null,
+              xpGained: 80,
+              mmrDelta: 12,
+              outcome: 'win',
+            }],
+            winnerUserIds: [7],
+            snapshotAvailableUntilMs: 1_727_592_000_000,
+          }],
+          nextCursor: null,
+        };
       } else if (url.endsWith('/api/regions')) {
         payload = [];
       } else if (url.endsWith('/api/regions/user-counts')) {
@@ -62,7 +96,12 @@ test('Profile and History open over the current page without navigation', async 
   const historyDialog = page.getByRole('dialog', { name: 'History' });
   await expect(historyDialog).toBeVisible();
   await expect(page.getByRole('dialog')).toHaveCount(1);
-  await expect(historyDialog.getByText('Match history is coming soon', { exact: true })).toBeVisible();
+  await expect(historyDialog.getByText('Duel', { exact: true })).toBeVisible();
+  await expect(historyDialog.getByText('Victory', { exact: true })).toBeVisible();
+  await expect(historyDialog.getByText('4,321', { exact: true })).toBeVisible();
+  await expect(historyDialog.getByText('+80', { exact: true })).toBeVisible();
+  await expect(historyDialog.getByText('+12', { exact: true })).toBeVisible();
+  await expect(historyDialog.getByText('2:05', { exact: true })).toBeVisible();
   expect(page.url()).toBe(originalUrl);
 
   await page.setViewportSize({ width: 360, height: 720 });

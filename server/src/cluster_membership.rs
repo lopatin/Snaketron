@@ -15,20 +15,28 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
-/// Bumped for the pre-match readiness gate, Boost in Solo and free-for-all,
-/// and the idle-kick system layered on top of both.
+/// Version 11 introduces deterministic death causes in events and recovery
+/// state. Mixed executors must not publish incompatible `SnakeDied` shapes.
 ///
-/// Every one of those changes is invisible to serde: `readiness`,
+/// Version 10 introduces combo-aware food events and state. Mixed executors
+/// would disagree about growth, score, and the event wire shape, so they must
+/// not co-own partitions during a rolling deploy.
+///
+/// Version 9 expanded executors from ten to fifty partitions. Partition
+/// selection and Redis key families are not encoded in serde payloads, so a
+/// mixed deployment would otherwise route the same game to different owners.
+///
+/// The prior version also covered serde-invisible readiness, Boost, and
+/// idle-kick changes: `readiness`,
 /// `simulation_epoch_ms`, `BoostConfig::unlimited`, `player_last_activity_ticks`,
-/// `idle_kicked_user_ids` and `completed_by_inactivity` all default. A
-/// previous-version executor would therefore deserialize a *held* checkpoint as
-/// an ungated match and simulate the whole elapsed gate window in one burst,
-/// would run a Solo or free-for-all match at half its intended simulation rate,
-/// and would resume an in-flight match with every player's idle clock reset to
-/// tick zero — silently re-arming or skipping kicks. The version gate makes it
-/// refuse the envelope instead, and keeps mixed-version executors from
-/// co-owning partitions during a rolling deploy.
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 8;
+/// `idle_kicked_user_ids` and `completed_by_inactivity` all default. Executors
+/// older than version 8 could therefore deserialize a *held* checkpoint as an
+/// ungated match and simulate the whole elapsed gate window in one burst, run a
+/// Solo or free-for-all match at half its intended simulation rate, or resume
+/// with every player's idle clock reset to tick zero. The version gate refuses
+/// incompatible envelopes and keeps mixed-version executors from co-owning
+/// partitions during a rolling deploy.
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 11;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);
@@ -184,6 +192,10 @@ impl ClusterNamespace {
 
     pub fn recovery(&self, game_id: u32) -> String {
         RedisKeys::cluster_recovery(&self.region, game_id)
+    }
+
+    pub fn replay_journal(&self, game_id: u32) -> String {
+        RedisKeys::cluster_replay_journal(&self.region, game_id)
     }
 
     pub fn planned_handoff_watermark(&self, game_id: u32) -> String {

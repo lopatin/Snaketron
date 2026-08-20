@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { AccountModalView } from './AccountModal';
 import { HomeHeader } from './HomeHeader';
 import { GameStartForm } from './GameStartForm';
@@ -14,6 +14,7 @@ import { useWebSocket } from '../contexts/WebSocketContext';
 import { useRegions } from '../hooks/useRegions';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
 import { isConnectionReady } from '../utils/connectionBanner';
+import { readHomeNotice, type HomeNotice } from '../utils/homeNotice';
 import { LobbyGameMode } from '../types';
 
 const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
@@ -25,7 +26,8 @@ interface NewHomeProps {
 
 export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
-  const { user, createGuest, logout } = useAuth();
+  const location = useLocation();
+  const { user, ensurePlayableSession, logout } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -34,6 +36,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     onMessage,
     currentRegionUrl,
     currentLobby,
+    isLobbyLeader,
     lobbyMembers,
     createLobby,
     leaveLobby,
@@ -48,6 +51,19 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [homeNotice, setHomeNotice] = useState<HomeNotice | null>(null);
+
+  // A redirect here (an invite link that went nowhere, say) can leave a
+  // sentence explaining itself. Consume it once and strip it from history, so
+  // a reload does not re-announce something the player already read.
+  useEffect(() => {
+    const notice = readHomeNotice(location.state);
+    if (!notice) {
+      return;
+    }
+    setHomeNotice(notice);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.pathname, location.state, navigate]);
 
   // Use regions hook for live data
   const {
@@ -107,17 +123,16 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     nickname: string,
     isCompetitive: boolean
   ) => {
-    if (isLobbyQueued) {
+    if (isLobbyQueued || !isLobbyLeader) {
       return;
     }
 
     setIsLoading(true);
     setStartError(null);
     try {
-      // If not logged in, create guest user
-      if (!user) {
-        await createGuest(nickname);
-      }
+      // In CrazyGames this waits for verified account restoration before it
+      // may create a guest. In other builds it preserves the existing flow.
+      await ensurePlayableSession(nickname);
 
       // Wait for the active regional socket to acknowledge this exact session
       // before issuing lobby or matchmaking commands.
@@ -177,13 +192,11 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
 
     setIsCreatingInvite(true);
     try {
-      if (!user) {
-        try {
-          await createGuest(generateGuestNickname());
-        } catch (error) {
-          console.error('Guest creation failed for lobby invite:', error);
-          return;
-        }
+      try {
+        await ensurePlayableSession(generateGuestNickname());
+      } catch (error) {
+        console.error('Player session creation failed for lobby invite:', error);
+        return;
       }
 
       await waitForSessionReady();
@@ -238,6 +251,8 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
           regionsLoading={regionsLoading}
           regionsError={regionsError}
           hasSelectedRegion={currentRegionId !== ''}
+          notice={homeNotice}
+          onDismissNotice={() => setHomeNotice(null)}
         />
 
         <main className="home-main">
@@ -248,6 +263,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
               isLoading={isLoading}
               isAuthenticated={user !== null && !user.isGuest}
               isLobbyQueued={isLobbyQueued}
+              isLobbyLeader={isLobbyLeader}
               lobbyPreferences={lobbyPreferences}
               onPreferencesChange={updateLobbyPreferences}
               onSignInClick={onOpenAuth}
@@ -283,6 +299,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
         isOpen={showInviteModal}
         onClose={() => setShowInviteModal(false)}
         lobbyCode={currentLobby?.code || null}
+        region={currentLobby?.region || null}
       />
 
       {/* Join Game Modal */}

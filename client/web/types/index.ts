@@ -6,9 +6,11 @@ export type {
   Position,
   Snake,
   SnakeBoost,
+  SnakeCombo,
   Arena,
   BoostConfig,
   BoostPad,
+  ComboConfig,
   TeamZoneConfig,
   TeamId,
   Player,
@@ -18,12 +20,23 @@ export type {
   GameMode,
   QueueMode,
   GameProperties,
+  DeathCause,
+  HighlightClip,
+  ScenarioAddons,
+  ScenarioPlaybackSegment,
+  ScenarioPresentation,
+  ScenarioScript,
   CustomGameSettings,
   GameEvent,
   GameEventMessage,
   GameCommandMessage,
   CommandId,
   SyncStatus,
+  AdBreakResolution,
+  BannerAdsConfig,
+  ClientAdsConfig,
+  LobbyAdBreakView,
+  VideoAdsConfig,
   LobbyMember,
   WSMessage,
   // HTTP DTOs (server/src/api/*)
@@ -39,11 +52,34 @@ export type {
   UserRankingResponse,
   RegionMetadata,
   HealthResponse,
+  MatchHistoryPage,
+  MatchHistoryPlayer,
+  MatchHistorySummary,
+  PublicRuntimeConfig,
+  RuntimeAdsConfig,
+  RuntimeAnnouncementConfig,
+  RuntimeConfig,
+  RuntimeConfigActor,
+  RuntimeConfigAuditPage,
+  RuntimeConfigRecord,
+  RuntimeHistoryConfig,
+  UpdateRuntimeConfigRequest,
 } from './generated';
 
 // Typed WebSocket protocol surface derived from the generated WSMessage union.
 import type { OutboundMessage, WSMessageTag, TypedMessage } from './protocol';
-import type { Direction, LobbyMember } from './generated';
+import type {
+  Challenge,
+  ChallengeInbox,
+  RematchState,
+  ClientAdsConfig,
+  Direction,
+  LobbyAdBreakView,
+  LobbyMember,
+  OnlinePlayer,
+  RegionRoster,
+} from './generated';
+export type { Challenge, ChallengeInbox, OnlinePlayer, RegionRoster, RematchState, RematchParticipant } from './generated';
 export type { OutboundMessage, WSMessageTag, TypedMessage, PayloadOf } from './protocol';
 
 // Leaderboard entry aliases: the components predate the generated names but the
@@ -63,7 +99,17 @@ export interface User {
   mmr?: number;
   token?: string;
   isGuest?: boolean;
+  isAdmin?: boolean;
+  authSource?: 'crazygames' | string;
+  avatarUrl?: string | null;
 }
+
+export type CrazyGamesSessionStatus =
+  | 'not-applicable'
+  | 'resolving'
+  | 'linked'
+  | 'guest'
+  | 'error';
 
 export interface AuthContextType {
   user: User | null;
@@ -71,9 +117,15 @@ export interface AuthContextType {
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string | null) => Promise<void>;
   createGuest: (nickname: string) => Promise<{ user: User; token: string }>;
+  ensurePlayableSession: (nickname?: string) => Promise<{ user: User; token: string }>;
   updateGuestNickname: (nickname: string) => void;
   logout: () => void;
   getToken: () => string | null;
+  crazyGamesSessionStatus: CrazyGamesSessionStatus;
+  crazyGamesSessionError: string | null;
+  retryCrazyGamesSession: () => Promise<void>;
+  beginCrazyGamesAccountTransition: () => void;
+  crazyGamesAccountTransitionSequence: number;
 }
 
 // Lobby Types
@@ -83,6 +135,7 @@ export interface Lobby {
   hostUserId: number;
   region: string;
   state: LobbyState;
+  adBreak?: LobbyAdBreakView | null;
 }
 
 export type ChatScope = 'lobby' | 'game';
@@ -99,7 +152,7 @@ export interface ChatMessage {
   timestamp: Date;
 }
 
-export type LobbyState = 'waiting' | 'queued' | 'matched';
+export type LobbyState = 'waiting' | 'ad_break' | 'queued' | 'matched';
 export type LobbyGameMode = 'duel' | '2v2' | 'solo' | 'ffa';
 export type MatchmakingStatus = 'idle' | 'queued' | 'joining';
 
@@ -130,9 +183,20 @@ export interface WebSocketContextType {
   ) => void;
   currentRegionUrl: string | null;
   latencyMs: number;
+  adConfiguration: ClientAdsConfig;
 
   // Lobby state
+  lobbyRestorationComplete: boolean;
   currentLobby: Lobby | null;
+  /**
+   * Whether this player may change the game mode or start matchmaking.
+   *
+   * Both are lobby-wide actions, so the server admits them only from the
+   * lobby's host. A player with no lobby is also `true`: they are about to
+   * create one and become its host, and gating them would make the ordinary
+   * solo case unplayable.
+   */
+  isLobbyLeader: boolean;
   lobbyMembers: LobbyMember[];
   lobbyChatMessages: ChatMessage[];
   gameChatMessages: ChatMessage[];
@@ -144,8 +208,24 @@ export interface WebSocketContextType {
   createLobby: () => Promise<void>;
   joinLobby: (lobbyCode: string) => Promise<void>;
   leaveLobby: () => Promise<void>;
+  clearSessionForAccountChange: () => void;
   sendChatMessage: (scope: ChatScope, message: string) => void;
   updateLobbyPreferences: (preferences: LobbyPreferences) => void;
+
+  // Social layer. `null` means the server has not sent a roster yet, which is
+  // different from "nobody is online" and is why the panel can stay hidden
+  // until there is something true to say.
+  onlinePlayers: RegionRoster | null;
+  challenges: ChallengeInbox;
+  /** Most recent challenge failure, for display; cleared by the next action. */
+  challengeError: string | null;
+  challengePlayer: (userId: number) => void;
+  /** Live rematch state for the game this socket is in, if any. */
+  rematchState: RematchState | null;
+  setRematchIntent: (gameId: number, optIn: boolean) => void;
+  respondToChallenge: (challengeId: string, accept: boolean) => void;
+  cancelChallenge: (challengeId: string) => void;
+  dismissChallengeError: () => void;
 }
 
 // Latency Settings Types
@@ -338,7 +418,7 @@ export interface RegionSelectorProps {
 
 // Leaderboard Types
 export type RankTier = 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond' | 'master' | 'grandmaster';
-export type RankDivision = 1 | 2 | 3 | 4;
+export type RankDivision = 1 | 2 | 3;
 
 export interface Rank {
   tier: RankTier;

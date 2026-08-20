@@ -16,7 +16,7 @@ impl RedisKeys {
     pub const MATCHMAKING_LOBBY_ACTIVE_GAME_PREFIX: &'static str =
         "matchmaking:{snaketron:mm}:lobby:";
     pub const MATCHMAKING_ACTIVE_GAME_SUFFIX: &'static str = ":active-game";
-    const EXECUTOR_PARTITION_COUNT: u32 = 10;
+    const EXECUTOR_PARTITION_COUNT: u32 = crate::game_executor::PARTITION_COUNT;
 
     fn executor_tag(partition_id: u32) -> String {
         format!("{{snaketron:exec:{partition_id}}}")
@@ -66,10 +66,46 @@ impl RedisKeys {
         )
     }
 
+    /// Per-member delivery handoff for a committed lobby match.
+    ///
+    /// Unlike the active-game mappings, terminal cleanup does not remove this
+    /// key. The gateway compare-deletes it only after this user successfully
+    /// authorizes the matching `JoinGame`, so a missed Pub/Sub notification
+    /// remains recoverable even when a short round has already completed.
+    pub fn matchmaking_lobby_user_pending_game(lobby_code: &str, user_id: u32) -> String {
+        format!(
+            "matchmaking:{{{}}}:lobby:{}:user:{}:pending-game",
+            Self::MATCHMAKING_TAG,
+            lobby_code,
+            user_id
+        )
+    }
+
     /// Exact serialized queue entry currently admitted for a lobby.
     pub fn matchmaking_lobby_queue_identity(lobby_code: &str) -> String {
         format!(
             "matchmaking:{{{}}}:lobby:{}:queue-identity",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Exact queued generation liveness lease, refreshed only by an active
+    /// member heartbeat and compared against the immutable queue identity.
+    pub fn matchmaking_lobby_queue_lease(lobby_code: &str) -> String {
+        format!(
+            "matchmaking:{{{}}}:lobby:{}:queue-lease",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Short-lived terminal outcome for one immutable queue operation. This
+    /// prevents an ambiguous admission retry from resurrecting a generation
+    /// after cancellation, expiry, or match commit removed its identity.
+    pub fn matchmaking_lobby_queue_outcome(lobby_code: &str) -> String {
+        format!(
+            "matchmaking:{{{}}}:lobby:{}:queue-outcome",
             Self::MATCHMAKING_TAG,
             lobby_code
         )
@@ -214,12 +250,123 @@ impl RedisKeys {
         format!("user:{}", user_id)
     }
 
+    // === Social presence and challenges ===
+
+    /// Region roster hash: `user_id` -> serialized `OnlinePlayer`.
+    ///
+    /// Shares a per-region hash tag with the expiry index below so one Lua
+    /// script can prune stale leases and read the surviving roster atomically,
+    /// exactly as the active-server registry does. SCAN is not an option here
+    /// for the same cluster-safety reason documented on that registry.
+    pub fn presence_roster(region: &str) -> String {
+        format!("presence:{{snaketron:presence:{region}}}:roster")
+    }
+
+    /// Region presence expiry index (score = absolute lease deadline in ms).
+    pub fn presence_expiry(region: &str) -> String {
+        format!("presence:{{snaketron:presence:{region}}}:expiry")
+    }
+
+    /// One user's challenge expiry index (score = absolute expiry in ms).
+    ///
+    /// Challenges are stored per participant rather than once per pair: each
+    /// side reads only its own two keys, which keeps every read and prune
+    /// inside a single hash slot even though a challenge spans two users.
+    pub fn user_challenge_index(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:index")
+    }
+
+    /// One user's challenge records: `challenge_id` -> serialized challenge.
+    pub fn user_challenge_data(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:data")
+    }
+
+    /// Rolling count of challenges one user has issued, for rate limiting.
+    /// Shares the user's challenge slot so it can be read alongside them.
+    pub fn user_challenge_rate(user_id: u32) -> String {
+        format!("challenge:{{snaketron:ch:{user_id}}}:rate")
+    }
+
+    /// Rematch opt-in and presence for one finished game.
+    ///
+    /// Tagged on the game rather than the user: the participant set is fixed
+    /// and shared, so one record serves everybody and every read, prune, and
+    /// election stays inside a single hash slot.
+    pub fn rematch_record(game_id: u32) -> String {
+        format!("rematch:{{snaketron:rm:{game_id}}}:record")
+    }
+
+    /// The lobby elected to host one game's rematch. `SET NX` on this key is
+    /// what makes the election exactly-once across the cluster.
+    pub fn rematch_lobby(game_id: u32) -> String {
+        format!("rematch:{{snaketron:rm:{game_id}}}:lobby")
+    }
+
+    /// Per-user loss-tolerant hint channel. Pub/Sub is at-most-once, so this
+    /// only ever says "your challenge state moved, re-read it" — the durable
+    /// keys above stay authoritative and a periodic reconcile covers a drop.
+    pub fn user_notifications_channel(user_id: u32) -> String {
+        format!("user:{user_id}:notifications")
+    }
+
+    /// Region-wide roster hint channel, published when the roster digest moves.
+    pub fn presence_updates_channel(region: &str) -> String {
+        format!("presence:{region}:updates")
+    }
+
+    // === Presence ===
+
+    /// Which lobby a user is currently present in, for resolving a
+    /// `/play/<username>` invite to a joinable lobby code.
+    ///
+    /// This is the reverse of `lobby_members_set`, which can only be read
+    /// when the lobby code is already known. The value is the lobby code, and
+    /// the key carries a lease refreshed by the same lobby heartbeat that
+    /// renews membership, so a lost socket expires the record instead of
+    /// advertising a lobby the user has already left.
+    ///
+    /// Deliberately untagged: it is only ever read and written on its own, and
+    /// a lobby-slot tag would concentrate every user's presence on one shard.
+    pub fn user_presence(user_id: u32) -> String {
+        format!("presence:user:{}", user_id)
+    }
+
     // === Lobby Keys ===
 
     /// Lobby metadata hash (stores lobby details)
     pub fn lobby_metadata(lobby_code: &str) -> String {
         format!(
             "lobby:{{{}}}:{}:metadata",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Short-lived membership write reservations. This key deliberately
+    /// shares the matchmaking hash slot with lobby metadata so admission can
+    /// inspect it atomically without scanning metadata fields.
+    pub fn lobby_membership_reservations(lobby_code: &str) -> String {
+        format!(
+            "lobby:{{{}}}:{}:membership-reservations",
+            Self::MATCHMAKING_TAG,
+            lobby_code
+        )
+    }
+
+    /// Short-lived idempotency result for one membership finalizer token.
+    pub fn lobby_membership_finalization_outcome(lobby_code: &str, token: &str) -> String {
+        format!(
+            "lobby:{{{}}}:{}:membership-outcome:{}",
+            Self::MATCHMAKING_TAG,
+            lobby_code,
+            token
+        )
+    }
+
+    /// Short ownership lease for expensive ad-break finalization work.
+    pub fn lobby_ad_break_finalization_claim(lobby_code: &str) -> String {
+        format!(
+            "lobby:{{{}}}:{}:ad-break-finalization",
             Self::MATCHMAKING_TAG,
             lobby_code
         )
@@ -367,6 +514,17 @@ impl RedisKeys {
         )
     }
 
+    /// Append-only replay cells covered by the adjacent recovery checkpoint.
+    /// The partition hash tag is deliberately identical to recovery, lease,
+    /// and command keys so one fenced Lua transaction can advance all of them.
+    pub fn cluster_replay_journal(region: &str, game_id: u32) -> String {
+        let partition = Self::game_partition(game_id);
+        format!(
+            "snaketron:{}:cluster:{region}:game:{game_id}:replay-journal:v1",
+            Self::executor_tag(partition)
+        )
+    }
+
     /// Highest event watermark published by an incumbent immediately before a
     /// cooperative handoff. The successor uses it only until its first
     /// checkpoint makes the merged watermark authoritative.
@@ -460,15 +618,23 @@ mod tests {
         assert!(RedisKeys::matchmaking_user_status(123).contains("{snaketron:mm}"));
         assert!(RedisKeys::matchmaking_user_active_game(123).ends_with("123:active-game"));
         assert!(RedisKeys::matchmaking_lobby_active_game("ABC123").ends_with("ABC123:active-game"));
+        assert!(
+            RedisKeys::matchmaking_lobby_user_pending_game("ABC123", 123)
+                .ends_with("ABC123:user:123:pending-game")
+        );
         assert_eq!(
             RedisKeys::readiness_write_canary("use1", "task:boot"),
             "snaketron:readiness:use1:task:boot"
         );
         assert_eq!(hash_tag(&RedisKeys::stream_events(0)), "snaketron:exec:0");
-        assert_eq!(hash_tag(&RedisKeys::game_snapshot(123)), "snaketron:exec:3");
+        let game_partition_tag = format!(
+            "snaketron:exec:{}",
+            123 % crate::game_executor::PARTITION_COUNT,
+        );
+        assert_eq!(hash_tag(&RedisKeys::game_snapshot(123)), game_partition_tag);
         assert_eq!(
             hash_tag(&RedisKeys::cluster_planned_handoff_watermark("use1", 123)),
-            "snaketron:exec:3"
+            game_partition_tag
         );
 
         // Test game type hashing
@@ -512,6 +678,31 @@ mod tests {
             RedisKeys::active_server_metrics_expiry(),
         ]);
         assert_same_slot(&[
+            RedisKeys::presence_roster("use1"),
+            RedisKeys::presence_expiry("use1"),
+        ]);
+        assert_ne!(
+            hash_tag(&RedisKeys::presence_roster("use1")),
+            hash_tag(&RedisKeys::presence_roster("euw1")),
+            "regions must not share a presence slot"
+        );
+        assert_same_slot(&[
+            RedisKeys::user_challenge_index(7),
+            RedisKeys::user_challenge_data(7),
+            RedisKeys::user_challenge_rate(7),
+        ]);
+        assert_same_slot(&[RedisKeys::rematch_record(42), RedisKeys::rematch_lobby(42)]);
+        assert_ne!(
+            hash_tag(&RedisKeys::rematch_record(42)),
+            hash_tag(&RedisKeys::rematch_record(43)),
+            "rematch records must stay distributed across games"
+        );
+        assert_ne!(
+            hash_tag(&RedisKeys::user_challenge_index(7)),
+            hash_tag(&RedisKeys::user_challenge_index(8)),
+            "challenge stores must stay distributed across users"
+        );
+        assert_same_slot(&[
             RedisKeys::matchmaking_active_matches(),
             RedisKeys::matchmaking_game_created_outbox(),
             RedisKeys::matchmaking_game_created_outbox_age(),
@@ -519,9 +710,15 @@ mod tests {
             RedisKeys::matchmaking_user_active_game(1),
             RedisKeys::matchmaking_user_queue_identity(1),
             RedisKeys::matchmaking_lobby_active_game("ABC"),
+            RedisKeys::matchmaking_lobby_user_pending_game("ABC", 1),
             RedisKeys::matchmaking_lobby_queue_identity("ABC"),
+            RedisKeys::matchmaking_lobby_queue_lease("ABC"),
+            RedisKeys::matchmaking_lobby_queue_outcome("ABC"),
             RedisKeys::matchmaking_lobby_notification_channel("ABC"),
             RedisKeys::lobby_metadata("ABC"),
+            RedisKeys::lobby_membership_reservations("ABC"),
+            RedisKeys::lobby_membership_finalization_outcome("ABC", "token"),
+            RedisKeys::lobby_ad_break_finalization_claim("ABC"),
         ]);
 
         let mut tags = std::collections::BTreeSet::new();
@@ -532,6 +729,7 @@ mod tests {
                 RedisKeys::cluster_partition_lease("use1", partition),
                 RedisKeys::cluster_active_games("use1", partition),
                 RedisKeys::cluster_recovery("use1", game_id),
+                RedisKeys::cluster_replay_journal("use1", game_id),
                 RedisKeys::cluster_planned_handoff_watermark("use1", game_id),
                 RedisKeys::cluster_recovery_failure("use1", game_id),
                 RedisKeys::cluster_command_quarantine("use1", partition),

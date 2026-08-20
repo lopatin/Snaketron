@@ -3,13 +3,27 @@
 use crate::cluster_membership::EXECUTOR_PROTOCOL_VERSION;
 use anyhow::{Context, Result, bail};
 use common::{
-    ClientCommandIdentityV2, CommandId, GameCommandMessage, GameEvent, GameEventMessage, GameState,
+    ClientCommandIdentityV2, CommandId, GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION,
+    GameCommandMessage, GameEvent, GameEventMessage, GameRecordingV1, GameState,
+    RecordedGameMessage, ReplayAnchor, ReplayVisibility,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Bumped to 5: Solo and free-for-all now carry Boost, which moves them to the
+/// Version 8 moves the complete replay archive out of every recovery envelope
+/// into a lease-fenced append-only Redis journal. A checkpoint now carries
+/// only recorder metadata and the journal cursor it atomically covers.
+///
+/// Version 7 added deterministic death attribution to serialized crash cues
+/// and to events produced after a checkpoint is restored.
+///
+/// Version 6: food value, physical growth, personal scoring, and team cargo
+/// now follow the authoritative per-snake combo state. Resuming a version-5
+/// checkpoint would silently switch an in-flight match from the old fixed
+/// two-segment growth model to combo scoring, so the recovery gate rejects it.
+///
+/// Version 5: Solo and free-for-all now carry Boost, which moves them to the
 /// 50ms simulation quantum, and 2v2/free-for-all carry double food. A
 /// checkpoint written before this change deserializes cleanly — `boost` and
 /// `unlimited` both default — but describes a match the current invariants
@@ -19,7 +33,7 @@ use std::time::{Duration, Instant};
 ///
 /// (4 was: team matches carry `score_limit` instead of `time_limit_ms`, and
 /// snakes carry a latched Boost intent.)
-pub const RECOVERY_SCHEMA_VERSION: u16 = 5;
+pub const RECOVERY_SCHEMA_VERSION: u16 = 8;
 pub const DEFAULT_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_secs(10);
@@ -34,10 +48,689 @@ pub const MAX_RECORDED_COMMAND_SESSIONS_PER_GAME: usize = 64;
 pub const MAX_CLIENT_GAME_SESSION_ID_BYTES: usize = 128;
 pub const RECOVERY_FAILURE_SCHEMA_VERSION: u16 = 1;
 pub const COMMAND_DECISION_SCHEMA_VERSION: u16 = 1;
+pub const REPLAY_JOURNAL_REFERENCE_SCHEMA_VERSION: u16 = 1;
 pub const PUBLIC_UNRECOVERABLE_GAME_REASON: &str =
     "The authoritative game state is unavailable after failover";
 pub const SPARSE_COMMAND_WINDOW_REJECTION_REASON: &str =
     "client command session exceeded its recoverable sparse sequence window";
+
+/// Five seconds balances inexpensive seeking with replay-journal volume.
+/// Checkpoints carry only the journal cursor; the full append-only history is
+/// stored beside the checkpoint under the same partition lease fence.
+pub const REPLAY_ANCHOR_INTERVAL_MS: u32 = 5_000;
+/// Executor-local budget for the replay view used by the optional
+/// Play-of-the-Game scorer. The independently recovery-persisted archive below
+/// remains complete, so presentation constraints never shorten replay storage.
+pub const POTG_SELECTION_RING_MAX_BYTES: usize = 6 * 1024 * 1024;
+const POTG_SELECTION_RING_JSON_OVERHEAD_BYTES: usize = 256;
+
+fn default_potg_selection_ring_max_bytes() -> usize {
+    POTG_SELECTION_RING_MAX_BYTES
+}
+
+fn replay_recording_allowed_from_lookup(
+    state: &GameState,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    if state.is_stress_test {
+        return false;
+    }
+    !lookup("SNAKETRON_TEST_MODE").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn replay_recording_allowed(state: &GameState) -> bool {
+    replay_recording_allowed_from_lookup(state, |name| std::env::var(name).ok())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum ReplayJournalEntry {
+    Anchor(ReplayAnchor),
+    Message(RecordedGameMessage),
+}
+
+impl ReplayJournalEntry {
+    fn tick(&self) -> u32 {
+        match self {
+            Self::Anchor(anchor) => anchor.tick,
+            Self::Message(message) => message.tick,
+        }
+    }
+
+    fn encoded_len(&self) -> Result<usize> {
+        // Count the serialized entry plus its array separator. Reserving the
+        // fixed envelope overhead makes this a conservative hard JSON budget.
+        Ok(serde_json::to_vec(self)?.len().saturating_add(1))
+    }
+}
+
+/// One immutable replay-journal cell. `cursor` is independent of the replay
+/// message sequence because an anchor and the latest message may legitimately
+/// share a replay sequence boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReplayJournalDelta {
+    cursor: u64,
+    entry: ReplayJournalEntry,
+}
+
+impl ReplayJournalDelta {
+    pub(crate) fn cursor(&self) -> u64 {
+        self.cursor
+    }
+}
+
+/// Bounded immutable pointer from a completion record to its retained Redis
+/// replay journal. New actors bind the cursor to final tick/sync metadata;
+/// PersistGame performs the full semantic verification off the partition hot
+/// path. The optional digest fields keep already-written records readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayJournalReferenceV1 {
+    pub schema_version: u16,
+    pub game_id: u32,
+    pub journal_cursor: u64,
+    pub next_sequence: u64,
+    /// Final replay boundary captured by the actor without assembling the
+    /// complete archive. PersistGame verifies the hydrated journal reaches
+    /// exactly this state before it serializes or uploads anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_tick: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_sync_hash: Option<u64>,
+    /// Compatibility binding used by completion records written before full
+    /// replay materialization moved out of the partition actor. New records
+    /// omit this pair and bind the journal through final tick/sync metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_bytes: Option<u64>,
+}
+
+impl ReplayJournalReferenceV1 {
+    fn new(game_id: u32, journal_cursor: u64, next_sequence: u64, final_state: &GameState) -> Self {
+        Self {
+            schema_version: REPLAY_JOURNAL_REFERENCE_SCHEMA_VERSION,
+            game_id,
+            journal_cursor,
+            next_sequence,
+            end_tick: Some(final_state.tick),
+            end_sync_hash: Some(final_state.sync_hash()),
+            recording_sha256: None,
+            recording_bytes: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != REPLAY_JOURNAL_REFERENCE_SCHEMA_VERSION {
+            bail!("unsupported replay journal reference schema version");
+        }
+        if self.journal_cursor == 0 || self.next_sequence == 0 {
+            bail!("replay journal reference cannot be empty");
+        }
+        match (self.end_tick, self.end_sync_hash) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => bail!("replay journal reference has incomplete final-state metadata"),
+        }
+        match (&self.recording_sha256, self.recording_bytes) {
+            (Some(sha256), Some(bytes)) => {
+                if bytes == 0 {
+                    bail!("replay journal reference recording cannot be empty");
+                }
+                if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    bail!("replay journal reference SHA-256 is invalid");
+                }
+            }
+            (None, None) => {}
+            _ => bail!("replay journal reference has an incomplete legacy digest"),
+        }
+        if self.end_tick.is_none() && self.recording_sha256.is_none() {
+            bail!("replay journal reference has no immutable recording boundary");
+        }
+        Ok(())
+    }
+}
+
+/// Recovery-persisted source for the immutable recording written at
+/// completion. Stress/load-test matches are excluded by a server-attested
+/// field on `GameState`; usernames are deliberately never used as a trust
+/// signal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayRecordingState {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(skip, default)]
+    anchors: Vec<ReplayAnchor>,
+    #[serde(skip, default)]
+    messages: Vec<RecordedGameMessage>,
+    #[serde(default)]
+    next_sequence: u64,
+    /// Highest append-only journal cell incorporated by this actor. This is
+    /// the only full-history position serialized into recovery checkpoints.
+    #[serde(default)]
+    journal_cursor: u64,
+    /// Executor-local cells not yet covered by a successful fenced checkpoint.
+    /// They are passed to the checkpoint Lua script but never serialized into
+    /// `RecoveryEnvelopeV2`, keeping retry payloads proportional to one delta.
+    #[serde(skip, default)]
+    pending_journal: Vec<ReplayJournalDelta>,
+    /// Bounded, oldest-first view used only for highlight selection. Keeping
+    /// it distinct from `anchors`/`messages` preserves the complete archive
+    /// across cap eviction and executor recovery.
+    #[serde(skip, default)]
+    potg_selection_ring: VecDeque<ReplayJournalEntry>,
+    #[serde(skip, default)]
+    potg_selection_ring_bytes: usize,
+    #[serde(skip, default)]
+    potg_ring_truncated: bool,
+    #[serde(skip, default)]
+    potg_ring_evicted_through_tick: u32,
+    #[serde(skip, default)]
+    activation_tick: u32,
+    #[serde(skip, default = "default_potg_selection_ring_max_bytes")]
+    potg_selection_ring_max_bytes: usize,
+}
+
+impl ReplayRecordingState {
+    pub fn new(activation_state: &GameState) -> Self {
+        if !replay_recording_allowed(activation_state) {
+            return Self::default();
+        }
+        let activation_anchor = ReplayAnchor {
+            tick: activation_state.tick,
+            sequence: 0,
+            state: activation_state.clone(),
+        };
+        let initial_entry = ReplayJournalEntry::Anchor(activation_anchor.clone());
+        let initial_bytes = initial_entry
+            .encoded_len()
+            .unwrap_or(POTG_SELECTION_RING_MAX_BYTES.saturating_add(1));
+        let mut recorder = Self {
+            enabled: true,
+            anchors: vec![activation_anchor],
+            messages: Vec::new(),
+            next_sequence: 1,
+            journal_cursor: 1,
+            pending_journal: vec![ReplayJournalDelta {
+                cursor: 1,
+                entry: initial_entry.clone(),
+            }],
+            potg_selection_ring: VecDeque::from([initial_entry]),
+            potg_selection_ring_bytes: initial_bytes,
+            potg_ring_truncated: false,
+            potg_ring_evicted_through_tick: activation_state.tick,
+            activation_tick: activation_state.tick,
+            potg_selection_ring_max_bytes: POTG_SELECTION_RING_MAX_BYTES,
+        };
+        recorder.enforce_potg_selection_cap();
+        recorder
+    }
+
+    /// Initial recovery checkpoints are written before a new actor normalizes
+    /// `Stopped` to its authoritative `Started` state. Seed only metadata at
+    /// that boundary; the actor creates and journals the real activation
+    /// anchor before its first live checkpoint.
+    fn checkpoint_seed(activation_state: &GameState) -> Self {
+        if !replay_recording_allowed(activation_state) {
+            Self::default()
+        } else {
+            Self {
+                enabled: true,
+                next_sequence: 1,
+                potg_selection_ring_max_bytes: POTG_SELECTION_RING_MAX_BYTES,
+                ..Self::default()
+            }
+        }
+    }
+
+    /// Lightweight in-process envelope view. Only the metadata fields are
+    /// serialized; the bounded pending delta is consumed separately by the
+    /// fenced checkpoint script.
+    pub(crate) fn checkpoint_view(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            next_sequence: self.next_sequence,
+            journal_cursor: self.journal_cursor,
+            pending_journal: self.pending_journal.clone(),
+            potg_selection_ring_max_bytes: POTG_SELECTION_RING_MAX_BYTES,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn journal_cursor(&self) -> u64 {
+        self.journal_cursor
+    }
+
+    pub(crate) fn pending_journal(&self) -> &[ReplayJournalDelta] {
+        &self.pending_journal
+    }
+
+    pub(crate) fn mark_journal_persisted(&mut self, cursor: u64) -> Result<()> {
+        if cursor > self.journal_cursor {
+            bail!("persisted replay journal cursor exceeds recorder cursor");
+        }
+        self.pending_journal.retain(|delta| delta.cursor > cursor);
+        Ok(())
+    }
+
+    pub(crate) fn journal_reference(
+        &self,
+        game_id: u32,
+        final_state: &GameState,
+    ) -> Result<Option<ReplayJournalReferenceV1>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let reference = ReplayJournalReferenceV1::new(
+            game_id,
+            self.journal_cursor,
+            self.next_sequence,
+            final_state,
+        );
+        reference.validate()?;
+        Ok(Some(reference))
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Old envelopes without archive state start at their checkpoint. Current
+    /// envelopes rebuild the executor-local PotG ring from the full archive.
+    pub fn enable_from_checkpoint_if_needed(&mut self, state: &GameState) {
+        if !replay_recording_allowed(state) {
+            *self = Self::default();
+        } else if self.anchors.is_empty()
+            && self.journal_cursor == 0
+            && (!self.enabled || self.pending_journal.is_empty())
+        {
+            *self = Self::new(state);
+        } else if self.enabled && self.potg_selection_ring.is_empty() {
+            // The selection ring is deliberately executor-local and skipped
+            // in recovery serialization. Rebuild it from the complete durable
+            // archive on takeover so failover preserves the best bounded tail
+            // available under the current cap.
+            self.rebuild_potg_selection_ring(state);
+        } else if self.enabled {
+            // Recompute rather than trusting persisted bookkeeping. This also
+            // applies the current binary's cap if a predecessor used a
+            // different serialized representation.
+            self.potg_selection_ring_bytes = self
+                .potg_selection_ring
+                .iter()
+                .map(|entry| entry.encoded_len().unwrap_or(usize::MAX))
+                .fold(0usize, usize::saturating_add);
+            self.enforce_potg_selection_cap();
+        }
+    }
+
+    fn rebuild_potg_selection_ring(&mut self, state: &GameState) {
+        if self.try_rebuild_potg_selection_ring(state).is_err() {
+            // Highlight selection is optional. A representation that cannot
+            // be sized degrades to no PotG while the full archive remains
+            // available and completion keeps progressing.
+            self.potg_selection_ring.clear();
+            self.potg_selection_ring_bytes = 0;
+            self.potg_ring_truncated = true;
+            self.potg_ring_evicted_through_tick = state.tick;
+        }
+    }
+
+    fn try_rebuild_potg_selection_ring(&mut self, state: &GameState) -> Result<()> {
+        self.potg_selection_ring.clear();
+        self.potg_selection_ring_bytes = 0;
+        self.potg_ring_truncated = false;
+        self.activation_tick = self
+            .anchors
+            .first()
+            .map_or(state.tick, |anchor| anchor.tick);
+        self.potg_ring_evicted_through_tick = self.activation_tick;
+
+        if self.anchors.is_empty() {
+            self.push_potg_entry(ReplayJournalEntry::Anchor(ReplayAnchor {
+                tick: state.tick,
+                sequence: self.next_sequence.saturating_sub(1),
+                state: state.clone(),
+            }))?;
+            return Ok(());
+        }
+
+        // Anchors are taken after the event batch at their tick. Seed the
+        // activation anchor first, then merge messages before later same-tick
+        // anchors to preserve the original replay boundary.
+        self.push_potg_entry(ReplayJournalEntry::Anchor(self.anchors[0].clone()))?;
+        let mut anchor_index = 1;
+        let mut message_index = 0;
+        while anchor_index < self.anchors.len() || message_index < self.messages.len() {
+            let message_precedes_anchor = match (
+                self.messages.get(message_index),
+                self.anchors.get(anchor_index),
+            ) {
+                (Some(message), Some(anchor)) => {
+                    (message.tick, message.sequence) <= (anchor.tick, anchor.sequence)
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if message_precedes_anchor {
+                self.push_potg_entry(ReplayJournalEntry::Message(
+                    self.messages[message_index].clone(),
+                ))?;
+                message_index += 1;
+            } else {
+                self.push_potg_entry(ReplayJournalEntry::Anchor(
+                    self.anchors[anchor_index].clone(),
+                ))?;
+                anchor_index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// A newly created actor changes `Stopped` to `Started` before it becomes
+    /// observable. Keep the pristine activation anchor aligned with that
+    /// authoritative state so replay does not depend on a transport-only
+    /// status announcement.
+    pub fn replace_pristine_activation(&mut self, state: &GameState) {
+        if self.enabled && self.messages.is_empty() && self.anchors.len() == 1 {
+            let anchor = ReplayAnchor {
+                tick: state.tick,
+                sequence: 0,
+                state: state.clone(),
+            };
+            self.anchors[0] = anchor.clone();
+            if let Some(delta) = self
+                .pending_journal
+                .iter_mut()
+                .find(|delta| delta.cursor == 1)
+            {
+                delta.entry = ReplayJournalEntry::Anchor(anchor.clone());
+            }
+            self.activation_tick = state.tick;
+            self.potg_selection_ring.clear();
+            let entry = ReplayJournalEntry::Anchor(anchor);
+            self.potg_selection_ring_bytes = entry
+                .encoded_len()
+                .unwrap_or(self.potg_selection_ring_max_bytes.saturating_add(1));
+            self.potg_selection_ring.push_back(entry);
+            self.enforce_potg_selection_cap();
+        }
+    }
+
+    /// Reconstruct complete authority from the lease-fenced append-only Redis
+    /// journal referenced by a deserialized checkpoint cursor.
+    pub(crate) fn hydrate_journal(
+        &mut self,
+        mut deltas: Vec<ReplayJournalDelta>,
+        checkpoint_state: &GameState,
+    ) -> Result<()> {
+        if !self.enabled {
+            if self.journal_cursor != 0 || !deltas.is_empty() {
+                bail!("disabled replay recorder references journal history");
+            }
+            return Ok(());
+        }
+        deltas.sort_by_key(ReplayJournalDelta::cursor);
+        if deltas.len() as u64 != self.journal_cursor {
+            bail!(
+                "replay journal has {} cells, checkpoint expects {}",
+                deltas.len(),
+                self.journal_cursor
+            );
+        }
+
+        self.anchors.clear();
+        self.messages.clear();
+        for (index, delta) in deltas.into_iter().enumerate() {
+            let expected = index as u64 + 1;
+            if delta.cursor != expected {
+                bail!(
+                    "replay journal cursor gap: expected {expected}, found {}",
+                    delta.cursor
+                );
+            }
+            match delta.entry {
+                ReplayJournalEntry::Anchor(anchor) => self.anchors.push(anchor),
+                ReplayJournalEntry::Message(message) => self.messages.push(message),
+            }
+        }
+        if self.journal_cursor > 0 && self.anchors.is_empty() {
+            bail!("replay journal has no activation anchor");
+        }
+        let expected_next = self
+            .messages
+            .last()
+            .map_or(1, |message| message.sequence.saturating_add(1));
+        if self.next_sequence != expected_next {
+            bail!(
+                "replay journal next sequence {} does not follow {}",
+                self.next_sequence,
+                expected_next.saturating_sub(1)
+            );
+        }
+        self.pending_journal.clear();
+        self.rebuild_potg_selection_ring(checkpoint_state);
+        Ok(())
+    }
+
+    pub(crate) fn hydrate_reference(
+        reference: &ReplayJournalReferenceV1,
+        deltas: Vec<ReplayJournalDelta>,
+        final_state: &GameState,
+    ) -> Result<Self> {
+        reference.validate()?;
+        let mut recorder = Self {
+            enabled: true,
+            next_sequence: reference.next_sequence,
+            journal_cursor: reference.journal_cursor,
+            potg_selection_ring_max_bytes: POTG_SELECTION_RING_MAX_BYTES,
+            ..Self::default()
+        };
+        recorder.hydrate_journal(deltas, final_state)?;
+        Ok(recorder)
+    }
+
+    pub fn record_event(&mut self, tick: u32, event: GameEvent) -> Result<()> {
+        if !self.enabled
+            || matches!(
+                event,
+                GameEvent::Snapshot { .. } | GameEvent::TickHash { .. }
+            )
+        {
+            return Ok(());
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .context("replay recording sequence overflow")?;
+        let message = RecordedGameMessage {
+            tick,
+            sequence,
+            event,
+        };
+        let entry = ReplayJournalEntry::Message(message.clone());
+        self.append_journal(entry.clone())?;
+        self.messages.push(message);
+        self.push_potg_entry(entry)?;
+        Ok(())
+    }
+
+    pub fn record_events(&mut self, events: &[(u32, u64, GameEvent)]) -> Result<()> {
+        for (tick, _, event) in events {
+            self.record_event(*tick, event.clone())?;
+        }
+        Ok(())
+    }
+
+    pub fn maybe_anchor(&mut self, state: &GameState) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let interval_ticks = REPLAY_ANCHOR_INTERVAL_MS
+            .div_ceil(state.properties.tick_duration_ms.max(1))
+            .max(1);
+        let should_anchor = self
+            .anchors
+            .last()
+            .is_none_or(|anchor| state.tick.saturating_sub(anchor.tick) >= interval_ticks);
+        if should_anchor {
+            let anchor = ReplayAnchor {
+                tick: state.tick,
+                sequence: self.next_sequence.saturating_sub(1),
+                state: state.clone(),
+            };
+            let entry = ReplayJournalEntry::Anchor(anchor.clone());
+            self.append_journal(entry.clone())?;
+            self.anchors.push(anchor);
+            self.push_potg_entry(entry)?;
+        }
+        Ok(())
+    }
+
+    fn append_journal(&mut self, entry: ReplayJournalEntry) -> Result<()> {
+        let cursor = self
+            .journal_cursor
+            .checked_add(1)
+            .context("replay journal cursor overflow")?;
+        self.pending_journal
+            .push(ReplayJournalDelta { cursor, entry });
+        self.journal_cursor = cursor;
+        Ok(())
+    }
+
+    fn push_potg_entry(&mut self, entry: ReplayJournalEntry) -> Result<()> {
+        self.potg_selection_ring_bytes = self
+            .potg_selection_ring_bytes
+            .saturating_add(entry.encoded_len()?);
+        self.potg_selection_ring.push_back(entry);
+        self.enforce_potg_selection_cap();
+        Ok(())
+    }
+
+    fn enforce_potg_selection_cap(&mut self) {
+        let entry_budget = self
+            .potg_selection_ring_max_bytes
+            .saturating_sub(POTG_SELECTION_RING_JSON_OVERHEAD_BYTES);
+        while self.potg_selection_ring_bytes > entry_budget {
+            let Some(evicted) = self.potg_selection_ring.pop_front() else {
+                self.potg_selection_ring_bytes = 0;
+                break;
+            };
+            self.potg_selection_ring_bytes = self
+                .potg_selection_ring_bytes
+                .saturating_sub(evicted.encoded_len().unwrap_or(0));
+            self.potg_ring_truncated = true;
+            self.potg_ring_evicted_through_tick =
+                self.potg_ring_evicted_through_tick.max(evicted.tick());
+        }
+
+        // A replay tail must begin at a state anchor. Once the oldest anchor
+        // is evicted, discard the now-unreplayable messages before the next
+        // anchor too. This is still strictly oldest-first eviction.
+        while matches!(
+            self.potg_selection_ring.front(),
+            Some(ReplayJournalEntry::Message(_))
+        ) {
+            let evicted = self
+                .potg_selection_ring
+                .pop_front()
+                .expect("front was present");
+            self.potg_selection_ring_bytes = self
+                .potg_selection_ring_bytes
+                .saturating_sub(evicted.encoded_len().unwrap_or(0));
+            self.potg_ring_truncated = true;
+            self.potg_ring_evicted_through_tick =
+                self.potg_ring_evicted_through_tick.max(evicted.tick());
+        }
+    }
+
+    pub fn potg_ring_truncated(&self) -> bool {
+        self.potg_ring_truncated
+    }
+
+    pub fn potg_ring_evicted_seconds(&self, tick_duration_ms: u32) -> u64 {
+        if !self.potg_ring_truncated {
+            return 0;
+        }
+        let retained_tick = self.potg_selection_ring.front().map_or(
+            self.potg_ring_evicted_through_tick,
+            ReplayJournalEntry::tick,
+        );
+        u64::from(retained_tick.saturating_sub(self.activation_tick))
+            .saturating_mul(u64::from(tick_duration_ms))
+            .div_ceil(1_000)
+    }
+
+    pub fn potg_selection_ring_bytes(&self) -> usize {
+        self.potg_selection_ring_bytes
+            .saturating_add(POTG_SELECTION_RING_JSON_OVERHEAD_BYTES)
+    }
+
+    /// Builds the bounded recording used by the optional scorer. Structural
+    /// validation, scoring, and selected-clip verification all run once in the
+    /// budgeted worker; the partition actor only copies this bounded view.
+    pub fn finish_potg_selection(
+        &self,
+        game_id: u32,
+        final_state: &GameState,
+    ) -> Result<Option<GameRecordingV1>> {
+        if !self.enabled || self.potg_selection_ring.is_empty() {
+            return Ok(None);
+        }
+        let mut anchors = Vec::new();
+        let mut messages = Vec::new();
+        for entry in &self.potg_selection_ring {
+            match entry {
+                ReplayJournalEntry::Anchor(anchor) => anchors.push(anchor.clone()),
+                ReplayJournalEntry::Message(message) => messages.push(message.clone()),
+            }
+        }
+        if anchors.is_empty() {
+            return Ok(None);
+        }
+        let recording = GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            visibility: ReplayVisibility::Public,
+            anchors,
+            messages,
+            end_tick: final_state.tick,
+            end_sync_hash: final_state.sync_hash(),
+        };
+        Ok(Some(recording))
+    }
+
+    pub fn finish(&self, game_id: u32, final_state: &GameState) -> Result<Option<GameRecordingV1>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let recording = self
+            .assemble(game_id, final_state)
+            .expect("enabled replay recorder assembles a recording");
+        recording.verify_end_hash()?;
+        Ok(Some(recording))
+    }
+
+    pub(crate) fn assemble(
+        &self,
+        game_id: u32,
+        final_state: &GameState,
+    ) -> Option<GameRecordingV1> {
+        self.enabled.then(|| GameRecordingV1 {
+            format_version: GAME_RECORDING_FORMAT_VERSION,
+            gameplay_version: GAMEPLAY_REPLAY_VERSION,
+            game_id,
+            visibility: ReplayVisibility::Public,
+            anchors: self.anchors.clone(),
+            messages: self.messages.clone(),
+            end_tick: final_state.tick,
+            end_sync_hash: final_state.sync_hash(),
+        })
+    }
+}
 
 /// Durable terminal marker for one indexed game whose authoritative recovery
 /// envelope cannot be reconstructed. Keeping this separate from the active
@@ -480,6 +1173,11 @@ pub struct RecoveryEnvelopeV2 {
     pub resolved_client_commands: ResolvedCommandState,
     pub next_server_command_sequence: u32,
     pub next_event_stream_sequence: u64,
+    /// Replay enablement, sequence, and append-only journal cursor. Complete
+    /// history is hydrated from the adjacent partition-local journal before
+    /// an actor is constructed.
+    #[serde(default)]
+    pub replay_recording: ReplayRecordingState,
     /// Ephemeral takeover floor loaded from the cooperative-handoff marker.
     /// It is deliberately outside the durable recovery schema: the successor
     /// merges it after decision replay, then its first checkpoint persists the
@@ -504,6 +1202,7 @@ impl RecoveryEnvelopeV2 {
         checkpointed_at_ms: i64,
         source_lease_token: String,
     ) -> Self {
+        let replay_recording = ReplayRecordingState::checkpoint_seed(&game_state);
         Self {
             schema_version: RECOVERY_SCHEMA_VERSION,
             executor_protocol_version: EXECUTOR_PROTOCOL_VERSION,
@@ -514,6 +1213,7 @@ impl RecoveryEnvelopeV2 {
             resolved_client_commands,
             next_server_command_sequence,
             next_event_stream_sequence,
+            replay_recording,
             planned_handoff_event_stream_watermark: None,
             checkpointed_at_ms,
             source_lease_token,
@@ -532,6 +1232,9 @@ impl RecoveryEnvelopeV2 {
             session.validate()?;
         }
         self.game_state.validate_boost_invariants()?;
+        if self.game_state.is_stress_test && self.replay_recording.is_enabled() {
+            bail!("stress-test recovery envelope cannot contain a replay recording");
+        }
         Ok(())
     }
 }
@@ -663,6 +1366,23 @@ mod tests {
             reason: reason.into(),
             command_id_client: None,
         }
+    }
+
+    #[test]
+    fn legacy_digest_only_replay_journal_reference_remains_readable() {
+        let reference: ReplayJournalReferenceV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": REPLAY_JOURNAL_REFERENCE_SCHEMA_VERSION,
+            "game_id": 17,
+            "journal_cursor": 4,
+            "next_sequence": 3,
+            "recording_sha256": "00".repeat(32),
+            "recording_bytes": 42
+        }))
+        .unwrap();
+        assert_eq!(reference.end_tick, None);
+        assert_eq!(reference.end_sync_hash, None);
+        assert_eq!(reference.recording_bytes, Some(42));
+        reference.validate().unwrap();
     }
 
     #[test]
@@ -1185,5 +1905,212 @@ mod tests {
         );
         assert_eq!(recovered_snake.movement_credit(), 0);
         assert_ne!(*recovered_snake.head().unwrap(), checkpoint_head);
+    }
+
+    #[test]
+    fn replay_recording_survives_checkpoint_and_reconstructs_authority() {
+        let game_id = 44;
+        let mut activation = GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        activation.add_player(9, Some("recorder".into())).unwrap();
+        activation.status = common::GameStatus::Started { server_id: 1 };
+        let mut engine = common::GameEngine::new_from_state(game_id, activation.clone());
+        let mut recorder = ReplayRecordingState::new(&activation);
+
+        for now_ms in [100, 200, 300, 400, 500] {
+            let events = engine.run_until(now_ms).unwrap();
+            recorder.record_events(&events).unwrap();
+            recorder.maybe_anchor(engine.get_committed_state()).unwrap();
+        }
+
+        let durable_journal = recorder.pending_journal.clone();
+        let encoded = serde_json::to_vec(&recorder.checkpoint_view()).unwrap();
+        let mut recovered: ReplayRecordingState = serde_json::from_slice(&encoded).unwrap();
+        recovered
+            .hydrate_journal(durable_journal, engine.get_committed_state())
+            .unwrap();
+        let recording = recovered
+            .finish(game_id, engine.get_committed_state())
+            .unwrap()
+            .expect("production game should be recorded");
+        recording.verify_end_hash().unwrap();
+    }
+
+    #[test]
+    fn trusted_stress_marker_excludes_recording() {
+        let mut state = GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        state.is_stress_test = true;
+        let recorder = ReplayRecordingState::new(&state);
+        assert!(!recorder.is_enabled());
+        assert!(recorder.finish(1, &state).unwrap().is_none());
+    }
+
+    #[test]
+    fn server_test_runtime_excludes_recording_without_mutating_process_env() {
+        let state = GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        assert!(replay_recording_allowed_from_lookup(&state, |_| None));
+        for marker in ["1", "true", "YES", " on "] {
+            assert!(!replay_recording_allowed_from_lookup(&state, |name| {
+                (name == "SNAKETRON_TEST_MODE").then(|| marker.to_owned())
+            }));
+        }
+
+        let mut stress = state;
+        stress.is_stress_test = true;
+        assert!(!replay_recording_allowed_from_lookup(&stress, |_| None));
+    }
+
+    #[test]
+    fn checkpoint_metadata_stays_bounded_for_long_recordings() {
+        let mut state = GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        state.add_player(9, Some("recorder".into())).unwrap();
+        state.status = common::GameStatus::Started { server_id: 1 };
+        let mut recorder = ReplayRecordingState::new(&state);
+        let baseline = serde_json::to_vec(&recorder.checkpoint_view()).unwrap();
+        recorder
+            .mark_journal_persisted(recorder.journal_cursor())
+            .unwrap();
+
+        for tick in 1..=160_000 {
+            recorder
+                .record_event(
+                    tick,
+                    GameEvent::ScoreUpdated {
+                        snake_id: 0,
+                        score: tick,
+                    },
+                )
+                .unwrap();
+            // Model the ordinary periodic fenced checkpoint: pending memory is
+            // bounded by recent deltas while the Redis journal keeps history.
+            if tick % 20 == 0 {
+                recorder
+                    .mark_journal_persisted(recorder.journal_cursor())
+                    .unwrap();
+            }
+        }
+
+        let encoded = serde_json::to_vec(&recorder.checkpoint_view()).unwrap();
+        let logical_archive_bytes = serde_json::to_vec(&recorder.messages).unwrap().len();
+        assert!(
+            logical_archive_bytes > 8 * 1024 * 1024,
+            "fixture must exercise a recording above the public one-shot limit"
+        );
+        assert!(encoded.len() <= baseline.len() + 64);
+        let text = String::from_utf8(encoded).unwrap();
+        assert!(!text.contains("ScoreUpdated"));
+        assert!(!text.contains("anchors"));
+        assert!(!text.contains("messages"));
+    }
+
+    #[test]
+    fn potg_ring_evicts_oldest_without_shortening_durable_archive() {
+        let game_id = 45;
+        let mut state = GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        state.add_player(9, Some("recorder".into())).unwrap();
+        state.status = common::GameStatus::Started { server_id: 1 };
+        let mut recorder = ReplayRecordingState::new(&state);
+        let one_anchor_budget = recorder
+            .potg_selection_ring_bytes
+            .saturating_add(POTG_SELECTION_RING_JSON_OVERHEAD_BYTES)
+            .saturating_add(64);
+        recorder.potg_selection_ring_max_bytes = one_anchor_budget;
+
+        let interval_ticks =
+            REPLAY_ANCHOR_INTERVAL_MS.div_ceil(state.properties.tick_duration_ms.max(1));
+        state.tick = state.tick.saturating_add(interval_ticks);
+        recorder.maybe_anchor(&state).unwrap();
+
+        assert!(recorder.potg_ring_truncated());
+        assert!(recorder.potg_selection_ring_bytes() <= one_anchor_budget);
+        assert_eq!(recorder.anchors.len(), 2, "full archive keeps both anchors");
+        let archive = recorder.finish(game_id, &state).unwrap().unwrap();
+        assert_eq!(archive.anchors.len(), 2);
+        archive.verify_end_hash().unwrap();
+        let selection = recorder
+            .finish_potg_selection(game_id, &state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.anchors.len(), 1);
+        assert_eq!(selection.anchors[0].tick, state.tick);
+        selection.verify_end_hash().unwrap();
+        assert!(serde_json::to_vec(&selection).unwrap().len() <= one_anchor_budget);
+        assert_eq!(
+            recorder.potg_ring_evicted_seconds(state.properties.tick_duration_ms),
+            u64::from(REPLAY_ANCHOR_INTERVAL_MS).div_ceil(1_000)
+        );
+    }
+
+    #[test]
+    fn recovery_rebuilds_selection_ring_from_complete_archive() {
+        let mut activation = GameState::new(
+            40,
+            40,
+            common::GameType::Solo,
+            common::QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        activation.add_player(9, Some("recorder".into())).unwrap();
+        activation.status = common::GameStatus::Started { server_id: 1 };
+        let mut recorder = ReplayRecordingState::new(&activation);
+        let interval_ticks =
+            REPLAY_ANCHOR_INTERVAL_MS.div_ceil(activation.properties.tick_duration_ms.max(1));
+        let mut checkpoint = activation.clone();
+        checkpoint.tick = checkpoint.tick.saturating_add(interval_ticks);
+        recorder.maybe_anchor(&checkpoint).unwrap();
+        let durable_journal = recorder.pending_journal.clone();
+        let encoded = serde_json::to_vec(&recorder.checkpoint_view()).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("potg_selection_ring"));
+
+        let mut recovered: ReplayRecordingState = serde_json::from_slice(&encoded).unwrap();
+        assert!(recovered.potg_selection_ring.is_empty());
+        recovered
+            .hydrate_journal(durable_journal, &checkpoint)
+            .unwrap();
+
+        assert!(!recovered.potg_ring_truncated());
+        let selection = recovered
+            .finish_potg_selection(46, &checkpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.anchors.len(), 2);
+        assert_eq!(selection.anchors[0].tick, activation.tick);
+        assert_eq!(selection.anchors[1].tick, checkpoint.tick);
+        selection.verify_end_hash().unwrap();
     }
 }

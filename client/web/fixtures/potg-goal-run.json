@@ -1,0 +1,658 @@
+{
+  "clip_format_version": 1,
+  "gameplay_version": 12,
+  "game_id": 4242,
+  "star_user_id": 1,
+  "star_snake_id": 0,
+  "star_name": "BANKER",
+  "reason": {
+    "GoalRun": {
+      "points": 15
+    }
+  },
+  "score": 140,
+  "breakdown": {
+    "total": 140,
+    "focus_tick": 144,
+    "kills": 0,
+    "boosted_cutoff_kills": 0,
+    "trap_kills": 0,
+    "banked_points": 15,
+    "max_chain": 0,
+    "pickups": 0,
+    "demolition_points": 0,
+    "banking_points": 140,
+    "combo_points": 0
+  },
+  "window": {
+    "start_tick": 24,
+    "end_tick": 204,
+    "focus_tick": 144
+  },
+  "anchor": {
+    "tick": 0,
+    "status": {
+      "Started": {
+        "server_id": 0
+      }
+    },
+    "arena": {
+      "width": 60,
+      "height": 40,
+      "snakes": [
+        {
+          "body": [
+            {
+              "x": 43,
+              "y": 20
+            },
+            {
+              "x": 43,
+              "y": 24
+            }
+          ],
+          "direction": "Up",
+          "is_alive": true,
+          "food": 14,
+          "team_id": 0,
+          "speed_milli": 1000,
+          "movement_credit": 0,
+          "boost": {
+            "charge_ms": 3000,
+            "active": false,
+            "intent": false
+          },
+          "combo": {
+            "chain_count": 0,
+            "remaining_ms": 0
+          }
+        },
+        {
+          "body": [
+            {
+              "x": 20,
+              "y": 30
+            },
+            {
+              "x": 16,
+              "y": 30
+            }
+          ],
+          "direction": "Right",
+          "is_alive": false,
+          "food": 0,
+          "team_id": 1,
+          "speed_milli": 1000,
+          "movement_credit": 0,
+          "boost": {
+            "charge_ms": 0,
+            "active": false,
+            "intent": false
+          },
+          "combo": {
+            "chain_count": 0,
+            "remaining_ms": 0
+          }
+        }
+      ],
+      "food": [],
+      "boost_pads": [
+        {
+          "id": 0,
+          "position": {
+            "x": 14,
+            "y": 4
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 1,
+          "position": {
+            "x": 14,
+            "y": 34
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 2,
+          "position": {
+            "x": 44,
+            "y": 4
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 3,
+          "position": {
+            "x": 44,
+            "y": 34
+          },
+          "charge_ms": 3000,
+          "size_cells": 2,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 4,
+          "position": {
+            "x": 26,
+            "y": 12
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 5,
+          "position": {
+            "x": 33,
+            "y": 12
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 6,
+          "position": {
+            "x": 37,
+            "y": 16
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 7,
+          "position": {
+            "x": 37,
+            "y": 23
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 8,
+          "position": {
+            "x": 33,
+            "y": 27
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 9,
+          "position": {
+            "x": 26,
+            "y": 27
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 10,
+          "position": {
+            "x": 22,
+            "y": 23
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        },
+        {
+          "id": 11,
+          "position": {
+            "x": 22,
+            "y": 16
+          },
+          "charge_ms": 750,
+          "size_cells": 1,
+          "respawn_at_tick": null
+        }
+      ],
+      "team_zone_config": {
+        "end_zone_depth": 10,
+        "goal_width": 9
+      }
+    },
+    "game_type": {
+      "TeamMatch": {
+        "per_team": 1
+      }
+    },
+    "queue_mode": "Quickmatch",
+    "is_stress_test": false,
+    "properties": {
+      "available_food_target": 10,
+      "tick_duration_ms": 50,
+      "time_limit_ms": null,
+      "score_limit": 25,
+      "boost": {
+        "speed_milli": 1500,
+        "capacity_ms": 3000,
+        "packet_charge_ms": 750,
+        "pad_respawn_ms": 8000,
+        "spot_layout_version": 3,
+        "rules_version": 2,
+        "unlimited": false
+      },
+      "combo": {
+        "window_ms": 2000,
+        "max_food_value": 3,
+        "rules_version": 1
+      },
+      "player_idle_timeout_ms": 600000,
+      "player_idle_warning_ms": 10000
+    },
+    "command_queue": {
+      "queue": [
+        {
+          "command_id_client": {
+            "tick": 28,
+            "user_id": 1,
+            "sequence_number": 1
+          },
+          "command_id_server": {
+            "tick": 28,
+            "user_id": 1,
+            "sequence_number": 1
+          },
+          "command": {
+            "Turn": {
+              "snake_id": 0,
+              "direction": "Right"
+            }
+          }
+        },
+        {
+          "command_id_client": {
+            "tick": 38,
+            "user_id": 1,
+            "sequence_number": 2
+          },
+          "command_id_server": {
+            "tick": 38,
+            "user_id": 1,
+            "sequence_number": 2
+          },
+          "command": {
+            "Turn": {
+              "snake_id": 0,
+              "direction": "Down"
+            }
+          }
+        },
+        {
+          "command_id_client": {
+            "tick": 66,
+            "user_id": 1,
+            "sequence_number": 3
+          },
+          "command_id_server": {
+            "tick": 66,
+            "user_id": 1,
+            "sequence_number": 3
+          },
+          "command": {
+            "Turn": {
+              "snake_id": 0,
+              "direction": "Left"
+            }
+          }
+        }
+      ],
+      "active_ids": [],
+      "tombstone_ids": []
+    },
+    "players": {
+      "2": {
+        "user_id": 2,
+        "snake_id": 1
+      },
+      "1": {
+        "user_id": 1,
+        "snake_id": 0
+      }
+    },
+    "rng": null,
+    "game_code": null,
+    "host_user_id": null,
+    "start_ms": 0,
+    "event_sequence": 0,
+    "usernames": {
+      "2": "DEFENDER",
+      "1": "BANKER"
+    },
+    "skins": {},
+    "spectators": [],
+    "scores": {},
+    "food_pickups": {},
+    "team_scores": {
+      "0": 0,
+      "1": 0
+    },
+    "player_xp": {},
+    "player_action_counts": {},
+    "player_last_activity_ticks": {
+      "1": 0,
+      "2": 0
+    },
+    "idle_kicked_user_ids": [],
+    "completed_by_inactivity": false,
+    "readiness": null,
+    "simulation_epoch_ms": null
+  },
+  "messages": [
+    {
+      "tick": 10,
+      "sequence": 1,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 1000
+        }
+      }
+    },
+    {
+      "tick": 20,
+      "sequence": 2,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 2000
+        }
+      }
+    },
+    {
+      "tick": 30,
+      "sequence": 3,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 3000
+        }
+      }
+    },
+    {
+      "tick": 30,
+      "sequence": 4,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 40,
+      "sequence": 5,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 4000
+        }
+      }
+    },
+    {
+      "tick": 40,
+      "sequence": 6,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Down"
+        }
+      }
+    },
+    {
+      "tick": 50,
+      "sequence": 7,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 5000
+        }
+      }
+    },
+    {
+      "tick": 60,
+      "sequence": 8,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 6000
+        }
+      }
+    },
+    {
+      "tick": 68,
+      "sequence": 9,
+      "event": {
+        "SnakeTurned": {
+          "snake_id": 0,
+          "direction": "Left"
+        }
+      }
+    },
+    {
+      "tick": 70,
+      "sequence": 10,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 7000
+        }
+      }
+    },
+    {
+      "tick": 80,
+      "sequence": 11,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 8000
+        }
+      }
+    },
+    {
+      "tick": 90,
+      "sequence": 12,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 9000
+        }
+      }
+    },
+    {
+      "tick": 100,
+      "sequence": 13,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 10000
+        }
+      }
+    },
+    {
+      "tick": 110,
+      "sequence": 14,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 11000
+        }
+      }
+    },
+    {
+      "tick": 120,
+      "sequence": 15,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 12000
+        }
+      }
+    },
+    {
+      "tick": 130,
+      "sequence": 16,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 13000
+        }
+      }
+    },
+    {
+      "tick": 140,
+      "sequence": 17,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 14000
+        }
+      }
+    },
+    {
+      "tick": 144,
+      "sequence": 18,
+      "event": {
+        "TeamScoreUpdated": {
+          "team_id": 0,
+          "score": 15
+        }
+      }
+    },
+    {
+      "tick": 144,
+      "sequence": 19,
+      "event": {
+        "SnakeDied": {
+          "snake_id": 0,
+          "cause": "Banked"
+        }
+      }
+    },
+    {
+      "tick": 144,
+      "sequence": 20,
+      "event": {
+        "SnakeRespawned": {
+          "snake_id": 0,
+          "position": {
+            "x": 8,
+            "y": 20
+          },
+          "direction": "Right"
+        }
+      }
+    },
+    {
+      "tick": 150,
+      "sequence": 21,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 15000
+        }
+      }
+    },
+    {
+      "tick": 160,
+      "sequence": 22,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 16000
+        }
+      }
+    },
+    {
+      "tick": 170,
+      "sequence": 23,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 17000
+        }
+      }
+    },
+    {
+      "tick": 180,
+      "sequence": 24,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 18000
+        }
+      }
+    },
+    {
+      "tick": 190,
+      "sequence": 25,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 19000
+        }
+      }
+    },
+    {
+      "tick": 200,
+      "sequence": 26,
+      "event": {
+        "TickHash": {
+          "hash": 0,
+          "server_ts_ms": 20000
+        }
+      }
+    }
+  ],
+  "end_sync_hash": "15758133424348116561",
+  "presentation": {
+    "rotation": 270,
+    "follow_snake_id": 0,
+    "segments": [
+      {
+        "until_tick": 104,
+        "time_scale": 1.0
+      },
+      {
+        "until_tick": 174,
+        "time_scale": 0.5
+      },
+      {
+        "until_tick": 204,
+        "time_scale": 1.0
+      }
+    ]
+  },
+  "config": {
+    "rules_version": 2,
+    "minimum_score": 120,
+    "elimination": 90,
+    "mutual_trade": 60,
+    "boosted_kill": 40,
+    "cutoff": 30,
+    "proximity": 20,
+    "trap": 30,
+    "laden_per_point": 4,
+    "laden_cap": 50,
+    "teammate_kill": -80,
+    "banked_per_point": 6,
+    "big_carry": 50,
+    "combo_step": 21,
+    "nick_of_time": 10,
+    "boosted_pickup": 5,
+    "feeding_frenzy": 20,
+    "death": -60
+  }
+}

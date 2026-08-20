@@ -5,17 +5,30 @@
 //! effect has a stable identity and is applied through a DynamoDB transaction
 //! containing both the mutation and its idempotency marker.
 
-use crate::db::Database;
+use crate::db::{
+    Database,
+    models::{MatchHistoryPlayer, MatchHistorySummary},
+};
 use crate::mmr_persistence::calculate_mmr_effect_specs;
-use crate::season::{get_current_season, get_region};
+use crate::season::{Season, get_region, get_season_at};
 use anyhow::{Result, anyhow};
-use common::{GameState, GameStatus, GameType, QueueMode};
+use chrono::{DateTime, Utc};
+use common::{
+    GAME_RECORDING_FORMAT_VERSION, GAMEPLAY_REPLAY_VERSION, GameRecordingV1, GameState, GameStatus,
+    GameType, HIGHLIGHT_CLIP_FORMAT_VERSION, HighlightClip, QueueMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const COMPLETION_SCHEMA_VERSION: u16 = 1;
+pub const MATCH_HISTORY_SCHEMA_VERSION: u16 = 1;
+/// A DynamoDB transaction contains the effect marker, completion anchor,
+/// completed-game row, canonical history row, and one projection per player.
+/// Keep the total at or below DynamoDB's 100-action limit.
+pub const MAX_HISTORY_TRANSACTION_PLAYERS: usize = 96;
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 
 /// Serialize a durable payload with recursively sorted object keys. Recovery
 /// reparses `GameState` hash maps in a fresh process, so ordinary JSON bytes
@@ -58,6 +71,31 @@ pub struct CompletionRecordV1 {
     pub revision: Uuid,
     pub ended_at_ms: i64,
     pub server_id: u64,
+    /// Season captured before the durable completion commit. Older records
+    /// deserialize without it and remain replayable, but cannot feed seasonal
+    /// news because their cohort is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<Season>,
+    /// Materialized recovery-safe source uploaded to private object storage by
+    /// PersistGame. New immutable Redis records leave this empty; the bounded
+    /// blocking materializer fills it process-locally. It also remains the
+    /// compatibility source for older inline completion records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<GameRecordingV1>,
+    /// Process-local canonical bytes produced by the bounded PersistGame
+    /// materializer. This is deliberately absent from the immutable Redis
+    /// schema; it prevents Dynamo/S3 persistence from serializing a huge
+    /// recording again on an async runtime worker.
+    #[serde(skip, default)]
+    pub recording_canonical_bytes: Option<Vec<u8>>,
+    /// Compact reference to the retained lease-fenced replay journal. New
+    /// completions always use it so the actor never assembles a full archive;
+    /// PersistGame materializes and uploads it after progression effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_journal: Option<crate::recovery::ReplayJournalReferenceV1>,
+    /// Server-selected canonical clip delivered identically to every viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_of_the_game: Option<HighlightClip>,
     pub final_state: GameState,
     pub effects: Vec<CompletionEffect>,
 }
@@ -71,9 +109,9 @@ impl CompletionRecordV1 {
         self.effects.iter().find(|effect| effect.id() == effect_id)
     }
 
-    /// Validate the durable record independently of any in-process executor
-    /// state. Callers must do this before committing the record, and the
-    /// database repeats the check before applying an effect.
+    /// Validate the immutable completion envelope without re-simulating its
+    /// potentially long replay artifacts. This method is intentionally cheap:
+    /// every effect and effect-marker retry calls it.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != COMPLETION_SCHEMA_VERSION {
             return Err(anyhow!(
@@ -111,6 +149,70 @@ impl CompletionRecordV1 {
                 self.game_id
             ));
         }
+        if let Some(recording) = &self.recording {
+            if recording.format_version != GAME_RECORDING_FORMAT_VERSION
+                || recording.gameplay_version != GAMEPLAY_REPLAY_VERSION
+                || recording.anchors.is_empty()
+            {
+                return Err(anyhow!("completion recording format is incompatible"));
+            }
+            if recording.game_id != self.game_id {
+                return Err(anyhow!("completion recording targets a different game"));
+            }
+            if recording.end_tick != self.final_state.tick
+                || recording.end_sync_hash != self.final_state.sync_hash()
+            {
+                return Err(anyhow!("completion recording does not match final state"));
+            }
+        }
+        if self.recording.is_some() && self.recording_journal.is_some() {
+            return Err(anyhow!(
+                "completion cannot contain both inline and journal replay sources"
+            ));
+        }
+        if self.recording_canonical_bytes.is_some() && self.recording.is_none() {
+            return Err(anyhow!(
+                "completion canonical replay bytes require a materialized recording"
+            ));
+        }
+        if let Some(recording_journal) = &self.recording_journal {
+            recording_journal.validate()?;
+            if recording_journal.game_id != self.game_id {
+                return Err(anyhow!(
+                    "completion replay journal targets a different game"
+                ));
+            }
+            if recording_journal
+                .end_tick
+                .is_some_and(|end_tick| end_tick != self.final_state.tick)
+                || recording_journal
+                    .end_sync_hash
+                    .is_some_and(|end_hash| end_hash != self.final_state.sync_hash())
+            {
+                return Err(anyhow!(
+                    "completion replay journal does not match final-state metadata"
+                ));
+            }
+        }
+        if let Some(clip) = &self.play_of_the_game {
+            if clip.clip_format_version != HIGHLIGHT_CLIP_FORMAT_VERSION
+                || clip.gameplay_version != GAMEPLAY_REPLAY_VERSION
+            {
+                return Err(anyhow!("completion highlight format is incompatible"));
+            }
+            if clip.game_id != self.game_id {
+                return Err(anyhow!("completion highlight targets a different game"));
+            }
+        }
+        if self.final_state.is_stress_test
+            && (self.recording.is_some()
+                || self.recording_journal.is_some()
+                || self.play_of_the_game.is_some())
+        {
+            return Err(anyhow!(
+                "stress-test completion must not contain replay artifacts"
+            ));
+        }
 
         let mut ids = HashSet::with_capacity(self.effects.len());
         let mut persist_game_count = 0;
@@ -125,6 +227,19 @@ impl CompletionRecordV1 {
                 ));
             }
             effect.validate_identity(self)?;
+            let effect_season = match effect {
+                CompletionEffect::UpdateRanking { season, .. }
+                | CompletionEffect::InsertHighScore { season, .. } => Some(*season),
+                _ => None,
+            };
+            if let (Some(record_season), Some(effect_season)) = (self.season, effect_season)
+                && record_season != effect_season
+            {
+                return Err(anyhow!(
+                    "completion season {record_season} does not match effect {} season {effect_season}",
+                    effect.id()
+                ));
+            }
             if matches!(effect, CompletionEffect::PersistGame { .. }) {
                 persist_game_count += 1;
             }
@@ -137,6 +252,15 @@ impl CompletionRecordV1 {
         if self.final_state.is_stress_test && self.effects.len() != 1 {
             return Err(anyhow!(
                 "stress-test completion must not contain progression or ranking effects"
+            ));
+        }
+        if !self.final_state.is_stress_test
+            && self.final_state.players.len() > MAX_HISTORY_TRANSACTION_PLAYERS
+        {
+            return Err(anyhow!(
+                "completion has {} players; at most {} can be persisted atomically with history",
+                self.final_state.players.len(),
+                MAX_HISTORY_TRANSACTION_PLAYERS
             ));
         }
 
@@ -247,6 +371,24 @@ impl CompletionRecordV1 {
         Ok(())
     }
 
+    /// Compatibility/full artifact validation for callers that already own an
+    /// inline recording. New actors commit only a journal reference; its full
+    /// archive is verified by PersistGame's bounded blocking materializer.
+    pub fn validate_replay_artifacts(&self) -> Result<()> {
+        self.validate()?;
+        if let Some(recording) = &self.recording {
+            recording.validate()?;
+            recording.verify_end_hash()?;
+        }
+        if let Some(recording_journal) = &self.recording_journal {
+            recording_journal.validate()?;
+        }
+        if let Some(clip) = &self.play_of_the_game {
+            clip.replay_and_verify()?;
+        }
+        Ok(())
+    }
+
     /// Ensure the submitted effect is the exact effect captured in this
     /// immutable record, rather than merely reusing one of its identifiers.
     pub fn validate_effect(&self, effect: &CompletionEffect) -> Result<()> {
@@ -263,6 +405,151 @@ impl CompletionRecordV1 {
             )),
         }
     }
+}
+
+/// Build the compact immutable result written to the canonical history row and
+/// copied into each player's history partition. This intentionally depends only
+/// on the durable completion payload plus the retention policy captured by the
+/// successful write attempt.
+pub fn match_history_summary(
+    completion: &CompletionRecordV1,
+    snapshot_retention_days: u16,
+) -> Result<MatchHistorySummary> {
+    let state = &completion.final_state;
+    let (mode, mode_label) = match &state.game_type {
+        GameType::Solo => ("solo".to_string(), "Solo".to_string()),
+        GameType::TeamMatch { per_team: 1 } => ("duel".to_string(), "Duel".to_string()),
+        GameType::TeamMatch { per_team: 2 } => ("2v2".to_string(), "2v2".to_string()),
+        GameType::TeamMatch { per_team } => {
+            let name = format!("{per_team}v{per_team}");
+            (name.clone(), name)
+        }
+        GameType::FreeForAll { .. } => ("ffa".to_string(), "Free for All".to_string()),
+        GameType::Custom { .. } => ("custom".to_string(), "Custom".to_string()),
+    };
+    let queue_mode = match state.queue_mode {
+        QueueMode::Quickmatch => "quickmatch",
+        QueueMode::Competitive => "competitive",
+    }
+    .to_string();
+
+    let mut winner_user_ids: Vec<u32> = completion
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            CompletionEffect::UpdateRanking {
+                user_id, won: true, ..
+            } => Some(*user_id),
+            _ => None,
+        })
+        .collect();
+
+    // Stress and solo records intentionally have no ranking effects. The
+    // terminal winner remains authoritative for those modes and is also a
+    // defensive fallback for historical/custom records.
+    if winner_user_ids.is_empty() && !matches!(state.game_type, GameType::Solo) {
+        let winning_snake_id = match state.status {
+            GameStatus::Complete { winning_snake_id } => winning_snake_id,
+            _ => None,
+        };
+        if let Some(winning_snake_id) = winning_snake_id {
+            let winning_team = state
+                .arena
+                .snakes
+                .get(winning_snake_id as usize)
+                .and_then(|snake| snake.team_id);
+            winner_user_ids.extend(state.players.iter().filter_map(|(user_id, player)| {
+                if state.is_player_idle_kicked(*user_id) {
+                    return None;
+                }
+                let snake = state.arena.snakes.get(player.snake_id as usize)?;
+                let won = winning_team
+                    .map(|team| snake.team_id == Some(team))
+                    .unwrap_or(player.snake_id == winning_snake_id);
+                won.then_some(*user_id)
+            }));
+        }
+    }
+    winner_user_ids.sort_unstable();
+    winner_user_ids.dedup();
+
+    let mmr_deltas: std::collections::HashMap<u32, i32> = completion
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            CompletionEffect::AddMmr { user_id, delta, .. } => Some((*user_id, *delta)),
+            _ => None,
+        })
+        .collect();
+    let multiple_players = state.players.len() > 1;
+    let has_winner = !winner_user_ids.is_empty();
+
+    let mut player_ids: Vec<u32> = state.players.keys().copied().collect();
+    player_ids.sort_unstable();
+    let players = player_ids
+        .into_iter()
+        .map(|user_id| {
+            let player = state
+                .players
+                .get(&user_id)
+                .expect("player id came from the same map");
+            let team_id = state
+                .arena
+                .snakes
+                .get(player.snake_id as usize)
+                .and_then(|snake| snake.team_id)
+                .map(|team| team.0);
+            let outcome = if matches!(state.game_type, GameType::Solo) {
+                "completed"
+            } else if state.is_player_idle_kicked(user_id) {
+                "removed"
+            } else if winner_user_ids.binary_search(&user_id).is_ok() {
+                "win"
+            } else if has_winner {
+                "loss"
+            } else if multiple_players {
+                "draw"
+            } else {
+                "completed"
+            };
+            MatchHistoryPlayer {
+                user_id,
+                username: username_for(state, user_id),
+                team_id,
+                score: state.scores.get(&player.snake_id).copied().unwrap_or(0),
+                team_score: team_id.and_then(|team_id| {
+                    state
+                        .team_scores
+                        .as_ref()
+                        .and_then(|scores| scores.get(&common::TeamId(team_id)).copied())
+                }),
+                xp_gained: state.player_xp.get(&user_id).copied().unwrap_or(0),
+                mmr_delta: mmr_deltas.get(&user_id).copied(),
+                outcome: outcome.to_string(),
+            }
+        })
+        .collect();
+
+    let started_at_ms = state.simulation_epoch_ms.unwrap_or(state.start_ms);
+    Ok(MatchHistorySummary {
+        schema_version: MATCH_HISTORY_SCHEMA_VERSION,
+        game_id: completion.game_id,
+        started_at_ms,
+        ended_at_ms: completion.ended_at_ms,
+        duration_ms: state.elapsed_match_ms(),
+        mode,
+        mode_label,
+        queue_mode,
+        is_private: state.game_code.is_some()
+            || matches!(&state.game_type, GameType::Custom { settings } if settings.is_private),
+        is_stress_test: state.is_stress_test,
+        completed_by_inactivity: state.completed_by_inactivity,
+        players,
+        winner_user_ids,
+        snapshot_available_until_ms: completion
+            .ended_at_ms
+            .saturating_add(i64::from(snapshot_retention_days).saturating_mul(MILLIS_PER_DAY)),
+    })
 }
 
 /// `chrono` is intentionally kept out of the durable record's public schema;
@@ -477,9 +764,9 @@ pub async fn materialize_completion(
         ));
     }
 
-    let mut effects = vec![CompletionEffect::PersistGame {
-        id: "game".to_string(),
-    }];
+    let season = season_for_completion_timestamp(ended_at_ms)?;
+    let mut effects = Vec::new();
+    let mut post_persist_effects = Vec::new();
 
     let mut player_ids: Vec<u32> = final_state.players.keys().copied().collect();
     player_ids.sort_unstable();
@@ -499,14 +786,15 @@ pub async fn materialize_completion(
         }
 
         let region = get_region();
-        let season = get_current_season();
         if matches!(final_state.game_type, GameType::Solo) {
             for user_id in player_ids {
                 let player = final_state
                     .players
                     .get(&user_id)
                     .expect("player id collected from same state");
-                effects.push(CompletionEffect::InsertHighScore {
+                // High-score publication reads the completed game row for
+                // privacy/news provenance, so keep it after PersistGame.
+                post_persist_effects.push(CompletionEffect::InsertHighScore {
                     id: format!("high_score:{user_id}"),
                     user_id,
                     username: username_for(&final_state, user_id),
@@ -546,6 +834,15 @@ pub async fn materialize_completion(
         }
     }
 
+    // Player progression is applied first. Replay upload is retried as part
+    // of PersistGame, but an S3 outage must not hold earned XP/MMR hostage.
+    // Solo high scores stay after persistence because their public provenance
+    // depends on the completed game row.
+    effects.push(CompletionEffect::PersistGame {
+        id: "game".to_string(),
+    });
+    effects.extend(post_persist_effects);
+
     let record = CompletionRecordV1 {
         schema_version: COMPLETION_SCHEMA_VERSION,
         game_id,
@@ -553,11 +850,22 @@ pub async fn materialize_completion(
         revision: Uuid::new_v4(),
         ended_at_ms,
         server_id,
+        season: Some(season),
+        recording: None,
+        recording_canonical_bytes: None,
+        recording_journal: None,
+        play_of_the_game: None,
         final_state,
         effects,
     };
     record.validate()?;
     Ok(record)
+}
+
+fn season_for_completion_timestamp(ended_at_ms: i64) -> Result<Season> {
+    let ended_at = DateTime::<Utc>::from_timestamp_millis(ended_at_ms)
+        .ok_or_else(|| anyhow!("invalid completion timestamp {ended_at_ms}"))?;
+    Ok(get_season_at(ended_at))
 }
 
 fn username_for(state: &GameState, user_id: u32) -> String {
@@ -587,7 +895,8 @@ pub async fn apply_all_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{GameStatus, GameType, QueueMode};
+    use chrono::TimeZone;
+    use common::{DeathCause, GameStatus, GameType, Position, QueueMode, SnakeCrash};
 
     #[test]
     fn effect_ids_are_stable_and_unique() {
@@ -628,6 +937,69 @@ mod tests {
     }
 
     #[test]
+    fn completion_timestamp_selects_the_season_at_the_exact_rollover() {
+        let before = Utc
+            .with_ymd_and_hms(2026, 9, 30, 23, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+            + 999;
+        let boundary = Utc
+            .with_ymd_and_hms(2026, 10, 1, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(season_for_completion_timestamp(before).unwrap(), 0);
+        assert_eq!(season_for_completion_timestamp(boundary).unwrap(), 1);
+    }
+
+    #[test]
+    fn pre_attribution_completion_record_deserializes_with_unknown_crash_cause() {
+        let mut state = GameState::new(40, 40, GameType::Solo, QueueMode::Quickmatch, Some(1), 0);
+        state.recent_crashes.push(SnakeCrash {
+            tick: 3,
+            snake_id: 0,
+            position: Position { x: 0, y: 5 },
+            cause: DeathCause::OutOfBounds,
+        });
+        state.status = GameStatus::Complete {
+            winning_snake_id: None,
+        };
+        let record = CompletionRecordV1 {
+            schema_version: COMPLETION_SCHEMA_VERSION,
+            game_id: 17,
+            partition_id: 7,
+            revision: Uuid::new_v4(),
+            ended_at_ms: 10,
+            server_id: 1,
+            season: None,
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
+            final_state: state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+
+        let mut legacy = serde_json::to_value(record).expect("serialize completion");
+        legacy["final_state"]["recent_crashes"][0]
+            .as_object_mut()
+            .expect("crash object")
+            .remove("cause");
+
+        let restored: CompletionRecordV1 =
+            serde_json::from_value(legacy).expect("deserialize pre-attribution completion");
+        assert_eq!(
+            restored.final_state.recent_crashes[0].cause,
+            DeathCause::Unknown
+        );
+        restored
+            .validate()
+            .expect("legacy completion remains valid");
+    }
+
+    #[test]
     fn stress_completion_rejects_player_progression_effects() {
         let mut state = GameState::new(
             60,
@@ -653,10 +1025,23 @@ mod tests {
             revision: Uuid::new_v4(),
             ended_at_ms: 10,
             server_id: 1,
+            season: Some(0),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: state,
             effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
         };
         assert!(record.validate().is_ok());
+
+        let mut legacy_record = record.clone();
+        legacy_record.season = None;
+        let serialized = serde_json::to_value(&legacy_record).unwrap();
+        assert!(
+            serialized.get("season").is_none(),
+            "legacy records must retain their pre-season serialization shape"
+        );
 
         record.effects.push(CompletionEffect::AddXp {
             id: "xp:7".into(),
@@ -671,5 +1056,52 @@ mod tests {
                 .to_string()
                 .contains("stress-test completion")
         );
+    }
+
+    #[test]
+    fn solo_history_is_completed_without_a_competitive_winner() {
+        let mut state = GameState::new(
+            40,
+            40,
+            GameType::Solo,
+            QueueMode::Quickmatch,
+            Some(1),
+            1_000,
+        );
+        let player = state
+            .add_player(7, Some("solo-player".into()))
+            .expect("solo player should be added");
+        state.tick = 12;
+        state.simulation_epoch_ms = Some(1_500);
+        state.scores.insert(player.snake_id, 9);
+        state.player_xp.insert(7, 25);
+        // Legacy snapshots may contain a terminal snake even though Solo is
+        // presented as a completed run, not a win/loss match.
+        state.status = GameStatus::Complete {
+            winning_snake_id: Some(player.snake_id),
+        };
+        let record = CompletionRecordV1 {
+            schema_version: COMPLETION_SCHEMA_VERSION,
+            game_id: 42,
+            partition_id: 3,
+            revision: Uuid::new_v4(),
+            ended_at_ms: 5_000,
+            server_id: 1,
+            season: Some(0),
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
+            final_state: state,
+            effects: vec![CompletionEffect::PersistGame { id: "game".into() }],
+        };
+
+        let summary = match_history_summary(&record, 30).unwrap();
+        assert_eq!(summary.started_at_ms, 1_500);
+        assert_eq!(summary.duration_ms, 12 * 50);
+        assert!(summary.winner_user_ids.is_empty());
+        assert_eq!(summary.players[0].score, 9);
+        assert_eq!(summary.players[0].xp_gained, 25);
+        assert_eq!(summary.players[0].outcome, "completed");
     }
 }

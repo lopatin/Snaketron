@@ -44,6 +44,40 @@ test('idle warning begins at the configured authoritative threshold', () => {
   });
 });
 
+test('server-provided twenty-second policy drives both warning boundaries', () => {
+  const serverConfiguredState = startedState({
+    tick: 99,
+    properties: {
+      tick_duration_ms: 100,
+      player_idle_timeout_ms: 20_000,
+      player_idle_warning_ms: 10_000,
+    },
+  });
+
+  assert.equal(buildPlayerIdlePresentation(serverConfiguredState, 7).warning, null);
+  assert.deepEqual(
+    buildPlayerIdlePresentation({ ...serverConfiguredState, tick: 100 }, 7),
+    {
+      isKicked: false,
+      warning: {
+        deadlineTick: 200,
+        remainingMs: 10_000,
+        remainingSeconds: 10,
+        progress: 1,
+        isUrgent: false,
+      },
+    },
+  );
+  assert.equal(
+    buildPlayerIdlePresentation({ ...serverConfiguredState, tick: 200 }, 7).warning,
+    null,
+  );
+  assert.equal(
+    buildPlayerIdlePresentation({ ...serverConfiguredState, tick: 201 }, 7).warning,
+    null,
+  );
+});
+
 test('idle warning uses simulation ticks, rounds seconds up, and becomes urgent', () => {
   const presentation = buildPlayerIdlePresentation(startedState({ tick: 551 }), 7);
 
@@ -51,6 +85,23 @@ test('idle warning uses simulation ticks, rounds seconds up, and becomes urgent'
   assert.equal(presentation.warning?.remainingSeconds, 5);
   assert.equal(presentation.warning?.progress, 0.49);
   assert.equal(presentation.warning?.isUrgent, true);
+});
+
+test('urgent styling begins halfway through the server-provided warning duration', () => {
+  const state = startedState({
+    tick: 499,
+    properties: {
+      tick_duration_ms: 100,
+      player_idle_timeout_ms: 60_000,
+      player_idle_warning_ms: 20_000,
+    },
+  });
+
+  assert.equal(buildPlayerIdlePresentation(state, 7).warning?.isUrgent, false);
+  assert.equal(
+    buildPlayerIdlePresentation({ ...state, tick: 500 }, 7).warning?.isUrgent,
+    true,
+  );
 });
 
 test('idle deadline rounds up to the first authoritative simulation quantum', () => {

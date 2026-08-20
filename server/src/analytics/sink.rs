@@ -475,6 +475,9 @@ mod tests {
 
     fn member(user_id: u32) -> LobbyMember {
         LobbyMember {
+            can_show_video_ad: false,
+            supports_ad_break: false,
+            distribution: None,
             user_id,
             username: format!("u{user_id}"),
             ts: 0.0,
@@ -487,6 +490,7 @@ mod tests {
 
     fn queued_lobby(game_types: Vec<GameType>, pool: MatchmakingPool) -> QueuedLobby {
         QueuedLobby {
+            queue_identity_json: None,
             lobby_code: "ABCDEF".to_owned(),
             queue_token: "token".to_owned(),
             members: vec![member(1)],
@@ -518,12 +522,17 @@ mod tests {
             0,
         );
         let record = CompletionRecordV1 {
+            season: None,
             schema_version: crate::completion::COMPLETION_SCHEMA_VERSION,
             game_id: 1,
             partition_id: 0,
             revision: uuid::Uuid::new_v4(),
             ended_at_ms: 1,
             server_id: 1,
+            recording: None,
+            recording_canonical_bytes: None,
+            recording_journal: None,
+            play_of_the_game: None,
             final_state: state,
             effects: Vec::new(),
         };

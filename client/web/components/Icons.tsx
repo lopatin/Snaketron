@@ -82,6 +82,23 @@ export const HistoryIcon = ({ className = '' }) => (
   </svg>
 );
 
+export const AdminIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={1.8}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M12 3 5 6v5c0 4.4 2.8 8.2 7 10 4.2-1.8 7-5.6 7-10V6l-7-3Zm-3 9 2 2 4-5"
+    />
+  </svg>
+);
+
 export const KeyIcon = ({ className = '' }) => (
   <svg
     className={className}
@@ -139,5 +156,90 @@ export const NetworkIcon = ({ className = '', style = {} }: { className?: string
       strokeLinejoin="round"
       d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"
     />
+  </svg>
+);
+
+export const FullscreenEnterIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={2.2}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"
+    />
+  </svg>
+);
+
+export const FullscreenExitIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={2.2}
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6"
+    />
+  </svg>
+);
+
+export const ShareIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <circle cx="18" cy="5" r="2.6" />
+    <circle cx="6" cy="12" r="2.6" />
+    <circle cx="18" cy="19" r="2.6" />
+    <path d="M8.3 10.8 15.7 6.4M8.3 13.2l7.4 4.4" />
+  </svg>
+);
+
+export const LinkIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M10.5 13.5a4 4 0 0 0 5.7 0l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.3 1.3" />
+    <path d="M13.5 10.5a4 4 0 0 0-5.7 0l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.3-1.3" />
+  </svg>
+);
+
+/** Crossed blades: the challenge affordance in the online-players panel. */
+export const ChallengeIcon = ({ className = '' }) => (
+  <svg
+    className={className}
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M4 3h3l10.5 10.5" />
+    <path d="M20 3h-3L6.5 13.5" />
+    <path d="m14.5 16.5 2.5-2.5 4 4-2.5 2.5z" />
+    <path d="m9.5 16.5-2.5-2.5-4 4 2.5 2.5z" />
   </svg>
 );

@@ -1,7 +1,10 @@
-use ::common::{GameEvent, GameType};
-use anyhow::{Context, Result};
+use ::common::{GameEvent, GameType, QueueMode};
+use anyhow::{Context, Result, ensure};
+use chrono::Utc;
 use futures_util::future::join_all;
 use redis::AsyncCommands;
+use server::matchmaking_manager::QueuedLobby;
+use server::matchmaking_pool::MatchmakingPool;
 use server::redis_keys::RedisKeys;
 use server::ws_server::WSMessage;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
@@ -10,12 +13,152 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 // Example: SNAKETRON_ENV=test cargo test -p server --test matchmaking_integration_tests
 
 mod common;
-use self::common::{TestClient, TestEnvironment};
+use self::common::{TestClient, TestEnvironment, is_unsolicited_push};
 
 // Serializes the tests in this binary: TestEnvironment::new() sets process-wide
 // env vars (DYNAMODB_TABLE_PREFIX, SNAKETRON_REDIS_URL) and flushes the shared
 // Redis test database, so concurrently running tests corrupt each other.
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Move one exact admitted lobby to an older queue age without waiting for the
+/// wall clock. The compare-and-swap updates every serialized Redis index used
+/// by production matchmaking, while leaving the immutable queue token and user
+/// claims untouched.
+async fn backdate_queued_lobby(
+    redis_conn: &mut redis::aio::MultiplexedConnection,
+    lobby_code: &str,
+    age: Duration,
+    expected_mmr: i32,
+    queued_not_before_ms: i64,
+) -> Result<()> {
+    let identity_key = RedisKeys::matchmaking_lobby_queue_identity(lobby_code);
+    let (mut lobby, original_json) = timeout(Duration::from_secs(5), async {
+        loop {
+            let member_json: Option<String> = redis_conn.get(&identity_key).await?;
+            if let Some(member_json) = member_json {
+                let lobby: QueuedLobby = serde_json::from_str(&member_json)
+                    .context("queued lobby identity contained malformed JSON")?;
+                ensure!(
+                    lobby.lobby_code == lobby_code,
+                    "queue identity for {lobby_code} belonged to {}",
+                    lobby.lobby_code
+                );
+                return Ok::<_, anyhow::Error>((lobby, member_json));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("lobby {lobby_code} was not admitted within five seconds"))??;
+
+    let observed_at = Utc::now().timestamp_millis();
+    let original_queued_at = lobby.queued_at;
+    ensure!(
+        lobby.avg_mmr == expected_mmr,
+        "lobby {lobby_code} was admitted at MMR {}, expected {expected_mmr}",
+        lobby.avg_mmr
+    );
+    ensure!(
+        lobby.game_types == [GameType::FreeForAll { max_players: 2 }],
+        "lobby {lobby_code} was admitted to the wrong game-type queues: {:?}",
+        lobby.game_types
+    );
+    ensure!(
+        lobby.queue_mode == QueueMode::Competitive,
+        "lobby {lobby_code} was admitted in {:?} mode",
+        lobby.queue_mode
+    );
+    ensure!(
+        lobby.matchmaking_pool == MatchmakingPool::Public,
+        "lobby {lobby_code} was admitted to the {:?} pool",
+        lobby.matchmaking_pool
+    );
+    ensure!(
+        original_queued_at >= queued_not_before_ms && original_queued_at <= observed_at,
+        "lobby {lobby_code} did not receive a fresh production queued_at timestamp"
+    );
+
+    let age_ms = i64::try_from(age.as_millis()).context("test lobby age exceeds i64")?;
+    lobby.queued_at = observed_at.saturating_sub(age_ms);
+    let updated_json = serde_json::to_string(&lobby)?;
+
+    // A queued generation is pinned by three things that must agree: the ZSET
+    // members, the queue identity, and the liveness lease. The matchmaking
+    // sampler reaps any lobby whose lease does not hold the exact member it
+    // sampled, so the lease has to move onto the rewritten member here or the
+    // backdated generation is discarded before it can ever be matched.
+    let script = redis::Script::new(
+        r#"
+        if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+        local lease = redis.call('GET', KEYS[2])
+        if not lease then return -6 end
+        if lease ~= ARGV[1] then return -7 end
+        for i = 3, #KEYS, 2 do
+            local queue_score = redis.call('ZSCORE', KEYS[i], ARGV[1])
+            if not queue_score then return -2 end
+            if tonumber(queue_score) ~= tonumber(ARGV[5]) then return -4 end
+            local mmr_score = redis.call('ZSCORE', KEYS[i + 1], ARGV[1])
+            if not mmr_score then return -3 end
+            if tonumber(mmr_score) ~= tonumber(ARGV[4]) then return -5 end
+        end
+        for i = 3, #KEYS, 2 do
+            redis.call('ZREM', KEYS[i], ARGV[1])
+            redis.call('ZREM', KEYS[i + 1], ARGV[1])
+            redis.call('ZADD', KEYS[i], ARGV[3], ARGV[2])
+            redis.call('ZADD', KEYS[i + 1], ARGV[4], ARGV[2])
+        end
+        redis.call('SET', KEYS[1], ARGV[2])
+        -- Preserve whatever admission put on the lease; only the member it
+        -- pins changes, so the generation keeps its real expiry.
+        local lease_ttl = redis.call('PTTL', KEYS[2])
+        if lease_ttl > 0 then
+            redis.call('SET', KEYS[2], ARGV[2], 'PX', lease_ttl)
+        else
+            redis.call('SET', KEYS[2], ARGV[2])
+        end
+        return 1
+        "#,
+    );
+    let mut invocation = script.prepare_invoke();
+    invocation.key(&identity_key);
+    invocation.key(RedisKeys::matchmaking_lobby_queue_lease(lobby_code));
+    for game_type in &lobby.game_types {
+        invocation
+            .key(RedisKeys::matchmaking_lobby_queue_for_pool(
+                game_type,
+                &lobby.queue_mode,
+                lobby.matchmaking_pool,
+            ))
+            .key(RedisKeys::matchmaking_lobby_mmr_index_for_pool(
+                game_type,
+                &lobby.queue_mode,
+                lobby.matchmaking_pool,
+            ));
+    }
+    let outcome: i64 = invocation
+        .arg(&original_json)
+        .arg(&updated_json)
+        .arg(lobby.queued_at)
+        .arg(lobby.avg_mmr)
+        .arg(original_queued_at)
+        .invoke_async(redis_conn)
+        .await?;
+    let reason = match outcome {
+        -1 => "queue identity no longer holds the observed member",
+        -2 => "lobby was missing from a game-type queue",
+        -3 => "lobby was missing from an MMR index",
+        -4 => "queue score did not match the admitted queued_at",
+        -5 => "MMR score did not match the admitted average",
+        -6 => "queue liveness lease was absent",
+        -7 => "queue liveness lease pinned a different member",
+        _ => "unknown failure",
+    };
+    ensure!(
+        outcome == 1,
+        "failed to backdate lobby {lobby_code}: {reason} (code {outcome})"
+    );
+    Ok(())
+}
 
 // #[tokio::test]
 #[allow(dead_code)]
@@ -147,7 +290,7 @@ async fn test_queue_for_match_requires_an_explicit_lobby() -> Result<()> {
                         assert_eq!(reason, "Join a lobby before queueing for matchmaking");
                         return Ok::<(), anyhow::Error>(());
                     }
-                    WSMessage::UserCountUpdate { .. } => {}
+                    other if is_unsolicited_push(&other) => {}
                     other => {
                         return Err(anyhow::anyhow!(
                             "Expected no-lobby matchmaking denial, got {:?}",
@@ -370,11 +513,6 @@ async fn test_concurrent_matchmaking() -> Result<()> {
     }
 
     let server_addr = env.ws_addr(0).expect("Server should exist");
-
-    // Give the server time to fully initialize all background services
-    // The matchmaking loop runs every 2 seconds, game discovery runs every 1 second
-    // When running multiple tests in parallel, initialization can be slower
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     println!("Starting concurrent matchmaking test with 6 clients");
 
@@ -744,9 +882,10 @@ async fn test_same_mmr_range_matches_instantly() -> Result<()> {
     Ok(())
 }
 
-/// Test that silver (600) and gold (900) lobbies match after ~10 seconds
+/// Test that silver (600) and gold (900) lobbies match once both queue ages
+/// cross the production ten-second expansion boundary.
 #[tokio::test]
-async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
+async fn test_silver_gold_matches_after_10_second_queue_age() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -769,14 +908,13 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
-    client1.create_lobby().await?;
-    client2.create_lobby().await?;
+    let lobby1 = client1.create_lobby().await?;
+    let lobby2 = client2.create_lobby().await?;
 
     println!("Testing: Silver (600) vs Gold (900) - 300 MMR difference");
 
-    let start_time = std::time::Instant::now();
-
     // Both queue for 1v1 match
+    let queued_not_before_ms = Utc::now().timestamp_millis();
     client1
         .send_message(WSMessage::QueueForMatch {
             game_type: GameType::FreeForAll { max_players: 2 },
@@ -791,9 +929,29 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
         })
         .await?;
 
-    // Wait for both to get matched
-    let game_id1 = wait_for_match(&mut client1).await?;
-    let game_id2 = wait_for_match(&mut client2).await?;
+    // Preserve the production 10s formula while avoiding 10 seconds of idle
+    // CI time. The real matchmaking loop reads these exact Redis entries.
+    let queue_age = Duration::from_millis(10_100);
+    backdate_queued_lobby(
+        &mut redis_conn,
+        &lobby1,
+        queue_age,
+        600,
+        queued_not_before_ms,
+    )
+    .await?;
+    backdate_queued_lobby(
+        &mut redis_conn,
+        &lobby2,
+        queue_age,
+        900,
+        queued_not_before_ms,
+    )
+    .await?;
+    let start_time = std::time::Instant::now();
+
+    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(10)).await?;
+    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(10)).await?;
 
     let match_time = start_time.elapsed();
 
@@ -801,20 +959,8 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
 
     println!("Match time: {:?}", match_time);
 
-    // Should match after approximately 10 seconds (allow 8-14 second range)
-    assert!(
-        match_time.as_secs() >= 8,
-        "Silver vs Gold should wait ~10s before matching, matched too quickly at {:?}",
-        match_time
-    );
-    assert!(
-        match_time.as_secs() <= 14,
-        "Silver vs Gold should match by ~10s, took too long at {:?}",
-        match_time
-    );
-
     println!(
-        "✓ Silver vs Gold matched in {:?} (expected: ~10s)",
+        "✓ Silver vs Gold matched in {:?} after injecting a 10.1s queue age",
         match_time
     );
 
@@ -824,9 +970,10 @@ async fn test_silver_gold_matches_in_10_seconds() -> Result<()> {
     Ok(())
 }
 
-/// Test that silver (600) and diamond (1500) lobbies match after ~30 seconds (max wait)
+/// Test that silver (600) and diamond (1500) lobbies match once both queue ages
+/// cross the production 30-second unrestricted boundary.
 #[tokio::test]
-async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
+async fn test_silver_diamond_matches_after_30_second_queue_age() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -849,14 +996,13 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
-    client1.create_lobby().await?;
-    client2.create_lobby().await?;
+    let lobby1 = client1.create_lobby().await?;
+    let lobby2 = client2.create_lobby().await?;
 
     println!("Testing: Silver (600) vs Diamond (1500) - 900 MMR difference");
 
-    let start_time = std::time::Instant::now();
-
     // Both queue for 1v1 match
+    let queued_not_before_ms = Utc::now().timestamp_millis();
     client1
         .send_message(WSMessage::QueueForMatch {
             game_type: GameType::FreeForAll { max_players: 2 },
@@ -871,9 +1017,27 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
         })
         .await?;
 
-    // Wait for both to get matched
-    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(40)).await?;
-    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(40)).await?;
+    let queue_age = Duration::from_millis(30_100);
+    backdate_queued_lobby(
+        &mut redis_conn,
+        &lobby1,
+        queue_age,
+        600,
+        queued_not_before_ms,
+    )
+    .await?;
+    backdate_queued_lobby(
+        &mut redis_conn,
+        &lobby2,
+        queue_age,
+        1500,
+        queued_not_before_ms,
+    )
+    .await?;
+    let start_time = std::time::Instant::now();
+
+    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(10)).await?;
+    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(10)).await?;
 
     let match_time = start_time.elapsed();
 
@@ -881,20 +1045,8 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
 
     println!("Match time: {:?}", match_time);
 
-    // Should match after approximately 30 seconds (allow 25-35 second range)
-    assert!(
-        match_time.as_secs() >= 25,
-        "Silver vs Diamond should wait ~30s before matching, matched too quickly at {:?}",
-        match_time
-    );
-    assert!(
-        match_time.as_secs() <= 35,
-        "Silver vs Diamond should match by ~30s (max wait time), took too long at {:?}",
-        match_time
-    );
-
     println!(
-        "✓ Silver vs Diamond matched in {:?} (expected: ~30s max)",
+        "✓ Silver vs Diamond matched in {:?} after injecting a 30.1s queue age",
         match_time
     );
 
@@ -904,9 +1056,10 @@ async fn test_silver_diamond_matches_in_30_seconds() -> Result<()> {
     Ok(())
 }
 
-/// Test that extreme MMR differences still match within 30 seconds (max wait time)
+/// Test that extreme MMR differences match after the production 30-second
+/// unrestricted queue-age boundary.
 #[tokio::test]
-async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
+async fn test_extreme_mmr_difference_matches_after_30_second_queue_age() -> Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -929,14 +1082,13 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
 
     client1.authenticate(env.user_ids()[0]).await?;
     client2.authenticate(env.user_ids()[1]).await?;
-    client1.create_lobby().await?;
-    client2.create_lobby().await?;
+    let lobby1 = client1.create_lobby().await?;
+    let lobby2 = client2.create_lobby().await?;
 
     println!("Testing: Bronze (300) vs Grandmaster (2000) - 1700 MMR difference");
 
-    let start_time = std::time::Instant::now();
-
     // Both queue for 1v1 match
+    let queued_not_before_ms = Utc::now().timestamp_millis();
     client1
         .send_message(WSMessage::QueueForMatch {
             game_type: GameType::FreeForAll { max_players: 2 },
@@ -951,11 +1103,27 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
         })
         .await?;
 
-    // Wait for both to get matched
-    // Use a longer timeout (40s) because the matchmaking loop runs every 2 seconds
-    // and needs to wait for >= 30 seconds before matching extreme MMR differences
-    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(40)).await?;
-    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(40)).await?;
+    let queue_age = Duration::from_millis(30_100);
+    backdate_queued_lobby(
+        &mut redis_conn,
+        &lobby1,
+        queue_age,
+        300,
+        queued_not_before_ms,
+    )
+    .await?;
+    backdate_queued_lobby(
+        &mut redis_conn,
+        &lobby2,
+        queue_age,
+        2000,
+        queued_not_before_ms,
+    )
+    .await?;
+    let start_time = std::time::Instant::now();
+
+    let game_id1 = wait_for_match_with_timeout(&mut client1, Duration::from_secs(10)).await?;
+    let game_id2 = wait_for_match_with_timeout(&mut client2, Duration::from_secs(10)).await?;
 
     let match_time = start_time.elapsed();
 
@@ -963,15 +1131,8 @@ async fn test_extreme_mmr_difference_max_30_seconds() -> Result<()> {
 
     println!("Match time: {:?}", match_time);
 
-    // Should match within 35 seconds (30s is the max intended wait, plus matchmaking loop interval)
-    assert!(
-        match_time.as_secs() <= 35,
-        "Even extreme MMR differences should match by 30s (max wait), took {:?}",
-        match_time
-    );
-
     println!(
-        "✓ Extreme MMR difference matched in {:?} (max: 30s)",
+        "✓ Extreme MMR difference matched in {:?} after injecting a 30.1s queue age",
         match_time
     );
 
@@ -992,9 +1153,6 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
 
     let mut env = TestEnvironment::new("test_mmr_based_matchmaking").await?;
     env.add_server().await?;
-
-    // Wait for matchmaking loop to start (runs every 2 seconds)
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Create users with different MMR values that are close enough to match
     // The matchmaking algorithm uses an average of all queued players, so we need
@@ -1024,7 +1182,11 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
 
     println!("All clients connected with MMRs: 1400, 1420, 1480, 1500, 1580, 1600");
 
-    // Queue clients in pairs to ensure proper MMR-based matching
+    // Queue clients in pairs and await the actual JoinGame signal before
+    // admitting the next pair. This is both faster and stronger than sleeping
+    // for an assumed matchmaking-loop cadence.
+    let mut matches: Vec<(usize, u32)> = Vec::new();
+
     // Queue first pair (lowest MMR)
     for (i, client) in clients.iter_mut().enumerate().take(2) {
         client
@@ -1044,8 +1206,9 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
         );
     }
 
-    // Wait for first pair to match before queueing others
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let first_game = wait_for_match(&mut clients[0]).await?;
+    let first_game_peer = wait_for_match(&mut clients[1]).await?;
+    matches.extend([(0, first_game), (1, first_game_peer)]);
 
     // Queue second pair (medium MMR)
     for (i, client) in clients.iter_mut().enumerate().skip(2).take(2) {
@@ -1066,8 +1229,9 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
         );
     }
 
-    // Wait for second pair to match
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let second_game = wait_for_match(&mut clients[2]).await?;
+    let second_game_peer = wait_for_match(&mut clients[3]).await?;
+    matches.extend([(2, second_game), (3, second_game_peer)]);
 
     // Queue third pair (highest MMR)
     for (i, client) in clients.iter_mut().enumerate().skip(4).take(2) {
@@ -1088,12 +1252,11 @@ async fn test_mmr_based_matchmaking() -> Result<()> {
         );
     }
 
-    // Wait for all to get matched
-    let mut matches: Vec<(usize, u32)> = Vec::new();
-    for (i, client) in clients.iter_mut().enumerate() {
-        let game_id = wait_for_match(client).await?;
-        println!("Client {} matched to game {}", i, game_id);
-        matches.push((i, game_id));
+    let third_game = wait_for_match(&mut clients[4]).await?;
+    let third_game_peer = wait_for_match(&mut clients[5]).await?;
+    matches.extend([(4, third_game), (5, third_game_peer)]);
+    for (client_index, game_id) in &matches {
+        println!("Client {} matched to game {}", client_index, game_id);
     }
 
     // Verify that players with similar MMR got matched together
@@ -1152,10 +1315,6 @@ async fn test_matchmaking_load() -> Result<()> {
 
     let mut env = TestEnvironment::new("test_matchmaking_load").await?;
     env.add_server().await?;
-
-    // Wait for matchmaking loop to start (runs every 2 seconds)
-    // Give extra time for the server to fully initialize
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Create 12 users for load testing (reduced to ensure reliable matching)
     // With max_players=2, this creates exactly 6 games

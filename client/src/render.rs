@@ -1,9 +1,18 @@
+use crate::skin::{
+    PaintCtx, SkinColors, SkinIdentity, SnakePose, SnakeSkin, paint_alive_with_occlusion,
+    skin_registry,
+};
 use common::{BoostPad, GameState, Position};
-use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
 /// Transform coordinates based on rotation angle
-fn transform_coords(x: f64, y: f64, width: f64, height: f64, rotation: i32) -> (f64, f64) {
+pub(crate) fn transform_coords(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation: i32,
+) -> (f64, f64) {
     match rotation {
         90 => (height - y - 1.0, x),
         180 => (width - x - 1.0, height - y - 1.0),
@@ -13,7 +22,7 @@ fn transform_coords(x: f64, y: f64, width: f64, height: f64, rotation: i32) -> (
 }
 
 /// Get effective dimensions based on rotation (swap width/height for 90/270)
-fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
+pub(crate) fn get_effective_dimensions(width: f64, height: f64, rotation: i32) -> (f64, f64) {
     match rotation {
         90 | 270 => (height, width),
         _ => (width, height),
@@ -79,75 +88,9 @@ const NOS_STEEL_DARK: &str = "#475569";
 const NOS_STEEL_LIGHT: &str = "#cbd5e1";
 const NOS_ORANGE: &str = "#ff641e";
 
-/// The dark core inside a living snake's head, as a fraction of one cell.
-const HEAD_CORE_RADIUS_RATIO: f64 = 0.38;
-
-const BOOST_OUTER_COLOR: &str = "#fff200";
-const BOOST_OUTER_EXTRA: f64 = 6.0;
-const ORDINARY_OUTLINE_EXTRA: f64 = 2.0;
-const BOOST_MASK_EXTRA: f64 = 3.0;
-const ORDINARY_MASK_EXTRA: f64 = 1.0;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SnakeOutlinePaint {
-    BoostOuter,
-    Ordinary,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct SnakeOutlineLayer {
-    paint: SnakeOutlinePaint,
-    extra: f64,
-}
-
-impl SnakeOutlineLayer {
-    fn color(self, ordinary_color: &str) -> &str {
-        match self.paint {
-            SnakeOutlinePaint::BoostOuter => BOOST_OUTER_COLOR,
-            SnakeOutlinePaint::Ordinary => ordinary_color,
-        }
-    }
-
-    fn line_width(self, cell_size: f64) -> f64 {
-        cell_size + self.extra
-    }
-
-    fn radius(self, cell_size: f64) -> f64 {
-        cell_size / 2.0 + self.extra / 2.0
-    }
-}
-
-const ACTIVE_SNAKE_OUTLINE_LAYERS: [SnakeOutlineLayer; 2] = [
-    SnakeOutlineLayer {
-        paint: SnakeOutlinePaint::BoostOuter,
-        extra: BOOST_OUTER_EXTRA,
-    },
-    SnakeOutlineLayer {
-        paint: SnakeOutlinePaint::Ordinary,
-        extra: ORDINARY_OUTLINE_EXTRA,
-    },
-];
-
-const ORDINARY_SNAKE_OUTLINE_LAYERS: [SnakeOutlineLayer; 1] = [SnakeOutlineLayer {
-    paint: SnakeOutlinePaint::Ordinary,
-    extra: ORDINARY_OUTLINE_EXTRA,
-}];
-
-fn snake_outline_layers(boost_active: bool) -> &'static [SnakeOutlineLayer] {
-    if boost_active {
-        &ACTIVE_SNAKE_OUTLINE_LAYERS
-    } else {
-        &ORDINARY_SNAKE_OUTLINE_LAYERS
-    }
-}
-
-fn snake_mask_extra(boost_active: bool) -> f64 {
-    if boost_active {
-        BOOST_MASK_EXTRA
-    } else {
-        ORDINARY_MASK_EXTRA
-    }
-}
+/// The arena's field colour. Snakes erase the grid dots underneath themselves
+/// by painting this before the skin paints anything.
+const ARENA_FIELD_COLOR: &str = "#ffffff";
 
 const NOS_REGULAR_WIDTH_RATIO: f64 = 0.50;
 const NOS_REGULAR_HEIGHT_RATIO: f64 = 0.88;
@@ -165,12 +108,12 @@ const NOS_FULL_PLATE_CENTER_Y_RATIO: f64 = 0.075;
 const NOS_REGULAR_GROWTH_PER_SIDE_PX: f64 = 1.0;
 
 #[derive(Clone, Copy)]
-enum NosBottleSkin {
+enum NosBottleVariant {
     Standard,
     Full,
 }
 
-impl NosBottleSkin {
+impl NosBottleVariant {
     fn orange_ratios(self) -> (f64, f64) {
         match self {
             Self::Standard => (
@@ -253,8 +196,8 @@ fn nos_bottle_body_path(ctx: &web_sys::CanvasRenderingContext2d, width: f64, hei
     ctx.close_path();
 }
 
-fn nos_wordmark_size(width: f64, height: f64, skin: NosBottleSkin) -> Option<f64> {
-    if matches!(skin, NosBottleSkin::Standard) {
+fn nos_wordmark_size(width: f64, height: f64, skin: NosBottleVariant) -> Option<f64> {
+    if matches!(skin, NosBottleVariant::Standard) {
         return None;
     }
 
@@ -271,7 +214,7 @@ fn nos_wordmark_size(width: f64, height: f64, skin: NosBottleSkin) -> Option<f64
 fn nos_pressure_plate_dimensions(
     width: f64,
     height: f64,
-    skin: NosBottleSkin,
+    skin: NosBottleVariant,
 ) -> (f64, f64, f64, f64) {
     let (orange_width_ratio, orange_height_ratio) = skin.orange_ratios();
     (
@@ -282,8 +225,27 @@ fn nos_pressure_plate_dimensions(
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn scenario_capture_fonts_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+        .and_then(|element| element.get_attribute("data-scenario-capture"))
+        .as_deref()
+        == Some("true")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scenario_capture_fonts_enabled() -> bool {
+    false
+}
+
 fn nos_wordmark_font(size: f64) -> String {
-    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    if scenario_capture_fonts_enabled() {
+        format!("italic 800 {size}px \"Snaketron Capture Black\", sans-serif")
+    } else {
+        format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+    }
 }
 
 /// Paint one faceted Pressure Plate NOS bottle in a local vector coordinate
@@ -296,7 +258,7 @@ fn draw_nos_bottle(
     width: f64,
     height: f64,
     angle: f64,
-    skin: NosBottleSkin,
+    skin: NosBottleVariant,
 ) -> Result<(), JsValue> {
     ctx.save();
     ctx.translate(center_x, center_y)?;
@@ -418,7 +380,7 @@ fn draw_regular_nos_canister(
         width,
         height,
         std::f64::consts::FRAC_PI_4,
-        NosBottleSkin::Standard,
+        NosBottleVariant::Standard,
     )
 }
 
@@ -443,7 +405,7 @@ fn draw_full_nos_canister(
         bottle_width,
         bottle_height,
         0.0,
-        NosBottleSkin::Full,
+        NosBottleVariant::Full,
     )
 }
 
@@ -457,7 +419,15 @@ fn grid_dot_is_covered_by_boost(
     })
 }
 
-fn snake_palette(
+/// Resolve one snake's colours the way the arena does: work out its
+/// viewer-relative role, then ask the skin.
+///
+/// Kept as one function because several small surfaces (the roster request, the
+/// CSS swatch export) want colours without painting anything, and because the
+/// golden trace exercises this exact composition across every input
+/// combination — which is what pins the role table to the palette it replaced.
+#[cfg(test)]
+pub(crate) fn snake_palette(
     snake_index: usize,
     snake_team: Option<u8>,
     team_member_slot: usize,
@@ -465,387 +435,16 @@ fn snake_palette(
     is_team_game: bool,
     local_snake_id: Option<usize>,
     local_team: Option<u8>,
-) -> (&'static str, &'static str) {
-    const BLUE: [(&str, &str); 2] = [("#70bfe3", "#5299bb"), ("#3c8dde", "#286eae")];
-    const RED: [(&str, &str); 2] = [("#ff6b6b", "#b84444"), ("#e34e5b", "#a92f3a")];
-
-    if is_team_game {
-        // Players see teammates as blue and opponents as red, with restrained
-        // within-team shades so the roster can map each 2v2 player to the
-        // corresponding snake. Spectators retain canonical team 0/1 colors.
-        let shade = team_member_slot % 2;
-        return match (local_team, snake_team) {
-            (Some(ours), Some(theirs)) if ours == theirs => BLUE[shade],
-            (Some(_), Some(_)) => RED[shade],
-            (None, Some(0)) => BLUE[shade],
-            (None, Some(_)) => RED[shade],
-            _ if Some(snake_index) == local_snake_id => BLUE[shade],
-            _ => RED[shade],
-        };
-    }
-
-    if Some(snake_index) == local_snake_id {
-        BLUE[0]
-    } else if snake_count == 2 {
-        RED[0]
-    } else {
-        match snake_index % 4 {
-            0 if local_snake_id.is_none() => BLUE[0],
-            1 => RED[0],
-            2 => ("#556270", "#353c47"),
-            _ => ("#f7b731", "#a87d1f"),
-        }
-    }
-}
-
-/// Paint one living snake's complete skin in screen-space cell coordinates.
-///
-/// `cells` is the compressed body — head first — with every point already run
-/// through `transform_coords`, so this routine is independent of arena rotation
-/// and of which surface it is drawing onto. The arena render loop and the
-/// roster glyph both call it, which is what keeps a player's roster snake
-/// identical to the snake they steer.
-///
-/// `mask_color` paints the opaque pass that erases the arena's grid dots from
-/// under the snake. Surfaces with no dot grid behind them (the roster) pass
-/// `None` and get the same skin with nothing painted behind it.
-///
-/// Cell coordinates must be whole, non-negative numbers because the head
-/// gradient walks the body one cell at a time; `cell_size` is free to be
-/// fractional.
-fn draw_alive_snake_skin(
-    ctx: &web_sys::CanvasRenderingContext2d,
-    cells: &[(f64, f64)],
-    cell_size: f64,
-    fill: &str,
-    outline: &str,
-    boost_active: bool,
-    mask_color: Option<&str>,
-) -> Result<(), JsValue> {
-    if cells.is_empty() {
-        return Ok(());
-    }
-
-    let full_circle = 2.0 * std::f64::consts::PI;
-    let outline_layers = snake_outline_layers(boost_active);
-    let mask_extra = snake_mask_extra(boost_active);
-
-    // Handle single-segment snake (just a head)
-    if cells.len() == 1 {
-        let (tx, ty) = cells[0];
-        let center_x = tx * cell_size + cell_size / 2.0;
-        let center_y = ty * cell_size + cell_size / 2.0;
-
-        // Paint the active Boost band underneath the ordinary contour.
-        // The body radius remains unchanged, so this is cosmetic only.
-        for layer in outline_layers {
-            ctx.set_fill_style_str(layer.color(outline));
-            ctx.begin_path();
-            ctx.arc(
-                center_x,
-                center_y,
-                layer.radius(cell_size),
-                0.0,
-                full_circle,
-            )?;
-            ctx.fill();
-        }
-
-        // Draw as a full circle
-        ctx.set_fill_style_str(fill);
-        ctx.begin_path();
-        ctx.arc(center_x, center_y, cell_size / 2.0, 0.0, full_circle)?;
-        ctx.fill();
-
-        // Draw inner circle
-        ctx.set_fill_style_str("#333");
-        ctx.begin_path();
-        ctx.arc(center_x, center_y, cell_size * 0.38, 0.0, full_circle)?;
-        ctx.fill();
-        return Ok(());
-    }
-
-    // First pass: fill through the complete visual outline to cover grid dots.
-    // Boost adds a crisp two-pixel signal band, while ordinary snakes retain
-    // their exact existing 1px mask.
-    if let Some(mask) = mask_color {
-        ctx.set_fill_style_str(mask);
-
-        for window in cells.windows(2) {
-            let ((tx1, ty1), (tx2, ty2)) = (window[0], window[1]);
-
-            if (tx1 - tx2).abs() < 0.01 {
-                // Vertical segment after transformation - draw rectangle
-                let x = tx1 * cell_size;
-                let min_y = ty1.min(ty2) * cell_size;
-                let max_y = ty1.max(ty2) * cell_size;
-                ctx.fill_rect(
-                    x - mask_extra,
-                    min_y - mask_extra,
-                    cell_size + mask_extra * 2.0,
-                    (max_y - min_y) + cell_size + mask_extra * 2.0,
-                );
-            } else if (ty1 - ty2).abs() < 0.01 {
-                // Horizontal segment after transformation - draw rectangle
-                let y = ty1 * cell_size;
-                let min_x = tx1.min(tx2) * cell_size;
-                let max_x = tx1.max(tx2) * cell_size;
-                ctx.fill_rect(
-                    min_x - mask_extra,
-                    y - mask_extra,
-                    (max_x - min_x) + cell_size + mask_extra * 2.0,
-                    cell_size + mask_extra * 2.0,
-                );
-            }
-        }
-
-        // Fill rectangles for all body points through the same mask.
-        for (tx, ty) in cells {
-            ctx.fill_rect(
-                tx * cell_size - mask_extra,
-                ty * cell_size - mask_extra,
-                cell_size + mask_extra * 2.0,
-                cell_size + mask_extra * 2.0,
-            );
-        }
-    }
-
-    // Second pass: paint complete outline layers from outside in. An active
-    // snake gets yellow first and its ordinary contour second; an inactive
-    // snake keeps the original single contour pass.
-    for layer in outline_layers {
-        let layer_color = layer.color(outline);
-        ctx.set_stroke_style_str(layer_color);
-
-        // Draw this outline layer for every body segment before moving inward,
-        // preventing outer yellow from crossing dark joints.
-        for window in cells.windows(2) {
-            let ((tx1, ty1), (tx2, ty2)) = (window[0], window[1]);
-
-            if (tx1 - tx2).abs() < 0.01 {
-                // Vertical segment after transformation
-                let x = tx1 * cell_size + cell_size / 2.0;
-                let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
-                let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
-
-                ctx.set_line_width(layer.line_width(cell_size));
-                ctx.set_line_cap("round");
-                ctx.begin_path();
-                ctx.move_to(x, min_y);
-                ctx.line_to(x, max_y);
-                ctx.stroke();
-            } else if (ty1 - ty2).abs() < 0.01 {
-                // Horizontal segment after transformation
-                let y = ty1 * cell_size + cell_size / 2.0;
-                let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
-                let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
-
-                ctx.set_line_width(layer.line_width(cell_size));
-                ctx.set_line_cap("round");
-                ctx.begin_path();
-                ctx.move_to(min_x, y);
-                ctx.line_to(max_x, y);
-                ctx.stroke();
-            }
-        }
-
-        // Fill every corner joint for this same layer.
-        ctx.set_fill_style_str(layer_color);
-        for (tx, ty) in &cells[1..cells.len() - 1] {
-            let center_x = tx * cell_size + cell_size / 2.0;
-            let center_y = ty * cell_size + cell_size / 2.0;
-
-            ctx.begin_path();
-            ctx.arc(
-                center_x,
-                center_y,
-                layer.radius(cell_size),
-                0.0,
-                full_circle,
-            )?;
-            ctx.fill();
-        }
-    }
-
-    // Third pass: Draw the actual snake
-    ctx.set_stroke_style_str(fill);
-    ctx.set_fill_style_str(fill);
-
-    // Draw main body segments
-    for window in cells.windows(2) {
-        let ((tx1, ty1), (tx2, ty2)) = (window[0], window[1]);
-
-        if (tx1 - tx2).abs() < 0.01 {
-            // Vertical segment after transformation
-            let x = tx1 * cell_size + cell_size / 2.0;
-            let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
-            let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
-
-            ctx.set_line_width(cell_size);
-            ctx.set_line_cap("round");
-            ctx.begin_path();
-            ctx.move_to(x, min_y);
-            ctx.line_to(x, max_y);
-            ctx.stroke();
-        } else if (ty1 - ty2).abs() < 0.01 {
-            // Horizontal segment after transformation
-            let y = ty1 * cell_size + cell_size / 2.0;
-            let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
-            let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
-
-            ctx.set_line_width(cell_size);
-            ctx.set_line_cap("round");
-            ctx.begin_path();
-            ctx.move_to(min_x, y);
-            ctx.line_to(max_x, y);
-            ctx.stroke();
-        }
-    }
-
-    // Draw corner joints as circles to create smooth turns
-    for (tx, ty) in &cells[1..cells.len() - 1] {
-        let center_x = tx * cell_size + cell_size / 2.0;
-        let center_y = ty * cell_size + cell_size / 2.0;
-
-        ctx.begin_path();
-        ctx.arc(center_x, center_y, cell_size / 2.0, 0.0, full_circle)?;
-        ctx.fill();
-    }
-
-    // Get head and tail information
-    let (head_tx, head_ty) = cells[0];
-    let head_center_x = head_tx * cell_size + cell_size / 2.0;
-    let head_center_y = head_ty * cell_size + cell_size / 2.0;
-
-    let (tail_tx, tail_ty) = cells[cells.len() - 1];
-    let tail_center_x = tail_tx * cell_size + cell_size / 2.0;
-    let tail_center_y = tail_ty * cell_size + cell_size / 2.0;
-
-    // Draw actual tail and head (no separate border circles needed)
-    // The round line caps already provide the border
-    ctx.set_fill_style_str(fill);
-
-    // Draw tail as full circle
-    ctx.begin_path();
-    ctx.arc(
-        tail_center_x,
-        tail_center_y,
-        cell_size / 2.0,
-        0.0,
-        full_circle,
-    )?;
-    ctx.fill();
-
-    // Fourth pass: Add white overlay gradient for first 10 cells from head
-    // Draw white overlay on segments within 10 cells of head
-    // First, collect all cells with their distances
-    let mut cells_with_distance = Vec::new();
-    let mut current_distance = 0.0;
-    let mut seen_cells = HashSet::new();
-
-    for (seg_idx, window) in cells.windows(2).enumerate() {
-        let (x1, y1) = (window[0].0 as i64, window[0].1 as i64);
-        let (x2, y2) = (window[1].0 as i64, window[1].1 as i64);
-
-        // Process each cell in the segment, respecting direction
-        if x1 == x2 {
-            // Vertical segment
-            let x = x1;
-            let step = if y2 > y1 { 1 } else { -1 };
-            let mut y = y1;
-
-            loop {
-                let cell_key = format!("{},{}", x, y);
-
-                // Skip the first cell of non-first segments (it's a corner already processed)
-                if !(seg_idx > 0 && y == y1) && !seen_cells.contains(&cell_key) {
-                    seen_cells.insert(cell_key.clone());
-                    if current_distance < 10.0 {
-                        cells_with_distance.push((x, y, current_distance));
-                    }
-                    current_distance += 1.0;
-                }
-
-                if y == y2 {
-                    break;
-                }
-                y += step;
-            }
-        } else if y1 == y2 {
-            // Horizontal segment
-            let y = y1;
-            let step = if x2 > x1 { 1 } else { -1 };
-            let mut x = x1;
-
-            loop {
-                let cell_key = format!("{},{}", x, y);
-
-                // Skip the first cell of non-first segments (it's a corner already processed)
-                if !(seg_idx > 0 && x == x1) && !seen_cells.contains(&cell_key) {
-                    seen_cells.insert(cell_key.clone());
-                    if current_distance < 10.0 {
-                        cells_with_distance.push((x, y, current_distance));
-                    }
-                    current_distance += 1.0;
-                }
-
-                if x == x2 {
-                    break;
-                }
-                x += step;
-            }
-        }
-    }
-
-    // Now draw all collected cells with their proper distances
-    for (x, y, distance) in cells_with_distance {
-        let opacity = (1.0 - distance / 10.0) * 0.3;
-        ctx.set_fill_style_str(&format!("rgba(255, 255, 255, {})", opacity));
-        ctx.fill_rect(
-            x as f64 * cell_size,
-            y as f64 * cell_size,
-            cell_size,
-            cell_size,
-        );
-    }
-
-    // Draw head as full circle (after overlay for proper layering)
-    ctx.set_fill_style_str(fill);
-    ctx.begin_path();
-    ctx.arc(
-        head_center_x,
-        head_center_y,
-        cell_size / 2.0,
-        0.0,
-        full_circle,
-    )?;
-    ctx.fill();
-
-    // Draw white overlay on head (strongest opacity)
-    ctx.set_fill_style_str("rgba(255, 255, 255, 0.3)");
-    ctx.begin_path();
-    ctx.arc(
-        head_center_x,
-        head_center_y,
-        cell_size / 2.0,
-        0.0,
-        full_circle,
-    )?;
-    ctx.fill();
-
-    // Draw smaller inner circle in head with different color
-    ctx.set_fill_style_str("#333");
-    ctx.begin_path();
-    ctx.arc(
-        head_center_x,
-        head_center_y,
-        cell_size * HEAD_CORE_RADIUS_RATIO,
-        0.0,
-        full_circle,
-    )?;
-    ctx.fill();
-
-    Ok(())
+) -> (String, String) {
+    crate::skin::classic::classic_palette(&SkinIdentity::resolve(
+        snake_index,
+        snake_team,
+        team_member_slot,
+        snake_count,
+        is_team_game,
+        local_snake_id,
+        local_team,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -875,7 +474,7 @@ const ROSTER_DEFAULT_FONT_FAMILY: &str =
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum RosterFacing {
+pub(crate) enum RosterFacing {
     Left,
     Right,
 }
@@ -900,7 +499,7 @@ impl RosterFacing {
 /// Everything `snake_palette` needs to resolve one snake's colours. The web
 /// client assembles this from the game state and passes it back, so hex values
 /// never have to be mirrored into TypeScript.
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct SnakeSkinInputs {
     snake_index: usize,
     #[serde(default)]
@@ -913,11 +512,16 @@ struct SnakeSkinInputs {
     local_snake_id: Option<usize>,
     #[serde(default)]
     local_team_id: Option<u8>,
+    /// Which skin this player is wearing. Absent means classic, which is what
+    /// keeps every existing caller working untouched.
+    #[serde(default)]
+    skin_ref: Option<String>,
 }
 
 impl SnakeSkinInputs {
-    fn colors(&self) -> (&'static str, &'static str) {
-        snake_palette(
+    /// The viewer-relative role, resolved by the renderer as always.
+    fn identity(&self) -> SkinIdentity {
+        SkinIdentity::resolve(
             self.snake_index,
             self.team_id,
             self.team_member_slot,
@@ -928,16 +532,19 @@ impl SnakeSkinInputs {
         )
     }
 
-    /// `{ fill, outline, label }` — the reported form of this snake's skin, so
-    /// callers can mirror onto the DOM exactly what was painted.
+    fn skin(&self) -> &'static dyn SnakeSkin {
+        skin_registry().resolve(self.skin_ref.as_deref())
+    }
+
+    fn colors(&self) -> SkinColors<'static> {
+        self.skin().colors(&self.identity())
+    }
+
+    /// `{ fill, outline, label, swatch }` — the reported form of this snake's
+    /// skin, so callers can mirror onto the DOM exactly what was painted.
+    /// `swatch` is additive; the three original fields keep their meaning.
     fn colors_json(&self) -> Result<String, JsValue> {
-        let (fill, outline) = self.colors();
-        serde_json::to_string(&serde_json::json!({
-            "fill": fill,
-            "outline": outline,
-            "label": roster_label_ink(fill),
-        }))
-        .map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_json::to_string(&self.colors()).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
 
@@ -957,7 +564,7 @@ struct RosterSnakeRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct RosterSnakeLayout {
+pub(crate) struct RosterSnakeLayout {
     cell_size: f64,
     cells: usize,
     offset_x: f64,
@@ -965,9 +572,14 @@ struct RosterSnakeLayout {
 }
 
 impl RosterSnakeLayout {
+    #[cfg(test)]
+    pub(crate) fn cell_size(self) -> f64 {
+        self.cell_size
+    }
+
     /// The compressed body the skin painter expects: head first, tail last,
     /// laid out along a single row exactly as a straight arena snake would be.
-    fn body_cells(self, facing: RosterFacing) -> [(f64, f64); 2] {
+    pub(crate) fn body_cells(self, facing: RosterFacing) -> [(f64, f64); 2] {
         let last = (self.cells - 1) as f64;
         match facing {
             RosterFacing::Right => [(last, 0.0), (0.0, 0.0)],
@@ -1001,12 +613,28 @@ fn finite_positive(value: f64) -> Option<f64> {
 /// as fits, then centre the leftover slack. Thickness sets the cell size, so
 /// the cell count is chosen to land the body span as close to the full width as
 /// possible without ever exceeding the row height.
-fn roster_snake_layout(width: f64, height: f64, boost_active: bool) -> RosterSnakeLayout {
-    let outline_extra = if boost_active {
-        BOOST_OUTER_EXTRA
-    } else {
-        ORDINARY_OUTLINE_EXTRA
-    };
+#[cfg(test)]
+pub(crate) fn roster_snake_layout(
+    width: f64,
+    height: f64,
+    boost_active: bool,
+) -> RosterSnakeLayout {
+    roster_snake_layout_for(skin_registry().resolve(None), width, height, boost_active)
+}
+
+/// Size a roster glyph for a particular skin.
+///
+/// The row has to leave room for whatever the skin paints beyond the body, so
+/// it reads the skin's reported overhang instead of any skin's constants.
+/// `overhang_px` is per side, and the row needs clearance on both, hence the
+/// doubling — which reproduces the original outline-extra arithmetic exactly.
+pub(crate) fn roster_snake_layout_for(
+    skin: &dyn SnakeSkin,
+    width: f64,
+    height: f64,
+    boost_active: bool,
+) -> RosterSnakeLayout {
+    let outline_extra = skin.metrics(boost_active).overhang_px * 2.0;
     let max_cell = (height - outline_extra).max(1.0);
     let available = (width - outline_extra).max(max_cell);
     let cells = ((available / max_cell).round().max(2.0) as usize).max(2);
@@ -1024,7 +652,11 @@ fn roster_snake_layout(width: f64, height: f64, boost_active: bool) -> RosterSna
 /// Anchor the name to the head. It begins (or ends) just clear of the dark head
 /// core and runs back toward the tail, so every roster name lines up with the
 /// head the player steers instead of floating in the middle of the body.
-fn roster_label_layout(layout: RosterSnakeLayout, facing: RosterFacing) -> RosterLabelLayout {
+fn roster_label_layout(
+    layout: RosterSnakeLayout,
+    facing: RosterFacing,
+    head_core_radius_ratio: f64,
+) -> RosterLabelLayout {
     let cell = layout.cell_size;
     let last = (layout.cells - 1) as f64;
     let (head_cell, tail_cell) = match facing {
@@ -1036,7 +668,7 @@ fn roster_label_layout(layout: RosterSnakeLayout, facing: RosterFacing) -> Roste
     let toward_tail = facing.toward_tail();
 
     let head_edge =
-        head_center + toward_tail * cell * (HEAD_CORE_RADIUS_RATIO + ROSTER_LABEL_HEAD_GAP_RATIO);
+        head_center + toward_tail * cell * (head_core_radius_ratio + ROSTER_LABEL_HEAD_GAP_RATIO);
     let tail_edge = tail_center - toward_tail * cell * ROSTER_LABEL_TAIL_OVERHANG_RATIO;
 
     RosterLabelLayout {
@@ -1071,7 +703,7 @@ fn relative_luminance(hex: &str) -> f64 {
 /// The deeper slate clears WCAG AA even on the darkest authored red skin at the
 /// roster's small label size; white cannot clear 4.5:1 on these mid-tone team
 /// colours.
-fn roster_label_ink(fill: &str) -> &'static str {
+pub(crate) fn roster_label_ink(fill: &str) -> &'static str {
     let fill_luminance = relative_luminance(fill);
     let dark_contrast =
         (fill_luminance + 0.05) / (relative_luminance(ROSTER_LABEL_DARK_INK) + 0.05);
@@ -1136,10 +768,11 @@ fn draw_roster_label(
     layout: RosterSnakeLayout,
     facing: RosterFacing,
     name: &str,
-    fill: &str,
+    colors: &SkinColors<'_>,
+    head_core_radius_ratio: f64,
     font_family: Option<&str>,
 ) -> Result<(), JsValue> {
-    let label = roster_label_layout(layout, facing);
+    let label = roster_label_layout(layout, facing, head_core_radius_ratio);
     let family = font_family
         .map(str::trim)
         .filter(|family| !family.is_empty())
@@ -1152,7 +785,7 @@ fn draw_roster_label(
 
     let visible = fit_roster_name(ctx, name, label.max_width)?;
     if !visible.is_empty() {
-        let ink = roster_label_ink(fill);
+        let ink = colors.label;
         ctx.set_fill_style_str(ink);
         ctx.set_shadow_color(roster_label_shadow(ink));
         ctx.set_shadow_blur(0.0);
@@ -1244,20 +877,19 @@ pub fn render_roster_snake(
         0.0,
     )?;
 
-    let (fill, outline) = request.skin.colors();
-    let layout = roster_snake_layout(width, height, request.boost_active);
+    let skin = request.skin.skin();
+    let identity = request.skin.identity();
+    let colors = request.skin.colors();
+    let metrics = skin.metrics(request.boost_active);
+    let layout = roster_snake_layout_for(skin, width, height, request.boost_active);
+    let cells = layout.body_cells(request.facing);
+    // A roster glyph is a portrait, not a live snake: it holds still so a row
+    // of them does not turn the lobby into a light show.
+    let pose = SnakePose::still(&cells, layout.cell_size, request.boost_active);
 
     ctx.save();
     ctx.translate(layout.offset_x, layout.offset_y)?;
-    draw_alive_snake_skin(
-        &ctx,
-        &layout.body_cells(request.facing),
-        layout.cell_size,
-        fill,
-        outline,
-        request.boost_active,
-        None,
-    )?;
+    paint_alive_with_occlusion(&mut PaintCtx::web(&ctx), skin, &pose, &identity, None)?;
     if request.is_ready {
         draw_roster_ready_check(&ctx, layout, request.facing)?;
     }
@@ -1266,11 +898,269 @@ pub fn render_roster_snake(
         layout,
         request.facing,
         &request.name,
-        fill,
+        &colors,
+        metrics.head_core_radius_ratio,
         request.font_family.as_deref(),
     )?;
     ctx.restore();
-    Ok(colors)
+    serde_json::to_string(&colors).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Paint one fixture pose for the skin QA route.
+///
+/// Draws through exactly the same entry point the arena uses, against the same
+/// pose corpus the golden traces and the conformance suite use — so "it looked
+/// right on the contact sheet" and "the tests pass" are statements about the
+/// same pictures, not two hopefully-similar ones.
+///
+/// `pose` names an entry in `skin::fixtures::POSES`; `role` is one of `own`,
+/// `teammate`, `enemy`, `spectated0`, `spectated1`, or `ffa0`..`ffa3`.
+#[wasm_bindgen(js_name = renderSkinFixture)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_skin_fixture(
+    canvas: &web_sys::HtmlCanvasElement,
+    skin_ref: &str,
+    pose: &str,
+    role: &str,
+    cell_size: f64,
+    boost_active: bool,
+    dead: bool,
+    anim_ms: f64,
+    reduced_motion: bool,
+) -> Result<(), JsValue> {
+    let Some(fixture) = crate::skin::fixtures::POSES
+        .iter()
+        .find(|candidate| candidate.name == pose)
+    else {
+        return Err(JsValue::from_str(&format!(
+            "no fixture pose named `{pose}`"
+        )));
+    };
+    let identity = crate::skin::fixtures::identity_by_name(role)
+        .ok_or_else(|| JsValue::from_str(&format!("no fixture role named `{role}`")))?;
+
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("fixture canvas has no 2d context"))?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .map_err(|_| JsValue::from_str("failed to cast the fixture 2d context"))?;
+    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
+    ctx.set_fill_style_str(ARENA_FIELD_COLOR);
+    ctx.fill_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
+
+    let skin = skin_registry().resolve(Some(skin_ref));
+    let posed = SnakePose {
+        cells: fixture.cells,
+        cell_size,
+        boost_active,
+        anim_ms,
+        reduced_motion,
+        // A fixture sheet is a 1x design-review surface, not the arena.
+        detail_scale: 1.0,
+    };
+    let mut paint = PaintCtx::web(&ctx);
+    if dead {
+        skin.paint_dead(&mut paint, &posed)
+    } else {
+        paint_alive_with_occlusion(&mut paint, skin, &posed, &identity, Some(ARENA_FIELD_COLOR))
+    }
+}
+
+/// The colours a skin reports for one named fixture role.
+///
+/// Exists so the QA route's swatch strip resolves roles exactly the way its
+/// snake tiles do, rather than rebuilding the arena's identity inputs by hand
+/// and getting them subtly wrong.
+#[wasm_bindgen(js_name = skinColorsForRole)]
+pub fn skin_colors_for_role(skin_ref: &str, role: &str) -> Result<String, JsValue> {
+    let identity = crate::skin::fixtures::identity_by_name(role)
+        .ok_or_else(|| JsValue::from_str(&format!("no fixture role named `{role}`")))?;
+    let colors = skin_registry().resolve(Some(skin_ref)).colors(&identity);
+    serde_json::to_string(&colors).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The fixture poses and roles the QA route can ask for.
+///
+/// Each pose reports its extent in cells. A surface that sizes tiles from a
+/// constant silently clips the long poses — `tile_wrapping_length` is 33 cells
+/// wide — and a clipped tile is exactly the kind of thing a contact sheet is
+/// supposed to catch rather than cause.
+#[wasm_bindgen(js_name = skinFixtures)]
+pub fn skin_fixtures() -> Result<String, JsValue> {
+    let poses: Vec<serde_json::Value> = crate::skin::fixtures::POSES
+        .iter()
+        .map(|pose| {
+            let (width, height) = crate::skin::fixtures::pose_extent(pose.cells);
+            serde_json::json!({
+                "name": pose.name,
+                "cellsWide": width,
+                "cellsHigh": height,
+            })
+        })
+        .collect();
+    serde_json::to_string(&serde_json::json!({
+        "poses": poses,
+        "roles": crate::skin::fixtures::ROLE_NAMES,
+        "cellSizes": crate::skin::fixtures::CELL_SIZES,
+        "animSamples": crate::skin::fixtures::ANIM_SAMPLES,
+    }))
+    .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The pixels a parity comparison is allowed to look at, for one fixture.
+///
+/// `specs/skin-shading-prd.md` section 12 measures its tolerance over **the
+/// snake's bounding box dilated by `overhang_px`**, deliberately not over the
+/// whole frame: a 99.9% budget across a mostly-empty canvas would silently
+/// permit hundreds of wrong pixels on the snake itself. Deriving the window
+/// here rather than in the harness means the two lowerings under comparison
+/// cannot disagree about where to look.
+#[wasm_bindgen(js_name = skinFixtureBounds)]
+pub fn skin_fixture_bounds(
+    skin_ref: &str,
+    pose: &str,
+    cell_size: f64,
+    boost_active: bool,
+) -> Result<String, JsValue> {
+    let Some(fixture) = crate::skin::fixtures::POSES
+        .iter()
+        .find(|candidate| candidate.name == pose)
+    else {
+        return Err(JsValue::from_str(&format!(
+            "no fixture pose named `{pose}`"
+        )));
+    };
+
+    let overhang = skin_registry()
+        .resolve(Some(skin_ref))
+        .metrics(boost_active)
+        .overhang_px;
+    let min_x = fixture.cells.iter().map(|c| c.0).fold(f64::MAX, f64::min) * cell_size;
+    let min_y = fixture.cells.iter().map(|c| c.1).fold(f64::MAX, f64::min) * cell_size;
+    let max_x = fixture.cells.iter().map(|c| c.0).fold(f64::MIN, f64::max) * cell_size + cell_size;
+    let max_y = fixture.cells.iter().map(|c| c.1).fold(f64::MIN, f64::max) * cell_size + cell_size;
+
+    serde_json::to_string(&serde_json::json!({
+        "x": (min_x - overhang).floor().max(0.0),
+        "y": (min_y - overhang).floor().max(0.0),
+        "width": (max_x - min_x + overhang * 2.0).ceil(),
+        "height": (max_y - min_y + overhang * 2.0).ceil(),
+        "overhangPx": overhang,
+    }))
+    .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Time the skin system's share of a frame, in the browser, on the frame
+/// `specs/skin-shading-prd.md` section 11 specifies.
+///
+/// Frame time is a property of Skia rather than of Rust, so it is the one perf
+/// budget the native census in `skin::perf` cannot measure. This paints the
+/// perf frame — eight snakes, longest bodies, every catalogue skin resolved,
+/// all boosting over the arena mask — `frames` times and reports the
+/// distribution.
+///
+/// It deliberately reports only the snakes. The ~2,300 grid-dot arcs that
+/// dominate a real frame are unchanged by any of this work, and including them
+/// would bury the number the budget is about.
+#[wasm_bindgen(js_name = skinPerfSmoke)]
+pub fn skin_perf_smoke(
+    canvas: &web_sys::HtmlCanvasElement,
+    frames: u32,
+) -> Result<String, JsValue> {
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("perf canvas has no 2d context"))?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .map_err(|_| JsValue::from_str("failed to cast the perf 2d context"))?;
+    let clock = web_sys::window()
+        .and_then(|window| window.performance())
+        .ok_or_else(|| JsValue::from_str("no performance clock"))?;
+
+    let skins = crate::skin::perf::perf_frame_skins();
+    let identities = crate::skin::perf::perf_frame_identities();
+    let cell_size = crate::skin::perf::PERF_CELL_SIZE;
+    let mut samples: Vec<f64> = Vec::with_capacity(frames as usize);
+
+    for frame in 0..frames {
+        ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
+        ctx.set_fill_style_str(ARENA_FIELD_COLOR);
+        ctx.fill_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
+
+        let started = clock.now();
+        for (index, (skin, identity)) in skins.iter().zip(&identities).enumerate() {
+            // Stack the snakes down the canvas so nothing is clipped away and
+            // the compositor pays for every one of them.
+            let cells: Vec<(f64, f64)> = crate::skin::perf::PERF_BODY
+                .iter()
+                .map(|(x, y)| (*x, y + index as f64 * 2.0))
+                .collect();
+            let pose = SnakePose {
+                cells: &cells,
+                cell_size,
+                boost_active: true,
+                // A distinct clock per frame, so an animated skin cannot be
+                // measured on a cached step it would never hit in play.
+                anim_ms: frame as f64 * 16.7,
+                reduced_motion: false,
+                detail_scale: 1.0,
+            };
+            paint_alive_with_occlusion(
+                &mut PaintCtx::web(&ctx),
+                *skin,
+                &pose,
+                identity,
+                Some(ARENA_FIELD_COLOR),
+            )?;
+        }
+        samples.push(clock.now() - started);
+    }
+
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("frame times are finite"));
+    let at = |quantile: f64| -> f64 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let index = ((samples.len() as f64 - 1.0) * quantile).round() as usize;
+        samples[index]
+    };
+
+    serde_json::to_string(&serde_json::json!({
+        "frames": samples.len(),
+        "snakes": skins.len(),
+        "skins": skins.iter().map(|skin| skin.id()).collect::<Vec<_>>(),
+        "p50Ms": at(0.5),
+        "p95Ms": at(0.95),
+        "maxMs": samples.last().copied().unwrap_or(0.0),
+    }))
+    .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Whether any skin texture requested so far is still arriving.
+///
+/// A textured skin fetches its pixels the first time it paints, and decoding is
+/// asynchronous while painting is not — so the first frame of such a skin shows
+/// its flat coat. The arena does not care: it repaints every frame and the
+/// texture appears the moment it lands. A surface that paints **once** does
+/// care, and this is what it waits on. `false` means every requested texture has
+/// either decoded or given up, so one more paint is the last one needed.
+#[wasm_bindgen(js_name = skinAssetsPending)]
+pub fn skin_assets_pending() -> bool {
+    crate::skin::atlas::any_pending()
+}
+
+/// The skins this build can render.
+///
+/// Exported so the catalogue in the UI is generated from the renderer's own
+/// registry rather than a hand-kept list that could offer something the
+/// renderer would silently fall back on.
+#[wasm_bindgen(js_name = skinCatalog)]
+pub fn skin_catalog() -> Result<String, JsValue> {
+    let entries: Vec<serde_json::Value> = skin_registry()
+        .entries()
+        .into_iter()
+        .map(|skin| serde_json::json!({ "id": skin.id(), "name": skin.name() }))
+        .collect();
+    serde_json::to_string(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Resolve one snake's authoritative colours without drawing anything, for the
@@ -1339,7 +1229,6 @@ const CARRIED_LABEL_HALO_RATIO: f64 = 0.20;
 /// `cell_size` of fill plus the ordinary contour — which is the width the
 /// snake actually occupies on screen.
 const CARRIED_LABEL_ALONG_BODY_CELLS: f64 = 2.0;
-const CARRIED_LABEL_ACROSS_BODY_BLEED_PX: f64 = ORDINARY_OUTLINE_EXTRA;
 /// Advance width of one Arial Black digit, in em. Used to pick a font size the
 /// number fits at, rather than squashing glyphs horizontally into the band:
 /// team arenas render rotated, so most snakes read screen-vertical and the
@@ -1442,16 +1331,22 @@ fn carried_food_label_layout(
     cell_size: f64,
     digits: usize,
     horizontal_on_screen: bool,
+    across_body_bleed_px: f64,
 ) -> CarriedFoodLabelLayout {
     let available = if horizontal_on_screen {
         cell_size * CARRIED_LABEL_ALONG_BODY_CELLS
     } else {
-        cell_size + CARRIED_LABEL_ACROSS_BODY_BLEED_PX
+        cell_size + across_body_bleed_px
     };
     let per_digit = CARRIED_LABEL_DIGIT_ADVANCE_EM * digits.max(1) as f64;
+    // The ceiling is a ratio, not a pixel count: physical pixels are not what
+    // the reader compares the glyph against — the snake is. At DPR 4 the cell
+    // arrives here around 60 px, where a flat 14 px ceiling drew the carried
+    // count at under a quarter of the body it sits inside.
+    let max_px = CARRIED_LABEL_MAX_PX * crate::skin::arena_detail_scale(cell_size);
     let font_px = cell_size
         .min(available / per_digit)
-        .clamp(CARRIED_LABEL_MIN_PX, CARRIED_LABEL_MAX_PX);
+        .clamp(CARRIED_LABEL_MIN_PX, max_px);
 
     CarriedFoodLabelLayout {
         font_px,
@@ -1471,7 +1366,77 @@ struct CarriedFoodLabel {
     center_y: f64,
     text: String,
     horizontal_on_screen: bool,
+    /// The number sits on the snake, so how much room it has across the body
+    /// depends on how wide that snake's skin paints. Captured per label because
+    /// two snakes in one arena can wear different skins.
+    across_body_bleed_px: f64,
     ink: &'static str,
+}
+
+// ---------------------------------------------------------------------------
+// Player-relative food value
+//
+// Food has one authoritative position but a different prospective value for
+// each player. The renderer therefore resolves the local predicted snake once
+// and stamps that value onto every food only while its combo is live. A
+// spectator (or a player with an expired chain) sees the ordinary unlabelled
+// food instead.
+// ---------------------------------------------------------------------------
+
+const FOOD_VALUE_LABEL_MIN_PX: f64 = 5.0;
+const FOOD_VALUE_LABEL_MAX_PX: f64 = 10.0;
+const FOOD_VALUE_LABEL_SIZE_RATIO: f64 = 0.76;
+const FOOD_VALUE_LABEL_ADVANCE_EM: f64 = 0.68;
+const FOOD_VALUE_LABEL_HALO_RATIO: f64 = 0.13;
+const FOOD_VALUE_LABEL_HALO_MIN_PX: f64 = 0.55;
+const FOOD_VALUE_LABEL_HALO_MAX_PX: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FoodValueLabelLayout {
+    font_px: f64,
+    halo_px: f64,
+}
+
+fn food_value_label_layout(cell_size: f64, characters: usize) -> FoodValueLabelLayout {
+    // The one-pixel food outline belongs to the icon, so a tiny label may use
+    // that same overscan. At the 5px arena floor, the legibility clamp wins by
+    // a fraction of a pixel instead of collapsing the value mark.
+    let available_width = cell_size + 2.0;
+    let font_for_width = available_width / (FOOD_VALUE_LABEL_ADVANCE_EM * characters.max(1) as f64);
+    let font_px = (cell_size * FOOD_VALUE_LABEL_SIZE_RATIO)
+        .min(font_for_width)
+        .clamp(FOOD_VALUE_LABEL_MIN_PX, FOOD_VALUE_LABEL_MAX_PX);
+
+    FoodValueLabelLayout {
+        font_px,
+        halo_px: (font_px * FOOD_VALUE_LABEL_HALO_RATIO)
+            .clamp(FOOD_VALUE_LABEL_HALO_MIN_PX, FOOD_VALUE_LABEL_HALO_MAX_PX),
+    }
+}
+
+fn food_value_label_font(size: f64) -> String {
+    format!("900 {size}px \"Arial Black\", Arial, sans-serif")
+}
+
+fn combo_food_label_text(value: u32) -> String {
+    value.to_string()
+}
+
+fn combo_food_label_value(
+    chain_count: u32,
+    remaining_ms: u32,
+    max_food_value: u32,
+    is_alive: bool,
+) -> Option<u32> {
+    if !is_alive || remaining_ms == 0 {
+        return None;
+    }
+
+    // The first pickup only primes the two-second chain. The second pickup is
+    // still ordinary and unlocks +2 for the next food; each later pickup
+    // advances the prospective value until it reaches the configured cap.
+    let value = chain_count.max(1).min(max_food_value.max(1));
+    (value > 1).then_some(value)
 }
 
 /// Renders a typed game state to a canvas element.
@@ -1481,14 +1446,75 @@ struct CarriedFoodLabel {
 /// type-checked and no silent `unwrap_or` defaults can mask a schema change.
 /// Local/opponent usernames are resolved here from `state.usernames` rather than
 /// being threaded in as scalar side-channel arguments.
+/// Everything about *how* a frame is presented, as opposed to what state it
+/// depicts. Grouped because these travel together through every surface that
+/// draws an arena — the live game, the tutorial, and the QA fixtures.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameOptions<'a> {
+    pub cell_size: f64,
+    pub local_user_id: Option<u32>,
+    pub rotation: i32,
+    /// Presentation clock for animated skins. Never simulation time.
+    pub anim_ms: f64,
+    pub reduced_motion: bool,
+    /// The viewer's skin, which dresses their snake and their bases.
+    pub local_skin_ref: Option<&'a str>,
+}
+
+/// Temporarily expose the canvas' public, un-translated coordinate system to a
+/// JavaScript cosmetic layer, then restore the renderer's one-pixel field
+/// translation. Each callback is isolated so a failed effect cannot suppress
+/// the authoritative arena frame.
+///
+/// A cosmetic renderer must never suppress gameplay. The web-side renderer
+/// also isolates each swappable effect in `finally` blocks; the save/restore
+/// here and the explicit resets below are defense in depth for an error that
+/// still crosses the WASM boundary, or a callback that changed canvas state
+/// outside its own save/restore pair before throwing.
+fn call_canvas_effect(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    canvas: &web_sys::HtmlCanvasElement,
+    cell_size: f64,
+    padding: f64,
+    callback: &js_sys::Function,
+    error_message: &str,
+) -> Result<(), JsValue> {
+    ctx.restore();
+    ctx.save();
+    // Canvas and cell size are supplied for focused renderers such as the
+    // tutorial crop. Existing live callbacks intentionally ignore arguments.
+    let callback_result = callback.call2(
+        &JsValue::NULL,
+        canvas.as_ref(),
+        &JsValue::from_f64(cell_size),
+    );
+    ctx.restore();
+    if let Err(error) = callback_result {
+        web_sys::console::error_2(&JsValue::from_str(error_message), &error);
+    }
+
+    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
+    ctx.set_global_alpha(1.0);
+    ctx.save();
+    ctx.translate(padding, padding)?;
+    Ok(())
+}
+
 pub fn render_game_state(
     state: &GameState,
     canvas: &web_sys::HtmlCanvasElement,
-    cell_size: f64,
-    local_user_id: Option<u32>,
-    rotation_int: i32,
+    options: FrameOptions<'_>,
     draw_celebration: &js_sys::Function,
+    draw_post_snakes: &js_sys::Function,
 ) -> Result<(), JsValue> {
+    let FrameOptions {
+        cell_size,
+        local_user_id,
+        rotation: rotation_int,
+        anim_ms,
+        reduced_motion,
+        local_skin_ref,
+    } = options;
     let context = canvas
         .get_context("2d")
         .map_err(|_| JsValue::from_str("Failed to get 2d context"))?
@@ -1552,6 +1578,25 @@ pub fn render_game_state(
         } else {
             (None, None)
         };
+    let local_food_value = local_snake_id
+        .and_then(|snake_id| arena.snakes.get(snake_id))
+        .and_then(|snake| {
+            combo_food_label_value(
+                snake.combo.chain_count,
+                snake.combo.remaining_ms,
+                state.properties.combo.max_food_value,
+                snake.is_alive,
+            )
+        });
+
+    // The arena's dressing comes from the *viewer's* skin: your base theme is
+    // how your game looks, not something opponents can see. Which side counts
+    // as friendly stays the renderer's decision.
+    let viewer_skin = skin_registry().resolve(local_skin_ref);
+    let base_sides = viewer_skin
+        .base_theme()
+        .unwrap_or(crate::skin::classic::CLASSIC_BASE_THEME)
+        .sides(local_player_team);
 
     // Draw team zones if present
     let team_zone_config_data = arena.team_zone_config.as_ref();
@@ -1559,11 +1604,7 @@ pub fn render_game_state(
         let end_zone_depth = team_zone_config.end_zone_depth as f64;
 
         // Determine zone background colors based on local player's team
-        let (left_color, right_color) = match local_player_team {
-            Some(0) => ("#e6f4fa", "#ffe6e6"), // Blue left, red right
-            Some(1) => ("#ffe6e6", "#e6f4fa"), // Red left, blue right
-            _ => ("#e6f4fa", "#ffe6e6"),       // Default: blue left, red right
-        };
+        let (left_color, right_color) = (base_sides.left_zone, base_sides.right_zone);
 
         // In the original orientation, zones are on left and right
         // We need to transform these based on rotation
@@ -1694,12 +1735,12 @@ pub fn render_game_state(
         }
 
         // Background and text colors based on perspective
-        let (left_bg_color, right_bg_color, left_text_color, right_text_color) =
-            match local_player_team {
-                Some(0) => ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0"),
-                Some(1) => ("#ffe6e6", "#e6f4fa", "#e4c0c0", "#c0d8e4"),
-                _ => ("#e6f4fa", "#ffe6e6", "#c0d8e4", "#e4c0c0"),
-            };
+        let (left_bg_color, right_bg_color, left_text_color, right_text_color) = (
+            base_sides.left_zone,
+            base_sides.right_zone,
+            base_sides.left_text,
+            base_sides.right_text,
+        );
 
         // Local/opponent fallback labels, resolved from the state's username map
         // (previously threaded in as scalar arguments from JS).
@@ -1978,6 +2019,40 @@ pub fn render_game_state(
             )?;
             ctx.fill();
         }
+
+        // Third pass: the same food is worth the same prospective amount to
+        // this local player, so every item receives one compact white mark.
+        // Spectators and inactive chains resolve `None` above and retain the
+        // original clean food art.
+        if let Some(value) = local_food_value {
+            let text = combo_food_label_text(value);
+            let layout = food_value_label_layout(cell_size, text.chars().count());
+            ctx.save();
+            ctx.set_text_align("center");
+            ctx.set_text_baseline("middle");
+            ctx.set_line_join("round");
+            ctx.set_font(&food_value_label_font(layout.font_px));
+            ctx.set_line_width(layout.halo_px);
+            ctx.set_stroke_style_str("#416c45");
+            ctx.set_fill_style_str("#ffffff");
+
+            for food in &arena.food {
+                let (tx, ty) = transform_coords(
+                    food.x as f64,
+                    food.y as f64,
+                    game_width,
+                    game_height,
+                    rotation_int,
+                );
+                let center_x = tx * cell_size + cell_size / 2.0;
+                // A quarter physical pixel counters the optical low bias of a
+                // bold digit on Canvas' `middle` baseline.
+                let center_y = ty * cell_size + cell_size / 2.0 - 0.25;
+                ctx.stroke_text(&text, center_x, center_y)?;
+                ctx.fill_text(&text, center_x, center_y)?;
+            }
+            ctx.restore();
+        }
     }
 
     // Draw only available Boost packets after food and before snakes. Cooling
@@ -2007,33 +2082,30 @@ pub fn render_game_state(
     // coordinate system so the callback can use the same 1px-padded positions
     // it used when effects were painted after the complete Rust frame. Restore
     // our field transform afterwards before drawing snakes and walls.
-    ctx.restore();
-    ctx.save();
-    // Canvas and cell size are supplied for focused renderers such as the
-    // tutorial crop. Existing live callbacks intentionally ignore arguments.
-    let celebration_result = draw_celebration.call2(
-        &JsValue::NULL,
-        canvas.as_ref(),
-        &JsValue::from_f64(cell_size),
-    );
-    ctx.restore();
-    if let Err(error) = celebration_result {
-        // A cosmetic renderer must never suppress gameplay. The web-side
-        // renderer also isolates each swappable effect in `finally` blocks;
-        // this callback-level save/restore and the explicit resets below are
-        // defense in depth for any error that still crosses the WASM boundary.
-        web_sys::console::error_2(
-            &JsValue::from_str("Score celebration callback failed"),
-            &error,
-        );
-    }
-    ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
-    ctx.set_global_alpha(1.0);
-    ctx.save();
-    ctx.translate(padding, padding)?;
+    call_canvas_effect(
+        &ctx,
+        canvas,
+        cell_size,
+        padding,
+        draw_celebration,
+        "Score celebration callback failed",
+    )?;
 
     // Draw snakes (both alive and dead)
     let snakes = &arena.snakes;
+    // Which skin each snake is wearing, resolved once for the whole frame.
+    // Unknown or absent ids fall back to classic inside `resolve`, so a snake
+    // always has something to paint with.
+    let snake_skins: Vec<&'static dyn SnakeSkin> = {
+        let mut resolved: Vec<&'static dyn SnakeSkin> =
+            vec![skin_registry().resolve(None); snakes.len()];
+        for (user_id, player) in &state.players {
+            if let Some(slot) = resolved.get_mut(player.snake_id as usize) {
+                *slot = skin_registry().resolve(state.skins.get(user_id).map(String::as_str));
+            }
+        }
+        resolved
+    };
     // Carried-food readouts are queued here and painted after every snake and
     // the walls, so a neighbouring snake's mask or a goal wall cannot cut into
     // a number.
@@ -2047,7 +2119,7 @@ pub fn render_game_state(
                 .iter()
                 .filter(|candidate| candidate.team_id == snake.team_id)
                 .count();
-            let (color, ordinary_border_color) = snake_palette(
+            let identity = SkinIdentity::resolve(
                 index,
                 snake.team_id.map(|team| team.0),
                 team_member_slot,
@@ -2056,6 +2128,8 @@ pub fn render_game_state(
                 local_snake_id,
                 local_player_team,
             );
+            let skin = snake_skins[index];
+            let colors = skin.colors(&identity);
 
             // Hand the shared skin painter a rotation-resolved body. The roster
             // glyph calls the very same routine, so the two can never drift.
@@ -2073,14 +2147,20 @@ pub fn render_game_state(
                 })
                 .collect();
 
-            draw_alive_snake_skin(
-                &ctx,
-                &cells,
+            let pose = SnakePose {
+                cells: &cells,
                 cell_size,
-                color,
-                ordinary_border_color,
-                snake.boost().active,
-                Some("#ffffff"),
+                boost_active: snake.boost().active,
+                anim_ms,
+                reduced_motion,
+                detail_scale: crate::skin::arena_detail_scale(cell_size),
+            };
+            paint_alive_with_occlusion(
+                &mut PaintCtx::web(&ctx),
+                skin,
+                &pose,
+                &identity,
+                Some(ARENA_FIELD_COLOR),
             )?;
 
             // Queue the carried-food readout. It rides a couple of cells behind
@@ -2107,312 +2187,29 @@ pub fn render_game_state(
                         anchor.run_is_horizontal,
                         rotation_int,
                     ),
-                    ink: roster_label_ink(color),
+                    across_body_bleed_px: skin.metrics(snake.boost().active).overhang_px * 2.0,
+                    ink: colors.label,
                 });
             }
         } else {
-            // Render dead snake with faint solid color
-            let color = "#f0f0f0"; // Light gray for dead snakes
-            let border_color = "#d0d0d0"; // Slightly darker border
-
-            ctx.set_fill_style_str(color);
-
-            // Draw snake body
-            let body = &snake.body;
-            if body.is_empty() {
-                continue;
-            }
-
-            // Handle single-segment snake (just a head)
-            if body.len() == 1 {
-                let head = &body[0];
-                let (tx, ty) = transform_coords(
-                    head.x as f64,
-                    head.y as f64,
-                    game_width,
-                    game_height,
-                    rotation_int,
-                );
-                let center_x = tx * cell_size + cell_size / 2.0;
-                let center_y = ty * cell_size + cell_size / 2.0;
-
-                // Draw border
-                ctx.set_fill_style_str(border_color);
-                ctx.begin_path();
-                ctx.arc(
-                    center_x,
-                    center_y,
-                    cell_size / 2.0 + 1.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                )?;
-                ctx.fill();
-
-                // Draw as a full circle
-                ctx.set_fill_style_str(color);
-                ctx.begin_path();
-                ctx.arc(
-                    center_x,
-                    center_y,
-                    cell_size / 2.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                )?;
-                ctx.fill();
-
-                // Draw X mark on head
-                ctx.set_stroke_style_str("#666");
-                ctx.set_line_width(2.0);
-                let x_size = cell_size * 0.3;
-                ctx.begin_path();
-                ctx.move_to(center_x - x_size, center_y - x_size);
-                ctx.line_to(center_x + x_size, center_y + x_size);
-                ctx.stroke();
-                ctx.begin_path();
-                ctx.move_to(center_x - x_size, center_y + x_size);
-                ctx.line_to(center_x + x_size, center_y - x_size);
-                ctx.stroke();
-                continue;
-            }
-
-            // First pass: Fill with white rectangles to cover grid dots
-            ctx.set_fill_style_str("#ffffff");
-
-            // Fill white rectangles for body segments (expanded by 1px)
-            for window in body.windows(2) {
-                let (p1, p2) = (&window[0], &window[1]);
-                let x1 = p1.x as f64;
-                let y1 = p1.y as f64;
-                let x2 = p2.x as f64;
-                let y2 = p2.y as f64;
-
-                // Transform both points
-                let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
-                let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
-
-                if (tx1 - tx2).abs() < 0.01 {
-                    // Vertical segment after transformation - draw rectangle
-                    let x = tx1 * cell_size;
-                    let min_y = ty1.min(ty2) * cell_size;
-                    let max_y = ty1.max(ty2) * cell_size;
-                    ctx.fill_rect(
-                        x - 1.0,
-                        min_y - 1.0,
-                        cell_size + 2.0,
-                        (max_y - min_y) + cell_size + 2.0,
-                    );
-                } else if (ty1 - ty2).abs() < 0.01 {
-                    // Horizontal segment after transformation - draw rectangle
-                    let y = ty1 * cell_size;
-                    let min_x = tx1.min(tx2) * cell_size;
-                    let max_x = tx1.max(tx2) * cell_size;
-                    ctx.fill_rect(
-                        min_x - 1.0,
-                        y - 1.0,
-                        (max_x - min_x) + cell_size + 2.0,
-                        cell_size + 2.0,
-                    );
-                }
-            }
-
-            // Fill white rectangles for all body points (expanded by 1px)
-            for point in body.iter() {
-                let (tx, ty) = transform_coords(
-                    point.x as f64,
-                    point.y as f64,
-                    game_width,
-                    game_height,
-                    rotation_int,
-                );
-                let rect_x = tx * cell_size - 1.0;
-                let rect_y = ty * cell_size - 1.0;
-                ctx.fill_rect(rect_x, rect_y, cell_size + 2.0, cell_size + 2.0);
-            }
-
-            // Second pass: Draw borders (1px larger)
-            ctx.set_stroke_style_str(border_color);
-
-            // Draw border for body segments
-            for window in body.windows(2) {
-                let (p1, p2) = (&window[0], &window[1]);
-                let x1 = p1.x as f64;
-                let y1 = p1.y as f64;
-                let x2 = p2.x as f64;
-                let y2 = p2.y as f64;
-
-                // Transform both points
-                let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
-                let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
-
-                if (tx1 - tx2).abs() < 0.01 {
-                    // Vertical segment after transformation
-                    let x = tx1 * cell_size + cell_size / 2.0;
-                    let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
-                    let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
-
-                    ctx.set_line_width(cell_size + 2.0);
-                    ctx.set_line_cap("round");
-                    ctx.begin_path();
-                    ctx.move_to(x, min_y);
-                    ctx.line_to(x, max_y);
-                    ctx.stroke();
-                } else if (ty1 - ty2).abs() < 0.01 {
-                    // Horizontal segment after transformation
-                    let y = ty1 * cell_size + cell_size / 2.0;
-                    let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
-                    let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
-
-                    ctx.set_line_width(cell_size + 2.0);
-                    ctx.set_line_cap("round");
-                    ctx.begin_path();
-                    ctx.move_to(min_x, y);
-                    ctx.line_to(max_x, y);
-                    ctx.stroke();
-                }
-            }
-
-            // Draw border for corner joints
-            ctx.set_fill_style_str(border_color);
-            for point in &body[1..body.len() - 1] {
-                let (tx, ty) = transform_coords(
-                    point.x as f64,
-                    point.y as f64,
-                    game_width,
-                    game_height,
-                    rotation_int,
-                );
-                let center_x = tx * cell_size + cell_size / 2.0;
-                let center_y = ty * cell_size + cell_size / 2.0;
-
-                ctx.begin_path();
-                ctx.arc(
-                    center_x,
-                    center_y,
-                    cell_size / 2.0 + 1.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                )?;
-                ctx.fill();
-            }
-
-            // Third pass: Draw the actual snake
-            ctx.set_stroke_style_str(color);
-            ctx.set_fill_style_str(color);
-
-            // Draw main body segments
-            for window in body.windows(2) {
-                let (p1, p2) = (&window[0], &window[1]);
-                let x1 = p1.x as f64;
-                let y1 = p1.y as f64;
-                let x2 = p2.x as f64;
-                let y2 = p2.y as f64;
-
-                // Transform both points
-                let (tx1, ty1) = transform_coords(x1, y1, game_width, game_height, rotation_int);
-                let (tx2, ty2) = transform_coords(x2, y2, game_width, game_height, rotation_int);
-
-                if (tx1 - tx2).abs() < 0.01 {
-                    // Vertical segment after transformation
-                    let x = tx1 * cell_size + cell_size / 2.0;
-                    let min_y = ty1.min(ty2) * cell_size + cell_size / 2.0;
-                    let max_y = ty1.max(ty2) * cell_size + cell_size / 2.0;
-
-                    ctx.set_line_width(cell_size);
-                    ctx.set_line_cap("round");
-                    ctx.begin_path();
-                    ctx.move_to(x, min_y);
-                    ctx.line_to(x, max_y);
-                    ctx.stroke();
-                } else if (ty1 - ty2).abs() < 0.01 {
-                    // Horizontal segment after transformation
-                    let y = ty1 * cell_size + cell_size / 2.0;
-                    let min_x = tx1.min(tx2) * cell_size + cell_size / 2.0;
-                    let max_x = tx1.max(tx2) * cell_size + cell_size / 2.0;
-
-                    ctx.set_line_width(cell_size);
-                    ctx.set_line_cap("round");
-                    ctx.begin_path();
-                    ctx.move_to(min_x, y);
-                    ctx.line_to(max_x, y);
-                    ctx.stroke();
-                }
-            }
-
-            // Draw corner joints as circles to create smooth turns
-            for point in &body[1..body.len() - 1] {
-                let (tx, ty) = transform_coords(
-                    point.x as f64,
-                    point.y as f64,
-                    game_width,
-                    game_height,
-                    rotation_int,
-                );
-                let center_x = tx * cell_size + cell_size / 2.0;
-                let center_y = ty * cell_size + cell_size / 2.0;
-
-                ctx.begin_path();
-                ctx.arc(
-                    center_x,
-                    center_y,
-                    cell_size / 2.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                )?;
-                ctx.fill();
-            }
-
-            // Get head and tail information
-            let head = &body[0];
-            let head_x = head.x as f64;
-            let head_y = head.y as f64;
-            let (head_tx, head_ty) =
-                transform_coords(head_x, head_y, game_width, game_height, rotation_int);
-            let head_center_x = head_tx * cell_size + cell_size / 2.0;
-            let head_center_y = head_ty * cell_size + cell_size / 2.0;
-
-            let tail = &body[body.len() - 1];
-            let tail_x = tail.x as f64;
-            let tail_y = tail.y as f64;
-            let (tail_tx, tail_ty) =
-                transform_coords(tail_x, tail_y, game_width, game_height, rotation_int);
-            let tail_center_x = tail_tx * cell_size + cell_size / 2.0;
-            let tail_center_y = tail_ty * cell_size + cell_size / 2.0;
-
-            // Draw tail as full circle
-            ctx.set_fill_style_str(color);
-            ctx.begin_path();
-            ctx.arc(
-                tail_center_x,
-                tail_center_y,
-                cell_size / 2.0,
-                0.0,
-                2.0 * std::f64::consts::PI,
-            )?;
-            ctx.fill();
-
-            // Draw head as full circle
-            ctx.begin_path();
-            ctx.arc(
-                head_center_x,
-                head_center_y,
-                cell_size / 2.0,
-                0.0,
-                2.0 * std::f64::consts::PI,
-            )?;
-            ctx.fill();
-
-            // Draw X mark on dead snake head
-            ctx.set_stroke_style_str("#666");
-            ctx.set_line_width(2.0);
-            let x_size = cell_size * 0.3;
-            ctx.begin_path();
-            ctx.move_to(head_center_x - x_size, head_center_y - x_size);
-            ctx.line_to(head_center_x + x_size, head_center_y + x_size);
-            ctx.stroke();
-            ctx.begin_path();
-            ctx.move_to(head_center_x - x_size, head_center_y + x_size);
-            ctx.line_to(head_center_x + x_size, head_center_y - x_size);
-            ctx.stroke();
+            let cells: Vec<(f64, f64)> = snake
+                .body
+                .iter()
+                .map(|point| {
+                    transform_coords(
+                        point.x as f64,
+                        point.y as f64,
+                        game_width,
+                        game_height,
+                        rotation_int,
+                    )
+                })
+                .collect();
+            let pose = SnakePose::still(&cells, cell_size, false);
+            // Death is identity-erasing by default, but it goes through the
+            // wearer's skin so the decision lives in one place and a future
+            // override has somewhere to land.
+            snake_skins[index].paint_dead(&mut PaintCtx::web(&ctx), &pose)?;
         }
     }
 
@@ -2424,12 +2221,7 @@ pub fn render_game_state(
         // Draw walls as 3px solid rectangles between field and endzone cells
         let wall_thickness = 3.0;
 
-        // Determine wall colors based on local player's team
-        let (left_wall_color, right_wall_color) = match local_player_team {
-            Some(0) => ("#7aa8c1", "#c18888"), // Local is Team 0: blue left, red right
-            Some(1) => ("#c18888", "#7aa8c1"), // Local is Team 1: red left, blue right
-            _ => ("#7aa8c1", "#c18888"),       // Default: blue left, red right
-        };
+        let (left_wall_color, right_wall_color) = (base_sides.left_wall, base_sides.right_wall);
 
         // Draw walls based on rotation
         match rotation_int {
@@ -2602,8 +2394,12 @@ pub fn render_game_state(
         ctx.set_text_baseline("middle");
         ctx.set_line_join("round");
         for label in &carried_food_labels {
-            let layout =
-                carried_food_label_layout(cell_size, label.text.len(), label.horizontal_on_screen);
+            let layout = carried_food_label_layout(
+                cell_size,
+                label.text.len(),
+                label.horizontal_on_screen,
+                label.across_body_bleed_px,
+            );
             ctx.set_font(&carried_food_label_font(layout.font_px));
             ctx.set_line_width(layout.halo_px);
             ctx.set_stroke_style_str(carried_label_halo(label.ink));
@@ -2614,10 +2410,18 @@ pub fn render_game_state(
         ctx.restore();
     }
 
-    // Draw game info
-    ctx.set_fill_style_str("#333");
-    ctx.set_font("16px monospace");
-    ctx.fill_text(&format!("Tick: {}", state.tick), 10.0, canvas_height + 20.0)?;
+    // Crash explosions and other impact treatments intentionally sit above
+    // every snake, wall, and carried-food label. Focused renderers invoke this
+    // on their full-arena scratch canvas before cropping, so the existing
+    // full-arena coordinate math remains valid.
+    call_canvas_effect(
+        &ctx,
+        canvas,
+        cell_size,
+        padding,
+        draw_post_snakes,
+        "Post-snakes callback failed",
+    )?;
 
     // Restore the canvas state (remove padding translation)
     ctx.restore();
@@ -2628,6 +2432,13 @@ pub fn render_game_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    /// The classic head-core ratio, for layout assertions that only care about
+    /// the label maths rather than about which skin supplied the number.
+    const HEAD_CORE_RATIO_FOR_TESTS: f64 = 0.38;
+    /// The classic snake's painted band beyond one cell, both sides.
+    const CLASSIC_BODY_BLEED_PX: f64 = 2.0;
 
     /// Head at (10,5), three cells left to the turn at (7,5), three cells down
     /// to the tail at (7,8). Seven cells long, stored as three points.
@@ -2761,7 +2572,12 @@ mod tests {
             let cell_size = f64::from(cell_size);
             for digits in 1..=4 {
                 for horizontal in [true, false] {
-                    let layout = carried_food_label_layout(cell_size, digits, horizontal);
+                    let layout = carried_food_label_layout(
+                        cell_size,
+                        digits,
+                        horizontal,
+                        CLASSIC_BODY_BLEED_PX,
+                    );
 
                     assert!(layout.font_px >= CARRIED_LABEL_MIN_PX);
                     assert!(layout.font_px <= CARRIED_LABEL_MAX_PX);
@@ -2774,7 +2590,7 @@ mod tests {
                     let available = if horizontal {
                         cell_size * CARRIED_LABEL_ALONG_BODY_CELLS
                     } else {
-                        cell_size + CARRIED_LABEL_ACROSS_BODY_BLEED_PX
+                        cell_size + CLASSIC_BODY_BLEED_PX
                     };
                     let natural = layout.font_px * CARRIED_LABEL_DIGIT_ADVANCE_EM * digits as f64;
                     assert!(
@@ -2789,18 +2605,21 @@ mod tests {
         // A wider number shrinks rather than condensing, and the tighter
         // across-body room shrinks it at least as much as the roomy along-body
         // case — which is the orientation most team-match snakes are in.
-        let one = carried_food_label_layout(10.0, 1, false);
-        let two = carried_food_label_layout(10.0, 2, false);
-        let three = carried_food_label_layout(10.0, 3, false);
+        let one = carried_food_label_layout(10.0, 1, false, CLASSIC_BODY_BLEED_PX);
+        let two = carried_food_label_layout(10.0, 2, false, CLASSIC_BODY_BLEED_PX);
+        let three = carried_food_label_layout(10.0, 3, false, CLASSIC_BODY_BLEED_PX);
         assert!(two.font_px < one.font_px);
         assert!(three.font_px <= two.font_px);
         assert!(
-            carried_food_label_layout(10.0, 2, false).font_px
-                <= carried_food_label_layout(10.0, 2, true).font_px
+            carried_food_label_layout(10.0, 2, false, CLASSIC_BODY_BLEED_PX).font_px
+                <= carried_food_label_layout(10.0, 2, true, CLASSIC_BODY_BLEED_PX).font_px
         );
 
         // A single digit never shrinks at a comfortable cell size.
-        assert_eq!(carried_food_label_layout(12.0, 1, false).font_px, 12.0);
+        assert_eq!(
+            carried_food_label_layout(12.0, 1, false, CLASSIC_BODY_BLEED_PX).font_px,
+            12.0
+        );
     }
 
     #[test]
@@ -2808,6 +2627,53 @@ mod tests {
         let font = carried_food_label_font(9.0);
 
         assert!(font.starts_with("900 9px "));
+        assert!(font.contains("Arial Black"));
+        assert!(!font.to_ascii_lowercase().contains("italic"));
+    }
+
+    #[test]
+    fn combo_food_labels_follow_the_local_snakes_next_value_and_cap() {
+        assert_eq!(combo_food_label_value(1, 1_000, 3, true), None);
+        assert_eq!(combo_food_label_value(2, 750, 3, true), Some(2));
+        assert_eq!(combo_food_label_value(3, 500, 3, true), Some(3));
+        assert_eq!(combo_food_label_value(99, 50, 3, true), Some(3));
+
+        // The first ordinary food, expiry, death, and a defensive cap of one
+        // all preserve the original unlabelled food art.
+        assert_eq!(combo_food_label_value(0, 0, 3, true), None);
+        assert_eq!(combo_food_label_value(2, 0, 3, true), None);
+        assert_eq!(combo_food_label_value(2, 500, 3, false), None);
+        assert_eq!(combo_food_label_value(0, 500, 1, true), None);
+
+        assert_eq!(combo_food_label_text(2), "2");
+        assert_eq!(combo_food_label_text(3), "3");
+    }
+
+    #[test]
+    fn food_value_label_stays_readable_across_every_arena_cell_size() {
+        for cell_size in 5..=15 {
+            let cell_size = f64::from(cell_size);
+            let layout = food_value_label_layout(cell_size, 1);
+
+            assert!(layout.font_px >= FOOD_VALUE_LABEL_MIN_PX);
+            assert!(layout.font_px <= FOOD_VALUE_LABEL_MAX_PX);
+            assert!(layout.halo_px >= FOOD_VALUE_LABEL_HALO_MIN_PX);
+            assert!(layout.halo_px <= FOOD_VALUE_LABEL_HALO_MAX_PX);
+            assert!(layout.halo_px < layout.font_px * 0.2);
+
+            let natural_width = layout.font_px * FOOD_VALUE_LABEL_ADVANCE_EM;
+            assert!(
+                natural_width <= cell_size + 2.0 + 1e-9
+                    || layout.font_px == FOOD_VALUE_LABEL_MIN_PX,
+                "food value at cell {cell_size} overflows without hitting the floor"
+            );
+        }
+
+        assert!((food_value_label_layout(10.0, 1).font_px - 7.6).abs() < 1e-9);
+        assert_eq!(food_value_label_layout(15.0, 1).font_px, 10.0);
+
+        let font = food_value_label_font(7.0);
+        assert!(font.starts_with("900 7px "));
         assert!(font.contains("Arial Black"));
         assert!(!font.to_ascii_lowercase().contains("italic"));
     }
@@ -2829,53 +2695,12 @@ mod tests {
     fn team_palette_is_stable_for_spectators() {
         assert_eq!(
             snake_palette(3, Some(0), 1, 4, true, None, None),
-            ("#3c8dde", "#286eae")
+            ("#3c8dde".to_string(), "#286eae".to_string())
         );
         assert_eq!(
             snake_palette(0, Some(1), 0, 4, true, None, None),
-            ("#ff6b6b", "#b84444")
+            ("#ff6b6b".to_string(), "#b84444".to_string())
         );
-    }
-
-    #[test]
-    fn active_boost_outline_layers_yellow_outside_the_ordinary_contour() {
-        let ordinary_color = "#5299bb";
-        let layers = snake_outline_layers(true);
-
-        assert_eq!(BOOST_OUTER_COLOR, "#fff200");
-        assert_eq!(layers.len(), 2);
-        assert_eq!(layers[0].paint, SnakeOutlinePaint::BoostOuter);
-        assert_eq!(layers[0].color(ordinary_color), BOOST_OUTER_COLOR);
-        assert_eq!(layers[1].paint, SnakeOutlinePaint::Ordinary);
-        assert_eq!(layers[1].color(ordinary_color), ordinary_color);
-
-        let cell_size = 10.0;
-        assert_eq!(layers[0].line_width(cell_size), 16.0);
-        assert_eq!(layers[1].line_width(cell_size), 12.0);
-        assert_eq!(layers[0].radius(cell_size), 8.0);
-        assert_eq!(layers[1].radius(cell_size), 6.0);
-        assert_eq!(
-            layers[0].radius(cell_size) - layers[1].radius(cell_size),
-            2.0
-        );
-        assert_eq!(layers[1].radius(cell_size) - cell_size / 2.0, 1.0);
-        assert_eq!(snake_mask_extra(true), 3.0);
-    }
-
-    #[test]
-    fn inactive_snake_keeps_the_existing_single_pixel_contour_and_mask() {
-        let ordinary_color = "#b84444";
-        let layers = snake_outline_layers(false);
-
-        assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].paint, SnakeOutlinePaint::Ordinary);
-        assert_eq!(layers[0].color(ordinary_color), ordinary_color);
-
-        let cell_size = 10.0;
-        assert_eq!(layers[0].line_width(cell_size), 12.0);
-        assert_eq!(layers[0].radius(cell_size), 6.0);
-        assert_eq!(layers[0].radius(cell_size) - cell_size / 2.0, 1.0);
-        assert_eq!(snake_mask_extra(false), 1.0);
     }
 
     /// The two roster sizes the stylesheet actually lays out. The snake must
@@ -2890,13 +2715,14 @@ mod tests {
         assert_eq!(desktop.offset_x, 2.5);
         assert_eq!(desktop.offset_y, 1.0);
         // The ordinary contour is 1px per side, so it fits inside the slack.
-        assert!(desktop.offset_y >= ORDINARY_OUTLINE_EXTRA / 2.0);
-        assert!(desktop.offset_x >= ORDINARY_OUTLINE_EXTRA / 2.0);
+        let overhang = skin_registry().resolve(None).metrics(false).overhang_px;
+        assert!(desktop.offset_y >= overhang);
+        assert!(desktop.offset_x >= overhang);
 
         let mobile = roster_snake_layout(102.0, 17.0, false);
         assert_eq!(mobile.cells, 7);
         assert!((mobile.cell_size - 100.0 / 7.0).abs() < 1e-9);
-        assert!(mobile.cell_size <= 17.0 - ORDINARY_OUTLINE_EXTRA);
+        assert!(mobile.cell_size <= 17.0 - CLASSIC_BODY_BLEED_PX);
         assert!((mobile.cell_size * mobile.cells as f64 - 100.0).abs() < 1e-9);
         assert!((mobile.offset_x - 1.0).abs() < 1e-9);
 
@@ -2938,9 +2764,13 @@ mod tests {
     fn roster_label_anchors_to_the_head_and_clears_its_dark_core() {
         let layout = roster_snake_layout(124.0, 19.0, false);
         let cell = layout.cell_size;
-        let core_radius = cell * HEAD_CORE_RADIUS_RATIO;
+        let head_core_ratio = skin_registry()
+            .resolve(None)
+            .metrics(false)
+            .head_core_radius_ratio;
+        let core_radius = cell * head_core_ratio;
 
-        let right = roster_label_layout(layout, RosterFacing::Right);
+        let right = roster_label_layout(layout, RosterFacing::Right, head_core_ratio);
         let head_center_x = (layout.cells - 1) as f64 * cell + cell / 2.0;
         assert_eq!(right.align, "right");
         assert!(
@@ -2956,7 +2786,7 @@ mod tests {
         assert!(right.x - right.max_width > tail_center_x - cell / 2.0);
         assert!(right.max_width > 80.0);
 
-        let left = roster_label_layout(layout, RosterFacing::Left);
+        let left = roster_label_layout(layout, RosterFacing::Left, head_core_ratio);
         assert_eq!(left.align, "left");
         assert!(
             (left.x - cell / 2.0 - core_radius - cell * ROSTER_LABEL_HEAD_GAP_RATIO).abs() < 1e-9,
@@ -2982,13 +2812,17 @@ mod tests {
         // being pinned to a hand-picked pixel size per breakpoint.
         let mobile = roster_snake_layout(86.0, 17.0, false);
         assert_eq!(
-            roster_label_layout(mobile, RosterFacing::Left).font_size,
+            roster_label_layout(mobile, RosterFacing::Left, HEAD_CORE_RATIO_FOR_TESTS).font_size,
             mobile.cell_size * ROSTER_LABEL_SIZE_RATIO
         );
         // Very small rows clamp instead of vanishing.
         assert_eq!(
-            roster_label_layout(roster_snake_layout(20.0, 6.0, false), RosterFacing::Left)
-                .font_size,
+            roster_label_layout(
+                roster_snake_layout(20.0, 6.0, false),
+                RosterFacing::Left,
+                HEAD_CORE_RATIO_FOR_TESTS,
+            )
+            .font_size,
             ROSTER_LABEL_MIN_SIZE
         );
     }
@@ -3044,9 +2878,11 @@ mod tests {
         assert!(!request.boost_active);
         assert!(!request.is_ready);
         assert_eq!(request.font_family, None);
+        let painted = request.skin.colors();
+        let expected = snake_palette(2, Some(0), 1, 4, true, Some(0), Some(0));
         assert_eq!(
-            request.skin.colors(),
-            snake_palette(2, Some(0), 1, 4, true, Some(0), Some(0))
+            (painted.fill.to_string(), painted.outline.to_string()),
+            expected
         );
 
         let ready: RosterSnakeRequest = serde_json::from_str(
@@ -3067,9 +2903,11 @@ mod tests {
             r#"{"snake_index":1,"team_id":1,"snake_count":2,"is_team_game":true}"#,
         )
         .unwrap();
+        let painted = spectator.colors();
+        let expected = snake_palette(1, Some(1), 0, 2, true, None, None);
         assert_eq!(
-            spectator.colors(),
-            snake_palette(1, Some(1), 0, 2, true, None, None)
+            (painted.fill.to_string(), painted.outline.to_string()),
+            expected
         );
     }
 
@@ -3148,18 +2986,18 @@ mod tests {
         let body_width = 10.0;
         let body_height = 20.0;
         let (white_width, white_height, standard_width, standard_height) =
-            nos_pressure_plate_dimensions(body_width, body_height, NosBottleSkin::Standard);
+            nos_pressure_plate_dimensions(body_width, body_height, NosBottleVariant::Standard);
         let (_, _, full_width, full_height) =
-            nos_pressure_plate_dimensions(body_width, body_height, NosBottleSkin::Full);
+            nos_pressure_plate_dimensions(body_width, body_height, NosBottleVariant::Full);
 
         assert_eq!(white_width, body_width);
         assert!(standard_width < full_width);
         assert!(standard_height < full_height);
         assert!(full_width < white_width);
         assert!(full_height < white_height);
-        assert_eq!(NosBottleSkin::Standard.orange_ratios(), (0.46, 0.42));
+        assert_eq!(NosBottleVariant::Standard.orange_ratios(), (0.46, 0.42));
 
-        let full_center_y = NosBottleSkin::Full.plate_center_y(body_height);
+        let full_center_y = NosBottleVariant::Full.plate_center_y(body_height);
         assert!(full_center_y - white_height / 2.0 >= body_height * -0.23);
         assert!(full_center_y + white_height / 2.0 <= body_height * 0.39);
     }
@@ -3169,18 +3007,21 @@ mod tests {
         for cell_size in 5..=15 {
             let (_, width, height) = regular_nos_dimensions(f64::from(cell_size));
             assert_eq!(
-                nos_wordmark_size(width, height, NosBottleSkin::Standard),
+                nos_wordmark_size(width, height, NosBottleVariant::Standard),
                 None
             );
         }
 
         for cell_size in 5..=8 {
             let (_, width, height) = full_nos_dimensions(f64::from(cell_size));
-            assert_eq!(nos_wordmark_size(width, height, NosBottleSkin::Full), None);
+            assert_eq!(
+                nos_wordmark_size(width, height, NosBottleVariant::Full),
+                None
+            );
         }
 
         let (_, width, height) = full_nos_dimensions(9.0);
-        let size = nos_wordmark_size(width, height, NosBottleSkin::Full)
+        let size = nos_wordmark_size(width, height, NosBottleVariant::Full)
             .expect("the wide full-pickup label should fit its horizontal wordmark");
         let font = nos_wordmark_font(size);
         assert!(font.starts_with("900 "));

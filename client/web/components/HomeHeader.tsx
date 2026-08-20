@@ -2,7 +2,19 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { LobbyMember, User } from '../types';
 import type { AccountModalView } from './AccountModal';
-import { HistoryIcon, KeyIcon, LogoutIcon, UserIcon, UserPlusIcon } from './Icons';
+import {
+  AdminIcon,
+  FullscreenEnterIcon,
+  FullscreenExitIcon,
+  HistoryIcon,
+  KeyIcon,
+  LogoutIcon,
+  UserIcon,
+  UserPlusIcon,
+} from './Icons';
+import { useCrazyGames } from '../contexts/CrazyGamesContext';
+import { useFullscreen } from '../hooks/useFullscreen';
+import { useInputSurface } from '../hooks/useInputSurface';
 
 interface HomeHeaderProps {
   activePage?: 'play' | 'leaderboards';
@@ -31,6 +43,13 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onOpenAccount,
   onLogout,
 }) => {
+  const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
+  const fullscreen = useFullscreen();
+  const inputSurface = useInputSurface();
+  // The CrazyGames portal owns fullscreen chrome, and desktop users have F11;
+  // this toggle exists for phones and tablets browsing snaketron.io directly.
+  const showFullscreenToggle =
+    inputSurface === 'touch' && fullscreen.supported && !isCrazyGamesBuild;
   const [isSocialOpen, setIsSocialOpen] = useState(false);
   const [isAccountOpen, setIsAccountOpen] = useState(false);
   const socialMenuRef = useRef<HTMLDivElement>(null);
@@ -179,7 +198,92 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
         </nav>
 
         <div className="home-account home-account-menu" ref={accountMenuRef}>
-          {currentUser && !currentUser.isGuest ? (
+          {showFullscreenToggle && (
+            <button
+              type="button"
+              className="home-fullscreen-toggle"
+              onClick={fullscreen.toggle}
+              aria-label={fullscreen.active ? 'Exit full screen' : 'Enter full screen'}
+              title={fullscreen.active ? 'Exit full screen' : 'Full screen'}
+              data-testid="home-fullscreen-toggle"
+            >
+              {fullscreen.active
+                ? <FullscreenExitIcon className="home-fullscreen-icon" />
+                : <FullscreenEnterIcon className="home-fullscreen-icon" />}
+            </button>
+          )}
+          {isCrazyGamesBuild ? (
+            currentUser?.authSource === 'crazygames' ? (
+              <>
+                <button
+                  ref={accountTriggerRef}
+                  id="crazygames-account-menu-trigger"
+                  type="button"
+                  className={`home-account-action home-account-trigger flex items-center gap-2 ${isAccountOpen ? 'is-open' : ''}`}
+                  onClick={() => {
+                    setIsSocialOpen(false);
+                    setIsAccountOpen((current) => !current);
+                  }}
+                  aria-label={`Playing as ${currentUser.username} through CrazyGames; progress saves automatically`}
+                  aria-expanded={isAccountOpen}
+                  aria-haspopup="menu"
+                  aria-controls="crazygames-account-menu"
+                  title="CrazyGames account linked · progress saves automatically"
+                >
+                  {currentUser.avatarUrl && (
+                    <img
+                      src={currentUser.avatarUrl}
+                      alt=""
+                      className="h-7 w-7 rounded-full border border-black/20 object-cover"
+                      referrerPolicy="no-referrer"
+                    />
+                  )}
+                  <span className="home-account-username">{currentUser.username}</span>
+                  <svg viewBox="0 0 12 8" aria-hidden="true">
+                    <path d="M1 1.5 6 6.5l5-5" />
+                  </svg>
+                </button>
+
+                {isAccountOpen && (
+                  <div
+                    id="crazygames-account-menu"
+                    className="home-social-panel home-account-panel"
+                    role="menu"
+                    aria-labelledby="crazygames-account-menu-trigger"
+                  >
+                    <div className="home-social-actions home-account-actions">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => openAccountModal('profile')}
+                      >
+                        <span>Profile</span>
+                        <UserIcon className="home-social-action-icon" />
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => openAccountModal('history')}
+                      >
+                        <span>History</span>
+                        <HistoryIcon className="home-social-action-icon" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={onAuthClick}
+                className="home-account-action"
+                disabled={!userAccountAvailable}
+                title={userAccountAvailable ? undefined : 'CrazyGames account login is unavailable in this embed'}
+              >
+                {userAccountAvailable ? 'Sign in with CrazyGames' : 'Playing as guest'}
+              </button>
+            )
+          ) : currentUser && !currentUser.isGuest ? (
             <>
               <button
                 ref={accountTriggerRef}
@@ -224,6 +328,16 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
                       <span>History</span>
                       <HistoryIcon className="home-social-action-icon" />
                     </button>
+                    {currentUser.isAdmin && (
+                      <Link
+                        to="/admin"
+                        role="menuitem"
+                        onClick={closeAccountMenu}
+                      >
+                        <span>Admin</span>
+                        <AdminIcon className="home-social-action-icon" />
+                      </Link>
+                    )}
                     <button
                       type="button"
                       role="menuitem"

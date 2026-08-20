@@ -49,7 +49,6 @@ const MATCHMAKING_QUEUE_COUNT: usize = crate::matchmaking_manager::MATCHMAKING_G
 #[derive(Default)]
 struct Counters {
     fenced_write_rejections: AtomicU64,
-    recovery_fingerprint_divergences: AtomicU64,
     planned_drain_failures: AtomicU64,
     command_claims: AtomicU64,
     command_acks: AtomicU64,
@@ -64,6 +63,8 @@ struct Counters {
     boost_activations: AtomicU64,
     boost_manual_stops: AtomicU64,
     boost_depletions: AtomicU64,
+    combo_food_collections: AtomicU64,
+    combo_points_awarded: AtomicU64,
     game_actor_advances: AtomicU64,
     game_actor_batch_quanta_sum: AtomicU64,
     game_actor_batch_quanta_max: AtomicU64,
@@ -113,6 +114,9 @@ struct Counters {
     game_duration_ms_sum: AtomicU64,
     game_duration_ms_max: AtomicU64,
     completed_game_players: AtomicU64,
+    potg_ring_truncated: AtomicU64,
+    ring_evicted_seconds_sum: AtomicU64,
+    ring_evicted_seconds_max: AtomicU64,
     redis_requests: AtomicU64,
     redis_errors: AtomicU64,
     redis_request_latency_ms_sum: AtomicU64,
@@ -135,10 +139,6 @@ macro_rules! counter_fn {
 }
 
 counter_fn!(record_fenced_write_rejection, fenced_write_rejections);
-counter_fn!(
-    record_recovery_fingerprint_divergence,
-    recovery_fingerprint_divergences
-);
 counter_fn!(record_planned_drain_failure, planned_drain_failures);
 counter_fn!(record_command_claims, command_claims);
 counter_fn!(record_command_acks, command_acks);
@@ -161,6 +161,45 @@ struct BoostMetricDimensions {
     queue_mode: &'static str,
     team_side: &'static str,
     speed_band: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComboMetricDimensions {
+    game_type: &'static str,
+    queue_mode: &'static str,
+    team_side: &'static str,
+}
+
+fn combo_metric_dimensions(state: &GameState, snake_id: u32) -> ComboMetricDimensions {
+    let game_type = match &state.game_type {
+        GameType::TeamMatch { per_team: 1 } => "duel",
+        GameType::TeamMatch { per_team: 2 } => "2v2",
+        GameType::TeamMatch { .. } => "other-team",
+        GameType::Solo => "solo",
+        GameType::FreeForAll { .. } => "free-for-all",
+        GameType::Custom { .. } => "custom",
+    };
+    let queue_mode = match &state.queue_mode {
+        QueueMode::Quickmatch => "quickmatch",
+        QueueMode::Competitive => "competitive",
+    };
+    let team_side = match state
+        .arena
+        .snakes
+        .get(snake_id as usize)
+        .and_then(|snake| snake.team_id)
+        .map(|team| team.0)
+    {
+        Some(0) => "team-0",
+        Some(1) => "team-1",
+        _ => "unknown",
+    };
+
+    ComboMetricDimensions {
+        game_type,
+        queue_mode,
+        team_side,
+    }
 }
 
 fn boost_metric_dimensions(state: &GameState, snake_id: u32) -> BoostMetricDimensions {
@@ -322,6 +361,36 @@ pub fn record_boost_lifecycle_transition(state: &GameState, transition: BoostLif
             );
         }
     }
+}
+
+/// Record one authoritative food collection after its event, catch-up
+/// checkpoint, or terminal snapshot has crossed a fenced durability boundary.
+/// All labels come from finite enums or finite value buckets; no game, user,
+/// player, command, or snake identifier is exported.
+pub fn record_combo_food_collected(
+    state: &GameState,
+    snake_id: u32,
+    points: u32,
+    combo_chain: u32,
+    combo_remaining_ms_before: u32,
+    boost_active: bool,
+) {
+    counters()
+        .combo_food_collections
+        .fetch_add(1, Ordering::Relaxed);
+    counters()
+        .combo_points_awarded
+        .fetch_add(u64::from(points), Ordering::Relaxed);
+    let dimensions = combo_metric_dimensions(state, snake_id);
+    crate::otel_metrics::record_combo_food_collected(
+        dimensions.game_type,
+        dimensions.queue_mode,
+        dimensions.team_side,
+        points,
+        combo_chain,
+        combo_remaining_ms_before,
+        boost_active,
+    );
 }
 
 counter_fn!(record_websocket_opened, websocket_opens);
@@ -493,6 +562,20 @@ pub fn record_game_completed(duration_ms: u64, players: usize) {
     crate::otel_metrics::record_game_completed(duration_ms, players);
 }
 
+/// Completion-level telemetry for the bounded PotG scorer view. Emitting once
+/// per affected game makes this directly usable as a truncation incidence
+/// rate, independent of how many individual entries were evicted.
+pub fn record_potg_ring_truncated(evicted_seconds: u64) {
+    let counters = counters();
+    counters.potg_ring_truncated.fetch_add(1, Ordering::Relaxed);
+    record_sum_and_max(
+        &counters.ring_evicted_seconds_sum,
+        &counters.ring_evicted_seconds_max,
+        evicted_seconds,
+    );
+    crate::otel_metrics::record_potg_ring_truncated(evicted_seconds);
+}
+
 pub fn record_redis_request(latency: Duration, failed: bool) {
     let counters = counters();
     let latency_ms = duration_ms(latency);
@@ -511,7 +594,6 @@ pub fn record_redis_request(latency: Duration, failed: bool) {
 #[derive(Default)]
 struct CounterSnapshot {
     fenced_write_rejections: u64,
-    recovery_fingerprint_divergences: u64,
     planned_drain_failures: u64,
     command_claims: u64,
     command_acks: u64,
@@ -526,6 +608,8 @@ struct CounterSnapshot {
     boost_activations: u64,
     boost_manual_stops: u64,
     boost_depletions: u64,
+    combo_food_collections: u64,
+    combo_points_awarded: u64,
     game_actor_advances: u64,
     game_actor_batch_quanta_sum: u64,
     game_actor_batch_quanta_max: u64,
@@ -575,6 +659,9 @@ struct CounterSnapshot {
     game_duration_ms_sum: u64,
     game_duration_ms_max: u64,
     completed_game_players: u64,
+    potg_ring_truncated: u64,
+    ring_evicted_seconds_sum: u64,
+    ring_evicted_seconds_max: u64,
     redis_requests: u64,
     redis_errors: u64,
     redis_request_latency_ms_sum: u64,
@@ -585,9 +672,6 @@ fn take_counter_snapshot() -> CounterSnapshot {
     let counters = counters();
     CounterSnapshot {
         fenced_write_rejections: counters.fenced_write_rejections.swap(0, Ordering::Relaxed),
-        recovery_fingerprint_divergences: counters
-            .recovery_fingerprint_divergences
-            .swap(0, Ordering::Relaxed),
         planned_drain_failures: counters.planned_drain_failures.swap(0, Ordering::Relaxed),
         command_claims: counters.command_claims.swap(0, Ordering::Relaxed),
         command_acks: counters.command_acks.swap(0, Ordering::Relaxed),
@@ -608,6 +692,8 @@ fn take_counter_snapshot() -> CounterSnapshot {
         boost_activations: counters.boost_activations.swap(0, Ordering::Relaxed),
         boost_manual_stops: counters.boost_manual_stops.swap(0, Ordering::Relaxed),
         boost_depletions: counters.boost_depletions.swap(0, Ordering::Relaxed),
+        combo_food_collections: counters.combo_food_collections.swap(0, Ordering::Relaxed),
+        combo_points_awarded: counters.combo_points_awarded.swap(0, Ordering::Relaxed),
         game_actor_advances: counters.game_actor_advances.swap(0, Ordering::Relaxed),
         game_actor_batch_quanta_sum: counters
             .game_actor_batch_quanta_sum
@@ -703,6 +789,9 @@ fn take_counter_snapshot() -> CounterSnapshot {
         game_duration_ms_sum: counters.game_duration_ms_sum.swap(0, Ordering::Relaxed),
         game_duration_ms_max: counters.game_duration_ms_max.swap(0, Ordering::Relaxed),
         completed_game_players: counters.completed_game_players.swap(0, Ordering::Relaxed),
+        potg_ring_truncated: counters.potg_ring_truncated.swap(0, Ordering::Relaxed),
+        ring_evicted_seconds_sum: counters.ring_evicted_seconds_sum.swap(0, Ordering::Relaxed),
+        ring_evicted_seconds_max: counters.ring_evicted_seconds_max.swap(0, Ordering::Relaxed),
         redis_requests: counters.redis_requests.swap(0, Ordering::Relaxed),
         redis_errors: counters.redis_errors.swap(0, Ordering::Relaxed),
         redis_request_latency_ms_sum: counters
@@ -1507,11 +1596,6 @@ fn emf_document(
             "Count",
         ),
         (
-            "RecoveryFingerprintDivergences",
-            counters.recovery_fingerprint_divergences,
-            "Count",
-        ),
-        (
             "PlannedDrainFailures",
             counters.planned_drain_failures,
             "Count",
@@ -1549,6 +1633,12 @@ fn emf_document(
         ("BoostActivations", counters.boost_activations, "Count"),
         ("BoostManualStops", counters.boost_manual_stops, "Count"),
         ("BoostDepletions", counters.boost_depletions, "Count"),
+        (
+            "ComboFoodCollections",
+            counters.combo_food_collections,
+            "Count",
+        ),
+        ("ComboPointsAwarded", counters.combo_points_awarded, "Count"),
         ("GameActorAdvances", counters.game_actor_advances, "Count"),
         (
             "GameActorBatchQuantaSum",
@@ -1742,6 +1832,17 @@ fn emf_document(
             counters.completed_game_players,
             "Count",
         ),
+        ("PotgRingTruncated", counters.potg_ring_truncated, "Count"),
+        (
+            "RingEvictedSecondsSum",
+            counters.ring_evicted_seconds_sum,
+            "Seconds",
+        ),
+        (
+            "RingEvictedSecondsMax",
+            counters.ring_evicted_seconds_max,
+            "Seconds",
+        ),
         ("RedisRequests", counters.redis_requests, "Count"),
         ("RedisErrors", counters.redis_errors, "Count"),
         (
@@ -1931,6 +2032,7 @@ mod tests {
                 snake_id: boost_snake_id,
             },
         );
+        record_combo_food_collected(&boost_state, boost_snake_id, 3, 7, 425, true);
         record_websocket_resync_requested(2);
         record_websocket_resync_accepted(1);
         record_websocket_resync_rejected(1);
@@ -1942,6 +2044,7 @@ mod tests {
         record_matchmaking_integrity_error(1);
         record_game_created_outbox_delivery_error(1);
         record_game_completed(3_000, 4);
+        record_potg_ring_truncated(17);
         record_redis_request(Duration::from_millis(9), true);
         crate::redis_utils::drop_redis_request_measurement_for_test(true);
         crate::redis_utils::drop_redis_request_measurement_for_test(false);
@@ -1976,6 +2079,8 @@ mod tests {
         assert!(snapshot.boost_activations >= 1);
         assert!(snapshot.boost_manual_stops >= 1);
         assert!(snapshot.boost_depletions >= 1);
+        assert!(snapshot.combo_food_collections >= 1);
+        assert!(snapshot.combo_points_awarded >= 3);
         assert!(snapshot.websocket_resync_requests >= 2);
         assert!(snapshot.websocket_resync_accepted >= 1);
         assert!(snapshot.websocket_resync_rejected >= 1);
@@ -1994,6 +2099,9 @@ mod tests {
         assert!(snapshot.game_duration_ms_sum >= 3_000);
         assert!(snapshot.game_duration_ms_max >= 3_000);
         assert!(snapshot.completed_game_players >= 4);
+        assert_eq!(snapshot.potg_ring_truncated, 1);
+        assert_eq!(snapshot.ring_evicted_seconds_sum, 17);
+        assert_eq!(snapshot.ring_evicted_seconds_max, 17);
         assert!(snapshot.redis_requests >= 2);
         assert!(snapshot.redis_errors >= 2);
         assert!(snapshot.redis_request_latency_ms_sum >= 9);
@@ -2029,13 +2137,18 @@ mod tests {
 
     #[test]
     fn emf_dimensions_keep_only_websocket_gauge_per_task() {
+        let counters = CounterSnapshot {
+            combo_food_collections: 4,
+            combo_points_awarded: 9,
+            ..CounterSnapshot::default()
+        };
         let main = emf_document(
             "test",
             "us-test-1",
             "boot-id",
             true,
             RegionalGauges::default(),
-            CounterSnapshot::default(),
+            counters,
             123,
         );
         assert_eq!(
@@ -2056,6 +2169,15 @@ mod tests {
                 .iter()
                 .all(|definition| definition["Name"] != "ActiveWebSockets")
         );
+        assert_eq!(main["ComboFoodCollections"], 4);
+        assert_eq!(main["ComboPointsAwarded"], 9);
+        for name in ["ComboFoodCollections", "ComboPointsAwarded"] {
+            assert!(
+                main_metrics.iter().any(|definition| {
+                    definition["Name"] == name && definition["Unit"] == "Count"
+                })
+            );
+        }
 
         let sockets = active_websockets_emf_document("test", "us-test-1", "boot-id", 7, 123);
         assert_eq!(
@@ -2104,9 +2226,12 @@ mod tests {
 
         assert_eq!(
             summarize_partition_leases(Some(&assignment), &leases),
-            (9, 1, 2),
+            (u64::from(PARTITION_COUNT - 1), 1, 2),
         );
-        assert_eq!(summarize_partition_leases(None, &leases), (9, 0, 0));
+        assert_eq!(
+            summarize_partition_leases(None, &leases),
+            (u64::from(PARTITION_COUNT - 1), 0, 0),
+        );
         Ok(())
     }
 
@@ -2329,6 +2454,32 @@ mod tests {
         );
         assert_eq!(
             boost_metric_dimensions(&state, u32::MAX).team_side,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn combo_metric_dimensions_are_finite_labels_without_identifiers() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Competitive,
+            None,
+            0,
+        );
+        let player = state.add_player(9_876_543, None).unwrap();
+
+        assert_eq!(
+            combo_metric_dimensions(&state, player.snake_id),
+            ComboMetricDimensions {
+                game_type: "2v2",
+                queue_mode: "competitive",
+                team_side: "team-0",
+            }
+        );
+        assert_eq!(
+            combo_metric_dimensions(&state, u32::MAX).team_side,
             "unknown"
         );
     }

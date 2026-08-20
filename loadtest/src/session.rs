@@ -17,6 +17,8 @@ use common::{
 use futures_util::{SinkExt, StreamExt, future::join_all, stream::SplitSink};
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use server::ads::AdBreakResolution;
+use server::game_executor::PARTITION_COUNT;
 use server::lifecycle::WS_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
 use server::lobby_manager::LobbyPreferences;
 use server::recovery::CommandOutcome;
@@ -1442,6 +1444,7 @@ async fn prepare_pre_game_candidate(
             token: session.token.clone(),
             protocol_version: CLIENT_PROTOCOL_VERSION,
             anon_id: None,
+            distribution: None,
         },
         cancellation,
     )
@@ -1901,6 +1904,7 @@ async fn authenticate_initial_admission_attempt(
                 token,
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 anon_id: None,
+                distribution: None,
             },
             cancellation,
         ),
@@ -4051,6 +4055,7 @@ async fn prepare_planned_candidate(
             token,
             protocol_version: CLIENT_PROTOCOL_VERSION,
             anon_id: None,
+            distribution: None,
         },
         cancellation,
     )
@@ -5281,7 +5286,7 @@ impl LiveSession {
                 session_id: self.record.session_id.clone(),
                 user_id: self.user_id,
                 game_id,
-                partition_id: game_id % 10,
+                partition_id: game_id % PARTITION_COUNT,
                 client_game_session_id: self.client_game_session_id.clone(),
                 command_sequence: sequence,
                 sent_at_unix_ms: resolution.sent_at_unix_ms,
@@ -5715,6 +5720,9 @@ impl LiveSession {
                         .last_observation()
                         .context("text frame was missing its reader receipt timestamp")?;
                     self.observe_received(&message, observation)?;
+                    if let Some(acknowledgement) = loadtest_ad_break_acknowledgement(&message) {
+                        self.send(acknowledgement).await?;
+                    }
                     return Ok(message);
                 }
                 Message::Ping(payload) => self.socket.send(Message::Pong(payload)).await?,
@@ -5814,6 +5822,7 @@ impl LiveSession {
                 token,
                 protocol_version: CLIENT_PROTOCOL_VERSION,
                 anon_id: None,
+                distribution: None,
             },
             cancellation,
         )
@@ -6037,14 +6046,34 @@ async fn next_socket_message(socket: &mut Socket) -> Result<WSMessage> {
             .ok_or_else(|| anyhow!("websocket stream ended"))??;
         match next {
             Message::Text(text) => {
-                return serde_json::from_str(&text).with_context(|| {
+                let message: WSMessage = serde_json::from_str(&text).with_context(|| {
                     format!("unrecognized websocket payload ({} bytes)", text.len())
-                });
+                })?;
+                if let Some(acknowledgement) = loadtest_ad_break_acknowledgement(&message) {
+                    send_socket_message(socket, &acknowledgement).await?;
+                }
+                return Ok(message);
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
             Message::Close(frame) => return Err(anyhow!("websocket closed: {frame:?}")),
             _ => {}
         }
+    }
+}
+
+fn loadtest_ad_break_acknowledgement(message: &WSMessage) -> Option<WSMessage> {
+    match message {
+        WSMessage::LobbyUpdate {
+            state,
+            ad_break: Some(ad_break),
+            ..
+        } if state == "ad_break" => Some(WSMessage::AdBreakResolved {
+            break_id: ad_break.id.clone(),
+            // Load clients do not host an advertising SDK. Resolve neutrally
+            // so protocol-v8 traffic never holds a public lobby barrier open.
+            resolution: AdBreakResolution::Unavailable,
+        }),
+        _ => None,
     }
 }
 
@@ -6760,7 +6789,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             user_id: 7,
             game_id: 42,
-            partition_id: 2,
+            partition_id: 42 % PARTITION_COUNT,
             client_game_session_id: "game-session-1".to_owned(),
             command_sequence: sequence,
             sent_at_unix_ms: 1_000 + sequence,
@@ -8105,7 +8134,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if value == "test-token"
             ));
             socket
@@ -8160,10 +8190,14 @@ mod tests {
                             user_id: 7,
                             username: "test-user".to_owned(),
                             ts: 0.0,
+                            supports_ad_break: true,
+                            can_show_video_ad: false,
+                            distribution: None,
                         }],
                         host_user_id: 7,
                         state: "queued".to_owned(),
                         preferences: server_preferences,
+                        ad_break: None,
                     })
                     .unwrap(),
                 ))
@@ -8274,7 +8308,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if value == "test-token"
             ));
             replacement
@@ -8321,10 +8356,14 @@ mod tests {
                             user_id: 7,
                             username: "test-user".to_owned(),
                             ts: 0.0,
+                            supports_ad_break: true,
+                            can_show_video_ad: false,
+                            distribution: None,
                         }],
                         host_user_id: 7,
                         state: "waiting".to_owned(),
                         preferences: server_preferences.clone(),
+                        ad_break: None,
                     })
                     .unwrap(),
                 ))
@@ -8347,10 +8386,14 @@ mod tests {
                             user_id: 7,
                             username: "test-user".to_owned(),
                             ts: 0.0,
+                            supports_ad_break: true,
+                            can_show_video_ad: false,
+                            distribution: None,
                         }],
                         host_user_id: 7,
                         state: "queued".to_owned(),
                         preferences: server_preferences,
+                        ad_break: None,
                     })
                     .unwrap(),
                 ))
@@ -8466,7 +8509,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if value == "test-token"
             ));
             candidate_socket
@@ -8497,10 +8541,14 @@ mod tests {
                             user_id: 7,
                             username: "test-user".to_owned(),
                             ts: 0.0,
+                            supports_ad_break: true,
+                            can_show_video_ad: false,
+                            distribution: None,
                         }],
                         host_user_id: 7,
                         state: "waiting".to_owned(),
                         preferences: server_preferences.clone(),
+                        ad_break: None,
                     })
                     .unwrap(),
                 ))
@@ -8544,10 +8592,14 @@ mod tests {
                             user_id: 7,
                             username: "test-user".to_owned(),
                             ts: 0.0,
+                            supports_ad_break: true,
+                            can_show_video_ad: false,
+                            distribution: None,
                         }],
                         host_user_id: 7,
                         state: "queued".to_owned(),
                         preferences: server_preferences,
+                        ad_break: None,
                     })
                     .unwrap(),
                 ))
@@ -8622,7 +8674,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if value == "test-token"
             ));
             candidate_socket
@@ -8736,7 +8789,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if value == "test-token"
             ));
             candidate_socket
@@ -8767,10 +8821,14 @@ mod tests {
                             user_id: 7,
                             username: "test-user".to_owned(),
                             ts: 0.0,
+                            supports_ad_break: true,
+                            can_show_video_ad: false,
+                            distribution: None,
                         }],
                         host_user_id: 7,
                         state: "queued".to_owned(),
                         preferences: server_preferences,
+                        ad_break: None,
                     })
                     .unwrap(),
                 ))
@@ -8909,7 +8967,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if value == "test-token"
             ));
 
@@ -9593,7 +9652,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if token == "stable-token"
             ));
             drop(first_socket);
@@ -9606,7 +9666,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if token == "stable-token"
             ));
             draining_socket
@@ -9656,7 +9717,8 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
-            anon_id: None,
+                    anon_id: None,
+                    distribution: None,
                 } if token == "stable-token"
             ));
             replacement_socket

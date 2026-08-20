@@ -1,11 +1,32 @@
-import React, { useEffect, useId, useRef } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useInputSurface } from '../hooks/useInputSurface';
 import type { MatchPresentation } from '../utils/gamePresentation';
+import type { Rank } from '../types';
 import {
   formatPerMinuteRate,
   getPlayAgainShortcutAction,
 } from '../utils/gamePresentation';
 import { resolveSnakeSkinColors } from '../utils/snakeSkin';
+import type { MatchRatingState } from '../utils/ratingReveal';
+import type { MatchHighlightState } from '../utils/highlightPresentation';
+import type { RematchState } from '../types';
+import {
+  canRematch,
+  hasOptedIntoRematch,
+  rematchBadgeFor,
+  rematchBlockReason,
+} from '../utils/rematchPresentation';
 import GameOverJewel from './GameOverJewel';
+import ShareGame from './ShareGame';
+import PlayOfTheGame from './PlayOfTheGame';
+import RatingReveal from './RatingReveal';
+
+/**
+ * Longest the replay will wait on the rating sweep before mounting anyway.
+ * Comfortably past a normal sweep; it only ever fires when the animation has
+ * stalled (a throttled background tab being the usual reason).
+ */
+const RATING_SETTLE_CEILING_MS = 6000;
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -18,7 +39,19 @@ const FOCUSABLE_SELECTOR = [
 
 export interface GameOverCardProps {
   open: boolean;
+  /** Match identity for React, not the wire id — see `GameHudShell`. */
+  gameId?: string;
+  /** The real `u32` game id, which is what a share link addresses. */
+  shareGameId?: number | null;
+  /** Live rematch state for this match, when the server is offering one. */
+  rematch?: RematchState | null;
+  currentUserId?: number;
+  onRematchToggle?: (optIn: boolean) => void;
   presentation: MatchPresentation;
+  rating?: MatchRatingState;
+  highlight?: MatchHighlightState;
+  /** Ladder rank of whoever earned the highlight; see `useStarRank`. */
+  starRank?: Rank | null;
   onDismiss: () => void;
   onMenu: () => void;
   onPlayAgain: () => void;
@@ -57,12 +90,21 @@ const MetricLabel: React.FC<MetricLabelProps> = ({
 
 const GameOverCard: React.FC<GameOverCardProps> = ({
   open,
+  gameId,
+  shareGameId = null,
+  rematch = null,
+  currentUserId,
+  onRematchToggle,
   presentation,
+  rating,
+  highlight,
+  starRank = null,
   onDismiss,
   onMenu,
   onPlayAgain,
   playAgainDisabled = false,
 }) => {
+  const inputSurface = useInputSurface();
   const dialogRef = useRef<HTMLDivElement>(null);
   const playAgainRef = useRef<HTMLButtonElement>(null);
   const onDismissRef = useRef(onDismiss);
@@ -72,10 +114,44 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
   const summaryId = useId();
   const ppmTooltipId = useId();
   const apmTooltipId = useId();
+  const [ratingSettled, setRatingSettled] = useState(
+    rating === undefined || rating.phase === 'idle' || rating.phase === 'unavailable',
+  );
+  const autoplayGameIdRef = useRef<number | null>(null);
 
   onDismissRef.current = onDismiss;
   onPlayAgainRef.current = onPlayAgain;
   playAgainDisabledRef.current = playAgainDisabled;
+
+  useEffect(() => {
+    setRatingSettled(
+      rating === undefined || rating.phase === 'idle' || rating.phase === 'unavailable',
+    );
+  }, [gameId, rating?.phase]);
+
+  useEffect(() => {
+    // Closing unmounts the replay player. Treat a later reopen as a new modal
+    // presentation so the one-shot gate cannot strand a controls-free PotG on
+    // its first frame.
+    if (!open) {
+      autoplayGameIdRef.current = null;
+    }
+  }, [open]);
+
+  // The replay waits for the rating sweep, and the sweep runs on rAF — which a
+  // background tab throttles to a stop. Without a ceiling, a card opened out of
+  // view would come back with no replay on it at all, so treat the sweep as
+  // finished once it has had more than enough time.
+  useEffect(() => {
+    if (!open || ratingSettled) return undefined;
+    const timer = window.setTimeout(() => setRatingSettled(true), RATING_SETTLE_CEILING_MS);
+    return () => window.clearTimeout(timer);
+  }, [open, ratingSettled]);
+
+  const handleRatingSettled = useCallback(() => setRatingSettled(true), []);
+  const handleHighlightAutoplayStarted = useCallback((playedGameId: number) => {
+    autoplayGameIdRef.current = playedGameId;
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -173,6 +249,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
     ? `${presentation.sides[0]?.score ?? 0}–${presentation.sides[1]?.score ?? 0}`
     : current?.score.toString() ?? presentation.soloScore.toString();
 
+
   return (
     <div
       className="game-over-backdrop"
@@ -218,6 +295,26 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
             <span aria-hidden="true">✕</span>
           </button>
         </header>
+
+        {rating && <RatingReveal state={rating} onSettled={handleRatingSettled} />}
+
+        {/* One thing at a time: the rating panel owns the card until its sweep
+            finishes, and only then does the replay mount and slide in. Mounting
+            both at once put two animations on screen competing for attention
+            and made the card land at its full height before either had
+            anything to show. */}
+        {highlight && ratingSettled && (
+          <PlayOfTheGame
+            highlight={highlight}
+            starRank={starRank}
+            ratingSettled={ratingSettled}
+            autoplayAllowed={
+              highlight.phase !== 'ready' ||
+              autoplayGameIdRef.current !== highlight.clip.game_id
+            }
+            onAutoplayStarted={handleHighlightAutoplayStarted}
+          />
+        )}
 
         <div className="game-over-statline" aria-label="Your match statistics">
           <div>
@@ -269,25 +366,101 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                 } as React.CSSProperties}
                 aria-hidden="true"
               />
-              <span className="game-over-player-name">
-                {player.name}
-                {player.isWinner && <span className="game-over-winner">Winner</span>}
-                {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
+              <span className="game-over-player-details">
+                <span className="game-over-player-name">
+                  {player.name}
+                  {player.isWinner && <span className="game-over-winner">Winner</span>}
+                  {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
+                  {rematchBadgeFor(rematch, player.userId) === 'rematch' && (
+                    <span
+                      className="game-over-rematch-pill"
+                      data-testid={`rematch-pill-${player.snakeId}`}
+                    >
+                      Rematch
+                    </span>
+                  )}
+                  {rematchBadgeFor(rematch, player.userId) === 'left' && (
+                    <span className="game-over-left-pill">Left</span>
+                  )}
+                </span>
+                {player.deathAttribution && (
+                  <span
+                    className="game-over-death-attribution"
+                    data-testid={`death-attribution-${player.snakeId}`}
+                  >
+                    {player.deathAttribution}
+                  </span>
+                )}
               </span>
               <strong>{player.score}</strong>
             </div>
           ))}
         </div>
 
+        {rematch && onRematchToggle && canRematch(rematch, currentUserId) && (
+          <div className="game-over-rematch" data-testid="rematch-toggle">
+            {/* Same control as the Competitive checkbox on the home form: a
+                bare label, the native input hidden for semantics, and a drawn
+                box. Copied rather than shared because the two are the only
+                checkboxes in the app and a component for two call sites would
+                be the wrong abstraction to reach for first. */}
+            <label className="flex items-center gap-2 cursor-pointer group">
+              <div className="relative">
+                <input
+                  type="checkbox"
+                  checked={hasOptedIntoRematch(rematch, currentUserId)}
+                  onChange={(event) => onRematchToggle(event.target.checked)}
+                  className="sr-only"
+                  data-testid="rematch-checkbox"
+                />
+                <div
+                  className={`w-4 h-4 border-2 rounded transition-all group-hover:border-gray-400 ${
+                    hasOptedIntoRematch(rematch, currentUserId)
+                      ? 'bg-blue-500 border-blue-500'
+                      : 'bg-white border-gray-300'
+                  }`}
+                >
+                  {hasOptedIntoRematch(rematch, currentUserId) && (
+                    <svg
+                      className="w-full h-full text-white"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth={3}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                  )}
+                </div>
+              </div>
+              <span className="game-over-rematch-label">Rematch</span>
+            </label>
+            {/* Only ever shown when ticking the box cannot actually produce a
+                game; silence there would read as the feature being broken. */}
+            {rematchBlockReason(rematch) && (
+              <span className="game-over-rematch-blocked" role="status">
+                {rematchBlockReason(rematch)}
+              </span>
+            )}
+          </div>
+        )}
+
         <footer className="game-over-actions">
           <button type="button" onClick={onMenu} className="game-shell-button is-menu">
             Main menu
           </button>
+          <ShareGame
+            gameId={shareGameId}
+            headline={presentation.resultSummary}
+            triggerClassName="game-shell-button"
+          />
           <div className="game-over-replay-actions">
-            <span className="game-over-shortcut" aria-hidden="true">
-              <kbd><span>Space</span></kbd>
-              <span>to</span>
-            </span>
+            {inputSurface !== 'touch' && (
+              <span className="game-over-shortcut" aria-hidden="true">
+                <kbd><span>Space</span></kbd>
+                <span>to</span>
+              </span>
+            )}
             <button
               ref={playAgainRef}
               type="button"

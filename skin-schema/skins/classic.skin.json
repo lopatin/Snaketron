@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "id": "classic-doc@1",
+  "name": "Classic (document)",
+  "palette": {
+    "friendly": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#3c8dde", "outline": "#286eae" }
+    ],
+    "enemy": [
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#e34e5b", "outline": "#a92f3a" }
+    ],
+    "free_for_all": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#556270", "outline": "#353c47" },
+      { "fill": "#f7b731", "outline": "#a87d1f" }
+    ]
+  },
+  "head": {
+    "core_ratio": 0.38,
+    "core_color": "#333333",
+    "gradient": {
+      "length_cells": 10.0,
+      "max_opacity": 0.3,
+      "color": "#ffffff"
+    }
+  },
+  "outline": {
+    "extra_px": 2.0,
+    "boost_band": { "color": "#fff200", "extra_px": 6.0 }
+  }
+}

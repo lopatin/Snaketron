@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "corpus_games": 200,
+  "seed": "0x534e414b4554524f",
+  "thresholds": {
+    "minimum_production_rate_bps": 7000,
+    "maximum_category_share_bps": 6000
+  },
+  "rounds": [
+    {
+      "name": "corrected_baseline",
+      "rules_version": 1,
+      "weight_changes": {},
+      "completed_games": 199,
+      "truncated_games": 1,
+      "non_trivial_games": 40,
+      "non_trivial_games_with_potg": 8,
+      "production_rate_bps": 2000,
+      "category_counts": {
+        "demolition": 17,
+        "banking": 22,
+        "combo": 7,
+        "frenzy": 0
+      },
+      "largest_category_share_bps": 4782,
+      "passed": false
+    },
+    {
+      "name": "tuning_round_1",
+      "rules_version": 2,
+      "weight_changes": {
+        "banked_per_point": {
+          "from": 5,
+          "to": 6
+        },
+        "combo_step": {
+          "from": 15,
+          "to": 21
+        }
+      },
+      "completed_games": 199,
+      "truncated_games": 1,
+      "non_trivial_games": 40,
+      "non_trivial_games_with_potg": 30,
+      "production_rate_bps": 7500,
+      "category_counts": {
+        "demolition": 19,
+        "banking": 63,
+        "combo": 43,
+        "frenzy": 0
+      },
+      "largest_category_share_bps": 5040,
+      "passed": true
+    }
+  ]
+}

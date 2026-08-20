@@ -1,10 +1,13 @@
 import React from 'react';
 import type { MatchPlayerPresentation, MatchPresentation } from '../utils/gamePresentation';
 import RosterSnakeCanvas from './RosterSnakeCanvas';
+import ShareGame from './ShareGame';
 
 export interface MatchRosterBandProps {
   presentation: MatchPresentation;
   isVisible: boolean;
+  /** Wire game id; a null id simply hides the share control. */
+  shareGameId?: number | null;
   onMenu?: () => void;
   onScoreCard?: () => void;
   scoreCardOpen?: boolean;
@@ -58,6 +61,7 @@ const PlayerLegend: React.FC<{
 const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
   presentation,
   isVisible,
+  shareGameId = null,
   onMenu,
   onScoreCard,
   scoreCardOpen = false,
@@ -65,6 +69,18 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
   const leftSide = presentation.sides[0];
   const rightSide = presentation.sides[1];
   const showActions = presentation.isComplete && Boolean(onMenu || onScoreCard);
+  // Share stays available for the whole match, not just at the end: the link
+  // is permanent and resolves to the result page once the match finishes, so
+  // posting it mid-game is a real thing to do.
+  const share = shareGameId !== null && (
+    <ShareGame
+      gameId={shareGameId}
+      headline={presentation.isComplete ? presentation.resultSummary : null}
+      variant="compact"
+      className="game-roster-share"
+      triggerClassName="game-shell-button is-share-icon"
+    />
+  );
 
   return (
     <section
@@ -73,6 +89,10 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
       aria-hidden={!isVisible}
       data-testid="game-roster-band"
     >
+      {!showActions && share && (
+        <div className="game-roster-action-slot is-right game-roster-share-slot">{share}</div>
+      )}
+
       {showActions && (
         <div className="game-roster-action-slot is-left">
           {onMenu && (
@@ -135,8 +155,9 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
 
       {showActions && (
         <div className="game-roster-action-slot is-right">
-          {onScoreCard && (
-            <div className="game-roster-actions is-right">
+          <div className="game-roster-actions is-right">
+            {share}
+            {onScoreCard && (
               <button
                 type="button"
                 onClick={onScoreCard}
@@ -146,8 +167,8 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
               >
                 Score card
               </button>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       )}
     </section>

@@ -12,7 +12,29 @@ replays/
 # Sync flight-recorder traces (see DEBUGGING.md)
 traces/
 loadtest-reports/
+.video-cache/
+# Captured clip masters are lossless build artifacts — 156 MB and growing,
+# in a repo with no LFS. The reproducible part is checked in: the scenario
+# JSON that produced each one, and the clip contract under
+# .claude/skills/snaketron-create-video/assets/launch-trailer/clip-contracts/.
+# Re-capture with tools/video/capture.mjs / scripts/capture_card.mjs.
+tools/video/clips/*/master.mkv
+__pycache__/
+*.pyc
 
 # Machine-readable staging certification bundles.
 test-results/autoscaling-*/
 dump.rdb
+
+# Design-tool scratch: fetched texture originals and Python bytecode. The
+# sources are third-party downloads (see client/web/THIRD_PARTY_ASSETS.md) and
+# only the built strips under client/web/public/images/skins/ are committed.
+client/design/tools/.texture-cache/
+# Byte-compiled helpers the texture tools import each other as. Narrow on
+# purpose: three .pyc files are tracked from before this rule existed, and a
+# blanket *.pyc would delete them out from under the build.
+client/design/tools/__pycache__/build_coat_textures.*.pyc
+client/design/tools/__pycache__/neural_tile.*.pyc
+client/design/tools/__pycache__/diffuse_tile.*.pyc
+client/design/tools/__pycache__/sprite_sheet.*.pyc
+client/design/tools/__pycache__/tileify.*.pyc

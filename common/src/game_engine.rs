@@ -22,6 +22,42 @@ fn validate_client_snapshot_state(game_state: &GameState) -> Result<()> {
     }
 }
 
+/// Replay one replicated message transactionally against an arbitrary anchor.
+///
+/// This is the single movement-only catch-up contract for live clients,
+/// recorded highlights, and offline scoring. A malformed delta can never
+/// commit only its pre-event movement or one half of an atomic event.
+pub fn advance_and_apply_replicated_message(
+    state: &GameState,
+    event_message: &GameEventMessage,
+) -> Result<GameState> {
+    let is_snapshot = matches!(&event_message.event, GameEvent::Snapshot { .. });
+    if let GameEvent::Snapshot { game_state } = &event_message.event {
+        if game_state.tick != event_message.tick {
+            return Err(anyhow::anyhow!(
+                "snapshot envelope tick {} does not match state tick {}",
+                event_message.tick,
+                game_state.tick
+            ));
+        }
+        validate_client_snapshot_state(game_state)?;
+    }
+
+    let mut candidate = match &event_message.event {
+        GameEvent::Snapshot { game_state } => game_state.clone(),
+        _ => state.clone(),
+    };
+    if !is_snapshot {
+        while candidate.current_tick() < event_message.tick {
+            candidate.tick_forward(true)?;
+        }
+        if !matches!(event_message.event, GameEvent::TickHash { .. }) {
+            candidate.try_apply_replicated_event(event_message.event.clone())?;
+        }
+    }
+    Ok(candidate)
+}
+
 /// Client-side synchronization health, updated on every processed server
 /// message. Exposed to the UI so it can detect divergence (hash mismatches),
 /// message loss (stream gaps), and trigger a resync instead of drifting.
@@ -387,22 +423,17 @@ impl GameEngine {
             self.sync_status.last_server_tick = event_message.tick;
         }
 
-        // Advance and apply against a candidate so malformed deltas cannot
-        // leave movement/cooldown catch-up committed without their event (or
-        // mutate only one half of a Boost collection). A rejected candidate is
-        // discarded and the transport is told to request a fresh snapshot.
-        let mut candidate = match &event_message.event {
-            GameEvent::Snapshot { game_state } => game_state.clone(),
-            _ => self.committed_state.clone(),
-        };
-        if !is_snapshot {
-            while candidate.current_tick() < event_message.tick {
-                if let Err(error) = candidate.tick_forward(true) {
+        // Advance and apply through the same helper used by recorded clips and
+        // highlight scoring. Keeping one movement-only replay contract avoids
+        // a second, subtly different implementation at the WASM boundary.
+        let candidate =
+            match advance_and_apply_replicated_message(&self.committed_state, event_message) {
+                Ok(candidate) => candidate,
+                Err(error) => {
                     self.sync_status.needs_resync = true;
                     return Err(error);
                 }
-            }
-        }
+            };
 
         // Fingerprint probes compare instead of mutate.
         if let GameEvent::TickHash {
@@ -434,12 +465,6 @@ impl GameEngine {
             return Ok(());
         }
 
-        if !is_snapshot
-            && let Err(error) = candidate.try_apply_replicated_event(event_message.event.clone())
-        {
-            self.sync_status.needs_resync = true;
-            return Err(error);
-        }
         self.committed_state = candidate;
 
         match &event_message.event {
@@ -863,7 +888,7 @@ mod tests {
         snake.body = vec![Position { x: 10, y: 18 }, Position { x: 13, y: 18 }];
         snake.direction = Direction::Left;
         snake.is_alive = true;
-        snake.food = 4;
+        snake.food = 2;
 
         let tick_ms = state.properties.tick_duration_ms as i64;
         (GameEngine::new_from_state(1, state), tick_ms)

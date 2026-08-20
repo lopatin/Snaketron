@@ -11,18 +11,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # Pinning Rust keeps cache keys and transported test binaries reproducible.
+  RUST_VERSION: 1.97.1
+  # Build and run the archive with exactly the same nextest release. Archive
+  # metadata is not guaranteed to be compatible across nextest releases.
+  NEXTEST_VERSION: 0.9.137
+
 jobs:
-  # Lint + compile guard: every test binary in the workspace must build, even
-  # the ones that are not executed in CI. Without this, test targets that fail
-  # to compile silently provide zero coverage (see DEBUGGING.md postmortem).
-  #
-  # The fmt and clippy steps MUST stay identical to the ones in the
-  # snaketron-io deployment repo (.github/workflows/test.yml), which runs them
-  # as a deploy gate. If they diverge, this repo can be green while the deploy
-  # pipeline fails on the same commit.
-  compile-tests:
-    name: Lint and Compile All Test Targets
-    runs-on: ubuntu-latest
+  # Keep the deployment gates unchanged. This job also owns doctests because
+  # nextest intentionally covers libtest unit/integration tests, not rustdoc.
+  quality:
+    name: Format, Clippy, and Documentation Tests
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -34,6 +36,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
 
       - name: Cache dependencies
@@ -48,6 +51,8 @@ jobs:
           sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
           protoc --version
 
+      # These two commands must stay identical to the deployment gate in the
+      # snaketron-io repository's .github/workflows/test.yml.
       - name: Run cargo fmt check (same gate as snaketron-io)
         run: cargo fmt --all -- --check
 
@@ -84,27 +89,95 @@ jobs:
         run: |
           echo "Compiling every test target in the workspace..."
           cargo test --all --no-run
+      - name: Run documentation tests
+        run: cargo test --workspace --doc
 
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
+  # Compile every libtest target once on a trusted Linux runner and transport
+  # those exact binaries to the isolated test runners. This replaces both the
+  # old compile-only job and the duplicate compilation in the test job.
+  build-test-archive:
+    name: Build All Test Targets Once
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
-    services:
-      postgres:
-        image: postgres:13.3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
+          protoc --version
+
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+          fallback: none
+
+      - name: Compile and archive every workspace test target
         env:
-          POSTGRES_USER: snaketron
-          POSTGRES_PASSWORD: snaketron
-          POSTGRES_DB: snaketron
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          
+          # Full test debuginfo made the local build 24% slower and its target
+          # directory 59% larger. Backtraces still retain symbol names.
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: >-
+          cargo nextest archive
+          --workspace
+          --locked
+          --archive-file nextest-archive.tar.zst
+
+      - name: Upload exact-commit test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive-${{ github.sha }}
+          path: nextest-archive.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+          # The archive is already zstd-compressed; recompressing it wastes CPU.
+          compression-level: 0
+
+  # Tests inside one shard stay serial because the integration harnesses flush
+  # shared Redis databases and mutate process-wide environment variables. Each
+  # runner gets two measured, non-overlapping eighth-slices; slowest/fastest
+  # pairing held the four projected test totals to 116.7-124.6 seconds. The four
+  # runners and their isolated service containers execute concurrently.
+  tests:
+    name: Tests (shard ${{ matrix.shard }}/4)
+    needs: build-test-archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            partition_a: "slice:1/8"
+            partition_b: "slice:7/8"
+          - shard: 2
+            partition_a: "slice:5/8"
+            partition_b: "slice:6/8"
+          - shard: 3
+            partition_a: "slice:8/8"
+            partition_b: "slice:2/8"
+          - shard: 4
+            partition_a: "slice:3/8"
+            partition_b: "slice:4/8"
+
+    services:
       redis:
         image: valkey/valkey:8-alpine
         ports:
@@ -115,8 +188,6 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-      # DynamoDB via LocalStack: DynamoDatabase::new() reads AWS_ENDPOINT_URL
-      # and creates its own tables, so no init script is needed here.
       localstack:
         image: localstack/localstack:3.0
         env:
@@ -130,53 +201,34 @@ jobs:
           --health-retries 10
 
     steps:
-      - name: Checkout code
+      # Nextest archives require the source tree at the same revision for test
+      # fixtures and runtime CARGO_MANIFEST_DIR values.
+      - name: Checkout exact source revision
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-        
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare cargo-nextest installation directory
+        run: mkdir -p ~/.cargo/bin
+
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          components: rustfmt, clippy
-          
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+          fallback: none
+
+      - name: Download exact-commit test archive
+        uses: actions/download-artifact@v4
         with:
-          workspaces: ". -> target"
-          cache-on-failure: true
-          
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq protobuf-compiler libprotobuf-dev
-          protoc --version
-          
-      - name: Check database connection
+          name: nextest-archive-${{ github.sha }}
+
+      - name: Run duration-balanced partitions
+        id: run_tests
         env:
-          DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
-        run: |
-          sudo apt-get install -y -qq postgresql-client
-          until pg_isready -h localhost -p 5432 -U snaketron; do
-            echo "Waiting for postgres..."
-            sleep 1
-          done
-          echo "PostgreSQL is ready!"
-          
-      - name: Check Redis connection
-        run: |
-          sudo apt-get install -y -qq redis-tools
-          until redis-cli -h localhost -p 6379 ping; do
-            echo "Waiting for Redis..."
-            sleep 1
-          done
-          echo "Redis is ready!"
-          
-      - name: Run all tests
-        env:
-          DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/snaketron
-          TEST_DATABASE_URL: postgres://snaketron:snaketron@localhost:5432/postgres
+          PARTITION_A: ${{ matrix.partition_a }}
+          PARTITION_B: ${{ matrix.partition_b }}
           REDIS_URL: redis://localhost:6379
+          SNAKETRON_REDIS_URL: redis://localhost:6379
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_REGION: us-east-1
           AWS_ACCESS_KEY_ID: test
@@ -185,15 +237,103 @@ jobs:
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |
-          echo "Running all tests..."
-          cargo test --all -- --nocapture --test-threads=1
-          
-      - name: Upload test results
-        if: failure()
+          report_dir="$RUNNER_TEMP/nextest-reports"
+          extract_dir="$RUNNER_TEMP/nextest-extract"
+          mkdir -p "$report_dir" "$extract_dir"
+          overall_status=0
+          partitions=("$PARTITION_A" "$PARTITION_B")
+
+          for partition in "${partitions[@]}"; do
+            report_name="${partition/:/-}"
+            report_name="${report_name//\//-}"
+
+            if cargo-nextest nextest run \
+              --archive-file nextest-archive.tar.zst \
+              --extract-to "$extract_dir" \
+              --extract-overwrite \
+              --workspace-remap "$GITHUB_WORKSPACE" \
+              --profile ci \
+              --partition "$partition" \
+              --run-ignored default
+            then
+              :
+            else
+              overall_status=1
+            fi
+
+            junit=target/nextest/ci/junit.xml
+            if [[ -f "$junit" ]]; then
+              mv "$junit" "$report_dir/$report_name.xml"
+            fi
+          done
+
+          exit "$overall_status"
+
+      - name: Upload partition test reports
+        if: failure() && steps.run_tests.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
-          path: |
-            target/debug/deps/*.json
-            **/*.log
+          name: test-results-shard-${{ matrix.shard }}-${{ github.sha }}
+          path: ${{ runner.temp }}/nextest-reports/*.xml
+          if-no-files-found: error
           retention-days: 7
+
+  # The wasm build, and only the wasm build.
+  #
+  # This was the skin pixel-parity gate: every shipped skin rendered headless
+  # and compared against a committed baseline sheet. It was removed as too
+  # expensive for what it caught — a Chromium install, a browser run, and a
+  # megabyte of baseline PNGs that had to be re-blessed whenever any shared
+  # painting changed.
+  #
+  # What is kept is the part that was never really about skins. This is the
+  # only job that compiles to `wasm32`, so without it a `#[cfg(target_arch =
+  # "wasm32")]` block or a `#[wasm_bindgen]` signature can break and every
+  # other job still passes — the failure surfacing when somebody loads the
+  # game. It costs a couple of minutes and no browser.
+  wasm-build:
+    name: WASM Build and Type Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/web/package-lock.json
+
+      - name: Build the wasm package
+        run: wasm-pack build --target web --out-dir pkg
+        working-directory: client
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: client/web
+
+      # Needs the wasm build above: the generated client.d.ts is what types
+      # every `getWasm()` call site.
+      - name: Type-check the web client
+        run: npx tsc --noEmit
+        working-directory: client/web

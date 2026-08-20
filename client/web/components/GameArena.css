@@ -28,7 +28,118 @@
 
 .game-arena-frame.has-boost-indicator .game-arena-panel {
   position: relative;
-  z-index: 2;
+  z-index: 3;
+}
+
+/* Combo callout -----------------------------------------------------------
+   The arena stays completely quiet between chains. Each pickup mounts one
+   fixed-position burst over the field, keeping the acknowledgement readable
+   without moving either the canvas or the Boost control beneath it. */
+.game-combo-callout {
+  position: absolute;
+  top: clamp(8px, 2.5%, 16px);
+  left: 50%;
+  z-index: 6;
+  pointer-events: none;
+  /* The arena measures the head against this box every movement tick and
+     fades the announcement out of its own way for the last couple of cells.
+     Default to fully opaque so any surface that does not drive the variable
+     (scenario capture, tests of the component in isolation) is unchanged. */
+  opacity: var(--combo-callout-proximity, 1);
+  transition: opacity 140ms linear;
+  transform: translateX(-50%);
+}
+
+.game-combo-callout__burst {
+  --combo-callout-accent: #78ad7a;
+  --combo-callout-edge: #315335;
+  --combo-callout-shadow: #315335;
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  column-gap: clamp(4px, 0.7vw, 7px);
+  row-gap: clamp(3px, 0.5vw, 5px);
+  padding: clamp(5px, 0.8vw, 8px) clamp(9px, 1.6vw, 15px);
+  border: 2px solid #17231b;
+  border-radius: 7px;
+  background:
+    linear-gradient(135deg, rgb(255 255 255 / 98%), rgb(246 250 246 / 98%));
+  box-shadow:
+    0 4px 0 var(--combo-callout-shadow),
+    0 8px 16px rgb(20 33 24 / 22%);
+  color: var(--combo-callout-edge);
+  font-family: "Arial Black", Arial, sans-serif;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+  font-weight: 950;
+  line-height: 0.9;
+  text-transform: uppercase;
+  white-space: nowrap;
+  animation: combo-callout-pop 360ms cubic-bezier(0.2, 0.82, 0.2, 1.16) both;
+  transform-origin: 50% 30%;
+}
+
+.game-combo-callout__burst.is-maxed {
+  --combo-callout-accent: #f4c642;
+  --combo-callout-edge: #745000;
+  --combo-callout-shadow: #9c6d00;
+  background:
+    linear-gradient(135deg, rgb(255 255 255 / 98%), rgb(255 249 226 / 98%));
+}
+
+.game-combo-callout__value {
+  color: var(--combo-callout-accent);
+  font-size: clamp(20px, 4vw, 30px);
+  letter-spacing: -0.055em;
+  text-shadow:
+    1px 0 var(--combo-callout-edge),
+    -1px 0 var(--combo-callout-edge),
+    0 1px var(--combo-callout-edge),
+    0 -1px var(--combo-callout-edge);
+}
+
+.game-combo-callout__label {
+  font-size: clamp(11px, 2.1vw, 16px);
+  letter-spacing: 0.035em;
+}
+
+.game-combo-callout__meter {
+  grid-column: 1 / -1;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(23 35 27 / 14%);
+  box-shadow: inset 0 0 0 1px rgb(23 35 27 / 12%);
+}
+
+.game-combo-callout__meter-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--combo-callout-edge);
+  box-shadow: inset 0 1px rgb(255 255 255 / 48%);
+  transform-origin: left center;
+  transition: transform 50ms linear;
+  will-change: transform;
+}
+
+@keyframes combo-callout-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.76) rotate(-3deg);
+  }
+
+  62% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.08) rotate(1deg);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1) rotate(0);
+  }
 }
 
 .game-boost-hud {
@@ -99,6 +210,14 @@
 
 .game-boost-meter:disabled {
   cursor: default;
+}
+
+/* Keep the button itself as the pointer-capture target. In particular, WebKit
+   can emit a transient lostpointercapture when implicit touch capture starts on
+   a nested SVG and explicit capture then moves to its parent button. */
+.game-boost-meter *,
+.touch-boost * {
+  pointer-events: none;
 }
 
 .game-boost-meter__canister {
@@ -196,6 +315,88 @@
     4px 0 9px rgb(255 213 0 / 30%);
   transition: transform 100ms linear;
   will-change: transform;
+}
+
+/* Vertical variant ----------------------------------------------------------
+   Used where the meter floats inside a frame instead of docking under the
+   arena: it is a closed rectangle on all four edges (the horizontal meter
+   deliberately opens its top edge into the arena border) and fills bottom-up.
+   Only the axis changes — colours, states and semantics stay shared. */
+.game-boost-hud.is-vertical {
+  width: var(--game-boost-vertical-width, 27px);
+  height: 100%;
+  flex: none;
+  align-self: stretch;
+  margin-top: 0;
+  transform: translateX(6px);
+}
+
+.game-boost-hud.is-vertical.is-visible {
+  transform: translateX(0);
+}
+
+.game-boost-hud.is-vertical .game-boost-meter {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 26px minmax(0, 1fr) 20px;
+  border: 1px solid var(--boost-frame);
+  border-radius: 6px;
+  box-shadow:
+    0 1px 3px rgb(23 32 51 / 12%),
+    inset 0 1px 0 rgb(255 255 255 / 62%);
+  text-align: center;
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__canister-dock {
+  width: 100%;
+  height: 100%;
+  border-right: 0;
+  border-bottom: 1px solid var(--boost-divider);
+  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 38%);
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__canister {
+  width: 18px;
+  height: 13px;
+}
+
+/* The tick marks run across the column, so the repeat axis and the fade mask
+   both rotate with the meter. */
+.game-boost-hud.is-vertical .game-boost-meter__reservoir {
+  width: 10px;
+  height: calc(100% - 16px);
+  align-self: center;
+  background: repeating-linear-gradient(
+    0deg,
+    rgb(42 61 87 / 34%) 0,
+    rgb(42 61 87 / 34%) 1px,
+    transparent 1px,
+    transparent 16px
+  );
+  mask-image: linear-gradient(0deg, transparent, #000 8%, #000 92%, transparent);
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__value {
+  border-top: 1px solid var(--boost-divider);
+  border-left: 0;
+  font-size: 9px;
+  letter-spacing: -0.03em;
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__track {
+  border-radius: 5px;
+}
+
+.game-boost-hud.is-vertical .game-boost-meter__fill {
+  transform-origin: center bottom;
+  background: linear-gradient(
+    0deg,
+    var(--boost-charge-start) 0%,
+    var(--boost-charge-mid) 62%,
+    var(--boost-charge-end) 100%
+  );
+  box-shadow:
+    inset 1px 0 0 rgb(255 255 255 / 72%),
+    0 -4px 9px rgb(255 213 0 / 30%);
 }
 
 .game-boost-hud.is-active {
@@ -661,6 +862,15 @@
     padding-bottom: 48px;
   }
 
+  .game-combo-callout {
+    top: 6px;
+  }
+
+  .game-combo-callout__burst {
+    padding: 4px 8px;
+    row-gap: 3px;
+  }
+
   .game-idle-warning {
     top: 6px;
     right: 6px;
@@ -697,8 +907,8 @@
 
   .game-controls-hint {
     position: fixed;
-    bottom: 10px;
-    left: 12px;
+    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
     min-height: 32px;
     gap: 17px;
     margin-top: 0;
@@ -839,6 +1049,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .game-combo-callout,
+  .game-combo-callout__burst,
   .game-boost-hud,
   .game-boost-meter,
   .game-boost-meter__fill,
@@ -850,9 +1062,35 @@
     animation: none;
     transition: none;
   }
+
+  .game-combo-callout__meter {
+    display: none;
+  }
 }
 
 @media (forced-colors: active) {
+  .game-combo-callout__burst,
+  .game-combo-callout__value,
+  .game-combo-callout__label {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    box-shadow: none;
+    text-shadow: none;
+    forced-color-adjust: auto;
+  }
+
+  .game-combo-callout__meter {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    box-shadow: none;
+  }
+
+  .game-combo-callout__meter-fill {
+    background: Highlight;
+    box-shadow: none;
+  }
+
   .game-idle-warning,
   .game-idle-warning__flag,
   .game-idle-warning__action,
@@ -1595,6 +1833,368 @@
   .tutorial-auto-start-fill,
   .tutorial-step-button,
   .tutorial-ready-button {
+    transition: none;
+  }
+}
+
+/* --- Touch controls: mobile d-pads + NOS Boost buttons ---------------------
+   Rendered only on touch surfaces (see useInputSurface). Portrait shows one
+   cluster at the bottom right — the NOS Boost button beside the d-pad.
+   Landscape mirrors a full cluster onto each side: a d-pad at each top
+   corner with a Boost button beneath it. The fullscreen toggle pairs with
+   the chat dock as a second rectangular utility button instead of living in
+   a cluster. The stage padding below MUST stay in lockstep with the reserve
+   constants in TouchControls.tsx, which GameArena's calculateSizes subtracts
+   so the canvas never slides beneath a cluster. */
+
+/* Size tokens live on the arena root, not the controls themselves, so the
+   controls hint and chat dock can position around the same cluster geometry. */
+.game-arena-screen.is-touch-surface {
+  --touch-dpad-size: 158px;
+  --touch-boost-size: 72px;
+}
+
+.touch-controls {
+  position: fixed;
+  inset: 0;
+  z-index: 42;
+  pointer-events: none;
+}
+
+/* An open chat must sit above the touch clusters: reading and typing is a
+   deliberate pause, and a d-pad floating over the transcript would steer the
+   snake on taps meant for the conversation. */
+.game-arena-screen.is-touch-surface .home-lobby-chat.is-expanded {
+  z-index: 65;
+}
+
+/* ...and above the results card's backdrop, which covers the whole viewport
+   at z-index 80. Chat keeps working after the final whistle — the server
+   never leaves the game scope and never checks status — but while the card
+   was up the panel sat under a scrim that swallowed every click, and a click
+   aimed at it dismissed the card instead. The end of a match is exactly when
+   people want to talk about it. */
+.game-arena-screen .home-lobby-chat {
+  z-index: 85;
+}
+
+.touch-controls__cluster {
+  position: fixed;
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+}
+
+.touch-dpad {
+  display: grid;
+  width: var(--touch-dpad-size);
+  height: var(--touch-dpad-size);
+  flex: none;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 4px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.touch-dpad__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 2px solid rgb(0 0 0 / 78%);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 84%);
+  color: rgb(0 0 0 / 78%);
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  backdrop-filter: blur(2px);
+}
+
+.touch-dpad__btn svg {
+  width: 26px;
+  height: 26px;
+}
+
+.touch-dpad__btn:active {
+  border-color: #000;
+  background: rgb(0 0 0 / 85%);
+  color: #fff;
+}
+
+.touch-dpad__btn--up { grid-area: 1 / 2; }
+.touch-dpad__btn--left { grid-area: 2 / 1; }
+.touch-dpad__btn--right { grid-area: 2 / 3; }
+.touch-dpad__btn--down { grid-area: 3 / 2; }
+
+.touch-dpad__btn--left svg { transform: rotate(-90deg); }
+.touch-dpad__btn--right svg { transform: rotate(90deg); }
+.touch-dpad__btn--down svg { transform: rotate(180deg); }
+
+.touch-dpad__hub {
+  grid-area: 2 / 2;
+  align-self: center;
+  justify-self: center;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 22%);
+}
+
+.touch-boost {
+  position: relative;
+  display: flex;
+  width: var(--touch-boost-size);
+  height: var(--touch-boost-size);
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 2px solid rgb(0 0 0 / 78%);
+  border-radius: 50%;
+  background: rgb(255 255 255 / 90%);
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  transition: border-color 130ms ease, box-shadow 130ms ease, opacity 130ms ease;
+}
+
+/* Stored-charge ring around the button, driven by --touch-boost-charge. */
+.touch-boost::before {
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
+  background: conic-gradient(
+    var(--game-blue, #3b82f6) var(--touch-boost-charge, 0deg),
+    rgb(0 0 0 / 12%) 0
+  );
+  content: "";
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4.5px));
+}
+
+.touch-boost.is-ready::before {
+  background: conic-gradient(var(--game-blue, #3b82f6) 360deg, rgb(0 0 0 / 12%) 0);
+}
+
+.touch-boost.is-active {
+  border-color: var(--game-blue, #3b82f6);
+  box-shadow: 0 0 0 5px rgb(59 130 246 / 30%);
+}
+
+.touch-boost:disabled {
+  opacity: 0.45;
+}
+
+.touch-boost__canister {
+  width: 46px;
+  height: 33px;
+}
+
+/* The fullscreen toggle is the chat dock's twin: same rectangular chrome,
+   seated right beside it. */
+.touch-fullscreen {
+  position: fixed;
+  display: flex;
+  width: 48px;
+  height: 48px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: #6b7280;
+  pointer-events: auto;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: border-color 150ms ease, color 150ms ease;
+}
+
+.touch-fullscreen svg {
+  width: 20px;
+  height: 20px;
+}
+
+.touch-fullscreen:active {
+  border-color: #3b82f6;
+  color: rgb(0 0 0 / 70%);
+}
+
+/* Smaller clusters where the viewport is tight. */
+@media (max-width: 360px), (orientation: portrait) and (max-height: 620px) {
+  .game-arena-screen.is-touch-surface {
+    --touch-dpad-size: 134px;
+    --touch-boost-size: 62px;
+  }
+}
+
+@media (orientation: landscape) and (max-height: 430px) {
+  .game-arena-screen.is-touch-surface {
+    --touch-dpad-size: 128px;
+    --touch-boost-size: 62px;
+  }
+}
+
+@media (orientation: portrait) {
+  .touch-controls__cluster--left {
+    display: none;
+  }
+
+  /* DOM order is [d-pad, boost]; row-reverse seats the d-pad on the outer
+     edge with the Boost button beside it, clear of the steering thumb. */
+  .touch-controls__cluster--right {
+    right: max(14px, env(safe-area-inset-right, 0px));
+    bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    flex-direction: row-reverse;
+    gap: 28px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-arena-stage {
+    padding-right: 8px;
+    padding-bottom: calc(var(--touch-portrait-reserve, 188px) + env(safe-area-inset-bottom, 0px));
+    padding-left: 8px;
+
+    /* Anchor to the HUD instead of dead-centering: when the 5px cell floor
+       makes the arena taller than the reserved space, the overflow goes
+       downward only, so the scoreboard is never covered. */
+    justify-content: flex-start;
+  }
+
+  /* The cluster owns the bottom-right corner; the chat dock and fullscreen
+     toggle run as a vertical stack along the left (long) edge, above the
+     controls legend — mirroring how landscape lays the pair along its own
+     long edge at the bottom. */
+  .game-arena-screen.is-touch-surface .home-lobby-chat {
+    right: auto;
+    left: max(12px, env(safe-area-inset-left, 0px));
+    bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .touch-fullscreen {
+    left: max(12px, env(safe-area-inset-left, 0px));
+    bottom: calc(120px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* The small-screen hint normally stretches to the chat trigger's old spot
+     on the right; on touch that ground belongs to the d-pad, so the (much
+     smaller) touch legend hugs the left edge instead. */
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch {
+    right: auto;
+  }
+}
+
+@media (orientation: landscape) {
+  /* Mirrored side columns: d-pad on top, Boost beneath, hanging from just
+     below the fixed scoreboard so short screens keep a free bottom row. */
+  .touch-controls__cluster--left,
+  .touch-controls__cluster--right {
+    top: calc(var(--game-scoreboard-footprint, 64px) + 14px);
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .touch-controls__cluster--left {
+    left: max(14px, env(safe-area-inset-left, 0px));
+  }
+
+  .touch-controls__cluster--right {
+    right: max(14px, env(safe-area-inset-right, 0px));
+  }
+
+  .game-arena-screen.is-touch-surface .game-arena-stage {
+    padding-right: calc(var(--touch-side-reserve, 188px) + env(safe-area-inset-right, 0px));
+    padding-bottom: 8px;
+    padding-left: calc(var(--touch-side-reserve, 188px) + env(safe-area-inset-left, 0px));
+  }
+
+  /* Bottom-right corner row: fullscreen and chat as twin rectangles. */
+  .game-arena-screen.is-touch-surface .home-lobby-chat {
+    right: max(8px, env(safe-area-inset-right, 0px));
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .touch-fullscreen {
+    right: calc(max(8px, env(safe-area-inset-right, 0px)) + 56px);
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* The legend moves to the freed bottom-left corner, under the left column. */
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    left: max(14px, env(safe-area-inset-left, 0px));
+    width: auto;
+    min-height: 0;
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch .game-controls-hint__group.is-boost {
+    display: flex;
+    align-items: center;
+  }
+}
+
+/* Ultra-short landscape: the Boost preference checkbox yields its row to
+   keep the help button clear of the left cluster; the preference remains
+   reachable on every taller layout. */
+@media (orientation: landscape) and (max-height: 400px) {
+  .game-arena-screen.is-touch-surface .game-controls-hint.is-touch .game-controls-hint__group.is-boost {
+    display: none;
+  }
+}
+
+/* Short landscape: the roster band's 19px snake pills sit in a 44px row
+   built for desktop air. Compacting the row (and the post-match Menu /
+   Score card buttons living in it) hands the arena a taller canvas —
+   calculateSizes budgets the same 30px total. */
+@media (orientation: landscape) and (max-height: 560px) {
+  .game-arena-screen.is-touch-surface .game-arena-utility-anchor {
+    height: 26px;
+    flex: 0 0 26px;
+    margin-block: 2px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-roster-band {
+    height: 26px;
+  }
+
+  .game-arena-screen.is-touch-surface .game-roster-band .game-shell-button {
+    min-height: 24px;
+    padding: 0 8px;
+  }
+}
+
+/* Same icon-only treatment the narrow-portrait rule gives the chat trigger,
+   so the paired utility rectangles stay square everywhere in the arena. */
+.game-arena-screen.is-touch-surface .home-chat-trigger {
+  width: 48px;
+  min-width: 48px;
+  height: 48px;
+  justify-content: center;
+  padding: 0;
+}
+
+.game-arena-screen.is-touch-surface .home-chat-label {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .touch-boost {
     transition: none;
   }
 }

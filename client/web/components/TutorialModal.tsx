@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { TutorialContent } from '../utils/tutorial';
 import { lockBodyScroll } from '../utils/bodyScrollLock';
+import { useInputSurface } from '../hooks/useInputSurface';
 import TutorialSceneCanvas from './TutorialSceneCanvas';
 
 const FOCUSABLE_SELECTOR = [
@@ -56,6 +57,7 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
   onReady,
   onClose,
 }) => {
+  const inputSurface = useInputSurface();
   const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   const activeStepRef = useRef(0);
@@ -411,7 +413,11 @@ const TutorialModal: React.FC<TutorialModalProps> = ({
                 <span className="tutorial-ready-status">Ready when you are</span>
               )
             ) : (
-              <span>Use ← and → to move between steps</span>
+              <span>
+                {inputSurface === 'touch'
+                  ? 'Tap a step above to revisit it'
+                  : 'Use ← and → to move between steps'}
+              </span>
             )}
             {isBriefing && autoStartSeconds !== null && (
               <span
