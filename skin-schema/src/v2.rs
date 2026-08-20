@@ -1669,6 +1669,21 @@ pub fn templates() -> Vec<Template> {
         },
         alpha: PropExpr(alpha.to_string()),
     };
+    // The same stop, but painted in the role's own fill pushed up or down in
+    // lightness. A crest with a *literal* colour would have to pick one hue
+    // for every role, and a warm crest on a blue friendly snake is two teams'
+    // colours on one snake; deriving it from the fill is hue-safe in every
+    // role by construction, and it deepens the colour rather than tinting it.
+    let lit_stop = |offset: &str, lighten: &str, alpha: &str| StopV2 {
+        offset: PropExpr(offset.to_string()),
+        color: ColorRef {
+            target: ColorTarget::Slot {
+                slot: SlotName::Fill,
+            },
+            lighten: Some(PropExpr(lighten.to_string())),
+        },
+        alpha: PropExpr(alpha.to_string()),
+    };
     // A gleam travelling the body, as three stops whose positions read the
     // clock. `alpha` and the crest's width are what separate a whisper from a
     // sweep; `easing` reshapes *when* it travels rather than how far.
@@ -1711,9 +1726,62 @@ pub fn templates() -> Vec<Template> {
         )
     };
 
+    // The moving gradient: a shadow and a highlight rolling along the body,
+    // one behind the other, both painted in the snake's own colour.
+    //
+    // It is deliberately out of step with the white Shine above it. That one
+    // peaks at the half-turn; this one is offset a quarter, so the two crests
+    // cross twice a cycle instead of travelling as one thick band — the
+    // interference is what stops it reading as simply a second highlight.
+    let sheen = |name: &str| {
+        let travel = "tri(time + 0.25)";
+        layer(
+            name,
+            "1",
+            LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Silhouette,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Gradient {
+                    axis: GradientAxis::AlongBody,
+                    stops: vec![
+                        lit_stop(&format!("{travel} - 0.44"), "-0.34", "0"),
+                        // The shadow is a hair stronger than the highlight,
+                        // and that is load-bearing rather than taste: the
+                        // sampler judges a gradient by its single strongest
+                        // stop, and `max_by` keeps the last of equals. Equal
+                        // alphas would quietly move the model onto the
+                        // lightening — the one direction that cannot fail a
+                        // contrast floor — and the check would go slack
+                        // without anything failing to say so.
+                        lit_stop(&format!("{travel} - 0.22"), "-0.34", "0.42"),
+                        // The wave passes through the body's own colour on its
+                        // way from shadow to highlight, so there is no seam.
+                        stop(
+                            travel,
+                            ColorTarget::Slot {
+                                slot: SlotName::Fill,
+                            },
+                            "0",
+                        ),
+                        lit_stop(&format!("{travel} + 0.22"), "0.45", "0.4"),
+                        lit_stop(&format!("{travel} + 0.44"), "0.45", "0"),
+                    ],
+                },
+            },
+        )
+    };
+
     // A board is two lanes of squares half a period out of phase — which is
     // exactly two band layers, and is how the shipped checkerboards are built.
-    let lane = |name: &str, t_center: f64, phase: f64, period: f64| {
+    //
+    // `lighten` is Harlequin's contribution, and Harlequin turns out not to
+    // have a gradient in it at all: its two lanes trade emphasis in exact
+    // antiphase, one cycle per turn, so the board's two colours continuously
+    // swap dominance. That see-saw under a travelling highlight is what reads
+    // as the colours never sitting still.
+    let lane = |name: &str, t_center: f64, phase: f64, period: f64, lighten: &str| {
         let mut lane = layer(
             name,
             "1",
@@ -1723,7 +1791,12 @@ pub fn templates() -> Vec<Template> {
                 span: SpanV2::whole(),
                 corner: CornerV2::Fan,
                 source: SourceV2::Band {
-                    color: ColorRef::slot(SlotName::Accent),
+                    color: ColorRef {
+                        target: ColorTarget::Slot {
+                            slot: SlotName::Accent,
+                        },
+                        lighten: Some(PropExpr(lighten.to_string())),
+                    },
                     period_cells: period,
                     duty: 0.5,
                     phase_cells: phase * period,
@@ -1777,11 +1850,28 @@ pub fn templates() -> Vec<Template> {
     // The two yellows: the game's own snake yellow, checked with a pale gold.
     check(&mut pattern.palette.free_for_all[3], "#ffe08a");
     pattern.period_ms = 1_400.0;
+    // Harlequin trades its lanes' *opacity*; this board trades their
+    // lightness, and that is a measurement rather than a preference. Veiling a
+    // check toward the body works when the two are far apart — Harlequin's
+    // cyan on violet is 0.2364 in OKLab — but this board is two yellows only
+    // 0.1085 apart, and the same trade moves them 0.0437, under the 0.08 that
+    // `color.rs` calls a difference nobody would miss. The antiphase pair
+    // below moves them 0.1407 instead. Doing both is worse than either: the
+    // swings partly cancel, and the dimmed diagonal sinks into the body.
+    //
+    // `sin` rather than Harlequin's `cos` also fixes a wart in the original.
+    // With `cos`, step 0 is the *extreme* of the swing, so the roster card,
+    // every golden and every reduced-motion viewer hold a fully tilted board.
+    // With `sin` step 0 is zero shift on both lanes, and the resting pose is
+    // the two-tone board as authored.
+    let tilt = "0.18 * sin(tau * time)";
+    let tilt_opposed = "0.18 * sin(tau * (time + 0.5))";
     pattern.layers = vec![
         ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
         ribbon("Body", RegionV2::Body, SlotName::Fill, 0.0, true),
-        lane("Board, upper", -0.25, 0.0, 2.0),
-        lane("Board, lower", 0.25, 0.5, 2.0),
+        lane("Board, upper", -0.25, 0.0, 2.0, tilt),
+        lane("Board, lower", 0.25, 0.5, 2.0, tilt_opposed),
+        sheen("Sheen"),
         // Stronger, faster, and eased: `tri` in place of `saw` makes the crest
         // sweep down the body and back rather than snapping to the head, and
         // squaring it holds it at the ends and hurries it through the middle.
@@ -2507,6 +2597,66 @@ mod tests {
             assert_eq!(template.document.head_core.color, classic.head.core_color);
             assert_eq!(template.document.head_core.ratio, classic.head.core_ratio);
         }
+    }
+
+    /// The Sheen's shadow must stay the strongest stop in its gradient.
+    ///
+    /// This looks like a taste knob and is not one. The sampler judges a
+    /// gradient by its single strongest stop, and `max_by` keeps the *last* of
+    /// equals — so equalising the two alphas would silently move the model off
+    /// the darkening and onto the lightening, which is the one direction that
+    /// cannot fail a contrast floor. The check would go slack with nothing
+    /// failing to say so, which is exactly the kind of quiet loosening a test
+    /// exists to prevent.
+    #[test]
+    fn the_sheens_shadow_outweighs_its_highlight_so_the_sampler_judges_the_dark() {
+        let pattern = templates()
+            .into_iter()
+            .find(|template| template.id == "pattern")
+            .expect("the pattern template exists");
+        let sheen = pattern
+            .document
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Sheen")
+            .expect("the pattern template carries a Sheen");
+        let LayerBodyV2::Span {
+            source: SourceV2::Gradient { stops, .. },
+            ..
+        } = &sheen.body
+        else {
+            panic!("the Sheen is a gradient span");
+        };
+
+        let value = |stop: &StopV2| {
+            stop.alpha
+                .parse()
+                .expect("a grammatical alpha")
+                .eval(&crate::expr::Env::default())
+        };
+        let shift = |stop: &StopV2| {
+            stop.color.lighten.as_ref().map_or(0.0, |lighten| {
+                lighten
+                    .parse()
+                    .expect("a grammatical lighten")
+                    .eval(&crate::expr::Env::default())
+            })
+        };
+        let strongest = |wanted: fn(f64) -> bool| {
+            stops
+                .iter()
+                .filter(|stop| wanted(shift(stop)))
+                .map(value)
+                .fold(f64::MIN, f64::max)
+        };
+        let darkest = strongest(|shift| shift < 0.0);
+        let brightest = strongest(|shift| shift > 0.0);
+
+        assert!(
+            darkest > brightest,
+            "the shadow ({darkest}) must outweigh the highlight ({brightest}), \
+             or the sampler quietly starts judging the safer direction"
+        );
     }
 
     /// The board is checked within one side's colours, never across two. A
