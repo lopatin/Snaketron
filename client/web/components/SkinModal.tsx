@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { getWasm } from '../wasm';
 import { formatBux } from '../utils/walletChip';
 import SnakeBuxIcon from './SnakeBuxIcon';
-import type { SkinSummary } from '../types/generated';
 
 /**
  * One skin, at length.
@@ -123,14 +122,37 @@ const DemoShot: React.FC<{ skinRef: string; shot: Shot; revision: number }> = ({
   );
 };
 
-interface SkinModalProps {
-  skin: SkinSummary;
+/**
+ * One skin, as this page needs it.
+ *
+ * A view model rather than the wire type, because two different things end up
+ * here: a player-authored skin, which has an author and a price and a count of
+ * who holds it, and a built-in, which has none of those and never will —
+ * everyone has every built-in from the moment they load the page. Modelling
+ * both as the authored shape would mean inventing an owner count for something
+ * that has no such concept, and a made-up number on a page whose whole job is
+ * to inform is worse than an absent one.
+ */
+export interface SkinView {
+  reference: string;
+  name: string;
+  priceBux: number;
   /** The document reference to paint, which is not the skin's own reference. */
   previewRef?: string;
+  /** Who made it. Absent for the ones that ship with the game. */
+  creatorName?: string;
+  owned: boolean;
+  /** Present only for authored skins; a built-in has nobody to count. */
+  stats?: { ownerCount: number; wearerCount: number };
+  /** Present only for authored skins, and only the creator may edit. */
+  editableSkinId?: number;
+}
+
+interface SkinModalProps {
+  skin: SkinView;
   registryRevision: number;
   balanceBux: number;
   isEquipped: boolean;
-  isMine: boolean;
   busy: boolean;
   onClose: () => void;
   onGet: () => void;
@@ -144,11 +166,9 @@ const plural = (count: number, one: string, many: string): string =>
 
 const SkinModal: React.FC<SkinModalProps> = ({
   skin,
-  previewRef,
   registryRevision,
   balanceBux,
   isEquipped,
-  isMine,
   busy,
   onClose,
   onGet,
@@ -174,7 +194,7 @@ const SkinModal: React.FC<SkinModalProps> = ({
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const paintRef = previewRef ?? skin.reference;
+  const paintRef = skin.previewRef ?? skin.reference;
 
   const action = useCallback(() => {
     if (isEquipped) {
@@ -239,7 +259,7 @@ const SkinModal: React.FC<SkinModalProps> = ({
         onClick={(event) => event.stopPropagation()}
       >
         <span className="shop-kicker">
-          {skin.creatorUsername ? `by ${skin.creatorUsername}` : 'Snaketron'}
+          {skin.creatorName ? `by ${skin.creatorName}` : 'Snaketron'}
         </span>
         <h2 id={titleId}>{skin.name}</h2>
 
@@ -259,14 +279,23 @@ const SkinModal: React.FC<SkinModalProps> = ({
         </div>
 
         <dl className="skin-stats">
-          <div>
-            <dt>Owned by</dt>
-            <dd>{plural(skin.ownerCount, 'player', 'players')}</dd>
-          </div>
-          <div>
-            <dt>Wearing now</dt>
-            <dd>{plural(skin.wearerCount, 'player', 'players')}</dd>
-          </div>
+          {skin.stats ? (
+            <>
+              <div>
+                <dt>Owned by</dt>
+                <dd>{plural(skin.stats.ownerCount, 'player', 'players')}</dd>
+              </div>
+              <div>
+                <dt>Wearing now</dt>
+                <dd>{plural(skin.stats.wearerCount, 'player', 'players')}</dd>
+              </div>
+            </>
+          ) : (
+            <div>
+              <dt>Where it came from</dt>
+              <dd>Ships with the game</dd>
+            </div>
+          )}
           <div>
             <dt>Price</dt>
             <dd className="skin-stat-price">
@@ -296,7 +325,7 @@ const SkinModal: React.FC<SkinModalProps> = ({
             </span>
           ) : null}
           {action()}
-          {isMine ? (
+          {skin.editableSkinId !== undefined ? (
             <button
               type="button"
               className="game-shell-button"

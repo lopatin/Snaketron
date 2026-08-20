@@ -10,6 +10,7 @@ import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import SnakeBuxIcon from './SnakeBuxIcon';
 import SkinModal from './SkinModal';
+import type { SkinView } from './SkinModal';
 import GetSkinModal from './GetSkinModal';
 import WalletModal from './WalletModal';
 import SkinToast from './SkinToast';
@@ -454,7 +455,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
   /** The skin whose page is open, if any. */
-  const [viewing, setViewing] = useState<SkinSummary | null>(null);
+  const [viewing, setViewing] = useState<SkinView | null>(null);
   /** The skin awaiting a spend confirmation. */
   const [getting, setGetting] = useState<SkinSummary | null>(null);
   /** Whether the wallet is open, and what it is being opened *for*. */
@@ -731,6 +732,42 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
     [authored],
   );
 
+  /**
+   * Turn a row into the thing its page is about.
+   *
+   * Every snake skin has a page, built-ins included — a row that opens for
+   * three of its entries and not the rest is not a list you can learn. What
+   * differs is what there is to say: a built-in has no author, no price and
+   * nobody to count, so it says so rather than showing zeroes.
+   */
+  const viewOf = useCallback(
+    (entry: CatalogEntry): SkinView => {
+      const match = summaryFor(entry.reference);
+      if (!match) {
+        return {
+          reference: entry.reference,
+          name: entry.name,
+          priceBux: 0,
+          owned: true,
+        };
+      }
+      return {
+        reference: match.reference,
+        name: match.name,
+        priceBux: match.priceBux,
+        previewRef: match.contentRef ?? undefined,
+        creatorName:
+          match.creatorUserId === user?.id
+            ? undefined
+            : (match.creatorUsername ?? undefined),
+        owned: match.owned,
+        stats: { ownerCount: match.ownerCount, wearerCount: match.wearerCount },
+        editableSkinId: match.creatorUserId === user?.id ? match.skinId : undefined,
+      };
+    },
+    [summaryFor, user?.id],
+  );
+
   return (
     <div className="home-page skins-page">
       <HomeHeader
@@ -802,10 +839,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                         const match = summaryFor(entry.reference);
                         return match ? () => startGet(match) : undefined;
                       })()}
-                      onOpen={(() => {
-                        const match = summaryFor(entry.reference);
-                        return match ? () => setViewing(match) : undefined;
-                      })()}
+                      onOpen={() => setViewing(viewOf(entry))}
                     />
                   ))
                 : null}
@@ -838,22 +872,27 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       {viewing ? (
         <SkinModal
           skin={viewing}
-          previewRef={viewing.contentRef ?? undefined}
           registryRevision={registryRevision}
           balanceBux={balanceBux ?? 0}
           isEquipped={viewing.reference === equippedSkin}
-          isMine={viewing.creatorUserId === user?.id}
-          busy={busySkin === viewing.skinId}
+          busy={busySkin === viewing.editableSkinId}
           onClose={() => setViewing(null)}
           onGet={() => {
+            const match = summaryFor(viewing.reference);
             setViewing(null);
-            startGet(viewing);
+            if (match) {
+              startGet(match);
+            }
           }}
           onEquip={() => {
             void equip('snake', viewing.reference);
             setViewing(null);
           }}
-          onEdit={() => navigate(`/skins/builder/${viewing.skinId}`)}
+          onEdit={() => {
+            if (viewing.editableSkinId !== undefined) {
+              navigate(`/skins/builder/${viewing.editableSkinId}`);
+            }
+          }}
           onTopUp={() => {
             setViewing(null);
             setWallet({ name: viewing.name, priceBux: viewing.priceBux });

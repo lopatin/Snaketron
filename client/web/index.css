@@ -7645,7 +7645,16 @@ a.home-social-icon:hover {
    as a thing bracketed rather than a thing listed. */
 .skins-row.is-equipped {
   background: #eff6ff;
-  box-shadow: inset 3px 0 0 var(--game-blue), inset -3px 0 0 var(--game-blue);
+  /* Bars down both sides, hairlines across the top and bottom: the row is
+     closed on all four edges, so it reads as a thing lifted out of the list
+     rather than a thing the list happens to start at. All four are inset
+     shadows so none of them takes part in layout — a real border would move
+     every row below it by a pixel as the equipped one changed. */
+  box-shadow:
+    inset 3px 0 0 var(--game-blue),
+    inset -3px 0 0 var(--game-blue),
+    inset 0 1px 0 var(--game-blue),
+    inset 0 -1px 0 var(--game-blue);
 }
 
 .skins-row.is-equipped:hover,
@@ -7804,20 +7813,22 @@ a.home-social-icon:hover {
 
 /* Equipped is a state, not an action, so it reads as a marker rather than a
    button you could press. Mirrors the results card's promoted pill. */
-/* A statement of fact, not an offer. In the button's blue-on-blue it read as
-   something to press — and pressing the thing that says "equipped" is the one
-   action a row in this state has nothing to do with. */
+/* A statement of fact, not an offer.
+   Every button on this page is bordered, boxed and italic, so a badge wearing
+   any of those reads as something to press — and pressing the thing that says
+   "equipped" is the one action a row in this state has nothing to do with.
+   Upright blue text with no chrome at all says the same word and asks for
+   nothing, and the blue ties it to the rules bracketing the row. */
 .skins-equipped-badge {
   display: inline-flex;
   min-height: 32px;
   align-items: center;
-  border: 1px solid rgb(63 63 65 / 45%);
-  border-radius: 5px;
+  border: 0;
   background: transparent;
-  padding: 0 13px;
-  color: var(--game-graphite);
+  padding: 0 4px;
+  color: var(--game-blue);
   font-size: 9px;
-  font-style: italic;
+  font-style: normal;
   font-weight: 900;
   letter-spacing: 0.07em;
   text-transform: uppercase;
