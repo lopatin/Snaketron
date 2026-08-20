@@ -94,6 +94,8 @@ interface Template {
   id: string;
   label: string;
   document: Document;
+  /** The fixture role this card paints — see `Template::preview_role`. */
+  previewRole: string;
 }
 
 interface Cost {
@@ -1213,7 +1215,7 @@ const TemplatePreview: React.FC<{ template: Template }> = ({ template }) => {
           canvas,
           handle,
           TEMPLATE_POSE,
-          'own',
+          template.previewRole,
           TEMPLATE_CELL,
           false,
           false,
@@ -1226,7 +1228,7 @@ const TemplatePreview: React.FC<{ template: Template }> = ({ template }) => {
       frame = requestAnimationFrame(loop);
     });
     return () => cancelAnimationFrame(frame);
-  }, [handle, layout.canvasWidth, layout.canvasHeight]);
+  }, [handle, template.previewRole, layout.canvasWidth, layout.canvasHeight]);
 
   return (
     <span

@@ -1563,6 +1563,13 @@ pub struct Template {
     pub id: String,
     pub label: String,
     pub document: SkinDocV2,
+    /// The fixture role name the picker should paint this card in.
+    ///
+    /// A card exists to show what the template *is*, and for a template built
+    /// around one palette slot that means painting that slot. It is not
+    /// cosmetic: friendly colours are pinned to a cool hue window, so a yellow
+    /// board is only legal — and only truthful — in a free-for-all slot.
+    pub preview_role: String,
 }
 
 /// The documents a new skin can start from.
@@ -1576,56 +1583,35 @@ pub struct Template {
 /// it would open the editor on a document the validator immediately refuses,
 /// which is a poor first impression and a baffling one.
 pub fn templates() -> Vec<Template> {
+    let pair = |fill: &str, outline: &str| ColorPair {
+        fill: fill.to_string(),
+        outline: outline.to_string(),
+        accent: None,
+    };
     let base = |name: &str| SkinDocV2 {
         schema_version: SCHEMA_VERSION_V2,
         id: "draft@1".to_string(),
         name: name.to_string(),
+        // The colours a player already knows, taken from the shipped classic
+        // document rather than invented near it. A template is the snake you
+        // had a moment ago with something added, and a starting point that
+        // silently restyles the body is a worse starting point — the author
+        // cannot tell which difference is the template and which is theirs.
         palette: RolePalette {
-            friendly: [
-                ColorPair {
-                    fill: "#5ad2e0".to_string(),
-                    outline: "#2e8fa0".to_string(),
-                    accent: None,
-                },
-                ColorPair {
-                    fill: "#38b6d6".to_string(),
-                    outline: "#1d7690".to_string(),
-                    accent: None,
-                },
-            ],
-            enemy: [
-                ColorPair {
-                    fill: "#ff7a59".to_string(),
-                    outline: "#b8452c".to_string(),
-                    accent: None,
-                },
-                ColorPair {
-                    fill: "#f2564e".to_string(),
-                    outline: "#a32f2e".to_string(),
-                    accent: None,
-                },
-            ],
+            friendly: [pair("#70bfe3", "#5299bb"), pair("#3c8dde", "#286eae")],
+            enemy: [pair("#ff6b6b", "#b84444"), pair("#e34e5b", "#a92f3a")],
             free_for_all: [
-                ColorPair {
-                    fill: "#5ad2e0".to_string(),
-                    outline: "#2e8fa0".to_string(),
-                    accent: None,
-                },
-                ColorPair {
-                    fill: "#ff7a59".to_string(),
-                    outline: "#b8452c".to_string(),
-                    accent: None,
-                },
-                ColorPair {
-                    fill: "#93a3b5".to_string(),
-                    outline: "#5d6e81".to_string(),
-                    accent: None,
-                },
-                ColorPair {
-                    fill: "#f5c04a".to_string(),
-                    outline: "#a3781f".to_string(),
-                    accent: None,
-                },
+                pair("#70bfe3", "#5299bb"),
+                pair("#ff6b6b", "#b84444"),
+                // Classic's steel is #556270, and this is the one colour a
+                // template may not copy: it is the weak spot classic carries a
+                // recorded exemption for, where the head glow lightens the body
+                // to a mid-grey the derived white label only reaches 3.0:1 on.
+                // Lightening past the threshold flips the derived label dark,
+                // which is what actually fixes it — darkening keeps the white
+                // label and the glow washes it out again.
+                pair("#93a3b5", "#5d6e81"),
+                pair("#f7b731", "#a87d1f"),
             ],
         },
         labels: LabelStyle::default(),
@@ -1635,8 +1621,8 @@ pub fn templates() -> Vec<Template> {
         textures: Vec::new(),
         period_ms: 2_400.0,
         head_core: HeadCoreV2 {
-            ratio: 0.36,
-            color: "#10203a".to_string(),
+            ratio: 0.38,
+            color: "#333333".to_string(),
         },
         layers: Vec::new(),
     };
@@ -1770,19 +1756,26 @@ pub fn templates() -> Vec<Template> {
     pattern
         .literals
         .insert("gleam".to_string(), "#ffffff".to_string());
-    // Harlequin's yellows, worn as a board with Pitlane's two-cell squares.
-    // The check colour is the accent rather than a literal, so it still flips
-    // with the side — a board reads as a board on both teams or it is not a
-    // team skin.
-    for slot in pattern.palette.friendly.iter_mut() {
-        slot.accent = Some("#fbcd82".to_string());
-    }
-    for slot in pattern.palette.enemy.iter_mut() {
-        slot.accent = Some("#f2b75f".to_string());
-    }
-    for slot in pattern.palette.free_for_all.iter_mut() {
-        slot.accent = Some("#f8e9bc".to_string());
-    }
+    // A board with Pitlane's two-cell squares, checked in Harlequin's manner:
+    // the second square is its own colour on the same side of the wheel as the
+    // first, never a colour borrowed from the other team. The check is the
+    // accent rather than a literal, so it flips with the side — a board reads
+    // as a board in every role or it is not a skin, it is one snake's costume.
+    //
+    // Which is why the yellow board lives in `free_for_all[3]` and the card
+    // paints that slot: friendly is pinned to a cool hue window, so a yellow
+    // friendly snake is not a choice the sampler would allow, and a yellow
+    // check over a blue body is two teams' colours on one snake.
+    let check = |slot: &mut ColorPair, hex: &str| slot.accent = Some(hex.to_string());
+    check(&mut pattern.palette.friendly[0], "#c8ecfa");
+    check(&mut pattern.palette.friendly[1], "#a8cdf2");
+    check(&mut pattern.palette.enemy[0], "#fbcd82");
+    check(&mut pattern.palette.enemy[1], "#f2b75f");
+    check(&mut pattern.palette.free_for_all[0], "#c8ecfa");
+    check(&mut pattern.palette.free_for_all[1], "#fbcd82");
+    check(&mut pattern.palette.free_for_all[2], "#93a3b5");
+    // The two yellows: the game's own snake yellow, checked with a pale gold.
+    check(&mut pattern.palette.free_for_all[3], "#ffe08a");
     pattern.period_ms = 1_400.0;
     pattern.layers = vec![
         ribbon("Outline", RegionV2::Contour, SlotName::Outline, 2.0, false),
@@ -1846,16 +1839,19 @@ pub fn templates() -> Vec<Template> {
             id: "classic".to_string(),
             label: "Classic".to_string(),
             document: classic,
+            preview_role: "own".to_string(),
         },
         Template {
             id: "pattern".to_string(),
             label: "Pattern".to_string(),
             document: pattern,
+            preview_role: "ffa3".to_string(),
         },
         Template {
             id: "sprite".to_string(),
             label: "Sprite".to_string(),
             document: sprite,
+            preview_role: "own".to_string(),
         },
     ]
 }
@@ -2464,6 +2460,111 @@ mod tests {
             // None of them may inherit the shipped document's exemption, which
             // is only sound because none of them is the shipped document.
             assert_ne!(template.document.id, "classic-doc@1");
+        }
+    }
+
+    /// A template starts from the snake the player already has, so the colours
+    /// a template does *not* set out to change must be the shipped ones. Get
+    /// this wrong and every skin quietly restyles the body, which makes the
+    /// author's own first change impossible to see against.
+    #[test]
+    fn templates_start_from_the_colours_the_player_already_has() {
+        let classic: crate::SkinDoc =
+            serde_json::from_str(include_str!("../../skin-schema/skins/classic.skin.json"))
+                .expect("the shipped classic document parses");
+
+        for template in templates() {
+            let palette = &template.document.palette;
+            for (index, shipped) in classic.palette.friendly.iter().enumerate() {
+                assert_eq!(
+                    palette.friendly[index].fill, shipped.fill,
+                    "template `{}` restyles friendly[{index}]",
+                    template.id
+                );
+                assert_eq!(palette.friendly[index].outline, shipped.outline);
+            }
+            for (index, shipped) in classic.palette.enemy.iter().enumerate() {
+                assert_eq!(
+                    palette.enemy[index].fill, shipped.fill,
+                    "template `{}` restyles enemy[{index}]",
+                    template.id
+                );
+            }
+            // The steel free-for-all slot is the documented exception, and the
+            // only one: it is where classic's recorded weak spot lives.
+            assert_ne!(
+                palette.free_for_all[2].fill,
+                classic.palette.free_for_all[2].fill
+            );
+            for index in [0usize, 1, 3] {
+                assert_eq!(
+                    palette.free_for_all[index].fill, classic.palette.free_for_all[index].fill,
+                    "template `{}` restyles free_for_all[{index}]",
+                    template.id
+                );
+            }
+
+            assert_eq!(template.document.head_core.color, classic.head.core_color);
+            assert_eq!(template.document.head_core.ratio, classic.head.core_ratio);
+        }
+    }
+
+    /// The board is checked within one side's colours, never across two. A
+    /// yellow check over a blue body puts two teams on one snake, and the card
+    /// that paints it would be advertising a skin nobody could read in a match.
+    #[test]
+    fn the_pattern_board_checks_each_role_against_its_own_side() {
+        let pattern = templates()
+            .into_iter()
+            .find(|template| template.id == "pattern")
+            .expect("the pattern template exists");
+
+        // The card paints the slot the board is built around, and that slot is
+        // yellow-on-yellow — which is only legal outside the hue windows.
+        assert_eq!(pattern.preview_role, "ffa3");
+
+        let hue = |hex: &str| Rgb::parse(hex).expect("valid hex").oklch_hue_chroma().0;
+        let board = &pattern.document.palette.free_for_all[3];
+        let check = board.accent.as_deref().expect("the board has a check");
+        assert!(
+            (hue(&board.fill) - hue(check)).abs() < 25.0,
+            "both squares must read as yellow: {} vs {check}",
+            board.fill
+        );
+        assert_ne!(
+            board.fill, check,
+            "a board needs two distinguishable squares"
+        );
+
+        // And every other role checks within its own window, so the board is a
+        // board on both teams rather than one snake's costume.
+        for (role, pair, window) in [
+            (
+                "friendly[0]",
+                &pattern.document.palette.friendly[0],
+                crate::color::FRIENDLY_HUES,
+            ),
+            (
+                "friendly[1]",
+                &pattern.document.palette.friendly[1],
+                crate::color::FRIENDLY_HUES,
+            ),
+            (
+                "enemy[0]",
+                &pattern.document.palette.enemy[0],
+                crate::color::ENEMY_HUES,
+            ),
+            (
+                "enemy[1]",
+                &pattern.document.palette.enemy[1],
+                crate::color::ENEMY_HUES,
+            ),
+        ] {
+            let check = pair.accent.as_deref().expect("every role is checked");
+            assert!(
+                window.contains(hue(check)),
+                "{role}'s check {check} is on the other side of the wheel"
+            );
         }
     }
 

@@ -265,4 +265,20 @@ mod tests {
         }
         assert!(identity_by_name("nonesuch").is_none());
     }
+
+    /// A template names the role its picker card should paint, and that name
+    /// crosses a crate boundary as a string — skin-schema cannot see this list.
+    /// A typo there would silently fall back to whatever the caller does with
+    /// an unresolvable role, so the two ends are tied together here.
+    #[test]
+    fn every_template_names_a_role_that_resolves() {
+        for template in skin_schema::v2::templates() {
+            assert!(
+                identity_by_name(&template.preview_role).is_some(),
+                "template `{}` previews as `{}`, which is not a role",
+                template.id,
+                template.preview_role
+            );
+        }
+    }
 }
