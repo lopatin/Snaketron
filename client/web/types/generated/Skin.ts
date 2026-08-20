@@ -19,4 +19,18 @@ pendingRevision: number | null, priceBux: number, headRevision: number, publishe
  * Denormalised so match preparation resolves a wearer in one read instead
  * of a read for the skin plus a read for its revision.
  */
-headContentRef: string, publishedContentRef: string | null, createdAtMs: bigint, updatedAtMs: bigint, publishedAtMs: bigint | null, };
+headContentRef: string, publishedContentRef: string | null, createdAtMs: bigint, updatedAtMs: bigint, publishedAtMs: bigint | null,
+/**
+ * How many players hold a grant on this skin.
+ *
+ * A counter on the skin rather than a count of grant rows: grants are
+ * keyed by their owner, so counting them per skin would be a scan. It is
+ * incremented in the same transaction that writes the grant, which is what
+ * keeps it from drifting away from the rows it counts.
+ */
+ownerCount: number,
+/**
+ * How many players currently have this skin equipped. Adjusted as
+ * equipment changes, so it lags a change by nothing and is never a scan.
+ */
+wearerCount: number, };

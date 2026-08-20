@@ -99,6 +99,9 @@ pub enum SkinsApiError {
     /// join, an explicit equip is worth an error: the player is looking at the
     /// result and deserves to know it did not take.
     UnknownSkin(String),
+    /// A real skin the caller has not acquired. Distinct from unknown: the
+    /// client can act on this one, by offering to get it.
+    NotOwned,
     Internal(anyhow::Error),
 }
 
@@ -106,6 +109,10 @@ impl IntoResponse for SkinsApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "No such skin".to_string()),
+            Self::NotOwned => (
+                StatusCode::FORBIDDEN,
+                "Get this skin before wearing it".to_string(),
+            ),
             Self::Gone => (StatusCode::GONE, "This skin has been removed".to_string()),
             Self::AuthRequired => (
                 StatusCode::UNAUTHORIZED,
@@ -171,6 +178,15 @@ pub async fn set_equipment(
     )
     .await?;
 
+    // What they were wearing, read before the write, so the wearer counts can
+    // be moved off the old skin and onto the new one.
+    let worn_before = state
+        .db
+        .get_user_by_id(auth_user.user_id)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .and_then(|user| user.selected_skin);
+
     state
         .db
         .set_user_equipment(
@@ -180,6 +196,26 @@ pub async fn set_equipment(
         )
         .await
         .map_err(SkinsApiError::Internal)?;
+
+    // Only the snake slot is counted, and only when it actually moved. These
+    // are display numbers on a skin's page, so a failure here is swallowed:
+    // an equip that worked must not report failure because a counter did not.
+    if let Some(requested) = snake.as_ref() {
+        let before = worn_before
+            .as_deref()
+            .and_then(crate::skin_store::equipped_skin_id);
+        let after = requested
+            .as_deref()
+            .and_then(crate::skin_store::equipped_skin_id);
+        if before != after {
+            if let Some(skin_id) = before {
+                let _ = state.db.adjust_skin_wearers(skin_id, -1).await;
+            }
+            if let Some(skin_id) = after {
+                let _ = state.db.adjust_skin_wearers(skin_id, 1).await;
+            }
+        }
+    }
 
     // Report the whole slot set back rather than echoing the request, so a
     // client that only sent one slot still learns the state it is now in.
@@ -277,13 +313,19 @@ fn catalogue_reference(inner: &str, kind: SkinKind) -> Option<String> {
 /// carries the three rules that matter: a creator wears their own private
 /// draft, everyone else needs an approved revision, and a disabled skin is
 /// refused to both.
-fn wearable_reference(skin: &Skin, viewer: i32, kind: SkinKind) -> Option<String> {
+fn wearable_reference(skin: &Skin, viewer: i32, kind: SkinKind, owned: bool) -> Option<String> {
     let wanted = match kind {
         SkinKind::Snake => crate::skin_store::SkinKind::Snake,
         SkinKind::Base => crate::skin_store::SkinKind::Base,
     };
     // Wrong slot is as wrong as nonexistent: a base is not a snake skin.
     if skin.kind != wanted || skin.content_ref_for(Some(viewer)).is_none() {
+        return None;
+    }
+    // You wear what you hold. Publication says a skin *may* be acquired;
+    // holding it is what says this player did, and equipping without that
+    // would make acquiring it decorative.
+    if !owned {
         return None;
     }
     Some(stored_form(&skin_id_reference(skin.skin_id), kind))
@@ -318,9 +360,18 @@ async fn resolve_slot(
             .map_err(SkinsApiError::Internal)?
             .ok_or_else(|| SkinsApiError::UnknownSkin(inner.to_string()))?;
 
-        return wearable_reference(&skin, viewer, kind)
+        // A creator holds their own work from the moment it exists, so this
+        // only has to be asked about somebody else's.
+        let owned = skin.creator_user_id == viewer
+            || state
+                .db
+                .has_skin_grant(viewer, skin_id)
+                .await
+                .map_err(SkinsApiError::Internal)?;
+
+        return wearable_reference(&skin, viewer, kind, owned)
             .map(|reference| Some(Some(reference)))
-            .ok_or_else(|| SkinsApiError::UnknownSkin(inner.to_string()));
+            .ok_or_else(|| SkinsApiError::NotOwned);
     }
 
     catalogue_reference(inner, kind)
@@ -371,11 +422,20 @@ pub struct SkinSummary {
     pub pending_revision: Option<u32>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Whether this viewer holds it. Equipping is gated on owning, so this is
+    /// what decides whether a row offers "get" or "equip".
+    pub owned: bool,
+    /// How many players hold it, and how many are wearing it right now.
+    pub owner_count: u32,
+    pub wearer_count: u32,
 }
 
 impl SkinSummary {
-    fn of(skin: &Skin, viewer: Option<i32>) -> Self {
+    fn of(skin: &Skin, viewer: Option<i32>, owned: bool) -> Self {
         Self {
+            owned: owned || viewer == Some(skin.creator_user_id),
+            owner_count: skin.owner_count,
+            wearer_count: skin.wearer_count,
             skin_id: skin.skin_id,
             reference: skin_id_reference(skin.skin_id),
             name: skin.name.clone(),
@@ -552,7 +612,7 @@ pub async fn create_skin(
 
     let mut response = (
         StatusCode::CREATED,
-        Json(SkinSummary::of(&skin, Some(auth_user.user_id))),
+        Json(SkinSummary::of(&skin, Some(auth_user.user_id), true)),
     )
         .into_response();
     no_store(&mut response);
@@ -617,7 +677,8 @@ pub async fn update_skin(
         }
     };
 
-    let mut response = Json(SkinSummary::of(&updated, Some(auth_user.user_id))).into_response();
+    let mut response =
+        Json(SkinSummary::of(&updated, Some(auth_user.user_id), true)).into_response();
     no_store(&mut response);
     Ok(response)
 }
@@ -651,7 +712,7 @@ pub async fn get_skin(
         return Err(SkinsApiError::NotFound);
     }
 
-    let mut response = Json(SkinSummary::of(&skin, user_id)).into_response();
+    let mut response = Json(SkinSummary::of(&skin, user_id, holds_grant)).into_response();
     no_store(&mut response);
     Ok(response)
 }
@@ -768,11 +829,25 @@ pub async fn list_skins(
             .map_err(SkinsApiError::Internal)?,
     };
 
+    // One query for the viewer's whole shelf, not one per row: a page of
+    // twenty skins should not be twenty ownership lookups.
+    let held: std::collections::HashSet<i32> = match viewer {
+        Some(user_id) => state
+            .db
+            .list_skin_grants(user_id)
+            .await
+            .map_err(SkinsApiError::Internal)?
+            .into_iter()
+            .map(|grant| grant.skin_id)
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+
     let mut response = Json(SkinListResponse {
         skins: page
             .skins
             .iter()
-            .map(|skin| SkinSummary::of(skin, viewer))
+            .map(|skin| SkinSummary::of(skin, viewer, held.contains(&skin.skin_id)))
             .collect(),
         cursor: page.cursor,
     })
@@ -929,7 +1004,7 @@ pub async fn admin_review_queue(
     let mut response = Json(SkinListResponse {
         skins: skins
             .iter()
-            .map(|skin| SkinSummary::of(skin, Some(auth_user.user_id)))
+            .map(|skin| SkinSummary::of(skin, Some(auth_user.user_id), false))
             .collect(),
         cursor: None,
     })
@@ -1012,7 +1087,8 @@ pub async fn admin_set_status(
         .map_err(SkinsApiError::Internal)?
         .ok_or(SkinsApiError::NotFound)?;
 
-    let mut response = Json(SkinSummary::of(&updated, Some(auth_user.user_id))).into_response();
+    let mut response =
+        Json(SkinSummary::of(&updated, Some(auth_user.user_id), true)).into_response();
     no_store(&mut response);
     Ok(response)
 }
@@ -1069,6 +1145,8 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             published_at_ms: None,
+            owner_count: 1,
+            wearer_count: 0,
         }
     }
 
@@ -1176,11 +1254,11 @@ mod tests {
     fn a_creator_may_equip_their_own_unpublished_skin() {
         let draft = stored_skin(1000, 42, Publication::Private, None);
         assert_eq!(
-            wearable_reference(&draft, 42, SkinKind::Snake),
+            wearable_reference(&draft, 42, SkinKind::Snake, true),
             Some("skin:1000".to_string()),
         );
         assert_eq!(
-            wearable_reference(&draft, 7, SkinKind::Snake),
+            wearable_reference(&draft, 7, SkinKind::Snake, true),
             None,
             "somebody else's private draft is not wearable"
         );
@@ -1190,7 +1268,7 @@ mod tests {
     fn a_published_skin_is_wearable_by_anyone() {
         let published = stored_skin(1000, 42, Publication::Published, Some(1));
         assert_eq!(
-            wearable_reference(&published, 7, SkinKind::Snake),
+            wearable_reference(&published, 7, SkinKind::Snake, true),
             Some("skin:1000".to_string()),
         );
     }
@@ -1200,8 +1278,14 @@ mod tests {
     #[test]
     fn a_disabled_skin_is_refused_even_to_the_person_who_made_it() {
         let disabled = stored_skin(1000, 42, Publication::Disabled, Some(1));
-        assert_eq!(wearable_reference(&disabled, 42, SkinKind::Snake), None);
-        assert_eq!(wearable_reference(&disabled, 7, SkinKind::Snake), None);
+        assert_eq!(
+            wearable_reference(&disabled, 42, SkinKind::Snake, true),
+            None
+        );
+        assert_eq!(
+            wearable_reference(&disabled, 7, SkinKind::Snake, true),
+            None
+        );
     }
 
     /// Withdrawn stops new grants, not existing ones — taking a skin back off
@@ -1210,7 +1294,7 @@ mod tests {
     fn an_unpublished_skin_stays_wearable_for_the_people_who_have_it() {
         let withdrawn = stored_skin(1000, 42, Publication::Unpublished, Some(1));
         assert_eq!(
-            wearable_reference(&withdrawn, 7, SkinKind::Snake),
+            wearable_reference(&withdrawn, 7, SkinKind::Snake, true),
             Some("skin:1000".to_string()),
         );
     }
@@ -1219,7 +1303,7 @@ mod tests {
     #[test]
     fn a_stored_skin_may_only_be_worn_in_its_own_slot() {
         let snake = stored_skin(1000, 42, Publication::Published, Some(1));
-        assert_eq!(wearable_reference(&snake, 42, SkinKind::Base), None);
+        assert_eq!(wearable_reference(&snake, 42, SkinKind::Base, true), None);
     }
 
     /// The equipped value is rebuilt from the id, so a caller cannot smuggle
@@ -1228,8 +1312,24 @@ mod tests {
     fn an_authored_reference_is_stored_in_its_canonical_form() {
         let skin = stored_skin(1000, 42, Publication::Published, Some(1));
         assert_eq!(
-            wearable_reference(&skin, 42, SkinKind::Snake),
+            wearable_reference(&skin, 42, SkinKind::Snake, true),
             Some(skin_id_reference(1000)),
+        );
+    }
+
+    /// Publication says a skin may be acquired; a grant says this player did.
+    /// Without the second, "get" would be a button that changed nothing.
+    #[test]
+    fn a_published_skin_is_not_wearable_until_it_has_been_acquired() {
+        let published = stored_skin(1000, 42, Publication::Published, Some(1));
+        assert_eq!(
+            wearable_reference(&published, 7, SkinKind::Snake, false),
+            None,
+            "browsing a skin is not owning it"
+        );
+        assert_eq!(
+            wearable_reference(&published, 7, SkinKind::Snake, true),
+            Some("skin:1000".to_string()),
         );
     }
 

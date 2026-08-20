@@ -107,6 +107,8 @@ pub fn skin_item(skin: &Skin) -> HashMap<String, AttributeValue> {
     }
     item.insert("createdAtMs".to_string(), number(skin.created_at_ms));
     item.insert("updatedAtMs".to_string(), number(skin.updated_at_ms));
+    item.insert("ownerCount".to_string(), number(skin.owner_count));
+    item.insert("wearerCount".to_string(), number(skin.wearer_count));
     if let Some(published_at) = skin.published_at_ms {
         item.insert("publishedAtMs".to_string(), number(published_at));
     }
@@ -158,6 +160,10 @@ pub fn skin_from_item(item: &HashMap<String, AttributeValue>) -> Result<Skin> {
         created_at_ms: read_number(item, "createdAtMs").unwrap_or(0),
         updated_at_ms: read_number(item, "updatedAtMs").unwrap_or(0),
         published_at_ms: read_number::<i64>(item, "publishedAtMs"),
+        // Absent on every item written before the counters existed, which is
+        // the same thing as none counted yet.
+        owner_count: read_number(item, "ownerCount").unwrap_or(0),
+        wearer_count: read_number(item, "wearerCount").unwrap_or(0),
     })
 }
 

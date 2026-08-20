@@ -126,6 +126,16 @@ pub struct Skin {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub published_at_ms: Option<i64>,
+    /// How many players hold a grant on this skin.
+    ///
+    /// A counter on the skin rather than a count of grant rows: grants are
+    /// keyed by their owner, so counting them per skin would be a scan. It is
+    /// incremented in the same transaction that writes the grant, which is what
+    /// keeps it from drifting away from the rows it counts.
+    pub owner_count: u32,
+    /// How many players currently have this skin equipped. Adjusted as
+    /// equipment changes, so it lags a change by nothing and is never a scan.
+    pub wearer_count: u32,
 }
 
 impl Skin {
@@ -312,6 +322,8 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             published_at_ms: None,
+            owner_count: 0,
+            wearer_count: 0,
         }
     }
 

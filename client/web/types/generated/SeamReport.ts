@@ -2,13 +2,29 @@
 
 /**
  * What a seam check found, per axis.
+ *
+ * The numbers are **percentiles**, not ratios, and the difference is not
+ * cosmetic. A ratio — the join's step over the mean interior step — was tried
+ * first and an adversarial review of the offline tooling established it is not
+ * diagnostic in either direction: a posterised print is mostly flat, so its
+ * mean interior step is tiny and one legitimate stripe edge landing on the
+ * join reads as 1.95; a high-contrast hide has a mean large enough to bury a
+ * real misalignment. Both were measured on shipped files
+ * (`build_coat_textures.py::seam_ratio`).
+ *
+ * A percentile asks the only question that matters — *is this join unusual for
+ * this texture?* — and answers it in the texture's own units. 0.5 is a
+ * perfectly ordinary column boundary.
  */
 export type SeamReport = {
 /**
- * Ratio of seam-line difference to the image's own local difference. At
- * or below 1.0 the join is invisible against the texture's own noise.
+ * Where the wrap join ranks among the image's own column steps, 0..1.
  */
-horizontalRatio: number, verticalRatio: number,
+horizontalRatio: number,
+/**
+ * The same for the join between the last row and the first.
+ */
+verticalRatio: number,
 /**
  * Whether a repair was applied to get here.
  */

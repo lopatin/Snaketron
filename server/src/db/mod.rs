@@ -197,6 +197,12 @@ pub trait Database: Send + Sync {
     ) -> Result<()>;
 
     async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>>;
+
+    /// Move a skin's "wearing it right now" count by one, in either direction.
+    ///
+    /// Best effort by design: this is a display number, and a lost adjustment
+    /// must never be able to fail the equip it describes.
+    async fn adjust_skin_wearers(&self, skin_id: i32, delta: i32) -> Result<()>;
     async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool>;
 
     // ---- Snake Bux --------------------------------------------------------

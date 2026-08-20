@@ -12,4 +12,13 @@ export type SkinSummary = { skinId: number, reference: string, name: string, kin
  * The revision a viewer would render, if any. Absent for a disabled skin
  * and for a private draft belonging to someone else.
  */
-contentRef: string | null, headRevision: number, publishedRevision: number | null, pendingRevision: number | null, createdAtMs: bigint, updatedAtMs: bigint, };
+contentRef: string | null, headRevision: number, publishedRevision: number | null, pendingRevision: number | null, createdAtMs: bigint, updatedAtMs: bigint,
+/**
+ * Whether this viewer holds it. Equipping is gated on owning, so this is
+ * what decides whether a row offers "get" or "equip".
+ */
+owned: boolean,
+/**
+ * How many players hold it, and how many are wearing it right now.
+ */
+ownerCount: number, wearerCount: number, };

@@ -5266,6 +5266,7 @@ mod tests {
         ) -> ());
         unused_database_method!(list_skin_grants(user_id: i32) -> Vec<crate::skin_store::SkinGrant>);
         unused_database_method!(has_skin_grant(user_id: i32, skin_id: i32) -> bool);
+        unused_database_method!(adjust_skin_wearers(skin_id: i32, delta: i32) -> ());
         unused_database_method!(apply_ledger_entry(
             user_id: i32,
             source: crate::wallet::LedgerSource,

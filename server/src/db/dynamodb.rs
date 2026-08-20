@@ -3326,6 +3326,10 @@ impl Database for DynamoDatabase {
             created_at_ms: now,
             updated_at_ms: now,
             published_at_ms: None,
+            // Its creator's own grant is written beside it, so it is born with
+            // exactly one owner and nobody wearing it yet.
+            owner_count: 1,
+            wearer_count: 0,
         };
 
         // The skin, its first revision, and the creator's own grant land
@@ -3776,9 +3780,11 @@ impl Database for DynamoDatabase {
         source: GrantSource,
         price_paid_bux: u32,
     ) -> Result<()> {
-        let result = self
-            .client
-            .put_item()
+        // The grant and the skin's owner count move together. Separately, a
+        // retried grant that lost its race would count an owner twice; the
+        // conditional put is what makes the pair idempotent, and the
+        // transaction is what makes the counter share that property.
+        let put_grant = Put::builder()
             .table_name(self.main_table())
             .set_item(Some(skins_dynamo::grant_item(
                 user_id,
@@ -3788,16 +3794,62 @@ impl Database for DynamoDatabase {
                 Utc::now().timestamp_millis(),
             )))
             .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .context("Failed to build a skin grant")?;
+        let count_owner = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD ownerCount :one")
+            .expression_attribute_values(":one", Self::av_n(1))
+            .build()
+            .context("Failed to build an owner count")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_grant).build())
+            .transact_items(TransactWriteItem::builder().update(count_owner).build())
             .send()
             .await;
 
         match result {
             Ok(_) => Ok(()),
             // Already owned. Ownership is permanent and its terms are
-            // historical, so a repeat grant leaves the original alone.
-            Err(error) if is_conditional_check_failure(&error) => Ok(()),
+            // historical, so a repeat grant leaves the original alone — and
+            // leaves the count alone with it.
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                Ok(())
+            }
             Err(error) => Err(error).context("Failed to grant a skin"),
         }
+    }
+
+    async fn adjust_skin_wearers(&self, skin_id: i32, delta: i32) -> Result<()> {
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD wearerCount :delta")
+            // Only for a skin that still exists: a deleted one should not be
+            // conjured back into being by somebody taking it off.
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":delta", Self::av_n(delta))
+            .send()
+            .await
+            .map(|_| ())
+            .or_else(|error| {
+                if is_conditional_check_failure(&error) {
+                    Ok(())
+                } else {
+                    Err(error).context("Failed to adjust a skin wearer count")
+                }
+            })
     }
 
     async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>> {
@@ -4426,11 +4478,15 @@ impl Database for DynamoDatabase {
             .expression_attribute_values(":price", Self::av_n(price))
             .build()
             .context("Failed to build a purchase debit")?;
-        let price_unchanged = ConditionCheck::builder()
+        // Both the price guard and the owner count, as one operation: a
+        // transaction may not touch an item twice, and these are the same item.
+        let price_unchanged = Update::builder()
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
             .key("sk", Self::av_s("META"))
+            .update_expression("ADD ownerCount :one")
             .condition_expression("priceBux = :price AND publication = :published")
+            .expression_attribute_values(":one", Self::av_n(1))
             .expression_attribute_values(":price", Self::av_n(skin.price_bux))
             .expression_attribute_values(":published", Self::av_s(Publication::Published.as_str()))
             .build()
@@ -4453,11 +4509,7 @@ impl Database for DynamoDatabase {
             .transact_write_items()
             .transact_items(TransactWriteItem::builder().put(put_entry).build())
             .transact_items(TransactWriteItem::builder().update(debit).build())
-            .transact_items(
-                TransactWriteItem::builder()
-                    .condition_check(price_unchanged)
-                    .build(),
-            )
+            .transact_items(TransactWriteItem::builder().update(price_unchanged).build())
             .transact_items(TransactWriteItem::builder().put(grant).build())
             .send()
             .await;
