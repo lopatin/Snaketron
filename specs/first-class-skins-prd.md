@@ -3,15 +3,15 @@
 | Field | Value |
 | --- | --- |
 | Status | Draft for review |
-| Product | Snaketron cosmetics: user-owned skins, textures, the Skins page, the Skin Builder, generation, and the Snake Bux economy |
-| Scope | Skin/texture entities in DynamoDB + S3; skins/textures/generation/wallet APIs; equip persistence; browse and editor UI; admin review; Xsolla-funded Snake Bux |
+| Product | Snaketron cosmetics: user-owned skins, textures, the Skins page, the Skin Builder, generation, and the Snakebux economy |
+| Scope | Skin/texture entities in DynamoDB + S3; skins/textures/generation/wallet APIs; equip persistence; browse and editor UI; admin review; Xsolla-funded Snakebux |
 | Depends on | `specs/skins-prd.md` (boundary, registry, refs), `specs/skin-shading-prd.md` (layer model, atlas, DSL) |
 | Owners | Product / Client / Server / Ops |
 | Last updated | 2026-08-19 |
 
 ## 1. Executive decision
 
-Skins graduate from a compiled-in catalogue to a first-class entity: created by players, stored in DynamoDB, rendered from content-addressed documents, browsed on a Skins page, edited in a Skin Builder, optionally AI-generated, and sold for Snake Bux. This is `specs/skins-prd.md` section 11 — the three preserved phases (selection, composition, unlocks) — built for real, plus the two things that PRD did not anticipate: a first-class **Texture** entity feeding the shading engine's image layers, and a generation pipeline that productizes the existing local LaMa tooling.
+Skins graduate from a compiled-in catalogue to a first-class entity: created by players, stored in DynamoDB, rendered from content-addressed documents, browsed on a Skins page, edited in a Skin Builder, optionally AI-generated, and sold for Snakebux. This is `specs/skins-prd.md` section 11 — the three preserved phases (selection, composition, unlocks) — built for real, plus the two things that PRD did not anticipate: a first-class **Texture** entity feeding the shading engine's image layers, and a generation pipeline that productizes the existing local LaMa tooling.
 
 The proposed design is:
 
@@ -22,7 +22,7 @@ The proposed design is:
 - **Base skins become a second equip slot.** A base skin is a skin of kind `base` — today's viewer-attributed `BaseTheme` promoted to its own equippable entity. Attribution rules from `specs/skins-prd.md` section 5.6 are unchanged: bases are viewer-attributed and never leave the client, so the base slot needs no wire change at all; snake-skin-embedded base themes remain as the fallback beneath an explicitly equipped base skin.
 - **Generation is an async job pipeline**, not a synchronous endpoint: prompt templates per texture kind (lengthwise animated sprite, static overlay, dual-axis tileable print), image generation via the OpenAI Images API with OpenRouter as the alternate provider, then the existing seam machinery — LaMa `[T, X, T]` inpaint-wrap and roll-and-repair with the measured seam gates from `client/design/tools/sprite_sheet.py` — run in a containerized worker built from those exact scripts. The pipeline rejects rather than ships marginal art, exactly as the local tools do today; a rejected generation retries with feedback, bounded, under hard per-job and global cost ceilings.
 - **Publishing is a review gate, not a toggle.** Publication and review are independent dimensions of a skin (section 5.1): default private; unpublished-to-the-world skins are equippable only by their creator; publishing a revision requires admin approval through a new `/admin` section built on the existing runtime-config admin pattern (versioned, audited — `server/src/api/admin.rs`). Unpublishing removes a skin from browse and purchase but never unequips anyone — once granted, ownership is permanent. Moderation gets the one cosmetic exception: an admin **disable** (distinct from unpublish) makes a skin resolve to classic everywhere within minutes, because "yours forever" cannot mean "abusive content renders forever." The disable path, minimal reporting, and the text-redaction rule ship in the *first* phase that lets user pixels reach another player's screen, not with the later admin UI.
-- **Snake Bux** is a server-authoritative virtual currency: a signed balance on the user item plus an idempotent, source-namespaced ledger, following the completion-effect transaction pattern (`server/src/db/dynamodb.rs:2413-2460`). Xsolla (the user brief's "Zsolla") sells Snake Bux on the web site as merchant of record; the game server's payment surface is a server-minted checkout token plus a signature-verified webhook that credits — and, on refund or chargeback, reverses — the ledger. Purchases are distribution-gated the way ads already are (`server/src/ads.rs::ClientDistribution`) because CrazyGames prohibits exposing IAP without portal approval (`CRAZYGAMES.md:75`).
+- **Snakebux** is a server-authoritative virtual currency: a signed balance on the user item plus an idempotent, source-namespaced ledger, following the completion-effect transaction pattern (`server/src/db/dynamodb.rs:2413-2460`). Xsolla (the user brief's "Zsolla") sells Snakebux on the web site as merchant of record; the game server's payment surface is a server-minted checkout token plus a signature-verified webhook that credits — and, on refund or chargeback, reverses — the ledger. Purchases are distribution-gated the way ads already are (`server/src/ads.rs::ClientDistribution`) because CrazyGames prohibits exposing IAP without portal approval (`CRAZYGAMES.md:75`).
 
 The honest headline, carried over from the shading PRD: for textured skins the machine can verify structure, size, seams, and budgets, but not what the pixels *depict* — and once a body is a texture, even the hue-window and label-contrast rails describe the document's declared colors, not the pixels (`specs/skin-shading-prd.md` section 13). First-class skins therefore make human review a load-bearing part of the design — publish review for public visibility, report-and-disable for what slips through — rather than pretending the validator covers content.
 
@@ -37,7 +37,7 @@ We want:
 - a Skin Builder where anyone can edit their own skins — a real layer editor over the document model, not a form of hand-picked fields;
 - textures as first-party citizens: uploadable, generatable from a prompt, resolution-laddered, seam-checked;
 - AI generation for both textures and whole skins, productizing the pipeline that today runs as local Python;
-- a currency (Snake Bux) and a way to buy it (Xsolla), so published skins can be priced.
+- a currency (Snakebux) and a way to buy it (Xsolla), so published skins can be priced.
 
 The mechanic must not:
 
@@ -60,12 +60,12 @@ The mechanic must not:
 6. The Skin Builder: schema-driven property editor (generically generated from the Rust types — never hand-synced), drag-reorderable layers, groups, the texture picker with upload/generate/variants, live always-animating previews for the poses that matter.
 7. Texture and skin generation as async jobs: prompt templates per texture kind, optional reference images, OpenAI Images + OpenRouter providers, containerized LaMa seam repair with the existing measured gates, under hard cost ceilings.
 8. Publication/review lifecycle with admin approval, browse of published skins by anyone, reporting, and the moderation disable — disable and reporting landing in the first user-content phase.
-9. Snake Bux wallet with a signed, source-namespaced idempotent ledger; Xsolla checkout on the web site including refund/chargeback reversal; skin purchase flow granting permanent ownership.
+9. Snakebux wallet with a signed, source-namespaced idempotent ledger; Xsolla checkout on the web site including refund/chargeback reversal; skin purchase flow granting permanent ownership.
 10. Every *structural* safety rail from the prior PRDs enforced on user documents server-side: schema validation, boost-band pin, overhang caps, animation bounds, op-budget static analysis, size caps — with hue windows and label contrast machine-enforced for color-derived layers and explicitly review-enforced for image-bearing documents, per `specs/skin-shading-prd.md` section 13.
 
 ### 3.2 Non-goals
 
-- Creator payouts, revenue share, or cash-out. v1 pricing moves Snake Bux from buyer to house; whether creators earn is an open decision (section 20) explicitly deferred.
+- Creator payouts, revenue share, or cash-out. v1 pricing moves Snakebux from buyer to house; whether creators earn is an open decision (section 20) explicitly deferred.
 - Trading, gifting, or a secondary market.
 - User-provided code of any kind. The document schema is the permanent user ceiling; the expression DSL's totality is a sandbox boundary and does not relax (`specs/skin-shading-prd.md` section 9.2).
 - Skinning arena gameplay objects (food, NOS canisters, grid) — the boundary rulings of `specs/skins-prd.md` section 7 stand unamended except where section 5.2 below explicitly extends them (base as a separate entity kind).
@@ -307,7 +307,7 @@ Route `/skins`, public (browse requires no account; equip/buy/create do). `HomeH
 - Previews of user skins require their documents and textures: the page fetches by-ref documents for the visible window, registers them at runtime (section 13), and lets structural fallback paint until textures settle (`whenSkinAssetsSettle()` exists for the once-painted case). Virtualize the list; never fetch more than the viewport + one screen.
 - Reduced motion: `prefers-reduced-motion` suppresses the hover animation entirely — previews stay at step 0, the standing rule.
 
-Purchases from this page: confirm dialog showing price and balance → `POST /purchase` with a client-minted idempotency key and the displayed price as `expectedPriceBux` (a raced price change 409s and re-prompts, it never silently charges more) → optimistic equip prompt on success. Insufficient balance routes to the Snake Bux purchase page (web builds only; CG builds show owned/free actions and hide priced ones per the distribution gate).
+Purchases from this page: confirm dialog showing price and balance → `POST /purchase` with a client-minted idempotency key and the displayed price as `expectedPriceBux` (a raced price change 409s and re-prompts, it never silently charges more) → optimistic equip prompt on success. Insufficient balance routes to the Snakebux purchase page (web builds only; CG builds show owned/free actions and hide priced ones per the distribution gate).
 
 ## 10. The Skin Builder
 
@@ -320,7 +320,7 @@ Route `/skins/builder/{skin_id}` (and `/skins/builder/new`). Creator or admin on
 - **Text element.** A layer whose source is `text`: the input enforces the 24-char safelist live and previews the normalization the validator applies; the Builder states plainly that text is hidden from other players until the revision passes review (section 5.3).
 - **Save** = `PUT /api/skins/{id}` → new head revision; the Builder shows validation results from the server as the authority even though the wasm validator pre-checks locally (same crate, same result, but the server's word is the one that counts). Publish request button appears on valid drafts.
 
-## 11. Snake Bux and Xsolla
+## 11. Snakebux and Xsolla
 
 - Balance lives on the user META (`boost_bux: i64`), mutated only by atomic ADDs guarded by namespaced ledger TXN rows — no read-modify-write anywhere. Every credit and debit has an idempotency identity in its own namespace: `XSOLLA#<txn>` for credits, `REFUND#<txn>` for reversals, `PURCHASE#<uuid>` for skin purchases, `ADMIN#<action>` for grants (section 6.1) — a client can never occupy a webhook's ledger slot.
 - **Xsolla** (assumed: the brief's "Zsolla") is merchant of record. Checkout: the client asks the authenticated `checkout-token` endpoint for a Pay Station token; the server binds the user id and a pack SKU from runtime config, so identity and amounts are never client-asserted. Settlement: the webhook (timing-safe signature verification, IP allowlist, replay-safe via the ledger) credits the SKU's configured Bux amount — the webhook body's amount field is cross-checked, never trusted. No card data, no PII beyond the Xsolla account linkage, ever touches Snaketron.
@@ -428,7 +428,7 @@ First-class skins v1 is complete when:
 5. The Builder edits any owned skin with a schema-generated property UI (schema-node exhaustiveness is a build error), drag-reorderable layers, groups, the texture picker with upload/generate/ladder-override, and always-animating previews of the specified poses.
 6. Texture and skin generation run as quota-gated async jobs through provider APIs and the containerized LaMa gates, accept raw reference images, and are bounded by per-job call budgets and the global circuit breaker; failures carry evidence.
 7. Publish review gates all public visibility including renames; re-publication of edits re-enters review without disturbing the live revision; disable removes content everywhere — live, spectate, and replay — within the document cache TTL; reporting exists from M1; all admin actions are audited.
-8. Snake Bux is credited only via the verified webhook against runtime-config SKUs, reversed on refund/chargeback with signed balances and negative-balance blocking, and debited only via namespaced idempotent purchase transactions conditioned on the displayed price; no client-trusted balance mutation exists; CG builds compile out purchase surfaces.
+8. Snakebux is credited only via the verified webhook against runtime-config SKUs, reversed on refund/chargeback with signed balances and negative-balance blocking, and debited only via namespaced idempotent purchase transactions conditioned on the displayed price; no client-trusted balance mutation exists; CG builds compile out purchase surfaces.
 9. Every prior-PRD invariant is re-verified in CI with user documents present: boost-band pin, overhang caps, op budget, classic goldens byte-identical, chaos suite and fingerprint tests green with `sha256:` refs — and the hue/contrast rails are enforced structurally where machine-visible and listed on the admin review checklist where not.
 10. The section 16 counters exist; generation spend has a circuit breaker, and review-queue age has an alert.
 

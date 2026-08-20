@@ -222,7 +222,7 @@ const SkinModal: React.FC<SkinModalProps> = ({
           data-testid="skin-modal-topup"
         >
           <SnakeBuxIcon size={16} />
-          Get more Snake Bux
+          Get more Snakebux
         </button>
       );
     }

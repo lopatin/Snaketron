@@ -508,7 +508,7 @@ class API {
     });
   }
 
-  /** What a player can buy Snake Bux in. */
+  /** What a player can buy Snakebux in. */
   async buxPacks(): Promise<BuxPack[]> {
     return this.request<BuxPack[]>('/api/wallet/packs');
   }

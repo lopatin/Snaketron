@@ -1,5 +1,5 @@
 /**
- * The arithmetic and the wording behind the header's Snake Bux chip.
+ * The arithmetic and the wording behind the header's Snakebux chip.
  *
  * Pure, and in `utils/` rather than in the component, because that is the only
  * place this repo's test runner can reach: `npm run test:unit` runs

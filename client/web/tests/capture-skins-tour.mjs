@@ -122,7 +122,7 @@ await page.waitForTimeout(400);
 await clip('06-base-rail', '.skins-column-bases', 12);
 
 // ---------------------------------------------------------------------------
-// 5. Buying. A priced skin, bought with Snake Bux, ends up worn.
+// 5. Buying. A priced skin, bought with Snakebux, ends up worn.
 // ---------------------------------------------------------------------------
 await setState({ signedIn: true, selectedSkin: 'classic@1', balanceBux: 900 });
 await page.goto(`${baseUrl}/skins`, { waitUntil: 'networkidle' });

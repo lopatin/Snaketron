@@ -205,7 +205,7 @@ pub trait Database: Send + Sync {
     async fn adjust_skin_wearers(&self, skin_id: i32, delta: i32) -> Result<()>;
     async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool>;
 
-    // ---- Snake Bux --------------------------------------------------------
+    // ---- Snakebux --------------------------------------------------------
     //
     // The balance is moved only by these, and only ever together with the
     // ledger row that names the change (`crate::wallet`).

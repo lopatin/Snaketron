@@ -4,7 +4,7 @@ import SnakeBuxIcon from './SnakeBuxIcon';
 import type { SkinSummary } from '../types/generated';
 
 /**
- * The confirmation for spending Snake Bux.
+ * The confirmation for spending Snakebux.
  *
  * Deliberately small and deliberately arithmetic: what you have, what it
  * costs, what you are left with. Someone who pressed "get" on a priced skin
@@ -127,7 +127,7 @@ const GetSkinModal: React.FC<GetSkinModalProps> = ({
               data-testid="get-topup"
             >
               <SnakeBuxIcon size={16} />
-              Get more Snake Bux
+              Get more Snakebux
             </button>
           )}
         </div>

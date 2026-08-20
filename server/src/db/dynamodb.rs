@@ -3943,7 +3943,7 @@ impl Database for DynamoDatabase {
         Ok(())
     }
 
-    // ---- Snake Bux --------------------------------------------------------
+    // ---- Snakebux --------------------------------------------------------
 
     async fn apply_ledger_entry(
         &self,

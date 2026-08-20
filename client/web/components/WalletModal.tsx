@@ -113,7 +113,7 @@ const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null 
         data-testid="wallet-modal"
       >
         <span className="shop-kicker">Wallet</span>
-        <h2 id={titleId}>Snake Bux</h2>
+        <h2 id={titleId}>Snakebux</h2>
 
         <button type="button" className="shop-close" onClick={onClose} aria-label="Close">
           <span aria-hidden="true">×</span>
