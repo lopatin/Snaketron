@@ -3825,26 +3825,27 @@ body {
   cursor: pointer;
 }
 
+/* Struck gold: gold taken down until it is ink.
+   Bright gold on white is a low-contrast pairing at any weight, and the fix
+   used to be a hard dark edge on all four sides — but at 15px those four
+   copies overlap into a smear rather than an edge, which is what made the
+   number look blurred. Darkening the gold itself does the same job with
+   nothing propping it up, and it is still unmistakably the coin's colour. */
 .home-bux-amount {
-  color: #f5b81c;
+  color: #8a5a06;
   font-size: 15px;
   font-weight: 900;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
-  /* Gold on white is a low-contrast pairing at any weight. A hard, unblurred
-     dark edge holds the digits together without dimming the colour, which a
-     darker gold would have done. */
-  text-shadow:
-    0 1px 0 rgb(63 39 0 / 34%),
-    0 -1px 0 rgb(63 39 0 / 20%),
-    1px 0 0 rgb(63 39 0 / 24%),
-    -1px 0 0 rgb(63 39 0 / 24%);
+  letter-spacing: -0.005em;
   transition: color 150ms ease, transform 150ms ease;
 }
 
+/* Warmer on hover rather than brighter: this gold reads because it is dark,
+   so lifting it toward the coin's own yellow would undo the thing that makes
+   it legible. */
 .home-bux-chip:hover .home-bux-amount,
 .home-bux-chip:focus-visible .home-bux-amount {
-  color: #ffc93c;
+  color: #9d6604;
 }
 
 .home-bux-chip:hover .snake-bux-icon {
