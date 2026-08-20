@@ -177,14 +177,14 @@ static METRICS: OnceLock<OtelMetrics> = OnceLock::new();
 static GAUGE_STATE: OnceLock<GaugeState> = OnceLock::new();
 
 /// Hosted-service exclusion leases currently held by this task, keyed by the
-/// service's `&'static str` name, so cardinality is bounded by the factory set
-/// compiled into the binary.
+/// service's own name, so cardinality is bounded by the factories this task
+/// registers at startup rather than by anything traffic can influence.
 ///
 /// A name is inserted at zero as soon as this task starts contending and is
 /// never removed. Keeping the zero is the point: a task that is never elected
 /// still reports a comparable series, so a query can separate "elected" from
 /// "not elected" instead of from "no data".
-static HOSTED_SERVICE_LEASES: OnceLock<Mutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
+static HOSTED_SERVICE_LEASES: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
 
 pub(crate) fn init() {
     let _ = metrics();
@@ -202,7 +202,7 @@ fn gauge_state() -> &'static GaugeState {
 /// none of which can panic, so a poisoned lock cannot mean a half-updated map.
 /// Recovering rather than unwrapping keeps a telemetry mutex from being able to
 /// kill the metrics export thread.
-fn hosted_service_leases() -> MutexGuard<'static, BTreeMap<&'static str, u64>> {
+fn hosted_service_leases() -> MutexGuard<'static, BTreeMap<String, u64>> {
     HOSTED_SERVICE_LEASES
         .get_or_init(Mutex::default)
         .lock()
@@ -210,27 +210,36 @@ fn hosted_service_leases() -> MutexGuard<'static, BTreeMap<&'static str, u64>> {
 }
 
 /// Starts reporting zero for a service this task is contending for.
-pub(crate) fn register_hosted_service_lease(name: &'static str) {
-    hosted_service_leases().entry(name).or_insert(0);
+pub(crate) fn register_hosted_service_lease(name: &str) {
+    let mut leases = hosted_service_leases();
+    if !leases.contains_key(name) {
+        leases.insert(name.to_owned(), 0);
+    }
 }
 
 /// Counts rather than latches, because one factory name can back several
-/// independently keyed leases — the Iceberg committer runs one per table.
-pub(crate) fn hosted_service_lease_acquired(name: &'static str) {
-    *hosted_service_leases().entry(name).or_insert(0) += 1;
+/// independently keyed leases.
+pub(crate) fn hosted_service_lease_acquired(name: &str) {
+    *hosted_service_leases().entry(name.to_owned()).or_insert(0) += 1;
 }
 
-pub(crate) fn hosted_service_lease_released(name: &'static str) {
+pub(crate) fn hosted_service_lease_released(name: &str) {
     let mut leases = hosted_service_leases();
-    let held = leases.entry(name).or_insert(0);
-    *held = held.saturating_sub(1);
+    match leases.get_mut(name) {
+        Some(held) => *held = held.saturating_sub(1),
+        // An unmatched release still has to leave the series behind, or a task
+        // that stood down would look like one that never contended.
+        None => {
+            leases.insert(name.to_owned(), 0);
+        }
+    }
 }
 
 /// `None` distinguishes "this task never contended for the service" from
 /// `Some(0)`, "it contended and lost" — the distinction the exported series
 /// depends on.
 #[cfg(test)]
-pub(crate) fn hosted_service_leases_held_for_test(name: &'static str) -> Option<u64> {
+pub(crate) fn hosted_service_leases_held_for_test(name: &str) -> Option<u64> {
     hosted_service_leases().get(name).copied()
 }
 
@@ -426,7 +435,7 @@ impl OtelMetrics {
         // services are elected independently and a single aggregate could not
         // say which of them is the one sharing this task's CPU. The exclusion
         // key is deliberately not the label: keys are operator-supplied and
-        // unbounded, while factory names are static.
+        // unbounded, while factory names are fixed at registration.
         observable_gauges.push(
             meter
                 .u64_observable_gauge("snaketron.hosted_service_leases_held")
@@ -434,7 +443,8 @@ impl OtelMetrics {
                 .with_unit("1")
                 .with_callback(|observer| {
                     for (name, held) in hosted_service_leases().iter() {
-                        observer.observe(*held, &[KeyValue::new("hosted_service.name", *name)]);
+                        observer
+                            .observe(*held, &[KeyValue::new("hosted_service.name", name.clone())]);
                     }
                 })
                 .build(),

@@ -833,6 +833,59 @@ impl GameServer {
             .ok()
             .filter(|arn| !arn.is_empty());
 
+        // Pinned to the bucket's own region: the SDK does not follow S3 region
+        // redirects, and every region writes to the one US bucket. Resolved
+        // once and shared by everything that touches S3 below — the websocket
+        // exporter, the durable exporter, and the committer, whose table
+        // bucket is US-only for the same reason — because two resolutions
+        // could drift apart.
+        let analytics_s3_region = std::env::var("SNAKETRON_ANALYTICS_BUCKET_REGION")
+            .unwrap_or_else(|_| "us-east-1".to_owned());
+
+        // The non-durable websocket tier (PRD R5), deliberately not a hosted
+        // service: it is unelected and runs on every task, because only the
+        // task terminating a socket can see that socket's frames. Gated on the
+        // raw bucket alone — without one there is nowhere to write.
+        if let Some(bucket) = analytics_bucket.clone() {
+            let client = crate::analytics::object_store::S3ObjectStore::client_for_region(
+                &analytics_s3_region,
+            )
+            .await;
+            let store: Arc<dyn crate::analytics::object_store::ObjectStore> = Arc::new(
+                crate::analytics::object_store::S3ObjectStore::new(client, bucket),
+            );
+            let ws_export_config = crate::analytics::ws_exporter::WsExporterConfig::from_env(
+                crate::analytics::exporter::ExportTarget {
+                    // Its own dataset, so the raw prefix and therefore the
+                    // Iceberg table it folds into stay separate from
+                    // `game-events`.
+                    dataset: "websocket-events".to_owned(),
+                    // `server_id` comes from `register_server`, which mints a
+                    // fresh one per registration, so no two live tasks share
+                    // this partition. That has to hold: keys only carry their
+                    // write order WITHIN one `host=` prefix (`resume.rs`), and
+                    // two tasks interleaving under one label would let the
+                    // fold's mark skip the other's objects.
+                    host: format!("{}-{}", region, server_id),
+                },
+            );
+            let ws_sample_rate = ws_export_config.sample_rate;
+            let (ws_event_sink, ws_export_task) = crate::analytics::ws_exporter::create(
+                store,
+                ws_export_config,
+                cancellation_token.child_token(),
+            );
+            crate::analytics::ws_sink::install(
+                ws_event_sink,
+                (*analytics_origin).clone(),
+                ws_sample_rate,
+            );
+            // Registered here rather than spawned and forgotten: R5.4 makes the
+            // final flush the only thing standing between a graceful stop and
+            // the loss of everything this task has buffered.
+            handles.push(tokio::spawn(ws_export_task));
+        }
+
         // Externally-registered background work. Supervised on exactly the same
         // terms as the server's own tasks: a child token, a retained handle,
         // and the shared shutdown budget. A hosted service that failed to be
@@ -913,12 +966,6 @@ impl GameServer {
             // and shipping one without the other would buffer events that
             // nothing drains.
             let mut factories = hosted_services;
-            // Pinned to the bucket's own region: the SDK does not follow S3
-            // region redirects, and every region writes to the one US bucket.
-            // Shared with the committer below, whose table bucket is US-only
-            // for the same reason — two resolutions could drift apart.
-            let analytics_s3_region = std::env::var("SNAKETRON_ANALYTICS_BUCKET_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_owned());
             if let Some(bucket) = analytics_bucket.clone() {
                 let exporter_redis = create_connection_manager_until_available(
                     redis_client.clone(),
@@ -946,9 +993,10 @@ impl GameServer {
 
             // The Iceberg fold, registered on the same terms as the exporter:
             // it is the far end of the same path, and objects nothing folds
-            // are objects nothing can query. Only `game-events` — the
-            // websocket exporter has no production producer, so a committer
-            // for it would poll an empty prefix forever.
+            // are objects nothing can query. One committer per dataset, since
+            // both tiers now have a producer; `IcebergCommitterFactory` keys
+            // its exclusion lease on the table, so the two fold concurrently
+            // rather than serializing behind one lock.
             if let Some(table_bucket_arn) = analytics_table_bucket_arn {
                 match analytics_bucket {
                     // The committer reads the raw tier, so an ARN without a
@@ -991,23 +1039,33 @@ impl GameServer {
                                         &analytics_s3_region,
                                     )
                                     .await;
+                                let catalog: Arc<dyn crate::analytics::committer::IcebergCatalog> =
+                                    Arc::new(catalog);
                                 let listing: Arc<dyn crate::analytics::committer::SourceListing> =
                                     Arc::new(
                                         crate::analytics::source_listing::S3SourceListing::new(
                                             client, raw_bucket,
                                         ),
                                     );
-                                factories.push(Arc::new(
-                                    crate::analytics::committer::IcebergCommitterFactory::new(
-                                        Arc::new(catalog),
-                                        listing,
-                                        crate::analytics::committer::CommitTarget {
-                                            dataset: "game-events".to_owned(),
-                                            table: "game_events".to_owned(),
-                                        },
-                                        ICEBERG_COMMIT_INTERVAL,
-                                    ),
-                                ));
+                                for target in [
+                                    crate::analytics::committer::CommitTarget {
+                                        dataset: "game-events".to_owned(),
+                                        table: "game_events".to_owned(),
+                                    },
+                                    crate::analytics::committer::CommitTarget {
+                                        dataset: "websocket-events".to_owned(),
+                                        table: "websocket_events".to_owned(),
+                                    },
+                                ] {
+                                    factories.push(Arc::new(
+                                        crate::analytics::committer::IcebergCommitterFactory::new(
+                                            catalog.clone(),
+                                            listing.clone(),
+                                            target,
+                                            ICEBERG_COMMIT_INTERVAL,
+                                        ),
+                                    ));
+                                }
                             }
                             Err(error) => error!(
                                 "the analytics S3 Tables catalog could not be built from \

@@ -63,22 +63,39 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Builds an envelope around a payload.
+/// Builds an envelope around a payload, stamped with the current clock.
 ///
 /// `event_id` is a UUIDv7 so it is both unique and time-sortable, which gives
 /// the Iceberg table a naturally clustered dedup key. `occurred_at_ms` is
-/// stamped here, at the origin, and no downstream component may rewrite it —
-/// that is what makes event-time partitioning honest after a replay.
+/// stamped at the origin, and no downstream component may rewrite it — that is
+/// what makes event-time partitioning honest after a replay.
 pub fn envelope(
     origin: &EventOrigin,
     identity: EventIdentity,
     payload: proto::event::Payload,
 ) -> proto::Event {
+    envelope_at(origin, identity, payload, now_ms())
+}
+
+/// Builds an envelope around a payload that was observed at `occurred_at_ms`.
+///
+/// Exists for producers that read the clock somewhere other than where they
+/// build the event — the websocket hooks capture the time on the connection's
+/// own task and project on the exporter's, and a re-read at projection time
+/// would report the drain's clock as the frame's. Every other field is
+/// origin-supplied and cannot go stale, so the timestamp is the only one that
+/// has to travel.
+pub fn envelope_at(
+    origin: &EventOrigin,
+    identity: EventIdentity,
+    payload: proto::event::Payload,
+    occurred_at_ms: i64,
+) -> proto::Event {
     proto::Event {
         event_id: Uuid::now_v7().to_string(),
         event_name: payload_name(&payload).to_owned(),
         event_version: 1,
-        occurred_at_ms: now_ms(),
+        occurred_at_ms,
         environment: origin.environment.clone(),
         region: origin.region.clone(),
         aws_region: origin.aws_region.clone(),

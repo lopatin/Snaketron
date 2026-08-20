@@ -23,6 +23,7 @@ pub mod schema;
 pub mod sink;
 pub mod source_listing;
 pub mod ws_exporter;
+pub mod ws_sink;
 
 pub use batch::{BatchLimits, BufferedEvent, EventBatcher, PendingFile};
 pub use emitter::{AnalyticsEmitter, DropReason, EmitterConfig, EmitterMetrics};

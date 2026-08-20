@@ -213,6 +213,12 @@ pub struct IcebergCommitterFactory {
     listing: Arc<dyn SourceListing>,
     target: CommitTarget,
     interval: Duration,
+    /// Derived from the table rather than constant, because this factory is
+    /// registered once per table and the name is what every log line and the
+    /// elected-lease gauge are labelled with. One shared name would sum the two
+    /// folds into a single series that could read as elected while the
+    /// websocket half was not running at all.
+    name: String,
 }
 
 impl IcebergCommitterFactory {
@@ -225,16 +231,23 @@ impl IcebergCommitterFactory {
         Self {
             catalog,
             listing,
+            name: committer_name(&target.table),
             target,
             interval,
         }
     }
 }
 
+/// The reported name and the exclusion key are built from one function so the
+/// series and the lock a reader is comparing cannot be labelled differently.
+fn committer_name(table: &str) -> String {
+    format!("iceberg-committer/{table}")
+}
+
 #[async_trait]
 impl HostedServiceFactory for IcebergCommitterFactory {
-    fn name(&self) -> &'static str {
-        "iceberg-committer"
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// Global, and keyed by table.
@@ -243,10 +256,7 @@ impl HostedServiceFactory for IcebergCommitterFactory {
     /// elect two committers and reintroduce the metadata problem. Keyed by
     /// table so `game_events` and `websocket_events` fold concurrently.
     fn exclusion_key(&self, _ctx: &ServiceContext) -> Option<ExclusionKey> {
-        Some(ExclusionKey::global(format!(
-            "iceberg-committer/{}",
-            self.target.table
-        )))
+        Some(ExclusionKey::global(committer_name(&self.target.table)))
     }
 
     async fn build(&self, ctx: ServiceContext) -> Result<Box<dyn HostedService>, ServiceError> {
@@ -706,12 +716,65 @@ mod tests {
         let (catalog, listing, _) = parts(&[]);
         let factory =
             IcebergCommitterFactory::new(catalog, listing, target(), Duration::from_secs(3600));
-        assert_eq!(factory.name(), "iceberg-committer");
+        assert_eq!(factory.name(), "iceberg-committer/game_events");
 
         let ctx = crate::analytics::committer::tests_support::context();
         let key = factory.exclusion_key(&ctx).expect("must be excluded");
         assert_eq!(key.domain, snaketron_service_api::ExclusionDomain::Global);
         assert_eq!(key.key, "iceberg-committer/game_events");
+    }
+
+    /// Two committers run, one per table, and the elected-lease gauge is
+    /// labelled with the factory's name. A shared name would sum them into one
+    /// series, so nothing could say whether the websocket fold in particular
+    /// was running.
+    #[test]
+    fn the_two_committers_report_under_distinct_names() {
+        let names: Vec<String> = ["game_events", "websocket_events"]
+            .into_iter()
+            .map(|table| {
+                let (catalog, listing, _) = parts(&[]);
+                IcebergCommitterFactory::new(
+                    catalog,
+                    listing,
+                    CommitTarget {
+                        dataset: "irrelevant".to_owned(),
+                        table: table.to_owned(),
+                    },
+                    Duration::from_secs(3600),
+                )
+                .name()
+                .to_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "iceberg-committer/game_events",
+                "iceberg-committer/websocket_events"
+            ]
+        );
+    }
+
+    /// The name a reader sees and the lock it describes must be the same
+    /// string, or a contended series would point at the wrong lease.
+    #[test]
+    fn the_reported_name_matches_the_exclusion_key() {
+        let (catalog, listing, _) = parts(&[]);
+        let factory = IcebergCommitterFactory::new(
+            catalog,
+            listing,
+            CommitTarget {
+                dataset: "websocket-events".to_owned(),
+                table: "websocket_events".to_owned(),
+            },
+            Duration::from_secs(3600),
+        );
+        let key = factory
+            .exclusion_key(&tests_support::context())
+            .expect("must be excluded");
+        assert_eq!(factory.name(), key.key);
     }
 
     /// Without a lease there is no fencing token, so building must fail rather

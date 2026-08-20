@@ -588,7 +588,7 @@ pub fn record_potg_ring_truncated(evicted_seconds: u64) {
 /// comparison it serves needs a percentile, and the EMF mirror carries the
 /// actor-advance duration as `GameActorAdvanceDurationUsSum`/`Max` on fleet-wide
 /// dimensions — so an EMF copy of this signal would have nothing to split.
-pub fn record_hosted_service_contention(name: &'static str) {
+pub fn record_hosted_service_contention(name: &str) {
     crate::otel_metrics::register_hosted_service_lease(name);
 }
 
@@ -601,19 +601,23 @@ pub fn record_hosted_service_contention(name: &'static str) {
 /// one on a task that is no longer elected, which silently reverses the
 /// comparison it exists to support.
 #[must_use = "leadership lasts exactly as long as this guard"]
-pub fn record_hosted_service_election(name: &'static str) -> HostedServiceElection {
+pub fn record_hosted_service_election(name: &str) -> HostedServiceElection {
     crate::otel_metrics::hosted_service_lease_acquired(name);
-    HostedServiceElection { name }
+    // Owned, because the guard outlives the borrow of the factory it came from
+    // and the release has to name the same series the acquire did.
+    HostedServiceElection {
+        name: name.to_owned(),
+    }
 }
 
 /// Clears one hosted service's elected-task signal when dropped.
 pub struct HostedServiceElection {
-    name: &'static str,
+    name: String,
 }
 
 impl Drop for HostedServiceElection {
     fn drop(&mut self) {
-        crate::otel_metrics::hosted_service_lease_released(self.name);
+        crate::otel_metrics::hosted_service_lease_released(&self.name);
     }
 }
 

@@ -73,7 +73,9 @@ pub fn spawn_supervisor(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let name = factory.name();
+        // Owned before the factory moves into `supervise`, so the error below
+        // can still say which service it was.
+        let name = factory.name().to_owned();
         if let Err(error) = supervise(factory, config, cancel).await {
             error!("hosted service {name} supervisor exited: {error}");
         }
@@ -246,7 +248,7 @@ async fn run_plain(
 }
 
 async fn run_with_lease(
-    name: &'static str,
+    name: &str,
     mut service: Box<dyn snaketron_service_api::HostedService>,
     lease: LeaseHandle,
     store: ExclusionLeaseStore,
@@ -257,7 +259,11 @@ async fn run_with_lease(
     let operation_timeout = store.operation_timeout();
     let renewer_lease = lease.clone();
     let renewer_token = child.clone();
+    // The renewer outlives this frame's borrow of the factory's name, so it
+    // gets its own copy rather than a reference into it.
+    let renewer_name = name.to_owned();
     let renewer = tokio::spawn(async move {
+        let name = renewer_name;
         let mut ticker = tokio::time::interval(renew_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

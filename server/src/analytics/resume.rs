@@ -42,10 +42,18 @@ use super::object_store::{dataset_prefix, partition_prefix, prefix_day};
 ///
 /// The cost of raising it is paid every tick, in keys listed and in marks
 /// stored — the floor day is inclusive, so the window spans
-/// `RETENTION_DAYS + 1` days of objects. Both stay small because there is
-/// exactly ONE exporter per region (`ExporterFactory::exclusion_key` is a
-/// regional lease), so a steady day contributes one `host=` per region rather
-/// than one per task, and a failover adds one more.
+/// `RETENTION_DAYS + 1` days of objects. How many prefixes that is depends on
+/// the dataset, because the two tiers export differently:
+///
+/// * `game-events` has exactly ONE exporter per region
+///   (`ExporterFactory::exclusion_key` is a regional lease), so a steady day
+///   contributes one `host=` per region and a failover adds one more.
+/// * `websocket-events` is exported by every task (`ws_exporter`, PRD R5.1),
+///   which is unavoidable — only the task terminating a socket can see its
+///   frames — so a day contributes one `host=` per task that ran, and a deploy
+///   or a scale-out adds one per replacement task. Each is one mark of a
+///   couple of hundred bytes, pruned out of the property once its day leaves
+///   the window.
 ///
 /// Raise it if a multi-day exporter outage is ever expected to replay a
 /// backlog still carrying its original event dates, since `dt=` is the EVENT

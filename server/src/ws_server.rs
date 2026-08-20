@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::future::{Future, pending};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -375,6 +375,96 @@ pub enum WSMessage {
     //     username: String,
     // },
 }
+
+/// Declares [`WSMessage::variant_name`] and the closed set of names it can
+/// return, from one list.
+///
+/// One list rather than two: the outbound hook needs the reverse direction — a
+/// wire tag mapped back onto the same `&'static str` — and a separately
+/// maintained table of the same names would be free to drift from the match
+/// without anything saying so. The match stays exhaustive, so a new variant
+/// still does not compile until it is listed here.
+macro_rules! ws_message_variant_names {
+    ($($variant:ident),+ $(,)?) => {
+        impl WSMessage {
+            /// The variant's own name, for the analytics `message_type` column.
+            ///
+            /// Derived from the variant rather than supplied by the caller, on
+            /// the same discipline as `analytics::event::payload_name`: a
+            /// caller-supplied string is free to drift from the message it
+            /// labels, and nothing would say so.
+            ///
+            /// The names are the variant identifiers, which is also what
+            /// serde's default external tagging puts on the wire, so the two
+            /// hooks agree; see
+            /// `a_serialized_frame_reports_its_own_variant_name`.
+            pub fn variant_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => stringify!($variant),)+
+                }
+            }
+        }
+
+        /// Every name an application frame can report, and therefore the whole
+        /// vocabulary of the `message_type` column for one.
+        const WS_MESSAGE_TYPE_NAMES: &[&str] = &[$(stringify!($variant)),+];
+    };
+}
+
+ws_message_variant_names![
+    Token,
+    Authenticate,
+    JoinGame,
+    LeaveGame,
+    GameCommandV2,
+    GameEvent,
+    CommandOutcomes,
+    CommandOutcomesComplete,
+    Chat,
+    LobbyChatMessage,
+    GameChatMessage,
+    LobbyChatHistory,
+    GameChatHistory,
+    Authenticated,
+    AdConfiguration,
+    PlayerReady,
+    RequestResync,
+    Ping,
+    Pong,
+    QueueForMatch,
+    QueueForMatchMulti,
+    LeaveQueue,
+    MatchFound,
+    QueueUpdate,
+    QueueLeft,
+    AdBreakResolved,
+    UpdateNickname,
+    SpectatorJoined,
+    AccessDenied,
+    GameLoadFailed,
+    GameWarming,
+    SoloGameCreated,
+    Drain,
+    UserCountUpdate,
+    CreateLobby,
+    LobbyCreated,
+    JoinLobby,
+    JoinedLobby,
+    LeaveLobby,
+    LeftLobby,
+    LobbyUpdate,
+    UpdateLobbyPreferences,
+    LobbyRegionMismatch,
+    OnlinePlayers,
+    ChallengePlayer,
+    RespondToChallenge,
+    CancelChallenge,
+    Challenges,
+    ChallengeAccepted,
+    ChallengeFailed,
+    SetRematchIntent,
+    Rematch,
+];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserToken {
@@ -1098,6 +1188,85 @@ fn axum_message_bytes(message: &axum::extract::ws::Message) -> usize {
     }
 }
 
+/// Longest variant name the wire-tag reader will accept.
+///
+/// Every name in [`WSMessage::variant_name`] is far shorter; the bound exists
+/// so a malformed frame can never turn an unbounded string into an unbounded
+/// analytics column value.
+const MAX_WIRE_TAG_LEN: usize = 64;
+
+/// The label recorded when a frame carries no readable variant name.
+const UNNAMED_MESSAGE_TYPE: &str = "unknown";
+
+/// The variant name of an outbound frame, read back from the frame itself.
+///
+/// The forwarder is handed serialized frames rather than `WSMessage` values —
+/// it is a separate task draining a `Sender<Message>` — so the name has to
+/// come from the wire. Application frames therefore report a PascalCase
+/// variant name and transport frames report a snake_case label, which keeps
+/// the two kinds distinguishable in the `message_type` column.
+///
+/// The returned name is `&'static str`, never a slice of the frame: the tag is
+/// looked up in `WS_MESSAGE_TYPE_NAMES` and the matching static is returned, so
+/// describing a frame costs no allocation and the column's vocabulary is closed
+/// rather than whatever the frame happened to contain.
+fn outbound_message_type(message: &Message) -> &'static str {
+    match message {
+        Message::Text(text) => wire_tag(text)
+            .and_then(interned_message_type)
+            .unwrap_or(UNNAMED_MESSAGE_TYPE),
+        Message::Binary(_) => "binary_frame",
+        Message::Ping(_) => "ping_frame",
+        Message::Pong(_) => "pong_frame",
+        Message::Close(_) => "close_frame",
+        _ => UNNAMED_MESSAGE_TYPE,
+    }
+}
+
+/// The `WSMessage` name equal to `tag`, or `None` if there is none.
+///
+/// Sorted once and binary-searched rather than scanned, because this runs on
+/// every outbound frame; the table is built from `WS_MESSAGE_TYPE_NAMES` rather
+/// than kept sorted by hand so adding a variant cannot silently break the
+/// search's precondition.
+fn interned_message_type(tag: &str) -> Option<&'static str> {
+    static SORTED: OnceLock<Vec<&'static str>> = OnceLock::new();
+    let sorted = SORTED.get_or_init(|| {
+        let mut names = WS_MESSAGE_TYPE_NAMES.to_vec();
+        names.sort_unstable();
+        names
+    });
+    sorted
+        .binary_search_by(|candidate| (**candidate).cmp(tag))
+        .ok()
+        .map(|index| sorted[index])
+}
+
+/// The externally-tagged variant name at the head of a serialized `WSMessage`.
+///
+/// `WSMessage` carries no serde container attribute, so it uses the default
+/// external tagging: a unit variant is `"Name"` and every other variant is
+/// `{"Name":…}`. Either way the first JSON string in the frame is the variant
+/// name.
+///
+/// Scanning that one token is O(name) where a full parse would be O(frame),
+/// and the frames this runs on include whole game snapshots — the send path
+/// must not pay to describe itself.
+fn wire_tag(text: &str) -> Option<&str> {
+    let after_brace = text.strip_prefix('{').unwrap_or(text);
+    let opened = after_brace.trim_start().strip_prefix('"')?;
+    let tag = &opened[..opened.find('"')?];
+    // Variant names need no JSON escaping, so an escaped or oversized tag did
+    // not come from `WSMessage` and is reported as unnamed rather than
+    // recorded verbatim.
+    (!tag.is_empty()
+        && tag.len() <= MAX_WIRE_TAG_LEN
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(tag)
+}
+
 async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>) {
     if let Some(handle) = handle.take() {
         handle.abort();
@@ -1106,6 +1275,32 @@ async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>
         // barrier after a replacement forwarder enqueues a newer snapshot.
         let _ = handle.await;
     }
+}
+
+/// The seat a connection is in after a state transition, published to its
+/// analytics context as it is read.
+///
+/// One function rather than a read at the top of the transition and a publish
+/// at the bottom, because the publish has to happen BEFORE anything acts on the
+/// transition. Entering a game spawns the game-event forwarder, and that
+/// forwarder's first frame is the anchor snapshot; it runs on its own task and
+/// can learn the seat only from here. A seat published afterwards would stamp
+/// the whole entry burst — the snapshot included — with the game this
+/// connection was in before, which on a rematch or a game switch is a wrong
+/// join key rather than a missing one.
+///
+/// Returning the value is what keeps that order: the transition below cannot
+/// decide whether it is entering a game without calling this first.
+fn publish_seat(
+    state: &ConnectionState,
+    analytics: &crate::analytics::ws_sink::WsConnection,
+) -> Option<u32> {
+    let seat = match state {
+        ConnectionState::Authenticated { game_id, .. } => *game_id,
+        ConnectionState::Unauthenticated => None,
+    };
+    analytics.set_game_id(seat);
+    seat
 }
 
 /// Internal function to handle the WebSocket connection logic
@@ -1143,6 +1338,12 @@ async fn handle_websocket_connection(
     let socket_generation = lifecycle.next_socket_generation();
     let mut drain_rx = lifecycle.subscribe_to_drain();
 
+    // One analytics context for the connection, keyed on an id that already
+    // exists before the first frame. The forwarder task below sees only
+    // serialized frames, so the identity both directions record has to be
+    // shared rather than derived independently on each side.
+    let ws_analytics = Arc::new(crate::analytics::ws_sink::WsConnection::new(&websocket_id));
+
     // Start in unauthenticated state
     let mut state = ConnectionState::Unauthenticated;
 
@@ -1173,6 +1374,7 @@ async fn handle_websocket_connection(
     let mut social_session: Option<SocialSession> = None;
 
     // Spawn task to forward messages from channel to WebSocket
+    let ws_analytics_for_forwarder = ws_analytics.clone();
     let forward_task = tokio::spawn(async move {
         let mut drain_open = true;
         let mut ws_open = true;
@@ -1186,6 +1388,24 @@ async fn handle_websocket_connection(
         {
             let is_close = matches!(msg, Message::Close(_));
             let outbound_bytes = tungstenite_message_bytes(&msg);
+            // Every one of this gateway's outbound sends funnels through this
+            // drain, so recording here covers them all. Recorded before the
+            // write rather than after it — as the throughput metric below is —
+            // because the conversion consumes the frame the type name is read
+            // from; the two differ only for the single frame in flight when a
+            // socket dies.
+            //
+            // The gate is here rather than inside `record_outbound` because
+            // reading the type off the wire is an ARGUMENT: inside the call it
+            // would already have happened. A connection outside the sample, or
+            // a deployment with no sink installed, pays one bool per frame.
+            if ws_analytics_for_forwarder.records() {
+                crate::analytics::ws_sink::record_outbound(
+                    &ws_analytics_for_forwarder,
+                    outbound_message_type(&msg),
+                    outbound_bytes,
+                );
+            }
             // Convert to Axum WebSocket message
             let axum_msg = match msg {
                 Message::Text(text) => axum::extract::ws::Message::Text(text.to_string()),
@@ -1309,7 +1529,26 @@ async fn handle_websocket_connection(
 
                         // Process the message
                         if let Message::Text(text) = tungstenite_msg {
-                            match serde_json::from_str::<WSMessage>(&text) {
+                            let parsed = serde_json::from_str::<WSMessage>(&text);
+                            // Above the match rather than inside it, so the
+                            // arms that never reach `process_ws_message` — the
+                            // resync fast path and the in-lobby denial below —
+                            // are recorded too. A frame that failed to parse is
+                            // deliberately not recorded: its type name would be
+                            // attacker-supplied rather than a known variant.
+                            // The gate is the call site's, not `record_inbound`'s,
+                            // for the same reason as on the outbound side: the
+                            // hook's arguments are evaluated before the call.
+                            if ws_analytics.records()
+                                && let Ok(message) = &parsed
+                            {
+                                crate::analytics::ws_sink::record_inbound(
+                                    &ws_analytics,
+                                    message.variant_name(),
+                                    text.len(),
+                                );
+                            }
+                            match parsed {
                                 Ok(WSMessage::RequestResync { game_id: resync_game_id }) => {
                                     crate::resilience_metrics::record_websocket_resync_requested(1);
                                     // The client detected loss or divergence (stream
@@ -1419,13 +1658,19 @@ async fn handle_websocket_connection(
                                         &cluster_namespace,
                                         &cancellation_token,
                                         &ads_config,
+                                        &ws_analytics,
                                     ).await {
                                         Ok(mut new_state) => {
-                                            // Check if we're entering a game or lobby
-                                            let entered_game_id = match &new_state {
-                                                ConnectionState::Authenticated { game_id, .. } => *game_id,
-                                                ConnectionState::Unauthenticated => None,
-                                            };
+                                            // Check if we're entering a game or lobby.
+                                            // Reading the seat and publishing it
+                                            // are one step, and everything below
+                                            // that acts on the transition needs
+                                            // this value — so nothing can spawn a
+                                            // subscription or send a frame before
+                                            // the forwarder has been told which
+                                            // game it is now in.
+                                            let entered_game_id =
+                                                publish_seat(&new_state, &ws_analytics);
                                             let entering_game = match requested_game_id {
                                                 Some(requested_game_id) => {
                                                     entered_game_id == Some(requested_game_id)
@@ -1788,8 +2033,11 @@ async fn handle_websocket_connection(
                                         Err(e) => {
                                             crate::resilience_metrics::record_websocket_process_error(1);
                                             error!("Error processing message: {}", e);
-                                            // State was consumed, need to reset
+                                            // State was consumed, need to reset.
+                                            // There is no new state to read the
+                                            // seat from, so it is cleared directly.
                                             state = ConnectionState::Unauthenticated;
+                                            ws_analytics.set_game_id(None);
                                             break;
                                         }
                                     }
@@ -4852,6 +5100,9 @@ async fn process_ws_message(
     cluster_namespace: &ClusterNamespace,
     cancellation_token: &CancellationToken,
     ads_config: &Arc<AdsConfig>,
+    // Taken only so the session id can be attached to the connection: it is
+    // minted inside this function and nowhere else.
+    ws_analytics: &crate::analytics::ws_sink::WsConnection,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -4946,6 +5197,11 @@ async fn process_ws_message(
                         anon_id.as_deref(),
                         protocol_version,
                     );
+                    // From here on this connection's frames carry the same
+                    // session id as the event above, so the two join. The
+                    // handshake frames that preceded this one carry none,
+                    // because until now there was no session to name.
+                    ws_analytics.bind_session(&session_id);
                     authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
@@ -8120,5 +8376,407 @@ mod session_identity_tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "must sort in creation order");
+    }
+}
+
+#[cfg(test)]
+mod message_type_naming_tests {
+    use super::*;
+    use crate::ads::{AdBreakResolution, ClientAdsConfig};
+    use crate::challenges::ChallengeInbox;
+    use crate::presence::RegionRoster;
+    use common::{CommandId, Direction, GameCommand, GameType, QueueMode};
+
+    /// One value of every `WSMessage` variant.
+    ///
+    /// A variant added without a name does not reach this test at all —
+    /// `WSMessage::variant_name` matches exhaustively, so the crate stops
+    /// compiling first. This roster is what proves the names it returns are
+    /// the ones that actually appear on the wire.
+    fn every_variant() -> Vec<WSMessage> {
+        vec![
+            WSMessage::Token("jwt".to_owned()),
+            WSMessage::Authenticate {
+                token: "jwt".to_owned(),
+                protocol_version: WS_PROTOCOL_VERSION,
+                anon_id: None,
+                distribution: None,
+            },
+            WSMessage::JoinGame(1),
+            WSMessage::LeaveGame,
+            WSMessage::GameCommandV2 {
+                command_id: ClientCommandIdentityV2 {
+                    game_id: 1,
+                    user_id: 2,
+                    client_game_session_id: "session".to_owned(),
+                    sequence: 3,
+                },
+                command: GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: 1,
+                        user_id: 2,
+                        sequence_number: 3,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::ActivateBoost { snake_id: 1 },
+                },
+            },
+            WSMessage::GameEvent(GameEventMessage {
+                game_id: 1,
+                tick: 2,
+                sequence: 3,
+                stream_seq: 4,
+                user_id: None,
+                event: GameEvent::SnakeTurned {
+                    snake_id: 1,
+                    direction: Direction::Up,
+                },
+            }),
+            WSMessage::CommandOutcomes {
+                game_id: 1,
+                client_game_session_id: "session".to_owned(),
+                contiguous_through: 0,
+                outcomes: BTreeMap::new(),
+                rejection_fence: None,
+            },
+            WSMessage::CommandOutcomesComplete {
+                game_id: 1,
+                terminal_rejection_reason: None,
+            },
+            WSMessage::Chat("hello".to_owned()),
+            WSMessage::LobbyChatMessage {
+                lobby_code: "ABCD".to_owned(),
+                message_id: "m".to_owned(),
+                user_id: 1,
+                username: "u".to_owned(),
+                message: "hi".to_owned(),
+                timestamp_ms: 0,
+            },
+            WSMessage::GameChatMessage {
+                game_id: 1,
+                message_id: "m".to_owned(),
+                user_id: 1,
+                username: "u".to_owned(),
+                message: "hi".to_owned(),
+                timestamp_ms: 0,
+            },
+            WSMessage::LobbyChatHistory {
+                lobby_code: "ABCD".to_owned(),
+                messages: Vec::new(),
+            },
+            WSMessage::GameChatHistory {
+                game_id: 1,
+                messages: Vec::new(),
+            },
+            WSMessage::Authenticated {
+                task_boot_id: "1:boot".to_owned(),
+                protocol_version: WS_PROTOCOL_VERSION,
+                capabilities: Vec::new(),
+                socket_generation: 1,
+            },
+            WSMessage::AdConfiguration(ClientAdsConfig::default()),
+            WSMessage::PlayerReady { game_id: 1 },
+            WSMessage::RequestResync { game_id: 1 },
+            WSMessage::Ping { client_time: 0 },
+            WSMessage::Pong {
+                client_time: 0,
+                server_time: 0,
+            },
+            WSMessage::QueueForMatch {
+                game_type: GameType::Solo,
+                queue_mode: QueueMode::Quickmatch,
+            },
+            WSMessage::QueueForMatchMulti {
+                game_types: Vec::new(),
+                queue_mode: QueueMode::Competitive,
+            },
+            WSMessage::LeaveQueue,
+            WSMessage::MatchFound { game_id: 1 },
+            WSMessage::QueueUpdate {
+                position: 1,
+                estimated_wait_seconds: 2,
+            },
+            WSMessage::QueueLeft,
+            WSMessage::AdBreakResolved {
+                break_id: "b".to_owned(),
+                resolution: AdBreakResolution::Completed,
+            },
+            WSMessage::UpdateNickname {
+                nickname: "n".to_owned(),
+            },
+            WSMessage::SpectatorJoined,
+            WSMessage::AccessDenied {
+                reason: "no".to_owned(),
+            },
+            WSMessage::GameLoadFailed {
+                game_id: 1,
+                reason: "no".to_owned(),
+            },
+            WSMessage::GameWarming {
+                game_id: 1,
+                retry_after_ms: 250,
+            },
+            WSMessage::SoloGameCreated { game_id: 1 },
+            WSMessage::Drain {
+                task_boot_id: "1:boot".to_owned(),
+                deadline_unix_ms: 0,
+            },
+            WSMessage::UserCountUpdate {
+                region_counts: HashMap::new(),
+            },
+            WSMessage::CreateLobby,
+            WSMessage::LobbyCreated {
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::JoinLobby {
+                lobby_code: "ABCD".to_owned(),
+                preferences: None,
+            },
+            WSMessage::JoinedLobby {
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::LeaveLobby,
+            WSMessage::LeftLobby,
+            WSMessage::LobbyUpdate {
+                lobby_code: "ABCD".to_owned(),
+                members: Vec::new(),
+                host_user_id: 1,
+                state: "waiting".to_owned(),
+                preferences: lobby_manager::LobbyPreferences::default(),
+                ad_break: None,
+            },
+            WSMessage::UpdateLobbyPreferences {
+                selected_modes: Vec::new(),
+                competitive: false,
+            },
+            WSMessage::LobbyRegionMismatch {
+                target_region: "euw1".to_owned(),
+                ws_url: "wss://euw1.example/ws".to_owned(),
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::OnlinePlayers(RegionRoster {
+                region: "use1".to_owned(),
+                players: Vec::new(),
+                total_online: 0,
+            }),
+            WSMessage::ChallengePlayer { user_id: 1 },
+            WSMessage::RespondToChallenge {
+                challenge_id: "c".to_owned(),
+                accept: true,
+            },
+            WSMessage::CancelChallenge {
+                challenge_id: "c".to_owned(),
+            },
+            WSMessage::Challenges(ChallengeInbox::default()),
+            WSMessage::ChallengeAccepted {
+                challenge_id: "c".to_owned(),
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::ChallengeFailed {
+                reason: "no".to_owned(),
+            },
+            WSMessage::SetRematchIntent {
+                game_id: 1,
+                opt_in: true,
+            },
+            WSMessage::Rematch(RematchState {
+                game_id: 1,
+                participants: Vec::new(),
+                lobby_code: None,
+                host_user_id: None,
+                game_type: None,
+                queue_mode: QueueMode::Quickmatch,
+                expires_at_ms: 0,
+            }),
+        ]
+    }
+
+    /// The load-bearing property for the outbound hook: the forwarder never
+    /// sees a `WSMessage`, so the name it reads off the wire has to be the
+    /// same name the inbound hook reads off the value. If serde's
+    /// representation ever changes — a container attribute, a renamed variant
+    /// — this fails instead of quietly relabelling a column.
+    #[test]
+    fn a_serialized_frame_reports_its_own_variant_name() {
+        for message in every_variant() {
+            let expected = message.variant_name();
+            let frame = Message::Text(
+                serde_json::to_string(&message)
+                    .expect("every variant must serialize")
+                    .into(),
+            );
+            assert_eq!(
+                outbound_message_type(&frame),
+                expected,
+                "the wire tag and the variant name disagree for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_variant_has_a_distinct_name() {
+        let names: Vec<&str> = every_variant()
+            .iter()
+            .map(WSMessage::variant_name)
+            .collect();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "names must be distinct: {names:?}"
+        );
+        assert_eq!(names.len(), 52, "every variant must be covered");
+    }
+
+    /// The names go into an analytics column, so they must stay inside the
+    /// shape the wire-tag reader accepts — otherwise the two directions would
+    /// label the same message differently.
+    #[test]
+    fn every_name_survives_the_wire_tag_reader() {
+        for message in every_variant() {
+            let name = message.variant_name();
+            assert!(!name.is_empty());
+            assert!(name.len() <= MAX_WIRE_TAG_LEN, "{name} is too long");
+            assert_ne!(
+                name, UNNAMED_MESSAGE_TYPE,
+                "{name} collides with the fallback"
+            );
+        }
+    }
+
+    /// Transport frames carry no variant, and must not be confusable with the
+    /// application message that shares their word.
+    #[test]
+    fn transport_frames_are_labelled_apart_from_application_messages() {
+        let application_frame = Message::Text(
+            serde_json::to_string(&WSMessage::Ping { client_time: 0 })
+                .unwrap()
+                .into(),
+        );
+        let transport_frame = Message::Ping(Vec::new().into());
+        let application = outbound_message_type(&application_frame);
+        let transport = outbound_message_type(&transport_frame);
+        assert_eq!(application, "Ping");
+        assert_eq!(transport, "ping_frame");
+        assert_ne!(application, transport);
+        assert_eq!(outbound_message_type(&Message::Close(None)), "close_frame");
+    }
+
+    /// The interning table and the match must describe the same set. An
+    /// outbound frame is named by looking its wire tag up in the table, so a
+    /// name the table was missing would be reported as unknown while the
+    /// inbound half still named it — the two directions of one message would
+    /// stop joining.
+    #[test]
+    fn the_interning_table_holds_exactly_the_variant_names() {
+        let from_variants: std::collections::BTreeSet<&str> = every_variant()
+            .iter()
+            .map(WSMessage::variant_name)
+            .collect();
+        let from_table: std::collections::BTreeSet<&str> =
+            WS_MESSAGE_TYPE_NAMES.iter().copied().collect();
+        assert_eq!(from_variants, from_table);
+    }
+
+    /// A well-formed tag this gateway never authors is not a `WSMessage`, and
+    /// collapses into the one bounded label rather than becoming a column
+    /// value of its own.
+    #[test]
+    fn a_well_formed_tag_that_is_not_a_variant_is_not_recorded_verbatim() {
+        assert_eq!(interned_message_type("GameEvent"), Some("GameEvent"));
+        assert_eq!(interned_message_type("NotAWsMessage"), None);
+        assert_eq!(
+            outbound_message_type(&Message::Text("{\"NotAWsMessage\":1}".into())),
+            UNNAMED_MESSAGE_TYPE
+        );
+    }
+
+    /// A frame this gateway did not author must not become an unbounded or
+    /// attacker-chosen column value.
+    #[test]
+    fn an_unreadable_frame_falls_back_to_one_bounded_label() {
+        let oversized = format!("{{\"{}\":1}}", "A".repeat(MAX_WIRE_TAG_LEN + 1));
+        for text in [
+            String::new(),
+            "not json".to_owned(),
+            "{}".to_owned(),
+            "{123:1}".to_owned(),
+            "{\"has space\":1}".to_owned(),
+            "{\"\":1}".to_owned(),
+            oversized,
+        ] {
+            assert_eq!(
+                outbound_message_type(&Message::Text(text.clone().into())),
+                UNNAMED_MESSAGE_TYPE,
+                "{text} must not be recorded verbatim"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod seat_publication_tests {
+    use super::*;
+    use crate::analytics::ws_sink::WsConnection;
+
+    fn seated(game_id: Option<u32>) -> ConnectionState {
+        ConnectionState::Authenticated {
+            metadata: PlayerMetadata {
+                user_id: 7,
+                username: "Player".to_owned(),
+                token: "session-token".to_owned(),
+                is_guest: false,
+                matchmaking_pool: MatchmakingPool::Public,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: Some(ClientDistribution::Web),
+            },
+            lobby_handle: None,
+            game_id,
+            websocket_id: "ws-seat".to_owned(),
+        }
+    }
+
+    /// The transition that reads this value goes on to spawn the game-event
+    /// forwarder, whose very first frame is the anchor snapshot. Publishing
+    /// therefore has to be complete before the value is returned: any window
+    /// between the two would stamp the entire game-entry burst with the game
+    /// this connection was in BEFORE, which on a rematch is a wrong join key
+    /// rather than a missing one.
+    #[test]
+    fn entering_a_game_publishes_the_new_seat_before_returning_it() {
+        let analytics = WsConnection::new("seat-order");
+        analytics.set_game_id(Some(11));
+
+        let entered = publish_seat(&seated(Some(77)), &analytics);
+
+        assert_eq!(entered, Some(77));
+        assert_eq!(
+            analytics.game_id(),
+            Some(77),
+            "the caller cannot learn the new seat without the forwarder having \
+             learned it too"
+        );
+    }
+
+    #[test]
+    fn leaving_a_game_clears_the_seat() {
+        let analytics = WsConnection::new("seat-clear");
+        analytics.set_game_id(Some(11));
+        assert_eq!(publish_seat(&seated(None), &analytics), None);
+        assert_eq!(analytics.game_id(), None);
+    }
+
+    /// A transition back to unauthenticated is a seat change too, and the
+    /// frames that follow it belong to no game.
+    #[test]
+    fn an_unauthenticated_transition_clears_the_seat() {
+        let analytics = WsConnection::new("seat-unauth");
+        analytics.set_game_id(Some(11));
+        assert_eq!(
+            publish_seat(&ConnectionState::Unauthenticated, &analytics),
+            None
+        );
+        assert_eq!(analytics.game_id(), None);
     }
 }

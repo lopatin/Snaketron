@@ -19,20 +19,106 @@ use tracing::warn;
 
 use super::batch::{BatchLimits, BufferedEvent, EventBatcher};
 use super::emitter::{DropReason, EmitterMetrics};
-use super::exporter::{ExportTarget, write_batch};
+use super::event::{EventIdentity, EventOrigin, envelope_at, to_json_line};
+use super::exporter::{ExportTarget, event_date, write_batch};
 use super::object_store::ObjectStore;
+use super::proto;
+
+/// Which way a frame was travelling.
+///
+/// The column values live here rather than at the two hooks so the inbound and
+/// outbound halves cannot spell them differently.
+///
+/// Crate-private, together with [`WsFrameRecord`] and [`WsEventSink::record`],
+/// so `ws_sink`'s two hooks stay the only way to put a frame on this channel:
+/// a caller that could name a direction itself could label an inbound frame
+/// outbound, and nothing downstream would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Inbound,
+    Outbound,
+}
+
+impl Direction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "in",
+            Self::Outbound => "out",
+        }
+    }
+}
+
+/// One frame, as much of it as the websocket task is willing to pay to
+/// describe.
+///
+/// This — not a finished event — is what crosses the channel, because
+/// everything needed to turn it into one (the envelope, the protobuf round
+/// trip, the JSON) is work the gameplay task must not do. The two fields that
+/// genuinely cannot be recovered later are carried by value: `occurred_at_ms`
+/// because a clock read on the drain would report the drain's time as the
+/// frame's, and `origin` because it is per-task state the drain would
+/// otherwise have to look up globally.
+///
+/// `message_type` is `&'static str` rather than an owned name so a frame costs
+/// no allocation at all: the inbound hook has the variant's own name and the
+/// outbound hook interns the wire tag against that same set.
+pub(crate) struct WsFrameRecord {
+    pub(crate) origin: Arc<EventOrigin>,
+    pub(crate) session_id: Option<Arc<str>>,
+    pub(crate) direction: Direction,
+    pub(crate) message_type: &'static str,
+    pub(crate) byte_len: usize,
+    pub(crate) game_id: Option<i64>,
+    pub(crate) occurred_at_ms: i64,
+}
+
+impl WsFrameRecord {
+    /// The projection. Pure: origin plus hook data in, one event out.
+    fn into_event(self) -> proto::Event {
+        envelope_at(
+            &self.origin,
+            EventIdentity {
+                session_id: self.session_id.map(|id| id.to_string()),
+                ..Default::default()
+            },
+            // Type and size only: message bodies carry chat and tokens and are
+            // never recorded.
+            proto::event::Payload::WebsocketMessage(proto::WebsocketMessage {
+                direction: self.direction.as_str().to_owned(),
+                message_type: self.message_type.to_owned(),
+                byte_len: i64::try_from(self.byte_len).unwrap_or(i64::MAX),
+                game_id: self.game_id,
+            }),
+            self.occurred_at_ms,
+        )
+    }
+
+    /// Projects the frame and serializes it — the whole cost the hooks were
+    /// relieved of, run here on the exporter's task.
+    fn project(self) -> anyhow::Result<BufferedEvent> {
+        let event = self.into_event();
+        Ok(BufferedEvent {
+            line: to_json_line(&event)?,
+            date: event_date(event.occurred_at_ms),
+            // No crash stability is needed here (R5.6) — the buffer is lost on
+            // a crash anyway — but the cursor still has to sort in write order
+            // within one host's day, which the event's UUIDv7 already does.
+            cursor: event.event_id,
+        })
+    }
+}
 
 /// Bounded intake. `try_send` and drop-on-full, never a blocking send: a
 /// websocket handler must not wait on analytics.
 #[derive(Clone)]
 pub struct WsEventSink {
-    sender: mpsc::Sender<BufferedEvent>,
+    sender: mpsc::Sender<WsFrameRecord>,
     metrics: Arc<EmitterMetrics>,
 }
 
 impl WsEventSink {
-    pub fn record(&self, event: BufferedEvent) -> bool {
-        match self.sender.try_send(event) {
+    pub(crate) fn record(&self, frame: WsFrameRecord) -> bool {
+        match self.sender.try_send(frame) {
             Ok(()) => true,
             Err(_) => {
                 self.metrics.record_drop(DropReason::BufferFull);
@@ -62,6 +148,60 @@ pub struct WsExporterConfig {
     pub sample_rate: f64,
 }
 
+impl WsExporterConfig {
+    /// The R5 knobs, read with the same parse idiom as
+    /// `exporter::default_limits` so an unparseable value falls back to the
+    /// default rather than refusing to start a game server over analytics.
+    pub fn from_env(target: ExportTarget) -> Self {
+        Self::from_lookup(target, |name| std::env::var(name).ok())
+    }
+
+    /// The parsing, with the environment injected.
+    ///
+    /// Split out so the defaults and the overrides can both be asserted
+    /// without mutating process environment that every other test shares.
+    fn from_lookup(target: ExportTarget, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let parse = |name: &str, fallback: usize| {
+            lookup(name)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        };
+        Self {
+            limits: BatchLimits {
+                max_batch_age: Duration::from_millis(parse(
+                    "SNAKETRON_WS_EXPORT_MAX_BATCH_AGE_MS",
+                    300_000,
+                ) as u64),
+                // Half the durable path's byte budget (R5.2): this buffer is
+                // pure process memory in the container that also holds game
+                // state, with no Valkey behind it to absorb a burst.
+                max_buffer_bytes: parse("SNAKETRON_WS_EXPORT_MAX_BUFFER_BYTES", 32 * 1024 * 1024),
+                max_buffer_events: parse("SNAKETRON_WS_EXPORT_MAX_BUFFER_EVENTS", 100_000),
+                // How a flush is split into objects, which R5.2 does not make
+                // configurable — it bounds the buffer, not the file. Matching
+                // the durable path keeps one object shape in the raw tier for
+                // both datasets rather than inventing a second.
+                max_events_per_file: 50_000,
+                max_bytes_per_file: 32 * 1024 * 1024,
+            },
+            target,
+            channel_capacity: parse("SNAKETRON_WS_EXPORT_BUFFER", 65_536),
+            flush_timeout: Duration::from_millis(parse(
+                "SNAKETRON_WS_EXPORT_FLUSH_TIMEOUT_MS",
+                5_000,
+            ) as u64),
+            // A non-finite rate would make `is_sampled` answer no for every
+            // session, which is indistinguishable from a dead pipeline. Fall
+            // back to recording everything so a typo is visible in the data
+            // volume rather than in its absence.
+            sample_rate: lookup("SNAKETRON_WS_EXPORT_SAMPLE")
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|rate| rate.is_finite())
+                .unwrap_or(1.0),
+        }
+    }
+}
+
 /// Whether a session is in the sample.
 ///
 /// A stable hash of the session id, so the decision is identical on every task
@@ -82,6 +222,10 @@ pub fn is_sampled(session_id: &str, sample_rate: f64) -> bool {
 }
 
 /// Creates the sink and the loop that drains it.
+///
+/// The loop owns the projection as well as the batching: a frame arrives as
+/// the little that the websocket task could afford to say about it, and every
+/// cost of turning that into a row is paid here.
 pub fn create(
     store: Arc<dyn ObjectStore>,
     config: WsExporterConfig,
@@ -102,8 +246,8 @@ pub fn create(
         loop {
             tokio::select! {
                 received = receiver.recv() => match received {
-                    Some(event) => {
-                        batcher.push(event);
+                    Some(frame) => {
+                        push_projected(&mut batcher, frame, &metrics);
                         if batcher.should_flush() {
                             flush(&store, &config.target, &mut batcher, &metrics).await;
                         }
@@ -122,8 +266,8 @@ pub fn create(
         // The reason this task is joined rather than detached: everything
         // buffered right now is lost unless it is written here.
         receiver.close();
-        while let Ok(event) = receiver.try_recv() {
-            batcher.push(event);
+        while let Ok(frame) = receiver.try_recv() {
+            push_projected(&mut batcher, frame, &metrics);
         }
         if !batcher.is_empty() {
             let pending = batcher.buffered_events() as u64;
@@ -143,6 +287,20 @@ pub fn create(
     };
 
     (sink, task)
+}
+
+/// Projects one frame and buffers it, or counts the loss.
+///
+/// A frame that cannot be serialized must not stop the ones behind it, and the
+/// loss must be counted rather than silent (invariant I9).
+fn push_projected(batcher: &mut EventBatcher, frame: WsFrameRecord, metrics: &EmitterMetrics) {
+    match frame.project() {
+        Ok(event) => batcher.push(event),
+        Err(error) => {
+            warn!("dropping unserializable websocket analytics event: {error}");
+            metrics.record_drop(DropReason::Rejected);
+        }
+    }
 }
 
 async fn flush(
@@ -202,11 +360,25 @@ mod tests {
         }
     }
 
-    fn event(id: u32) -> BufferedEvent {
-        BufferedEvent {
-            line: format!("{{\"n\":{id}}}"),
-            date: "2026-08-19".to_owned(),
-            cursor: format!("{id:05}"),
+    fn test_origin() -> Arc<EventOrigin> {
+        Arc::new(EventOrigin {
+            environment: "test".to_owned(),
+            region: "use1".to_owned(),
+            aws_region: "us-east-1".to_owned(),
+            instance_id: "1:boot".to_owned(),
+        })
+    }
+
+    /// One frame in the shape the hooks hand over: nothing projected yet.
+    fn frame(id: u32) -> WsFrameRecord {
+        WsFrameRecord {
+            origin: test_origin(),
+            session_id: Some(Arc::from(format!("s-{id}").as_str())),
+            direction: Direction::Outbound,
+            message_type: "GameEvent",
+            byte_len: 64,
+            game_id: Some(i64::from(id)),
+            occurred_at_ms: 1_755_000_000_000,
         }
     }
 
@@ -231,7 +403,7 @@ mod tests {
         let handle = tokio::spawn(task);
 
         for id in 0..5 {
-            assert!(sink.record(event(id)));
+            assert!(sink.record(frame(id)));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(fake.keys.lock().unwrap().is_empty(), "not flushed yet");
@@ -255,7 +427,7 @@ mod tests {
         let mut accepted = 0;
         let started = std::time::Instant::now();
         for id in 0..200 {
-            if sink.record(event(id)) {
+            if sink.record(frame(id)) {
                 accepted += 1;
             }
         }
@@ -279,7 +451,7 @@ mod tests {
         let metrics = sink.metrics();
         let handle = tokio::spawn(task);
 
-        sink.record(event(1));
+        sink.record(frame(1));
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
 
@@ -306,7 +478,7 @@ mod tests {
         let handle = tokio::spawn(task);
 
         for id in 0..3 {
-            sink.record(event(id));
+            sink.record(frame(id));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
@@ -317,6 +489,82 @@ mod tests {
 
         cancel.cancel();
         handle.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn target() -> ExportTarget {
+        ExportTarget {
+            dataset: "websocket-events".to_owned(),
+            host: "use1-1".to_owned(),
+        }
+    }
+
+    fn nothing_set(_: &str) -> Option<String> {
+        None
+    }
+
+    /// The PRD's defaults (R5.1, R5.2, R5.5, R5.7), pinned by value: an
+    /// unconfigured deployment is the one every deployment starts as, and a
+    /// silently changed default would move the loss window or the cost.
+    #[test]
+    fn an_unconfigured_exporter_uses_the_documented_defaults() {
+        let config = WsExporterConfig::from_lookup(target(), nothing_set);
+        assert_eq!(config.channel_capacity, 65_536);
+        assert_eq!(config.limits.max_batch_age, Duration::from_millis(300_000));
+        assert_eq!(config.limits.max_buffer_bytes, 33_554_432);
+        assert_eq!(config.limits.max_buffer_events, 100_000);
+        assert_eq!(config.flush_timeout, Duration::from_millis(5_000));
+        assert_eq!(config.sample_rate, 1.0);
+    }
+
+    #[test]
+    fn every_knob_is_read_from_the_environment() {
+        let config = WsExporterConfig::from_lookup(target(), |name| {
+            Some(
+                match name {
+                    "SNAKETRON_WS_EXPORT_BUFFER" => "128",
+                    "SNAKETRON_WS_EXPORT_MAX_BATCH_AGE_MS" => "1000",
+                    "SNAKETRON_WS_EXPORT_MAX_BUFFER_BYTES" => "2048",
+                    "SNAKETRON_WS_EXPORT_MAX_BUFFER_EVENTS" => "7",
+                    "SNAKETRON_WS_EXPORT_FLUSH_TIMEOUT_MS" => "250",
+                    "SNAKETRON_WS_EXPORT_SAMPLE" => "0.25",
+                    other => panic!("unexpected variable {other}"),
+                }
+                .to_owned(),
+            )
+        });
+        assert_eq!(config.channel_capacity, 128);
+        assert_eq!(config.limits.max_batch_age, Duration::from_millis(1_000));
+        assert_eq!(config.limits.max_buffer_bytes, 2_048);
+        assert_eq!(config.limits.max_buffer_events, 7);
+        assert_eq!(config.flush_timeout, Duration::from_millis(250));
+        assert_eq!(config.sample_rate, 0.25);
+    }
+
+    /// Analytics must never keep a game server from starting, so garbage falls
+    /// back rather than failing.
+    #[test]
+    fn unparseable_values_fall_back_to_the_defaults() {
+        let config = WsExporterConfig::from_lookup(target(), |_| Some("banana".to_owned()));
+        assert_eq!(config.channel_capacity, 65_536);
+        assert_eq!(config.limits.max_buffer_bytes, 33_554_432);
+        assert_eq!(config.sample_rate, 1.0);
+    }
+
+    /// A NaN rate compares false against every threshold, so `is_sampled`
+    /// would answer no for every session — a silently dead pipeline that looks
+    /// exactly like no traffic.
+    #[test]
+    fn a_non_finite_sample_rate_records_everything_rather_than_nothing() {
+        let config = WsExporterConfig::from_lookup(target(), |name| {
+            (name == "SNAKETRON_WS_EXPORT_SAMPLE").then(|| "NaN".to_owned())
+        });
+        assert_eq!(config.sample_rate, 1.0);
+        assert!(is_sampled("any-session", config.sample_rate));
     }
 }
 
@@ -356,6 +604,132 @@ mod sampling_tests {
         assert!(
             (0.20..=0.30).contains(&ratio),
             "expected roughly 25%, got {ratio}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn origin() -> Arc<EventOrigin> {
+        Arc::new(EventOrigin {
+            environment: "test".to_owned(),
+            region: "use1".to_owned(),
+            aws_region: "us-east-1".to_owned(),
+            instance_id: "42:boot".to_owned(),
+        })
+    }
+
+    fn record(
+        session_id: Option<&str>,
+        direction: Direction,
+        message_type: &'static str,
+        byte_len: usize,
+        game_id: Option<i64>,
+    ) -> WsFrameRecord {
+        WsFrameRecord {
+            origin: origin(),
+            session_id: session_id.map(Arc::from),
+            direction,
+            message_type,
+            byte_len,
+            game_id,
+            occurred_at_ms: 1_755_000_000_000,
+        }
+    }
+
+    fn payload(event: &proto::Event) -> &proto::WebsocketMessage {
+        match event.payload.as_ref().expect("a payload") {
+            proto::event::Payload::WebsocketMessage(message) => message,
+            other => panic!("expected a websocket message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_projected_event_carries_direction_type_size_and_game() {
+        let event = record(
+            Some("s_abc"),
+            Direction::Outbound,
+            "GameEvent",
+            4096,
+            Some(77),
+        )
+        .into_event();
+
+        assert_eq!(event.event_name, "websocket_message");
+        assert_eq!(
+            event.identity.as_ref().unwrap().session_id.as_deref(),
+            Some("s_abc")
+        );
+        let message = payload(&event);
+        assert_eq!(message.direction, "out");
+        assert_eq!(message.message_type, "GameEvent");
+        assert_eq!(message.byte_len, 4096);
+        assert_eq!(message.game_id, Some(77));
+    }
+
+    /// The two directions must be distinguishable in the table, and the labels
+    /// must come from one place.
+    #[test]
+    fn the_two_directions_project_distinct_labels() {
+        let inbound = record(None, Direction::Inbound, "PlayerReady", 12, None).into_event();
+        let outbound = record(None, Direction::Outbound, "PlayerReady", 12, None).into_event();
+        assert_eq!(payload(&inbound).direction, "in");
+        assert_eq!(payload(&outbound).direction, "out");
+        assert_ne!(
+            payload(&inbound).direction,
+            payload(&outbound).direction,
+            "a frame's direction must be readable from the row"
+        );
+    }
+
+    /// A pre-authentication frame has no session to attribute, and must say so
+    /// rather than inventing one that joins to nothing.
+    #[test]
+    fn an_unauthenticated_frame_carries_no_session() {
+        let event = record(None, Direction::Inbound, "Authenticate", 200, None).into_event();
+        assert!(event.identity.as_ref().unwrap().session_id.is_none());
+        assert!(
+            payload(&event).game_id.is_none(),
+            "an absent game must be absent, not zero"
+        );
+    }
+
+    /// The proto field is a signed 64-bit integer and `byte_len` is a `usize`.
+    /// Saturating keeps an absurd length from wrapping into a negative size,
+    /// which would read as a corrupt row rather than an implausible one.
+    #[test]
+    fn an_implausible_length_saturates_rather_than_wrapping() {
+        let event = record(None, Direction::Outbound, "GameEvent", usize::MAX, None).into_event();
+        assert_eq!(payload(&event).byte_len, i64::MAX);
+    }
+
+    /// The reason the hooks pay for a clock read: the frame's own time has to
+    /// survive the hand-off, or every row would report when the exporter got
+    /// round to it — and the partition it lands in would follow.
+    #[test]
+    fn the_frames_own_timestamp_survives_projection() {
+        // 2026-04-19T12:00:00Z: midday, so no timezone slip could move the
+        // derived date and let this pass by accident.
+        let captured = 1_776_600_000_000;
+        let mut frame = record(None, Direction::Inbound, "Ping", 8, None);
+        frame.occurred_at_ms = captured;
+
+        let buffered = frame.project().expect("a frame must serialize");
+        assert_eq!(buffered.date, event_date(captured));
+        assert!(
+            buffered.line.contains(&captured.to_string()),
+            "the serialized row must carry the captured time: {}",
+            buffered.line
+        );
+
+        let mut later = record(None, Direction::Inbound, "Ping", 8, None);
+        later.occurred_at_ms = captured;
+        assert_eq!(
+            later.into_event().occurred_at_ms,
+            captured,
+            "projection must not re-read the clock"
         );
     }
 }

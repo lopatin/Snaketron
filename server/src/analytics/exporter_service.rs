@@ -72,7 +72,7 @@ impl ExporterFactory {
 
 #[async_trait]
 impl HostedServiceFactory for ExporterFactory {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "analytics-exporter"
     }
 

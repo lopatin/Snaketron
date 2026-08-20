@@ -355,7 +355,15 @@ pub trait HostedService: Send + 'static {
 /// Builds [`HostedService`] instances and declares how they are scheduled.
 #[async_trait]
 pub trait HostedServiceFactory: Send + Sync + 'static {
-    fn name(&self) -> &'static str;
+    /// How this factory identifies itself in logs, configuration, and metrics.
+    ///
+    /// Borrowed from the factory rather than `&'static str` so a factory that
+    /// is registered more than once with different parameters can say which
+    /// instance it is — the Iceberg committer is registered per table, and one
+    /// shared name would make every per-instance series ambiguous. Still meant
+    /// to be a small closed set decided at registration, never derived from
+    /// traffic: it becomes a metric attribute.
+    fn name(&self) -> &str;
 
     /// The key by which instances must be mutually exclusive, or `None` for no
     /// exclusion. Computed once per instance, so it may depend on region,

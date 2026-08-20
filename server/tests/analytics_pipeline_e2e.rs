@@ -464,3 +464,95 @@ async fn a_conditional_write_to_an_existing_key_reports_already_present() -> Res
     );
     Ok(())
 }
+
+/// The websocket path, which reaches S3 without touching Valkey.
+///
+/// Worth its own coverage because it shares almost nothing with the durable
+/// path above: no stream, no consumer group, no elected exporter. Every task
+/// buffers in memory and writes straight to S3, so the only thing standing
+/// between a graceful stop and silent data loss is the final flush — and a
+/// missing flush leaves no trace anywhere downstream to notice.
+///
+/// This is the only test in this binary that installs the process-global ws
+/// sink. Adding a second installer would be a no-op against the `OnceLock` and
+/// would quietly assert nothing.
+#[tokio::test]
+async fn websocket_events_reach_s3_when_the_exporter_stops_gracefully() -> Result<()> {
+    let Some(s3) = s3_or_skip().await else {
+        return Ok(());
+    };
+
+    let run = uuid::Uuid::now_v7();
+    let dataset = format!("ws-events-{run}");
+    let store: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(s3.clone(), bucket()));
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut config = server::analytics::ws_exporter::WsExporterConfig::from_env(ExportTarget {
+        dataset: dataset.clone(),
+        host: "use1-1".to_owned(),
+    });
+    config.sample_rate = 1.0;
+    // Pin the flush triggers out of reach so the ONLY thing that can move
+    // these events to S3 is the shutdown flush. Without this the test would
+    // still pass on a size or age trigger, and would stop covering R5.4 the
+    // day a default changed.
+    config.limits.max_buffer_events = 1_000_000;
+    config.limits.max_buffer_bytes = 1 << 30;
+    config.limits.max_batch_age = std::time::Duration::from_secs(3600);
+    let (sink, task) = server::analytics::ws_exporter::create(store, config, cancel.clone());
+    server::analytics::ws_sink::install(sink, origin(), 1.0);
+    let driver = tokio::spawn(task);
+
+    let connection = server::analytics::ws_sink::WsConnection::new(&format!("conn-{run}"));
+    connection.bind_session(&format!("s-{run}"));
+    for i in 0..4 {
+        server::analytics::ws_sink::record_inbound(&connection, "Authenticate", 64 + i);
+        server::analytics::ws_sink::record_outbound(&connection, "GameState", 512 + i);
+    }
+
+    cancel.cancel();
+    driver.await.expect("the exporter task must join");
+
+    use server::analytics::committer::SourceListing;
+    let listing = server::analytics::source_listing::S3SourceListing::new(s3, bucket());
+    let keys = listing
+        .list_after(&dataset, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    assert!(
+        !keys.is_empty(),
+        "a graceful stop must flush the buffer to S3; nothing was written"
+    );
+
+    let ndjson = listing
+        .fetch(&dataset, &keys[0])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let lines: Vec<&str> = ndjson.lines().collect();
+    assert_eq!(lines.len(), 8, "every recorded frame must be present");
+
+    let mut directions: Vec<String> = Vec::new();
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        assert_eq!(value["event_name"], "websocket_message");
+        assert_eq!(
+            value["identity"]["session_id"],
+            serde_json::Value::String(format!("s-{run}")),
+            "every frame must carry the session it belongs to"
+        );
+        directions.push(
+            value["websocket_message"]["direction"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    directions.sort();
+    directions.dedup();
+    assert_eq!(
+        directions,
+        vec!["in", "out"],
+        "both directions must be recorded"
+    );
+    Ok(())
+}

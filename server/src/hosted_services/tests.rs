@@ -167,7 +167,7 @@ struct CountingFactory {
 
 #[async_trait]
 impl HostedServiceFactory for CountingFactory {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "counting"
     }
 
@@ -447,7 +447,7 @@ struct FailingFactory {
 
 #[async_trait]
 impl HostedServiceFactory for FailingFactory {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "failing"
     }
     fn failure_policy(&self) -> FailurePolicy {
@@ -506,7 +506,7 @@ struct SleeperFactory;
 
 #[async_trait]
 impl HostedServiceFactory for SleeperFactory {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "sleeper"
     }
     async fn build(&self, _ctx: ServiceContext) -> Result<Box<dyn HostedService>, ServiceError> {
@@ -752,7 +752,7 @@ struct ElectedFactory {
 
 #[async_trait]
 impl HostedServiceFactory for ElectedFactory {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.name
     }
 
@@ -855,7 +855,7 @@ struct FailedBuildFactory {
 
 #[async_trait]
 impl HostedServiceFactory for FailedBuildFactory {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "test-telemetry-failed-build"
     }
 
