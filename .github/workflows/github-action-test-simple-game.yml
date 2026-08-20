@@ -188,10 +188,14 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # 4.x, not 3.x: the analytics e2e tests write through S3 conditional
+      # writes (If-None-Match), which only the 4.x line implements. Keep this
+      # pinned in lockstep with snaketron/docker-compose.yml so a local run and
+      # a CI run exercise the same LocalStack.
       localstack:
-        image: localstack/localstack:3.0
+        image: localstack/localstack:4.0
         env:
-          SERVICES: dynamodb
+          SERVICES: dynamodb,s3
         ports:
           - 4566:4566
         options: >-
@@ -234,6 +238,12 @@ jobs:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           DYNAMODB_TABLE_PREFIX: snaketron
+          # Make the analytics e2e tests a hard requirement rather than a
+          # silent skip. Without this they still report `ok` when S3 or Valkey
+          # is missing, so a green run would say nothing about whether the
+          # pipeline works. They target the LocalStack service above; reaching
+          # real AWS needs SNAKETRON_E2E_S3_ENDPOINT=aws, which CI never sets.
+          SNAKETRON_E2E: "1"
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |

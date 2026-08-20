@@ -317,12 +317,24 @@ mod tests {
         assert_eq!(metrics.dropped(DropReason::Trimmed), 250);
     }
 
+    /// The partition is UTC, and must stay UTC: a fleet spanning regions would
+    /// otherwise write the same instant into two different `dt=` buckets
+    /// depending on each host's local zone, and Athena would read a day that
+    /// silently means something different per file.
+    ///
+    /// The two constants straddle UTC midnight while sharing a local calendar
+    /// day in any zone west of UTC, so a switch to local time turns the
+    /// `assert_ne` below into a failure rather than a silent behaviour change.
     #[test]
     fn events_are_bucketed_by_utc_event_date() {
-        // 2026-08-19T23:59:59.999Z and one millisecond later.
-        assert_eq!(event_date(1_787_270_399_999), event_date(1_787_270_399_999));
+        // 2026-08-20T23:59:59.999Z and one millisecond later.
         let before = event_date(1_787_270_399_999);
         let after = event_date(1_787_270_400_000);
+
+        // Pin the values, not just the fact that they differ: "they changed"
+        // also holds for a local-time bucket that changed at the wrong instant.
+        assert_eq!(before, "2026-08-20");
+        assert_eq!(after, "2026-08-21");
         assert_ne!(before, after, "midnight must change the bucket");
     }
 

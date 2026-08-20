@@ -45,31 +45,42 @@ fn redis_url() -> String {
     std::env::var("SNAKETRON_E2E_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned())
 }
 
+/// The default LocalStack endpoint, used when nothing else says otherwise.
+const LOCALSTACK: &str = "http://localhost:4566";
+
 /// Where S3 lives for this run, resolved deliberately rather than inherited.
 ///
-/// `.cargo/config.toml` sets `AWS_ENDPOINT_URL=http://localhost:4566` for every
-/// cargo process in this repo, which is the right default (tests target
-/// LocalStack) but makes ambient configuration decide where a *proof* run
-/// writes. That is exactly the kind of silence this test exists to remove, so
-/// the endpoint is resolved here and then pinned into `AWS_ENDPOINT_URL_S3`,
-/// which outranks `AWS_ENDPOINT_URL` in the SDK. After `resolve_endpoint`, the
-/// ambient value cannot redirect anything.
+/// **These tests never touch real AWS unless explicitly told to.** The
+/// fallback is LocalStack, not AWS: a test that writes to a real bucket by
+/// default is one stray environment away from writing to a real bucket
+/// someone cares about. Real AWS requires `SNAKETRON_E2E_S3_ENDPOINT=aws`.
 ///
-/// Precedence: `SNAKETRON_E2E_S3_ENDPOINT` (explicit) > `AWS_ENDPOINT_URL`
-/// (the repo's LocalStack default) > real AWS. Setting
-/// `SNAKETRON_E2E_S3_ENDPOINT=aws` selects real AWS explicitly, which also
-/// requires real credentials in the environment — the same config file pins
-/// `AWS_ACCESS_KEY_ID=test`, and env credentials outrank `~/.aws/credentials`.
+/// The resolved value is then pinned into `AWS_ENDPOINT_URL_S3`, which
+/// outranks `AWS_ENDPOINT_URL` in the SDK, so ambient configuration cannot
+/// redirect the run afterwards. `.cargo/config.toml` sets
+/// `AWS_ENDPOINT_URL=http://localhost:4566` for every cargo process here, and
+/// silently inheriting it is what once sent a "real AWS" run to a LocalStack
+/// that was not running — a `dispatch failure` that reads like a network
+/// fault.
+///
+/// Precedence:
+///   1. `SNAKETRON_E2E_S3_ENDPOINT=aws` — real AWS, opt-in only. Also needs
+///      real credentials in the environment, because the same config file
+///      pins `AWS_ACCESS_KEY_ID=test` and env credentials outrank
+///      `~/.aws/credentials`.
+///   2. `SNAKETRON_E2E_S3_ENDPOINT=<url>` — that endpoint.
+///   3. `AWS_ENDPOINT_URL` — the repo's LocalStack default.
+///   4. Otherwise `LOCALSTACK`.
 fn resolve_endpoint() -> Option<String> {
     let explicit = std::env::var("SNAKETRON_E2E_S3_ENDPOINT").ok();
     let endpoint = match explicit.as_deref() {
-        // "aws" is a deliberate opt-out of every local endpoint.
+        // The one and only way to reach real AWS.
         Some("aws") => None,
         Some(value) if !value.is_empty() => Some(value.to_owned()),
-        _ => match std::env::var("AWS_ENDPOINT_URL") {
-            Ok(value) if !value.is_empty() => Some(value),
-            _ => None,
-        },
+        _ => Some(match std::env::var("AWS_ENDPOINT_URL") {
+            Ok(value) if !value.is_empty() => value,
+            _ => LOCALSTACK.to_owned(),
+        }),
     };
 
     // Pin the service-specific endpoint so nothing ambient can override the
@@ -154,37 +165,71 @@ async fn s3_or_skip() -> Option<aws_sdk_s3::Client> {
         }
     }
     let client = S3ObjectStore::client_for(REGION, s3_endpoint().as_deref()).await;
+    let target = s3_endpoint().unwrap_or_else(|| "real AWS".to_owned());
+
+    // The probe asks "is S3 reachable", NOT "does the bucket exist" — those
+    // are different questions and conflating them is what made this skip
+    // against a perfectly healthy LocalStack. A 404 means the service
+    // answered; only a transport failure or a timeout means it is absent.
+    //
     // head_bucket rather than list_buckets: the latter needs account-level
     // s3:ListAllMyBuckets, which a scoped credential may legitimately lack,
     // and a permissions error there would look like "no S3 available".
     let probe = client.head_bucket().bucket(bucket()).send();
-    match tokio::time::timeout(Duration::from_secs(15), probe).await {
-        Ok(Ok(_)) => Some(client),
+    let reachable = match tokio::time::timeout(Duration::from_secs(15), probe).await {
+        Ok(Ok(_)) => true,
         Ok(Err(error)) => {
-            eprintln!("S3 probe error: {error}");
-            if let Some(source) = std::error::Error::source(&error) {
-                eprintln!("  caused by: {source}");
+            // A modeled service error is a RESPONSE: S3 is up and said no.
+            // A dispatch/transport failure is not.
+            let answered = error.raw_response().is_some();
+            if !answered {
+                eprintln!("S3 probe error: {error}");
+                if let Some(source) = std::error::Error::source(&error) {
+                    eprintln!("  caused by: {source}");
+                }
             }
-            unavailable(&format!(
-                "S3 at {}",
-                s3_endpoint().unwrap_or_else(|| "real AWS".to_owned())
-            ))?;
-            None
+            answered
         }
         Err(_) => {
-            unavailable(&format!(
-                "S3 at {} (timed out)",
-                s3_endpoint().unwrap_or_else(|| "real AWS".to_owned())
-            ))?;
-            None
+            unavailable(&format!("S3 at {target} (timed out)"))?;
+            return None;
         }
+    };
+
+    if !reachable {
+        unavailable(&format!("S3 at {target}"))?;
+        return None;
     }
+
+    // Reachable — now make sure the bucket is actually usable. A failure here
+    // is a real failure, not a skip: S3 answered, so "cannot create the
+    // bucket" is a problem with the run, not a missing dependency.
+    if let Err(error) = create_bucket(&client).await {
+        panic!("S3 at {target} is reachable but the bucket is unusable: {error}");
+    }
+    Some(client)
 }
 
-async fn ensure_bucket(client: &aws_sdk_s3::Client) -> Result<()> {
-    // Already-exists is success: the test is repeatable by design.
-    let _ = client.create_bucket().bucket(bucket()).send().await;
-    Ok(())
+/// Creates the test bucket, treating already-exists as success.
+///
+/// `create_bucket` is region-sensitive: outside us-east-1 it requires an
+/// explicit location constraint, and LocalStack mirrors that. REGION is
+/// us-east-1, so none is sent.
+async fn create_bucket(client: &aws_sdk_s3::Client) -> Result<()> {
+    match client.create_bucket().bucket(bucket()).send().await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let already_mine = matches!(
+                error.as_service_error(),
+                Some(e) if e.is_bucket_already_owned_by_you() || e.is_bucket_already_exists()
+            );
+            if already_mine {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("creating bucket {}: {error}", bucket()))
+            }
+        }
+    }
 }
 
 fn sample_event(mmr: i64) -> proto::Event {
@@ -211,7 +256,6 @@ async fn events_travel_from_emitter_through_valkey_to_s3() -> Result<()> {
     let Some(s3) = s3_or_skip().await else {
         return Ok(());
     };
-    ensure_bucket(&s3).await?;
 
     let run = uuid::Uuid::now_v7();
     let stream_key = format!("snaketron:{{snaketron:analytics:e2e}}:events:{run}");
@@ -360,7 +404,6 @@ async fn replaying_a_batch_writes_no_duplicate_object() -> Result<()> {
     let Some(s3) = s3_or_skip().await else {
         return Ok(());
     };
-    ensure_bucket(&s3).await?;
 
     let run = uuid::Uuid::now_v7();
     let store: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(s3.clone(), bucket()));
@@ -405,7 +448,6 @@ async fn a_conditional_write_to_an_existing_key_reports_already_present() -> Res
     let Some(s3) = s3_or_skip().await else {
         return Ok(());
     };
-    ensure_bucket(&s3).await?;
 
     let store = S3ObjectStore::new(s3, bucket());
     let key = format!("raw/conditional/{}.json.gz", uuid::Uuid::now_v7());
