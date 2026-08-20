@@ -550,6 +550,11 @@ class API {
   }
 
   /** The textures this account owns, newest first. */
+  /** Where this client talks to, so callers can build asset URLs. */
+  get baseUrl(): string {
+    return this.baseURL;
+  }
+
   async listTextures(): Promise<TextureListResponse> {
     return this.request<TextureListResponse>('/api/textures');
   }

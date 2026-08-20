@@ -8508,20 +8508,167 @@ a.home-social-icon:hover {
 }
 
 /* --- Texture picker --------------------------------------------------------
-   The one field that can create what it selects, so it is a menu with two
-   buttons and a job under it rather than a menu. */
+   The one field that can create what it selects, and the one that has to show
+   what it is selecting: a texture is a picture, and a list of names is a list
+   of things you have to remember. */
 .texture-picker {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.texture-picker-select {
+/* The trigger and its popover, so the popover hangs off the *button* rather
+   than off the whole control — anchored to the control it opened over the
+   prompt row below it. */
+.texture-picker-anchor {
+  position: relative;
+}
+
+.texture-picker-current {
+  display: flex;
   width: 100%;
+  align-items: center;
+  gap: 9px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--game-graphite);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px 6px 6px;
+  text-align: left;
+}
+
+.texture-picker-current:hover {
+  border-color: #9ca3af;
+}
+
+/* A square, and the art cropped to fill it: a coat is twelve times wider than
+   it is tall, so fitting one whole would be a hairline. */
+.texture-swatch {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 1px solid rgb(63 63 65 / 18%);
+  border-radius: 5px;
+  background: #f3f4f6;
+  object-fit: cover;
+}
+
+.texture-swatch.is-empty {
+  display: block;
+}
+
+.texture-picker-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.texture-picker-caret {
+  flex: none;
+  color: var(--game-muted);
+  font-size: 10px;
+}
+
+.texture-popover {
+  display: flex;
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  flex-direction: column;
+  gap: 6px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  background: var(--game-paper);
+  box-shadow: 4px 4px 0 rgb(63 63 65 / 14%);
+  padding: 8px;
+}
+
+.texture-popover-search {
+  width: 100%;
+  box-sizing: border-box;
+  border: 2px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 9px;
+}
+
+.texture-popover-search:focus {
+  border-color: var(--game-blue);
+  outline: none;
+}
+
+/* Capped and scrolling: the shipped art alone is seven rows, and an author
+   with a library would otherwise push the panel off the page. */
+.texture-popover-list {
+  display: flex;
+  max-height: 260px;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.texture-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--game-graphite);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 4px;
+  text-align: left;
+}
+
+.texture-option:hover {
+  background: #f1f5f9;
+}
+
+.texture-option.is-chosen {
+  background: #dbeafe;
+}
+
+.texture-option-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.texture-option-tag {
+  flex: none;
+  color: var(--game-blue);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.texture-popover-empty {
+  margin: 0;
+  color: var(--game-muted);
+  font-size: 12px;
+  padding: 12px 4px;
+  text-align: center;
 }
 
 .texture-picker-make {
   display: flex;
+  min-height: 30px;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
@@ -8558,10 +8705,6 @@ a.home-social-icon:hover {
   text-transform: uppercase;
 }
 
-.texture-picker-stage.is-failed {
-  color: var(--game-red);
-}
-
 .texture-picker-spinner {
   width: 12px;
   height: 12px;
@@ -8575,4 +8718,14 @@ a.home-social-icon:hover {
   margin: 0;
   color: var(--game-red);
   font-size: 12px;
+}
+
+/* The texture field is a div rather than a label (a label would forward its
+   clicks to the popover trigger), so its caption is styled by name. */
+.builder-field-caption {
+  color: var(--game-muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }

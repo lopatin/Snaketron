@@ -471,8 +471,12 @@ const Control: React.FC<ControlProps> = ({ field, scope, literals, onChange, onD
       // or make one and have it selected when it arrives.
       if (field.path.endsWith('source.texture')) {
         return (
-          <label className="builder-field">
-            <span>{field.label}</span>
+          // A div, not a label. A label forwards every click inside it to its
+          // first form control, so choosing from the popover also re-fired the
+          // trigger and reopened it over the selection it had just made. It is
+          // the wrong element anyway: this is several controls, not one.
+          <div className="builder-field">
+            <span className="builder-field-caption">{field.label}</span>
             <TexturePicker
               value={typeof value === 'string' ? value : ''}
               builtins={textures.catalogue}
@@ -481,7 +485,7 @@ const Control: React.FC<ControlProps> = ({ field, scope, literals, onChange, onD
               }
             />
             {field.help ? <small>{field.help}</small> : null}
-          </label>
+          </div>
         );
       }
       return (

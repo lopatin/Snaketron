@@ -775,7 +775,7 @@ fn source_variants() -> Vec<VariantV2> {
                             })
                             .collect(),
                     },
-                    "Art the client ships. Picking one declares it for you.",
+                    "Art the client ships, and anything you have made. Picking one declares it for you.",
                 ),
                 field(
                     "source.fit.type",

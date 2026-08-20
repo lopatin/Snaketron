@@ -24,6 +24,30 @@ interface BuiltinTexture {
   contentRef: string;
 }
 
+/** One row of the popover: what to draw, what to call it, what it selects. */
+interface Choice {
+  id: string;
+  label: string;
+  kind: string;
+  contentRef: string;
+  /** The image to show in the swatch. */
+  preview: string;
+  mine: boolean;
+}
+
+/**
+ * The smallest rung of a stored texture is the right thumbnail: it is the one
+ * already sized for something small, and it is a fraction of the canonical
+ * variant's bytes.
+ */
+const thumbnailOf = (texture: Texture): string => {
+  const smallest = [...texture.variants].sort(
+    (a, b) => a.texelsPerCell - b.texelsPerCell,
+  )[0];
+  const rung = smallest?.texelsPerCell ?? 64;
+  return `${api.baseUrl}/api/textures/by-ref/${encodeURIComponent(texture.contentRef)}/${rung}.png`;
+};
+
 interface TexturePickerProps {
   /** The name the layer currently references. */
   value: string;
@@ -51,7 +75,10 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
   const [prompt, setPrompt] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -127,41 +154,122 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
 
   const running = job !== null && job.state !== 'done' && job.state !== 'failed';
 
+  // Shipped art and the author's own, in one list. A document does not care
+  // which a texture came from, so neither does this.
+  const choices: Choice[] = [
+    ...builtins.map((art) => ({
+      id: art.id,
+      label: art.label,
+      kind: art.kind,
+      contentRef: art.contentRef,
+      // Built from the id, which `docv2::builtin_texture` files each piece
+      // under; a test there pins the convention this relies on.
+      preview: `images/skins/${art.id}.png`,
+      mine: false,
+    })),
+    ...mine.map((texture) => ({
+      id: `texture-${texture.textureId}`,
+      label: texture.lastPrompt ?? `Texture ${texture.textureId}`,
+      kind: texture.kind,
+      contentRef: texture.contentRef,
+      preview: thumbnailOf(texture),
+      mine: true,
+    })),
+  ];
+  const chosen = choices.find((each) => each.id === value);
+  const needle = search.trim().toLowerCase();
+  const shown = needle
+    ? choices.filter((each) => each.label.toLowerCase().includes(needle))
+    : choices;
+
+  // Close on Escape or on a click that lands outside. Both are what a popover
+  // is expected to do, and neither is worth surprising anyone by omitting.
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false);
+      }
+    };
+    const onClick = (event: MouseEvent) => {
+      if (!popoverRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    // Deferred: the click that opened this would otherwise close it again.
+    const timer = setTimeout(() => window.addEventListener('mousedown', onClick), 0);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('mousedown', onClick);
+      clearTimeout(timer);
+    };
+  }, [open]);
+
   return (
-    <div className="texture-picker">
-      <select
-        className="texture-picker-select"
-        value={value}
-        onChange={(event) => {
-          const id = event.target.value;
-          const builtin = builtins.find((each) => each.id === id);
-          if (builtin) {
-            onChoose(builtin.id, builtin.contentRef, builtin.kind);
-            return;
-          }
-          const own = mine.find((each) => `texture-${each.textureId}` === id);
-          if (own) {
-            onChoose(id, own.contentRef, own.kind);
-          }
+    <div className="texture-picker" ref={popoverRef}>
+      <div className="texture-picker-anchor">
+      <button
+        type="button"
+        className="texture-picker-current"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => {
+          setSearch('');
+          setOpen((was) => !was);
         }}
       >
-        <optgroup label="Included">
-          {builtins.map((art) => (
-            <option key={art.id} value={art.id}>
-              {art.label}
-            </option>
-          ))}
-        </optgroup>
-        {mine.length > 0 ? (
-          <optgroup label="Yours">
-            {mine.map((texture) => (
-              <option key={texture.textureId} value={`texture-${texture.textureId}`}>
-                {texture.lastPrompt ?? `Texture ${texture.textureId}`}
-              </option>
-            ))}
-          </optgroup>
-        ) : null}
-      </select>
+        {chosen ? (
+          <img className="texture-swatch" src={chosen.preview} alt="" />
+        ) : (
+          <span className="texture-swatch is-empty" aria-hidden="true" />
+        )}
+        <span className="texture-picker-name">{chosen?.label ?? 'Choose a texture'}</span>
+        <span className="texture-picker-caret" aria-hidden="true">▾</span>
+      </button>
+
+      {open ? (
+        <div className="texture-popover" role="listbox">
+          <input
+            className="texture-popover-search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search textures…"
+            aria-label="Search textures"
+            autoFocus
+          />
+          <div className="texture-popover-list">
+            {shown.length === 0 ? (
+              <p className="texture-popover-empty">Nothing matches that.</p>
+            ) : (
+              shown.map((choice) => (
+                <button
+                  type="button"
+                  key={choice.id}
+                  role="option"
+                  aria-selected={choice.id === value}
+                  className={`texture-option${choice.id === value ? ' is-chosen' : ''}`}
+                  onClick={() => {
+                    // Close first. Choosing re-renders the whole inspector,
+                    // and a state update queued behind that was arriving too
+                    // late to be seen — the popover stayed open over the
+                    // selection it had just made.
+                    setOpen(false);
+                    onChoose(choice.id, choice.contentRef, choice.kind);
+                  }}
+                >
+                  <img className="texture-swatch" src={choice.preview} alt="" loading="lazy" />
+                  <span className="texture-option-name">{choice.label}</span>
+                  {choice.mine ? <span className="texture-option-tag">yours</span> : null}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      ) : null}
+      </div>
 
       <div className="texture-picker-make">
         <input
@@ -182,7 +290,6 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
               api.generateTexture({
                 kind: 'coat',
                 prompt: prompt.trim(),
-                // Whatever is selected now is what "more like this" means.
                 referenceTextureIds: mine
                   .filter((each) => `texture-${each.textureId}` === value)
                   .map((each) => each.textureId),
@@ -214,9 +321,12 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
         />
       </div>
 
-      {job ? (
-        <p className={`texture-picker-stage${job.state === 'failed' ? ' is-failed' : ''}`}>
-          {running ? <span className="texture-picker-spinner" aria-hidden="true" /> : null}
+      {/* Only while something is happening. A job that finished said so by
+          selecting its texture; leaving "Done" on screen afterwards is a
+          status for a question nobody is still asking. */}
+      {running ? (
+        <p className="texture-picker-stage">
+          <span className="texture-picker-spinner" aria-hidden="true" />
           {STAGE_WORDS[job.state] ?? job.state}
         </p>
       ) : null}

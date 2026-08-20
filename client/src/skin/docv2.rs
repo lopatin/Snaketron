@@ -737,6 +737,29 @@ fn builtin_texture(name: &str) -> Option<ResolvedTexture> {
     })
 }
 
+#[cfg(test)]
+mod builtin_asset_tests {
+    /// Every piece of first-party art is filed under its own id.
+    ///
+    /// The Builder's texture picker builds a thumbnail URL from the id alone,
+    /// because it has the catalogue and not this mapping. That is only sound
+    /// while the two agree, and they agree by convention rather than by
+    /// construction — so the convention is checked here, where breaking it
+    /// would otherwise show up as a missing thumbnail in a popover.
+    #[test]
+    fn a_builtin_texture_is_filed_under_its_own_name() {
+        for art in skin_schema::v2::BUILTIN_TEXTURES {
+            let resolved = super::builtin_texture(art.id)
+                .unwrap_or_else(|| panic!("`{}` has no art behind it", art.id));
+            assert_eq!(
+                resolved.url,
+                format!("images/skins/{}.png", art.id),
+                "the picker builds this URL from the id and would 404"
+            );
+        }
+    }
+}
+
 /// Where a document's texture actually comes from.
 fn resolve_texture(texture: &skin_schema::v2::TextureRefV2) -> ResolvedTexture {
     if let Some(name) = texture
