@@ -1,4 +1,5 @@
 import { getWasm } from '../wasm';
+import { api } from '../services/api';
 
 /**
  * Fetching the player-authored skins a match is wearing.
@@ -30,6 +31,25 @@ export const isContentRef = (value: unknown): value is string =>
  */
 const abandoned = new Set<string>();
 
+/**
+ * Who the `abandoned` set was learned as.
+ *
+ * A 404 means "not yours to see", which is a fact about the viewer and not
+ * about the reference — and the viewer changes without the page reloading, at
+ * exactly the moment signing in turns "not yours" into "yours". Forgetting the
+ * set when the identity changes keeps the never-retry property for a stable
+ * session while letting a sign-in recover, instead of leaving the author
+ * looking at their own skin painted classic.
+ */
+let abandonedFor: string | null = null;
+
+const forgetIfViewerChanged = (token: string | null): void => {
+  if (token !== abandonedFor) {
+    abandoned.clear();
+    abandonedFor = token;
+  }
+};
+
 /** References currently being fetched, so eight players in one skin fetch once. */
 const inFlight = new Map<string, Promise<void>>();
 
@@ -43,10 +63,21 @@ const baseUrl = (): string =>
  * response that has been substituted in transit is refused rather than drawn.
  */
 const fetchAndRegister = async (contentRef: string): Promise<void> => {
-  const response = await fetch(`${baseUrl()}/api/skins/by-ref/${contentRef}`);
+  // Signed, when there is someone to sign as. A skin the viewer has made but
+  // not published is served only to them, so an anonymous request for it comes
+  // back 404 and the author watches their own skin paint classic.
+  const token = api.getAuthToken();
+  const response = await fetch(`${baseUrl()}/api/skins/by-ref/${contentRef}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
   if (!response.ok) {
-    // 410 means moderated away, 404 means it was never ours to see. Both are
-    // permanent, and both mean classic.
+    // 410 means moderated away: permanent for everyone, so stop asking.
+    //
+    // 404 is only permanent for *this* viewer, and who the viewer is can
+    // change without the page reloading — signing in is exactly the event that
+    // turns "never yours to see" into "yours". Remembering it against the
+    // reference alone is what made a skin stay classic for the rest of the
+    // session after one unauthenticated miss.
     abandoned.add(contentRef);
     return;
   }
@@ -84,6 +115,7 @@ export const ensureAuthoredSkins = (
   if (!wasm) {
     return Promise.resolve();
   }
+  forgetIfViewerChanged(api.getAuthToken());
   const started: Array<Promise<void>> = [];
 
   for (const reference of Object.values(skins)) {
@@ -117,5 +149,6 @@ export const ensureAuthoredSkins = (
 /** Test seam: forget what this module has learned. */
 export const resetAuthoredSkinCache = (): void => {
   abandoned.clear();
+  abandonedFor = null;
   inFlight.clear();
 };
