@@ -284,6 +284,30 @@ mod tests {
         );
     }
 
+    /// The Builder names these in its own source, across a crate boundary and
+    /// a wasm one, so nothing type-checks the pair. Deleting one shows up as a
+    /// blank canvas in a modal rather than as a build error — which is exactly
+    /// how `mid_horizontal` went missing once already.
+    #[test]
+    fn the_bodies_the_builder_asks_for_all_resolve() {
+        for name in [
+            // The preview deck's slides.
+            "straight_16",
+            "straight_18",
+            "straight_19",
+            "longer_than_head_gradient",
+            "starting_length",
+            "self_crossing",
+            "zigzag",
+            "wide_u_turn",
+        ] {
+            assert!(
+                pose_by_name(name).is_some(),
+                "the Builder asks for `{name}` and nothing answers"
+            );
+        }
+    }
+
     /// The shading engine needs a body whose runs are one cell long, and one
     /// long enough for a tile to wrap. Losing either silently would take the
     /// coverage with it.

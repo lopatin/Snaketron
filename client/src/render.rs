@@ -1033,6 +1033,30 @@ pub fn upgrade_skin_document(document_json: &str) -> Result<String, JsValue> {
     }
 }
 
+/// Compose skins from a description.
+///
+/// `brief` is a JSON [`skin_schema::generate::Brief`]: a prompt, colours
+/// sampled from any reference images, documents the author kept from an
+/// earlier round, and whatever they typed to steer the next one. What comes
+/// back is an array of variations, each carrying a document that has already
+/// passed the same validator the server runs — so the caller can put any of
+/// them straight into the Builder without checking first.
+///
+/// It runs here rather than on the server because it needs no model and no
+/// money: the ideas come from the schema's own vocabulary, so a round of six
+/// costs a millisecond and a page refresh rather than a queue and a quota.
+#[wasm_bindgen(js_name = generateSkins)]
+pub fn generate_skins(brief: &str, count: usize, seed: f64) -> Result<String, JsValue> {
+    let brief: skin_schema::generate::Brief = serde_json::from_str(brief)
+        .map_err(|error| JsValue::from_str(&format!("brief: {error}")))?;
+    // A JS number reaches u64 intact only up to 2^53; the seed is a nonce
+    // rather than an address, so wrapping the fraction away is fine and
+    // keeping it deterministic is what matters.
+    let seed = seed.abs() as u64;
+    let produced = skin_schema::generate::variations(&brief, count.clamp(1, 24), seed);
+    serde_json::to_string(&produced).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 /// The documents a new skin can start from.
 ///
 /// Templates rather than an empty stack, because an empty stack is not a skin

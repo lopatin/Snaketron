@@ -15,6 +15,7 @@ pub mod content;
 pub mod describe;
 pub mod describe_v2;
 pub mod expr;
+pub mod generate;
 pub mod ring;
 pub mod sampler;
 pub mod v2;

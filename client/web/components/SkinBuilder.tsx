@@ -5,6 +5,7 @@ import { HomeHeader } from './HomeHeader';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
 import { getWasm, initWasm } from '../wasm';
+import GenerateSkinModal from './GenerateSkinModal';
 import type { SkinSummary } from '../types/generated';
 
 /**
@@ -715,6 +716,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
    * yet. The rule only becomes news at the moment it stops you.
    */
   const [nameRefused, setNameRefused] = useState(false);
+  const [generating, setGenerating] = useState(false);
   const nameRef = useRef<HTMLInputElement | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [cost, setCost] = useState<Cost | null>(null);
@@ -1062,9 +1064,26 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
       <main className="builder-main">
         {/* Always the page's own name. Titling it after the template just
             chosen made the page look like it belonged to that template, and
-            the name is editable in Skin settings anyway. */}
+            the name is editable in the field above the preview. */}
         <div className="builder-intro">
           <h1 className="builder-title">Skin Builder</h1>
+          <button
+            type="button"
+            className="game-shell-button builder-generate"
+            onClick={() => setGenerating(true)}
+          >
+            <span className="builder-generate-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
+                {/* A four-pointed sparkle and two smaller ones: a wand needs a
+                    hand to hold it, and this reads at 15px where a wand does
+                    not. */}
+                <path d="M12 2.6l1.7 4.6 4.6 1.7-4.6 1.7L12 15.2l-1.7-4.6L5.7 8.9l4.6-1.7z" />
+                <path d="M18.4 14.1l.85 2.3 2.3.85-2.3.85-.85 2.3-.85-2.3-2.3-.85 2.3-.85z" />
+                <path d="M5.2 15.4l.6 1.6 1.6.6-1.6.6-.6 1.6-.6-1.6-1.6-.6 1.6-.6z" />
+              </svg>
+            </span>
+            Generate
+          </button>
         </div>
 
         {shownProblems.length > 0 ? (
@@ -1242,6 +1261,21 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           ) : null}
         </details>
       </main>
+
+      {generating ? (
+        <GenerateSkinModal
+          onClose={() => setGenerating(false)}
+          onUse={(generated, name) => {
+            // The generator hands over a document that has already passed the
+            // validator, so this is the same move as picking a template — with
+            // a name, which a template deliberately does not bring.
+            setDocument({ ...(generated as Document), name });
+            setNameRefused(false);
+            setSelected(0);
+            setGenerating(false);
+          }}
+        />
+      ) : null}
 
       {/* Pinned to the viewport rather than sitting at the end of the page.
           The stack is long and the inspector is longer, so a Save that lives

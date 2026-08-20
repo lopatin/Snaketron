@@ -6640,9 +6640,285 @@ a.home-social-icon:hover {
 
 .skins-intro,
 .builder-intro {
+  display: flex;
   width: min(100%, 72rem);
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   margin: 0 auto 28px;
 }
+
+/* Beside the heading rather than in the layers panel: generating is how a skin
+   *starts*, so it belongs with the page's name and not among the controls for
+   editing one that already exists. */
+.builder-generate {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+}
+
+.builder-generate-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* --- Generate modal ------------------------------------------------------
+   The match-break dialog's look, which is the house style for a modal: a
+   white wash rather than a grey scrim, a hard graphite border, and an offset
+   shadow with no blur. The values are restated rather than borrowed because
+   `ad-break-*` is named for what it interrupts, not for how it looks — but
+   they come from there, and a change to one should be a change to both. */
+.generate-backdrop {
+  position: fixed;
+  z-index: 9998;
+  inset: 0;
+  display: grid;
+  animation: ad-break-backdrop-in 160ms ease-out both;
+  backdrop-filter: blur(9px);
+  background: rgb(248 250 252 / 92%);
+  padding: 20px;
+  place-items: center;
+  -webkit-backdrop-filter: blur(9px);
+}
+
+.generate-dialog {
+  display: flex;
+  position: relative;
+  box-sizing: border-box;
+  width: min(100%, 720px);
+  max-height: calc(100dvh - 40px);
+  flex-direction: column;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  animation: ad-break-dialog-in 180ms ease-out both;
+  background: var(--game-paper);
+  box-shadow: 8px 8px 0 rgb(63 63 65 / 16%);
+  outline: none;
+  padding: 28px 28px 0;
+  text-align: left;
+}
+
+/* One segment per round generated, filling as you go. */
+.generate-rule {
+  display: flex;
+  height: 12px;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 24px;
+}
+
+.generate-rule span {
+  width: 23px;
+  height: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 3px;
+  background: #f1f5f9;
+  transform: skewX(-10deg);
+}
+
+.generate-rule span.is-resolved {
+  border-color: var(--game-blue);
+  background: var(--game-blue);
+}
+
+.generate-kicker {
+  display: block;
+  flex: none;
+  margin-bottom: 8px;
+  color: var(--game-blue);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+}
+
+.generate-dialog h2 {
+  margin: 0;
+  flex: none;
+  color: var(--game-graphite);
+  font-size: clamp(22px, 5vw, 28px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.5px;
+  line-height: 1.04;
+  text-transform: uppercase;
+}
+
+.generate-dialog > p {
+  margin: 13px 0 0;
+  flex: none;
+  color: var(--game-muted);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.generate-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 6px;
+  background: var(--game-paper);
+  color: var(--game-graphite);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+}
+
+.generate-close:hover {
+  background: #f1f5f9;
+}
+
+/* The one part that scrolls, so the heading and the actions stay put while a
+   round of six does not have to fit the viewport. */
+.generate-body {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.generate-prompt,
+.generate-guidance {
+  width: 100%;
+  box-sizing: border-box;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 15px;
+  padding: 10px 12px;
+  resize: none;
+}
+
+.generate-prompt:focus,
+.generate-guidance:focus {
+  border-color: var(--game-blue);
+  outline: none;
+}
+
+.generate-reference {
+  display: flex;
+  min-height: 30px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.generate-swatches {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.generate-swatches i {
+  width: 17px;
+  height: 17px;
+  border: 1px solid rgb(63 63 65 / 22%);
+  border-radius: 4px;
+}
+
+.generate-clear {
+  border: 0;
+  background: none;
+  color: var(--game-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 4px;
+  text-decoration: underline;
+}
+
+.generate-error {
+  margin: 0;
+  color: var(--game-red);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Two columns of wide, short snakes; auto-fit so the grid survives the dialog
+   narrowing on a phone. */
+.generate-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.generate-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  padding: 12px 10px 9px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.generate-option:hover {
+  border-color: #9ca3af;
+}
+
+.generate-option.is-kept {
+  border-color: var(--game-blue);
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 18%);
+}
+
+.generate-preview {
+  display: block;
+  overflow: hidden;
+}
+
+.generate-preview canvas {
+  display: block;
+}
+
+.generate-option-name {
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* The match-break dialog's footer rule, carrying the actions. */
+.generate-status {
+  display: flex;
+  min-height: 38px;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--game-rule);
+  margin-top: 20px;
+  color: var(--game-muted);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 1px;
+  padding: 16px 0 20px;
+  text-transform: uppercase;
+}
+
+.generate-actions {
+  display: flex;
+  gap: 9px;
+}
+
 
 .skins-title,
 .builder-title {
