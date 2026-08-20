@@ -458,21 +458,69 @@ pub struct HeadCoreV2 {
 /// sprite family unreachable to the very editor built to explore it — and
 /// makes the starting templates lie about what a skin can be.
 pub const BUILTIN_TEXTURE_PREFIX: &str = "builtin:";
-pub const BUILTIN_TEXTURES: &[&str] = &[
-    "stars-and-stripes.v1",
-    "race-livery.v1",
-    "tiger-live.v1",
-    "zebra-live.v1",
-    "jaguar.v1",
-    "tiger.v1",
-    "zebra.v1",
+/// One piece of first-party art, and enough about it to offer in a menu.
+///
+/// The kind is not decoration: a coat is one long strip worn down the body and
+/// a sheet is a stack of frames played as an animation, and a document that
+/// declares the wrong one paints a flag as a smear or a stripe as a flicker.
+/// Keeping it beside the id is what stops a picker from having to guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinTexture {
+    pub id: &'static str,
+    /// What to call it in a menu.
+    pub label: &'static str,
+    pub kind: TextureKindV2,
+}
+
+pub const BUILTIN_TEXTURES: &[BuiltinTexture] = &[
+    BuiltinTexture {
+        id: "stars-and-stripes.v1",
+        label: "Stars and stripes",
+        kind: TextureKindV2::Sheet,
+    },
+    BuiltinTexture {
+        id: "race-livery.v1",
+        label: "Race livery",
+        kind: TextureKindV2::Sheet,
+    },
+    BuiltinTexture {
+        id: "tiger-live.v1",
+        label: "Tiger, moving",
+        kind: TextureKindV2::Sheet,
+    },
+    BuiltinTexture {
+        id: "zebra-live.v1",
+        label: "Zebra, moving",
+        kind: TextureKindV2::Sheet,
+    },
+    BuiltinTexture {
+        id: "jaguar.v1",
+        label: "Jaguar",
+        kind: TextureKindV2::Coat,
+    },
+    BuiltinTexture {
+        id: "tiger.v1",
+        label: "Tiger",
+        kind: TextureKindV2::Coat,
+    },
+    BuiltinTexture {
+        id: "zebra.v1",
+        label: "Zebra",
+        kind: TextureKindV2::Coat,
+    },
 ];
+
+/// The catalogue entry a reference names, if it names one.
+pub fn builtin_texture(reference: &str) -> Option<&'static BuiltinTexture> {
+    let name = reference.strip_prefix(BUILTIN_TEXTURE_PREFIX)?;
+    BUILTIN_TEXTURES.iter().find(|art| art.id == name)
+}
 
 /// Whether a reference names art the client already has.
 pub fn is_builtin_texture(reference: &str) -> bool {
     reference
         .strip_prefix(BUILTIN_TEXTURE_PREFIX)
-        .is_some_and(|name| BUILTIN_TEXTURES.contains(&name))
+        .is_some_and(|name| BUILTIN_TEXTURES.iter().any(|art| art.id == name))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,7 +863,7 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
                      or first-party art the client ships ({})",
                     BUILTIN_TEXTURES
                         .iter()
-                        .map(|name| format!("`{BUILTIN_TEXTURE_PREFIX}{name}`"))
+                        .map(|art| format!("`{BUILTIN_TEXTURE_PREFIX}{}`", art.id))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),

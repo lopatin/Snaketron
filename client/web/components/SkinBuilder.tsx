@@ -89,6 +89,14 @@ interface SchemaV2 {
   addLayer: Variant[];
   systemLayers: { name: string; position: string; help: string }[];
   limits: { maxLayers: number; maxOps: number; maxTextures: number };
+  builtinTextures: BuiltinTexture[];
+}
+
+interface BuiltinTexture {
+  id: string;
+  label: string;
+  kind: string;
+  contentRef: string;
 }
 
 interface Template {
@@ -142,6 +150,48 @@ const write = (target: unknown, path: string, next: unknown): unknown => {
   const seed = child ?? (/^\d+$/.test(rest[0]) ? [] : {});
   (container as Record<string, unknown>)[head] = write(seed, rest.join('.'), next);
   return container;
+};
+
+/**
+ * Declare whatever art the layers currently name.
+ *
+ * A texture reference is two halves — a layer names a texture, and the
+ * document says what that name points at — and only the first half ever had a
+ * control, so the second is written here. Reconciling the whole stack rather
+ * than reacting to one field is what makes it reliable: a texture can arrive
+ * by adding a layer, by switching a source's kind, or by picking from the
+ * menu, and those are three different paths through `write`. Existing
+ * declarations are left alone, so an author who renamed one keeps their name.
+ */
+const declareNamedTextures = (doc: Document, catalogue: BuiltinTexture[]): Document => {
+  if (catalogue.length === 0) {
+    return doc;
+  }
+  const named = new Set<string>();
+  const walk = (layers: unknown) => {
+    if (!Array.isArray(layers)) {
+      return;
+    }
+    for (const layer of layers as Layer[]) {
+      const texture = read(layer, 'source.texture');
+      if (typeof texture === 'string' && texture) {
+        named.add(texture);
+      }
+      walk(read(layer, 'layers'));
+    }
+  };
+  walk(doc.layers);
+
+  const held = Array.isArray(doc.textures)
+    ? (doc.textures as Array<Record<string, unknown>>)
+    : [];
+  const missing = [...named]
+    .filter((name) => !held.some((each) => each.name === name))
+    .map((name) => catalogue.find((art) => art.id === name))
+    .filter((art): art is BuiltinTexture => Boolean(art))
+    .map((art) => ({ name: art.id, ref: art.contentRef, kind: art.kind }));
+
+  return missing.length === 0 ? doc : { ...doc, textures: [...held, ...missing] };
 };
 
 /** Drop a dotted path. Used by the optional-section switch. */
@@ -857,7 +907,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           return current;
         }
         const list = (current.layers as Layer[]) ?? [];
-        return {
+        const next = {
           ...current,
           layers: list.map((layer, other) =>
             other === index
@@ -870,10 +920,11 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
               : layer,
           ),
         };
+        return declareNamedTextures(next, schema?.builtinTextures ?? []);
       });
       setStatus(null);
     },
-    [],
+    [schema],
   );
 
   const dropLayerPath = useCallback(
@@ -901,12 +952,18 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           return current;
         }
         const list = (current.layers as Layer[]) ?? [];
-        return { ...current, layers: [...list, { ...variant.default }] };
+        // The layer can arrive already naming a texture, so its declaration
+        // has to arrive with it — otherwise adding one from the menu produces
+        // an invalid document before the author has touched anything.
+        return declareNamedTextures(
+          { ...current, layers: [...list, { ...variant.default }] },
+          schema?.builtinTextures ?? [],
+        );
       });
       setSelected(layers.length);
       setStatus(null);
     },
-    [layers.length],
+    [layers.length, schema],
   );
 
   const removeLayer = useCallback((index: number) => {

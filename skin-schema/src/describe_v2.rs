@@ -368,6 +368,43 @@ pub struct SchemaV2 {
     pub system_layers: Vec<SystemLayer>,
     /// Budgets, so the panel's meter and the validator agree by construction.
     pub limits: Limits,
+    /// The first-party art a document may name, with the kind each one is.
+    ///
+    /// A texture layer names a texture the *document* has to declare, and the
+    /// panel has to write that declaration when an author picks from the menu
+    /// — which it can only do correctly if it knows whether the art is a coat
+    /// or a sheet. Sending the catalogue is what keeps that knowledge on one
+    /// side of the wasm boundary instead of copied to both.
+    pub builtin_textures: Vec<BuiltinTextureV2>,
+}
+
+/// What a new texture layer starts as: a coat, because a coat is the kind that
+/// looks like something on any body, where a sheet on a four-cell snake is one
+/// frame of an animation nobody can see yet.
+///
+/// Named rather than indexed, because an index into the catalogue quietly means
+/// something else the moment the catalogue is reordered.
+const DEFAULT_TEXTURE_ID: &str = "jaguar.v1";
+
+/// The catalogue entry [`DEFAULT_TEXTURE_ID`] names.
+fn default_texture() -> &'static crate::v2::BuiltinTexture {
+    crate::v2::builtin_texture(&format!(
+        "{}{DEFAULT_TEXTURE_ID}",
+        crate::v2::BUILTIN_TEXTURE_PREFIX
+    ))
+    .expect("the default texture is in the catalogue")
+}
+
+/// One catalogue entry, as the panel needs it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinTextureV2 {
+    pub id: String,
+    pub label: String,
+    /// `coat` or `sheet`, spelled as the document spells it.
+    pub kind: String,
+    /// The reference a document puts in its `textures` entry.
+    pub content_ref: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -709,7 +746,7 @@ fn source_variants() -> Vec<VariantV2> {
             help: Some("Art you generated or uploaded.".to_string()),
             default: serde_json::json!({
                 "type": "image",
-                "texture": "",
+                "texture": default_texture().id,
                 "fit": { "type": "tile" },
                 "drift_cells": 0.0
             }),
@@ -717,11 +754,28 @@ fn source_variants() -> Vec<VariantV2> {
                 explained(
                     "source.texture",
                     "Texture",
-                    KindV2::Text {
-                        max_length: 64,
-                        charset: None,
+                    // A menu of the art the client ships, not a box to type a
+                    // name into. Nothing in the panel ever let an author
+                    // *declare* a texture, so a free-text field could only
+                    // ever name one that did not exist — the seven pieces of
+                    // first-party art the renderer already paints were
+                    // unreachable from the editor built to use them.
+                    KindV2::Choice {
+                        options: crate::v2::BUILTIN_TEXTURES
+                            .iter()
+                            .map(|art| ChoiceV2 {
+                                value: art.id.to_string(),
+                                label: art.label.to_string(),
+                                help: Some(match art.kind {
+                                    crate::v2::TextureKindV2::Sheet => {
+                                        "Frames, played as an animation.".to_string()
+                                    }
+                                    _ => "One strip, worn down the body.".to_string(),
+                                }),
+                            })
+                            .collect(),
                     },
-                    "The name of a texture this skin declares.",
+                    "Art the client ships. Picking one declares it for you.",
                 ),
                 field(
                     "source.fit.type",
@@ -1190,12 +1244,39 @@ pub fn describe_v2() -> SchemaV2 {
             max_ops: crate::v2::MAX_OPS_PER_SNAKE,
             max_textures: crate::v2::MAX_TEXTURE_REFS,
         },
+        builtin_textures: crate::v2::BUILTIN_TEXTURES
+            .iter()
+            .map(|art| BuiltinTextureV2 {
+                id: art.id.to_string(),
+                label: art.label.to_string(),
+                kind: match art.kind {
+                    crate::v2::TextureKindV2::Sheet => "sheet".to_string(),
+                    crate::v2::TextureKindV2::Overlay => "overlay".to_string(),
+                    crate::v2::TextureKindV2::Coat => "coat".to_string(),
+                },
+                content_ref: format!("{}{}", crate::v2::BUILTIN_TEXTURE_PREFIX, art.id),
+            })
+            .collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Declare the art the image default names.
+    ///
+    /// Read off the same constant the default is built from, so the two cannot
+    /// drift — and only that one, because a document may hold four textures and
+    /// the catalogue has seven.
+    fn declare_default_texture(doc: &mut crate::v2::SkinDocV2) {
+        let art = default_texture();
+        doc.textures.push(crate::v2::TextureRefV2 {
+            name: art.id.to_string(),
+            content_ref: format!("{}{}", crate::v2::BUILTIN_TEXTURE_PREFIX, art.id),
+            kind: art.kind,
+        });
+    }
     use crate::v2::{LayerV2, SkinDocV2, SourceV2, validate_v2};
 
     fn base_document() -> SkinDocV2 {
@@ -1240,12 +1321,10 @@ mod tests {
 
             let mut doc = base_document();
             // A texture layer names a texture, so the document has to declare
-            // one for the default to be checkable at all.
-            doc.textures.push(crate::v2::TextureRefV2 {
-                name: String::new(),
-                content_ref: format!("sha256:{}", "a".repeat(64)),
-                kind: crate::v2::TextureKindV2::Coat,
-            });
+            // one for the default to be checkable at all — and it has to be the
+            // one the menu's default actually picks, which is the point of the
+            // menu: a document may only name art it declares.
+            declare_default_texture(&mut doc);
             doc.layers.push(layer);
 
             if let Err(errors) = validate_v2(&doc) {
@@ -1307,11 +1386,7 @@ mod tests {
                 });
 
             let mut doc = base_document();
-            doc.textures.push(crate::v2::TextureRefV2 {
-                name: String::new(),
-                content_ref: format!("sha256:{}", "b".repeat(64)),
-                kind: crate::v2::TextureKindV2::Coat,
-            });
+            declare_default_texture(&mut doc);
             doc.layers.push(LayerV2 {
                 name: "Test".to_string(),
                 boost_only: false,
