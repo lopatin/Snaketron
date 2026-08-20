@@ -707,6 +707,15 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
   const [document, setDocument] = useState<Document | null>(null);
   const [selected, setSelected] = useState(0);
   const [problems, setProblems] = useState<string[]>([]);
+  /**
+   * Whether a save has been turned away for want of a name.
+   *
+   * The document is invalid without one from the first keystroke, but saying
+   * so from the first keystroke is scolding somebody for not having finished
+   * yet. The rule only becomes news at the moment it stops you.
+   */
+  const [nameRefused, setNameRefused] = useState(false);
+  const nameRef = useRef<HTMLInputElement | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [cost, setCost] = useState<Cost | null>(null);
   const [skin, setSkin] = useState<SkinSummary | null>(null);
@@ -718,6 +727,12 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
 
   const handle = useMemo(() => `draft:${skinId ?? 'new'}`, [skinId]);
   const valid = problems.length === 0;
+  // The schema owns the limit; reading it here keeps the field and the
+  // validator from disagreeing about what a too-long name is.
+  const nameLimit = useMemo(() => {
+    const field = schema?.document.find((each) => each.path === 'name');
+    return field?.kind.control === 'text' ? field.kind.maxLength : 48;
+  }, [schema]);
 
   useEffect(() => {
     let cancelled = false;
@@ -790,7 +805,14 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
     if (!wasm || !document) {
       return;
     }
-    const json = JSON.stringify(document);
+    // The validator wants a display name and is right to; a draft nobody has
+    // named yet is not a bug, it is a draft. It previews under a stand-in so
+    // the missing name is the save's business rather than the renderer's, and
+    // so one blank field cannot blank the whole page.
+    const named = String(document.name ?? '').trim()
+      ? document
+      : { ...document, name: 'Untitled skin' };
+    const json = JSON.stringify(named);
     try {
       setCost(JSON.parse(wasm.skinCostV2(json)) as Cost);
     } catch {
@@ -804,6 +826,13 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
       setProblems(String(cause).split('\n').filter(Boolean));
     }
   }, [document, handle]);
+
+  const unnamed = !String(document?.name ?? '').trim();
+  const shownProblems = useMemo(
+    () =>
+      nameRefused && unnamed ? [...problems, 'name — a skin needs a display name'] : problems,
+    [problems, nameRefused, unnamed],
+  );
 
   const layers = useMemo(
     () => (Array.isArray(document?.layers) ? (document.layers as Layer[]) : []),
@@ -929,10 +958,15 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
     if (!document) {
       return;
     }
+    if (!String(document.name ?? '').trim()) {
+      setNameRefused(true);
+      nameRef.current?.focus();
+      return;
+    }
     setSaving(true);
     setStatus(null);
     try {
-      const name = (document.name as string) ?? 'My skin';
+      const name = String(document.name).trim();
       if (skin) {
         setSkin(await api.updateSkin(skin.skinId, { name, document }));
         setStatus('Saved.');
@@ -995,7 +1029,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
                 type="button"
                 key={template.id}
                 className="builder-template"
-                onClick={() => setDocument(template.document)}
+                onClick={() => setDocument({ ...template.document, name: '' })}
               >
                 <strong>{template.label}</strong>
                 {/* The skin itself, painted by the real renderer and moving,
@@ -1033,9 +1067,9 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           <h1 className="builder-title">Skin Builder</h1>
         </div>
 
-        {problems.length > 0 ? (
+        {shownProblems.length > 0 ? (
           <ul className="builder-problems" role="alert">
-            {problems.map((problem) => (
+            {shownProblems.map((problem) => (
               <li key={problem}>{problem}</li>
             ))}
           </ul>
@@ -1053,6 +1087,26 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
               field in the pane beside them. A preview you have to scroll back
               up to is not a preview of what you are currently doing. */}
           <div className="builder-sidebar">
+            {/* The skin's name, in the same field the front page asks for a
+                nickname in. It is the one property of the document that is not
+                a rendering choice, so it sits above the picture rather than
+                filed under Skin settings with the cycle length. No label: a
+                placeholder says the same thing and takes no room from a column
+                this narrow. */}
+            <input
+              ref={nameRef}
+              type="text"
+              className="w-full bg-white px-4 py-3 text-base border-2 border-gray-300 rounded-lg transition-colors focus:outline-none focus:border-blue-500"
+              value={String(document.name ?? '')}
+              onChange={(event) => {
+                setNameRefused(false);
+                changeDocument('name', event.target.value);
+              }}
+              placeholder="Skin name"
+              maxLength={nameLimit}
+              aria-label="Skin name"
+            />
+
             <PreviewDeck handle={handle} revision={revision} valid={valid} />
 
             <aside className="builder-stack" aria-label="Layers">
@@ -1170,18 +1224,20 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           <summary>Skin settings</summary>
           {schema ? (
             <form onSubmit={(event) => event.preventDefault()}>
-              {schema.document.map((field) => (
-                <Control
-                  key={field.path}
-                  field={field}
-                  scope={document}
-                  literals={literals}
-                  onChange={changeDocument}
-                  onDrop={(path) =>
-                    setDocument((held) => (held ? (drop(held, path) as Document) : held))
-                  }
-                />
-              ))}
+              {schema.document
+                .filter((field) => field.path !== 'name')
+                .map((field) => (
+                  <Control
+                    key={field.path}
+                    field={field}
+                    scope={document}
+                    literals={literals}
+                    onChange={changeDocument}
+                    onDrop={(path) =>
+                      setDocument((held) => (held ? (drop(held, path) as Document) : held))
+                    }
+                  />
+                ))}
             </form>
           ) : null}
         </details>
