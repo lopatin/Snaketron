@@ -254,6 +254,39 @@ pub struct CheckoutToken {
     pub price_usd_cents: u32,
 }
 
+/// One pack, as the top-up surface presents it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct BuxPack {
+    pub sku: String,
+    pub bux: u32,
+    pub price_usd_cents: u32,
+}
+
+/// What is on sale.
+///
+/// The two tables are joined here rather than in the client, so a SKU that
+/// gained a value without gaining a price is absent from the shop instead of
+/// being offered at nothing.
+pub async fn list_packs() -> Response {
+    let packs: Vec<BuxPack> = PACKS
+        .iter()
+        .filter_map(|(sku, bux)| {
+            PACK_PRICES_USD_CENTS
+                .iter()
+                .find(|(id, _)| id == sku)
+                .map(|(_, cents)| BuxPack {
+                    sku: (*sku).to_string(),
+                    bux: *bux,
+                    price_usd_cents: *cents,
+                })
+        })
+        .collect();
+    Json(packs).into_response()
+}
+
 /// Mint a checkout token for one pack.
 ///
 /// The user and the amount are bound *here*, server-side. If the client

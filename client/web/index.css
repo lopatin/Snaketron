@@ -3809,41 +3809,60 @@ body {
    controls rather than two visual languages sharing a row. A link rather
    than a readout, because the useful next thing to do with a balance is
    spend it. */
+/* The balance, unboxed.
+   A bordered chip made the number look like one more control in a row of
+   controls; the coin says what it is faster than a border and a unit ever did,
+   so the container goes and the icon carries it. */
 .home-bux-chip {
   display: flex;
   height: 40px;
   flex: none;
-  align-items: baseline;
-  gap: 4px;
-  border: 2px solid #d1d5db;
-  border-radius: 8px;
-  background: #fff;
-  padding: 0 11px;
-  color: rgb(0 0 0 / 60%);
-  text-decoration: none;
-  transition: border-color 150ms ease, color 150ms ease;
-}
-
-.home-bux-chip:hover,
-.home-bux-chip:focus-visible {
-  border-color: #3b82f6;
-  color: rgb(0 0 0 / 80%);
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  padding: 0 4px;
+  cursor: pointer;
 }
 
 .home-bux-amount {
-  align-self: center;
-  color: var(--game-graphite);
-  font-size: 13px;
+  color: #f5b81c;
+  font-size: 15px;
   font-weight: 900;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
+  /* Gold on white is a low-contrast pairing at any weight. A hard, unblurred
+     dark edge holds the digits together without dimming the colour, which a
+     darker gold would have done. */
+  text-shadow:
+    0 1px 0 rgb(63 39 0 / 34%),
+    0 -1px 0 rgb(63 39 0 / 20%),
+    1px 0 0 rgb(63 39 0 / 24%),
+    -1px 0 0 rgb(63 39 0 / 24%);
+  transition: color 150ms ease, transform 150ms ease;
 }
 
-.home-bux-unit {
-  align-self: center;
-  font-size: 8.5px;
-  font-weight: 900;
-  letter-spacing: 0.095em;
+.home-bux-chip:hover .home-bux-amount,
+.home-bux-chip:focus-visible .home-bux-amount {
+  color: #ffc93c;
+}
+
+.home-bux-chip:hover .snake-bux-icon {
+  transform: scale(1.07);
+}
+
+.home-bux-chip:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.snake-bux-icon {
+  display: inline-block;
+  flex: none;
+  transition: transform 150ms ease;
+  user-select: none;
+  vertical-align: -2px;
 }
 
 .home-account-action {
@@ -7618,12 +7637,98 @@ a.home-social-icon:hover {
   background: #f9fafb;
 }
 
-/* Marked by a rule and a badge rather than a tint. The preview canvas paints
-   the arena's own white behind the snake, so any coloured row background shows
-   as a white block around the art — the equipped row was the one place that
-   was visible. */
+/* Equipped: tinted, and barred on both sides.
+   The canvas is handed the same tint (see `EQUIPPED_FIELD`), because it paints
+   opaquely — a body crossing itself fills the gap with the field colour — so a
+   row that tinted only around the canvas would frame the art in white.
+   Two rules rather than one: a single left rule is the reflex, and a pair reads
+   as a thing bracketed rather than a thing listed. */
 .skins-row.is-equipped {
-  box-shadow: inset 3px 0 0 var(--game-blue);
+  background: #eff6ff;
+  box-shadow: inset 3px 0 0 var(--game-blue), inset -3px 0 0 var(--game-blue);
+}
+
+.skins-row.is-equipped:hover,
+.skins-row.is-equipped:focus-within {
+  background: #e6f0ff;
+}
+
+/* The row is a target; the action on it is a different target.
+   Three layers, and the order is the whole trick: the row's contents sit at the
+   bottom, an invisible full-bleed button covers them, and the action column
+   rises back above it. So a click anywhere — art, name, price, the gaps
+   between them — opens the skin, and only the button that does something else
+   is out of reach. Putting the cover *under* the contents instead left just the
+   leftover whitespace clickable, which is a target nobody can find. */
+.skins-row.is-openable {
+  position: relative;
+  cursor: pointer;
+}
+
+.skins-row.is-openable .skins-row-preview,
+.skins-row.is-openable .skins-row-meta {
+  position: relative;
+  z-index: 0;
+}
+
+.skins-row-open {
+  position: absolute;
+  z-index: 1;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  inset: 0;
+  cursor: pointer;
+}
+
+.skins-row-open:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: -3px;
+}
+
+.skins-row-action {
+  position: relative;
+  z-index: 2;
+  /* Transparent to the pointer except where a control actually is, so the
+     empty half of this column still opens the skin like the rest of the row. */
+  pointer-events: none;
+}
+
+.skins-row-action > * {
+  pointer-events: auto;
+}
+
+/* Every row carrying a button turns the list into a wall of buttons, so the
+   action appears for the row you are actually pointing at. Reserved space
+   rather than none, so rows do not resize as the pointer crosses them. */
+.skins-row-cta {
+  opacity: 0;
+  transition: opacity 120ms ease, border-color 140ms ease, background-color 140ms ease;
+}
+
+.skins-row:hover .skins-row-cta,
+.skins-row:focus-within .skins-row-cta,
+.skins-row-cta:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  /* Nothing hovers on a touch screen, so the action is simply always there. */
+  .skins-row-cta {
+    opacity: 1;
+  }
+}
+
+.skins-row-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.skins-row-lock {
+  margin-right: 4px;
+  opacity: 0.75;
+  vertical-align: -1px;
 }
 
 /* Fixture poses paint at their own arena coordinates, so the canvas is larger
@@ -7699,15 +7804,18 @@ a.home-social-icon:hover {
 
 /* Equipped is a state, not an action, so it reads as a marker rather than a
    button you could press. Mirrors the results card's promoted pill. */
+/* A statement of fact, not an offer. In the button's blue-on-blue it read as
+   something to press — and pressing the thing that says "equipped" is the one
+   action a row in this state has nothing to do with. */
 .skins-equipped-badge {
   display: inline-flex;
   min-height: 32px;
   align-items: center;
-  border: 1px solid var(--game-blue);
+  border: 1px solid rgb(63 63 65 / 45%);
   border-radius: 5px;
-  background: #eff6ff;
+  background: transparent;
   padding: 0 13px;
-  color: var(--game-blue);
+  color: var(--game-graphite);
   font-size: 9px;
   font-style: italic;
   font-weight: 900;
@@ -8832,4 +8940,421 @@ a.home-social-icon:hover {
   font-weight: 800;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+}
+
+/* --- The shop: wallet, skin page, and the spend confirmation ---------------
+   The match-break dialog's look, which is the house style for a modal: a white
+   wash rather than a grey scrim, a hard graphite border, and an offset shadow
+   with no blur. Restated rather than borrowed from `generate-*`, which is named
+   for what it generates — but the values come from there, and a change to one
+   should be a change to both. */
+.shop-backdrop {
+  position: fixed;
+  z-index: 9998;
+  inset: 0;
+  display: grid;
+  animation: ad-break-backdrop-in 160ms ease-out both;
+  backdrop-filter: blur(9px);
+  background: rgb(248 250 252 / 92%);
+  padding: 20px;
+  place-items: center;
+  -webkit-backdrop-filter: blur(9px);
+}
+
+.shop-dialog {
+  display: flex;
+  position: relative;
+  box-sizing: border-box;
+  max-height: calc(100dvh - 40px);
+  flex-direction: column;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  animation: ad-break-dialog-in 180ms ease-out both;
+  background: var(--game-paper);
+  box-shadow: 8px 8px 0 rgb(63 63 65 / 16%);
+  outline: none;
+  padding: 26px 26px 22px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.shop-dialog.is-wallet {
+  width: min(100%, 430px);
+}
+
+.shop-dialog.is-skin {
+  width: min(100%, 640px);
+}
+
+.shop-dialog.is-get {
+  width: min(100%, 380px);
+}
+
+.shop-kicker {
+  color: rgb(63 63 65 / 52%);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.shop-dialog h2 {
+  margin: 2px 0 14px;
+  color: var(--game-graphite);
+  font-size: 26px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.shop-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: rgb(63 63 65 / 55%);
+  font-size: 21px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.shop-close:hover {
+  background: rgb(63 63 65 / 8%);
+  color: var(--game-graphite);
+}
+
+/* --- Wallet --- */
+.shop-balance {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fffdf6;
+  padding: 14px 16px;
+}
+
+.shop-balance strong {
+  color: #b57c05;
+  font-size: 27px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.shop-balance span {
+  color: rgb(63 63 65 / 55%);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.shop-shortfall {
+  margin: 12px 0 0;
+  border-left: 3px solid var(--game-blue);
+  padding-left: 11px;
+  color: rgb(63 63 65 / 78%);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.shop-shortfall strong {
+  color: var(--game-graphite);
+}
+
+.shop-error {
+  margin: 12px 0 0;
+  border-left: 3px solid #dc2626;
+  padding-left: 11px;
+  color: #b91c1c;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.shop-packs {
+  display: grid;
+  margin: 16px 0 0;
+  padding: 0;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  list-style: none;
+}
+
+.shop-pack {
+  display: flex;
+  position: relative;
+  width: 100%;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  border: 2px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 13px 8px 11px;
+  cursor: pointer;
+  transition: border-color 140ms ease, transform 140ms ease;
+}
+
+.shop-pack:hover:not(:disabled) {
+  border-color: #f5b81c;
+  transform: translateY(-1px);
+}
+
+.shop-pack:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.shop-pack.is-enough {
+  border-color: #f5b81c;
+}
+
+.shop-pack-bux {
+  color: #b57c05;
+  font-size: 17px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.shop-pack-price {
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.shop-pack-flag {
+  position: absolute;
+  top: -8px;
+  right: 8px;
+  border-radius: 999px;
+  background: #f5b81c;
+  padding: 2px 7px;
+  color: #4a3200;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.shop-note {
+  margin: 14px 0 0;
+  color: rgb(63 63 65 / 50%);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* --- A skin's own page --- */
+.skin-shots {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px;
+}
+
+.skin-shot {
+  display: flex;
+  margin: 0;
+  align-items: center;
+  gap: 14px;
+}
+
+.skin-shot-crop {
+  display: block;
+  flex: none;
+  overflow: hidden;
+}
+
+.skin-shot canvas {
+  display: block;
+}
+
+.skin-shot figcaption {
+  color: rgb(63 63 65 / 45%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.skin-stats {
+  display: grid;
+  margin: 14px 0 0;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.skin-stats div {
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.skin-stats dt {
+  color: rgb(63 63 65 / 48%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.skin-stats dd {
+  display: flex;
+  margin: 3px 0 0;
+  align-items: center;
+  gap: 5px;
+  color: var(--game-graphite);
+  font-size: 13px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.skin-stat-price {
+  color: #b57c05;
+}
+
+.skin-actions {
+  display: flex;
+  margin-top: 16px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.skin-cta {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 18px;
+  font-size: 11px;
+}
+
+/* --- Spending --- */
+.get-preview {
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 12px;
+}
+
+.get-sums {
+  margin: 15px 0 0;
+}
+
+.get-sums div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+}
+
+.get-sums dt {
+  color: rgb(63 63 65 / 60%);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.get-sums dd {
+  display: flex;
+  margin: 0;
+  align-items: center;
+  gap: 5px;
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.get-sums dd.is-cost {
+  color: #b45309;
+}
+
+.get-sums-total {
+  border-top: 1px solid #e1e3e7;
+  margin-top: 2px;
+}
+
+.get-actions {
+  display: flex;
+  margin-top: 16px;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.get-actions .game-shell-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+}
+
+/* --- The receipt --- */
+.skin-toast {
+  display: flex;
+  position: fixed;
+  z-index: 9999;
+  bottom: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 9px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  animation: skin-toast-in 220ms ease-out both;
+  background: var(--game-paper);
+  box-shadow: 5px 5px 0 rgb(63 63 65 / 16%);
+  padding: 11px 16px;
+  color: var(--game-graphite);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.skin-toast-tick {
+  color: #15803d;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+@keyframes skin-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 14px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skin-toast {
+    animation: none;
+    transform: translateX(-50%);
+  }
+}
+
+@media (max-width: 620px) {
+  .skin-stats {
+    grid-template-columns: 1fr;
+  }
+
+  .shop-packs {
+    grid-template-columns: 1fr;
+  }
 }

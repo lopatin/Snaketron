@@ -16,6 +16,7 @@ import {
 import type { CheckUsernameResponse } from '../types/generated';
 import { getOrCreateAnonId } from '../utils/anonId';
 import type { PlayerLobbyResponse } from '../types/generated';
+import type { BuxPack, CheckoutToken } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
 import type { PublicGameResponse } from '../types/generated';
@@ -504,6 +505,19 @@ class API {
     return this.request<Equipment>('/api/users/me/equipped', {
       method: 'PUT',
       body: JSON.stringify(request),
+    });
+  }
+
+  /** What a player can buy Snake Bux in. */
+  async buxPacks(): Promise<BuxPack[]> {
+    return this.request<BuxPack[]>('/api/wallet/packs');
+  }
+
+  /** Mint a checkout token for one pack; the provider hosts the rest. */
+  async buxCheckoutToken(sku: string): Promise<CheckoutToken> {
+    return this.request<CheckoutToken>('/api/wallet/xsolla/checkout-token', {
+      method: 'POST',
+      body: JSON.stringify({ sku }),
     });
   }
 

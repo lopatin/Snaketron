@@ -916,6 +916,12 @@ pub fn render_roster_snake(
 /// `pose` names a fixture body (the corpus or a preview-only one); `role` is
 /// one of `own`,
 /// `teammate`, `enemy`, `spectated0`, `spectated1`, or `ffa0`..`ffa3`.
+///
+/// `field_color` is what to paint behind the snake, and it is not merely
+/// cosmetic: the same colour fills the canvas and fills the gap a crossing body
+/// leaves over itself, so a caller that tints the surface around the canvas has
+/// to be able to tint both together. Left unset it is the arena's own field,
+/// which is what every surface but a tinted row wants.
 #[wasm_bindgen(js_name = renderSkinFixture)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_skin_fixture(
@@ -928,7 +934,9 @@ pub fn render_skin_fixture(
     dead: bool,
     anim_ms: f64,
     reduced_motion: bool,
+    field_color: Option<String>,
 ) -> Result<(), JsValue> {
+    let field = field_color.as_deref().unwrap_or(ARENA_FIELD_COLOR);
     let Some(fixture) = crate::skin::fixtures::pose_by_name(pose) else {
         return Err(JsValue::from_str(&format!(
             "no fixture pose named `{pose}`"
@@ -943,7 +951,7 @@ pub fn render_skin_fixture(
         .dyn_into::<web_sys::CanvasRenderingContext2d>()
         .map_err(|_| JsValue::from_str("failed to cast the fixture 2d context"))?;
     ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
-    ctx.set_fill_style_str(ARENA_FIELD_COLOR);
+    ctx.set_fill_style_str(field);
     ctx.fill_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
 
     let skin = skin_registry().resolve(Some(skin_ref));
@@ -963,7 +971,7 @@ pub fn render_skin_fixture(
     if dead {
         skin.paint_dead(&mut paint, &posed)
     } else {
-        paint_alive_with_occlusion(&mut paint, skin, &posed, &identity, Some(ARENA_FIELD_COLOR))
+        paint_alive_with_occlusion(&mut paint, skin, &posed, &identity, Some(field))
     }
 }
 

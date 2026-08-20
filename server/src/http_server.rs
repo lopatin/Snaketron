@@ -368,6 +368,7 @@ pub async fn install_http_application(
             post(skins::report_skin).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
         )
         .route("/api/wallet", get(wallet_api::get_wallet))
+        .route("/api/wallet/packs", get(wallet_api::list_packs))
         .route("/api/textures", get(textures::list_mine))
         // Generation is slow and costs money per attempt, so the route that
         // starts one is rate limited as well as quota'd inside the handler.

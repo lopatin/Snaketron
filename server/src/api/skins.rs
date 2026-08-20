@@ -753,8 +753,15 @@ pub async fn get_document_by_ref(
     // reason to hold this reference — but its author does. They have to be
     // able to see their own skin on their own Skins page before anyone has
     // approved it, and this route is where the picture comes from.
-    let was_public =
-        revision.exposed_at_ms.is_some() || skin.published_revision == Some(revision.revision);
+    // A content reference names bytes, not a revision — and two revisions can
+    // hold the same bytes, which is exactly what saving twice without changing
+    // anything produces. Resolution then returns whichever twin it finds, so a
+    // check that only compared revision numbers would 404 a document that is
+    // demonstrably published: the skin's own published reference is these very
+    // bytes. Asking about the bytes first is both simpler and correct.
+    let was_public = skin.published_content_ref.as_deref() == Some(content_ref.as_str())
+        || revision.exposed_at_ms.is_some()
+        || skin.published_revision == Some(revision.revision);
     if !was_public {
         let may_read = auth_user
             .as_ref()

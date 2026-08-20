@@ -15,6 +15,8 @@ import {
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
 import { useWallet } from '../contexts/WalletContext';
 import { BUX_UNIT, formatBux, shouldShowBuxChip } from '../utils/walletChip';
+import SnakeBuxIcon from './SnakeBuxIcon';
+import WalletModal from './WalletModal';
 import { useFullscreen } from '../hooks/useFullscreen';
 import { useInputSurface } from '../hooks/useInputSurface';
 
@@ -47,6 +49,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
 }) => {
   const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
   const { balanceBux } = useWallet();
+  const [walletOpen, setWalletOpen] = useState(false);
   const fullscreen = useFullscreen();
   const inputSurface = useInputSurface();
   // The CrazyGames portal owns fullscreen chrome, and desktop users have F11;
@@ -212,15 +215,16 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
               two-child flexbox with `space-between`, so a third top-level child
               would silently re-third the layout and move both existing groups. */}
           {shouldShowBuxChip(Boolean(currentUser), balanceBux) && (
-            <Link
-              to="/skins"
+            <button
+              type="button"
               className="home-bux-chip"
               title={`${formatBux(balanceBux)} ${BUX_UNIT}`}
+              onClick={() => setWalletOpen(true)}
               data-testid="home-bux-chip"
             >
+              <SnakeBuxIcon size={22} />
               <span className="home-bux-amount">{formatBux(balanceBux)}</span>
-              <span className="home-bux-unit">{BUX_UNIT}</span>
-            </Link>
+            </button>
           )}
           {showFullscreenToggle && (
             <button
@@ -448,6 +452,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
             </button>
           )}
         </div>
+      {walletOpen ? <WalletModal onClose={() => setWalletOpen(false)} /> : null}
     </header>
   );
 };

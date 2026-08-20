@@ -9,6 +9,7 @@ export * from './Challenge';
 export * from './ChallengeInbox';
 export * from './ChallengeState';
 export * from './BrowseResponse';
+export * from './BuxPack';
 export * from './CatalogEntry';
 export * from './CheckUsernameResponse';
 export * from './CheckoutToken';
