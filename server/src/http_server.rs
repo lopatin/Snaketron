@@ -495,6 +495,11 @@ pub async fn install_http_application(
         )
         .with_state(auth_state.clone());
 
+    // Optional auth, not none: every route here serves an anonymous caller,
+    // and three of them serve a signed-in one *more* — your own skins, your own
+    // skin, and the document behind a draft only you can see. Without this the
+    // extension is never installed, `filter=mine` can only answer 401, and a
+    // skin you have made but not published is invisible on your own Skins page.
     let skin_document_routes = Router::new()
         .route(
             "/api/skins/by-ref/:content_ref",
@@ -506,6 +511,10 @@ pub async fn install_http_application(
             get(textures::get_manifest),
         )
         .route("/api/skins/:skin_id", get(skins::get_skin))
+        .layer(middleware::from_fn_with_state(
+            auth_middleware_state.clone(),
+            crate::api::middleware::optional_auth_middleware,
+        ))
         .with_state(auth_state.clone());
 
     // Replay and highlight reads are intentionally anonymous. At launch all

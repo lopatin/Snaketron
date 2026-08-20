@@ -1153,6 +1153,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
             type="button"
             className="game-shell-button builder-generate"
             onClick={() => setGenerating(true)}
+            aria-label="Generate"
           >
             <span className="builder-generate-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor">
@@ -1164,7 +1165,18 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
                 <path d="M5.2 15.4l.6 1.6 1.6.6-1.6.6-.6 1.6-.6-1.6-1.6-.6 1.6-.6z" />
               </svg>
             </span>
-            Generate
+            {/* One span per letter so a colour can travel through the word
+                rather than the whole label changing at once — a wave reads as
+                a thing asking to be clicked, a flash reads as a glitch. The
+                letters are hidden from assistive tech and the button carries
+                the word, because "G, e, n, …" is not a label. */}
+            <span className="builder-generate-label" aria-hidden="true">
+              {'Generate'.split('').map((letter, at) => (
+                <span key={at} style={{ animationDelay: `${at * 60}ms` }}>
+                  {letter}
+                </span>
+              ))}
+            </span>
           </button>
         </div>
 
@@ -1302,16 +1314,13 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
             </h2>
             {current && schema ? (
               <form onSubmit={(event) => event.preventDefault()}>
-                {schema.layer.map((field) => (
-                  <Control
-                    key={field.path}
-                    field={field}
-                    scope={current}
-                    literals={literals}
-                    onChange={(path, value) => changeLayer(selected, path, value)}
-                    onDrop={(path) => dropLayerPath(selected, path)}
-                  />
-                ))}
+                <FieldList
+                  fields={schema.layer}
+                  scope={current}
+                  literals={literals}
+                  onChange={(path, value) => changeLayer(selected, path, value)}
+                  onDrop={(path) => dropLayerPath(selected, path)}
+                />
               </form>
             ) : (
               <p className="builder-note">
@@ -1325,20 +1334,15 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           <summary>Skin settings</summary>
           {schema ? (
             <form onSubmit={(event) => event.preventDefault()}>
-              {schema.document
-                .filter((field) => field.path !== 'name')
-                .map((field) => (
-                  <Control
-                    key={field.path}
-                    field={field}
-                    scope={document}
-                    literals={literals}
-                    onChange={changeDocument}
-                    onDrop={(path) =>
-                      setDocument((held) => (held ? (drop(held, path) as Document) : held))
-                    }
-                  />
-                ))}
+              <FieldList
+                fields={schema.document.filter((field) => field.path !== 'name')}
+                scope={document}
+                literals={literals}
+                onChange={changeDocument}
+                onDrop={(path) =>
+                  setDocument((held) => (held ? (drop(held, path) as Document) : held))
+                }
+              />
             </form>
           ) : null}
         </details>
@@ -1495,6 +1499,58 @@ const TemplatePreview: React.FC<{ template: Template }> = ({ template }) => {
         style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
       />
     </span>
+  );
+};
+
+/**
+ * Lay out a list of fields, letting consecutive toggles share a row.
+ *
+ * A toggle is a checkbox and three words; giving each its own line in a column
+ * of full-width inputs spaces them as though they were unrelated to each other
+ * and to everything around them. Runs are grouped rather than specific pairs
+ * named, so the rule is a layout fact — "toggles sit together" — and not a list
+ * of field paths to keep in sync with the schema.
+ */
+const FieldList: React.FC<{
+  fields: FieldV2[];
+  scope: Record<string, unknown>;
+  literals: string[];
+  onChange: (path: string, value: unknown) => void;
+  onDrop: (path: string) => void;
+}> = ({ fields, scope, literals, onChange, onDrop }) => {
+  const rows: FieldV2[][] = [];
+  for (const field of fields) {
+    const previous = rows[rows.length - 1];
+    const isToggle = field.kind.control === 'toggle';
+    if (isToggle && previous && previous[0].kind.control === 'toggle') {
+      previous.push(field);
+    } else {
+      rows.push([field]);
+    }
+  }
+
+  return (
+    <>
+      {rows.map((row) => {
+        const controls = row.map((field) => (
+          <Control
+            key={field.path}
+            field={field}
+            scope={scope}
+            literals={literals}
+            onChange={onChange}
+            onDrop={onDrop}
+          />
+        ));
+        return row.length === 1 ? (
+          controls[0]
+        ) : (
+          <div className="builder-toggle-row" key={row[0].path}>
+            {controls}
+          </div>
+        );
+      })}
+    </>
   );
 };
 

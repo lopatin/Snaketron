@@ -282,6 +282,14 @@ interface SkinRowProps {
   previewRef?: string;
   /** Who made it, for player-authored skins. Built-ins have no byline. */
   byline?: string;
+  /**
+   * A word about this skin's standing, for skins you made.
+   *
+   * Only yours can be listed while unpublished, so without this a private
+   * draft and a published skin look identical on a page that is showing you
+   * both — and the difference is exactly what you would want to know.
+   */
+  status?: string;
   slot: Slot;
   isEquipped: boolean;
   canEquip: boolean;
@@ -297,6 +305,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
   entry,
   previewRef,
   byline,
+  status,
   slot,
   isEquipped,
   canEquip,
@@ -337,6 +346,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
       <div className="skins-row-meta">
         <span className="skins-row-name">{entry.name}</span>
         {byline ? <span className="skins-row-byline">by {byline}</span> : null}
+        {status ? <span className="skins-row-status">{status}</span> : null}
         <span className={`skins-row-price${entry.priceBux > 0 ? ' is-priced' : ''}`}>
           {entry.priceBux === 0 ? 'Free' : `${entry.priceBux} BB`}
         </span>
@@ -403,21 +413,37 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
 
   useEffect(() => {
     let cancelled = false;
-    // Built-ins and player-authored skins are two different lists on the
-    // server — one is compiled in, the other is stored — and one list to a
-    // player. Authored skins go first: they are the new thing, and a catalogue
-    // that buries them under nineteen built-ins is not much of a shop window.
+    const empty = { skins: [] as SkinSummary[], cursor: null };
+    // Three lists, because they answer three different questions and only the
+    // server can answer any of them: what this build ships, what other players
+    // have published, and what *you* have. The last one is the reason a page
+    // like this exists at all — a skin you made but have not published is
+    // invisible to the published list by design, so a page built only from
+    // that list can never show you your own work.
     void Promise.all([
       api.browseSkins('snake'),
       api.browseSkins('base'),
-      api.browseAuthoredSkins('snake').catch(() => ({ skins: [], cursor: null })),
+      api.browseAuthoredSkins('snake').catch(() => empty),
+      user ? api.browseAuthoredSkins('snake', 'mine').catch(() => empty) : Promise.resolve(empty),
     ])
-      .then(([snakes, bases, authored]) => {
+      .then(([snakes, bases, published, mine]) => {
         if (cancelled) {
           return;
         }
+        // `mine` is listed by creator rather than by slot, so anything that is
+        // not a snake is dropped here rather than being drawn as one.
+        const merged: SkinSummary[] = mine.skins.filter((skin) => skin.kind === 'snake');
+        for (const skin of published.skins) {
+          if (!merged.some((held) => held.reference === skin.reference)) {
+            merged.push(skin);
+          }
+        }
+
+        // Yours first, then everyone else's, then the built-ins: a catalogue
+        // that buries what you made under nineteen shipped skins is not much
+        // of a wardrobe.
         setSnakeSkins([
-          ...authored.skins.map(
+          ...merged.map(
             (skin): CatalogEntry => ({
               reference: skin.reference,
               name: skin.name,
@@ -427,7 +453,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
           ),
           ...snakes.skins,
         ]);
-        setAuthored(authored.skins);
+        setAuthored(merged);
         setBaseSkins(bases.skins);
       })
       .catch(() => {
@@ -438,7 +464,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [user]);
 
   // Painting an authored skin means having its document. This waits for both
   // halves — the list, and the wasm module to register into — because the
@@ -596,12 +622,14 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       <main className="skins-main">
         <div className="skins-intro">
           <h1 className="skins-title">SKINS</h1>
-          <p className="skins-subtitle">
-            Pick how your snake looks to everyone else, and how your side of the
-            arena looks to you.
-          </p>
           <div className="skins-intro-actions">
-            <Link className="game-shell-button is-primary" to="/skins/builder">
+            <Link
+              className="game-shell-button is-primary skins-make-own"
+              to="/skins/builder"
+            >
+              <span className="skins-make-own-icon" aria-hidden="true">
+                +
+              </span>
               Make your own
             </Link>
           </div>
@@ -632,11 +660,29 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                           (candidate) => candidate.reference === entry.reference,
                         )?.contentRef ?? undefined
                       }
-                      byline={
-                        authored.find(
+                      byline={(() => {
+                        const match = authored.find(
                           (candidate) => candidate.reference === entry.reference,
-                        )?.creatorUsername ?? undefined
-                      }
+                        );
+                        // "by you" on your own skin is noise; the status chip
+                        // beside it already says whose it is.
+                        return match && match.creatorUserId !== user?.id
+                          ? (match.creatorUsername ?? undefined)
+                          : undefined;
+                      })()}
+                      status={(() => {
+                        const match = authored.find(
+                          (candidate) => candidate.reference === entry.reference,
+                        );
+                        if (!match || match.creatorUserId !== user?.id) {
+                          return undefined;
+                        }
+                        return match.publication === 'published'
+                          ? 'Yours · published'
+                          : match.pendingRevision !== null
+                            ? 'Yours · in review'
+                            : 'Yours · private';
+                      })()}
                       registryRevision={registryRevision}
                       isBusy={busySlot === 'snake'}
                       onEquip={(reference) => void equip('snake', reference)}
@@ -645,8 +691,11 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                           (candidate) => candidate.reference === entry.reference,
                         );
                         // Built-ins are free and already everyone's; only a
-                        // priced authored skin needs buying.
-                        return match && match.priceBux > 0
+                        // priced authored skin somebody else made needs
+                        // buying. Your own is yours at any price.
+                        return match &&
+                          match.priceBux > 0 &&
+                          match.creatorUserId !== user?.id
                           ? () => void buy(match)
                           : undefined;
                       })()}
@@ -660,10 +709,6 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             <h2 id="skins-bases-heading" className="skins-column-heading">
               Base skins
             </h2>
-            <p className="skins-column-note">
-              Base dressing themes the arena you are looking at. It is yours
-              alone — other players see their own.
-            </p>
             <ul className="skins-list" data-testid="base-skin-list">
               {ready
                 ? baseSkins.map((entry) => (

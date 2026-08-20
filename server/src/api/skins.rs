@@ -156,12 +156,28 @@ pub async fn set_equipment(
     Extension(auth_user): Extension<AuthUser>,
     Json(request): Json<EquipRequest>,
 ) -> Result<Response, SkinsApiError> {
-    let snake = validate_slot(request.selected_skin.as_ref(), SkinKind::Snake)?;
-    let base = validate_slot(request.selected_base.as_ref(), SkinKind::Base)?;
+    let snake = resolve_slot(
+        &state,
+        auth_user.user_id,
+        request.selected_skin.as_ref(),
+        SkinKind::Snake,
+    )
+    .await?;
+    let base = resolve_slot(
+        &state,
+        auth_user.user_id,
+        request.selected_base.as_ref(),
+        SkinKind::Base,
+    )
+    .await?;
 
     state
         .db
-        .set_user_equipment(auth_user.user_id, snake, base)
+        .set_user_equipment(
+            auth_user.user_id,
+            snake.as_ref().map(|slot| slot.as_deref()),
+            base.as_ref().map(|slot| slot.as_deref()),
+        )
         .await
         .map_err(SkinsApiError::Internal)?;
 
@@ -184,22 +200,35 @@ pub async fn set_equipment(
     Ok(response)
 }
 
-/// Turn one requested slot into the storage layer's three-valued form,
-/// refusing anything the catalogue does not contain.
-fn validate_slot(
-    requested: Option<&Option<String>>,
+/// What one slot of an equip request is asking for.
+///
+/// Separated from resolving it so the parsing — three-valued, trimmed, length
+/// capped, base prefix stripped — can be read and tested without a database.
+#[derive(Debug, PartialEq, Eq)]
+enum SlotRequest<'a> {
+    /// The field was absent: leave the slot as it is.
+    Untouched,
+    /// The field was null or blank: go back to the default look.
+    Cleared,
+    /// A reference, with any `base:` prefix already removed.
+    Named(&'a str),
+}
+
+/// Read one slot of the request without deciding whether it may be worn.
+fn read_slot<'a>(
+    requested: Option<&'a Option<String>>,
     kind: SkinKind,
-) -> Result<Option<Option<&'static str>>, SkinsApiError> {
+) -> Result<SlotRequest<'a>, SkinsApiError> {
     let Some(slot) = requested else {
-        return Ok(None);
+        return Ok(SlotRequest::Untouched);
     };
     let Some(reference) = slot else {
-        return Ok(Some(None));
+        return Ok(SlotRequest::Cleared);
     };
 
     let trimmed = reference.trim();
     if trimmed.is_empty() {
-        return Ok(Some(None));
+        return Ok(SlotRequest::Cleared);
     }
     if trimmed.len() > MAX_SKIN_REF_LENGTH {
         return Err(SkinsApiError::UnknownSkin(format!(
@@ -208,47 +237,95 @@ fn validate_slot(
         )));
     }
 
-    // Resolve to the catalogue's own `&'static str` rather than storing the
-    // caller's bytes: what lands in the database is then always a reference
-    // this build compiled, never merely one that compared equal to it.
-    let known = match kind {
-        SkinKind::Snake => skin_catalog::CATALOG
-            .iter()
-            .find(|entry| entry.reference == trimmed)
-            .map(|entry| entry.reference),
+    // A base is a snake reference wearing a prefix, so the prefix comes off
+    // here and goes back on whatever the reference resolves to.
+    match kind {
+        SkinKind::Snake => Ok(SlotRequest::Named(trimmed)),
         SkinKind::Base => trimmed
             .strip_prefix(BASE_REF_PREFIX)
-            .and_then(|inner| {
-                skin_catalog::CATALOG
-                    .iter()
-                    .find(|entry| entry.reference == inner)
-            })
-            .map(|entry| base_reference(entry.reference)),
-    };
-
-    known
-        .map(|reference| Some(Some(reference)))
-        .ok_or_else(|| SkinsApiError::UnknownSkin(trimmed.to_string()))
+            .filter(|inner| !inner.is_empty())
+            .map(SlotRequest::Named)
+            .ok_or_else(|| SkinsApiError::UnknownSkin(trimmed.to_string())),
+    }
 }
 
-/// The stored form of a base reference.
+/// Put a resolved inner reference back into the form the slot stores.
+fn stored_form(inner: &str, kind: SkinKind) -> String {
+    match kind {
+        SkinKind::Snake => inner.to_string(),
+        SkinKind::Base => format!("{BASE_REF_PREFIX}{inner}"),
+    }
+}
+
+/// Resolve a built-in against the compiled catalogue.
 ///
-/// Bases are snake references wearing a prefix, and the set is small and
-/// compile-time known, so the prefixed form can be a `&'static str` too rather
-/// than a string allocated per request.
-fn base_reference(snake_reference: &'static str) -> &'static str {
-    static PREFIXED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let prefixed = PREFIXED.get_or_init(|| {
-        skin_catalog::CATALOG
-            .iter()
-            .map(|entry| format!("{BASE_REF_PREFIX}{}", entry.reference))
-            .collect()
-    });
-    let index = skin_catalog::CATALOG
+/// Returns the catalogue's own string rather than the caller's bytes, so what
+/// lands in the database is always a reference this build compiled and never
+/// merely one that compared equal to it.
+fn catalogue_reference(inner: &str, kind: SkinKind) -> Option<String> {
+    skin_catalog::CATALOG
         .iter()
-        .position(|entry| entry.reference == snake_reference)
-        .expect("callers pass a reference they just found in the catalogue");
-    prefixed[index].as_str()
+        .find(|entry| entry.reference == inner)
+        .map(|entry| stored_form(entry.reference, kind))
+}
+
+/// Whether this viewer may wear this stored skin in this slot.
+///
+/// The wearability question is `Skin::content_ref_for` — the same one match
+/// preparation asks when it turns a stored reference back into something to
+/// draw — so a skin can never be equippable here and unrenderable there. It
+/// carries the three rules that matter: a creator wears their own private
+/// draft, everyone else needs an approved revision, and a disabled skin is
+/// refused to both.
+fn wearable_reference(skin: &Skin, viewer: i32, kind: SkinKind) -> Option<String> {
+    let wanted = match kind {
+        SkinKind::Snake => crate::skin_store::SkinKind::Snake,
+        SkinKind::Base => crate::skin_store::SkinKind::Base,
+    };
+    // Wrong slot is as wrong as nonexistent: a base is not a snake skin.
+    if skin.kind != wanted || skin.content_ref_for(Some(viewer)).is_none() {
+        return None;
+    }
+    Some(stored_form(&skin_id_reference(skin.skin_id), kind))
+}
+
+/// Turn one requested slot into the storage layer's three-valued form,
+/// refusing anything the caller may not wear.
+///
+/// Two kinds of reference arrive here and they are checked against different
+/// authorities. A built-in is checked against the compiled catalogue, because
+/// what this build can draw is a fact about the binary. A first-class skin
+/// (`skin:<id>`) is checked against the store, because whether it may be worn
+/// is a fact about that skin and this viewer — and it is the reason an author
+/// can equip a skin nobody else can see yet.
+async fn resolve_slot(
+    state: &AuthState,
+    viewer: i32,
+    requested: Option<&Option<String>>,
+    kind: SkinKind,
+) -> Result<Option<Option<String>>, SkinsApiError> {
+    let inner = match read_slot(requested, kind)? {
+        SlotRequest::Untouched => return Ok(None),
+        SlotRequest::Cleared => return Ok(Some(None)),
+        SlotRequest::Named(inner) => inner,
+    };
+
+    if let Some(skin_id) = crate::skin_store::equipped_skin_id(inner) {
+        let skin = state
+            .db
+            .get_skin(skin_id)
+            .await
+            .map_err(SkinsApiError::Internal)?
+            .ok_or_else(|| SkinsApiError::UnknownSkin(inner.to_string()))?;
+
+        return wearable_reference(&skin, viewer, kind)
+            .map(|reference| Some(Some(reference)))
+            .ok_or_else(|| SkinsApiError::UnknownSkin(inner.to_string()));
+    }
+
+    catalogue_reference(inner, kind)
+        .map(|reference| Some(Some(reference)))
+        .ok_or_else(|| SkinsApiError::UnknownSkin(inner.to_string()))
 }
 
 fn no_store(response: &mut Response) {
@@ -591,6 +668,7 @@ pub async fn get_skin(
 ///   uniform, so the route cannot be used to discover what exists.
 pub async fn get_document_by_ref(
     State(state): State<AuthState>,
+    auth_user: Option<Extension<AuthUser>>,
     Path(content_ref): Path<String>,
 ) -> Result<Response, SkinsApiError> {
     if !skin_schema::content::is_content_ref(&content_ref) {
@@ -610,12 +688,19 @@ pub async fn get_document_by_ref(
         return Err(SkinsApiError::Gone);
     }
 
-    // Never published and never worn means nobody has a legitimate reason to
-    // hold this reference.
+    // Never published and never worn means almost nobody has a legitimate
+    // reason to hold this reference — but its author does. They have to be
+    // able to see their own skin on their own Skins page before anyone has
+    // approved it, and this route is where the picture comes from.
     let was_public =
         revision.exposed_at_ms.is_some() || skin.published_revision == Some(revision.revision);
     if !was_public {
-        return Err(SkinsApiError::NotFound);
+        let may_read = auth_user
+            .as_ref()
+            .is_some_and(|Extension(user)| skin.may_edit(user.user_id, user.is_admin));
+        if !may_read {
+            return Err(SkinsApiError::NotFound);
+        }
     }
 
     let mut response = (
@@ -623,12 +708,21 @@ pub async fn get_document_by_ref(
         revision.document,
     )
         .into_response();
+    // The URL is the hash of the bytes, so a public revision is safe to cache
+    // hard and forever. A revision that was never public is a different
+    // matter: the same URL answers 404 for everyone but its author, and a
+    // shared cache keyed on the URL alone would hand one of them the other's
+    // answer.
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_str(&format!(
-            "public, max-age={DOCUMENT_CACHE_SECONDS}, must-revalidate"
-        ))
-        .expect("a formatted cache-control header is always valid"),
+        if was_public {
+            HeaderValue::from_str(&format!(
+                "public, max-age={DOCUMENT_CACHE_SECONDS}, must-revalidate"
+            ))
+            .expect("a formatted cache-control header is always valid")
+        } else {
+            HeaderValue::from_static("private, no-store")
+        },
     );
     response.headers_mut().insert(
         header::ETAG,
@@ -931,6 +1025,53 @@ mod tests {
         serde_json::from_str(json).expect("valid equip request")
     }
 
+    /// The built-in half of `resolve_slot`, without the database the authored
+    /// half needs. Everything a compiled reference goes through, and nothing
+    /// else, so these cases stay unit tests.
+    fn builtin_slot(
+        requested: Option<&Option<String>>,
+        kind: SkinKind,
+    ) -> Result<Option<Option<String>>, SkinsApiError> {
+        let inner = match read_slot(requested, kind)? {
+            SlotRequest::Untouched => return Ok(None),
+            SlotRequest::Cleared => return Ok(Some(None)),
+            SlotRequest::Named(inner) => inner,
+        };
+        catalogue_reference(inner, kind)
+            .map(|reference| Some(Some(reference)))
+            .ok_or_else(|| SkinsApiError::UnknownSkin(inner.to_string()))
+    }
+
+    fn stored(reference: &str) -> Option<Option<String>> {
+        Some(Some(reference.to_string()))
+    }
+
+    /// A skin as the store would hand it back.
+    fn stored_skin(
+        skin_id: i32,
+        creator: i32,
+        publication: Publication,
+        published_revision: Option<u32>,
+    ) -> Skin {
+        Skin {
+            skin_id,
+            kind: crate::skin_store::SkinKind::Snake,
+            creator_user_id: creator,
+            creator_username: Some("author".to_string()),
+            name: "Electric Keys".to_string(),
+            publication,
+            pending_revision: None,
+            price_bux: 0,
+            head_revision: published_revision.unwrap_or(1) + 1,
+            published_revision,
+            head_content_ref: "sha256:head".to_string(),
+            published_content_ref: published_revision.map(|_| "sha256:published".to_string()),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            published_at_ms: None,
+        }
+    }
+
     /// The three-valued encoding is the whole point of the request type: these
     /// three bodies must mean three different things.
     #[test]
@@ -952,11 +1093,11 @@ mod tests {
     fn an_empty_request_touches_nothing() {
         let request = equip("{}");
         assert_eq!(
-            validate_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap(),
+            builtin_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap(),
             None
         );
         assert_eq!(
-            validate_slot(request.selected_base.as_ref(), SkinKind::Base).unwrap(),
+            builtin_slot(request.selected_base.as_ref(), SkinKind::Base).unwrap(),
             None
         );
     }
@@ -964,21 +1105,21 @@ mod tests {
     #[test]
     fn a_known_skin_resolves_to_the_catalogues_own_string() {
         let request = equip(r#"{"selectedSkin":"  aurora@1  "}"#);
-        let resolved = validate_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap();
-        assert_eq!(resolved, Some(Some("aurora@1")));
+        let resolved = builtin_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap();
+        assert_eq!(resolved, stored("aurora@1"));
     }
 
     #[test]
     fn a_base_slot_only_accepts_prefixed_references() {
         let prefixed = equip(r#"{"selectedBase":"base:tidewave@1"}"#);
         assert_eq!(
-            validate_slot(prefixed.selected_base.as_ref(), SkinKind::Base).unwrap(),
-            Some(Some("base:tidewave@1"))
+            builtin_slot(prefixed.selected_base.as_ref(), SkinKind::Base).unwrap(),
+            stored("base:tidewave@1")
         );
 
         let bare = equip(r#"{"selectedBase":"tidewave@1"}"#);
         assert!(
-            validate_slot(bare.selected_base.as_ref(), SkinKind::Base).is_err(),
+            builtin_slot(bare.selected_base.as_ref(), SkinKind::Base).is_err(),
             "a bare snake reference is not a base"
         );
     }
@@ -997,7 +1138,7 @@ mod tests {
         ] {
             let request = equip(body);
             assert!(
-                validate_slot(request.selected_skin.as_ref(), SkinKind::Snake).is_err(),
+                builtin_slot(request.selected_skin.as_ref(), SkinKind::Snake).is_err(),
                 "{body} should have been refused"
             );
         }
@@ -1007,7 +1148,7 @@ mod tests {
     fn an_over_long_reference_is_refused_without_being_echoed_back() {
         let long = "a".repeat(MAX_SKIN_REF_LENGTH + 1);
         let request = equip(&format!(r#"{{"selectedSkin":"{long}"}}"#));
-        let error = validate_slot(request.selected_skin.as_ref(), SkinKind::Snake)
+        let error = builtin_slot(request.selected_skin.as_ref(), SkinKind::Snake)
             .expect_err("an over-long reference is not a skin");
         let SkinsApiError::UnknownSkin(message) = error else {
             panic!("expected an unknown-skin error");
@@ -1022,9 +1163,105 @@ mod tests {
     fn whitespace_only_is_treated_as_clearing_the_slot() {
         let request = equip(r#"{"selectedSkin":"   "}"#);
         assert_eq!(
-            validate_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap(),
+            builtin_slot(request.selected_skin.as_ref(), SkinKind::Snake).unwrap(),
             Some(None)
         );
+    }
+
+    /// The point of the whole feature: you can wear a skin you made before
+    /// anyone has approved it, because it is yours and nobody else can see it
+    /// anyway. Until this existed, saving a skin produced something that
+    /// appeared in no list and could be equipped from nowhere.
+    #[test]
+    fn a_creator_may_equip_their_own_unpublished_skin() {
+        let draft = stored_skin(1000, 42, Publication::Private, None);
+        assert_eq!(
+            wearable_reference(&draft, 42, SkinKind::Snake),
+            Some("skin:1000".to_string()),
+        );
+        assert_eq!(
+            wearable_reference(&draft, 7, SkinKind::Snake),
+            None,
+            "somebody else's private draft is not wearable"
+        );
+    }
+
+    #[test]
+    fn a_published_skin_is_wearable_by_anyone() {
+        let published = stored_skin(1000, 42, Publication::Published, Some(1));
+        assert_eq!(
+            wearable_reference(&published, 7, SkinKind::Snake),
+            Some("skin:1000".to_string()),
+        );
+    }
+
+    /// The kill switch has to beat ownership, or moderation would not be
+    /// moderation.
+    #[test]
+    fn a_disabled_skin_is_refused_even_to_the_person_who_made_it() {
+        let disabled = stored_skin(1000, 42, Publication::Disabled, Some(1));
+        assert_eq!(wearable_reference(&disabled, 42, SkinKind::Snake), None);
+        assert_eq!(wearable_reference(&disabled, 7, SkinKind::Snake), None);
+    }
+
+    /// Withdrawn stops new grants, not existing ones — taking a skin back off
+    /// someone who already has it is not a thing this system does.
+    #[test]
+    fn an_unpublished_skin_stays_wearable_for_the_people_who_have_it() {
+        let withdrawn = stored_skin(1000, 42, Publication::Unpublished, Some(1));
+        assert_eq!(
+            wearable_reference(&withdrawn, 7, SkinKind::Snake),
+            Some("skin:1000".to_string()),
+        );
+    }
+
+    /// A snake skin in the base slot is as wrong as a reference to nothing.
+    #[test]
+    fn a_stored_skin_may_only_be_worn_in_its_own_slot() {
+        let snake = stored_skin(1000, 42, Publication::Published, Some(1));
+        assert_eq!(wearable_reference(&snake, 42, SkinKind::Base), None);
+    }
+
+    /// The equipped value is rebuilt from the id, so a caller cannot smuggle
+    /// bytes of their own choosing into the field every other player reads.
+    #[test]
+    fn an_authored_reference_is_stored_in_its_canonical_form() {
+        let skin = stored_skin(1000, 42, Publication::Published, Some(1));
+        assert_eq!(
+            wearable_reference(&skin, 42, SkinKind::Snake),
+            Some(skin_id_reference(1000)),
+        );
+    }
+
+    /// Parsing is separate from resolving, and it is what strips the prefix a
+    /// base wears — including for an authored base.
+    #[test]
+    fn reading_a_slot_strips_the_base_prefix_and_nothing_else() {
+        let snake = Some(Some("skin:1000".to_string()));
+        assert_eq!(
+            read_slot(snake.as_ref(), SkinKind::Snake).unwrap(),
+            SlotRequest::Named("skin:1000"),
+        );
+
+        let base = Some(Some("base:skin:1000".to_string()));
+        assert_eq!(
+            read_slot(base.as_ref(), SkinKind::Base).unwrap(),
+            SlotRequest::Named("skin:1000"),
+        );
+
+        let bare = Some(Some("base:".to_string()));
+        assert!(
+            read_slot(bare.as_ref(), SkinKind::Base).is_err(),
+            "a prefix with nothing behind it names no skin"
+        );
+    }
+
+    /// A `skin:` reference is answered by the store, so it must never fall
+    /// through to the catalogue and come back as a built-in.
+    #[test]
+    fn an_authored_reference_is_never_resolved_against_the_catalogue() {
+        assert_eq!(catalogue_reference("skin:1000", SkinKind::Snake), None);
+        assert_eq!(catalogue_reference("skin:1000", SkinKind::Base), None);
     }
 
     #[test]

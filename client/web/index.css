@@ -6651,16 +6651,86 @@ a.home-social-icon:hover {
 /* Beside the heading rather than in the layers panel: generating is how a skin
    *starts*, so it belongs with the page's name and not among the controls for
    editing one that already exists. */
+/* The Generate button.
+   Blue rather than graphite because it is the one control on the page that
+   makes something out of nothing; everything else edits what is already
+   there. */
 .builder-generate {
   display: inline-flex;
   flex: none;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
+  border-color: var(--game-blue);
+  color: var(--game-blue);
+}
+
+.builder-generate:hover:not(:disabled) {
+  border-color: var(--game-blue);
+  background: #eff6ff;
 }
 
 .builder-generate-icon {
   display: inline-flex;
   align-items: center;
+}
+
+.builder-generate-label {
+  display: inline-flex;
+}
+
+/* The mount wave.
+   Each letter runs the same colour cycle, staggered by an inline delay, so the
+   colour crosses the word left to right instead of the label blinking as one.
+   It runs once: this is an introduction, not a permanent animation competing
+   with the preview beside it. */
+.builder-generate-label > span {
+  animation: builder-generate-wave 900ms ease-in-out 1 both;
+  white-space: pre;
+}
+
+@keyframes builder-generate-wave {
+  0% {
+    color: var(--game-blue);
+  }
+
+  20% {
+    color: #ec4899;
+  }
+
+  40% {
+    color: #f59e0b;
+  }
+
+  60% {
+    color: #10b981;
+  }
+
+  80% {
+    color: #8b5cf6;
+  }
+
+  100% {
+    color: var(--game-blue);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .builder-generate-label > span {
+    animation: none;
+  }
+}
+
+/* Two checkboxes and six words between them: a column of full-width inputs
+   spaces these as though they were unrelated. */
+.builder-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+}
+
+.builder-toggle-row > .builder-field {
+  flex: 0 1 auto;
 }
 
 /* --- Generate modal ------------------------------------------------------
@@ -6944,6 +7014,25 @@ a.home-social-icon:hover {
   display: flex;
   gap: 9px;
   margin-top: 14px;
+}
+
+/* The page's one call to action, sized like one. */
+.skins-make-own {
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 20px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  letter-spacing: 0.085em;
+}
+
+.skins-make-own-icon {
+  display: inline-flex;
+  align-items: center;
+  font-size: 19px;
+  font-style: italic;
+  font-weight: 900;
+  line-height: 1;
 }
 
 .skins-error,
@@ -7578,6 +7667,21 @@ a.home-social-icon:hover {
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* "Yours", and what standing it has. Blue because it is about you, and the
+   page uses blue for the things that are. */
+.skins-row-status {
+  align-self: flex-start;
+  border: 1px solid rgb(59 130 246 / 32%);
+  border-radius: 999px;
+  background: #eff6ff;
+  padding: 2px 8px;
+  color: var(--game-blue);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 

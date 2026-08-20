@@ -139,6 +139,61 @@ pub async fn auth_middleware(
     }
 }
 
+/// Identify the caller if they present a valid token, and carry on if they do
+/// not.
+///
+/// For routes that serve everyone but serve *more* to someone signed in: the
+/// Skins page is browsable anonymously, yet "my own skins" and "my own
+/// unpublished draft" are questions only answerable about a known viewer. A
+/// token that does not verify is ignored rather than refused, because these
+/// routes are public — the worst outcome of a bad token is the anonymous view,
+/// and the handlers apply their own visibility rules on top of whatever this
+/// installs.
+pub async fn optional_auth_middleware(
+    State(state): State<AuthMiddlewareState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .map(str::to_string);
+
+    let mut identified = false;
+    if let Some(token) = token
+        && let Ok(claims) = state.jwt_manager.verify_token(&token)
+        && let Ok(user_id) = claims.sub.parse::<i32>()
+        && let Ok(Some(user)) = state.db.get_user_by_id(user_id).await
+    {
+        let database_pool = if user.is_stress_test {
+            MatchmakingPool::Stress
+        } else {
+            MatchmakingPool::Public
+        };
+        // The same consistency check the strict middleware makes: a token
+        // whose claims disagree with the row identifies nobody.
+        if user.is_guest == claims.is_guest && database_pool == claims.matchmaking_pool {
+            request.extensions_mut().insert(AuthUser {
+                user_id,
+                username: user.username.clone(),
+                is_guest: user.is_guest,
+                is_admin: is_admin_user(&user),
+            });
+            identified = true;
+        }
+    }
+
+    let mut response = next.run(request).await;
+    // A response shaped by who asked must never land in a shared cache under a
+    // key that does not include them.
+    if identified {
+        apply_private_no_store(&mut response);
+    }
+    response
+}
+
 /// Require the authenticated identity installed by [`auth_middleware`] to be
 /// present in the server-side allowlist.
 pub async fn admin_middleware(request: Request, next: Next) -> Response {

@@ -1070,12 +1070,10 @@ fn layer_fields() -> Vec<FieldV2> {
              make it react.",
         ),
         field("boost_only", "Only while boosting", KindV2::Toggle),
-        explained(
+        field(
             "omit_on_single_cell",
             "Skip on a one-cell snake",
             KindV2::Toggle,
-            "A snake that is a single cell has no body to speak of, and most \
-             dressing looks wrong on it.",
         ),
         transform_fields("transform"),
         field(
