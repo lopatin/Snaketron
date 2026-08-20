@@ -90,8 +90,11 @@ fn s3_endpoint() -> Option<String> {
     resolve_endpoint()
 }
 
-/// Isolated per run so a real-AWS proof cannot touch anything that already
-/// exists, and so repeated runs never collide.
+/// The bucket is a fixed name, overridable so a real-AWS proof can be pointed
+/// at one you own rather than at whatever `snaketron-analytics-e2e` happens to
+/// be. Per-run isolation lives on the OBJECT PREFIX, not here: each test mints
+/// a `Uuid::now_v7()` and folds it into the dataset name, so repeated runs
+/// never collide even though they share a bucket.
 fn bucket() -> String {
     std::env::var("SNAKETRON_E2E_BUCKET").unwrap_or_else(|_| "snaketron-analytics-e2e".to_owned())
 }

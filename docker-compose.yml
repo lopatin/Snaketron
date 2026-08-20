@@ -3,10 +3,16 @@ version: '3.8'
 services:
   localstack:
     # 4.x, not 3.x: the analytics pipeline's idempotency rests on S3
-    # conditional writes (If-None-Match), which AWS shipped in Nov 2024 and
-    # LocalStack only implements in its 4.x line. NOTE: this bump was not
-    # exercised locally (Docker would not start on the authoring machine), so
-    # the first CI run is what confirms DynamoDB behaviour is unchanged.
+    # conditional writes (If-None-Match), which AWS shipped in Aug 2024 and
+    # LocalStack implements only in its 4.x line.
+    #
+    # NOTE: this bump is UNVALIDATED, and CI will not validate it. No workflow
+    # reads this file -- both test jobs start their own
+    # `localstack/localstack:3.0` service container with `SERVICES=dynamodb`
+    # (this repo's .github/workflows/github-action-test-simple-game.yml and
+    # snaketron-io's .github/workflows/test.yml). A green CI run therefore says
+    # nothing about whether 4.0 changed DynamoDB behaviour. Run the
+    # DynamoDB-backed tests against this stack locally before trusting it.
     image: localstack/localstack:4.0
     container_name: snaketron-localstack
     environment:

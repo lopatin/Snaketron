@@ -306,12 +306,30 @@ impl HostedService for Exporter {
 
 /// Reads `occurred_at_ms` back out of a serialized line.
 ///
-/// Falls back to now on a malformed line so one bad event cannot misfile an
-/// entire batch into the wrong day partition.
+/// The field is QUOTED on the wire: `to_json_line` sets
+/// `stringify_64_bit_integers(true)` for the proto3 JSON mapping, so a bare
+/// `as_i64()` returns `None` on every line this pipeline actually emits and
+/// silently takes the fallback below. That stamps the batch with wall-clock
+/// now, and `event_date` turns it into the `dt=` partition — so a replayed or
+/// backlogged batch would be filed under the day it was exported rather than
+/// the day it happened, which is precisely the guarantee `event.rs` makes
+/// about `occurred_at_ms` never being rewritten downstream.
+///
+/// Falls back to now only on a genuinely malformed line, so one bad event
+/// cannot misfile an entire batch.
 fn occurred_at(line: &str) -> i64 {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
-        .and_then(|value| value.get("occurred_at_ms").and_then(|v| v.as_i64()))
+        .and_then(|value| {
+            value.get("occurred_at_ms").and_then(|v| match v {
+                serde_json::Value::Number(n) => n.as_i64(),
+                // The canonical encoding. Same acceptance as
+                // `arrow_rows::json_i64`, so the fold and the partitioner
+                // can never disagree about what a line says.
+                serde_json::Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            })
+        })
         .unwrap_or_else(super::event::now_ms)
 }
 
@@ -324,6 +342,64 @@ mod tests {
         assert_eq!(
             occurred_at("{\"occurred_at_ms\":1755600000123}"),
             1_755_600_000_123
+        );
+    }
+
+    /// The fixture above is hand-written and does NOT match what this pipeline
+    /// emits: `to_json_line` quotes 64-bit integers per the proto3 JSON
+    /// mapping. Reading a real line is the only version of this test that
+    /// proves the day partition is derived from event time rather than from
+    /// whenever the exporter happened to run.
+    #[test]
+    fn occurred_at_is_read_from_a_line_the_writer_actually_produced() {
+        let event = super::super::event::envelope(
+            &super::super::event::EventOrigin {
+                environment: "test".to_owned(),
+                region: "use1".to_owned(),
+                aws_region: "us-east-1".to_owned(),
+                instance_id: "1:test".to_owned(),
+            },
+            super::super::event::EventIdentity::default(),
+            super::super::proto::event::Payload::GuestCreated(Default::default()),
+        );
+        let line = super::super::event::to_json_line(&event).unwrap();
+        assert!(
+            line.contains("\"occurred_at_ms\":\""),
+            "the writer quotes 64-bit integers; this test is meaningless otherwise"
+        );
+        assert_eq!(occurred_at(&line), event.occurred_at_ms);
+    }
+
+    /// The reason the above matters: `occurred_at` feeds `event_date`, which
+    /// becomes the `dt=` path component. A backdated event -- a replay, or a
+    /// batch that sat in the stream across midnight -- must be filed under the
+    /// day it HAPPENED, not the day it was exported. When `occurred_at` fell
+    /// back to wall-clock now, every such event was silently misfiled.
+    #[test]
+    fn a_backdated_event_is_partitioned_by_when_it_happened() {
+        let mut event = super::super::event::envelope(
+            &super::super::event::EventOrigin {
+                environment: "test".to_owned(),
+                region: "use1".to_owned(),
+                aws_region: "us-east-1".to_owned(),
+                instance_id: "1:test".to_owned(),
+            },
+            super::super::event::EventIdentity::default(),
+            super::super::proto::event::Payload::GuestCreated(Default::default()),
+        );
+        // 2024-03-05T06:07:08.009Z, comfortably in the past.
+        event.occurred_at_ms = 1_709_618_828_009;
+        let line = super::super::event::to_json_line(&event).unwrap();
+
+        assert_eq!(
+            super::super::exporter::event_date(occurred_at(&line)),
+            "2024-03-05",
+            "the partition must follow event time, not export time"
+        );
+        assert_ne!(
+            super::super::exporter::event_date(occurred_at(&line)),
+            super::super::exporter::event_date(super::super::event::now_ms()),
+            "and must therefore differ from today"
         );
     }
 

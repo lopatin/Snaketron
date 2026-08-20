@@ -265,8 +265,9 @@ mod tests {
         assert_eq!(names.len(), 17, "every registry entry must be covered");
     }
 
-    /// One line, snake_case keys, unquoted integers — each of which a view
-    /// depends on.
+    /// One line, snake_case keys, and QUOTED 64-bit integers — each of which
+    /// a view depends on. The quoting is the proto3 JSON mapping, and
+    /// `observability/athena/` declares those columns `string` to match.
     #[test]
     fn serialization_is_single_line_snake_case_json() {
         let event = envelope(

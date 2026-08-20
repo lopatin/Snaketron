@@ -2,12 +2,11 @@
 //!
 //! This is the production implementation of the trait the committer defines;
 //! `committer.rs` keeps a fake for the fold-logic tests. Everything here is
-//! shaped by four constraints of `iceberg` 0.10.1, none of which are optional:
+//! shaped by five constraints of `iceberg` 0.10.1, none of which are optional:
 //!
 //! 1. **`update_schema` can only add and delete.** No rename, no type
-//!    promotion, no partition-spec evolution. So the diff is name-matched and
-//!    strictly additive, and `schema.rs` pre-widens every integer so a
-//!    promotion is never needed.
+//!    promotion. So the diff is name-matched and strictly additive, and
+//!    `schema.rs` pre-widens every integer so a promotion is never needed.
 //! 2. **A parent path resolves against the schema the transaction started
 //!    from**, not against columns added earlier in the same transaction. A new
 //!    struct and its children therefore cannot be two adds — the struct must
@@ -206,9 +205,13 @@ fn require_v2(table: &str, version: FormatVersion) -> Result<(), ServiceError> {
 ///
 /// The pre-widening in `schema.rs` is respected exactly as encoded there —
 /// `uint32` already arrives as `long`, `uint64` as `decimal(20,0)`, enums as
-/// `string`, timestamps as `timestamptz` — because `iceberg` has no
-/// type-promotion API and a promotion that is needed later cannot be
-/// performed at all.
+/// `string` — because `iceberg` has no type-promotion API and a promotion
+/// that is needed later cannot be performed at all.
+///
+/// `timestamptz` is accepted too, but it never comes from `schema.rs`:
+/// `scalar_type_name` cannot emit it. It exists solely for the synthetic
+/// `occurred_at` column this module derives so `day()` has a timestamp to
+/// partition on.
 ///
 /// An unrecognized name is an error rather than a silent `string`: a
 /// misspelled type that quietly became a string would be discovered only when
