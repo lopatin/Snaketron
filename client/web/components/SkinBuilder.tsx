@@ -228,11 +228,17 @@ const SLIDES: Slide[] = [
     id: 'colours',
     label: 'The four free-for-all colours, on four body lengths',
     widthCells: 21,
+    // All four are near the panel's width, tails flush left, and the lengths
+    // run short, long, longest, middling — so the heads trace a rise to a peak
+    // and back rather than a staircase. Four bodies at four *very* different
+    // lengths compared the colours against different amounts of snake; at
+    // these lengths the only thing that differs between rows is the colour,
+    // which is what the slide is for.
     previews: [
-      { pose: 'starting_length', role: 'ffa0', label: 'Four cells' },
-      { pose: 'straight_horizontal', role: 'ffa1', label: 'Six cells' },
-      { pose: 'mid_horizontal', role: 'ffa2', label: 'Thirteen cells' },
-      { pose: 'longer_than_head_gradient', role: 'ffa3', label: 'Twenty-one cells' },
+      { pose: 'straight_16', role: 'ffa0', label: 'Sixteen cells' },
+      { pose: 'straight_19', role: 'ffa1', label: 'Nineteen cells' },
+      { pose: 'longer_than_head_gradient', role: 'ffa2', label: 'Twenty-one cells' },
+      { pose: 'straight_18', role: 'ffa3', label: 'Eighteen cells' },
     ],
   },
   {
@@ -1481,7 +1487,7 @@ const PreviewDeck: React.FC<{ handle: string; revision: number; valid: boolean }
       <div className="builder-deck">
         <button
           type="button"
-          className="builder-chevron"
+          className="builder-chevron is-prev"
           aria-label="Previous preview"
           onClick={() => step(-1)}
         >
@@ -1508,7 +1514,7 @@ const PreviewDeck: React.FC<{ handle: string; revision: number; valid: boolean }
         </div>
         <button
           type="button"
-          className="builder-chevron"
+          className="builder-chevron is-next"
           aria-label="Next preview"
           onClick={() => step(1)}
         >

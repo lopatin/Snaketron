@@ -107,15 +107,45 @@ pub const POSES: &[Pose] = &[
         name: "starting_length",
         cells: &[(5.0, 3.0), (2.0, 3.0)],
     },
+];
+
+/// Bodies the Builder's preview draws, kept out of the corpus above.
+///
+/// [`POSES`] is a correctness instrument: every entry is there because the
+/// painter has a branch only it reaches, and every entry costs a block of
+/// recorded trace plus a pass of the conformance suite at three cell sizes and
+/// four clock samples. Four straight bodies at four lengths reach exactly the
+/// branches one straight body reaches, so putting them there would buy no
+/// coverage and charge for it — and would mean re-recording the goldens every
+/// time someone nudged a preview.
+///
+/// They all start at x = 0, so a column of them lines up on its left edge and
+/// the difference between them reads as length rather than as position.
+pub const PREVIEW_ONLY_POSES: &[Pose] = &[
     Pose {
-        // Thirteen cells: long enough that the head glow has run out well
-        // before the tail, short enough to sit beside the four-cell stub
-        // without dwarfing it. It exists so a row of bodies can show a
-        // *progression* of lengths rather than two short ones and a long one.
-        name: "mid_horizontal",
-        cells: &[(14.0, 3.0), (2.0, 3.0)],
+        name: "straight_16",
+        cells: &[(15.0, 3.0), (0.0, 3.0)],
+    },
+    Pose {
+        name: "straight_18",
+        cells: &[(17.0, 3.0), (0.0, 3.0)],
+    },
+    Pose {
+        name: "straight_19",
+        cells: &[(18.0, 3.0), (0.0, 3.0)],
     },
 ];
+
+/// Resolve a pose by name, preview-only bodies included.
+///
+/// The corpus is what the goldens and the conformance suite iterate; this is
+/// what a *renderer caller* asks, and it may have either kind.
+pub fn pose_by_name(name: &str) -> Option<&'static Pose> {
+    POSES
+        .iter()
+        .chain(PREVIEW_ONLY_POSES)
+        .find(|pose| pose.name == name)
+}
 
 /// Arena bodies for the corpse painter, which still consumes untransformed
 /// grid positions plus a rotation.

@@ -7384,17 +7384,23 @@ a.home-social-icon:hover {
 /* Chevron, picture, chevron. The picture takes the slack so the two arrows
    stay put between slides — arrows that move as the content changes size read
    as a different control each time. */
+/* The chevrons float over the slide rather than flanking it, so the pictures
+   get the panel's whole width — which is what lets four bodies read as four
+   lengths instead of four similar smudges. They sit in the corners the
+   artwork does not reach: the bodies are flush left and vary on the right, so
+   a disc at each edge, vertically centred, lands on background almost always
+   and on a tail or a head at worst. */
 .builder-deck {
   display: flex;
-  min-height: 128px;
+  position: relative;
+  min-height: 116px;
   align-items: center;
-  gap: 4px;
 }
 
 .builder-slide {
   display: flex;
+  width: 100%;
   min-width: 0;
-  flex: 1;
   align-items: center;
   justify-content: center;
 }
@@ -7423,22 +7429,38 @@ a.home-social-icon:hover {
 }
 
 .builder-chevron {
+  display: grid;
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  width: 20px;
+  height: 20px;
   border: 0;
-  border-radius: 6px;
-  background: none;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 72%);
   color: var(--game-graphite);
   cursor: pointer;
-  flex: none;
-  font-size: 22px;
+  font-size: 15px;
   line-height: 1;
-  opacity: 0.45;
-  padding: 8px 6px;
+  opacity: 0.5;
+  padding: 0;
+  place-items: center;
+  transform: translateY(-50%);
   transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.builder-chevron.is-prev {
+  left: -4px;
+}
+
+.builder-chevron.is-next {
+  right: -4px;
 }
 
 .builder-chevron:hover,
 .builder-chevron:focus-visible {
-  background: #f3f4f6;
+  background: #fff;
+  box-shadow: 0 0 0 1px #d1d5db;
   opacity: 1;
 }
 
@@ -7577,7 +7599,6 @@ a.home-social-icon:hover {
   margin: 0 0 2px;
   color: var(--game-graphite);
   font-size: 11px;
-  font-style: italic;
   font-weight: 900;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -7854,7 +7875,6 @@ a.home-social-icon:hover {
 .builder-document summary {
   color: var(--game-graphite);
   font-size: 11px;
-  font-style: italic;
   font-weight: 900;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -7895,7 +7915,6 @@ a.home-social-icon:hover {
   padding: 0 7px;
   color: var(--game-graphite);
   font-size: 11px;
-  font-style: italic;
   font-weight: 900;
   letter-spacing: 0.1em;
   text-transform: uppercase;

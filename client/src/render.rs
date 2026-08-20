@@ -913,7 +913,8 @@ pub fn render_roster_snake(
 /// right on the contact sheet" and "the tests pass" are statements about the
 /// same pictures, not two hopefully-similar ones.
 ///
-/// `pose` names an entry in `skin::fixtures::POSES`; `role` is one of `own`,
+/// `pose` names a fixture body (the corpus or a preview-only one); `role` is
+/// one of `own`,
 /// `teammate`, `enemy`, `spectated0`, `spectated1`, or `ffa0`..`ffa3`.
 #[wasm_bindgen(js_name = renderSkinFixture)]
 #[allow(clippy::too_many_arguments)]
@@ -928,10 +929,7 @@ pub fn render_skin_fixture(
     anim_ms: f64,
     reduced_motion: bool,
 ) -> Result<(), JsValue> {
-    let Some(fixture) = crate::skin::fixtures::POSES
-        .iter()
-        .find(|candidate| candidate.name == pose)
-    else {
+    let Some(fixture) = crate::skin::fixtures::pose_by_name(pose) else {
         return Err(JsValue::from_str(&format!(
             "no fixture pose named `{pose}`"
         )));
@@ -1203,10 +1201,7 @@ pub fn skin_fixture_bounds(
     cell_size: f64,
     boost_active: bool,
 ) -> Result<String, JsValue> {
-    let Some(fixture) = crate::skin::fixtures::POSES
-        .iter()
-        .find(|candidate| candidate.name == pose)
-    else {
+    let Some(fixture) = crate::skin::fixtures::pose_by_name(pose) else {
         return Err(JsValue::from_str(&format!(
             "no fixture pose named `{pose}`"
         )));
