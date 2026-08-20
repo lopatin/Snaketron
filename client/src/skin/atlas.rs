@@ -309,6 +309,15 @@ mod browser {
                 });
                 return images.len() - 1;
             };
+            // Anonymous CORS *before* the src, because the attribute has to be
+            // set when the fetch starts to have any effect. A generated texture
+            // is served from the API origin while the game is served from its
+            // own, and drawing a cross-origin image without this taints the
+            // canvas — after which anything that reads pixels back throws a
+            // SecurityError. The byte route already answers
+            // `access-control-allow-origin: *`, so this costs a header and
+            // buys a canvas that can still be read.
+            element.set_cross_origin(Some("anonymous"));
             element.set_src(url);
             images.push(Entry {
                 url: url.to_string(),

@@ -49,6 +49,13 @@ pub struct GenerateRequest {
     pub kind: String,
     /// What the player asked for, in their words.
     pub prompt: String,
+    /// Textures of theirs to hand the model alongside the prompt.
+    ///
+    /// Ids rather than bytes: the caller already owns these and the server can
+    /// already read them, so re-uploading pixels it is holding would be a
+    /// round trip to say something it knows.
+    #[serde(default)]
+    pub reference_texture_ids: Vec<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +162,26 @@ pub async fn generate(
         return Err(TexturesApiError::Disabled);
     }
 
+    // Only the caller's own textures may be referenced, and each is resolved to
+    // the digest of its canonical variant — the same bytes the renderer draws.
+    // Anything they do not own is dropped rather than refused: a stale id in a
+    // picker is not worth failing a generation over.
+    let mut references = Vec::new();
+    if !request.reference_texture_ids.is_empty() {
+        let owned = state
+            .db
+            .list_textures_by_owner(auth_user.user_id, 100)
+            .await
+            .map_err(TexturesApiError::Internal)?;
+        for id in &request.reference_texture_ids {
+            if let Some(texture) = owned.iter().find(|each| each.texture_id == *id)
+                && let Some(canonical) = texture.variants.first()
+            {
+                references.push(canonical.sha256.clone());
+            }
+        }
+    }
+
     let (width, height, rows) = canonical_size(kind);
     let now = chrono::Utc::now().timestamp_millis();
     let job = GenerationJob {
@@ -178,7 +205,7 @@ pub async fn generate(
         detail: None,
         subject: Some(subject.to_string()),
         source_ref: None,
-        reference_refs: Vec::new(),
+        reference_refs: references,
         created_at_ms: now,
         updated_at_ms: now,
         // Nothing has claimed it yet.

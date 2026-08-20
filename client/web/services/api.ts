@@ -19,6 +19,10 @@ import type { PlayerLobbyResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
 import type { PublicGameResponse } from '../types/generated';
+import type { Texture } from '../types/generated/Texture';
+import type { JobAccepted } from '../types/generated/JobAccepted';
+import type { GenerationJob } from '../types/generated/GenerationJob';
+import type { TextureListResponse } from '../types/generated/TextureListResponse';
 import type {
   BrowseResponse,
   Equipment,
@@ -204,10 +208,14 @@ class API {
   // boundary rather than defaulting every call to `any`.
   async request<T>(endpoint: string, options: RequestOptions = {}): Promise<T> {
     const url = `${this.baseURL}${endpoint}`;
+    // A multipart body writes its own content type, boundary and all. Setting
+    // `application/json` over the top of it — which the default here would —
+    // makes the server refuse a body it can otherwise read perfectly well.
+    const sendsForm = options.body instanceof FormData;
     const config: RequestOptions = {
       ...options,
       headers: {
-        'Content-Type': 'application/json',
+        ...(sendsForm ? {} : { 'Content-Type': 'application/json' }),
         ...options.headers,
       },
     };
@@ -539,6 +547,45 @@ class API {
    */
   async getSkinDocument(contentRef: string): Promise<unknown> {
     return this.request<unknown>(`/api/skins/by-ref/${encodeURIComponent(contentRef)}`);
+  }
+
+  /** The textures this account owns, newest first. */
+  async listTextures(): Promise<TextureListResponse> {
+    return this.request<TextureListResponse>('/api/textures');
+  }
+
+  /**
+   * Hand over art you already have.
+   *
+   * The one route in this API that takes bytes rather than JSON. `request`
+   * spots the `FormData` and stands back from the content type, because the
+   * browser has to write the multipart boundary itself.
+   */
+  async uploadTexture(file: File, kind: string, subject?: string): Promise<JobAccepted> {
+    const form = new FormData();
+    form.append('kind', kind);
+    if (subject) {
+      form.append('subject', subject);
+    }
+    form.append('file', file);
+    return this.request<JobAccepted>('/api/textures', { method: 'POST', body: form });
+  }
+
+  /** Ask a model for one, with optional references. */
+  async generateTexture(request: {
+    kind: string;
+    prompt: string;
+    referenceTextureIds?: number[];
+  }): Promise<JobAccepted> {
+    return this.request<JobAccepted>('/api/textures/generate', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Where a texture job has got to. */
+  async getGenerationJob(jobId: string): Promise<GenerationJob> {
+    return this.request<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(jobId)}`);
   }
 
   /** Create a skin from a document the editor has already compiled. */

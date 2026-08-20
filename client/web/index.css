@@ -8494,3 +8494,73 @@ a.home-social-icon:hover {
     gap: 14px 18px;
   }
 }
+
+/* --- Texture picker --------------------------------------------------------
+   The one field that can create what it selects, so it is a menu with two
+   buttons and a job under it rather than a menu. */
+.texture-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.texture-picker-select {
+  width: 100%;
+}
+
+.texture-picker-make {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.texture-picker-prompt {
+  min-width: 0;
+  flex: 1 1 150px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+}
+
+.texture-picker-prompt:focus {
+  border-color: var(--game-blue);
+  outline: none;
+}
+
+/* A stage, not a spinner: the worker writes one per transition, so this can
+   say which of them the job is actually in. */
+.texture-picker-stage {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--game-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.texture-picker-stage.is-failed {
+  color: var(--game-red);
+}
+
+.texture-picker-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #dbeafe;
+  border-radius: 50%;
+  border-top-color: var(--game-blue);
+  animation: spin 850ms linear infinite;
+}
+
+.texture-picker-error {
+  margin: 0;
+  color: var(--game-red);
+  font-size: 12px;
+}

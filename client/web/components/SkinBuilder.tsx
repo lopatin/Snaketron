@@ -6,6 +6,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
 import { getWasm, initWasm } from '../wasm';
 import GenerateSkinModal from './GenerateSkinModal';
+import TexturePicker from './TexturePicker';
 import type { SkinSummary } from '../types/generated';
 
 /**
@@ -312,6 +313,19 @@ const SLIDES: Slide[] = [
 ];
 
 
+/**
+ * What the texture picker needs, which is the same for every control on the
+ * page.
+ *
+ * A context rather than two more props: they would have to be threaded through
+ * groups, lists, optionals and variants to reach the one field that wants
+ * them, and every level in between would carry something it does not use.
+ */
+const TextureContext = React.createContext<{
+  catalogue: BuiltinTexture[];
+  choose: (path: string, name: string, contentRef: string, kind: string) => void;
+}>({ catalogue: [], choose: () => {} });
+
 interface ControlProps {
   field: FieldV2;
   /** The object this field's path is relative to: a layer, or the document. */
@@ -324,6 +338,7 @@ interface ControlProps {
 
 /** One control, chosen by the descriptor rather than by this file. */
 const Control: React.FC<ControlProps> = ({ field, scope, literals, onChange, onDrop }) => {
+  const textures = React.useContext(TextureContext);
   const { kind } = field;
   const value = read(scope, field.path);
 
@@ -451,6 +466,24 @@ const Control: React.FC<ControlProps> = ({ field, scope, literals, onChange, onD
       );
 
     case 'choice':
+      // The texture field is a choice whose options an author can add to, so
+      // it gets the picker rather than the plain menu: pick from what exists,
+      // or make one and have it selected when it arrives.
+      if (field.path.endsWith('source.texture')) {
+        return (
+          <label className="builder-field">
+            <span>{field.label}</span>
+            <TexturePicker
+              value={typeof value === 'string' ? value : ''}
+              builtins={textures.catalogue}
+              onChoose={(name, contentRef, textureKind) =>
+                textures.choose(field.path, name, contentRef, textureKind)
+              }
+            />
+            {field.help ? <small>{field.help}</small> : null}
+          </label>
+        );
+      }
       return (
         <label className="builder-field">
           <span>{field.label}</span>
@@ -927,6 +960,35 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
     [schema],
   );
 
+  /**
+   * Point a layer at a texture and make sure the document declares it.
+   *
+   * Generated and uploaded textures are in no catalogue, so the reference has
+   * to come from whoever chose it rather than be looked up afterwards — which
+   * is why this sits beside `declareNamedTextures` rather than inside it. That
+   * one reconciles against a known list; this one is told.
+   */
+  const chooseTexture = useCallback(
+    (path: string, name: string, contentRef: string, kind: string) => {
+      setDocument((current) => {
+        if (!current) {
+          return current;
+        }
+        const held = Array.isArray(current.textures)
+          ? (current.textures as Array<Record<string, unknown>>)
+          : [];
+        return {
+          ...current,
+          textures: held.some((each) => each.name === name)
+            ? held
+            : [...held, { name, ref: contentRef, kind }],
+        };
+      });
+      changeLayer(selected, path, name);
+    },
+    [changeLayer, selected],
+  );
+
   const dropLayerPath = useCallback(
     (index: number, path: string) => {
       setDocument((current) => {
@@ -1115,6 +1177,9 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
   const overBudget = cost ? cost.ops > cost.maxOps : false;
 
   return (
+    <TextureContext.Provider
+      value={{ catalogue: schema?.builtinTextures ?? [], choose: chooseTexture }}
+    >
     <div className="home-page builder-page">
       {chrome}
 
@@ -1383,6 +1448,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
         </div>
       </div>
     </div>
+    </TextureContext.Provider>
   );
 };
 
