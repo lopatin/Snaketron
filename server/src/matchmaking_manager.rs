@@ -94,6 +94,21 @@ fn classify_atomic_matchmaking_outcome(code: i64) -> Option<AtomicMatchmakingOut
     }
 }
 
+/// The analytics label for an admission outcome. Reporting the classification
+/// rather than only the successes is what makes a rejection rate visible at
+/// all; the constants live in the sink so the emitted string and the sink's own
+/// queue-wait bookkeeping cannot drift apart.
+fn admission_result_label(outcome: Option<AtomicMatchmakingOutcome>) -> &'static str {
+    use crate::analytics::sink;
+    match outcome {
+        Some(AtomicMatchmakingOutcome::Applied) => sink::ADMISSION_APPLIED,
+        Some(AtomicMatchmakingOutcome::Idempotent) => sink::ADMISSION_IDEMPOTENT,
+        Some(AtomicMatchmakingOutcome::ExpectedConflict) => sink::ADMISSION_REJECTED,
+        Some(AtomicMatchmakingOutcome::IntegrityError) => sink::ADMISSION_INTEGRITY_ERROR,
+        None => sink::ADMISSION_UNKNOWN,
+    }
+}
+
 #[derive(Serialize)]
 struct MatchCommitQueuePair {
     queue_key: String,
@@ -741,7 +756,9 @@ impl MatchmakingManager {
                 }
             }
         };
-        match classify_atomic_matchmaking_outcome(code) {
+        let outcome = classify_atomic_matchmaking_outcome(code);
+        crate::analytics::sink::record_queue_entered(&lobby, admission_result_label(outcome));
+        match outcome {
             Some(AtomicMatchmakingOutcome::Applied) => {
                 crate::resilience_metrics::record_matchmaking_admission(1);
                 info!(
@@ -1217,6 +1234,12 @@ impl MatchmakingManager {
                     wait_ms,
                     matched_players,
                     matched_lobbies,
+                );
+                crate::analytics::sink::record_match_committed(
+                    game_id,
+                    wait_ms as i64,
+                    matched_players,
+                    matchmaking_pool,
                 );
                 Ok(MatchCommitOutcome::Committed { outbox_id: detail })
             }

@@ -15,3 +15,4 @@ loadtest-reports/
 
 # Machine-readable staging certification bundles.
 test-results/autoscaling-*/
+dump.rdb

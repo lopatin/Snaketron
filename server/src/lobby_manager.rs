@@ -317,6 +317,13 @@ impl LobbyManager {
         self.save_lobby_metadata(&lobby_metadata)
             .await
             .context("Failed to store lobby metadata")?;
+        // Emitted here rather than after initialization so the creation is
+        // stamped before the default-preferences event it causes.
+        crate::analytics::sink::record_lobby_created(
+            &lobby_metadata.lobby_code,
+            host_user_id,
+            matchmaking_pool,
+        );
 
         // Initialize lobby preferences
         let preferences = LobbyPreferences::default();
@@ -444,6 +451,7 @@ impl LobbyManager {
         });
 
         info!("User {} joined lobby '{}'", user_id, lobby.lobby_code);
+        crate::analytics::sink::record_lobby_joined(&lobby.lobby_code, user_id, &lobby.members);
 
         // Subscribe to lobby updates
         let rx = {
@@ -794,6 +802,8 @@ impl LobbyManager {
             .await
             .context("Failed to fetch lobby member count")?;
 
+        crate::analytics::sink::record_lobby_left(lobby_code, user_id, remaining);
+
         let result = if remaining == 0 {
             self.delete_lobby(lobby_code).await?;
             LeaveLobbyResult::LobbyDeleted
@@ -917,6 +927,7 @@ impl LobbyManager {
             .set::<_, _, ()>(&key, payload)
             .await
             .context("Failed to store lobby preferences")?;
+        crate::analytics::sink::record_lobby_preferences_set(preferences);
 
         if let Err(e) = self.publish_lobby_update(lobby_code).await {
             warn!(

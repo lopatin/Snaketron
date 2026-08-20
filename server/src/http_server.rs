@@ -450,7 +450,15 @@ async fn websocket_handler(
             state.cluster_namespace,
         )
         .await;
-        crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());
+        let session_duration = session_started_at.elapsed();
+        crate::resilience_metrics::record_websocket_session(session_duration);
+        // The socket future has returned, so this is the only place that knows
+        // the whole session length. Nothing about the user survives here, so
+        // the event carries the duration and the reason and no identity.
+        crate::analytics::sink::record_session_ended(
+            session_duration.as_millis() as i64,
+            "socket_closed",
+        );
 
         // Decrement connection count when connection closes
         let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;

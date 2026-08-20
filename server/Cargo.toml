@@ -32,6 +32,8 @@ serde_json = "1"
 aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1.19.0"
 aws-sdk-s3 = "1.104"
+# Explicit dependency so the process can choose between the two crypto
+# providers the dependency graph pulls in; see ensure_crypto_provider.
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 anyhow = "1"
 thiserror = "1"
@@ -73,6 +75,16 @@ ts-rs = { version = "11", optional = true }
 # must move in lockstep with `iceberg` (it re-exports its `Catalog` trait).
 iceberg = "=0.10.1"
 iceberg-catalog-s3tables = "=0.10.1"
+# Arrow and Parquet are the write path's data plane. Their versions are NOT
+# independent choices: `iceberg` 0.10.1 depends on arrow 58 / parquet 58 and its
+# writers take `arrow_array::RecordBatch` and `parquet::file::properties::
+# WriterProperties` by value, so a different major here would be a different
+# type and would not compile.
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-schema = "58"
+parquet = "58"
+base64 = "0.22"
 
 [build-dependencies]
 tonic-build = { version = "0.12.3", features = ["prost"] }
@@ -80,5 +92,6 @@ prost-build = "0.13.5"
 
 [dev-dependencies]
 jsonwebtoken = "9.3"
+tempfile = "3"
 rand = "0.8"
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics", "testing"] }

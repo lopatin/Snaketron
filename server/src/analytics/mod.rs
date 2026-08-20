@@ -5,6 +5,7 @@
 //! path here drops rather than blocks, and every failure is counted rather
 //! than propagated.
 
+pub mod arrow_rows;
 pub mod batch;
 pub mod committer;
 pub mod completion_events;
@@ -14,6 +15,8 @@ pub mod exporter;
 pub mod exporter_service;
 pub mod flusher;
 pub mod iceberg_catalog;
+#[cfg(test)]
+mod iceberg_local_tests;
 pub mod object_store;
 pub mod schema;
 pub mod sink;

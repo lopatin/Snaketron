@@ -43,6 +43,21 @@ pub struct CommitTarget {
 /// logic is testable without a live S3 Tables bucket.
 #[async_trait]
 pub trait IcebergCatalog: Send + Sync + 'static {
+    /// Creates the table if it is absent, and is a no-op if it is not.
+    ///
+    /// `columns` is the proto-derived schema, passed in rather than derived
+    /// here so the catalog stays free of protobuf knowledge and remains
+    /// testable against a local warehouse.
+    ///
+    /// Implementations own the partition spec and sort order, and both are
+    /// **one-way doors**: iceberg-rust has no partition-spec evolution, so the
+    /// layout chosen at creation is the layout the table has for life.
+    async fn ensure_table(
+        &self,
+        table: &str,
+        columns: &[DerivedColumn],
+    ) -> Result<(), ServiceError>;
+
     /// Columns currently present on the table.
     async fn current_columns(&self, table: &str) -> Result<Vec<String>, ServiceError>;
 
@@ -52,16 +67,24 @@ pub trait IcebergCatalog: Send + Sync + 'static {
     async fn add_columns(&self, table: &str, columns: &[DerivedColumn])
     -> Result<(), ServiceError>;
 
-    /// Commits data for one source object, fenced on `epoch`.
+    /// Appends one source object's rows and advances the resume mark, fenced
+    /// on `epoch`.
+    ///
+    /// `rows` is the DECODED NDJSON of the source object — proto3 canonical
+    /// JSON, one event per line. It is passed by value rather than fetched
+    /// here because the encoding of the raw tier (gzip, and the key layout it
+    /// implies) belongs to the source, not to the catalog.
     ///
     /// Implementations MUST reject the commit when a higher epoch has already
     /// committed. A rejection means "I am no longer the holder" and must not
-    /// be retried.
+    /// be retried. The append and the resume mark MUST land in one atomic
+    /// commit, or a crash between them either duplicates or loses the object.
     async fn commit(
         &self,
         table: &str,
         source_key: &str,
         epoch: u64,
+        rows: &str,
     ) -> Result<CommitOutcome, ServiceError>;
 
     /// The highest source key already folded, used to resume.
@@ -77,7 +100,7 @@ pub enum CommitOutcome {
     Fenced,
 }
 
-/// Lists source objects to fold.
+/// Lists and reads source objects to fold.
 #[async_trait]
 pub trait SourceListing: Send + Sync + 'static {
     /// Keys strictly after `after`, in lexicographic order.
@@ -86,6 +109,13 @@ pub trait SourceListing: Send + Sync + 'static {
         dataset: &str,
         after: Option<&str>,
     ) -> Result<Vec<String>, ServiceError>;
+
+    /// Reads one object and returns its NDJSON.
+    ///
+    /// Decoding lives here, not in the catalog: the raw tier's gzip is a
+    /// property of how the exporter writes objects (R6.3), and a catalog that
+    /// knew about it would have to be taught again for every future encoding.
+    async fn fetch(&self, dataset: &str, key: &str) -> Result<String, ServiceError>;
 }
 
 /// Reconciles the table schema against the embedded proto descriptors.
@@ -104,6 +134,8 @@ pub async fn reconcile_schema(
     let event = event_descriptor(&pool)
         .map_err(|e| ServiceError::failed(format!("event descriptor: {e}")))?;
     let desired = derive_columns(&event);
+
+    catalog.ensure_table(table, &desired).await?;
 
     let existing = catalog.current_columns(table).await?;
     let missing: Vec<DerivedColumn> = desired
@@ -142,7 +174,8 @@ pub async fn fold_once(
 
     let mut committed = 0usize;
     for key in keys {
-        match catalog.commit(&target.table, &key, epoch).await? {
+        let rows = listing.fetch(&target.dataset, &key).await?;
+        match catalog.commit(&target.table, &key, epoch, &rows).await? {
             CommitOutcome::Committed => committed += 1,
             CommitOutcome::AlreadyPresent => {}
             CommitOutcome::Fenced => {
@@ -264,12 +297,23 @@ mod tests {
     struct FakeCatalog {
         columns: Mutex<Vec<String>>,
         committed: Mutex<Vec<String>>,
+        rows: Mutex<Vec<String>>,
         added: Mutex<Vec<Vec<String>>>,
         fence_at: Mutex<Option<u64>>,
+        created: Mutex<usize>,
     }
 
     #[async_trait]
     impl IcebergCatalog for FakeCatalog {
+        async fn ensure_table(
+            &self,
+            _table: &str,
+            _columns: &[DerivedColumn],
+        ) -> Result<(), ServiceError> {
+            *self.created.lock().unwrap() += 1;
+            Ok(())
+        }
+
         async fn current_columns(&self, _table: &str) -> Result<Vec<String>, ServiceError> {
             Ok(self.columns.lock().unwrap().clone())
         }
@@ -290,6 +334,7 @@ mod tests {
             _table: &str,
             source_key: &str,
             epoch: u64,
+            rows: &str,
         ) -> Result<CommitOutcome, ServiceError> {
             if let Some(fence) = *self.fence_at.lock().unwrap()
                 && epoch < fence
@@ -301,6 +346,7 @@ mod tests {
                 return Ok(CommitOutcome::AlreadyPresent);
             }
             committed.push(source_key.to_owned());
+            self.rows.lock().unwrap().push(rows.to_owned());
             Ok(CommitOutcome::Committed)
         }
 
@@ -329,6 +375,10 @@ mod tests {
                     .cloned()
                     .collect(),
             })
+        }
+
+        async fn fetch(&self, _dataset: &str, key: &str) -> Result<String, ServiceError> {
+            Ok(format!("{{\"event_id\":\"{key}\"}}"))
         }
     }
 
@@ -405,6 +455,30 @@ mod tests {
         let count = fold_once(&catalog, &listing, &target(), 1).await.unwrap();
         assert_eq!(count, 2);
         assert_eq!(fake.committed.lock().unwrap().len(), 2);
+    }
+
+    /// The fold must hand the catalog the object's BYTES, not just its key —
+    /// a commit that moved the resume mark without carrying rows would look
+    /// identical from the outside and would lose every event.
+    #[tokio::test]
+    async fn each_commit_carries_the_rows_read_from_its_object() {
+        let (catalog, listing, fake) = parts(&["a.json.gz", "b.json.gz"]);
+        fold_once(&catalog, &listing, &target(), 1).await.unwrap();
+
+        let rows = fake.rows.lock().unwrap().clone();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("a.json.gz"), "{rows:?}");
+        assert!(rows[1].contains("b.json.gz"), "{rows:?}");
+    }
+
+    /// Every pass ensures the table, because the first fold of a fresh
+    /// environment has no table to reconcile against.
+    #[tokio::test]
+    async fn every_fold_ensures_the_table_exists_first() {
+        let (catalog, listing, fake) = parts(&["a.json.gz"]);
+        fold_once(&catalog, &listing, &target(), 1).await.unwrap();
+        fold_once(&catalog, &listing, &target(), 1).await.unwrap();
+        assert_eq!(*fake.created.lock().unwrap(), 2);
     }
 
     /// Re-running must be a no-op, which is what makes a crashed run safe to

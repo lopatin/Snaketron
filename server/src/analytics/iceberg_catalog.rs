@@ -17,6 +17,17 @@
 //!    `last-column-id + 1`, every sibling id is untouched, and older files
 //!    project as null. It is never drop+add, which would orphan data.
 //! 4. **Schema evolution and data append never share a transaction.**
+//! 5. **There is no partition-spec evolution.** `Transaction` offers
+//!    `update_schema`, `replace_sort_order`, and property/location/statistics
+//!    updates — and nothing that adds, drops, or re-binds a partition field.
+//!    The spec chosen in [`partition_spec`] at creation is therefore the spec
+//!    the table has for life, which is why it needs a synthetic `occurred_at`
+//!    column: `day()` is undefined on the `long` the protos carry.
+//!
+//! The append itself is [`write_data_files`] plus `fast_append`, and it shares
+//! ONE transaction with the resume mark so a crash cannot land one without the
+//! other. The encode runs on `spawn_blocking` because this process is also
+//! serving games on a 100 ms tick.
 //!
 //! The catalog is `iceberg-catalog-s3tables`, which speaks the native
 //! `aws-sdk-s3tables` API rather than the Iceberg REST endpoint, so SigV4
@@ -26,16 +37,28 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::spec::{
-    FormatVersion, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
+    DataFile, DataFileFormat, FormatVersion, NestedField, NestedFieldRef, NullOrder, PartitionSpec,
+    PrimitiveType, Schema, SortDirection, SortField, SortOrder, StructType, Transform, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::partitioning::PartitioningWriter;
+use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
 use snaketron_service_api::ServiceError;
 use tracing::{info, warn};
 
+use super::arrow_rows::{OCCURRED_AT_COLUMN, OCCURRED_AT_MS_COLUMN, ndjson_to_record_batch};
 use super::committer::{CommitOutcome, IcebergCatalog};
 use super::schema::DerivedColumn;
 
@@ -103,7 +126,12 @@ impl S3TablesIcebergCatalog {
         TableIdent::new(self.namespace.clone(), table.to_owned())
     }
 
-    async fn load(&self, table: &str) -> Result<Table, ServiceError> {
+    /// Loads a table, refusing anything that is not format-version 2.
+    ///
+    /// Public because the format-version check is the only correct way to get
+    /// a handle on one of these tables; a caller that bypassed it could write
+    /// happily into a table Athena can no longer read.
+    pub async fn load(&self, table: &str) -> Result<Table, ServiceError> {
         let loaded = self
             .catalog
             .load_table(&self.ident(table))
@@ -111,6 +139,39 @@ impl S3TablesIcebergCatalog {
             .map_err(|e| ServiceError::failed(format!("loading table {table}: {e}")))?;
         require_v2(table, loaded.metadata().format_version())?;
         Ok(loaded)
+    }
+
+    /// Creates the namespace if it is absent.
+    ///
+    /// A table cannot be created under a namespace that does not exist, and the
+    /// first fold of a fresh environment is exactly the case where it does not.
+    async fn ensure_namespace(&self) -> Result<(), ServiceError> {
+        if self
+            .catalog
+            .namespace_exists(&self.namespace)
+            .await
+            .map_err(|e| ServiceError::failed(format!("checking namespace: {e}")))?
+        {
+            return Ok(());
+        }
+        match self
+            .catalog
+            .create_namespace(&self.namespace, HashMap::new())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if self
+                    .catalog
+                    .namespace_exists(&self.namespace)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                Err(ServiceError::failed(format!("creating namespace: {error}")))
+            }
+        }
     }
 
     /// Tears a table down. `purge_table`, never `drop_table`: the latter is an
@@ -419,11 +480,307 @@ fn already_folded(high_water_mark: Option<&str>, source_key: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Table creation
+// ---------------------------------------------------------------------------
+
+/// Partition field name for the event day.
+///
+/// Named separately from the source column because Iceberg forbids a
+/// non-identity partition field from taking a schema column's name.
+const OCCURRED_AT_DAY_PARTITION: &str = "occurred_at_day";
+
+/// The identity-partitioned region column. It is a schema column AND a
+/// partition field, which Iceberg allows only for the identity transform.
+const REGION_COLUMN: &str = "region";
+
+/// The first sort key. Almost every query filters on it, so clustering by it
+/// is what lets row-group statistics skip most of a day's files.
+const EVENT_NAME_COLUMN: &str = "event_name";
+
+/// The `doc` string on the one column that is not a proto field.
+///
+/// Deliberately not spelled `pb:` — that prefix means "this is proto field
+/// number N", and claiming a number for a synthetic column would corrupt the
+/// registry that the `doc` strings ARE.
+const OCCURRED_AT_DOC: &str = "derived:occurred_at_ms";
+
+/// The schema a brand-new table is created with.
+///
+/// It is the proto-derived schema plus exactly one synthetic column,
+/// [`OCCURRED_AT_COLUMN`]. That column exists because the partition spec needs
+/// it: `day()` is defined on a date or a timestamp, `occurred_at_ms` is a
+/// `long` (R8.12 puts millisecond precision at the proto layer, because Athena
+/// reads milliseconds), and **there is no partition-spec evolution in
+/// iceberg-rust** — `Transaction` exposes `update_schema`, `replace_sort_order`,
+/// and property/location/statistics updates, and nothing that adds, drops, or
+/// re-binds a partition field. So the spec chosen here is the spec the table
+/// has forever, and getting it wrong means rebuilding the table.
+///
+/// Field ids are assigned here only to satisfy the schema builder's uniqueness
+/// check. `TableMetadataBuilder::new` reassigns every one of them from
+/// `FIRST_FIELD_ID` and remaps the partition spec and sort order along with
+/// them, so the values below never reach the table.
+pub fn initial_schema(columns: &[DerivedColumn]) -> Result<Schema, ServiceError> {
+    let plan = plan_additions(&BTreeSet::new(), columns)?;
+
+    let mut next_id = 0;
+    let mut fields: Vec<NestedFieldRef> = Vec::with_capacity(plan.len() + 1);
+
+    next_id += 1;
+    let mut occurred_at = NestedField::optional(
+        next_id,
+        OCCURRED_AT_COLUMN,
+        Type::Primitive(PrimitiveType::Timestamptz),
+    );
+    occurred_at.doc = Some(OCCURRED_AT_DOC.to_owned());
+    fields.push(Arc::new(occurred_at));
+
+    for add in plan {
+        next_id += 1;
+        let id = next_id;
+        let field_type = assign_field_ids(&add.field_type, &mut next_id);
+        let mut field = NestedField::optional(id, add.name, field_type);
+        field.doc = Some(add.doc);
+        fields.push(Arc::new(field));
+    }
+
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(fields)
+        .build()
+        .map_err(|e| ServiceError::failed(format!("building initial schema: {e}")))
+}
+
+/// Rewrites a planned type's nested field ids from a single running counter.
+///
+/// [`plan_additions`] restarts its counter per column, which is correct for
+/// `add_column` (Iceberg reassigns ids there) but produces duplicates across
+/// columns, and a schema with duplicate ids does not build.
+fn assign_field_ids(field_type: &Type, next_id: &mut i32) -> Type {
+    let Type::Struct(struct_type) = field_type else {
+        return field_type.clone();
+    };
+    let fields: Vec<NestedFieldRef> = struct_type
+        .fields()
+        .iter()
+        .map(|field| {
+            *next_id += 1;
+            let id = *next_id;
+            let inner = assign_field_ids(&field.field_type, next_id);
+            let mut fresh = NestedField::optional(id, field.name.clone(), inner);
+            fresh.doc = field.doc.clone();
+            Arc::new(fresh)
+        })
+        .collect();
+    Type::Struct(StructType::new(fields))
+}
+
+/// `day(occurred_at)` and `region`, per R8.10.
+///
+/// Hidden partitioning, with no hand-rolled `dt` string column: a predicate on
+/// `occurred_at` alone prunes correctly, and a redundant string column would be
+/// a second thing to keep honest across a replay.
+///
+/// `region` is an identity partition sharing its name with the schema column it
+/// comes from, which Iceberg permits **only** for the identity transform — the
+/// day field therefore has to be named [`OCCURRED_AT_DAY_PARTITION`] rather
+/// than `occurred_at`.
+pub fn partition_spec(schema: &Schema) -> Result<PartitionSpec, ServiceError> {
+    PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .add_partition_field(
+            OCCURRED_AT_COLUMN,
+            OCCURRED_AT_DAY_PARTITION,
+            Transform::Day,
+        )
+        .and_then(|builder| {
+            builder.add_partition_field(REGION_COLUMN, REGION_COLUMN, Transform::Identity)
+        })
+        .and_then(|builder| builder.build())
+        .map_err(|e| ServiceError::failed(format!("building partition spec: {e}")))
+}
+
+/// `(event_name, occurred_at_ms)`, per R8.10.
+///
+/// Nulls last in both positions: a null event name is a corrupt row and belongs
+/// at the end of a file, not at the front of every scan.
+pub fn sort_order(schema: &Schema) -> Result<SortOrder, ServiceError> {
+    let mut builder = SortOrder::builder();
+    for name in [EVENT_NAME_COLUMN, OCCURRED_AT_MS_COLUMN] {
+        let field = schema.field_by_name(name).ok_or_else(|| {
+            ServiceError::failed(format!("sort column `{name}` is missing from the schema"))
+        })?;
+        builder.with_sort_field(
+            SortField::builder()
+                .source_id(field.id)
+                .transform(Transform::Identity)
+                .direction(SortDirection::Ascending)
+                .null_order(NullOrder::Last)
+                .build(),
+        );
+    }
+    builder
+        .build(schema)
+        .map_err(|e| ServiceError::failed(format!("building sort order: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// The data append
+// ---------------------------------------------------------------------------
+
+/// Encodes NDJSON into Parquet and returns the data files, WITHOUT committing.
+///
+/// The whole encode runs on `spawn_blocking`. This is not defensive: the
+/// committer is elected onto a task that is also serving games on a 100 ms tick,
+/// Parquet encoding is CPU-bound with no yield points, and an hour's events
+/// encoded on a runtime worker would stall every game that worker owns. The
+/// async writer is driven with `Handle::block_on` from inside the blocking
+/// thread, so the I/O still uses the shared runtime while the CPU stays off it.
+async fn write_data_files(table: &Table, ndjson: &str) -> Result<Vec<DataFile>, ServiceError> {
+    let table = table.clone();
+    let ndjson = ndjson.to_owned();
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || handle.block_on(encode_data_files(table, ndjson)))
+        .await
+        .map_err(|e| ServiceError::failed(format!("parquet encode task: {e}")))?
+}
+
+async fn encode_data_files(table: Table, ndjson: String) -> Result<Vec<DataFile>, ServiceError> {
+    let schema = table.metadata().current_schema().clone();
+    let Some(batch) = ndjson_to_record_batch(&schema, &ndjson)? else {
+        // No rows means no file. An empty Parquet file would still cost a
+        // manifest entry for the life of the table.
+        return Ok(Vec::new());
+    };
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata())
+        .map_err(|e| ServiceError::failed(format!("data file location: {e}")))?;
+    // A per-commit uuid suffix: two committers overlapping across a lease
+    // handover must never generate the same object name, because a conditional
+    // overwrite is not available here and a collision would lose data.
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "events".to_owned(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let table_properties = table
+        .metadata()
+        .table_properties()
+        .map_err(|e| ServiceError::failed(format!("reading table properties: {e}")))?;
+    let parquet_writer_builder =
+        ParquetWriterBuilder::from_table_properties(&table_properties, schema.clone());
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+
+    let spec = table.metadata().default_partition_spec().clone();
+    if spec.is_unpartitioned() {
+        let mut writer = data_file_writer_builder
+            .build(None)
+            .await
+            .map_err(|e| ServiceError::failed(format!("building data file writer: {e}")))?;
+        writer
+            .write(batch)
+            .await
+            .map_err(|e| ServiceError::failed(format!("writing parquet: {e}")))?;
+        return writer
+            .close()
+            .await
+            .map_err(|e| ServiceError::failed(format!("closing parquet writer: {e}")));
+    }
+
+    // Fanout, not clustered: the source objects are in emission order, not
+    // partition order, and a clustered writer would silently produce one file
+    // per partition CHANGE rather than one per partition.
+    let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(schema, spec)
+        .map_err(|e| ServiceError::failed(format!("building partition splitter: {e}")))?;
+    let partitioned = splitter
+        .split(&batch)
+        .map_err(|e| ServiceError::failed(format!("computing partition values: {e}")))?;
+
+    let mut writer = FanoutWriter::new(data_file_writer_builder);
+    for (partition_key, partition_batch) in partitioned {
+        writer
+            .write(partition_key, partition_batch)
+            .await
+            .map_err(|e| ServiceError::failed(format!("writing parquet: {e}")))?;
+    }
+    PartitioningWriter::close(writer)
+        .await
+        .map_err(|e| ServiceError::failed(format!("closing parquet writers: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // The trait
 // ---------------------------------------------------------------------------
 
 #[async_trait]
 impl IcebergCatalog for S3TablesIcebergCatalog {
+    async fn ensure_table(
+        &self,
+        table: &str,
+        columns: &[DerivedColumn],
+    ) -> Result<(), ServiceError> {
+        // The namespace check comes FIRST because `table_exists` against a
+        // missing namespace is an ERROR, not a `false`, in both the memory
+        // catalog and S3 Tables — asking the questions in the other order turns
+        // a fresh environment into a hard failure.
+        self.ensure_namespace().await?;
+
+        let ident = self.ident(table);
+        if self
+            .catalog
+            .table_exists(&ident)
+            .await
+            .map_err(|e| ServiceError::failed(format!("checking table {table}: {e}")))?
+        {
+            // Load rather than return early: `load` is where the
+            // format-version check lives, and a v3 table has to be caught
+            // before anything is written into it.
+            self.load(table).await?;
+            return Ok(());
+        }
+
+        let schema = initial_schema(columns)?;
+        let spec = partition_spec(&schema)?;
+        let order = sort_order(&schema)?;
+        let creation = TableCreation::builder()
+            .name(table.to_owned())
+            .schema(schema)
+            .partition_spec(spec.into_unbound())
+            .sort_order(order)
+            // Explicit, not defaulted. Athena implements Iceberg spec 1.4.2 and
+            // reads v2 only, and a v3 table would work everywhere in Rust and
+            // fail only at query time.
+            .format_version(FormatVersion::V2)
+            .build();
+
+        match self.catalog.create_table(&self.namespace, creation).await {
+            Ok(_) => {
+                info!("created analytics table {table} (format-version 2, day+region partitioned)");
+                Ok(())
+            }
+            Err(error) => {
+                // Two committers can race the create exactly once: at the
+                // moment a dataset first appears, before any lease exists for
+                // its table. Losing that race means the table is there, which
+                // is the outcome asked for.
+                if self.catalog.table_exists(&ident).await.unwrap_or(false) {
+                    warn!("lost the create race for {table}; using the existing table");
+                    return Ok(());
+                }
+                Err(ServiceError::failed(format!(
+                    "creating table {table}: {error}"
+                )))
+            }
+        }
+    }
+
     async fn current_columns(&self, table: &str) -> Result<Vec<String>, ServiceError> {
         let loaded = self.load(table).await?;
         Ok(schema_column_names(loaded.metadata().current_schema()))
@@ -472,6 +829,7 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
         table: &str,
         source_key: &str,
         epoch: u64,
+        rows: &str,
     ) -> Result<CommitOutcome, ServiceError> {
         let loaded = self.load(table).await?;
         let properties = loaded.metadata().properties();
@@ -486,6 +844,13 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
             return Ok(CommitOutcome::AlreadyPresent);
         }
 
+        // Encoded BEFORE the transaction is opened. The data files are just
+        // objects until a snapshot references them, so an encode that fails
+        // here leaves the table untouched, and one that succeeds without a
+        // commit leaves orphans that S3 Tables' managed cleanup removes.
+        let data_files = write_data_files(&loaded, rows).await?;
+        let row_count: u64 = data_files.iter().map(|file| file.record_count()).sum();
+
         let tx = Transaction::new(&loaded);
         let action = tx
             .update_table_properties()
@@ -495,8 +860,24 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
             .apply(tx)
             .map_err(|e| ServiceError::failed(format!("planning commit: {e}")))?;
 
+        // The append and the high-water mark move in ONE transaction. Split
+        // across two, a crash between them either re-folds the object (adding
+        // duplicate rows) or advances the mark past data that was never
+        // appended (losing it silently).
+        let tx = if data_files.is_empty() {
+            tx
+        } else {
+            let append = tx.fast_append().add_data_files(data_files);
+            append
+                .apply(tx)
+                .map_err(|e| ServiceError::failed(format!("planning append: {e}")))?
+        };
+
         match tx.commit(self.catalog.as_ref()).await {
-            Ok(_) => Ok(CommitOutcome::Committed),
+            Ok(_) => {
+                info!("folded {source_key} into {table}: {row_count} row(s)");
+                Ok(CommitOutcome::Committed)
+            }
             Err(error) => {
                 // S3 Tables gives the commit a version token, so a lost race
                 // fails here rather than clobbering. Re-read before reporting:

@@ -2,10 +2,17 @@ version: '3.8'
 
 services:
   localstack:
-    image: localstack/localstack:3.0
+    # 4.x, not 3.x: the analytics pipeline's idempotency rests on S3
+    # conditional writes (If-None-Match), which AWS shipped in Nov 2024 and
+    # LocalStack only implements in its 4.x line. NOTE: this bump was not
+    # exercised locally (Docker would not start on the authoring machine), so
+    # the first CI run is what confirms DynamoDB behaviour is unchanged.
+    image: localstack/localstack:4.0
     container_name: snaketron-localstack
     environment:
-      - SERVICES=dynamodb
+      # s3 is required by the analytics pipeline tests, which write gzipped
+      # NDJSON and rely on conditional writes (If-None-Match) for idempotency.
+      - SERVICES=dynamodb,s3
       - DEBUG=0
       - PERSISTENCE=0
       - AWS_DEFAULT_REGION=us-east-1

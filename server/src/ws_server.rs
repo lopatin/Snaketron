@@ -3527,6 +3527,11 @@ async fn process_ws_message(
                         "websocket session {session_id} authenticated (anon_id present: {})",
                         anon_id.is_some()
                     );
+                    crate::analytics::sink::record_session_started(
+                        &session_id,
+                        anon_id.as_deref(),
+                        protocol_version,
+                    );
                     authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
@@ -3826,6 +3831,10 @@ async fn process_ws_message(
                         {
                             Ok(removed) => {
                                 if removed {
+                                    crate::analytics::sink::record_queue_left(
+                                        &lobby_code,
+                                        metadata.user_id,
+                                    );
                                     info!(
                                         lobby_code = lobby_code,
                                         "Removed lobby from matchmaking queues after cancel"

@@ -113,6 +113,12 @@ struct Exporter {
     ctx: ServiceContext,
 }
 
+/// One `XRANGE` entry: its id, and its field/value pairs.
+///
+/// Named because the bare tuple is what `redis` returns and reads as noise at
+/// the call site — the shape is only ever used to look at the id.
+type StreamEntry = (String, Vec<(String, String)>);
+
 impl Exporter {
     /// `BUSYGROUP` means someone already created it, which is success.
     async fn ensure_group(&self) -> Result<(), ServiceError> {
@@ -135,7 +141,7 @@ impl Exporter {
     /// an operator has to be able to tell "no traffic" from "we dropped it".
     async fn check_discontinuity(&self, resume_from: &str) {
         let mut redis = self.redis.clone();
-        let oldest: redis::RedisResult<Vec<(String, Vec<(String, String)>)>> =
+        let oldest: redis::RedisResult<Vec<StreamEntry>> =
             redis.xrange_count(&self.stream_key, "-", "+", 1).await;
         if let Ok(entries) = oldest
             && let Some((oldest_id, _)) = entries.first()

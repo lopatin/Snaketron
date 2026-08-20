@@ -120,11 +120,31 @@ impl S3ObjectStore {
     /// writes to the one US bucket, so the region must be stated rather than
     /// inherited from the task's own environment.
     pub async fn client_for_region(region: &str) -> aws_sdk_s3::Client {
-        let config = aws_config::from_env()
-            .region(aws_config::Region::new(region.to_owned()))
-            .load()
-            .await;
-        aws_sdk_s3::Client::new(&config)
+        Self::client_for(
+            region,
+            std::env::var("SNAKETRON_S3_ENDPOINT").ok().as_deref(),
+        )
+        .await
+    }
+
+    /// Builds a client, optionally against a non-AWS endpoint.
+    ///
+    /// The endpoint override exists so the pipeline can be exercised end to end
+    /// against LocalStack. It also forces path-style addressing, because a
+    /// virtual-host bucket name does not resolve against a local endpoint.
+    pub async fn client_for(region: &str, endpoint: Option<&str>) -> aws_sdk_s3::Client {
+        let loader = aws_config::from_env().region(aws_config::Region::new(region.to_owned()));
+        let config = loader.load().await;
+        match endpoint {
+            None => aws_sdk_s3::Client::new(&config),
+            Some(endpoint) => {
+                let s3_config = aws_sdk_s3::config::Builder::from(&config)
+                    .endpoint_url(endpoint)
+                    .force_path_style(true)
+                    .build();
+                aws_sdk_s3::Client::from_conf(s3_config)
+            }
+        }
     }
 }
 
