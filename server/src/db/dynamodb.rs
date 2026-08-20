@@ -375,6 +375,18 @@ impl DynamoDatabase {
         if let Some(lease) = job.lease_until_ms {
             item.insert("leaseUntilMs".to_string(), Self::av_n(lease));
         }
+        if let Some(subject) = &job.subject {
+            item.insert("subject".to_string(), Self::av_s(subject));
+        }
+        if let Some(source) = &job.source_ref {
+            item.insert("sourceRef".to_string(), Self::av_s(source));
+        }
+        if !job.reference_refs.is_empty() {
+            item.insert(
+                "referenceRefs".to_string(),
+                AttributeValue::Ss(job.reference_refs.clone()),
+            );
+        }
         // Jobs are working state, not a record: a week is long enough to read
         // a failure and short enough that the table does not accumulate them.
         //
@@ -449,6 +461,13 @@ impl DynamoDatabase {
             created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
             updated_at_ms: Self::extract_i64(item, "updatedAtMs").unwrap_or(0),
             lease_until_ms: Self::extract_i64(item, "leaseUntilMs"),
+            subject: Self::extract_string(item, "subject"),
+            source_ref: Self::extract_string(item, "sourceRef"),
+            reference_refs: item
+                .get("referenceRefs")
+                .and_then(|value| value.as_ss().ok())
+                .map(|list| list.to_vec())
+                .unwrap_or_default(),
         })
     }
 

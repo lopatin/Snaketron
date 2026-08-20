@@ -281,6 +281,11 @@ pub async fn install_http_application(
 
     // Start background task to broadcast user counts to WebSocket clients every 5 seconds
     spawn_user_count_broadcaster(redis.clone(), cancellation_token.clone());
+    spawn_texture_worker(
+        db.clone(),
+        state.texture_store.clone(),
+        cancellation_token.clone(),
+    );
 
     // Start background task to broadcast the region's online-player roster.
     spawn_region_roster_broadcaster(redis.clone(), region.clone(), cancellation_token.clone());
@@ -292,6 +297,7 @@ pub async fn install_http_application(
         jwt_manager: jwt_manager.clone(),
         user_cache: Some(state.user_cache.clone()),
         crazygames_verifier: crazygames::configured_verifier_from_env()?,
+        texture_store: state.texture_store.clone(),
     };
     let auth_middleware_state = AuthMiddlewareState {
         jwt_manager: jwt_manager.clone(),
@@ -323,6 +329,10 @@ pub async fn install_http_application(
     // Generation is the one route where a request turns into money, so it is
     // throttled as well as quota'd and circuit-broken inside the handler.
     let generation_limiter = rate_limit_layer(20, 60);
+    // Uploads are cheaper than generations — no model, no bill — but they are
+    // still four megabytes of pixels each, so they get their own allowance
+    // rather than sharing one with the route that spends money.
+    let upload_limiter = rate_limit_layer(30, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
@@ -367,6 +377,19 @@ pub async fn install_http_application(
                 .layer(axum::extract::DefaultBodyLimit::max(8 * 1024))
                 .layer(middleware::from_fn_with_state(
                     generation_limiter,
+                    rate_limit_middleware,
+                )),
+        )
+        // A PNG plus its metadata. The 4 MB cap is the PRD's, and it is the
+        // largest body this API takes: the handler checks the magic bytes and
+        // the declared dimensions, and everything that costs CPU happens in
+        // the worker.
+        .route(
+            "/api/textures",
+            post(textures::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    upload_limiter,
                     rate_limit_middleware,
                 )),
         )
@@ -1224,6 +1247,49 @@ fn spawn_region_roster_broadcaster(
 }
 
 /// Background task to broadcast user count updates every 5 seconds
+/// Start the loop that drains the texture queue, when there is anything for it
+/// to do.
+///
+/// It needs somewhere to put pixels and something to ask for them; without
+/// either, a worker would claim jobs only to fail them, which is worse than
+/// leaving them queued for a deployment that can finish them. So the absence
+/// of a store or of every provider key means no worker rather than a broken
+/// one, and the log says which.
+fn spawn_texture_worker(
+    db: Arc<dyn crate::db::Database>,
+    store: Option<Arc<dyn crate::texture_store::TextureStore>>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    let Some(store) = store else {
+        tracing::info!("no texture store configured; the texture worker will not run");
+        return;
+    };
+    let providers = crate::generation_providers::configured_providers();
+    if providers.is_empty() {
+        // Uploads need no provider, so this is worth running anyway — it just
+        // cannot generate.
+        tracing::info!("no image provider configured; the texture worker will handle uploads only");
+    }
+
+    let worker = crate::texture_worker::Worker {
+        db,
+        store,
+        providers,
+        budget: crate::generation::Budget::default(),
+        name: format!(
+            "{}-{}",
+            gethostname::gethostname().to_string_lossy(),
+            std::process::id()
+        ),
+    };
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        cancellation_token.cancelled().await;
+        let _ = tx.send(true);
+    });
+    tokio::spawn(worker.run_forever(rx));
+}
+
 fn spawn_user_count_broadcaster(
     redis: RedisConnection,
     cancellation_token: tokio_util::sync::CancellationToken,

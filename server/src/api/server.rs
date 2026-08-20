@@ -26,6 +26,7 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
         jwt_manager: jwt_manager.clone(),
         user_cache: None,
         crazygames_verifier: crazygames::configured_verifier_from_env()?,
+        texture_store: None,
     };
     let auth_middleware_state = AuthMiddlewareState {
         jwt_manager: jwt_manager.clone(),

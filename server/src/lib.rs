@@ -48,6 +48,7 @@ pub mod telemetry;
 pub mod texture;
 pub mod texture_pixels;
 pub mod texture_store;
+pub mod texture_worker;
 pub mod user_cache;
 pub mod wallet;
 pub mod ws_server;

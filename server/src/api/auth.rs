@@ -26,6 +26,13 @@ pub struct AuthState {
     /// unchanged. Emitting is always non-blocking and drops under pressure, so
     /// an auth handler never waits on it.
     pub analytics: Option<AnalyticsHandle>,
+    /// Where texture pixels live, when a deployment stores any.
+    ///
+    /// The upload route needs it: it puts the bytes away and records a job
+    /// naming their digest, so the worker reads from the store rather than
+    /// being handed megabytes through a queue. `None` is a deployment that
+    /// accepts no textures, and the route says so rather than half-working.
+    pub texture_store: Option<Arc<dyn crate::texture_store::TextureStore>>,
 }
 
 /// Everything an HTTP handler needs to emit an analytics event.

@@ -180,6 +180,27 @@ pub struct GenerationJob {
     pub detail: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// The author's own words, kept apart from the engineered prompt.
+    ///
+    /// `prompt` is what the model is sent — a per-kind template wrapped around
+    /// the subject — and showing that back to someone who typed "tiger fur"
+    /// would be showing them our prompt engineering. This is what goes into the
+    /// texture's `last_prompt`, so regenerating is one edit rather than a
+    /// retype.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// The digest of an uploaded original, when this job is an upload.
+    ///
+    /// An upload and a generation reach the same pixel pass from different
+    /// directions — one already has its bytes, the other has to ask for them —
+    /// so they are one job type with one state machine rather than two of
+    /// everything. Set means "the bytes are already in the store, skip the
+    /// model".
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    /// Digests of reference images to hand the model alongside the prompt.
+    #[serde(default)]
+    pub reference_refs: Vec<String>,
     /// When this job's claim goes stale, if it is claimed.
     ///
     /// A worker that dies mid-job would otherwise strand it forever: the state
@@ -204,6 +225,17 @@ pub struct GenerationJob {
 pub const LEASE_MS: i64 = 5 * 60 * 1000;
 
 impl GenerationJob {
+    /// How many frames this job's kind expects, if it is a stack of them.
+    ///
+    /// Derived rather than stored: the row count is a property of the kind, and
+    /// a field would be one more thing that can disagree with the pixels.
+    pub fn rows_hint(&self) -> Option<u32> {
+        match self.kind {
+            crate::texture::TextureKind::Sheet => Some(20),
+            _ => None,
+        }
+    }
+
     /// Whether a claim on this job has lapsed, so another worker may take it.
     ///
     /// A job with no lease at all counts as lapsed: that is either a job

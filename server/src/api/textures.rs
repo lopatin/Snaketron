@@ -176,6 +176,9 @@ pub async fn generate(
         texture_id: None,
         failure: None,
         detail: None,
+        subject: Some(subject.to_string()),
+        source_ref: None,
+        reference_refs: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
         // Nothing has claimed it yet.
@@ -435,6 +438,178 @@ fn no_store(response: &mut Response) {
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store, must-revalidate, private"),
     );
+}
+
+/// Accept art an author already has.
+///
+/// `multipart/form-data`: a `kind` field and a `file` part holding the PNG,
+/// with an optional `subject` describing it for the library. The response is a
+/// job id rather than a texture, and that is the PRD's split rather than an
+/// implementation detail — decoding, dimension checks, seam measurement and
+/// ladder generation all happen in the worker, because synchronous pixel work
+/// in the request path is a CPU-exhaustion vector sitting behind free
+/// registration.
+///
+/// What the handler does do is refuse the obvious: the magic bytes decide
+/// whether this is a PNG rather than the filename, and the IHDR's declared
+/// dimensions are checked *before* anything decodes them, because a four
+/// megabyte body can claim sixty thousand pixels square.
+pub async fn upload(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    mut form: axum::extract::Multipart,
+) -> Result<Response, TexturesApiError> {
+    if auth_user.is_guest {
+        return Err(TexturesApiError::GuestNotAllowed);
+    }
+
+    let mut kind: Option<TextureKind> = None;
+    let mut subject: Option<String> = None;
+    let mut png: Option<Vec<u8>> = None;
+
+    while let Some(field) = form.next_field().await.map_err(|error| {
+        TexturesApiError::Invalid(vec![format!("body: could not be read as a form: {error}")])
+    })? {
+        match field.name().unwrap_or_default() {
+            "kind" => {
+                let value = field.text().await.unwrap_or_default();
+                kind = TextureKind::parse(&value);
+                if kind.is_none() {
+                    return Err(TexturesApiError::Invalid(vec![format!(
+                        "kind: {value} is not a texture"
+                    )]));
+                }
+            }
+            "subject" => subject = field.text().await.ok(),
+            "file" => {
+                png = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|error| {
+                            TexturesApiError::Invalid(vec![format!(
+                                "file: could not be read: {error}"
+                            )])
+                        })?
+                        .to_vec(),
+                );
+            }
+            // An unknown part is ignored rather than refused: a browser may add
+            // its own, and this is the one route that takes a real form.
+            _ => {}
+        }
+    }
+
+    let kind =
+        kind.ok_or_else(|| TexturesApiError::Invalid(vec!["kind: is required".to_string()]))?;
+    let png =
+        png.ok_or_else(|| TexturesApiError::Invalid(vec!["file: is required".to_string()]))?;
+
+    // The magic bytes and the header, before anything larger happens.
+    let header = texture::read_png_header(&png).map_err(|error| {
+        TexturesApiError::Invalid(vec![format!("{} {}", error.field, error.problem)])
+    })?;
+    texture::validate_shape(texture::ProposedTexture {
+        kind,
+        width_px: header.width_px,
+        height_px: header.height_px,
+        rows: if kind == TextureKind::Sheet {
+            Some(canonical_size(kind).2)
+        } else {
+            None
+        },
+        byte_len: png.len(),
+    })
+    .map_err(|errors| {
+        TexturesApiError::Invalid(
+            errors
+                .into_iter()
+                .map(|error| format!("{} {}", error.field, error.problem))
+                .collect(),
+        )
+    })?;
+
+    let Some(store) = state.texture_store.as_ref() else {
+        return Err(TexturesApiError::Disabled);
+    };
+
+    // The bytes go in the store first, addressed by their own hash, and the
+    // job carries the digest. That way a retry of the same upload is the same
+    // object rather than a second copy, and the worker reads bytes rather than
+    // being handed them through a queue that would have to carry megabytes.
+    let sha256 = crate::texture_store::digest(&png);
+    store
+        .put(
+            &crate::texture_store::TextureObject {
+                sha256: sha256.clone(),
+                content_type: "image/png",
+                byte_len: png.len(),
+            },
+            &png,
+        )
+        .await
+        .map_err(|error| {
+            error!(error = %error, "could not store an uploaded texture");
+            TexturesApiError::StorageUnavailable
+        })?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let job = GenerationJob {
+        // Same bytes, same author, same ten seconds: one job, not two.
+        job_id: crate::wallet::request_fingerprint(&[
+            &auth_user.user_id.to_string(),
+            kind.as_str(),
+            &sha256,
+            &(now / 10_000).to_string(),
+        ])
+        .trim_start_matches("sha256:")[..32]
+            .to_string(),
+        owner_user_id: auth_user.user_id,
+        kind,
+        // No model is asked anything, so there is no prompt to engineer.
+        prompt: String::new(),
+        state: JobState::Queued,
+        spend: Spend::default(),
+        texture_id: None,
+        failure: None,
+        detail: None,
+        subject,
+        source_ref: Some(sha256),
+        reference_refs: Vec::new(),
+        created_at_ms: now,
+        updated_at_ms: now,
+        lease_until_ms: None,
+    };
+
+    if state
+        .db
+        .get_generation_job(&job.job_id)
+        .await
+        .map_err(|error| {
+            error!(error = %error, "could not read a generation job");
+            TexturesApiError::Internal(error)
+        })?
+        .is_none()
+    {
+        state
+            .db
+            .create_generation_job(&job)
+            .await
+            .map_err(|error| {
+                error!(error = %error, "could not record an upload job");
+                TexturesApiError::Internal(error)
+            })?;
+    }
+
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(JobAccepted {
+            job_id: job.job_id.clone(),
+        }),
+    )
+        .into_response();
+    no_store(&mut response);
+    Ok(response)
 }
 
 #[cfg(test)]

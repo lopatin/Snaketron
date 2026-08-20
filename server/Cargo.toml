@@ -72,7 +72,11 @@ flate2 = "1.0"
 rand = "0.8"
 rustrict = { version = "0.7.38", default-features = false, features = ["censor"] }
 # HTTP API dependencies
-axum = { version = "0.7", features = ["tokio", "ws"] }
+#  is for the texture upload route: a PNG part plus its metadata
+# is the one place the API takes bytes rather than JSON.
+# `multipart` is for the texture upload route: a PNG part beside its metadata
+# is the one place this API takes bytes rather than JSON.
+axum = { version = "0.7", features = ["tokio", "ws", "multipart"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Password hashing
