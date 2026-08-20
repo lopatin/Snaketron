@@ -1277,28 +1277,46 @@ async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>
     }
 }
 
-/// The seat a connection is in after a state transition, published to its
-/// analytics context as it is read.
+/// Publishes everything a connection's analytics context can only learn from
+/// its state — the account it is authenticated as and the seat it is in — and
+/// returns that seat.
 ///
 /// One function rather than a read at the top of the transition and a publish
 /// at the bottom, because the publish has to happen BEFORE anything acts on the
 /// transition. Entering a game spawns the game-event forwarder, and that
 /// forwarder's first frame is the anchor snapshot; it runs on its own task and
-/// can learn the seat only from here. A seat published afterwards would stamp
-/// the whole entry burst — the snapshot included — with the game this
+/// can learn either fact only from here. A seat published afterwards would
+/// stamp the whole entry burst — the snapshot included — with the game this
 /// connection was in before, which on a rematch or a game switch is a wrong
-/// join key rather than a missing one.
+/// join key rather than a missing one. The account is published from the same
+/// point rather than a second one so it cannot acquire a weaker ordering than
+/// the seat already has.
 ///
-/// Returning the value is what keeps that order: the transition below cannot
+/// Returning the seat is what keeps that order: the transition below cannot
 /// decide whether it is entering a game without calling this first.
-fn publish_seat(
+fn publish_analytics_context(
     state: &ConnectionState,
     analytics: &crate::analytics::ws_sink::WsConnection,
 ) -> Option<u32> {
-    let seat = match state {
-        ConnectionState::Authenticated { game_id, .. } => *game_id,
-        ConnectionState::Unauthenticated => None,
+    let (account, seat) = match state {
+        ConnectionState::Authenticated {
+            metadata, game_id, ..
+        } => (
+            Some(crate::analytics::ws_sink::Account {
+                user_id: metadata.user_id,
+                is_guest: metadata.is_guest,
+                // Load-test connections are seated in their own pool, so this
+                // is knowable exactly where the account is.
+                is_stress_test: metadata.matchmaking_pool
+                    == crate::matchmaking_pool::MatchmakingPool::Stress,
+            }),
+            *game_id,
+        ),
+        // Not "unknown": a connection in this state has no account behind it,
+        // and frames recorded from here must carry none.
+        ConnectionState::Unauthenticated => (None, None),
     };
+    analytics.set_account(account);
     analytics.set_game_id(seat);
     seat
 }
@@ -1662,15 +1680,19 @@ async fn handle_websocket_connection(
                                     ).await {
                                         Ok(mut new_state) => {
                                             // Check if we're entering a game or lobby.
-                                            // Reading the seat and publishing it
-                                            // are one step, and everything below
-                                            // that acts on the transition needs
-                                            // this value — so nothing can spawn a
-                                            // subscription or send a frame before
-                                            // the forwarder has been told which
-                                            // game it is now in.
+                                            // Reading the seat and publishing the
+                                            // whole analytics context are one
+                                            // step, and everything below that acts
+                                            // on the transition needs this value —
+                                            // so nothing can spawn a subscription
+                                            // or send a frame before the forwarder
+                                            // has been told which game it is now
+                                            // in and who is in it.
                                             let entered_game_id =
-                                                publish_seat(&new_state, &ws_analytics);
+                                                publish_analytics_context(
+                                                    &new_state,
+                                                    &ws_analytics,
+                                                );
                                             let entering_game = match requested_game_id {
                                                 Some(requested_game_id) => {
                                                     entered_game_id == Some(requested_game_id)
@@ -2034,10 +2056,12 @@ async fn handle_websocket_connection(
                                             crate::resilience_metrics::record_websocket_process_error(1);
                                             error!("Error processing message: {}", e);
                                             // State was consumed, need to reset.
-                                            // There is no new state to read the
-                                            // seat from, so it is cleared directly.
+                                            // The reset state is published the
+                                            // same way every other transition
+                                            // is, so the account and the seat
+                                            // cannot be cleared out of step.
                                             state = ConnectionState::Unauthenticated;
-                                            ws_analytics.set_game_id(None);
+                                            publish_analytics_context(&state, &ws_analytics);
                                             break;
                                         }
                                     }
@@ -8715,17 +8739,21 @@ mod message_type_naming_tests {
 }
 
 #[cfg(test)]
-mod seat_publication_tests {
+mod analytics_publication_tests {
     use super::*;
-    use crate::analytics::ws_sink::WsConnection;
+    use crate::analytics::ws_sink::{Account, WsConnection};
 
     fn seated(game_id: Option<u32>) -> ConnectionState {
+        seated_as(7, false, game_id)
+    }
+
+    fn seated_as(user_id: i32, is_guest: bool, game_id: Option<u32>) -> ConnectionState {
         ConnectionState::Authenticated {
             metadata: PlayerMetadata {
-                user_id: 7,
+                user_id,
                 username: "Player".to_owned(),
                 token: "session-token".to_owned(),
-                is_guest: false,
+                is_guest,
                 matchmaking_pool: MatchmakingPool::Public,
                 supports_ad_break: true,
                 can_show_video_ad: false,
@@ -8748,7 +8776,7 @@ mod seat_publication_tests {
         let analytics = WsConnection::new("seat-order");
         analytics.set_game_id(Some(11));
 
-        let entered = publish_seat(&seated(Some(77)), &analytics);
+        let entered = publish_analytics_context(&seated(Some(77)), &analytics);
 
         assert_eq!(entered, Some(77));
         assert_eq!(
@@ -8763,7 +8791,7 @@ mod seat_publication_tests {
     fn leaving_a_game_clears_the_seat() {
         let analytics = WsConnection::new("seat-clear");
         analytics.set_game_id(Some(11));
-        assert_eq!(publish_seat(&seated(None), &analytics), None);
+        assert_eq!(publish_analytics_context(&seated(None), &analytics), None);
         assert_eq!(analytics.game_id(), None);
     }
 
@@ -8774,9 +8802,91 @@ mod seat_publication_tests {
         let analytics = WsConnection::new("seat-unauth");
         analytics.set_game_id(Some(11));
         assert_eq!(
-            publish_seat(&ConnectionState::Unauthenticated, &analytics),
+            publish_analytics_context(&ConnectionState::Unauthenticated, &analytics),
             None
         );
+        assert_eq!(analytics.game_id(), None);
+    }
+
+    /// The account has to be readable at the same instant the seat is, for the
+    /// same reason: the caller goes on to spawn the game-event forwarder, and
+    /// that task reads the analytics context from another thread. Anything the
+    /// forwarder's first frames could be stamped with must already be in place
+    /// when the caller receives the seat.
+    #[test]
+    fn a_transition_publishes_the_account_before_returning_the_seat() {
+        let analytics = WsConnection::new("account-order");
+        assert_eq!(
+            analytics.account(),
+            None,
+            "a fresh connection has authenticated as nobody"
+        );
+
+        let entered = publish_analytics_context(&seated_as(4242, false, Some(77)), &analytics);
+
+        assert_eq!(entered, Some(77));
+        assert_eq!(
+            analytics.account(),
+            Some(Account {
+                user_id: 4242,
+                is_guest: false,
+                is_stress_test: false,
+            }),
+            "the caller cannot learn the new seat without the forwarder having \
+             learned who is in it too"
+        );
+    }
+
+    /// A guest is an account like any other; the flag is the only thing that
+    /// distinguishes it, so it has to be published, not defaulted.
+    #[test]
+    fn a_guest_is_published_as_a_guest_account() {
+        let analytics = WsConnection::new("account-guest");
+        publish_analytics_context(&seated_as(1001, true, None), &analytics);
+        assert_eq!(
+            analytics.account(),
+            Some(Account {
+                user_id: 1001,
+                is_guest: true,
+                is_stress_test: false,
+            })
+        );
+    }
+
+    /// Who is on the connection does not change when they sit down or stand
+    /// up, so ordinary in-game transitions must leave the account alone.
+    #[test]
+    fn the_account_survives_entering_and_leaving_a_game() {
+        let analytics = WsConnection::new("account-seat-changes");
+        let expected = Some(Account {
+            user_id: 4242,
+            is_guest: false,
+            is_stress_test: false,
+        });
+
+        publish_analytics_context(&seated_as(4242, false, None), &analytics);
+        assert_eq!(analytics.account(), expected);
+
+        publish_analytics_context(&seated_as(4242, false, Some(77)), &analytics);
+        assert_eq!(analytics.account(), expected, "entering a game");
+        assert_eq!(analytics.game_id(), Some(77));
+
+        publish_analytics_context(&seated_as(4242, false, None), &analytics);
+        assert_eq!(analytics.account(), expected, "leaving a game");
+        assert_eq!(analytics.game_id(), None);
+    }
+
+    /// Falling back to unauthenticated ends the account, and the frames after
+    /// it must not keep naming the person who was there.
+    #[test]
+    fn an_unauthenticated_transition_clears_the_account() {
+        let analytics = WsConnection::new("account-unauth");
+        publish_analytics_context(&seated_as(4242, false, Some(77)), &analytics);
+        assert!(analytics.account().is_some(), "there was someone to clear");
+
+        publish_analytics_context(&ConnectionState::Unauthenticated, &analytics);
+
+        assert_eq!(analytics.account(), None);
         assert_eq!(analytics.game_id(), None);
     }
 }

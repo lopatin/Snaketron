@@ -27,6 +27,61 @@ use super::ws_exporter::{Direction, WsEventSink, WsFrameRecord, is_sampled};
 /// `u32` on the wire, so no real value collides with it.
 const NO_GAME: i64 = -1;
 
+/// The account a websocket connection has authenticated as.
+///
+/// The guest flag travels with the id rather than beside it because a row that
+/// names one without the other is not interpretable: see [`WsConnection`] for
+/// why the pair is published and read as a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Account {
+    pub user_id: i32,
+    pub is_guest: bool,
+    /// Whether this connection belongs to the load-test pool.
+    ///
+    /// Travels with the account for the same reason the guest flag does, and
+    /// because without it synthetic websocket traffic is indistinguishable
+    /// from real traffic in these rows — a load test would silently move every
+    /// per-account metric derived from them.
+    pub is_stress_test: bool,
+}
+
+/// Sentinel for "no account is known on this connection yet".
+///
+/// [`pack_account`] shifts a 32-bit id up by two bits, so every packed value
+/// lies in `[-2^33, 2^33)`. `i64::MIN` is outside that range and so cannot be
+/// produced by any account, however account ids are allocated.
+const NO_ACCOUNT: i64 = i64::MIN;
+
+/// Packs an account into one word: the id shifted up by two, the stress flag
+/// in bit 1, the guest flag in bit 0.
+///
+/// A shift rather than a bitmask so the sign survives: the whole `i32` range
+/// round-trips, and nothing here has to assume account ids are positive.
+fn pack_account(account: Account) -> i64 {
+    (i64::from(account.user_id) << 2)
+        | (i64::from(account.is_stress_test) << 1)
+        | i64::from(account.is_guest)
+}
+
+fn unpack_account(packed: i64) -> Option<Account> {
+    if packed == NO_ACCOUNT {
+        return None;
+    }
+    // Arithmetic shift, so a negative id comes back negative. The value is
+    // exactly what `pack_account` was handed, so the narrowing cannot lose
+    // anything.
+    let user_id = packed >> 2;
+    debug_assert!(
+        i32::try_from(user_id).is_ok(),
+        "a packed account id must round-trip"
+    );
+    Some(Account {
+        user_id: user_id as i32,
+        is_guest: packed & 1 == 1,
+        is_stress_test: (packed >> 1) & 1 == 1,
+    })
+}
+
 struct Sink {
     events: WsEventSink,
     /// Shared rather than cloned per frame: the four strings in it are the same
@@ -83,6 +138,17 @@ pub struct WsConnection {
     /// The game this connection is seated in. Kept here rather than read from
     /// `ConnectionState` because the outbound forwarder cannot reach it.
     game_id: AtomicI64,
+    /// The account this connection authenticated as, packed by
+    /// [`pack_account`]. Kept here for the same reason as `game_id`: the
+    /// outbound forwarder holds only serialized frames, so the authenticated
+    /// identity reaches it from nowhere else.
+    ///
+    /// One word rather than an id atomic beside a flag atomic, because both
+    /// halves are read together on every frame: two loads could straddle a
+    /// publication and pair one state's id with the other state's guest flag,
+    /// which is precisely the misattribution this column exists to prevent.
+    /// One relaxed load is also cheaper than two.
+    account: AtomicI64,
 }
 
 impl WsConnection {
@@ -105,6 +171,7 @@ impl WsConnection {
             sampled: is_sampled(connection_key, sample_rate),
             session_id: Mutex::new(None),
             game_id: AtomicI64::new(NO_GAME),
+            account: AtomicI64::new(NO_ACCOUNT),
         }
     }
 
@@ -132,6 +199,17 @@ impl WsConnection {
             .store(game_id.map_or(NO_GAME, i64::from), Ordering::Relaxed);
     }
 
+    /// Attaches the account this connection has authenticated as, or clears it
+    /// when the connection is no longer authenticated.
+    ///
+    /// Clearing matters as much as setting: a frame sent after a connection
+    /// falls back to unauthenticated has no account behind it, and must not
+    /// keep naming the one that used to be there.
+    pub fn set_account(&self, account: Option<Account>) {
+        self.account
+            .store(account.map_or(NO_ACCOUNT, pack_account), Ordering::Relaxed);
+    }
+
     fn session_id(&self) -> Option<Arc<str>> {
         self.session_id.lock().ok().and_then(|held| held.clone())
     }
@@ -142,6 +220,15 @@ impl WsConnection {
             NO_GAME => None,
             game_id => Some(game_id),
         }
+    }
+
+    /// The account this connection's frames are currently attributed to.
+    ///
+    /// `None` means there is genuinely no account — the frame arrived before
+    /// authentication, or after a fall back to unauthenticated — never that
+    /// one was known and dropped.
+    pub fn account(&self) -> Option<Account> {
+        unpack_account(self.account.load(Ordering::Relaxed))
     }
 }
 
@@ -175,7 +262,7 @@ fn record(
 /// frame path is reachable from a test without installing a process-global.
 ///
 /// What is left on the frame path: an uncontended mutex lock that yields a
-/// refcount bump, a relaxed atomic load, a clock read, and a `try_send` of a
+/// refcount bump, two relaxed atomic loads, a clock read, and a `try_send` of a
 /// struct of machine words. Nothing allocates, nothing waits, and nothing can
 /// fail back to the caller.
 ///
@@ -198,6 +285,7 @@ fn record_into(
     let _ = sink.events.record(WsFrameRecord {
         origin: sink.origin.clone(),
         session_id: connection.session_id(),
+        account: connection.account(),
         direction,
         message_type,
         byte_len,
@@ -210,13 +298,63 @@ fn record_into(
 mod tests {
     use super::*;
 
+    /// All three fields share one word, so the packing has to round-trip every
+    /// combination — a flag landing in the wrong bit would silently relabel
+    /// real traffic as synthetic, or a load test as real.
+    #[test]
+    fn every_account_shape_survives_the_packing() {
+        for user_id in [i32::MIN, -7, 0, 1, 4242, i32::MAX] {
+            for is_guest in [false, true] {
+                for is_stress_test in [false, true] {
+                    let account = Account {
+                        user_id,
+                        is_guest,
+                        is_stress_test,
+                    };
+                    assert_eq!(
+                        unpack_account(pack_account(account)),
+                        Some(account),
+                        "lost {account:?} in the round trip"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sentinel has to stay outside the range packing can produce, or a
+    /// real account would read as "no account known yet".
+    #[test]
+    fn no_account_is_unreachable_by_packing() {
+        for user_id in [i32::MIN, i32::MAX] {
+            for is_guest in [false, true] {
+                for is_stress_test in [false, true] {
+                    assert_ne!(
+                        pack_account(Account {
+                            user_id,
+                            is_guest,
+                            is_stress_test
+                        }),
+                        NO_ACCOUNT
+                    );
+                }
+            }
+        }
+        assert_eq!(unpack_account(NO_ACCOUNT), None);
+    }
+
     /// The whole point of the shared per-connection context: both hooks read
     /// the same identity, so the two directions of one session join.
     #[test]
     fn a_connection_shares_one_identity_across_both_directions() {
         let connection = WsConnection::new("ws-1");
+        let account = Account {
+            user_id: 4242,
+            is_guest: false,
+            is_stress_test: false,
+        };
         connection.bind_session("s_shared");
         connection.set_game_id(Some(9));
+        connection.set_account(Some(account));
 
         // The inbound loop and the outbound forwarder each read the context
         // independently; they must see the same answer.
@@ -225,6 +363,73 @@ mod tests {
         assert_eq!(&*from_inbound, "s_shared");
         assert_eq!(from_inbound, from_outbound);
         assert_eq!(connection.game_id(), Some(9));
+        assert_eq!(connection.account(), Some(account));
+    }
+
+    /// The two halves of the account share one word, so the pack has to
+    /// round-trip every id a connection could be handed — including the signs
+    /// the encoding deliberately assumes nothing about.
+    #[test]
+    fn packing_round_trips_every_account_and_never_collides_with_the_sentinel() {
+        for user_id in [i32::MIN, -1, 0, 1, 1_000, i32::MAX] {
+            for is_guest in [false, true] {
+                let account = Account {
+                    user_id,
+                    is_guest,
+                    is_stress_test: false,
+                };
+                assert_eq!(unpack_account(pack_account(account)), Some(account));
+                assert_ne!(
+                    pack_account(account),
+                    NO_ACCOUNT,
+                    "a real account must never be mistaken for no account"
+                );
+            }
+        }
+        assert_eq!(unpack_account(NO_ACCOUNT), None);
+    }
+
+    /// Who is on the connection and where they are sitting are independent
+    /// facts: moving between games must not disturb the account, and losing
+    /// the account must not be inferable from a seat change.
+    #[test]
+    fn the_account_outlives_seat_changes_and_is_cleared_when_it_ends() {
+        let connection = WsConnection::new("ws-account-life");
+        let account = Account {
+            user_id: 77,
+            is_guest: true,
+            is_stress_test: false,
+        };
+        connection.set_account(Some(account));
+
+        connection.set_game_id(Some(3));
+        assert_eq!(
+            connection.account(),
+            Some(account),
+            "entering a game must not change who is playing"
+        );
+        connection.set_game_id(None);
+        assert_eq!(
+            connection.account(),
+            Some(account),
+            "leaving a game must not change who was playing"
+        );
+
+        // Seated again, so the clear below is asserted against a live seat
+        // rather than one that was already absent.
+        connection.set_game_id(Some(8));
+        connection.set_account(None);
+        assert_eq!(
+            connection.account(),
+            None,
+            "a frame sent after the connection falls back to unauthenticated \
+             has no account behind it"
+        );
+        assert_eq!(
+            connection.game_id(),
+            Some(8),
+            "clearing the account must not disturb the seat"
+        );
     }
 
     /// The session id is written once and read on every frame from two tasks,
@@ -382,6 +587,29 @@ mod export_path_tests {
         )
     }
 
+    /// Drains the exporter and parses what it wrote.
+    ///
+    /// The final flush runs on the exporter's own task, so this polls for the
+    /// write rather than sleeping a fixed amount.
+    async fn written_lines(
+        fake: &Arc<FakeStore>,
+        cancel: CancellationToken,
+    ) -> Vec<serde_json::Value> {
+        cancel.cancel();
+        let mut objects = Vec::new();
+        for _ in 0..100 {
+            objects = fake.objects.lock().unwrap().clone();
+            if !objects.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (_, body) = objects.first().expect("the shutdown flush must write");
+        body.lines()
+            .map(|line| serde_json::from_str(line).expect("every line must be JSON"))
+            .collect()
+    }
+
     /// End to end through the sink: a recorded frame has to survive the
     /// hand-off, the exporter's projection, serialization, batching, and the
     /// write, and land under the websocket dataset rather than the game-events
@@ -431,6 +659,70 @@ mod export_path_tests {
         assert_eq!(lines[0]["websocket_message"]["game_id"], "4242");
         assert_eq!(lines[1]["websocket_message"]["direction"], "out");
         assert_eq!(lines[0]["region"], "use1", "the origin must reach the row");
+    }
+
+    /// The property that makes these rows joinable to an account at all: once
+    /// the connection is authenticated, BOTH directions carry the same account
+    /// through to the written row. The outbound forwarder is a separate task
+    /// holding only serialized bytes, so if it did not read the shared context
+    /// its half of every session would be unattributable.
+    #[tokio::test]
+    async fn an_authenticated_connection_stamps_both_directions_with_the_account() {
+        let fake = Arc::new(FakeStore::default());
+        let store: Arc<dyn ObjectStore> = fake.clone();
+        let (sink, cancel) = sink_over(store, 64);
+
+        let connection = WsConnection::at_sample_rate("ws-account", 1.0);
+        connection.bind_session("s_account");
+        connection.set_account(Some(Account {
+            user_id: 4242,
+            is_guest: false,
+            is_stress_test: false,
+        }));
+        record_into(&sink, &connection, Direction::Inbound, "PlayerReady", 31);
+        record_into(&sink, &connection, Direction::Outbound, "GameEvent", 900);
+
+        let lines = written_lines(&fake, cancel).await;
+        assert_eq!(lines.len(), 2, "both directions must be written");
+        assert_eq!(lines[0]["websocket_message"]["direction"], "in");
+        assert_eq!(lines[1]["websocket_message"]["direction"], "out");
+        // Quoted per the proto3 JSON mapping, like every other 64-bit column.
+        assert_eq!(lines[0]["identity"]["user_id"], "4242");
+        assert_eq!(lines[1]["identity"]["user_id"], "4242");
+        assert_eq!(lines[0]["identity"]["is_guest"], false);
+        assert_eq!(lines[1]["identity"]["is_guest"], false);
+    }
+
+    /// The handshake frames genuinely have no account, and the row must say so
+    /// the way `session_id` already does: absent, not a placeholder that would
+    /// join to someone else's rows.
+    #[tokio::test]
+    async fn a_frame_before_authentication_carries_no_account() {
+        let fake = Arc::new(FakeStore::default());
+        let store: Arc<dyn ObjectStore> = fake.clone();
+        let (sink, cancel) = sink_over(store, 64);
+
+        // Nothing bound and nothing published: exactly the state a connection
+        // is in while the client's first frame is still in flight.
+        let connection = WsConnection::at_sample_rate("ws-preauth", 1.0);
+        assert_eq!(connection.account(), None);
+        record_into(&sink, &connection, Direction::Inbound, "Authenticate", 200);
+
+        let lines = written_lines(&fake, cancel).await;
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0]["identity"]["user_id"].is_null(),
+            "a pre-authentication row must name no account: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0]["identity"]["session_id"].is_null(),
+            "and no session, which is the behaviour the account now matches"
+        );
+        assert_eq!(
+            lines[0]["identity"]["is_guest"], true,
+            "false would read as a verified registered account"
+        );
     }
 
     /// Invariant I1 at the hook, not just at the channel: an overwhelmed

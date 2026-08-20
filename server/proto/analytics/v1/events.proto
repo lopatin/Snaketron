@@ -26,7 +26,23 @@ message Identity {
   optional string anon_id = 2;
   // Server-minted, one per websocket session.
   optional string session_id = 3;
+  // Only meaningful on a row that also names a `user_id`. Proto3 bools carry
+  // no presence, so this cannot say "unknown", and the two producers resolve
+  // that differently:
+  //
+  //   * `websocket_message` rows stamp `true` when no account is known, so
+  //     `false` is a positive claim backed by a verified account and a
+  //     pre-authentication frame can never be counted as registered activity.
+  //   * every other event builds identity from `EventIdentity::default()`,
+  //     which leaves this `false` when no account is known.
+  //
+  // Either way the rule for a query is the same: gate on
+  // `user_id IS NOT NULL` before reading this, or a guest-vs-registered split
+  // will be wrong under one convention or the other.
   bool is_guest = 4;
+  // False when unknown, deliberately: a row with no account cannot be
+  // attributed to a load test, and marking unknown traffic synthetic would
+  // delete real traffic from every filtered view.
   bool is_stress_test = 5;
 }
 

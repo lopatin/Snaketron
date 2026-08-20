@@ -23,6 +23,7 @@ use super::event::{EventIdentity, EventOrigin, envelope_at, to_json_line};
 use super::exporter::{ExportTarget, event_date, write_batch};
 use super::object_store::ObjectStore;
 use super::proto;
+use super::ws_sink::Account;
 
 /// Which way a frame was travelling.
 ///
@@ -65,6 +66,11 @@ impl Direction {
 pub(crate) struct WsFrameRecord {
     pub(crate) origin: Arc<EventOrigin>,
     pub(crate) session_id: Option<Arc<str>>,
+    /// The account the connection had authenticated as when the frame passed,
+    /// or `None` for a frame that arrived before authentication. Copied by
+    /// value because it is two machine words, so carrying it costs no
+    /// allocation and no refcount.
+    pub(crate) account: Option<Account>,
     pub(crate) direction: Direction,
     pub(crate) message_type: &'static str,
     pub(crate) byte_len: usize,
@@ -79,6 +85,24 @@ impl WsFrameRecord {
             &self.origin,
             EventIdentity {
                 session_id: self.session_id.map(|id| id.to_string()),
+                // Absent, not zero, when there is no account: a placeholder id
+                // would join to a real row belonging to someone else.
+                user_id: self.account.map(|account| i64::from(account.user_id)),
+                // QUERY AUTHORS: `is_guest` is a bare proto3 bool, so it has no
+                // presence and cannot say "unknown". A frame with no account is
+                // therefore stamped `true`, read as "not known to be a
+                // registered account". That keeps `is_guest = false` a positive
+                // claim backed by a verified account, so a pre-authentication
+                // frame can never be counted as registered-user activity. The
+                // cost is the other direction: rows where `user_id` is null are
+                // guest-flagged but have no account at all, so any guest-vs-
+                // registered split must filter on `user_id IS NOT NULL` first.
+                is_guest: self.account.is_none_or(|account| account.is_guest),
+                // Unlike the guest flag this defaults to FALSE when unknown,
+                // and deliberately: a row with no account cannot be attributed
+                // to a load test either, and marking unknown traffic synthetic
+                // would delete real traffic from every filtered view.
+                is_stress_test: self.account.is_some_and(|account| account.is_stress_test),
                 ..Default::default()
             },
             // Type and size only: message bodies carry chat and tokens and are
@@ -374,6 +398,11 @@ mod tests {
         WsFrameRecord {
             origin: test_origin(),
             session_id: Some(Arc::from(format!("s-{id}").as_str())),
+            account: Some(Account {
+                user_id: 1_000 + id as i32,
+                is_guest: false,
+                is_stress_test: false,
+            }),
             direction: Direction::Outbound,
             message_type: "GameEvent",
             byte_len: 64,
@@ -628,9 +657,21 @@ mod projection_tests {
         byte_len: usize,
         game_id: Option<i64>,
     ) -> WsFrameRecord {
+        with_account(None, session_id, direction, message_type, byte_len, game_id)
+    }
+
+    fn with_account(
+        account: Option<Account>,
+        session_id: Option<&str>,
+        direction: Direction,
+        message_type: &'static str,
+        byte_len: usize,
+        game_id: Option<i64>,
+    ) -> WsFrameRecord {
         WsFrameRecord {
             origin: origin(),
             session_id: session_id.map(Arc::from),
+            account,
             direction,
             message_type,
             byte_len,
@@ -694,6 +735,107 @@ mod projection_tests {
             payload(&event).game_id.is_none(),
             "an absent game must be absent, not zero"
         );
+    }
+
+    /// The join this column exists for: a frame recorded after authentication
+    /// has to name the account, or the row is unattributable however it is
+    /// queried.
+    #[test]
+    fn an_authenticated_frame_names_the_account_behind_it() {
+        let event = with_account(
+            Some(Account {
+                user_id: 4242,
+                is_guest: false,
+                is_stress_test: false,
+            }),
+            Some("s_auth"),
+            Direction::Inbound,
+            "PlayerReady",
+            12,
+            Some(9),
+        )
+        .into_event();
+
+        let identity = event.identity.as_ref().expect("an identity");
+        assert_eq!(identity.user_id, Some(4242));
+        assert!(
+            !identity.is_guest,
+            "a verified registered account is the one case that may claim this"
+        );
+    }
+
+    /// A guest is a real account with a real id — the flag is the only thing
+    /// separating it from a registered one, so it has to survive projection
+    /// rather than falling back to the proto default.
+    #[test]
+    fn a_guest_account_is_named_and_flagged_as_a_guest() {
+        let event = with_account(
+            Some(Account {
+                user_id: 1001,
+                is_guest: true,
+                is_stress_test: false,
+            }),
+            Some("s_guest"),
+            Direction::Outbound,
+            "GameEvent",
+            64,
+            None,
+        )
+        .into_event();
+
+        let identity = event.identity.as_ref().expect("an identity");
+        assert_eq!(identity.user_id, Some(1001));
+        assert!(identity.is_guest);
+    }
+
+    /// Honesty about the handshake: those frames genuinely predate any
+    /// account, so `user_id` must be ABSENT rather than zero — a zero would
+    /// join to whatever row happens to hold that id.
+    ///
+    /// `is_guest` has no presence and so cannot say "unknown"; `true` is the
+    /// deliberate choice, because `false` would read as a verified registered
+    /// account on a row that has no account at all.
+    #[test]
+    fn a_pre_authentication_frame_carries_no_account_and_cannot_read_as_registered() {
+        let event = record(None, Direction::Inbound, "Authenticate", 200, None).into_event();
+
+        let identity = event.identity.as_ref().expect("an identity");
+        assert_eq!(
+            identity.user_id, None,
+            "an absent account must be absent, not zero"
+        );
+        assert!(
+            identity.is_guest,
+            "a row with no account must not present itself as a registered user"
+        );
+    }
+
+    /// The invariant a query author can lean on, over every account state a
+    /// frame can be in: `is_guest = false` is a positive claim, and it is only
+    /// ever made where an account is actually named.
+    #[test]
+    fn is_guest_is_false_only_on_rows_that_name_an_account() {
+        for account in [
+            None,
+            Some(Account {
+                user_id: 5,
+                is_guest: true,
+                is_stress_test: false,
+            }),
+            Some(Account {
+                user_id: 6,
+                is_guest: false,
+                is_stress_test: false,
+            }),
+        ] {
+            let event =
+                with_account(account, None, Direction::Outbound, "GameEvent", 1, None).into_event();
+            let identity = event.identity.as_ref().expect("an identity");
+            assert!(
+                identity.is_guest || identity.user_id.is_some(),
+                "is_guest=false with no user_id claims a registered account that does not exist"
+            );
+        }
     }
 
     /// The proto field is a signed 64-bit integer and `byte_len` is a `usize`.

@@ -175,6 +175,13 @@ pub fn record_game_started(game_id: u32, state: &GameState, player_count: usize)
 /// identity-bearing moment of a websocket. The account behind it is not known
 /// until verification completes, so this event carries the session and the
 /// pseudonymous browser id only.
+///
+/// It stays that way deliberately. Emitting it here — before the JWT is
+/// verified — is what makes it the funnel's denominator: it counts every
+/// attempt, including the ones that go on to fail verification. The account
+/// is still reachable from it, by joining on `session_id` to this session's
+/// `websocket_message` rows, which carry both the session and the account
+/// once authentication has completed.
 pub fn record_session_started(session_id: &str, anon_id: Option<&str>, protocol_version: u16) {
     let Some(sink) = SINK.get() else { return };
     sink.emitter.emit(session_started_event(

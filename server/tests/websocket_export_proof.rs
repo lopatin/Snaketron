@@ -25,7 +25,7 @@ use server::analytics::iceberg_catalog::{S3TablesConfig, S3TablesIcebergCatalog}
 use server::analytics::object_store::{ObjectStore, S3ObjectStore};
 use server::analytics::source_listing::S3SourceListing;
 use server::analytics::ws_exporter::{WsExporterConfig, create};
-use server::analytics::ws_sink::WsConnection;
+use server::analytics::ws_sink::{Account, WsConnection};
 use server::analytics::{event::EventOrigin, schema};
 use tokio_util::sync::CancellationToken;
 
@@ -93,6 +93,16 @@ async fn websocket_events_reach_iceberg_and_a_graceful_stop_loses_nothing() {
     let connection = WsConnection::new(&format!("conn-{run}"));
     connection.bind_session(&format!("s-{run}"));
     connection.set_game_id(Some(4242));
+
+    // One frame from before authentication. It must come back with NO account
+    // — absent, not zero — or a handshake would join to a real user.
+    server::analytics::ws_sink::record_inbound(&connection, "Token", 42);
+
+    connection.set_account(Some(Account {
+        user_id: 987_654,
+        is_guest: false,
+        is_stress_test: false,
+    }));
     for i in 0..5 {
         server::analytics::ws_sink::record_inbound(&connection, "Authenticate", 100 + i);
         server::analytics::ws_sink::record_outbound(&connection, "GameState", 900 + i);
@@ -207,7 +217,38 @@ async fn websocket_events_reach_iceberg_and_a_graceful_stop_loses_nothing() {
     directions.dedup();
     println!("ICEBERG_ROWS: {rows} DIRECTIONS: {directions:?}");
 
-    assert_eq!(rows, 10, "all ten recorded messages must be in the table");
+    assert_eq!(rows, 11, "every recorded message must be in the table");
+
+    // The whole point of this change: these rows join to an account.
+    let mut accounts: Vec<Option<i64>> = Vec::new();
+    for batch in &batches {
+        let identity = batch
+            .column_by_name("identity")
+            .expect("identity struct column")
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .expect("struct");
+        let user_id = identity
+            .column_by_name("user_id")
+            .expect("user_id field")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64");
+        for i in 0..user_id.len() {
+            accounts.push(user_id.is_valid(i).then(|| user_id.value(i)));
+        }
+    }
+    let named = accounts.iter().filter(|a| **a == Some(987_654)).count();
+    let absent = accounts.iter().filter(|a| a.is_none()).count();
+    println!("ACCOUNT_ROWS: {named}  NO_ACCOUNT_ROWS: {absent}");
+    assert_eq!(
+        named, 10,
+        "every post-authentication frame must name the account: {accounts:?}"
+    );
+    assert_eq!(
+        absent, 1,
+        "the pre-authentication frame must carry no account at all: {accounts:?}"
+    );
     assert!(
         directions.iter().any(|d| d == "in") && directions.iter().any(|d| d == "out"),
         "both directions must survive the round trip: {directions:?}"
