@@ -1,4 +1,4 @@
-//! Boost Bux: the balance, and the ledger that guards every change to it.
+//! Snake Bux: the balance, and the ledger that guards every change to it.
 //!
 //! Two rules do all the work here, and both exist because this is the one part
 //! of the system where a bug costs real money.

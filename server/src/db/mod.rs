@@ -199,7 +199,7 @@ pub trait Database: Send + Sync {
     async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>>;
     async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool>;
 
-    // ---- Boost Bux --------------------------------------------------------
+    // ---- Snake Bux --------------------------------------------------------
     //
     // The balance is moved only by these, and only ever together with the
     // ledger row that names the change (`crate::wallet`).

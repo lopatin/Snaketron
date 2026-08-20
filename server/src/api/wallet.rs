@@ -1,4 +1,4 @@
-//! Boost Bux over HTTP: reading a balance, spending it, and taking payment.
+//! Snake Bux over HTTP: reading a balance, spending it, and taking payment.
 //!
 //! The payment provider is the merchant of record, so this server never sees a
 //! card. What it does own is the part that decides how many Bux a player has,
@@ -101,7 +101,7 @@ impl IntoResponse for WalletApiError {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Disabled => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Buying Boost Bux is not available right now".to_string(),
+                "Buying Snake Bux is not available right now".to_string(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -267,7 +267,7 @@ pub async fn xsolla_checkout_token(
 ) -> Result<Response, WalletApiError> {
     if auth_user.is_guest {
         return Err(WalletApiError::BadRequest(
-            "Buying Boost Bux needs a registered account".to_string(),
+            "Buying Snake Bux needs a registered account".to_string(),
         ));
     }
 

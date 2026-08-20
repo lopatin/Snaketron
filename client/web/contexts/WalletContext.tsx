@@ -12,7 +12,7 @@ import { coerceBalance } from '../utils/walletChip';
 import { useAuth } from './AuthContext';
 
 /**
- * How many Boost Bux the signed-in player has.
+ * How many Snake Bux the signed-in player has.
  *
  * A context rather than a fetch inside the header, because two places need the
  * same number and one of them already knows it sooner: the purchase route

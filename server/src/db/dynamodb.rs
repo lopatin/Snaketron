@@ -3891,7 +3891,7 @@ impl Database for DynamoDatabase {
         Ok(())
     }
 
-    // ---- Boost Bux --------------------------------------------------------
+    // ---- Snake Bux --------------------------------------------------------
 
     async fn apply_ledger_entry(
         &self,

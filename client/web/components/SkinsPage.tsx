@@ -5,7 +5,7 @@ import { SocialFooter } from './SocialFooter';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
 import { useWallet } from '../contexts/WalletContext';
-import { coerceBalance, purchaseMessage } from '../utils/walletChip';
+import { BUX_UNIT, coerceBalance, purchaseMessage } from '../utils/walletChip';
 import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import type { CatalogEntry, SkinSummary } from '../types/generated';
@@ -348,7 +348,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
         {byline ? <span className="skins-row-byline">by {byline}</span> : null}
         {status ? <span className="skins-row-status">{status}</span> : null}
         <span className={`skins-row-price${entry.priceBux > 0 ? ' is-priced' : ''}`}>
-          {entry.priceBux === 0 ? 'Free' : `${entry.priceBux} BB`}
+          {entry.priceBux === 0 ? 'Free' : `${entry.priceBux} ${BUX_UNIT}`}
         </span>
       </div>
 
@@ -365,7 +365,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
             onClick={onBuy}
             data-testid={`skin-buy-${entry.reference}`}
           >
-            {canEquip ? `Buy · ${entry.priceBux} BB` : 'Sign in to buy'}
+            {canEquip ? `Buy · ${entry.priceBux} ${BUX_UNIT}` : 'Sign in to buy'}
           </button>
         ) : (
           <button
