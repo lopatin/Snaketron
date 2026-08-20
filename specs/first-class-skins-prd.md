@@ -542,16 +542,47 @@ writing progress at all.
 `server/tests/generation_claim_lease_tests.rs` runs the whole sequence against
 LocalStack, because the behaviour under test *is* the conditional write.
 
-### 20.3 What a worker still needs
+### 20.3 The worker — done, and what it turned out to be
 
-Two things, and neither is code in this repository:
+The drain loop runs as a task inside the server process. Section 19 refused a
+*subprocess* and a torch image, for the LaMa repair that section 20 then
+dropped; what is left is HTTP calls and image arithmetic, and a separate
+container for that would be ceremony rather than isolation.
 
-- **A provider key.** `SNAKETRON_OPENAI_API_KEY` and
-  `SNAKETRON_OPENROUTER_API_KEY` are read by `generation_providers.rs` and
-  appear in no deployment configuration anywhere in the repo. A worker without
-  one would claim jobs and fail them.
-- **A place to run.** Section 20 rules out a subprocess inside the serving
-  container; the drain loop itself is a small amount of wiring over pieces that
-  already exist (`claim_generation_job`, `configured_providers`,
-  `validate_shape`, `TextureStore::put`, `create_texture`), but *where* it runs
-  is a deployment decision rather than a coding one.
+Uploads and generations are one job with one state machine. They differ only
+in where the first image comes from — an upload already has its bytes in the
+store, a generation asks a model — and after that both run shape → measure →
+ladder → store → record.
+
+**Seams without the model.** The offline tool inpaints across the wrap, which
+needs the model section 20 dropped. The worker makes a strip tile by
+*construction* instead: half is generated and half is its mirror, so the join
+is column zero meeting its own reflection. The tooling's percentile metric
+scores it 0.0000 against 1.0000 for the raw generation, and the test asserts
+the columns are literally identical rather than trusting the metric. No
+provider call, no retry. What it spends is symmetry — invisible on fur and
+stripes, wrong on lettering — so only the kinds that tile are mirrored.
+
+**Providers.** Gemini is new and goes first; OpenAI and OpenRouter remain.
+Measured on one prompt through the real code: Gemini 5.6s/$0.039, OpenRouter
+5.5s/$0.030, OpenAI 55.1s/$0.040. All three return usable art and all three
+reach a perfect wrap. References ride natively in Gemini's request and through
+OpenAI's `images/edits` endpoint.
+
+Three defects were found only by calling code nothing had called: the request
+sent `"size": "768x64"`, which no image API offers; `references` was accepted
+and ignored; and the seam gate compared a percentile against a threshold of
+1.5, which no percentile reaches, so it would have accepted everything.
+
+### 20.4 What is still not wired
+
+- **Deployment configuration.** The keys are read from
+  `SNAKETRON_{OPENAI,OPENROUTER,GEMINI}_API_KEY` and the bucket from
+  `SNAKETRON_TEXTURE_S3_BUCKET`; none of them appears in `docker-compose.yml`
+  or any deployment manifest here. Absent a key the worker still runs and still
+  serves uploads — it simply cannot generate, and says so at startup.
+- **Per-user quotas.** The daily spend ceiling is global. One account can spend
+  the whole day's budget, which is a ceiling on the bill but not on the abuse.
+- **Ladder overrides.** Section 7's per-rung upload, for the hand-simplified
+  low-resolution case, is not built; the ladder is resized from the canonical
+  image every time.
