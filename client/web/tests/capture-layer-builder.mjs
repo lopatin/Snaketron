@@ -27,6 +27,19 @@ const context = await browser.newContext({
 await context.addInitScript(() => {
   window.localStorage.setItem('token', 'capture-session');
 });
+// Answer the session call and let everything else fail. A blanket 200 of the
+// wrong shape is worse than a failure: the contexts fall back to their own safe
+// defaults on an error, but happily consume a body they cannot read.
+await context.route('**/api/**', (route) => {
+  if (route.request().url().includes('/auth/me')) {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ id: 1, username: 'capture', display_name: 'Capture', bux_balance: 12_500 }),
+    });
+  }
+  return route.abort();
+});
 
 const page = await context.newPage();
 page.on('console', (message) => {
@@ -82,7 +95,7 @@ await page.goto(`${baseUrl}/skins/builder`);
 await settle(1200);
 await shot('01-templates');
 
-await pickTemplate('Shine');
+await pickTemplate('Pattern');
 await shot('02-panel');
 await clip('03-stack', '.builder-stack');
 
@@ -112,10 +125,10 @@ await settle(700);
 await clip('08-cost', '.builder-actions');
 
 // A word worn along the body.
-await pickTemplate('Lit').catch(() => {});
+await pickTemplate('Classic').catch(() => {});
 await page.goto(`${baseUrl}/skins/builder`);
 await settle(1200);
-await pickTemplate('Lit');
+await pickTemplate('Classic');
 await page.getByRole('button', { name: /Painted stretch/i }).click();
 await settle(500);
 const sourceSelect = page

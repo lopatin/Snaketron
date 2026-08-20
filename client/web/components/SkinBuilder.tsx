@@ -180,24 +180,92 @@ const asConstant = (value: unknown): number | null => {
   return null;
 };
 
-const PREVIEW_CELL = 15;
+/**
+ * Small enough that three previews sit on one row at the strip's full width.
+ *
+ * At 15 they missed by two pixels and wrapped two-and-two-and-one, which reads
+ * as an accident rather than a layout. Three across also groups them the way
+ * they are meant to be read: the roles you meet in a team game on the first
+ * row, the free-for-all colours that have nowhere else to appear on the second.
+ */
+const PREVIEW_CELL = 13;
 /** The template previews: a long horizontal body, drawn small enough to sit in a card. */
 const TEMPLATE_POSE = 'longer_than_head_gradient';
 const TEMPLATE_CELL = 11;
 const PREVIEW_PAD = 6;
 
 /**
- * What the preview shows: your snake, an opponent's, and one turning.
+ * What the preview shows: your snake, an opponent's, one turning, and every
+ * colour a free-for-all can deal you.
  *
  * The pose names are fixtures the Rust side owns. A body longer than the head
- * glow is the one that shows a glow's whole falloff, and a corner is where a
- * texture or a band reveals whether it survives a turn.
+ * glow is the one that shows a glow's whole falloff, and a wide U-turn is
+ * where a texture or a band reveals whether it survives a turn — two of them,
+ * with the head running back alongside the tail so the two arms can be
+ * compared side by side.
+ *
+ * Two of the four free-for-all slots are here. Slots 1 and 2 are left out
+ * because the roles above already stand for them — a document that paints them
+ * differently would be a document whose own snake changes colour depending on
+ * the mode, which is not a thing anyone is trying to build. Slots 3 and 4 have
+ * no other home, and they are the two with no hue window behind them: a
+ * friendly colour is held inside a cool band and an enemy one inside a warm
+ * band, so a bad choice there is refused with a message, while a free-for-all
+ * colour may be anything, which makes seeing it the only check there is.
+ *
+ * Their captions are the palette control's own words, so the thing an author
+ * edits and the thing they are looking at share a name.
  */
 const PREVIEW_POSES: Array<{ pose: string; role: string; label: string }> = [
   { pose: 'longer_than_head_gradient', role: 'own', label: 'Yours' },
   { pose: 'longer_than_head_gradient', role: 'enemy', label: 'As an opponent' },
-  { pose: 'single_corner', role: 'own', label: 'Turning' },
+  { pose: 'wide_u_turn', role: 'own', label: 'Turning' },
+  { pose: 'longer_than_head_gradient', role: 'ffa2', label: 'Free-for-all 3' },
+  { pose: 'longer_than_head_gradient', role: 'ffa3', label: 'Free-for-all 4' },
 ];
+
+/**
+ * The box every preview draws into, big enough for the largest pose in the
+ * row.
+ *
+ * Sizing each preview to its own pose is what made the turning one look
+ * dropped in from somewhere else: a U-turn is five cells tall and a straight
+ * body is one, so its figure came out a third the width and three times the
+ * height of its neighbours, and the row grew to fit it while the others sat at
+ * the bottom of all that space. One box for the set, with each pose centred
+ * inside it, is what makes them a row rather than three unrelated pictures.
+ */
+const usePreviewBox = (handle: string, revision: number, valid: boolean) => {
+  const [box, setBox] = useState({ width: 370, height: 60 });
+
+  useEffect(() => {
+    const wasm = getWasm();
+    if (!wasm || !valid) {
+      return;
+    }
+    let width = 0;
+    let height = 0;
+    for (const pose of new Set(PREVIEW_POSES.map((preview) => preview.pose))) {
+      try {
+        const bounds = JSON.parse(
+          wasm.skinFixtureBounds(handle, pose, PREVIEW_CELL, false),
+        ) as { width: number; height: number };
+        width = Math.max(width, bounds.width);
+        height = Math.max(height, bounds.height);
+      } catch {
+        // A pose that will not measure simply does not get a vote on the box.
+      }
+    }
+    if (width > 0 && height > 0) {
+      setBox({
+        width: Math.ceil(width + PREVIEW_PAD * 2),
+        height: Math.ceil(height + PREVIEW_PAD * 2),
+      });
+    }
+  }, [handle, revision, valid]);
+
+  return box;
+};
 
 interface ControlProps {
   field: FieldV2;
@@ -655,6 +723,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
   const hidden = useRef<Record<number, unknown>>({});
 
   const handle = useMemo(() => `draft:${skinId ?? 'new'}`, [skinId]);
+  const previewBox = usePreviewBox(handle, revision, problems.length === 0);
 
   useEffect(() => {
     let cancelled = false;
@@ -980,6 +1049,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
               label={preview.label}
               revision={revision}
               valid={problems.length === 0}
+              box={previewBox}
             />
           ))}
         </div>
@@ -1266,6 +1336,8 @@ interface BuilderPreviewProps {
   label: string;
   revision: number;
   valid: boolean;
+  /** The box shared by every preview in the row, from `usePreviewBox`. */
+  box: { width: number; height: number };
 }
 
 /**
@@ -1281,6 +1353,7 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
   label,
   revision,
   valid,
+  box,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [layout, setLayout] = useState({
@@ -1294,7 +1367,7 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
 
   // Fixture poses paint at their own arena coordinates rather than at the
   // origin, so the canvas has to be tall enough to reach the pose and the
-  // wrapper crops back to it. Without this a strip of three previews is mostly
+  // wrapper crops back to it. Without this a strip of previews is mostly
   // empty space.
   useEffect(() => {
     const wasm = getWasm();
@@ -1305,18 +1378,25 @@ const BuilderPreview: React.FC<BuilderPreviewProps> = ({
       const bounds = JSON.parse(
         wasm.skinFixtureBounds(handle, pose, PREVIEW_CELL, false),
       ) as { x: number; y: number; width: number; height: number };
+      // Centre this pose in the shared box: the offset is where the crop's
+      // top-left lands in canvas space, so half the slack comes off it.
+      const offsetX = Math.round(bounds.x - (box.width - bounds.width) / 2);
+      const offsetY = Math.round(bounds.y - (box.height - bounds.height) / 2);
       setLayout({
-        canvasWidth: Math.ceil(bounds.x + bounds.width + PREVIEW_PAD),
-        canvasHeight: Math.ceil(bounds.y + bounds.height + PREVIEW_PAD),
-        cropWidth: Math.ceil(bounds.width + PREVIEW_PAD * 2),
-        cropHeight: Math.ceil(bounds.height + PREVIEW_PAD * 2),
-        offsetX: Math.round(bounds.x - PREVIEW_PAD),
-        offsetY: Math.round(bounds.y - PREVIEW_PAD),
+        // The canvas has to reach the far edge of the crop, which centring can
+        // push past the pose itself; anything beyond the drawing is
+        // transparent and shows the strip.
+        canvasWidth: Math.max(1, Math.ceil(offsetX + box.width)),
+        canvasHeight: Math.max(1, Math.ceil(offsetY + box.height)),
+        cropWidth: box.width,
+        cropHeight: box.height,
+        offsetX,
+        offsetY,
       });
     } catch {
       // Keep the previous framing; a slightly wrong one beats none.
     }
-  }, [handle, pose, revision, valid]);
+  }, [handle, pose, revision, valid, box.width, box.height]);
 
   useEffect(() => {
     const canvas = canvasRef.current;

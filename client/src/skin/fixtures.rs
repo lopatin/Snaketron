@@ -88,6 +88,16 @@ pub const POSES: &[Pose] = &[
         name: "self_crossing",
         cells: &[(2.0, 2.0), (6.0, 2.0), (6.0, 5.0), (4.0, 5.0), (4.0, 1.0)],
     },
+    Pose {
+        // A wide U-turn: out along one arm, four cells across, and back. It
+        // spans the same 21 cells as `longer_than_head_gradient` so the two
+        // sit at one width in the Builder's preview row, and it is the pose
+        // that shows what `single_corner` cannot — a pattern crossing *two*
+        // turns, and the head running back alongside the tail where any
+        // mismatch between the two arms is side by side and obvious.
+        name: "wide_u_turn",
+        cells: &[(0.0, 2.0), (20.0, 2.0), (20.0, 6.0), (0.0, 6.0)],
+    },
 ];
 
 /// Arena bodies for the corpse painter, which still consumes untransformed
