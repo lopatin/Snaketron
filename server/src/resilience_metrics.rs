@@ -576,6 +576,47 @@ pub fn record_potg_ring_truncated(evicted_seconds: u64) {
     crate::otel_metrics::record_potg_ring_truncated(evicted_seconds);
 }
 
+/// Announces that this task is contending for a hosted service's exclusion
+/// lease, which makes its leadership gauge report zero instead of nothing.
+///
+/// Only one task in the fleet is elected, so a fleet-average p99 dilutes that
+/// task's contribution by the fleet size. Splitting the gameplay-latency series
+/// by leadership needs both halves of the split to exist, and the losing tasks
+/// are the half that would otherwise be missing.
+///
+/// This pair is OpenTelemetry-only, unlike the rest of this module. The
+/// comparison it serves needs a percentile, and the EMF mirror carries the
+/// actor-advance duration as `GameActorAdvanceDurationUsSum`/`Max` on fleet-wide
+/// dimensions — so an EMF copy of this signal would have nothing to split.
+pub fn record_hosted_service_contention(name: &'static str) {
+    crate::otel_metrics::register_hosted_service_lease(name);
+}
+
+/// Marks this task as an elected holder of `name`'s exclusion lease for exactly
+/// as long as the returned guard lives.
+///
+/// Leadership ends through several paths that are easy to miss individually — a
+/// failed build, a lost renewal, a disabled service, an unwind — so this is a
+/// guard rather than a paired clear call. A missed clear would pin the gauge at
+/// one on a task that is no longer elected, which silently reverses the
+/// comparison it exists to support.
+#[must_use = "leadership lasts exactly as long as this guard"]
+pub fn record_hosted_service_election(name: &'static str) -> HostedServiceElection {
+    crate::otel_metrics::hosted_service_lease_acquired(name);
+    HostedServiceElection { name }
+}
+
+/// Clears one hosted service's elected-task signal when dropped.
+pub struct HostedServiceElection {
+    name: &'static str,
+}
+
+impl Drop for HostedServiceElection {
+    fn drop(&mut self) {
+        crate::otel_metrics::hosted_service_lease_released(self.name);
+    }
+}
+
 pub fn record_redis_request(latency: Duration, failed: bool) {
     let counters = counters();
     let latency_ms = duration_ms(latency);

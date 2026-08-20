@@ -17,6 +17,20 @@ use crate::http_server::{DeferredHttpServer, install_http_application};
 /// Exclusion leases renew on a third of their TTL, so two consecutive failed
 /// renewals still leave room to fail closed before expiry.
 const HOSTED_SERVICE_LEASE_TTL: Duration = Duration::from_secs(6);
+/// The global term is longer than the regional one because DynamoDB has no
+/// server-side expiry: the term is compared against caller wall clocks, and a
+/// clock-skew allowance is charged against the single renewal interval a
+/// holder has left after a missed renewal. Ten seconds leaves that interval
+/// well clear of the floor instead of sitting on it; the cost is four extra
+/// seconds of failover for background analytics services, which nothing
+/// interactive waits on.
+const HOSTED_SERVICE_GLOBAL_LEASE_TTL: Duration = Duration::from_secs(10);
+const _: () = assert!(
+    HOSTED_SERVICE_GLOBAL_LEASE_TTL.as_millis()
+        >= crate::hosted_services::dynamo_kv::MIN_GLOBAL_LEASE_TTL.as_millis(),
+    "the global lease term must clear the clock-skew floor, or the skew allowance is wider \
+     than the window a holder has to recover a missed renewal in"
+);
 /// Per-service stop budget, clamped by the host's remaining global deadline so
 /// one slow service delays only itself.
 const HOSTED_SERVICE_STOP_BUDGET: Duration = Duration::from_secs(10);
@@ -847,7 +861,7 @@ impl GameServer {
                         ExclusionLeaseStore::new(
                             store,
                             "snaketron:hosted",
-                            HOSTED_SERVICE_LEASE_TTL,
+                            HOSTED_SERVICE_GLOBAL_LEASE_TTL,
                             DEFAULT_COORDINATION_OPERATION_TIMEOUT,
                             node_rank,
                         )

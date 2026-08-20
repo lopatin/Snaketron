@@ -101,6 +101,13 @@ tonic-build = { version = "0.12.3", features = ["prost"] }
 prost-build = "0.13.5"
 
 [dev-dependencies]
+# The DynamoDB lease tests drive the real SDK stack against a canned HTTP
+# connector so the clock-offset interceptor is exercised without a network or
+# a live table. `http_client_fn`/`SdkBody` are not re-exported by
+# `aws-sdk-dynamodb`, hence the direct entries; both already resolve to the
+# versions the SDK pulls in.
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 jsonwebtoken = "9.3"
 tempfile = "3"
 rand = "0.8"

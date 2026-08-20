@@ -31,7 +31,12 @@ use super::lease::ExclusionLeaseStore;
 
 /// How often a lease is renewed relative to its TTL. A third leaves room for
 /// two consecutive failed renewals before the fail-closed deadline.
-const RENEW_DIVISOR: u32 = 3;
+///
+/// Module-visible because the DynamoDB store derives its minimum global lease
+/// term from it: the clock-skew allowance is only a margin while it stays
+/// narrower than one renewal interval, and a second copy of the cadence there
+/// could drift out of step with this one unnoticed.
+pub(super) const RENEW_DIVISOR: u32 = 3;
 /// How long to wait before re-attempting acquisition of a contended lease.
 const ACQUIRE_RETRY: Duration = Duration::from_millis(500);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
@@ -155,8 +160,10 @@ async fn run_once(
 ) -> Outcome {
     let key = factory.exclusion_key(&config.context);
 
-    let (lease, store) = match key {
-        None => (None, None),
+    // `_elected` is bound, not discarded: it must live to the end of this
+    // function so every early return below still clears the signal.
+    let (lease, store, _elected) = match key {
+        None => (None, None, None),
         Some(key) => {
             let store = match key.domain {
                 snaketron_service_api::ExclusionDomain::Region => config.region_leases.clone(),
@@ -167,10 +174,23 @@ async fn run_once(
                     "no lease store configured for {key}"
                 )));
             };
+            // Before the attempt, so the tasks that lose the election are also
+            // observable — they are the baseline the elected task is compared
+            // against.
+            // Before the attempt, so the tasks that lose the election are also
+            // observable — they are the baseline the elected task is compared
+            // against.
+            crate::resilience_metrics::record_hosted_service_contention(factory.name());
             match store.try_acquire(&key, &config.holder_id).await {
                 Err(error) => return Outcome::Failed(error),
                 Ok(None) => return Outcome::LeaseUnavailable,
-                Ok(Some(lease)) => (Some(lease), Some(store)),
+                Ok(Some(lease)) => (
+                    Some(lease),
+                    Some(store),
+                    Some(crate::resilience_metrics::record_hosted_service_election(
+                        factory.name(),
+                    )),
+                ),
             }
         }
     };

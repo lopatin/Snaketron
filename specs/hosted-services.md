@@ -1,6 +1,10 @@
 # Spec: Hosted Services (runtime plugin injection)
 
-**Status:** Draft for review. Nothing in this document is built yet.
+**Status:** Implemented. The runtime lives in `server/src/hosted_services/`
+and `service-api/`; the first services using it are the analytics exporter and
+the Iceberg committer under `server/src/analytics/`. Section 7's composition
+root remains a deferred choice (arrangement (A) is what ships today).
+
 **Repo:** This describes a change to the **public** Snaketron game crate. Its
 first consumer is the private `snaketron-io` deployment repo, whose analytics
 pipeline is specified in `snaketron-io/specs/game-events-analytics-prd.md`.
@@ -355,7 +359,9 @@ leases do not have:
 
 1. **No server-side clock.** Expiry must be a client-supplied timestamp compared
    inside the condition, so safety depends on bounded us-east-1 ↔ eu-west-1
-   clock skew. Skew must be measured and budgeted, not assumed.
+   clock skew. Skew must be measured and budgeted, not assumed — see §9.1 for
+   the budget, the per-node acquisition gate, and what the measurement can and
+   cannot show.
 2. **DynamoDB TTL cannot expire a lease** — it is asynchronous and may lag up to
    48 hours. TTL is for cleanup only; correctness must come from the condition.
 3. **The codebase classifies DynamoDB failures by re-reading**, not by typed
@@ -413,10 +419,15 @@ each; **CDK needs no change**, because the server container never overrides
 
 (B) has two real costs that must be paid deliberately:
 
-1. **A second, independently-resolved `Cargo.lock`.** The public manifest pins
-   `tokio-util`, `tokio-tungstenite`, and `tungstenite` at `"*"`, so the shipped
-   binary is not provably the binary the nextest archive tested. **Fix the `"*"`
-   pins before adopting (B)** — this is worth doing regardless.
+1. **A second, independently-resolved `Cargo.lock`.** The private workspace
+   resolves its own, so the shipped binary is not *provably* the binary the
+   nextest archive tested: two locks resolved at different moments can land on
+   different versions inside the same caret range. This used to be acute because
+   the public manifest pinned three dependencies at `"*"`; it no longer does
+   (§9.4 — `tokio-util = "0.7"`, `tokio-tungstenite = "0.26"`, `tungstenite` not
+   a direct dependency, no `"*"` anywhere in the workspace). The concern is
+   narrower now, not gone: adopting (B) means deciding how the two locks are
+   held in agreement, rather than assuming they are.
 2. **Submodule bumps become potential compile failures** that the public repo's
    CI cannot see. Mitigated by a snaketron-io CI job building the private binary
    against the pinned submodule — which that repo should have anyway.
@@ -455,16 +466,164 @@ one-file change to defer.
 
 ---
 
-## 9. Open questions
+## 9. Recorded decisions
 
-1. **Clock skew budget** for the DynamoDB global lease (§6.2). Must be measured
-   between us-east-1 and eu-west-1 before the lease TTL is chosen.
-2. **CPU isolation.** A hosted service shares the game container's 2 vCPU with a
-   100 ms tick loop. CPU-bound work (Parquet encoding) must use
-   `spawn_blocking`, and the p99-latency comparison that guards the analytics
-   pipeline should cover the elected task specifically, not the fleet average.
-3. **Should election prefer a draining or least-loaded task?** Electing a task
-   that is actively serving players concentrates any jitter on those players.
-   Probably not worth the complexity, but it should be a recorded decision.
-4. **`"*"` version pins** in `snaketron/server/Cargo.toml` (§7) — worth fixing
-   independently of this spec.
+The four questions this spec opened with are closed. The reasoning is recorded
+alongside each answer, because in three of the four the cost of the *rejected*
+option is the part worth remembering.
+
+### 9.1 Clock skew budget: 2 s, with acquisition gated at half of it
+
+**Decision.** The global lease keeps a 2 s skew allowance (`SKEW_ALLOWANCE`,
+`dynamo_kv.rs:34`). Acquisition additionally requires the acquiring node's own
+measured clock offset to be within half that budget. Renewal is not gated.
+
+**One clock, measured per node.** Both regions write the same us-east-1 table
+(§6.2), so the system already has a single authoritative clock — and every
+response from it carries a `Date` header. A node therefore never has to agree
+with the other region directly; it measures its own offset against the very
+table it is about to condition a write on. Cross-node skew is bounded by the sum
+of two such offsets, which is why the per-node gate is half the budget: it keeps
+any pair inside 2 s even in the worst case, where the incumbent and the
+contender err in opposite directions.
+
+**Why only acquisition.** Acquisition is the entire clock-dependent surface.
+`try_acquire_lease` compares the caller's wall clock against the stored
+`expiresAtMs` (`expiresAtMs < :stale`). Renewal does not: `extend_if_equal`
+conditions on `holder = :holder` and contains no time term at all, so a node
+with a bad clock can neither renew itself into a lease it has lost nor be
+evicted from one it still holds. Gating renewal as well would turn a clock fault
+into an avoidable loss of leadership — the node would stop renewing a lease
+that, by the store's own condition, is still validly its own.
+
+**What was measured, and what it does not show.** `Date` headers from DynamoDB
+in us-east-1 and eu-west-1 agreed with the local clock across five samples each,
+with no discrepancy visible. That is a weaker statement than it looks: HTTP
+`Date` has **one-second granularity**, so the instrument cannot resolve a
+sub-second difference and no sub-second claim is made here. It also samples AWS
+*service* endpoints from one machine — not Fargate task clocks, which are what
+the lease actually depends on.
+
+The runtime gate is what covers that gap. It replaces an assumption that the
+clocks agree with a continuous measurement that fails closed, on the node that
+would be harmed by being wrong.
+
+**Why not simply widen the budget instead.** The allowance is subtracted from a
+lease's usable life, so it is paid on every unclean failover. With
+`HOSTED_SERVICE_LEASE_TTL` at 6 s (`game_server.rs:19`), 2 s is already a third
+of the TTL, and a dead holder's key blocks its successor for TTL + allowance.
+Doubling the budget "to be safe" lengthens every failover by the same amount and
+still detects nothing. A measured gate is the cheaper instrument, and unlike a
+wider budget it reports the fault instead of absorbing it.
+
+- **HS-6.** A node must not **acquire** a lease whose domain is `Global` unless
+  its most recent measured offset against the lease table's `Date` header is
+  within half the skew allowance; an offset it failed to measure counts as a
+  failed gate. Renewal is deliberately not gated, because it carries no time
+  comparison. `Region` is out of scope: its Valkey store expires keys with
+  server-side `PX`/`PEXPIRE`, so no client clock enters the decision.
+
+### 9.2 CPU isolation: `spawn_blocking`, and A24 measures the elected task
+
+**Decision.** CPU-bound work in a hosted service runs on `spawn_blocking`.
+Parquet encoding already does (`write_data_files`,
+`analytics/iceberg_catalog.rs`). The p99-latency comparison that guards the
+analytics pipeline — acceptance criterion **A24** of
+`snaketron-io/specs/game-events-analytics-prd.md`, recorded there as decision
+**D13** and gated by item 5 of that document's Definition of Done — is scoped to
+the **elected** task, not to a fleet average.
+
+**The scoping is the load-bearing half.** Exclusion means exactly one task in
+the fleet runs the committer, so a fleet-average p99 divides that task's
+regression by the fleet size — and hides it better the larger the deployment
+gets. The measurement would degrade precisely as the thing it guards grows.
+Confining the comparison to the elected task's lease-holding window is also what
+keeps the pipeline-on and pipeline-off samples talking about the same thing: a
+fleet average dilutes them with tasks that were never running the work at all.
+
+This requires the elected task to be identifiable in latency metrics. The
+supervisor is the only component that knows which task holds the lease, so that
+is where the signal has to originate; without it A24 cannot be measured at all,
+only approximated by the average it is meant to replace.
+
+- **HS-7.** A hosted service must not run CPU-bound work on a runtime worker.
+  The host's game loop shares those workers on a 100 ms tick and a hosted
+  service has no claim on them.
+
+### 9.3 Election preference: no
+
+**Decision.** Election does **not** prefer a draining or least-loaded task.
+Preference stays what it is: a static, operator-supplied region ordering
+(`NodeRank`, `service-api/src/lib.rs:210`, set from
+`SNAKETRON_HOSTED_SERVICE_RANK`).
+
+The question was a real one — electing a task that is actively serving players
+concentrates whatever jitter the service causes onto those players — so the
+rejected option's cost is worth stating rather than waving away:
+
+1. **It needs a load signal inside the lease value.** Mechanically that part is
+   easy; the stored value already carries the rank (`encode_holder`,
+   `lease.rs:30`). But rank and load are different kinds of thing. Rank is
+   static and known in advance, so two contenders comparing it always reach the
+   same conclusion. Load is a *sample*: it is already stale by the time
+   leadership matters, and two contenders comparing each other's stale samples
+   can reach opposite conclusions. The comparison stops being deterministic
+   exactly when it becomes contended.
+2. **It is self-defeating.** A task that became busy would hand off leadership,
+   and a handoff is itself disruptive — the successor rebuilds the service and
+   re-establishes its position. That trades steady low-grade jitter for a burst
+   of it at the precise moment the fleet is loaded. Note that `may_preempt` is
+   already strict (`<`, not `<=`) so that equally-ranked nodes cannot take turns
+   evicting each other; a continuously-changing load term reintroduces that loop
+   with a value guaranteed to keep crossing.
+3. **The one stable preference already exists.** Region is the only preference
+   that is both genuine and knowable before the fact, and `NodeRank` already
+   expresses it.
+
+**Draining is already handled, and not by preference.** The supervisor releases
+the lease when the service's run ends, including on shutdown
+(`supervisor.rs:209`), so a draining leader hands leadership over cleanly
+instead of making its successor wait out the TTL. Preferring a draining task as
+*leader* would have been the wrong shape regardless: it elects the member of the
+fleet most likely to disappear next.
+
+**The mitigation that replaces it** is §9.2, both halves: keep the CPU work off
+the runtime, and measure the elected task specifically rather than the fleet.
+The second half is what makes accepting this decision safe rather than hopeful.
+
+**What would reopen it.** A24 showing a real p99 regression on the elected task
+— measured on that task over its lease-holding window, not diluted into a fleet
+number. At that point drain-preference is worth its cost, and the form to reach
+for is preference at drain time only, which is deterministic ("this task is
+going away") rather than a continuous load term.
+
+### 9.4 `"*"` version pins: fixed
+
+Fixed ahead of this spec, and independently of it. `server/Cargo.toml` now pins
+`tokio-util = "0.7"` and `tokio-tungstenite = "0.26"`, `tungstenite` is not a
+direct dependency at all, and no workspace manifest carries a `"*"` requirement.
+§7's cost (B)(1) has been restated accordingly: the second-`Cargo.lock` concern
+survives on its own merits, the `"*"` pins no longer contribute to it.
+
+---
+
+**Nothing above is still open, and HS-6 and HS-7 are built.**
+
+- HS-6 is enforced by `ClockOffsetProbe` in
+  `server/src/hosted_services/dynamo_kv.rs`: a per-operation smithy `Intercept`
+  records `midpoint(send, receive) - Date` from the lease table's own response,
+  `try_acquire_lease` refuses outside `ACQUIRE_OFFSET_BUDGET` (and refuses an
+  offset it never measured), and `extend_if_equal`/`delete_if_equal` are
+  untouched. `MIN_GLOBAL_LEASE_TTL` makes the TTL-versus-allowance relationship
+  a checked precondition rather than a comment. Ten unit tests cover it, four of
+  them driving the real SDK stack against a canned connector with a skewed
+  clock.
+- HS-7's `spawn_blocking` was already in place; what closes it is the
+  measurability half — the `snaketron.hosted_service_leases_held` gauge
+  (`otel_metrics.rs`, set from `supervisor.rs` through an RAII guard so no exit
+  path can leave it latched) is what lets A24 split by elected task.
+
+What is *not* done is A24 itself: the split is now possible, but the comparison
+has not been run, and no p99 gameplay-tick instrumentation exists to run it
+against — `resilience_metrics.rs` exports sum/max, not percentiles. That is the
+real remaining gap behind §9.2.

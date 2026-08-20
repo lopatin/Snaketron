@@ -727,3 +727,220 @@ fn rank_ordering_is_strict() {
         "equal ranks must not preempt"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Elected-task telemetry.
+//
+// Only one task in the fleet runs an elected singleton, so a fleet-average p99
+// dilutes that task's contribution by the fleet size. These tests pin the
+// signal that makes the per-elected-task comparison possible: it must track the
+// lease itself, not the happy path. Each factory below uses its own `&'static`
+// name because the leadership registry is process-global and this file shares a
+// test binary with the rest of the crate's unit tests.
+// ---------------------------------------------------------------------------
+
+/// `None` means the task never contended for the service at all, which is a
+/// different observation from `Some(0)`, "contended and lost".
+fn leases_held(name: &'static str) -> Option<u64> {
+    crate::otel_metrics::hosted_service_leases_held_for_test(name)
+}
+
+struct ElectedFactory {
+    name: &'static str,
+    key: ExclusionKey,
+}
+
+#[async_trait]
+impl HostedServiceFactory for ElectedFactory {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn exclusion_key(&self, _ctx: &ServiceContext) -> Option<ExclusionKey> {
+        Some(self.key.clone())
+    }
+
+    async fn build(&self, _ctx: ServiceContext) -> Result<Box<dyn HostedService>, ServiceError> {
+        Ok(Box::new(Sleeper))
+    }
+}
+
+/// Acquiring marks the task elected; a clean stop unmarks it.
+#[tokio::test]
+async fn leadership_telemetry_is_set_on_acquire_and_cleared_on_release() {
+    const NAME: &str = "test-telemetry-elected";
+    let kv: Arc<dyn KeyValueStore> = Arc::new(MemoryStore::default());
+    let cancel = CancellationToken::new();
+
+    assert_eq!(leases_held(NAME), None, "nothing contended before the run");
+    let handle = spawn_supervisor(
+        Arc::new(ElectedFactory {
+            name: NAME,
+            key: ExclusionKey::global("telemetry-elected"),
+        }),
+        supervisor_config(kv, "task"),
+        cancel.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        leases_held(NAME),
+        Some(1),
+        "the holder must report as elected"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap();
+    assert_eq!(
+        leases_held(NAME),
+        Some(0),
+        "a stopped holder is not elected"
+    );
+}
+
+/// Losing the lease mid-run must clear the signal. A task that stood down but
+/// kept reporting as elected would attribute the wrong latency series to the
+/// pipeline for the rest of its life.
+#[tokio::test]
+async fn leadership_telemetry_clears_when_the_lease_is_lost() {
+    const NAME: &str = "test-telemetry-preempted";
+    let kv: Arc<dyn KeyValueStore> = Arc::new(MemoryStore::default());
+    let key = ExclusionKey::global("telemetry-preempted");
+    let cancel = CancellationToken::new();
+
+    let handle = spawn_supervisor(
+        Arc::new(ElectedFactory {
+            name: NAME,
+            key: key.clone(),
+        }),
+        ranked_supervisor_config(kv.clone(), "holder", 1),
+        cancel.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(leases_held(NAME), Some(1));
+
+    // A strictly preferred node takes the lease *without* a supervisor, so the
+    // only thing that can clear the signal is the holder discovering that its
+    // own renewal failed. Its worse rank also stops it from taking the lease
+    // back, which keeps the assertion below deterministic.
+    let preferred = ExclusionLeaseStore::new(
+        kv,
+        "test",
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        0,
+    )
+    .unwrap();
+    preferred
+        .try_acquire(&key, "preferred")
+        .await
+        .unwrap()
+        .expect("a better rank must preempt");
+
+    // The renewer ticks at TTL/3 = 200 ms; the stand-down follows immediately.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        leases_held(NAME),
+        Some(0),
+        "a displaced holder must stop reporting as elected"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap();
+}
+
+struct FailedBuildFactory {
+    attempts: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl HostedServiceFactory for FailedBuildFactory {
+    fn name(&self) -> &'static str {
+        "test-telemetry-failed-build"
+    }
+
+    fn failure_policy(&self) -> FailurePolicy {
+        FailurePolicy::Disable
+    }
+
+    fn exclusion_key(&self, _ctx: &ServiceContext) -> Option<ExclusionKey> {
+        Some(ExclusionKey::global("telemetry-failed-build"))
+    }
+
+    async fn build(&self, _ctx: ServiceContext) -> Result<Box<dyn HostedService>, ServiceError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(ServiceError::failed("boom"))
+    }
+}
+
+/// The discriminating case: `build` runs *after* the lease is taken, and its
+/// failure returns early past the release at the bottom of `run_once`. Clearing
+/// the signal only on the happy path would strand this task at "elected"
+/// forever, on a task that is running nothing at all.
+#[tokio::test]
+async fn a_failed_build_does_not_strand_the_leadership_signal() {
+    const NAME: &str = "test-telemetry-failed-build";
+    let kv: Arc<dyn KeyValueStore> = Arc::new(MemoryStore::default());
+    let attempts = Arc::new(AtomicU64::new(0));
+    let cancel = CancellationToken::new();
+
+    let handle = spawn_supervisor(
+        Arc::new(FailedBuildFactory {
+            attempts: attempts.clone(),
+        }),
+        supervisor_config(kv, "task"),
+        cancel.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("Disable ends the supervisor on the first failure")
+        .unwrap();
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the lease must have been taken for the build to have been attempted"
+    );
+    assert_eq!(
+        leases_held(NAME),
+        Some(0),
+        "an early return after acquisition must still clear leadership"
+    );
+    assert!(!cancel.is_cancelled());
+}
+
+/// The tasks that lose the election are the baseline the elected task is
+/// compared against, so they have to report zero rather than nothing. Without
+/// this a never-elected task would be indistinguishable from a task whose build
+/// does not carry the service at all.
+#[tokio::test]
+async fn a_task_that_loses_the_election_still_reports_zero() {
+    const NAME: &str = "test-telemetry-loser";
+    let kv: Arc<dyn KeyValueStore> = Arc::new(MemoryStore::default());
+    let key = ExclusionKey::global("telemetry-loser");
+    let cancel = CancellationToken::new();
+
+    // Taken by a strictly preferred node first, so the supervisor below never
+    // wins and the only value it can ever report is the contending zero.
+    let preferred = ranked_store(kv.clone(), 0);
+    preferred
+        .try_acquire(&key, "preferred")
+        .await
+        .unwrap()
+        .expect("free");
+
+    let handle = spawn_supervisor(
+        Arc::new(ElectedFactory { name: NAME, key }),
+        ranked_supervisor_config(kv, "loser", 1),
+        cancel.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        leases_held(NAME),
+        Some(0),
+        "a contender must be observable at zero"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap();
+}
