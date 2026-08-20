@@ -14,7 +14,7 @@
 //! plus a thin recorder so the projection can be unit tested without a global.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use common::GameState;
 
@@ -26,6 +26,7 @@ use crate::matchmaking_pool::MatchmakingPool;
 use super::emitter::AnalyticsEmitter;
 use super::event::{EventIdentity, EventOrigin, envelope, now_ms};
 use super::proto;
+use super::ws_sink::{Account, CloseReason, WsConnection};
 
 /// Upper bound on tracked queue entries. A queue entry is a few dozen bytes and
 /// the live queue is orders of magnitude smaller than this, so the cap only
@@ -171,34 +172,115 @@ pub fn record_game_started(game_id: u32, state: &GameState, player_count: usize)
     ));
 }
 
-/// Emitted at the moment a session id is minted, which is the first
-/// identity-bearing moment of a websocket. The account behind it is not known
-/// until verification completes, so this event carries the session and the
-/// pseudonymous browser id only.
+/// Emitted the moment a websocket is accepted, before a single frame is read.
 ///
-/// It stays that way deliberately. Emitting it here — before the JWT is
-/// verified — is what makes it the funnel's denominator: it counts every
-/// attempt, including the ones that go on to fail verification. The account
-/// is still reachable from it, by joining on `session_id` to this session's
-/// `websocket_message` rows, which carry both the session and the account
-/// once authentication has completed.
-pub fn record_session_started(session_id: &str, anon_id: Option<&str>, protocol_version: u16) {
+/// Carries no account, because at accept nothing is known about who is on the
+/// socket and a placeholder would be a join key to nothing. It carries the
+/// connection id, which is the one thing that IS known: it is what lets this
+/// accept be joined to its own close, and without it a socket that never
+/// authenticated has no key at all.
+///
+/// Its job is to be COUNTED: it is the denominator every connection-level
+/// funnel divides by, and it is the one arm no rejection downstream can
+/// suppress.
+pub fn record_connection_started(connection: &WsConnection) {
     let Some(sink) = SINK.get() else { return };
-    sink.emitter.emit(session_started_event(
+    sink.emitter.emit(connection_started_event(
         &sink.origin,
-        session_id,
-        anon_id,
-        protocol_version,
+        connection.connection_id(),
     ));
 }
 
-/// Emitted where the socket future finishes, which is the only place that knows
-/// the full session duration. Nothing about the user survives to that point, so
-/// this event is a duration and a reason, with no identity to join on.
-pub fn record_session_ended(duration_ms: i64, close_reason: &str) {
+/// Emitted when authentication SUCCEEDS, and only then.
+///
+/// This is what makes the event mean what its name says. It used to fire the
+/// moment a session id was minted — BEFORE the token was verified — which made
+/// it a count of attempts that could carry no account. The attempts are now
+/// counted by `connection_ended`, whose close reason names the refusal and
+/// whose `protocol_version` names the cohort, so moving this behind
+/// verification deletes nothing from the funnel and lets it carry the full
+/// identity it always should have had.
+pub fn record_session_started(connection: &WsConnection, account: Account) {
+    // Recorded on the connection FIRST and unconditionally, sink or no sink:
+    // this is what pairs the eventual `session_ended` with this event, and a
+    // deployment without analytics must not leave a connection believing it
+    // never had a session.
+    connection.start_session(account);
     let Some(sink) = SINK.get() else { return };
-    sink.emitter
-        .emit(session_ended_event(&sink.origin, duration_ms, close_reason));
+    sink.emitter.emit(session_started_event(
+        &sink.origin,
+        &SessionStart::observed(connection, account),
+    ));
+}
+
+/// Emitted where the socket's own task finishes — for EVERY connection.
+///
+/// Reads the lifecycle off the connection context instead of taking it as
+/// arguments, because the facts were learned at four different places and the
+/// close site is none of them. That is also the defect this replaces: the old
+/// call sat above `handle_websocket`, which returns `()`, so the event could
+/// name neither the account nor the session it was ending.
+///
+/// `session_ended` rides along, but only for a connection that actually
+/// carried a session. Emitting one for every socket would put unverified
+/// attempts straight back into the authenticated-session count this split
+/// exists to clean.
+pub fn record_connection_closed(connection: &WsConnection) {
+    let Some(sink) = SINK.get() else { return };
+    for event in connection_close_events(&sink.origin, &ConnectionClose::observed(connection)) {
+        sink.emitter.emit(event);
+    }
+}
+
+/// Everything a closing websocket is described by, read off the connection
+/// context in exactly one place.
+#[derive(Debug, Clone)]
+pub struct ConnectionClose {
+    /// The same id the matching `connection_started` reported. Read off the
+    /// connection, so the two halves cannot name different sockets.
+    pub connection_id: String,
+    pub duration_ms: i64,
+    pub close_reason: CloseReason,
+    pub protocol_version: Option<u16>,
+    pub session_id: Option<Arc<str>>,
+    pub anon_id: Option<Arc<str>>,
+    /// The account the session authenticated as. `None` means this connection
+    /// never started a session, and is what suppresses `session_ended`.
+    pub session_account: Option<Account>,
+}
+
+impl ConnectionClose {
+    fn observed(connection: &WsConnection) -> Self {
+        Self {
+            connection_id: connection.connection_id().to_owned(),
+            duration_ms: connection.elapsed_ms(),
+            close_reason: connection.close_reason(),
+            protocol_version: connection.protocol_version(),
+            session_id: connection.session_id(),
+            anon_id: connection.anon_id(),
+            session_account: connection.session_account(),
+        }
+    }
+}
+
+/// The handshake facts a started session is described by.
+#[derive(Debug, Clone)]
+pub struct SessionStart {
+    pub session_id: Option<Arc<str>>,
+    pub anon_id: Option<Arc<str>>,
+    pub protocol_version: Option<u16>,
+    pub account: Account,
+}
+
+impl SessionStart {
+    fn observed(connection: &WsConnection, account: Account) -> Self {
+        Self {
+            session_id: connection.session_id(),
+            anon_id: connection.anon_id(),
+            protocol_version: connection.protocol_version(),
+            account,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,34 +440,116 @@ fn game_started_event(
     )
 }
 
-fn session_started_event(
-    origin: &EventOrigin,
-    session_id: &str,
-    anon_id: Option<&str>,
-    protocol_version: u16,
-) -> proto::Event {
+fn connection_started_event(origin: &EventOrigin, connection_id: &str) -> proto::Event {
     envelope(
         origin,
-        EventIdentity {
-            anon_id: anon_id.map(str::to_owned),
-            session_id: Some(session_id.to_owned()),
-            ..Default::default()
-        },
-        proto::event::Payload::SessionStarted(proto::SessionStarted {
-            protocol_version: i64::from(protocol_version),
+        // Not "unknown identity": there is genuinely nothing to say about WHO
+        // is on this socket yet. The handshake has not been read.
+        //
+        // `is_guest` therefore stays `false`, which is the convention every
+        // durable event in `raw/game-events/` uses — `true` is a positive claim
+        // about a verified guest account, never a stand-in for "unknown".
+        // `websocket_message` inverts that, and this event must not inherit the
+        // inversion by proximity: an accept marked `is_guest = true` would make
+        // every connection look like a guest one.
+        EventIdentity::default(),
+        proto::event::Payload::ConnectionStarted(proto::ConnectionStarted {
+            connection_id: connection_id.to_owned(),
         }),
     )
 }
 
-fn session_ended_event(origin: &EventOrigin, duration_ms: i64, close_reason: &str) -> proto::Event {
+fn session_started_event(origin: &EventOrigin, start: &SessionStart) -> proto::Event {
     envelope(
         origin,
-        EventIdentity::default(),
-        proto::event::Payload::SessionEnded(proto::SessionEnded {
-            duration_ms: duration_ms.max(0),
-            close_reason: close_reason.to_owned(),
+        EventIdentity {
+            user_id: Some(i64::from(start.account.user_id)),
+            anon_id: start.anon_id.as_deref().map(str::to_owned),
+            session_id: start.session_id.as_deref().map(str::to_owned),
+            is_guest: start.account.is_guest,
+            is_stress_test: start.account.is_stress_test,
+        },
+        proto::event::Payload::SessionStarted(proto::SessionStarted {
+            // Zero only for a handshake shape that carried no version at all.
+            // Every such shape is refused before it can authenticate, so in
+            // practice this is always the version the client reported.
+            protocol_version: start.protocol_version.map_or(0, i64::from),
         }),
     )
+}
+
+/// The identity a closing connection ended up with.
+///
+/// The account and the session id are reported only when a session actually
+/// STARTED. A session id minted for a handshake that then failed verification
+/// names no `session_started` row, so carrying it would be a join key to
+/// nothing that looks exactly like a join key to something — and it would make
+/// "did this connection have a session?" unanswerable from the row itself.
+///
+/// The anon id is carried either way, because the refused connections are
+/// precisely where it earns its keep: it is what says whether the clients a
+/// rollout is rejecting are returning browsers or first-time ones.
+///
+/// `is_guest` is `false` unless a verified guest account is behind the session,
+/// matching `connection_started` and every other durable event. It is NOT
+/// `websocket_message`'s inverted convention, where `true` means "no account
+/// known": the two halves of this pair have to agree, or a guest split taken
+/// across accepts and closes would disagree with itself.
+fn close_identity(close: &ConnectionClose) -> EventIdentity {
+    EventIdentity {
+        user_id: close
+            .session_account
+            .map(|account| i64::from(account.user_id)),
+        anon_id: close.anon_id.as_deref().map(str::to_owned),
+        session_id: close
+            .session_account
+            .and_then(|_| close.session_id.as_deref().map(str::to_owned)),
+        is_guest: close
+            .session_account
+            .is_some_and(|account| account.is_guest),
+        is_stress_test: close
+            .session_account
+            .is_some_and(|account| account.is_stress_test),
+    }
+}
+
+/// The events one closing websocket produces.
+///
+/// Always a `connection_ended`; a `session_ended` as well, and only, when the
+/// connection actually carried a session. The session is the inner scope, so
+/// it is reported as ending first.
+fn connection_close_events(origin: &EventOrigin, close: &ConnectionClose) -> Vec<proto::Event> {
+    let identity = close_identity(close);
+    // Clamped rather than trusted: a duration is a subtraction, and a negative
+    // one would be read downstream as a real (impossibly fast) session.
+    let duration_ms = close.duration_ms.max(0);
+    let close_reason = close.close_reason.as_str().to_owned();
+
+    let mut events = Vec::with_capacity(2);
+    if close.session_account.is_some() {
+        events.push(envelope(
+            origin,
+            identity.clone(),
+            proto::event::Payload::SessionEnded(proto::SessionEnded {
+                duration_ms,
+                close_reason: close_reason.clone(),
+            }),
+        ));
+    }
+    events.push(envelope(
+        origin,
+        identity,
+        proto::event::Payload::ConnectionEnded(proto::ConnectionEnded {
+            duration_ms,
+            close_reason,
+            protocol_version: close.protocol_version.map(i64::from),
+            // Unconditional. A close that sometimes reports the id would make
+            // the accept/close join sometimes possible, which is the same as
+            // never for a query that has to be right.
+            connection_id: close.connection_id.clone(),
+        }),
+    ));
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -563,8 +727,10 @@ mod tests {
         record_queue_left("ABCDEF", 7);
         record_match_committed(1, 5, 2, MatchmakingPool::Public);
         record_game_started(1, &state, 2);
-        record_session_started("s_1", None, 12);
-        record_session_ended(10, "socket_closed");
+        let connection = WsConnection::new("inert");
+        record_connection_started(&connection);
+        record_session_started(&connection, account(7));
+        record_connection_closed(&connection);
     }
 
     #[test]
@@ -776,16 +942,60 @@ mod tests {
         assert!(event.identity.as_ref().unwrap().is_stress_test);
     }
 
-    /// The session id is the only thing that ties later events on a socket
-    /// together, so it must be on the identity, not buried in the payload.
+    fn account(user_id: i32) -> Account {
+        Account {
+            user_id,
+            is_guest: false,
+            is_stress_test: false,
+        }
+    }
+
+    fn session_start(account: Account) -> SessionStart {
+        SessionStart {
+            session_id: Some(Arc::from("s_abc")),
+            anon_id: Some(Arc::from("anon-1")),
+            protocol_version: Some(12),
+            account,
+        }
+    }
+
+    /// A close with nothing behind it: the shape a refused handshake produces.
+    fn refused_close(protocol_version: Option<u16>, close_reason: CloseReason) -> ConnectionClose {
+        ConnectionClose {
+            connection_id: "conn-1".to_owned(),
+            duration_ms: 40,
+            close_reason,
+            protocol_version,
+            // A session id IS minted before verification, so a refused
+            // connection genuinely holds one. It must not be reported.
+            session_id: Some(Arc::from("s_abc")),
+            anon_id: Some(Arc::from("anon-1")),
+            session_account: None,
+        }
+    }
+
+    fn named(events: &[proto::Event], name: &str) -> Option<usize> {
+        events.iter().position(|event| event.event_name == name)
+    }
+
+    /// The point of moving this event behind verification: it can finally name
+    /// the account. A `session_started` without a `user_id` is the defect.
     #[test]
-    fn a_session_start_carries_the_session_and_anon_ids() {
-        let event = session_started_event(&origin(), "s_abc", Some("anon-1"), 12);
+    fn a_session_start_carries_the_account_it_authenticated_as() {
+        let event = session_started_event(
+            &origin(),
+            &session_start(Account {
+                user_id: 4242,
+                is_guest: true,
+                is_stress_test: false,
+            }),
+        );
         assert_eq!(event.event_name, "session_started");
         let identity = event.identity.as_ref().unwrap();
+        assert_eq!(identity.user_id, Some(4242));
+        assert!(identity.is_guest);
         assert_eq!(identity.session_id.as_deref(), Some("s_abc"));
         assert_eq!(identity.anon_id.as_deref(), Some("anon-1"));
-        assert_eq!(identity.user_id, None, "the account is not known yet");
         let proto::event::Payload::SessionStarted(started) = payload(&event) else {
             panic!("expected session_started");
         };
@@ -796,19 +1006,295 @@ mod tests {
     /// event must simply omit the field rather than invent one.
     #[test]
     fn a_session_without_an_anon_id_omits_it() {
-        let event = session_started_event(&origin(), "s_abc", None, 12);
+        let event = session_started_event(
+            &origin(),
+            &SessionStart {
+                anon_id: None,
+                ..session_start(account(7))
+            },
+        );
         assert_eq!(event.identity.as_ref().unwrap().anon_id, None);
     }
 
+    /// A load-test connection has to be labelled at the session, or every
+    /// funnel built on these events silently counts synthetic traffic.
     #[test]
-    fn a_session_end_carries_its_duration_and_reason() {
-        let event = session_ended_event(&origin(), 9_000, "socket_closed");
-        assert_eq!(event.event_name, "session_ended");
-        let proto::event::Payload::SessionEnded(ended) = payload(&event) else {
+    fn a_stress_account_is_flagged_on_the_session() {
+        let event = session_started_event(
+            &origin(),
+            &session_start(Account {
+                user_id: 9,
+                is_guest: false,
+                is_stress_test: true,
+            }),
+        );
+        assert!(event.identity.as_ref().unwrap().is_stress_test);
+    }
+
+    /// The funnel-deletion trap, at the projection level: a connection that
+    /// never authenticated produces a `connection_ended` and NOTHING else. If a
+    /// `session_ended` appeared here, every unverified attempt would be counted
+    /// as an authenticated session that ended.
+    #[test]
+    fn a_close_without_a_session_reports_only_the_socket() {
+        let events = connection_close_events(
+            &origin(),
+            &refused_close(Some(7), CloseReason::AuthenticationFailed),
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.event_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["connection_ended"],
+        );
+        let identity = events[0].identity.as_ref().unwrap();
+        assert_eq!(identity.user_id, None);
+        assert_eq!(
+            identity.session_id, None,
+            "a session id minted for a handshake that failed names no \
+             session_started row, so reporting it would be a join key to nothing"
+        );
+        assert_eq!(
+            identity.anon_id.as_deref(),
+            Some("anon-1"),
+            "the browser behind a refused client is exactly what a rollout needs"
+        );
+    }
+
+    /// The whole reason the version lives on the connection instead of in the
+    /// handshake's scope: for a rejected client this row is the ONLY evidence
+    /// of which version was rejected.
+    #[test]
+    fn a_rejected_client_still_reports_the_version_it_asked_for() {
+        let events = connection_close_events(
+            &origin(),
+            &refused_close(Some(3), CloseReason::ProtocolRejected),
+        );
+        let proto::event::Payload::ConnectionEnded(ended) = payload(&events[0]) else {
+            panic!("expected connection_ended");
+        };
+        assert_eq!(ended.protocol_version, Some(3));
+        assert_eq!(ended.close_reason, "protocol_rejected");
+        assert_eq!(ended.duration_ms, 40);
+    }
+
+    /// Absent, never zero: a socket that closed before its handshake has no
+    /// version, and a zero-defaulted column would show it as a real version-0
+    /// cohort in exactly the rollout query this field exists for.
+    #[test]
+    fn a_socket_that_never_handshook_reports_no_version_rather_than_zero() {
+        let events =
+            connection_close_events(&origin(), &refused_close(None, CloseReason::SocketClosed));
+        let proto::event::Payload::ConnectionEnded(ended) = payload(&events[0]) else {
+            panic!("expected connection_ended");
+        };
+        assert_eq!(ended.protocol_version, None);
+    }
+
+    /// A connection that HAD a session ends both, and both name the account —
+    /// the attribution the old, unattributed `session_ended` could not carry.
+    #[test]
+    fn a_close_with_a_session_ends_both_and_both_name_the_account() {
+        let events = connection_close_events(
+            &origin(),
+            &ConnectionClose {
+                connection_id: "conn-9".to_owned(),
+                duration_ms: 9_000,
+                close_reason: CloseReason::SocketClosed,
+                protocol_version: Some(12),
+                session_id: Some(Arc::from("s_abc")),
+                anon_id: Some(Arc::from("anon-1")),
+                session_account: Some(Account {
+                    user_id: 77,
+                    is_guest: true,
+                    is_stress_test: false,
+                }),
+            },
+        );
+        assert!(named(&events, "session_ended").is_some());
+        assert!(named(&events, "connection_ended").is_some());
+        assert_eq!(events.len(), 2, "exactly one of each");
+        for event in &events {
+            let identity = event.identity.as_ref().unwrap();
+            assert_eq!(
+                identity.user_id,
+                Some(77),
+                "{} lost the account",
+                event.event_name
+            );
+            assert!(
+                identity.is_guest,
+                "{} lost the guest flag",
+                event.event_name
+            );
+            assert_eq!(identity.session_id.as_deref(), Some("s_abc"));
+        }
+        let proto::event::Payload::SessionEnded(ended) =
+            payload(&events[named(&events, "session_ended").unwrap()])
+        else {
             panic!("expected session_ended");
         };
         assert_eq!(ended.duration_ms, 9_000);
         assert_eq!(ended.close_reason, "socket_closed");
+    }
+
+    /// The account is read from the SESSION, not from the connection's live
+    /// per-frame attribution — that one is cleared when a connection falls back
+    /// to unauthenticated, and the session still belonged to somebody.
+    #[test]
+    fn a_session_that_ended_unauthenticated_still_names_who_it_was() {
+        let connection = WsConnection::new("close-after-deauth");
+        connection.bind_session("s_abc");
+        record_session_started(&connection, account(77));
+        // Exactly what the connection loop does when a message fails: publish
+        // the reset state, clearing the live account.
+        connection.set_account(None);
+
+        let close = ConnectionClose::observed(&connection);
+        assert_eq!(close.session_account, Some(account(77)));
+        let events = connection_close_events(&origin(), &close);
+        assert!(named(&events, "session_ended").is_some());
+        assert_eq!(
+            events[0].identity.as_ref().unwrap().user_id,
+            Some(77),
+            "the session's identity must survive the connection losing it"
+        );
+    }
+
+    /// A duration is a subtraction, and a negative one would read downstream as
+    /// a real, impossibly fast session.
+    #[test]
+    fn a_negative_duration_is_clamped_rather_than_emitted() {
+        let events = connection_close_events(
+            &origin(),
+            &ConnectionClose {
+                duration_ms: -5,
+                ..refused_close(Some(12), CloseReason::SocketClosed)
+            },
+        );
+        let proto::event::Payload::ConnectionEnded(ended) = payload(&events[0]) else {
+            panic!("expected connection_ended");
+        };
+        assert_eq!(ended.duration_ms, 0);
+    }
+
+    /// The accept knows the socket, and nothing else. `is_guest` staying
+    /// `false` is the load-bearing half: `websocket_message` stamps `true` for
+    /// "no account known", and an accept that inherited that convention would
+    /// make every connection in `raw/game-events/` look like a guest one.
+    #[test]
+    fn a_connection_start_names_the_socket_and_nobody_on_it() {
+        let event = connection_started_event(&origin(), "conn-1");
+        assert_eq!(event.event_name, "connection_started");
+        let identity = event.identity.as_ref().unwrap();
+        assert_eq!(identity.user_id, None);
+        assert_eq!(identity.session_id, None);
+        assert_eq!(identity.anon_id, None);
+        assert!(
+            !identity.is_guest,
+            "an accept knows no account, and `false` — not `true` — is what \
+             this tier means by that"
+        );
+        let proto::event::Payload::ConnectionStarted(started) = payload(&event) else {
+            panic!("expected connection_started");
+        };
+        assert_eq!(
+            started.connection_id, "conn-1",
+            "the id is the only join key an unauthenticated socket ever has"
+        );
+    }
+
+    /// The pairing, at the projection level: one connection's accept and its
+    /// own close must carry the same id, and it must be the id the connection
+    /// itself was built with — not one minted at either end.
+    #[test]
+    fn an_accept_and_its_own_close_carry_the_same_connection_id() {
+        let connection = WsConnection::new("ws-pairing");
+        let started = connection_started_event(&origin(), connection.connection_id());
+        let closed = connection_close_events(&origin(), &ConnectionClose::observed(&connection));
+
+        let proto::event::Payload::ConnectionStarted(start) = payload(&started) else {
+            panic!("expected connection_started");
+        };
+        let proto::event::Payload::ConnectionEnded(end) = payload(&closed[0]) else {
+            panic!("expected connection_ended");
+        };
+        assert_eq!(start.connection_id, "ws-pairing");
+        assert_eq!(
+            end.connection_id, start.connection_id,
+            "an accept that cannot be joined to its own close answers no \
+             per-connection question at all"
+        );
+    }
+
+    /// Two live connections must not share an id. If the id came from anywhere
+    /// process-wide these would collide, and every per-connection query would
+    /// silently fold two sockets into one.
+    #[test]
+    fn two_connections_never_share_an_id() {
+        let first = WsConnection::new("ws-first");
+        let second = WsConnection::new("ws-second");
+        let ends: Vec<String> = [&first, &second]
+            .into_iter()
+            .map(|connection| {
+                let events =
+                    connection_close_events(&origin(), &ConnectionClose::observed(connection));
+                match payload(&events[0]) {
+                    proto::event::Payload::ConnectionEnded(ended) => ended.connection_id,
+                    other => panic!("expected connection_ended, got {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(ends, vec!["ws-first".to_owned(), "ws-second".to_owned()]);
+    }
+
+    /// A close with a verified guest account is the ONE shape that may set
+    /// `is_guest`, and a close with no account may not — the inverted
+    /// `websocket_message` convention would report every refused handshake as
+    /// a guest.
+    #[test]
+    fn is_guest_is_a_claim_about_a_verified_account_not_about_ignorance() {
+        let refused = connection_close_events(
+            &origin(),
+            &refused_close(Some(12), CloseReason::AuthenticationFailed),
+        );
+        assert!(
+            !refused[0].identity.as_ref().unwrap().is_guest,
+            "nobody was verified, so nothing may be claimed about a guest"
+        );
+
+        let guest = connection_close_events(
+            &origin(),
+            &ConnectionClose {
+                session_account: Some(Account {
+                    user_id: 5,
+                    is_guest: true,
+                    is_stress_test: false,
+                }),
+                ..refused_close(Some(12), CloseReason::SocketClosed)
+            },
+        );
+        for event in &guest {
+            assert!(
+                event.identity.as_ref().unwrap().is_guest,
+                "{} lost the verified guest claim",
+                event.event_name
+            );
+        }
+    }
+
+    /// Every reason renders as a stable label, because these become column
+    /// values that a saved query filters on.
+    #[test]
+    fn close_reasons_render_as_stable_labels() {
+        assert_eq!(CloseReason::SocketClosed.as_str(), "socket_closed");
+        assert_eq!(CloseReason::ProtocolRejected.as_str(), "protocol_rejected");
+        assert_eq!(
+            CloseReason::AuthenticationFailed.as_str(),
+            "authentication_failed"
+        );
+        assert_eq!(CloseReason::ConnectionError.as_str(), "connection_error");
     }
 
     // -----------------------------------------------------------------------

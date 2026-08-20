@@ -33,8 +33,9 @@ message Identity {
   //   * `websocket_message` rows stamp `true` when no account is known, so
   //     `false` is a positive claim backed by a verified account and a
   //     pre-authentication frame can never be counted as registered activity.
-  //   * every other event builds identity from `EventIdentity::default()`,
-  //     which leaves this `false` when no account is known.
+  //   * every other event — the durable ones in `raw/game-events/`, the
+  //     `connection_started` / `connection_ended` pair included — leaves this
+  //     `false` when no account is known, so `true` is the positive claim.
   //
   // Either way the rule for a query is the same: gate on
   // `user_id IS NOT NULL` before reading this, or a guest-vs-registered split
@@ -61,10 +62,86 @@ message GuestConverted {
 
 message UserLogin {}
 
+// A websocket was accepted, before a single frame was read from it.
+//
+// Named `connection_*` and NOT `websocket_*`: `websocket_message` is
+// non-durable and lands in a different external table (`raw/websocket-events/`)
+// while this pair is durable and lands in `raw/game-events/`. A shared prefix
+// would make two arms with opposite durability guarantees look like siblings
+// and read as queryable from one table, which they are not.
+//
+// Identity-free apart from `connection_id`: at accept nothing is known about
+// who is on the socket, and a placeholder account would be a join key to
+// nothing. It exists to be COUNTED — it is the denominator every
+// connection-level funnel divides by, and the one arm that no rejection can
+// suppress.
+//
+// `identity.is_guest` follows the MAJORITY convention, not `websocket_message`'s
+// inverted one: it is left `false` whenever no verified account is known, so a
+// `true` here is always a positive claim about a real guest account. An accept
+// knows no account at all, so this is always `false`. Stamping `true` for
+// "unknown" — which `websocket_message` does — would make every accept look
+// like a guest and inflate the guest side of any split taken over
+// `raw/game-events/`.
+message ConnectionStarted {
+  // The socket's own id, and the ONLY thing that makes an accept joinable to
+  // its own close. Sourced from `websocket_id`, a per-connection UUIDv4 minted
+  // where the socket is accepted, so it is unique per connection and shared by
+  // nothing else in the process.
+  //
+  // Number 1 because this message was empty: it is the lowest free number and
+  // sits in the single-tag-byte range. It deliberately does NOT match the
+  // number the same field takes on `ConnectionEnded` — proto numbers are
+  // per-message, readers key on the NAME, and burning 1-3 here to line them up
+  // would retire three numbers forever for a symmetry nobody can observe.
+  //
+  // Not on `Identity`, deliberately. `Identity` rides every event including
+  // `websocket_message`, which is emitted per FRAME; a per-connection value
+  // read once at close must not become a per-frame clone.
+  string connection_id = 1;
+}
+
+// That websocket closed. Emitted for every connection without exception, which
+// is what keeps a failed handshake countable: `session_started` now fires only
+// after authentication succeeds, so an attempt that was refused for its
+// protocol version or its token appears ONLY here. Dropping this event would
+// silently delete the failure arm of every authentication funnel.
+//
+// `identity.is_guest` follows the same majority convention as
+// `connection_started`: `false` unless a verified guest account is known. Both
+// halves of the pair must agree, or a guest-vs-registered split taken across
+// accepts and closes would disagree with itself.
+message ConnectionEnded {
+  int64 duration_ms = 1;
+  string close_reason = 2;
+  // The gameplay protocol the client reported, if it ever reported one.
+  //
+  // Optional rather than zero-defaulted because "never sent a handshake" and
+  // "reported version 0" are different facts, and a rollout counted by this
+  // column would read the second as a real cohort. This is what makes a
+  // version rollout countable from the rejections alone.
+  optional int64 protocol_version = 3;
+  // The same id the matching `connection_started` carried, so an accept joins
+  // to its own close. Without it "how long did sockets that never
+  // authenticated survive?" and "did this client retry?" are unanswerable
+  // rather than merely awkward: an unauthenticated socket has no session id and
+  // no account, so this is its only key.
+  //
+  // Number 4 as the next free number in this message. Present on EVERY close,
+  // never conditional: a pair that is sometimes joinable is a pair no query can
+  // rely on.
+  string connection_id = 4;
+}
+
+// An authenticated session began. Fires only after verification SUCCEEDS, so
+// the account behind it is known and rides the envelope's identity.
 message SessionStarted {
   int64 protocol_version = 1;
 }
 
+// That session's connection closed. Emitted only for a connection that
+// actually carried a session, so `session_started` and `session_ended` pair
+// exactly; every other close is a `connection_ended` alone.
 message SessionEnded {
   int64 duration_ms = 1;
   string close_reason = 2;
@@ -179,5 +256,7 @@ message Event {
     GameCompleted game_completed = 114;
     GamePlayerResult game_player_result = 115;
     WebsocketMessage websocket_message = 116;
+    ConnectionStarted connection_started = 117;
+    ConnectionEnded connection_ended = 118;
   }
 }

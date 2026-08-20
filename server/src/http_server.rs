@@ -949,15 +949,15 @@ async fn websocket_handler(
             )
             .await;
             let session_duration = session_started_at.elapsed();
+            // The resilience metric stays here. It is a transport fact with no
+            // identity in it, and it belongs beside the opened/closed counters
+            // and the connection-count bookkeeping in this same closure, which
+            // are its only peers. The ANALYTICS session events moved down into
+            // `handle_websocket`, where the connection context still exists —
+            // emitting them from here is what left them unattributed, because
+            // `handle_websocket` returns `()` and nothing about the user
+            // survives the call.
             crate::resilience_metrics::record_websocket_session(session_duration);
-            // The socket future has returned, so this is the only place that
-            // knows the whole session length. Nothing about the user survives
-            // here, so the event carries the duration and the reason and no
-            // identity.
-            crate::analytics::sink::record_session_ended(
-                session_duration.as_millis() as i64,
-                "socket_closed",
-            );
 
             // Decrement connection count when connection closes
             let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;

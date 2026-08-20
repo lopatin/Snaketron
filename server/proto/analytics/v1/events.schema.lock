@@ -18,6 +18,15 @@
 message snaketron.analytics.v1.AccountRegistered
   1 mmr int64 long
 
+message snaketron.analytics.v1.ConnectionEnded
+  1 duration_ms int64 long
+  2 close_reason string string
+  3 protocol_version int64 long
+  4 connection_id string string
+
+message snaketron.analytics.v1.ConnectionStarted
+  1 connection_id string string
+
 message snaketron.analytics.v1.Event
   1 event_id string string
   2 event_name string string
@@ -45,6 +54,8 @@ message snaketron.analytics.v1.Event
   114 game_completed message:snaketron.analytics.v1.GameCompleted struct
   115 game_player_result message:snaketron.analytics.v1.GamePlayerResult struct
   116 websocket_message message:snaketron.analytics.v1.WebsocketMessage struct
+  117 connection_started message:snaketron.analytics.v1.ConnectionStarted struct
+  118 connection_ended message:snaketron.analytics.v1.ConnectionEnded struct
 
 message snaketron.analytics.v1.GameCompleted
   1 game_id int64 long

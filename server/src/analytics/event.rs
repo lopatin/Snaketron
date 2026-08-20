@@ -129,6 +129,8 @@ pub fn payload_name(payload: &proto::event::Payload) -> &'static str {
         P::GameCompleted(_) => "game_completed",
         P::GamePlayerResult(_) => "game_player_result",
         P::WebsocketMessage(_) => "websocket_message",
+        P::ConnectionStarted(_) => "connection_started",
+        P::ConnectionEnded(_) => "connection_ended",
     }
 }
 
@@ -271,6 +273,8 @@ mod tests {
             P::GameCompleted(Default::default()),
             P::GamePlayerResult(Default::default()),
             P::WebsocketMessage(Default::default()),
+            P::ConnectionStarted(Default::default()),
+            P::ConnectionEnded(Default::default()),
         ];
         let names: Vec<&str> = arms.iter().map(payload_name).collect();
         let unique: std::collections::HashSet<_> = names.iter().collect();
@@ -279,7 +283,7 @@ mod tests {
             names.len(),
             "names must be distinct: {names:?}"
         );
-        assert_eq!(names.len(), 17, "every registry entry must be covered");
+        assert_eq!(names.len(), 19, "every registry entry must be covered");
     }
 
     /// One line, snake_case keys, and QUOTED 64-bit integers — each of which

@@ -1137,6 +1137,22 @@ pub async fn handle_websocket(
 ) {
     info!("New WebSocket connection established");
 
+    // One analytics context for the connection, created HERE rather than
+    // inside the connection loop so that the close events below cannot be
+    // skipped. `handle_websocket_connection` propagates with `?` in a handful
+    // of places, and `connection_ended` has to fire for every connection
+    // without exception — it is the only event a refused handshake ever
+    // produces, so a path that skips it deletes that attempt from the funnel
+    // entirely.
+    let websocket_id = uuid::Uuid::new_v4().to_string();
+    let ws_analytics = Arc::new(crate::analytics::ws_sink::WsConnection::new(&websocket_id));
+    // Emitted before a single frame is read, because that is what makes it a
+    // count of CONNECTIONS rather than of connections that got far enough to
+    // say something. It reports the connection's own id, read back off the
+    // context rather than from `websocket_id` here, so the accept and the close
+    // below cannot drift onto different values.
+    crate::analytics::sink::record_connection_started(&ws_analytics);
+
     // Process the WebSocket connection
     if let Err(e) = handle_websocket_connection(
         socket,
@@ -1155,12 +1171,22 @@ pub async fn handle_websocket(
         lifecycle,
         cluster_namespace,
         ads_config,
+        websocket_id,
+        ws_analytics.clone(),
     )
     .await
     {
         crate::resilience_metrics::record_websocket_process_error(1);
+        // Last classification wins, and this one knows the most: the
+        // connection task itself failed.
+        ws_analytics.set_close_reason(crate::analytics::ws_sink::CloseReason::ConnectionError);
         error!("WebSocket connection error: {}", e);
     }
+
+    // Fire-and-forget, on the way out of a task that is already finished, so
+    // nothing here can reach gameplay. Emits `connection_ended` always, and
+    // `session_ended` only if this connection ever had a session.
+    crate::analytics::sink::record_connection_closed(&ws_analytics);
 }
 
 fn tungstenite_message_bytes(message: &Message) -> usize {
@@ -1301,17 +1327,7 @@ fn publish_analytics_context(
     let (account, seat) = match state {
         ConnectionState::Authenticated {
             metadata, game_id, ..
-        } => (
-            Some(crate::analytics::ws_sink::Account {
-                user_id: metadata.user_id,
-                is_guest: metadata.is_guest,
-                // Load-test connections are seated in their own pool, so this
-                // is knowable exactly where the account is.
-                is_stress_test: metadata.matchmaking_pool
-                    == crate::matchmaking_pool::MatchmakingPool::Stress,
-            }),
-            *game_id,
-        ),
+        } => (Some(analytics_account(metadata)), *game_id),
         // Not "unknown": a connection in this state has no account behind it,
         // and frames recorded from here must carry none.
         ConnectionState::Unauthenticated => (None, None),
@@ -1319,6 +1335,63 @@ fn publish_analytics_context(
     analytics.set_account(account);
     analytics.set_game_id(seat);
     seat
+}
+
+/// The analytics view of an authenticated player.
+///
+/// One mapping, used by both the per-frame publication and the session event,
+/// so the account a `session_started` names can never disagree with the one
+/// that session's frames are stamped with.
+fn analytics_account(metadata: &PlayerMetadata) -> crate::analytics::ws_sink::Account {
+    crate::analytics::ws_sink::Account {
+        user_id: metadata.user_id,
+        is_guest: metadata.is_guest,
+        // Load-test connections are seated in their own pool, so this is
+        // knowable exactly where the account is.
+        is_stress_test: metadata.matchmaking_pool
+            == crate::matchmaking_pool::MatchmakingPool::Stress,
+    }
+}
+
+/// Records what one authentication attempt produced.
+///
+/// ONE place, because the trap here is quiet and total. `session_started` used
+/// to fire before the token was verified, which made it the count of ATTEMPTS
+/// — protocol rejections included. Moving it behind verification, so it can
+/// carry an account, would delete the failure arm of every authentication
+/// funnel unless the failures land somewhere else. They land on
+/// `connection_ended`: the close reason set below travels on the connection to
+/// the socket's end, next to the protocol version the client reported, so a
+/// refused client is still a complete row and a version rollout is still
+/// countable.
+///
+/// A refusal never starts a session, so it never produces a `session_ended`
+/// either — the started/ended pair stays exact.
+fn record_authentication_outcome(
+    ws_analytics: &crate::analytics::ws_sink::WsConnection,
+    outcome: &Result<ConnectionState>,
+) {
+    use crate::analytics::ws_sink::CloseReason;
+    match outcome {
+        Ok(ConnectionState::Authenticated { metadata, .. }) => {
+            crate::analytics::sink::record_session_started(
+                ws_analytics,
+                analytics_account(metadata),
+            );
+            // A connection that authenticated is healthy; whatever ends it
+            // later is an ordinary close, not a refusal. Set explicitly rather
+            // than left at the default, so a retry after a refused handshake
+            // is not still described by the refusal it recovered from.
+            ws_analytics.set_close_reason(CloseReason::SocketClosed);
+        }
+        // `authenticate_ws_connection` returns an unauthenticated state from
+        // exactly one place: the protocol-version gate it applies before it
+        // looks at the token at all.
+        Ok(ConnectionState::Unauthenticated) => {
+            ws_analytics.set_close_reason(CloseReason::ProtocolRejected);
+        }
+        Err(_) => ws_analytics.set_close_reason(CloseReason::AuthenticationFailed),
+    }
 }
 
 /// Internal function to handle the WebSocket connection logic
@@ -1340,6 +1413,12 @@ async fn handle_websocket_connection(
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
     ads_config: Arc<AdsConfig>,
+    // Stable for the connection's whole life, and already the key the
+    // analytics context was sampled on. Minted by the caller so both can be.
+    websocket_id: String,
+    // Created by the caller so the connection's close events cannot be skipped
+    // by an early `?` return from this function.
+    ws_analytics: Arc<crate::analytics::ws_sink::WsConnection>,
 ) -> Result<()> {
     // Split the WebSocket into send and receive parts using futures_util
     let (mut ws_sink, mut ws_stream) = futures_util::StreamExt::split(ws_stream);
@@ -1351,16 +1430,8 @@ async fn handle_websocket_connection(
     let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
     let (drain_tx, mut priority_drain_rx) = mpsc::channel::<Message>(1);
 
-    // Generate a unique websocket ID for this connection
-    let websocket_id = uuid::Uuid::new_v4().to_string();
     let socket_generation = lifecycle.next_socket_generation();
     let mut drain_rx = lifecycle.subscribe_to_drain();
-
-    // One analytics context for the connection, keyed on an id that already
-    // exists before the first frame. The forwarder task below sees only
-    // serialized frames, so the identity both directions record has to be
-    // shared rather than derived independently on each side.
-    let ws_analytics = Arc::new(crate::analytics::ws_sink::WsConnection::new(&websocket_id));
 
     // Start in unauthenticated state
     let mut state = ConnectionState::Unauthenticated;
@@ -5181,7 +5252,12 @@ async fn process_ws_message(
         ConnectionState::Unauthenticated => {
             match ws_message {
                 WSMessage::Token(jwt_token) => {
-                    authenticate_ws_connection(
+                    // The legacy shape reports no protocol version, so nothing
+                    // is recorded for it — and it is refused for exactly that.
+                    // It still runs through the same outcome recorder, because
+                    // a legacy client is a cohort a rollout wants counted, and
+                    // `connection_ended` is now the only place it can be.
+                    let outcome = authenticate_ws_connection(
                         jwt_token,
                         None,
                         None,
@@ -5197,7 +5273,9 @@ async fn process_ws_message(
                         cluster_namespace,
                         ads_config,
                     )
-                    .await
+                    .await;
+                    record_authentication_outcome(ws_analytics, &outcome);
+                    outcome
                 }
                 WSMessage::Authenticate {
                     token: jwt_token,
@@ -5208,25 +5286,31 @@ async fn process_ws_message(
                     // Validated at the boundary so a malformed or unbounded
                     // client string can never reach an analytics event.
                     let anon_id = sanitize_anon_id(anon_id);
-                    // Minted here because this is the first identity-bearing
-                    // moment of a connection: the socket exists earlier, but
-                    // nothing is known about who is on it until now.
+                    // Minted here because this is the first moment a
+                    // connection says anything about itself. The socket
+                    // existed earlier — `connection_started` already counted it
+                    // — but nothing was known about who was on it until now,
+                    // and after this arm it is still only a CLAIM until
+                    // verification below either admits it or refuses it.
                     let session_id = new_session_id();
                     debug!(
-                        "websocket session {session_id} authenticated (anon_id present: {})",
+                        "websocket handshake {session_id} received (anon_id present: {})",
                         anon_id.is_some()
                     );
-                    crate::analytics::sink::record_session_started(
-                        &session_id,
-                        anon_id.as_deref(),
-                        protocol_version,
-                    );
-                    // From here on this connection's frames carry the same
-                    // session id as the event above, so the two join. The
-                    // handshake frames that preceded this one carry none,
-                    // because until now there was no session to name.
+                    // Handed to the connection context BEFORE verification, and
+                    // deliberately. These are the facts the close event has to
+                    // report, and for a refused client the close event is the
+                    // only event there will ever be: this arm's scope is gone
+                    // long before the socket ends. Recording them is not a
+                    // claim that a session started — `session_started` is that
+                    // claim, and it is emitted below, only on success.
+                    ws_analytics.report_protocol_version(protocol_version);
+                    ws_analytics.bind_anon_id(anon_id.as_deref());
+                    // From here on this connection's frames carry this session
+                    // id, so the frames of one handshake group together whether
+                    // or not the token turns out to be good.
                     ws_analytics.bind_session(&session_id);
-                    authenticate_ws_connection(
+                    let outcome = authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
                         distribution,
@@ -5242,7 +5326,9 @@ async fn process_ws_message(
                         cluster_namespace,
                         ads_config,
                     )
-                    .await
+                    .await;
+                    record_authentication_outcome(ws_analytics, &outcome);
+                    outcome
                 }
                 WSMessage::Ping { client_time } => {
                     // Respond with Pong even in unauthenticated state to keep connection alive
@@ -8888,5 +8974,154 @@ mod analytics_publication_tests {
 
         assert_eq!(analytics.account(), None);
         assert_eq!(analytics.game_id(), None);
+    }
+}
+
+/// The authentication funnel's shape.
+///
+/// `session_started` used to fire before verification, which made it the count
+/// of ATTEMPTS. Now that it fires only on success, every refusal has to remain
+/// countable through the connection's close — and the way to break that is not
+/// to crash, it is to record nothing. These pin the two refusal shapes
+/// directly.
+#[cfg(test)]
+mod authentication_outcome_tests {
+    use super::*;
+    use crate::analytics::ws_sink::{Account, CloseReason, WsConnection};
+
+    fn authenticated(user_id: i32, is_guest: bool, pool: MatchmakingPool) -> ConnectionState {
+        ConnectionState::Authenticated {
+            metadata: PlayerMetadata {
+                user_id,
+                username: "Player".to_owned(),
+                token: "session-token".to_owned(),
+                is_guest,
+                matchmaking_pool: pool,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: Some(ClientDistribution::Web),
+            },
+            lobby_handle: None,
+            game_id: None,
+            websocket_id: "ws-auth".to_owned(),
+        }
+    }
+
+    /// A connection standing exactly where the handshake arm leaves one just
+    /// before it calls `authenticate_ws_connection`.
+    fn handshaken(key: &str, protocol_version: u16) -> WsConnection {
+        let connection = WsConnection::new(key);
+        connection.report_protocol_version(protocol_version);
+        connection.bind_anon_id(Some("2f1c2f1c-2f1c-2f1c-2f1c-2f1c2f1c2f1c"));
+        connection.bind_session("s_attempt");
+        connection
+    }
+
+    #[test]
+    fn a_successful_authentication_starts_a_session_naming_the_account() {
+        let connection = handshaken("auth-ok", WS_PROTOCOL_VERSION);
+
+        record_authentication_outcome(
+            &connection,
+            &Ok(authenticated(4242, true, MatchmakingPool::Public)),
+        );
+
+        assert_eq!(
+            connection.session_account(),
+            Some(Account {
+                user_id: 4242,
+                is_guest: true,
+                is_stress_test: false,
+            }),
+            "a started session has to name who it belongs to"
+        );
+        assert!(connection.has_session());
+        assert_eq!(connection.close_reason(), CloseReason::SocketClosed);
+    }
+
+    /// A load-test connection must be labelled at the session, so synthetic
+    /// traffic can be excluded from every funnel built on these events.
+    #[test]
+    fn a_stress_pool_session_is_flagged_at_its_start() {
+        let connection = handshaken("auth-stress", WS_PROTOCOL_VERSION);
+        record_authentication_outcome(
+            &connection,
+            &Ok(authenticated(9, false, MatchmakingPool::Stress)),
+        );
+        assert!(
+            connection
+                .session_account()
+                .is_some_and(|account| account.is_stress_test)
+        );
+    }
+
+    /// THE TRAP. A token that does not verify must start no session — that is
+    /// the whole reason the event moved — while remaining countable through
+    /// the close reason, which is now the only place the attempt appears.
+    #[test]
+    fn a_failed_authentication_starts_no_session_and_stays_countable() {
+        let connection = handshaken("auth-bad-token", WS_PROTOCOL_VERSION);
+
+        record_authentication_outcome(&connection, &Err(anyhow!("Authentication failed")));
+
+        assert!(
+            !connection.has_session(),
+            "an unverified token must never produce an authenticated session"
+        );
+        assert_eq!(connection.session_account(), None);
+        assert_eq!(connection.close_reason(), CloseReason::AuthenticationFailed);
+        assert_eq!(
+            connection.protocol_version(),
+            Some(WS_PROTOCOL_VERSION),
+            "the version has to reach the close event, or the attempt is \
+             uncountable by cohort"
+        );
+    }
+
+    /// The other refusal shape, and the one a version rollout is measured by:
+    /// `authenticate_ws_connection` returns an unauthenticated state from the
+    /// protocol gate alone.
+    #[test]
+    fn a_protocol_rejection_starts_no_session_and_keeps_its_version() {
+        let rejected = WS_PROTOCOL_VERSION.wrapping_sub(1);
+        let connection = handshaken("auth-old-client", rejected);
+
+        record_authentication_outcome(&connection, &Ok(ConnectionState::Unauthenticated));
+
+        assert!(
+            !connection.has_session(),
+            "a client that was never admitted has no session"
+        );
+        assert_eq!(connection.close_reason(), CloseReason::ProtocolRejected);
+        assert_eq!(connection.protocol_version(), Some(rejected));
+    }
+
+    /// The gate itself, asserted here so the refusal the test above simulates
+    /// is the refusal production actually produces.
+    #[test]
+    fn only_an_exact_protocol_match_is_admitted() {
+        assert!(validate_client_protocol_version(Some(WS_PROTOCOL_VERSION)).is_ok());
+        assert!(validate_client_protocol_version(Some(WS_PROTOCOL_VERSION - 1)).is_err());
+        assert!(
+            validate_client_protocol_version(None).is_err(),
+            "the legacy Token shape reports no version and is refused for it"
+        );
+    }
+
+    /// A client that retries after a refusal and succeeds is not still
+    /// described by the refusal it recovered from.
+    #[test]
+    fn a_retry_that_succeeds_is_no_longer_described_as_rejected() {
+        let connection = handshaken("auth-retry", WS_PROTOCOL_VERSION);
+        record_authentication_outcome(&connection, &Ok(ConnectionState::Unauthenticated));
+        assert_eq!(connection.close_reason(), CloseReason::ProtocolRejected);
+
+        record_authentication_outcome(
+            &connection,
+            &Ok(authenticated(7, false, MatchmakingPool::Public)),
+        );
+
+        assert_eq!(connection.close_reason(), CloseReason::SocketClosed);
+        assert!(connection.has_session());
     }
 }
