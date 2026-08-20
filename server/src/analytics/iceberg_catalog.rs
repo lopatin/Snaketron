@@ -24,8 +24,8 @@
 //!    column: `day()` is undefined on the `long` the protos carry.
 //!
 //! The append itself is [`write_data_files`] plus `fast_append`, and it shares
-//! ONE transaction with the resume mark so a crash cannot land one without the
-//! other. The encode runs on `spawn_blocking` because this process is also
+//! ONE transaction with the resume marks so a crash cannot land one without
+//! the other. The encode runs on `spawn_blocking` because this process is also
 //! serving games on a 100 ms tick.
 //!
 //! The catalog is `iceberg-catalog-s3tables`, which speaks the native
@@ -59,6 +59,7 @@ use tracing::{info, warn};
 
 use super::arrow_rows::{OCCURRED_AT_COLUMN, OCCURRED_AT_MS_COLUMN, ndjson_to_record_batch};
 use super::committer::{CommitOutcome, IcebergCatalog};
+use super::resume::{ResumeMarks, today_utc, window_start};
 use super::schema::DerivedColumn;
 
 /// The lease epoch of the committer that last committed.
@@ -69,8 +70,23 @@ use super::schema::DerivedColumn;
 /// second store to be unavailable at the wrong moment.
 pub const EPOCH_PROPERTY: &str = "snaketron.committer.epoch";
 
-/// The highest source key already folded, used to resume.
+/// The single global mark the committer used to resume from.
+///
+/// **Read, never written.** It is wrong as a resume bound — object keys sort
+/// chronologically only within one `dt=…/host=…` prefix, so one global mark
+/// silently drops every host sorting below whichever host set it (see
+/// `resume.rs`). It is still honoured as an additional floor so a table
+/// carrying one does not re-fold what it already holds, and it is left in
+/// place rather than deleted so a rollback to an older binary still resumes.
 pub const HIGH_WATER_MARK_PROPERTY: &str = "snaketron.committer.high-water-mark";
+
+/// The highest folded key per partition prefix, as a JSON object.
+///
+/// One property rather than one per prefix because every property lives in
+/// `metadata.json`, which S3 Tables refuses to serve past 50 MB — the same
+/// budget the snapshot list is competing for. `ResumeMarks::prune` keeps the
+/// object to the retention window's worth of hosts.
+pub const RESUME_MARKS_PROPERTY: &str = "snaketron.committer.resume-marks";
 
 /// Property name for the AWS region, as `iceberg-catalog-s3tables` spells it.
 const AWS_REGION_NAME: &str = "region_name";
@@ -173,6 +189,19 @@ impl S3TablesIcebergCatalog {
         }
     }
 
+    /// The greatest key folded across every partition prefix.
+    ///
+    /// Observability only — an operator asking "how far has the fold got".
+    /// The fold does NOT resume from it: one global key cannot express what
+    /// has been folded when keys only sort chronologically within a prefix,
+    /// which is exactly the bug `resume.rs` documents.
+    pub async fn high_water_mark(&self, table: &str) -> Result<Option<String>, ServiceError> {
+        let loaded = self.load(table).await?;
+        Ok(read_marks(loaded.metadata().properties())?
+            .highest()
+            .map(str::to_owned))
+    }
+
     /// Tears a table down. `purge_table`, never `drop_table`: the latter is an
     /// explicit `FeatureUnsupported` stub against S3 Tables, so it fails
     /// rather than deleting anything.
@@ -188,6 +217,20 @@ impl S3TablesIcebergCatalog {
 /// still serve Rust reads and writes, so nothing here would fail — the loss
 /// would surface only as Athena refusing to query, far from the cause. Fail at
 /// the catalog boundary instead.
+/// Whether an error is "the table is registered but has no metadata location".
+///
+/// Matched on the message because that is all the catalog offers: the S3
+/// Tables catalog raises it as a bare `ErrorKind::Unexpected`
+/// (`iceberg-catalog-s3tables-0.10.1/src/catalog.rs:262-268`), which is the
+/// same kind it uses for transport faults, so the kind alone cannot
+/// distinguish "half-created" from "S3 is down" — and purging on the latter
+/// would be destructive.
+fn is_missing_metadata(error: &ServiceError) -> bool {
+    error
+        .to_string()
+        .contains("does not have metadata location")
+}
+
 fn require_v2(table: &str, version: FormatVersion) -> Result<(), ServiceError> {
     if version == FormatVersion::V2 {
         return Ok(());
@@ -474,12 +517,16 @@ fn read_epoch(properties: &HashMap<String, String>) -> Result<Option<u64>, Servi
         .transpose()
 }
 
-/// Whether `source_key` is at or below the high-water mark.
+/// Reads the resume state out of table properties.
 ///
-/// Keys sort chronologically within a prefix, so this is the whole resume
-/// story: everything at or below the mark is already folded.
-fn already_folded(high_water_mark: Option<&str>, source_key: &str) -> bool {
-    matches!(high_water_mark, Some(mark) if source_key <= mark)
+/// Both properties, because a table written by the single-mark committer
+/// carries only the legacy one and must not be re-folded from the beginning.
+fn read_marks(properties: &HashMap<String, String>) -> Result<ResumeMarks, ServiceError> {
+    ResumeMarks::decode(
+        properties.get(RESUME_MARKS_PROPERTY).map(String::as_str),
+        properties.get(HIGH_WATER_MARK_PROPERTY).map(String::as_str),
+    )
+    .map_err(|error| ServiceError::failed(format!("{RESUME_MARKS_PROPERTY}: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -745,8 +792,37 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
             // Load rather than return early: `load` is where the
             // format-version check lives, and a v3 table has to be caught
             // before anything is written into it.
-            self.load(table).await?;
-            return Ok(());
+            match self.load(table).await {
+                Ok(_) => return Ok(()),
+                Err(error) if is_missing_metadata(&error) => {
+                    // S3 Tables `CreateTable` registers the table BEFORE the
+                    // client writes its first metadata.json, so a create that
+                    // dies in between leaves a registration `table_exists`
+                    // answers yes to and `load_table` can never open. Observed
+                    // against a real table bucket, not hypothetical.
+                    //
+                    // This is NOT self-healed, deliberately. The only repair
+                    // the catalog offers is `purge_table`, which maps to
+                    // `s3tables:DeleteTable` and is permanent — S3 Tables has
+                    // no soft delete. Granting the game server that permission
+                    // to automate a rare recovery would put "irreversibly drop
+                    // the analytics table" one bug away, to avoid a failure
+                    // that is loud, costs no data, and takes one command to
+                    // clear. That trade is badly asymmetric, and it would
+                    // contradict the additive-only stance the raw tier
+                    // enforces with an explicit delete deny.
+                    return Err(ServiceError::failed(format!(
+                        "analytics table {table} is registered but has no metadata location, \
+                         which is what an interrupted CreateTable leaves behind. It holds no \
+                         data — a table with no metadata location has no snapshots — but it \
+                         can never be opened, and the fold cannot proceed until it is removed. \
+                         Delete it and the next fold recreates it: aws s3tables delete-table \
+                         --table-bucket-arn <arn> --namespace {namespace} --name {table}",
+                        namespace = self.namespace.to_url_string(),
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let schema = initial_schema(columns)?;
@@ -773,7 +849,12 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
                 // moment a dataset first appears, before any lease exists for
                 // its table. Losing that race means the table is there, which
                 // is the outcome asked for.
-                if self.catalog.table_exists(&ident).await.unwrap_or(false) {
+                // Confirm by LOADING, not by `table_exists`. On S3 Tables
+                // `table_exists` is a `GetTable` call that answers yes for a
+                // registration carrying no metadata — precisely what a failed
+                // create leaves — so trusting it here reports a permanently
+                // unusable table as healthy and the fold silently never runs.
+                if self.load(table).await.is_ok() {
                     warn!("lost the create race for {table}; using the existing table");
                     return Ok(());
                 }
@@ -840,10 +921,8 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
         if is_fenced(read_epoch(properties)?, epoch) {
             return Ok(CommitOutcome::Fenced);
         }
-        if already_folded(
-            properties.get(HIGH_WATER_MARK_PROPERTY).map(String::as_str),
-            source_key,
-        ) {
+        let mut marks = read_marks(properties)?;
+        if marks.already_folded(source_key) {
             return Ok(CommitOutcome::AlreadyPresent);
         }
 
@@ -854,18 +933,28 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
         let data_files = write_data_files(&loaded, rows).await?;
         let row_count: u64 = data_files.iter().map(|file| file.record_count()).sum();
 
+        marks.record(source_key);
+        // Pruned against the same window the fold lists from, so a dropped
+        // entry is always one whose keys the next listing cannot return.
+        // Unpruned, this property gains an entry per host per day forever
+        // inside a `metadata.json` that stops serving at 50 MB.
+        marks.prune(window_start(today_utc()));
+
         let tx = Transaction::new(&loaded);
+        // `HIGH_WATER_MARK_PROPERTY` is deliberately NOT set. Writing it would
+        // reinstate the global floor and re-drop every host sorting below this
+        // key — the bug the per-prefix marks exist to fix.
         let action = tx
             .update_table_properties()
             .set(EPOCH_PROPERTY.to_owned(), epoch.to_string())
-            .set(HIGH_WATER_MARK_PROPERTY.to_owned(), source_key.to_owned());
+            .set(RESUME_MARKS_PROPERTY.to_owned(), marks.encode()?);
         let tx = action
             .apply(tx)
             .map_err(|e| ServiceError::failed(format!("planning commit: {e}")))?;
 
-        // The append and the high-water mark move in ONE transaction. Split
+        // The append and the resume marks move in ONE transaction. Split
         // across two, a crash between them either re-folds the object (adding
-        // duplicate rows) or advances the mark past data that was never
+        // duplicate rows) or advances the marks past data that was never
         // appended (losing it silently).
         let tx = if data_files.is_empty() {
             tx
@@ -904,13 +993,9 @@ impl IcebergCatalog for S3TablesIcebergCatalog {
         }
     }
 
-    async fn high_water_mark(&self, table: &str) -> Result<Option<String>, ServiceError> {
+    async fn resume_marks(&self, table: &str) -> Result<ResumeMarks, ServiceError> {
         let loaded = self.load(table).await?;
-        Ok(loaded
-            .metadata()
-            .properties()
-            .get(HIGH_WATER_MARK_PROPERTY)
-            .cloned())
+        read_marks(loaded.metadata().properties())
     }
 }
 
@@ -1342,17 +1427,68 @@ mod tests {
 
     // -- Resume --------------------------------------------------------
 
-    /// Keys sort chronologically within a prefix, so the mark is the whole
-    /// resume story: at or below it is already folded.
+    fn raw_key(date: &str, host: &str, cursor: &str) -> String {
+        crate::analytics::object_store::object_key("game-events", date, host, cursor, cursor, "h")
+    }
+
+    /// The resume state comes out of the marks property, and a table that has
+    /// never been folded folds everything the listing hands it.
     #[test]
-    fn the_high_water_mark_decides_what_is_already_folded() {
-        assert!(!already_folded(None, "a.json.gz"));
-        assert!(already_folded(Some("b.json.gz"), "a.json.gz"));
+    fn an_unfolded_table_has_no_marks() {
+        let marks = read_marks(&HashMap::new()).expect("read");
+        assert_eq!(marks.highest(), None);
+        assert!(!marks.already_folded(&raw_key("2026-08-19", "use1-3", "1-0")));
+    }
+
+    #[test]
+    fn the_marks_property_round_trips_through_table_properties() {
+        let us = raw_key("2026-08-19", "use1-3", "5000000000000-0");
+        let eu = raw_key("2026-08-19", "euw1-5", "1000000000000-0");
+
+        let mut marks = ResumeMarks::default();
+        marks.record(&us);
+        let properties =
+            HashMap::from([(RESUME_MARKS_PROPERTY.to_owned(), marks.encode().unwrap())]);
+
+        let restored = read_marks(&properties).expect("read");
+        assert!(restored.already_folded(&us));
         assert!(
-            already_folded(Some("b.json.gz"), "b.json.gz"),
-            "the mark itself is folded"
+            !restored.already_folded(&eu),
+            "a US mark must not hide an EU key that sorts below it"
         );
-        assert!(!already_folded(Some("b.json.gz"), "c.json.gz"));
+    }
+
+    /// The migration path. An older binary left one global mark; it is read as
+    /// an extra floor, which can only skip more and so can never duplicate.
+    #[test]
+    fn a_table_carrying_only_the_legacy_mark_still_resumes_from_it() {
+        let legacy = raw_key("2026-08-19", "use1-3", "5000000000000-0");
+        let properties = HashMap::from([(HIGH_WATER_MARK_PROPERTY.to_owned(), legacy.clone())]);
+
+        let marks = read_marks(&properties).expect("read");
+        assert!(marks.already_folded(&legacy));
+        assert!(!marks.already_folded(&raw_key("2026-08-19", "use1-3", "9000000000000-0")));
+    }
+
+    /// Garbage in the marks property must stop the fold, not read as "nothing
+    /// folded" — that would re-fold the whole window and duplicate its rows.
+    #[test]
+    fn a_malformed_marks_property_is_an_error_not_an_empty_resume() {
+        let properties = HashMap::from([(RESUME_MARKS_PROPERTY.to_owned(), "nope".to_owned())]);
+        let error = read_marks(&properties).expect_err("garbage must not disable the resume");
+        assert!(error.to_string().contains(RESUME_MARKS_PROPERTY), "{error}");
+    }
+
+    /// The two property names are the durable contract with every table
+    /// already in production; changing either silently re-folds or re-drops.
+    #[test]
+    fn the_property_names_are_pinned() {
+        assert_eq!(EPOCH_PROPERTY, "snaketron.committer.epoch");
+        assert_eq!(
+            HIGH_WATER_MARK_PROPERTY,
+            "snaketron.committer.high-water-mark"
+        );
+        assert_eq!(RESUME_MARKS_PROPERTY, "snaketron.committer.resume-marks");
     }
 
     // -- Format version ------------------------------------------------

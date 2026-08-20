@@ -18,8 +18,10 @@ pub mod iceberg_catalog;
 #[cfg(test)]
 mod iceberg_local_tests;
 pub mod object_store;
+pub mod resume;
 pub mod schema;
 pub mod sink;
+pub mod source_listing;
 pub mod ws_exporter;
 
 pub use batch::{BatchLimits, BufferedEvent, EventBatcher, PendingFile};

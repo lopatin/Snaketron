@@ -34,6 +34,14 @@ const _: () = assert!(
 /// Per-service stop budget, clamped by the host's remaining global deadline so
 /// one slow service delays only itself.
 const HOSTED_SERVICE_STOP_BUDGET: Duration = Duration::from_secs(10);
+/// How often the elected committer folds the raw tier into Iceberg.
+///
+/// Analytics is a next-day-reporting tier, so freshness buys almost nothing
+/// here. The tick governs only how often the fold LISTS: how many Iceberg
+/// snapshots accumulate is set by how many objects the exporters wrote, not by
+/// how often anyone looks, so a shorter tick would add listings without adding
+/// data.
+const ICEBERG_COMMIT_INTERVAL: Duration = Duration::from_secs(3600);
 
 use crate::hosted_services::{
     DynamoKeyValueStore, ExclusionLeaseStore, SupervisorConfig, TaskLifecycleView,
@@ -813,13 +821,28 @@ impl GameServer {
             cancellation_token.child_token(),
         ));
 
+        // The two halves of the durable tier, resolved together because each is
+        // useless alone: the raw bucket the regional exporters write, and the
+        // S3 Tables bucket the elected committer folds them into. Empty is
+        // treated as absent — an empty bucket name reaches S3 as a request
+        // that can only fail.
+        let analytics_bucket = std::env::var("SNAKETRON_ANALYTICS_BUCKET")
+            .ok()
+            .filter(|bucket| !bucket.is_empty());
+        let analytics_table_bucket_arn = std::env::var("SNAKETRON_ANALYTICS_TABLE_BUCKET_ARN")
+            .ok()
+            .filter(|arn| !arn.is_empty());
+
         // Externally-registered background work. Supervised on exactly the same
         // terms as the server's own tasks: a child token, a retained handle,
         // and the shared shutdown budget. A hosted service that failed to be
         // joined here would silently lose its final flush, which is the whole
         // reason the registry exists rather than each operator spawning their
         // own detached task.
-        if !hosted_services.is_empty() || std::env::var("SNAKETRON_ANALYTICS_BUCKET").is_ok() {
+        if !hosted_services.is_empty()
+            || analytics_bucket.is_some()
+            || analytics_table_bucket_arn.is_some()
+        {
             // Leases are short and their renewals must not queue behind
             // another subsystem's traffic, so they get their own connection.
             let hosted_services_kv_redis = create_connection_manager_until_available(
@@ -890,21 +913,22 @@ impl GameServer {
             // and shipping one without the other would buffer events that
             // nothing drains.
             let mut factories = hosted_services;
-            if let Ok(bucket) = std::env::var("SNAKETRON_ANALYTICS_BUCKET")
-                && !bucket.is_empty()
-            {
+            // Pinned to the bucket's own region: the SDK does not follow S3
+            // region redirects, and every region writes to the one US bucket.
+            // Shared with the committer below, whose table bucket is US-only
+            // for the same reason — two resolutions could drift apart.
+            let analytics_s3_region = std::env::var("SNAKETRON_ANALYTICS_BUCKET_REGION")
+                .unwrap_or_else(|_| "us-east-1".to_owned());
+            if let Some(bucket) = analytics_bucket.clone() {
                 let exporter_redis = create_connection_manager_until_available(
                     redis_client.clone(),
                     cancellation_token.clone(),
                 )
                 .await?;
-                // Pinned to the bucket's own region: the SDK does not follow S3
-                // region redirects, and every region writes to the one US bucket.
-                let s3_region = std::env::var("SNAKETRON_ANALYTICS_BUCKET_REGION")
-                    .unwrap_or_else(|_| "us-east-1".to_owned());
-                let client =
-                    crate::analytics::object_store::S3ObjectStore::client_for_region(&s3_region)
-                        .await;
+                let client = crate::analytics::object_store::S3ObjectStore::client_for_region(
+                    &analytics_s3_region,
+                )
+                .await;
                 let store: Arc<dyn crate::analytics::object_store::ObjectStore> = Arc::new(
                     crate::analytics::object_store::S3ObjectStore::new(client, bucket),
                 );
@@ -918,6 +942,82 @@ impl GameServer {
                         region.clone(),
                     ),
                 ));
+            }
+
+            // The Iceberg fold, registered on the same terms as the exporter:
+            // it is the far end of the same path, and objects nothing folds
+            // are objects nothing can query. Only `game-events` — the
+            // websocket exporter has no production producer, so a committer
+            // for it would poll an empty prefix forever.
+            if let Some(table_bucket_arn) = analytics_table_bucket_arn {
+                match analytics_bucket {
+                    // The committer reads the raw tier, so an ARN without a
+                    // raw bucket can only produce nothing. Refusing to
+                    // register is the loud half of that: a committer pointed
+                    // at no bucket would fail every tick and read as a
+                    // pipeline that is merely quiet.
+                    None => error!(
+                        "SNAKETRON_ANALYTICS_TABLE_BUCKET_ARN is set but \
+                         SNAKETRON_ANALYTICS_BUCKET is not; there is nothing to fold, \
+                         so the Iceberg committer will not be registered"
+                    ),
+                    Some(raw_bucket) => {
+                        let config = crate::analytics::iceberg_catalog::S3TablesConfig {
+                            table_bucket_arn,
+                            namespace: std::env::var("SNAKETRON_ANALYTICS_NAMESPACE")
+                                .ok()
+                                .filter(|namespace| !namespace.is_empty())
+                                .unwrap_or_else(|| "snaketron".to_owned()),
+                            region: analytics_s3_region.clone(),
+                            catalog_name: "snaketron-analytics".to_owned(),
+                        };
+                        // Connecting only validates and builds a client — it
+                        // reaches nothing
+                        // (`iceberg-catalog-s3tables-0.10.1/src/catalog.rs:170-231`).
+                        // So a failure here is a permanently bad ARN or an
+                        // empty catalog name, not an outage a later attempt
+                        // would clear, and retrying would loop on the same
+                        // answer. Logged rather than propagated because
+                        // analytics must never stop a game server from
+                        // serving.
+                        match crate::analytics::iceberg_catalog::S3TablesIcebergCatalog::connect(
+                            &config,
+                        )
+                        .await
+                        {
+                            Ok(catalog) => {
+                                let client =
+                                    crate::analytics::object_store::S3ObjectStore::client_for_region(
+                                        &analytics_s3_region,
+                                    )
+                                    .await;
+                                let listing: Arc<dyn crate::analytics::committer::SourceListing> =
+                                    Arc::new(
+                                        crate::analytics::source_listing::S3SourceListing::new(
+                                            client, raw_bucket,
+                                        ),
+                                    );
+                                factories.push(Arc::new(
+                                    crate::analytics::committer::IcebergCommitterFactory::new(
+                                        Arc::new(catalog),
+                                        listing,
+                                        crate::analytics::committer::CommitTarget {
+                                            dataset: "game-events".to_owned(),
+                                            table: "game_events".to_owned(),
+                                        },
+                                        ICEBERG_COMMIT_INTERVAL,
+                                    ),
+                                ));
+                            }
+                            Err(error) => error!(
+                                "the analytics S3 Tables catalog could not be built from \
+                                 SNAKETRON_ANALYTICS_TABLE_BUCKET_ARN and \
+                                 SNAKETRON_ANALYTICS_NAMESPACE, so no event will reach the \
+                                 table until they are corrected and the task restarts: {error}"
+                            ),
+                        }
+                    }
+                }
             }
 
             for factory in factories {

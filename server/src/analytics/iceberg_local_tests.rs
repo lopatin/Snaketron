@@ -35,6 +35,7 @@ use super::schema::{DerivedColumn, derive_columns, descriptor_pool, event_descri
 
 const NAMESPACE: &str = "analytics";
 const TABLE: &str = "game_events";
+const DATASET: &str = "game-events";
 
 /// 2025-08-19T00:00:00.123Z.
 const DAY_ONE_MS: i64 = 1_755_561_600_123;
@@ -522,6 +523,22 @@ impl SourceListing for InMemorySource {
     }
 }
 
+/// Today in UTC, computed here rather than through the production window
+/// helper so a bug in that helper cannot make these tests agree with it.
+fn today() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// A raw-tier key exactly as the exporter writes one, on today's partition so
+/// it is inside the fold's retention window.
+///
+/// The `dt=` here is the OBJECT's partition and is independent of the event
+/// times in the body — those still drive the table's `occurred_at_day`
+/// partition, which is what the other tests assert on.
+fn source_key(host: &str, cursor: &str) -> String {
+    crate::analytics::object_store::object_key(DATASET, &today(), host, cursor, cursor, "hash")
+}
+
 /// The full loop against a real table: create, reconcile, fetch, encode,
 /// append, commit — and then do it again and land nothing, because a crashed
 /// run must be safe to repeat.
@@ -533,17 +550,17 @@ async fn folding_writes_rows_and_a_second_fold_adds_none() {
     let listing: Arc<dyn SourceListing> = Arc::new(InMemorySource {
         objects: vec![
             (
-                "raw/game-events/dt=2025-08-19/host=a/0-1-aa.json.gz".to_owned(),
+                source_key("use1-1", "0-1"),
                 format!("{}\n", game_completed_line("evt-a", DAY_ONE_MS, "use1", 1)),
             ),
             (
-                "raw/game-events/dt=2025-08-20/host=a/2-3-bb.json.gz".to_owned(),
+                source_key("use1-1", "2-3"),
                 format!("{}\n", user_login_line("evt-b", DAY_TWO_MS, "euw1", 9)),
             ),
         ],
     });
     let target = CommitTarget {
-        dataset: "game-events".to_owned(),
+        dataset: DATASET.to_owned(),
         table: TABLE.to_owned(),
     };
 
@@ -566,6 +583,95 @@ async fn folding_writes_rows_and_a_second_fold_adds_none() {
     let regions = strings_by_event_id(&batches, "region");
     assert_eq!(regions["evt-a"], Some("use1".to_owned()));
     assert_eq!(regions["evt-b"], Some("euw1".to_owned()));
+}
+
+/// The two-region loss, proven against a real table rather than a fake.
+///
+/// `host` is `{region}-{server_id}`, so `host=euw1-*` sorts BELOW
+/// `host=use1-*`. The fold must therefore run TWICE with an EU write in
+/// between: a single pass over both objects passes happily under either
+/// scheme, which is exactly why this was invisible in testing. Under one
+/// global mark the second pass lists nothing and the EU row never reaches the
+/// table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fold_spanning_two_regions_loses_neither() {
+    let (_dir, concrete) = warehouse().await;
+    let concrete = Arc::new(concrete);
+    let catalog: Arc<dyn IcebergCatalog> = concrete.clone();
+    let target = CommitTarget {
+        dataset: DATASET.to_owned(),
+        table: TABLE.to_owned(),
+    };
+
+    let us_key = source_key("use1-3", "1000000000000-0");
+    let eu_key = source_key("euw1-5", "2000000000000-0");
+    assert!(
+        eu_key < us_key,
+        "the premise of this test is that the EU key sorts below the US key:\n  eu={eu_key}\n  us={us_key}"
+    );
+    let us_object = (
+        us_key.clone(),
+        format!("{}\n", game_completed_line("evt-us", DAY_ONE_MS, "use1", 1)),
+    );
+    let eu_object = (
+        eu_key.clone(),
+        format!("{}\n", game_completed_line("evt-eu", DAY_ONE_MS, "euw1", 2)),
+    );
+
+    // 1. Only the US host has written anything yet.
+    let only_us: Arc<dyn SourceListing> = Arc::new(InMemorySource {
+        objects: vec![us_object.clone()],
+    });
+    assert_eq!(
+        fold_once(&catalog, &only_us, &target, 1)
+            .await
+            .expect("first fold"),
+        1
+    );
+
+    // 2. The EU host writes afterwards, beneath the key the US fold landed on.
+    let both: Arc<dyn SourceListing> = Arc::new(InMemorySource {
+        objects: vec![eu_object, us_object],
+    });
+    assert_eq!(
+        fold_once(&catalog, &both, &target, 1)
+            .await
+            .expect("second fold"),
+        1,
+        "the EU object must fold, and the US object must not fold twice"
+    );
+
+    // 3. Both regions are in the table, exactly once each.
+    let batches = scan(&concrete, TABLE).await;
+    assert_eq!(row_count(&batches), 2, "no duplicate rows");
+    let regions = strings_by_event_id(&batches, "region");
+    assert_eq!(regions["evt-us"], Some("use1".to_owned()));
+    assert_eq!(
+        regions.get("evt-eu"),
+        Some(&Some("euw1".to_owned())),
+        "an entire region was silently dropped: {regions:?}"
+    );
+
+    // 4. And a third fold with nothing new still lands nothing.
+    let both_again: Arc<dyn SourceListing> = Arc::new(InMemorySource {
+        objects: vec![
+            (
+                eu_key,
+                format!("{}\n", game_completed_line("evt-eu", DAY_ONE_MS, "euw1", 2)),
+            ),
+            (
+                us_key,
+                format!("{}\n", game_completed_line("evt-us", DAY_ONE_MS, "use1", 1)),
+            ),
+        ],
+    });
+    assert_eq!(
+        fold_once(&catalog, &both_again, &target, 1)
+            .await
+            .expect("third fold"),
+        0
+    );
+    assert_eq!(row_count(&scan(&concrete, TABLE).await), 2);
 }
 
 /// The encode runs on `spawn_blocking` and drives the async writer with

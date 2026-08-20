@@ -29,6 +29,7 @@ use snaketron_service_api::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::resume::{ResumeMarks, listing_floor, today_utc, window_start};
 use super::schema::{DerivedColumn, derive_columns, descriptor_pool, event_descriptor};
 
 /// A fold target. One table per dataset, keyed independently so the datasets
@@ -67,8 +68,8 @@ pub trait IcebergCatalog: Send + Sync + 'static {
     async fn add_columns(&self, table: &str, columns: &[DerivedColumn])
     -> Result<(), ServiceError>;
 
-    /// Appends one source object's rows and advances the resume mark, fenced
-    /// on `epoch`.
+    /// Appends one source object's rows and advances that key's prefix mark,
+    /// fenced on `epoch`.
     ///
     /// `rows` is the DECODED NDJSON of the source object — proto3 canonical
     /// JSON, one event per line. It is passed by value rather than fetched
@@ -77,8 +78,12 @@ pub trait IcebergCatalog: Send + Sync + 'static {
     ///
     /// Implementations MUST reject the commit when a higher epoch has already
     /// committed. A rejection means "I am no longer the holder" and must not
-    /// be retried. The append and the resume mark MUST land in one atomic
+    /// be retried. The append and the resume marks MUST land in one atomic
     /// commit, or a crash between them either duplicates or loses the object.
+    ///
+    /// The mark check is repeated here rather than trusted from the caller's
+    /// snapshot: this is the authoritative one, taken under the same read that
+    /// checks the fence.
     async fn commit(
         &self,
         table: &str,
@@ -87,8 +92,13 @@ pub trait IcebergCatalog: Send + Sync + 'static {
         rows: &str,
     ) -> Result<CommitOutcome, ServiceError>;
 
-    /// The highest source key already folded, used to resume.
-    async fn high_water_mark(&self, table: &str) -> Result<Option<String>, ServiceError>;
+    /// The highest folded key **per partition prefix**, used to skip.
+    ///
+    /// Not a listing bound: the fold always lists a fixed retention window,
+    /// because a host that starts writing today produces keys sorting below
+    /// marks that already exist, and any floor derived from the marks would
+    /// skip exactly those. See `resume.rs`.
+    async fn resume_marks(&self, table: &str) -> Result<ResumeMarks, ServiceError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,13 +177,22 @@ pub async fn fold_once(
 ) -> Result<usize, ServiceError> {
     reconcile_schema(catalog, &target.table).await?;
 
-    let resume = catalog.high_water_mark(&target.table).await?;
-    let keys = listing
-        .list_after(&target.dataset, resume.as_deref())
-        .await?;
+    let marks = catalog.resume_marks(&target.table).await?;
+    // The floor is a retention window, never `min(marks)`. A host that starts
+    // writing today emits keys BELOW every existing mark — `host` is
+    // `{region}-{server_id}`, so a new region or a new server id can sort
+    // anywhere — and a marks-derived floor would list right past them.
+    let floor = listing_floor(&target.dataset, window_start(today_utc()));
+    let keys = listing.list_after(&target.dataset, Some(&floor)).await?;
 
     let mut committed = 0usize;
     for key in keys {
+        // A local skip so the window is not re-fetched and re-encoded every
+        // tick. It is an optimization only: `commit` repeats the check against
+        // the table itself, which is the authoritative one.
+        if marks.already_folded(&key) {
+            continue;
+        }
         let rows = listing.fetch(&target.dataset, &key).await?;
         match catalog.commit(&target.table, &key, epoch, &rows).await? {
             CommitOutcome::Committed => committed += 1,
@@ -350,11 +369,20 @@ mod tests {
             Ok(CommitOutcome::Committed)
         }
 
-        async fn high_water_mark(&self, _table: &str) -> Result<Option<String>, ServiceError> {
-            Ok(self.committed.lock().unwrap().last().cloned())
+        /// Built from what was actually committed, exactly as the real
+        /// catalog derives it from the marks property — so a fold test here
+        /// exercises the same skip rule production uses.
+        async fn resume_marks(&self, _table: &str) -> Result<ResumeMarks, ServiceError> {
+            let mut marks = ResumeMarks::default();
+            for key in self.committed.lock().unwrap().iter() {
+                marks.record(key);
+            }
+            Ok(marks)
         }
     }
 
+    /// Objects in a bucket, filtered exactly as `ListObjectsV2(StartAfter=…)`
+    /// filters: strictly greater, lexicographic.
     struct FakeListing {
         keys: Vec<String>,
     }
@@ -389,8 +417,29 @@ mod tests {
         }
     }
 
+    /// Today in UTC, computed here rather than through the production window
+    /// helper, so a bug in that helper cannot make these tests agree with it.
+    fn today() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    /// A key exactly as the exporter writes one, on a given day.
+    ///
+    /// Real keys, not `a.json.gz`: the fold's listing floor is a retention
+    /// window over `raw/{dataset}/dt=…`, so a fixture outside that layout
+    /// would be filtered out and every fold test would pass while folding
+    /// nothing.
+    fn key_on(date: &str, host: &str, cursor: &str) -> String {
+        crate::analytics::object_store::object_key("game-events", date, host, cursor, cursor, "h")
+    }
+
+    /// A key inside the retention window.
+    fn raw_key(host: &str, cursor: &str) -> String {
+        key_on(&today(), host, cursor)
+    }
+
     fn parts(
-        keys: &[&str],
+        keys: &[String],
     ) -> (
         Arc<dyn IcebergCatalog>,
         Arc<dyn SourceListing>,
@@ -398,9 +447,13 @@ mod tests {
     ) {
         let catalog = Arc::new(FakeCatalog::default());
         let listing: Arc<dyn SourceListing> = Arc::new(FakeListing {
-            keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+            keys: keys.to_vec(),
         });
         (catalog.clone(), listing, catalog)
+    }
+
+    fn two_objects() -> [String; 2] {
+        [raw_key("use1-1", "1"), raw_key("use1-1", "2")]
     }
 
     /// A brand-new table gains every proto-derived column on the first pass.
@@ -451,70 +504,181 @@ mod tests {
 
     #[tokio::test]
     async fn folding_commits_each_source_object_once() {
-        let (catalog, listing, fake) = parts(&["a.json.gz", "b.json.gz"]);
+        let (catalog, listing, fake) = parts(&two_objects());
         let count = fold_once(&catalog, &listing, &target(), 1).await.unwrap();
         assert_eq!(count, 2);
         assert_eq!(fake.committed.lock().unwrap().len(), 2);
     }
 
     /// The fold must hand the catalog the object's BYTES, not just its key —
-    /// a commit that moved the resume mark without carrying rows would look
+    /// a commit that moved a resume mark without carrying rows would look
     /// identical from the outside and would lose every event.
     #[tokio::test]
     async fn each_commit_carries_the_rows_read_from_its_object() {
-        let (catalog, listing, fake) = parts(&["a.json.gz", "b.json.gz"]);
+        let objects = two_objects();
+        let (catalog, listing, fake) = parts(&objects);
         fold_once(&catalog, &listing, &target(), 1).await.unwrap();
 
         let rows = fake.rows.lock().unwrap().clone();
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].contains("a.json.gz"), "{rows:?}");
-        assert!(rows[1].contains("b.json.gz"), "{rows:?}");
+        assert!(rows[0].contains(&objects[0]), "{rows:?}");
+        assert!(rows[1].contains(&objects[1]), "{rows:?}");
     }
 
     /// Every pass ensures the table, because the first fold of a fresh
     /// environment has no table to reconcile against.
     #[tokio::test]
     async fn every_fold_ensures_the_table_exists_first() {
-        let (catalog, listing, fake) = parts(&["a.json.gz"]);
+        let (catalog, listing, fake) = parts(&[raw_key("use1-1", "1")]);
         fold_once(&catalog, &listing, &target(), 1).await.unwrap();
         fold_once(&catalog, &listing, &target(), 1).await.unwrap();
         assert_eq!(*fake.created.lock().unwrap(), 2);
     }
 
     /// Re-running must be a no-op, which is what makes a crashed run safe to
-    /// repeat.
+    /// repeat. The listing hands back the same window every tick, so the skip
+    /// is doing the work here — an empty second fold is not evidence on its
+    /// own, which is why the object count is asserted too.
     #[tokio::test]
     async fn a_second_fold_is_idempotent() {
-        let (catalog, listing, fake) = parts(&["a.json.gz", "b.json.gz"]);
+        let objects = two_objects();
+        let (catalog, listing, fake) = parts(&objects);
         fold_once(&catalog, &listing, &target(), 1).await.unwrap();
         let second = fold_once(&catalog, &listing, &target(), 1).await.unwrap();
         assert_eq!(second, 0, "nothing new to commit");
         assert_eq!(fake.committed.lock().unwrap().len(), 2, "no duplicate rows");
+        assert_eq!(
+            fake.rows.lock().unwrap().len(),
+            2,
+            "an already-folded object must not even be fetched"
+        );
     }
 
-    /// Resume must pick up only what is new, not rescan from the beginning.
+    /// The two-region loss, reproduced at the fold.
+    ///
+    /// `host` is `{region}-{server_id}` (`exporter_service.rs`), so
+    /// `host=euw1-*` sorts BELOW `host=use1-*`. Fold once while only the US
+    /// host has written and a single global mark lands on a US key; every EU
+    /// object written afterwards for that same day sorts beneath it and is
+    /// skipped forever.
     #[tokio::test]
-    async fn folding_resumes_from_the_high_water_mark() {
-        let (catalog, listing, fake) = parts(&["a.json.gz", "b.json.gz"]);
+    async fn an_eu_object_written_after_a_us_object_is_still_folded() {
+        // Computed here rather than through the production window helper, so a
+        // bug in that helper cannot make this test agree with it.
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let raw = |host: &str, cursor: &str| {
+            crate::analytics::object_store::object_key(
+                "game-events",
+                &day,
+                host,
+                cursor,
+                cursor,
+                "hash",
+            )
+        };
+        let us = raw("use1-3", "1000000000000-0");
+        let eu = raw("euw1-5", "2000000000000-0");
+        assert!(
+            eu < us,
+            "the premise of this test is that the EU key sorts below the US key:\n  eu={eu}\n  us={us}"
+        );
+
+        let fake = Arc::new(FakeCatalog::default());
+        let catalog: Arc<dyn IcebergCatalog> = fake.clone();
+
+        // 1. Only the US host has written anything.
+        let first: Arc<dyn SourceListing> = Arc::new(FakeListing {
+            keys: vec![us.clone()],
+        });
+        assert_eq!(
+            fold_once(&catalog, &first, &target(), 1).await.unwrap(),
+            1,
+            "the US object must fold"
+        );
+
+        // 2. The EU host writes afterwards. Its key sorts below the US key.
+        let second: Arc<dyn SourceListing> = Arc::new(FakeListing {
+            keys: vec![eu.clone(), us.clone()],
+        });
+        assert_eq!(
+            fold_once(&catalog, &second, &target(), 1).await.unwrap(),
+            1,
+            "the EU object must fold too"
+        );
+
+        let committed = fake.committed.lock().unwrap().clone();
+        assert!(
+            committed.contains(&eu),
+            "an entire region was silently dropped: {committed:?}"
+        );
+    }
+
+    /// Resume must pick up only what is new, not re-commit the whole window.
+    #[tokio::test]
+    async fn folding_commits_only_what_the_marks_do_not_cover() {
+        let objects = two_objects();
+        let (catalog, listing, fake) = parts(&objects);
         fold_once(&catalog, &listing, &target(), 1).await.unwrap();
 
+        let third = raw_key("use1-1", "3");
         let listing2: Arc<dyn SourceListing> = Arc::new(FakeListing {
-            keys: vec![
-                "a.json.gz".to_owned(),
-                "b.json.gz".to_owned(),
-                "c.json.gz".to_owned(),
-            ],
+            keys: vec![objects[0].clone(), objects[1].clone(), third.clone()],
         });
         let count = fold_once(&catalog, &listing2, &target(), 1).await.unwrap();
         assert_eq!(count, 1, "only the new object");
         assert_eq!(fake.committed.lock().unwrap().len(), 3);
     }
 
+    /// The same loss as the two-region case, inside one region: exporter
+    /// failover moves the server id, and `use1-12` sorts below `use1-3`.
+    #[tokio::test]
+    async fn an_object_from_a_new_server_id_below_the_existing_mark_is_folded() {
+        let three = raw_key("use1-3", "1000000000000-0");
+        let twelve = raw_key("use1-12", "2000000000000-0");
+        assert!(twelve < three, "the premise:\n  {twelve}\n  {three}");
+
+        let fake = Arc::new(FakeCatalog::default());
+        let catalog: Arc<dyn IcebergCatalog> = fake.clone();
+
+        let before: Arc<dyn SourceListing> = Arc::new(FakeListing {
+            keys: vec![three.clone()],
+        });
+        fold_once(&catalog, &before, &target(), 1).await.unwrap();
+
+        let after: Arc<dyn SourceListing> = Arc::new(FakeListing {
+            keys: vec![twelve.clone(), three.clone()],
+        });
+        assert_eq!(
+            fold_once(&catalog, &after, &target(), 1).await.unwrap(),
+            1,
+            "the failed-over exporter's object must fold"
+        );
+        assert!(fake.committed.lock().unwrap().contains(&twelve));
+    }
+
+    /// The lateness budget, stated as a test rather than left implicit: the
+    /// fold lists a retention window, so an object written for a day older
+    /// than the window is never folded. This is the cost of not deriving the
+    /// floor from the marks, and `RETENTION_DAYS` is the knob for it.
+    #[tokio::test]
+    async fn an_object_older_than_the_retention_window_is_not_folded() {
+        let ancient = key_on("2001-01-01", "use1-1", "1");
+        let fresh = raw_key("use1-1", "1");
+        let (catalog, listing, fake) = parts(&[ancient.clone(), fresh.clone()]);
+
+        assert_eq!(
+            fold_once(&catalog, &listing, &target(), 1).await.unwrap(),
+            1
+        );
+        let committed = fake.committed.lock().unwrap().clone();
+        assert_eq!(committed, vec![fresh]);
+    }
+
     /// The fencing property: a stale committer's commit is rejected, and the
     /// rejection stops it rather than being retried.
     #[tokio::test]
     async fn a_stale_epoch_is_fenced_and_stops() {
-        let (catalog, listing, fake) = parts(&["a.json.gz"]);
+        let (catalog, listing, fake) = parts(&[raw_key("use1-1", "1")]);
         *fake.fence_at.lock().unwrap() = Some(9);
 
         let error = fold_once(&catalog, &listing, &target(), 3)
@@ -530,7 +694,7 @@ mod tests {
     /// The newer epoch still works — fencing rejects the stale writer only.
     #[tokio::test]
     async fn the_current_epoch_commits_normally_while_fencing_is_active() {
-        let (catalog, listing, fake) = parts(&["a.json.gz"]);
+        let (catalog, listing, fake) = parts(&[raw_key("use1-1", "1")]);
         *fake.fence_at.lock().unwrap() = Some(9);
         let count = fold_once(&catalog, &listing, &target(), 9).await.unwrap();
         assert_eq!(count, 1);

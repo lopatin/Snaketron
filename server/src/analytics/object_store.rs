@@ -75,6 +75,16 @@ fn sanitize(component: &str) -> String {
         .collect()
 }
 
+/// The prefix every object of one dataset shares.
+///
+/// The reading half of [`object_key`], and here rather than at the reader so
+/// the two cannot disagree about sanitization — a listing built from an
+/// unsanitized dataset name would find nothing and be indistinguishable from
+/// a dataset with no data.
+pub fn dataset_prefix(dataset: &str) -> String {
+    format!("raw/{}/", sanitize(dataset))
+}
+
 /// Builds the object key.
 ///
 /// Partitioned by event date and host only — no hour, no minute, and nothing
@@ -90,14 +100,59 @@ pub fn object_key(
     content_hash: &str,
 ) -> String {
     format!(
-        "raw/{}/dt={}/host={}/{}-{}-{}.json.gz",
-        sanitize(dataset),
+        "{}dt={}/host={}/{}-{}-{}.json.gz",
+        dataset_prefix(dataset),
         sanitize(date),
         sanitize(host),
         sanitize(first_cursor),
         sanitize(last_cursor),
         sanitize(content_hash),
     )
+}
+
+/// The partition prefix of a key: the span within which keys sort in the order
+/// they were written.
+///
+/// The reading half of [`object_key`], and here rather than at the reader for
+/// the same reason [`dataset_prefix`] is: a parse that disagreed with the
+/// writer would group keys that do not belong together, and nothing would say
+/// so.
+///
+/// Only the trailing file name carries the cursor, so two keys are comparable
+/// as "written earlier / later" ONLY when they share `dt={date}/host={host}`.
+/// Across hosts the comparison is meaningless in both directions —
+/// `host=euw1-5` sorts below `host=use1-3` because `'e' < 'u'`, and
+/// `host=use1-12` sorts below `host=use1-3` because `'1' < '3'` — which is why
+/// one global mark cannot express what has been folded.
+///
+/// A key that does not carry the layout yields `""`. Those share one bucket:
+/// they have no partition to order within, so a single mark is the best
+/// available answer for them, and it is exactly the old behaviour.
+pub fn partition_prefix(key: &str) -> &str {
+    // The first `/dt=` is the real one: `sanitize` turns every `/` in a
+    // dataset name into `-`, so a dataset cannot contribute another.
+    let Some(start) = key.find("/dt=") else {
+        return "";
+    };
+    let after_dataset = &key[start + 1..];
+    let Some(date_end) = after_dataset.find('/') else {
+        return "";
+    };
+    let after_date = &after_dataset[date_end + 1..];
+    if !after_date.starts_with("host=") {
+        return "";
+    }
+    let Some(host_end) = after_date.find('/') else {
+        return "";
+    };
+    &after_dataset[..date_end + 1 + host_end]
+}
+
+/// The `dt=` day of a partition prefix, or `None` when the prefix carries no
+/// day — which is only the `""` bucket [`partition_prefix`] returns for a key
+/// outside the layout.
+pub fn prefix_day(prefix: &str) -> Option<&str> {
+    prefix.strip_prefix("dt=")?.split('/').next()
 }
 
 /// S3-backed store using conditional writes.
@@ -246,12 +301,70 @@ mod tests {
         assert!(key.ends_with(".json.gz"), "lowercase extension for Athena");
     }
 
+    /// The committer lists by prefix, so the prefix has to be a literal
+    /// prefix of what the writer produces — including for a dataset name that
+    /// sanitizes, where a listing built from the raw name would find nothing
+    /// and be indistinguishable from a dataset with no data.
+    #[test]
+    fn every_written_key_lies_under_its_dataset_prefix() {
+        for dataset in ["game-events", "websocket/events", "a b"] {
+            let key = object_key(dataset, "2026-08-19", "use1-7", "a", "b", "c");
+            assert!(
+                key.starts_with(&dataset_prefix(dataset)),
+                "{key} is not under {}",
+                dataset_prefix(dataset)
+            );
+        }
+    }
+
     /// A traversal attempt in a component must not escape the prefix.
     #[test]
     fn key_components_cannot_escape_the_prefix() {
         let key = object_key("d", "../../etc", "h/../x", "a", "b", "c");
         assert!(!key.contains(".."));
         assert!(key.starts_with("raw/d/dt="));
+    }
+
+    /// The prefix must be exactly the span in which keys sort chronologically:
+    /// one date and one host. Anything wider is not ordered, which is the
+    /// whole reason the resume state is keyed by it.
+    #[test]
+    fn the_partition_prefix_is_the_date_and_host_of_a_key() {
+        let key = object_key("game-events", "2026-08-19", "use1-3", "a", "b", "c");
+        assert_eq!(partition_prefix(&key), "dt=2026-08-19/host=use1-3");
+        assert_eq!(prefix_day("dt=2026-08-19/host=use1-3"), Some("2026-08-19"));
+    }
+
+    /// Two keys share a prefix exactly when they came from the same host on
+    /// the same day — never across regions, and never across server ids.
+    #[test]
+    fn keys_from_different_hosts_or_days_never_share_a_prefix() {
+        let build = |date: &str, host: &str| {
+            partition_prefix(&object_key("game-events", date, host, "a", "b", "c")).to_owned()
+        };
+        assert_eq!(build("2026-08-19", "use1-3"), build("2026-08-19", "use1-3"));
+        assert_ne!(build("2026-08-19", "use1-3"), build("2026-08-19", "euw1-5"));
+        assert_ne!(
+            build("2026-08-19", "use1-3"),
+            build("2026-08-19", "use1-12")
+        );
+        assert_ne!(build("2026-08-19", "use1-3"), build("2026-08-20", "use1-3"));
+    }
+
+    /// A key that predates the layout, or that no `object_key` produced, has
+    /// no partition to be ordered within. It gets the one shared bucket, which
+    /// is the old single-mark behaviour and is correct for exactly these keys.
+    #[test]
+    fn a_key_outside_the_layout_falls_into_one_shared_bucket() {
+        for key in [
+            "a.json.gz",
+            "raw/proof/k1",
+            "raw/game-events/dt=2026-08-19/loose.json.gz",
+            "raw/game-events/dt=2026-08-19/host=use1-3",
+        ] {
+            assert_eq!(partition_prefix(key), "", "{key} must not parse a prefix");
+        }
+        assert_eq!(prefix_day(""), None);
     }
 
     #[test]
