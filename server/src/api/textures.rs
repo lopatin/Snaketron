@@ -178,6 +178,8 @@ pub async fn generate(
         detail: None,
         created_at_ms: now,
         updated_at_ms: now,
+        // Nothing has claimed it yet.
+        lease_until_ms: None,
     };
 
     // A repeat of the same request inside the window finds its job already

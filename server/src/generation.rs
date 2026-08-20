@@ -180,6 +180,39 @@ pub struct GenerationJob {
     pub detail: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// When this job's claim goes stale, if it is claimed.
+    ///
+    /// A worker that dies mid-job would otherwise strand it forever: the state
+    /// says `generating` and nothing will ever say otherwise, so the client
+    /// polls a value that cannot change and the work is never redone. The
+    /// lease is what makes a dead worker's job re-claimable, and it lives on
+    /// the job rather than being set once at claim time because an update
+    /// rewrites the whole item — a lease written only by the claim would be
+    /// erased by the first progress write, which is the same shape as the bug
+    /// that once made the job's lifetime disappear.
+    ///
+    /// A worker renews it by writing progress; see [`LEASE_MS`].
+    #[serde(default)]
+    pub lease_until_ms: Option<i64>,
+}
+
+/// How long a claim holds before another worker may take the job.
+///
+/// Long enough that a slow image model is not treated as a crash — the
+/// provider timeout plus the repair attempts it is allowed — and short enough
+/// that a real crash is not a job lost for the rest of the day.
+pub const LEASE_MS: i64 = 5 * 60 * 1000;
+
+impl GenerationJob {
+    /// Whether a claim on this job has lapsed, so another worker may take it.
+    ///
+    /// A job with no lease at all counts as lapsed: that is either a job
+    /// written before leases existed or one whose claim never recorded one,
+    /// and in both cases leaving it unclaimable forever is the failure the
+    /// lease exists to prevent.
+    pub fn claim_is_stale(&self, now_ms: i64) -> bool {
+        !self.state.is_terminal() && self.lease_until_ms.is_none_or(|until| until <= now_ms)
+    }
 }
 
 /// What an image provider returns.

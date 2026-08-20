@@ -372,6 +372,9 @@ impl DynamoDatabase {
         }
         item.insert("createdAtMs".to_string(), Self::av_n(job.created_at_ms));
         item.insert("updatedAtMs".to_string(), Self::av_n(job.updated_at_ms));
+        if let Some(lease) = job.lease_until_ms {
+            item.insert("leaseUntilMs".to_string(), Self::av_n(lease));
+        }
         // Jobs are working state, not a record: a week is long enough to read
         // a failure and short enough that the table does not accumulate them.
         //
@@ -384,7 +387,14 @@ impl DynamoDatabase {
             Self::av_n(job.created_at_ms / 1_000 + 7 * 24 * 60 * 60),
         );
 
-        if job.state == JobState::Queued {
+        // Every unfinished job carries a queue entry, not only untouched ones.
+        // A claim used to remove it, which meant a worker that died took the
+        // job out of the only index that could find it again — the state said
+        // `generating` and no query would ever return it. Keeping the entry
+        // until the job is genuinely finished is what makes a lapsed lease
+        // recoverable; the claim condition, not the index, is what stops two
+        // workers running the same job.
+        if !job.state.is_terminal() {
             item.insert("gsi1pk".to_string(), Self::av_s("GENJOB_QUEUE"));
             item.insert(
                 "gsi1sk".to_string(),
@@ -438,6 +448,7 @@ impl DynamoDatabase {
             detail: Self::extract_string(item, "detail"),
             created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
             updated_at_ms: Self::extract_i64(item, "updatedAtMs").unwrap_or(0),
+            lease_until_ms: Self::extract_i64(item, "leaseUntilMs"),
         })
     }
 
@@ -4188,8 +4199,10 @@ impl Database for DynamoDatabase {
         worker: &str,
         now_ms: i64,
     ) -> Result<Option<GenerationJob>> {
-        // Queued jobs sit in one small index partition; it holds the queue
-        // rather than a history, because a claim removes the entry.
+        // Unfinished jobs sit in one small index partition. It holds work in
+        // progress as well as work not started, so a job whose worker died is
+        // still reachable — finding it again is the whole reason the entry
+        // outlives the claim.
         let response = self
             .client
             .query()
@@ -4207,9 +4220,17 @@ impl Database for DynamoDatabase {
             let Ok(job) = Self::generation_job_from_item(&item) else {
                 continue;
             };
+            // A job someone else is actively working is skipped here; the
+            // condition below is what actually decides, but reading the lease
+            // first saves a pointless conditional write per busy job.
+            if !job.claim_is_stale(now_ms) {
+                continue;
+            }
             // The claim is the conditional write, not the read above: two
             // workers reading the same job is expected, and exactly one of
-            // them wins the update.
+            // them wins the update. The condition repeats the staleness test
+            // because between the read and the write another worker may have
+            // taken it.
             let claimed = self
                 .client
                 .update_item()
@@ -4217,16 +4238,27 @@ impl Database for DynamoDatabase {
                 .key("pk", Self::av_s(format!("GENJOB#{}", job.job_id)))
                 .key("sk", Self::av_s("META"))
                 .update_expression(
-                    "SET #state = :generating, claimedBy = :worker, updatedAtMs = :now \
-                     REMOVE gsi1pk, gsi1sk",
+                    "SET #state = :generating, claimedBy = :worker, updatedAtMs = :now, \
+                     leaseUntilMs = :lease",
                 )
-                .condition_expression("#state = :queued")
+                // Queued, or claimed by a worker that stopped saying so.
+                .condition_expression(
+                    "#state = :queued \
+                     OR (#state <> :done AND #state <> :failed \
+                         AND (attribute_not_exists(leaseUntilMs) OR leaseUntilMs <= :now))",
+                )
                 .expression_attribute_names("#state", "state")
                 .expression_attribute_values(
                     ":generating",
                     Self::av_s(JobState::Generating.as_str()),
                 )
                 .expression_attribute_values(":queued", Self::av_s(JobState::Queued.as_str()))
+                .expression_attribute_values(":done", Self::av_s(JobState::Done.as_str()))
+                .expression_attribute_values(":failed", Self::av_s(JobState::Failed.as_str()))
+                .expression_attribute_values(
+                    ":lease",
+                    Self::av_n(now_ms + crate::generation::LEASE_MS),
+                )
                 .expression_attribute_values(":worker", Self::av_s(worker))
                 .expression_attribute_values(":now", Self::av_n(now_ms))
                 .send()
@@ -4237,6 +4269,10 @@ impl Database for DynamoDatabase {
                     let mut claimed = job;
                     claimed.state = JobState::Generating;
                     claimed.updated_at_ms = now_ms;
+                    // The caller writes progress from this value, and a write
+                    // rebuilds the whole item — so it has to carry the lease
+                    // it was just granted or the first update drops it.
+                    claimed.lease_until_ms = Some(now_ms + crate::generation::LEASE_MS);
                     return Ok(Some(claimed));
                 }
                 // Someone else took it. Try the next one rather than failing.

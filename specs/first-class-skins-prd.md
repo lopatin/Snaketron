@@ -512,11 +512,46 @@ now fixed with a test:
   re-claimed after a crash got a fresh full budget, turning a per-job ceiling
   into a per-attempt-of-the-job one.
 
-### 20.2 What a worker still needs before it can be written
+### 20.2 The claim lease — done
 
-Recorded so the next attempt starts from the real list rather than rediscovering
-it: **a claim lease**. `claim_generation_job` removes the queue index entry and
-sets `generating` with no expiry, so a worker that dies mid-job strands that job
-invisibly forever and the client polls a state that will never change. A lease
-plus a reaper — or a claim condition that also accepts a stale `generating` —
-is a prerequisite, not a refinement.
+This was recorded as the one prerequisite a worker needed before it could be
+written, and it is now in place. `claim_generation_job` used to remove the
+queue index entry and set `generating` with no expiry, so a worker that died
+mid-job took the work out of the only index that could find it again: the state
+said `generating`, nothing would ever say otherwise, and the client polled a
+value that could not change.
+
+The shape is the second of the two options this section offered — a claim
+condition that also accepts a stale `generating` — because it needs no reaper
+process to exist:
+
+- a job carries `lease_until_ms`, set at claim time to `now + LEASE_MS` (five
+  minutes: longer than a slow model, shorter than a lost afternoon);
+- the queue index entry now survives the claim and is removed only at a
+  terminal state, so a lapsed job is still findable;
+- the claim's condition accepts `queued`, or any non-terminal state whose lease
+  has passed — which is what makes a dead worker's job somebody else's rather
+  than nobody's.
+
+The lease lives on the job rather than being written once by the claim, and
+that is load-bearing: an update rewrites the whole item, so a claim-only lease
+would be erased by the first progress write — the same shape as the bug in
+20.1 that made a job's lifetime disappear. A worker renews its lease by
+writing progress at all.
+
+`server/tests/generation_claim_lease_tests.rs` runs the whole sequence against
+LocalStack, because the behaviour under test *is* the conditional write.
+
+### 20.3 What a worker still needs
+
+Two things, and neither is code in this repository:
+
+- **A provider key.** `SNAKETRON_OPENAI_API_KEY` and
+  `SNAKETRON_OPENROUTER_API_KEY` are read by `generation_providers.rs` and
+  appear in no deployment configuration anywhere in the repo. A worker without
+  one would claim jobs and fail them.
+- **A place to run.** Section 20 rules out a subprocess inside the serving
+  container; the drain loop itself is a small amount of wiring over pieces that
+  already exist (`claim_generation_job`, `configured_providers`,
+  `validate_shape`, `TextureStore::put`, `create_texture`), but *where* it runs
+  is a deployment decision rather than a coding one.
