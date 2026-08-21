@@ -9,13 +9,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Literal
+
+from PIL import Image, ImageDraw, ImageFont
 
 from .config import FactoryConfig
 from .db import Database
@@ -527,15 +531,13 @@ class FactoryDoctor:
         """Exercise the real worker contract without granting any side effect."""
 
         try:
-            swatch = base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGNUPV72n4GBgYEJRIAwACP3AmWUVESEAAAAAElFTkSuQmCC"
-            )
-            swatch_ref = f"sha256:{hashlib.sha256(swatch).hexdigest()}"
+            visual_challenge, card = _worker_conformance_card()
+            card_ref = f"sha256:{hashlib.sha256(card).hexdigest()}"
             bundle = SkillBundle.load(self.config.paths.skill_dir)
             capabilities = json.loads(self.config.paths.capability_manifest.read_text(encoding="utf-8"))
             limits = capabilities["limits"]
             request = WorkerRequest(
-                request_id="doctor-worker-conformance-v1",
+                request_id="doctor-worker-conformance-v2",
                 attempt_id="doctor-side-effect-free-fixture",
                 purpose=Purpose.CONTROL,
                 skill_sha256=bundle.sha256,
@@ -544,21 +546,27 @@ class FactoryDoctor:
                 artifact_refs={},
                 authoring_inputs={
                     "conformance_fixture": {
-                        "name": "Doctor Procedural Stripe",
+                        "name": "Doctor Visual Identifier",
                         "brief": (
-                            "Inspect the attached approved_prototype swatch. Return one valid, nonempty "
-                            "SkinDoc v2 procedural layer-only draft whose first friendly palette fill "
-                            "matches the swatch's exact opaque RGB value. Use no textures, assets, "
-                            "tool requests, or external actions. Do not infer the color from text."
+                            "Inspect the attached approved_prototype card. Read the six-digit decimal "
+                            "identifier printed on it and include those exact six digits in the SkinDoc "
+                            "name. The identifier is present only in the image. Return one valid, nonempty "
+                            "SkinDoc v2 procedural layer-only draft with no textures, assets, tool requests, "
+                            "or external actions. To keep this protocol check independent of color "
+                            "interpretation, use exactly the known-valid role palette from the bundled "
+                            "layers fixture: two friendly entries (#70bfe3/#5299bb/#c8ecfa and "
+                            "#3c8dde/#286eae/#a8cdf2), two enemy entries "
+                            "(#ff6b6b/#b84444/#fbcd82 and #e34e5b/#a92f3a/#f2b75f), and four "
+                            "free-for-all entries copied from that fixture."
                         ),
                         "implementation_path": "layers",
                     }
                 },
                 inline_artifacts={
                     "approved_prototype": InlineArtifact(
-                        content_hash=swatch_ref,
+                        content_hash=card_ref,
                         media_type="image/png",
-                        base64_data=base64.b64encode(swatch).decode("ascii"),
+                        base64_data=base64.b64encode(card).decode("ascii"),
                     )
                 },
                 pure_tools=[],
@@ -595,22 +603,17 @@ class FactoryDoctor:
                 ]
                 raise ValueError("worker returned a SkinDoc that fails deterministic gates: " + "; ".join(failures))
             layers = document.get("layers")
-            try:
-                sampled_fill = str(document["palette"]["friendly"][0]["fill"]).lower()
-            except (KeyError, IndexError, TypeError) as error:
-                raise ValueError("worker conformance SkinDoc has no inspectable friendly palette fill") from error
             if not isinstance(layers, list) or not layers:
                 raise ValueError("worker conformance SkinDoc has no procedural layer")
-            if sampled_fill != "#25c776":
-                raise ValueError(
-                    f"worker did not read the exact prototype swatch; first friendly fill was {sampled_fill!r}"
-                )
+            name = document.get("name")
+            if not isinstance(name, str) or visual_challenge not in name:
+                raise ValueError("worker did not copy the six-digit image-only identifier into the SkinDoc name")
             return DoctorCheck(
                 name="task_worker_conformance",
                 ok=True,
                 detail=(
-                    f"vision WorkerRequest/WorkerResult and deterministic SkinDoc gates passed with "
-                    f"exact model {result.resolved_model!r}"
+                    "image-only challenge, vision WorkerRequest/WorkerResult, and deterministic SkinDoc "
+                    f"gates passed with exact model {result.resolved_model!r}"
                 ),
             )
         except Exception as error:
@@ -672,6 +675,23 @@ class FactoryDoctor:
                 ok=False,
                 detail=_safe_error(error),
             )
+
+
+def _worker_conformance_card() -> tuple[str, bytes]:
+    """Return an OCR-friendly PNG whose random challenge exists only in its pixels."""
+
+    challenge = "".join(secrets.choice("23456789") for _ in range(6))
+    image = Image.new("RGB", (768, 320), "#ffffff")
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((16, 16, 752, 304), radius=28, fill="#edf6ff", outline="#1e5aa8", width=8)
+    heading_font = ImageFont.load_default(size=34)
+    challenge_font = ImageFont.load_default(size=112)
+    draw.text((384, 70), "VISUAL CHECK", fill="#1e3a5f", font=heading_font, anchor="mm")
+    draw.text((384, 198), challenge, fill="#080b10", font=challenge_font, anchor="mm", stroke_width=2)
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return challenge, output.getvalue()
 
 
 def _safe_error(error: Exception) -> str:

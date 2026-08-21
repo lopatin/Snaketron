@@ -34,6 +34,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 package="$(cd "$script_dir/.." && pwd -P)"
 repo_root="$(cd "$package/.." && pwd -P)"
 environment_manifest="$package/config/service-env.json"
+factory_config="${SKIN_FACTORY_INSTALL_CONFIG:-$package/config/factory.yaml}"
+
+[[ "$factory_config" = /* && -f "$factory_config" && ! -L "$factory_config" ]] || {
+  printf 'SKIN_FACTORY_INSTALL_CONFIG must be an existing absolute regular file\n' >&2
+  exit 1
+}
+if [[ "$enable_cron" == true && "$factory_config" != "$package/config/factory.yaml" ]]; then
+  printf 'a custom SKIN_FACTORY_INSTALL_CONFIG may prepare only; it cannot enable cron\n' >&2
+  exit 1
+fi
 
 [[ -f "$environment_manifest" ]] || {
   printf 'service environment manifest is missing\n' >&2
@@ -103,8 +113,14 @@ if any(not value[name] for name in required):
 PY
 
 factory_var="$package/var"
+install_state="${SKIN_FACTORY_INSTALL_STATE_DIR:-$factory_var}"
 [[ ! -L "$factory_var" ]] || { printf 'factory data directory cannot be a symlink\n' >&2; exit 1; }
 install -d -m 700 "$factory_var"
+[[ "$install_state" = /* && ! -L "$install_state" ]] || {
+  printf 'SKIN_FACTORY_INSTALL_STATE_DIR must be an absolute non-symlink path\n' >&2
+  exit 1
+}
+install -d -m 700 "$install_state"
 "$uv_bin" sync --project "$package" --frozen --no-dev --extra production
 "$package/.venv/bin/playwright" install chromium
 "$package/scripts/build-renderer-bundle.sh"
@@ -187,7 +203,7 @@ chmod 400 "$lama_model"
 
 # Promotion loads immutable behavior refs. Fetch tags explicitly even when the
 # checkout was originally cloned with a restricted tag policy.
-promotion_remote="$("$package/.venv/bin/python" - "$package/config/factory.yaml" <<'PY'
+promotion_remote="$("$package/.venv/bin/python" - "$factory_config" <<'PY'
 import pathlib, sys, yaml
 value = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(value["optimizer"]["promotion_remote"])
@@ -195,7 +211,12 @@ PY
 )"
 git -C "$repo_root" fetch --tags "$promotion_remote"
 
-environment="$package/.factory.env"
+environment="${SKIN_FACTORY_INSTALL_ENVIRONMENT:-$package/.factory.env}"
+[[ "$environment" = /* && ! -L "$environment" ]] || {
+  printf 'SKIN_FACTORY_INSTALL_ENVIRONMENT must be an absolute non-symlink path\n' >&2
+  exit 1
+}
+install -d -m 700 "$(dirname "$environment")"
 if [[ "$source_env" != "$environment" ]]; then
   install -m 600 "$source_env" "$environment"
 else
@@ -212,7 +233,7 @@ hermes_home="${HERMES_HOME:-$HOME/.hermes}"
 [[ ! -L "$hermes_home" ]] || { printf 'Hermes home cannot be a symlink\n' >&2; exit 1; }
 install -d -m 700 "$hermes_home"
 hermes_dotenv="$hermes_home/.env"
-required_script_timeout="$("$package/.venv/bin/python" - "$package/config/factory.yaml" "$hermes_dotenv" <<'PY'
+required_script_timeout="$("$package/.venv/bin/python" - "$factory_config" "$hermes_dotenv" <<'PY'
 import math, os, pathlib, re, stat, sys, tempfile, yaml
 
 factory_path = pathlib.Path(sys.argv[1])
@@ -259,11 +280,11 @@ finally:
 print(required)
 PY
 )"
-printf '%s\n' "$required_script_timeout" > "$factory_var/hermes-script-timeout-seconds"
-chmod 600 "$factory_var/hermes-script-timeout-seconds"
+printf '%s\n' "$required_script_timeout" > "$install_state/hermes-script-timeout-seconds"
+chmod 600 "$install_state/hermes-script-timeout-seconds"
 
 "$package/.venv/bin/factory" doctor \
-  --config "$package/config/factory.yaml" \
+  --config "$factory_config" \
   --env-file "$environment" \
   --identity service \
   --offline \
@@ -307,12 +328,12 @@ fi
 # a side-effect-free real-worker schema fixture, and a behavior-bound marker
 # written only after the operator explicitly requested the paid smoke cycle.
 "$package/.venv/bin/factory" doctor \
-  --config "$package/config/factory.yaml" \
+  --config "$factory_config" \
   --env-file "$environment" \
   --identity service \
   --json
 "$package/.venv/bin/factory" readiness-pin \
-  --config "$package/config/factory.yaml" \
+  --config "$factory_config" \
   --env-file "$environment" \
   --check-paid-smoke \
   --json

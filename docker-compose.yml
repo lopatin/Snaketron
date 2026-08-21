@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   localstack:
     # 4.x, not 3.x: the analytics pipeline's idempotency rests on S3
@@ -13,21 +11,24 @@ services:
     # snaketron-io's .github/workflows/test.yml) so a local run and a CI run
     # exercise the same LocalStack.
     image: localstack/localstack:4.0
-    container_name: snaketron-localstack
+    container_name: "${SNAKETRON_LOCALSTACK_CONTAINER_NAME:-snaketron-localstack}"
     environment:
       # s3 is required by the analytics pipeline tests, which write gzipped
       # NDJSON and rely on conditional writes (If-None-Match) for idempotency.
       - SERVICES=dynamodb,s3
       - DEBUG=0
-      - PERSISTENCE=0
+      - PERSISTENCE=${SNAKETRON_LOCALSTACK_PERSISTENCE:-0}
       - AWS_DEFAULT_REGION=us-east-1
-      - SNAKETRON_REPLAY_S3_BUCKET=snaketron-replays-dev
-      - SNAKETRON_REPLAY_S3_PREFIX=recordings
+      - DYNAMODB_TABLE_PREFIX=${SNAKETRON_DYNAMODB_TABLE_PREFIX:-snaketron}
+      - SNAKETRON_REPLAY_S3_BUCKET=${SNAKETRON_REPLAY_S3_BUCKET:-snaketron-replays-dev}
+      - SNAKETRON_REPLAY_S3_PREFIX=${SNAKETRON_REPLAY_S3_PREFIX:-recordings}
+      - SNAKETRON_TEXTURE_S3_BUCKET=${SNAKETRON_TEXTURE_S3_BUCKET:-snaketron-textures-dev}
+      - SNAKETRON_TEXTURE_S3_PREFIX=${SNAKETRON_TEXTURE_S3_PREFIX:-textures}
       - DOCKER_HOST=unix:///var/run/docker.sock
     ports:
-      - "4566:4566"
+      - "${SNAKETRON_LOCALSTACK_HOST_PORT:-4566}:4566"
     volumes:
-      - "./localstack-data:/var/lib/localstack"
+      - "${SNAKETRON_LOCALSTACK_DATA_DIR:-./localstack-data}:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "./localstack-init.sh:/etc/localstack/init/ready.d/init-snaketron.sh"
     restart: unless-stopped
@@ -41,9 +42,9 @@ services:
 
   redis:
     image: valkey/valkey:8-alpine
-    container_name: snaketron-valkey
+    container_name: "${SNAKETRON_REDIS_CONTAINER_NAME:-snaketron-valkey}"
     ports:
-      - "6379:6379"
+      - "${SNAKETRON_REDIS_HOST_PORT:-6379}:6379"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
@@ -57,19 +58,23 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
-    container_name: snaketron-server
+    container_name: "${SNAKETRON_SERVER_CONTAINER_NAME:-snaketron-server}"
     environment:
       # DynamoDB configuration
       AWS_ENDPOINT_URL: http://localstack:4566
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
-      DYNAMODB_TABLE_PREFIX: snaketron
+      DYNAMODB_TABLE_PREFIX: "${SNAKETRON_DYNAMODB_TABLE_PREFIX:-snaketron}"
       # Private durable replay object storage (LocalStack in development).
-      SNAKETRON_REPLAY_S3_BUCKET: snaketron-replays-dev
-      SNAKETRON_REPLAY_S3_PREFIX: recordings
+      SNAKETRON_REPLAY_S3_BUCKET: "${SNAKETRON_REPLAY_S3_BUCKET:-snaketron-replays-dev}"
+      SNAKETRON_REPLAY_S3_PREFIX: "${SNAKETRON_REPLAY_S3_PREFIX:-recordings}"
       SNAKETRON_REPLAY_S3_FORCE_PATH_STYLE: "true"
       SNAKETRON_REPLAY_S3_STORAGE_CLASS: STANDARD
+      # Private texture storage is mandatory for factory forge uploads.
+      SNAKETRON_TEXTURE_S3_BUCKET: "${SNAKETRON_TEXTURE_S3_BUCKET:-snaketron-textures-dev}"
+      SNAKETRON_TEXTURE_S3_PREFIX: "${SNAKETRON_TEXTURE_S3_PREFIX:-textures}"
+      SNAKETRON_TEXTURE_S3_FORCE_PATH_STYLE: "true"
       # Recent verified recordings are cached in Valkey; cache failures fall
       # back to the private replay bucket.
       SNAKETRON_REPLAY_CACHE_PREFIX: snaketron:replay-cache
@@ -114,14 +119,15 @@ services:
       # Test mode - accept any token (set to "true" for testing without auth)
       # SNAKETRON_TEST_MODE: "true"
       # JWT secret (use a secure secret in production)
-      SNAKETRON_JWT_SECRET: "development-secret-key-change-in-production"
+      SNAKETRON_JWT_SECRET: "${SNAKETRON_JWT_SECRET:-development-secret-key-change-in-production}"
+      SNAKETRON_ADMIN_USER_IDS: "${SNAKETRON_ADMIN_USER_IDS:-}"
       # Redis configuration for membership, assignment, leases, and streams
       SNAKETRON_REDIS_URL: "redis://redis:6379"
     ports:
-      - "8080:8080"   # HTTP port (API + WebSocket)
-      - "50051:50051" # gRPC port
+      - "${SNAKETRON_HTTP_HOST_PORT:-8080}:8080"   # HTTP port (API + WebSocket)
+      - "${SNAKETRON_GRPC_HOST_PORT:-50051}:50051" # gRPC port
     volumes:
-      - ./replays:/var/lib/snaketron/replays
+      - "${SNAKETRON_REPLAY_DATA_DIR:-./replays}:/var/lib/snaketron/replays"
     depends_on:
       localstack:
         condition: service_healthy

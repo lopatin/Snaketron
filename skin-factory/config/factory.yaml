@@ -20,7 +20,10 @@ paths:
 models:
   task_worker:
     provider: openai_compatible
-    model: qwen3.8-27b
+    # LM Studio accepts the short alias but advertises and returns this exact
+    # fully-qualified identifier. Recovery and worker handoff are fail-closed
+    # on the resolved model, so pin the identity the server actually emits.
+    model: qwen/qwen3.8-27b
     base_url: http://localhost:1234/v1
     api_key_env: LMSTUDIO_API_KEY
     timeout_seconds: 300

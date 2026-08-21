@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Provision, rotate, or revoke the durable Skin Factory credential safely.
+"""Bootstrap local accounts or manage the durable Skin Factory credential safely.
 
 The operator JWT is read from an owner-private JSON file. A newly issued raw
 service token is written atomically to the owner-private service JSON and is
 never printed or placed in a command-line argument.
+
+Local account bootstrap is deliberately loopback-only. It stores generated
+passwords in a separate owner-private JSON file, registers each account (or
+logs it in on an exact retry), and writes only the administrator JWT to the
+operator file. The server must then be restarted with the emitted numeric
+administrator ID in ``SNAKETRON_ADMIN_USER_IDS`` before provisioning the
+least-privilege factory credential.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 import urllib.error
@@ -24,13 +32,19 @@ from typing import Any
 
 OPERATOR_TOKEN = "SNAKETRON_FACTORY_OPERATOR_TOKEN"
 SERVICE_TOKEN = "SNAKETRON_FACTORY_SERVICE_TOKEN"
+LOCAL_ADMIN_USERNAME = "SNAKETRON_LOCAL_ADMIN_USERNAME"
+LOCAL_ADMIN_PASSWORD = "SNAKETRON_LOCAL_ADMIN_PASSWORD"
+LOCAL_ADMIN_USER_ID = "SNAKETRON_LOCAL_ADMIN_USER_ID"
+LOCAL_FACTORY_USERNAME = "SNAKETRON_LOCAL_FACTORY_USERNAME"
+LOCAL_FACTORY_PASSWORD = "SNAKETRON_LOCAL_FACTORY_PASSWORD"
+LOCAL_FACTORY_USER_ID = "SNAKETRON_LOCAL_FACTORY_USER_ID"
 TOKEN_ID = re.compile(r"^snk_factory_v1\.([0-9a-f]{32})\.[A-Za-z0-9_-]{43}$")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never forward an administrator bearer to a redirect target."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(newurl, code, "credential API redirects are refused", headers, fp)
 
 
@@ -46,6 +60,19 @@ def validate_base_url(value: str) -> str:
     if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
         raise SystemExit("--base-url must use HTTPS (HTTP is allowed only for an explicit loopback host)")
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def validate_loopback_base_url(value: str) -> str:
+    """Accept only an explicit loopback origin for account/password traffic."""
+
+    normalized = validate_base_url(value)
+    hostname = urllib.parse.urlsplit(normalized).hostname
+    loopback = hostname == "localhost"
+    with contextlib.suppress(ValueError):
+        loopback = loopback or (hostname is not None and ipaddress.ip_address(hostname).is_loopback)
+    if not loopback:
+        raise SystemExit("local account bootstrap requires an explicit loopback --base-url")
+    return normalized
 
 
 def private_json(path: Path, *, may_not_exist: bool = False) -> dict[str, str]:
@@ -116,6 +143,162 @@ def request(
     return value
 
 
+def account_request(
+    base_url: str,
+    path: str,
+    payload: dict[str, str],
+    *,
+    allow_conflict: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    """Send one loopback-only registration/login request without exposing secrets."""
+
+    base_url = validate_loopback_base_url(base_url)
+    data = json.dumps(payload).encode("utf-8")
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(
+            urllib.request.Request(
+                f"{base_url}{path}",
+                data=data,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=30,
+        ) as response:
+            value = json.load(response)
+            status_code = response.status
+    except urllib.error.HTTPError as error:
+        detail = error.read(1_000).decode("utf-8", errors="replace")
+        if allow_conflict and error.code == 409:
+            return error.code, {}
+        raise SystemExit(f"Snaketron account API returned HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise SystemExit(f"Snaketron account API is unavailable: {error.reason}") from error
+    if not isinstance(value, dict):
+        raise SystemExit("Snaketron account API returned a non-object response")
+    return status_code, value
+
+
+def local_account_secrets(path: Path) -> dict[str, str]:
+    """Load or generate the two dedicated local account identities."""
+
+    accounts = private_json(path, may_not_exist=True)
+    if not accounts:
+        suffix = secrets.token_hex(3)
+        accounts = {
+            LOCAL_ADMIN_USERNAME: f"local_admin_{suffix}",
+            LOCAL_ADMIN_PASSWORD: secrets.token_urlsafe(32),
+            LOCAL_FACTORY_USERNAME: f"local_factory_{suffix}",
+            LOCAL_FACTORY_PASSWORD: secrets.token_urlsafe(32),
+        }
+        write_private_json(path, accounts)
+
+    missing = [
+        key
+        for key in (
+            LOCAL_ADMIN_USERNAME,
+            LOCAL_ADMIN_PASSWORD,
+            LOCAL_FACTORY_USERNAME,
+            LOCAL_FACTORY_PASSWORD,
+        )
+        if not accounts.get(key)
+    ]
+    if missing:
+        raise SystemExit(f"{path} is missing required local account keys: {', '.join(missing)}")
+    if accounts[LOCAL_ADMIN_USERNAME] == accounts[LOCAL_FACTORY_USERNAME]:
+        raise SystemExit("local administrator and factory usernames must be distinct")
+    return accounts
+
+
+def register_or_login_local_account(
+    base_url: str,
+    username: str,
+    password: str,
+) -> dict[str, Any]:
+    """Register once, falling back to login so an interrupted bootstrap is retry-safe."""
+
+    status_code, response = account_request(
+        base_url,
+        "/api/auth/register",
+        {"username": username, "password": password},
+        allow_conflict=True,
+    )
+    if status_code == 409:
+        _, response = account_request(
+            base_url,
+            "/api/auth/login",
+            {"username": username, "password": password},
+        )
+
+    token = response.get("token")
+    user = response.get("user")
+    if not isinstance(token, str) or not token or not isinstance(user, dict):
+        raise SystemExit("Snaketron returned a malformed local account response")
+    if (
+        user.get("username") != username
+        or type(user.get("id")) is not int
+        or user["id"] <= 0
+        or user.get("isGuest") is not False
+        or type(user.get("isAdmin")) is not bool
+    ):
+        raise SystemExit("Snaketron returned an inconsistent local account identity")
+    return {"token": token, "user": user}
+
+
+def bootstrap_local_accounts(
+    base_url: str,
+    accounts_path: Path,
+    operator_path: Path,
+    *,
+    require_admin: bool,
+) -> tuple[int, int, bool]:
+    """Create/login the local admin and non-admin factory identities."""
+
+    base_url = validate_loopback_base_url(base_url)
+    accounts = local_account_secrets(accounts_path)
+    admin = register_or_login_local_account(
+        base_url,
+        accounts[LOCAL_ADMIN_USERNAME],
+        accounts[LOCAL_ADMIN_PASSWORD],
+    )
+    factory = register_or_login_local_account(
+        base_url,
+        accounts[LOCAL_FACTORY_USERNAME],
+        accounts[LOCAL_FACTORY_PASSWORD],
+    )
+    admin_user = admin["user"]
+    factory_user = factory["user"]
+    admin_user_id = admin_user["id"]
+    factory_user_id = factory_user["id"]
+    if admin_user_id == factory_user_id:
+        raise SystemExit("local administrator and factory accounts resolved to the same user")
+    if factory_user["isAdmin"]:
+        raise SystemExit(
+            "factory account is currently an administrator; remove its ID from "
+            "SNAKETRON_ADMIN_USER_IDS before provisioning"
+        )
+
+    for key, actual in (
+        (LOCAL_ADMIN_USER_ID, admin_user_id),
+        (LOCAL_FACTORY_USER_ID, factory_user_id),
+    ):
+        recorded = accounts.get(key)
+        if recorded is not None and recorded != str(actual):
+            raise SystemExit(f"{accounts_path} contains a stale {key}")
+        accounts[key] = str(actual)
+
+    if require_admin and not admin_user["isAdmin"]:
+        raise SystemExit(
+            f"local administrator {admin_user_id} is not authorized; restart the same isolated "
+            f"server with SNAKETRON_ADMIN_USER_IDS={admin_user_id}, then retry"
+        )
+
+    write_private_json(accounts_path, accounts)
+    operator = private_json(operator_path, may_not_exist=True)
+    operator[OPERATOR_TOKEN] = admin["token"]
+    write_private_json(operator_path, operator)
+    return admin_user_id, factory_user_id, admin_user["isAdmin"]
+
+
 def current_credential_id(service: dict[str, str], explicit: str | None) -> str:
     if explicit:
         if re.fullmatch(r"[0-9a-f]{32}", explicit) is None:
@@ -124,9 +307,7 @@ def current_credential_id(service: dict[str, str], explicit: str | None) -> str:
     token = service.get(SERVICE_TOKEN, "")
     match = TOKEN_ID.fullmatch(token)
     if match is None:
-        raise SystemExit(
-            f"{SERVICE_TOKEN} is missing or malformed; supply the non-secret --credential-id"
-        )
+        raise SystemExit(f"{SERVICE_TOKEN} is missing or malformed; supply the non-secret --credential-id")
     return match.group(1)
 
 
@@ -146,13 +327,49 @@ def install_issued_token(service_path: Path, service: dict[str, str], response: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("provision", "rotate", "revoke"))
+    parser.add_argument(
+        "action",
+        choices=("bootstrap-local-accounts", "provision", "rotate", "revoke"),
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--operator-env", type=Path, required=True)
-    parser.add_argument("--service-env", type=Path, required=True)
+    parser.add_argument("--service-env", type=Path)
+    parser.add_argument("--accounts-env", type=Path)
+    parser.add_argument(
+        "--require-admin",
+        action="store_true",
+        help="for local bootstrap, require the restarted server to recognize the admin ID",
+    )
     parser.add_argument("--user-id", type=int)
     parser.add_argument("--credential-id")
     args = parser.parse_args()
+
+    if args.action == "bootstrap-local-accounts":
+        if args.accounts_env is None:
+            raise SystemExit("bootstrap-local-accounts requires --accounts-env")
+        admin_user_id, factory_user_id, is_admin = bootstrap_local_accounts(
+            args.base_url,
+            args.accounts_env,
+            args.operator_env,
+            require_admin=args.require_admin,
+        )
+        print(f"bootstrapped dedicated local accounts admin_user_id={admin_user_id} factory_user_id={factory_user_id}")
+        if is_admin:
+            print("local administrator authority confirmed")
+        else:
+            print(
+                "restart the same isolated server with "
+                f"SNAKETRON_ADMIN_USER_IDS={admin_user_id}; then rerun this action with "
+                "--require-admin before provisioning"
+            )
+        return
+
+    if args.require_admin:
+        raise SystemExit("--require-admin is valid only with bootstrap-local-accounts")
+    if args.accounts_env is not None:
+        raise SystemExit("--accounts-env is valid only with bootstrap-local-accounts")
+    if args.service_env is None:
+        raise SystemExit(f"{args.action} requires --service-env")
 
     operator = private_json(args.operator_env)
     operator_token = operator.get(OPERATOR_TOKEN)
@@ -183,9 +400,7 @@ def main() -> None:
             f"/api/admin/factory-credentials/{credential_id}/rotate",
         )
         replacement_id = install_issued_token(args.service_env, service, response)
-        print(
-            f"rotated factory credential {credential_id} to {replacement_id} in {args.service_env}"
-        )
+        print(f"rotated factory credential {credential_id} to {replacement_id} in {args.service_env}")
         return
 
     request(

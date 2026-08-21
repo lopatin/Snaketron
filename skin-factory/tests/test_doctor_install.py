@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -9,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from PIL import Image
 from test_gallery_cli import seeded_factory
 from typer.testing import CliRunner
 
@@ -31,6 +34,13 @@ from snaketron_factory.factory import Factory
 from snaketron_factory.promotion import GitPromoter, _run
 from snaketron_factory.readiness import ReadinessError, check_paid_smoke, record_paid_smoke
 from snaketron_factory.worker import SkillBundle
+
+
+def test_repository_config_pins_lm_studio_resolved_worker_identity() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "config/factory.yaml")
+
+    assert config.models.task_worker.model == "qwen/qwen3.8-27b"
+    assert config.worker.endpoint == "http://localhost:1234/v1"
 
 
 def _write_executable(path: Path, source: str) -> None:
@@ -196,7 +206,8 @@ async def test_content_model_preflight_accepts_configurable_openai_image_provide
 
 
 @pytest.mark.asyncio
-async def test_online_doctor_executes_side_effect_free_worker_contract(factory_config) -> None:
+async def test_online_doctor_executes_side_effect_free_worker_contract(factory_config, monkeypatch) -> None:
+    monkeypatch.setattr("snaketron_factory.doctor.secrets.choice", lambda _alphabet: "8")
     received: list[WorkerRequest] = []
 
     class Worker:
@@ -216,7 +227,7 @@ async def test_online_doctor_executes_side_effect_free_worker_contract(factory_c
                     ),
                     skin_document={
                         "schema_version": 2,
-                        "name": "Doctor Procedural Stripe",
+                        "name": "Doctor Visual 888888",
                         "palette": {
                             "friendly": [{"fill": "#25c776", "outline": "#155c3d", "accent": "#d9fff0"}],
                             "enemy": [{"fill": "#e45d6a", "outline": "#7c2832", "accent": "#ffd0d5"}],
@@ -270,12 +281,18 @@ async def test_online_doctor_executes_side_effect_free_worker_contract(factory_c
     assert "exact model 'worker-test'" in check.detail
     assert len(received) == 1
     request = received[0]
+    assert request.request_id == "doctor-worker-conformance-v2"
     assert request.attempt_id == "doctor-side-effect-free-fixture"
     assert request.artifact_refs == {}
     assert set(request.inline_artifacts) == {"approved_prototype"}
-    swatch = request.inline_artifacts["approved_prototype"]
-    assert swatch.media_type == "image/png"
-    assert swatch.content_hash.startswith("sha256:")
+    card = request.inline_artifacts["approved_prototype"]
+    assert card.media_type == "image/png"
+    card_bytes = base64.b64decode(card.base64_data, validate=True)
+    assert card.content_hash == f"sha256:{hashlib.sha256(card_bytes).hexdigest()}"
+    with Image.open(io.BytesIO(card_bytes)) as image:
+        assert image.format == "PNG"
+        assert image.size == (768, 320)
+    assert "888888" not in json.dumps(request.authoring_inputs, sort_keys=True)
     assert request.pure_tools == []
 
 
