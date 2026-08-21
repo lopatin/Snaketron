@@ -69,6 +69,15 @@ class PackageValidationTests(unittest.TestCase):
             ):
                 self.assertIn(term, text, f"{path}: missing {term}")
 
+        prototypes = (validator.PACKAGE / "references/prototypes.md").read_text(encoding="utf-8")
+        for term in (
+            "source_image_sha256",
+            "geometry_projection",
+            "prototype-body-mask-v1",
+            "only authoring input",
+        ):
+            self.assertIn(term, prototypes, f"prototype reference missing {term}")
+
     def test_prototype_manifest_rejects_each_missing_authority_hash(self):
         manifest = validator.read_json(validator.PACKAGE / "fixtures/layers/prototype-manifest.json")
         for authority in sorted(validator.PROTOTYPE_AUTHORITY_KEYS):
@@ -100,12 +109,57 @@ class PackageValidationTests(unittest.TestCase):
                     errors,
                 )
 
+    def test_prototype_manifest_requires_exact_projection_provenance(self):
+        manifest = validator.read_json(validator.PACKAGE / "fixtures/layers/prototype-manifest.json")
+        probes = (
+            ("source_image_sha256", None, "source_image_sha256 is required"),
+            ("source_image_sha256", "not-a-hash", "source_image_sha256 is required"),
+            ("geometry_projection", None, "geometry_projection must be exactly"),
+            ("geometry_projection", "legacy-mask", "geometry_projection must be exactly"),
+        )
+        for field, replacement, expected in probes:
+            with self.subTest(field=field, replacement=replacement):
+                changed = copy.deepcopy(manifest)
+                if replacement is None:
+                    changed.pop(field)
+                else:
+                    changed[field] = replacement
+                errors = []
+                validator.validate_manifest(changed, "probe", errors)
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_prototype_manifest_schema_cannot_relax_projection_provenance(self):
+        schema = validator.read_json(validator.PACKAGE / "schemas/prototype-manifest.schema.json")
+
+        relaxed_source = copy.deepcopy(schema)
+        relaxed_source["required"].remove("source_image_sha256")
+        relaxed_source["properties"]["source_image_sha256"]["pattern"] = "^[a-f0-9]{64}$"
+        errors = []
+        validator.validate_prototype_manifest_schema(relaxed_source, errors)
+        self.assertTrue(any("must require every field" in error for error in errors), errors)
+        self.assertTrue(any("prefixed source image SHA-256" in error for error in errors), errors)
+
+        relaxed_projection = copy.deepcopy(schema)
+        relaxed_projection["required"].remove("geometry_projection")
+        relaxed_projection["properties"]["geometry_projection"].pop("const")
+        errors = []
+        validator.validate_prototype_manifest_schema(relaxed_projection, errors)
+        self.assertTrue(any("must require every field" in error for error in errors), errors)
+        self.assertTrue(any("pin geometry_projection" in error for error in errors), errors)
+
     def test_canonical_prototype_prompts_and_hashes_bind_continuous_geometry(self):
         expected = validator.canonical_prototype_authorities()
         for route in sorted(validator.ROUTES):
             manifest = validator.read_json(validator.PACKAGE / f"fixtures/{route}/prototype-manifest.json")
             for authority, digest in expected.items():
                 self.assertEqual(manifest[authority], digest, f"{route}: {authority}")
+            self.assertTrue(validator.is_hash(manifest["source_image_sha256"]), route)
+            self.assertEqual(
+                manifest["geometry_projection"],
+                validator.PROTOTYPE_GEOMETRY_PROJECTION,
+                route,
+            )
+            self.assertIn(validator.PROTOTYPE_PROJECTION_PROMPT, manifest["prompt"], route)
             for term in validator.PROTOTYPE_PROMPT_TERMS:
                 self.assertIn(term, manifest["prompt"], f"{route}: {term}")
 

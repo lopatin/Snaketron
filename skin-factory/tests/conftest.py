@@ -89,8 +89,28 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
     geometry_dir = repo / "skin-schema"
     geometry_fixtures = geometry_dir / "fixtures"
     geometry_fixtures.mkdir(parents=True)
+    # Keep the test authority small, while preserving every structural
+    # property required by the production projection contract: an exact
+    # nearest-neighbour native renderer mask, one-cell body paint box, and a
+    # system-owned dark head core.  Provider fixtures can then exercise the
+    # real deterministic projection boundary instead of bypassing it with
+    # arbitrary byte strings.
+    scale = 4
+    native_width, native_height = 54, 9
+    native = Image.new("RGB", (native_width, native_height), (102, 102, 102))
+    native_pixels = native.load()
+    for y in range(3, 6):
+        for x in range(4, 50):
+            native_pixels[x, y] = (255, 255, 255)
+    native_pixels[3, 4] = (255, 255, 255)
+    native_pixels[50, 4] = (255, 255, 255)
+    native_pixels[49, 4] = (28, 28, 28)
+    guide_image = native.resize(
+        (native_width * scale, native_height * scale),
+        resample=Image.Resampling.NEAREST,
+    )
     guide_buffer = io.BytesIO()
-    Image.new("RGB", (16, 9), (255, 255, 255)).save(guide_buffer, format="PNG")
+    guide_image.save(guide_buffer, format="PNG")
     guide = guide_buffer.getvalue()
     guide_path = geometry_fixtures / "prototype-guide.png"
     guide_path.write_bytes(guide)
@@ -102,8 +122,61 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
                 "id": "prototype-geometry-test-v1",
                 "guide": "fixtures/prototype-guide.png",
                 "guide_sha256": hashlib.sha256(guide).hexdigest(),
-                "guide_canvas": {"width_px": 16, "height_px": 9},
-                "renderer_source": {"fixture": "straight_16"},
+                "guide_canvas": {
+                    "width_px": native_width * scale,
+                    "height_px": native_height * scale,
+                    "background": "#666666",
+                    "body_mask": "#ffffff",
+                    "system_head_core": "#1c1c1c",
+                },
+                "renderer_source": {
+                    "fixture": "straight_16",
+                    "native_cell_px": 3,
+                    "body_cells": 16,
+                    "native_canvas": {
+                        "width_px": native_width,
+                        "height_px": native_height,
+                    },
+                },
+                "presentation_transform": {
+                    "type": "nearest_neighbor_integer_upscale",
+                    "scale": scale,
+                },
+                "prototype_projection": {
+                    "version": "prototype-body-mask-v1",
+                    "foreground_detection": {
+                        "background_model": "robust_quadratic_border_rgb",
+                        "border_fraction": 0.08,
+                        "robust_keep_fraction": 0.8,
+                        "robust_iterations": 2,
+                        "max_border_samples": 8192,
+                        "foreground_delta": 18,
+                        "foreground_chroma_delta": 10,
+                        "neutral_dark_delta": 42,
+                        "axis_support_fraction": 0.006,
+                        "max_axis_gap_fraction": 0.02,
+                        "max_secondary_support_fraction": 0.35,
+                        "max_center_offset_fraction": [0.2, 0.2],
+                        "min_width_fraction": 0.25,
+                        "max_height_fraction": 0.6,
+                        "min_aspect_ratio": 2.0,
+                        "max_input_pixels": 4_194_304,
+                    },
+                    "mapping": {
+                        "native_body_bbox_px": [3, 3, 51, 6],
+                        "native_head_core_bbox_px": [48, 3, 51, 6],
+                        "native_head_core_center_px": [49.5, 4.5],
+                        "native_head_core_restore_radius_px": 0.75,
+                        "source_resample": "center_aligned_bilinear_rgb8",
+                    },
+                    "output": {
+                        "body_clip": "exact_renderer_reference_alpha",
+                        "head_core": "exact_renderer_reference_pixels",
+                        "background": "exact_guide_canvas_background",
+                        "presentation": "contract_nearest_neighbor_integer_upscale",
+                        "png": "deterministic_rgb8_filter0_zlib9",
+                    },
+                },
                 "invariants": ["one continuous capsule"],
             },
             sort_keys=True,

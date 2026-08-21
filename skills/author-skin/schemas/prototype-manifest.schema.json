@@ -13,6 +13,8 @@
     "prompt",
     "model_config",
     "image_sha256",
+    "source_image_sha256",
+    "geometry_projection",
     "design_guidelines_sha256",
     "prototype_geometry_sha256",
     "prototype_guide_sha256"
@@ -30,6 +32,14 @@
     "image_sha256": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "source_image_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "geometry_projection": {
+      "type": "string",
+      "const": "prototype-body-mask-v1"
     },
     "design_guidelines_sha256": {
       "type": "string",

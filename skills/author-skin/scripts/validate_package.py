@@ -43,6 +43,12 @@ PROTOTYPE_AUTHORITY_KEYS = {
     "prototype_geometry_sha256",
     "prototype_guide_sha256",
 }
+PROTOTYPE_GEOMETRY_PROJECTION = "prototype-body-mask-v1"
+PROTOTYPE_PROJECTION_PROMPT = (
+    "prototype-body-mask-v1 deterministically projects the retained source material through the exact native "
+    "renderer body mask before review; image_sha256 is the projected authority and source_image_sha256 is "
+    "audit-only raw provider material."
+)
 PROTOTYPE_MANIFEST_KEYS = {
     "brief",
     "palette_intent",
@@ -52,6 +58,8 @@ PROTOTYPE_MANIFEST_KEYS = {
     "prompt",
     "model_config",
     "image_sha256",
+    "source_image_sha256",
+    "geometry_projection",
 } | PROTOTYPE_AUTHORITY_KEYS
 PROTOTYPE_PROMPT_TERMS = (
     "exact pinned blank geometry guide",
@@ -60,6 +68,7 @@ PROTOTYPE_PROMPT_TERMS = (
     "small centered dark core",
     "rounded tail",
     "no gaps, detached plates, perspective, or outside paint",
+    PROTOTYPE_PROJECTION_PROMPT,
 )
 
 REQUIRED_FILES = {
@@ -269,6 +278,10 @@ def validate_boundaries(errors: list[str]) -> None:
         "`guide_sha256`",
         "`prototype_geometry_sha256`",
         "`prototype_guide_sha256`",
+        "`source_image_sha256`",
+        "`geometry_projection`",
+        "`prototype-body-mask-v1`",
+        "only authoring input",
         "`invalid_input`",
     ):
         add(
@@ -340,6 +353,16 @@ def validate_manifest(manifest: dict[str, Any], label: str, errors: list[str]) -
     add(errors, is_hash(manifest.get("image_sha256")), f"{label}: invalid image hash")
     add(
         errors,
+        is_hash(manifest.get("source_image_sha256")),
+        f"{label}: source_image_sha256 is required and must be a prefixed SHA-256 digest",
+    )
+    add(
+        errors,
+        manifest.get("geometry_projection") == PROTOTYPE_GEOMETRY_PROJECTION,
+        f"{label}: geometry_projection must be exactly {PROTOTYPE_GEOMETRY_PROJECTION}",
+    )
+    add(
+        errors,
         isinstance(manifest.get("model_config"), str) and bool(manifest["model_config"]),
         f"{label}: model_config must name a stored configuration",
     )
@@ -389,6 +412,20 @@ def validate_prototype_manifest_schema(schema: dict[str, Any], errors: list[str]
             definition.get("type") == "string" and definition.get("pattern") == "^[a-f0-9]{64}$",
             f"prototype-manifest schema must require a non-null SHA-256: {authority}",
         )
+    source_definition = properties.get("source_image_sha256", {})
+    add(
+        errors,
+        source_definition.get("type") == "string"
+        and source_definition.get("pattern") == r"^sha256:[a-f0-9]{64}$",
+        "prototype-manifest schema must require a prefixed source image SHA-256",
+    )
+    projection_definition = properties.get("geometry_projection", {})
+    add(
+        errors,
+        projection_definition.get("type") == "string"
+        and projection_definition.get("const") == PROTOTYPE_GEOMETRY_PROJECTION,
+        f"prototype-manifest schema must pin geometry_projection to {PROTOTYPE_GEOMETRY_PROJECTION}",
+    )
 
 
 def validate_design_guidelines(evidence: Any, label: str, errors: list[str]) -> None:

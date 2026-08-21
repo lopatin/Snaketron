@@ -86,9 +86,23 @@ def seeded_factory(tmp_path: Path) -> tuple[Factory, dict, dict, bytes]:
         media_type="image/png",
         size_bytes=len(image),
     )
+    source_bytes = b"raw-provider-source-retained-for-audit"
+    source_stored = objects.put(source_bytes)
+    source = database.add_artifact(
+        attempt_id=attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROVIDER_RESPONSE,
+        content_hash=source_stored.uri,
+        object_ref=source_stored.uri,
+        media_type="image/png",
+        size_bytes=len(source_bytes),
+        occurrence_key="prototype-source:0",
+    )
     manifest = canonical_json(
         {
             "image_sha256": artifact["content_hash"],
+            "source_image_sha256": source["content_hash"],
+            "geometry_projection": "prototype-body-mask-v1",
             "design_guidelines_sha256": behavior["design_guidelines_sha"],
             "prototype_geometry_sha256": behavior["prototype_geometry_sha"],
             "prototype_guide_sha256": behavior["prototype_guide_sha"],
