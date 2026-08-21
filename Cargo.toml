@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "macros",
     "common",
+    "service-api",
     "server",
     "client",
     "skin-schema",

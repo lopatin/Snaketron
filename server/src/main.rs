@@ -151,7 +151,14 @@ async fn main() -> Result<()> {
     );
 
     // Create server configuration
+    // Composition root for hosted services. `snaketron-io` (or any operator)
+    // registers deployment-specific background work here; the public server
+    // ships with none, so an unmodified build behaves exactly as before.
+    // See snaketron/specs/hosted-services.md §7.
+    let hosted_services: Vec<Arc<dyn snaketron_service_api::HostedServiceFactory>> = Vec::new();
+
     let config = GameServerConfig {
+        hosted_services,
         db: db.clone(),
         http_addr: http_addr.clone(),
         grpc_addr,

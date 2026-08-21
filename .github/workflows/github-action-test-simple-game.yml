@@ -59,6 +59,36 @@ jobs:
       - name: Run cargo clippy (same gate as snaketron-io)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Also identical to the snaketron-io gate. The analytics proto is the
+      # Iceberg table's schema and iceberg-rust can only add and delete
+      # columns, so a rename or retype reaches the table as drop+add and
+      # silently orphans the data already written under the old name.
+      - name: Check the analytics schema lock (same gate as snaketron-io)
+        run: cargo test -p server --lib analytics::schema
+
+      # The lock only protects the field numbers it records, so an unrecorded
+      # proto change must not reach main either.
+      - name: Require the analytics schema lock to be current
+        env:
+          UPDATE_SCHEMA_LOCK: 1
+        run: |
+          set -euo pipefail
+          lock=server/proto/analytics/v1/events.schema.lock
+          cargo test -p server --lib analytics::schema
+          # status, not diff: an uncommitted lock file is untracked, and a
+          # `git diff` against nothing would pass and protect nothing.
+          if [ -n "$(git status --porcelain -- "$lock")" ]; then
+            git diff -- "$lock" || true
+            echo "::error file=$lock::Stale schema lock. Regenerate with 'UPDATE_SCHEMA_LOCK=1 cargo test -p server --lib analytics::schema' and commit it."
+            exit 1
+          fi
+
+      - name: Compile all test targets (no run)
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          echo "Compiling every test target in the workspace..."
+          cargo test --all --no-run
       - name: Run documentation tests
         run: cargo test --workspace --doc
 
@@ -158,10 +188,14 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # 4.x, not 3.x: the analytics e2e tests write through S3 conditional
+      # writes (If-None-Match), which only the 4.x line implements. Keep this
+      # pinned in lockstep with snaketron/docker-compose.yml so a local run and
+      # a CI run exercise the same LocalStack.
       localstack:
-        image: localstack/localstack:3.0
+        image: localstack/localstack:4.0
         env:
-          SERVICES: dynamodb
+          SERVICES: dynamodb,s3
         ports:
           - 4566:4566
         options: >-
@@ -204,6 +238,12 @@ jobs:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           DYNAMODB_TABLE_PREFIX: snaketron
+          # Make the analytics e2e tests a hard requirement rather than a
+          # silent skip. Without this they still report `ok` when S3 or Valkey
+          # is missing, so a green run would say nothing about whether the
+          # pipeline works. They target the LocalStack service above; reaching
+          # real AWS needs SNAKETRON_E2E_S3_ENDPOINT=aws, which CI never sets.
+          SNAKETRON_E2E: "1"
           RUST_LOG: info
           RUST_BACKTRACE: 1
         run: |

@@ -14,9 +14,43 @@ use crate::executor_cluster::{ExecutorClusterHandle, start_executor_cluster};
 use crate::game_bus::GameBus;
 use crate::game_executor::PARTITION_COUNT;
 use crate::http_server::{DeferredHttpServer, install_http_application};
+/// Exclusion leases renew on a third of their TTL, so two consecutive failed
+/// renewals still leave room to fail closed before expiry.
+const HOSTED_SERVICE_LEASE_TTL: Duration = Duration::from_secs(6);
+/// The global term is longer than the regional one because DynamoDB has no
+/// server-side expiry: the term is compared against caller wall clocks, and a
+/// clock-skew allowance is charged against the single renewal interval a
+/// holder has left after a missed renewal. Ten seconds leaves that interval
+/// well clear of the floor instead of sitting on it; the cost is four extra
+/// seconds of failover for background analytics services, which nothing
+/// interactive waits on.
+const HOSTED_SERVICE_GLOBAL_LEASE_TTL: Duration = Duration::from_secs(10);
+const _: () = assert!(
+    HOSTED_SERVICE_GLOBAL_LEASE_TTL.as_millis()
+        >= crate::hosted_services::dynamo_kv::MIN_GLOBAL_LEASE_TTL.as_millis(),
+    "the global lease term must clear the clock-skew floor, or the skew allowance is wider \
+     than the window a holder has to recover a missed renewal in"
+);
+/// Per-service stop budget, clamped by the host's remaining global deadline so
+/// one slow service delays only itself.
+const HOSTED_SERVICE_STOP_BUDGET: Duration = Duration::from_secs(10);
+/// How often the elected committer folds the raw tier into Iceberg.
+///
+/// Analytics is a next-day-reporting tier, so freshness buys almost nothing
+/// here. The tick governs only how often the fold LISTS: how many Iceberg
+/// snapshots accumulate is set by how many objects the exporters wrote, not by
+/// how often anyone looks, so a shorter tick would add listings without adding
+/// data.
+const ICEBERG_COMMIT_INTERVAL: Duration = Duration::from_secs(3600);
+
+use crate::hosted_services::{
+    DynamoKeyValueStore, ExclusionLeaseStore, SupervisorConfig, TaskLifecycleView,
+    ValkeyKeyValueStore, service_config_from_env, spawn_supervisor,
+};
 use crate::lifecycle::TaskLifecycle;
 use crate::lobby_manager::LobbyManager;
 use crate::matchmaking_manager::MatchmakingManager;
+use crate::partition_lease::DEFAULT_COORDINATION_OPERATION_TIMEOUT;
 use crate::player_idle::PlayerIdleConfig;
 use crate::pubsub_manager::PubSubManager;
 use crate::redis_utils::{RedisClient, create_connection_manager_until_available};
@@ -31,6 +65,10 @@ use crate::{
     ws_server::JwtVerifier,
 };
 use serde::Deserialize;
+use snaketron_service_api::deps::KeyValueStore;
+use snaketron_service_api::{
+    Environment, HostedServiceFactory, RegionId, ServiceContext, TaskIdentity,
+};
 use std::path::PathBuf;
 
 use crate::ads::AdsConfig;
@@ -214,6 +252,11 @@ pub struct GameServerConfig {
     pub redis_url: String,
     /// Boost rules resolved and validated once at process startup.
     pub boost_config: BoostConfig,
+    /// Externally-supplied background work, supervised on the same terms as
+    /// the server's own tasks. Empty by default, so a deployment that
+    /// registers nothing behaves exactly as before.
+    /// See `snaketron/specs/hosted-services.md`.
+    pub hosted_services: Vec<Arc<dyn HostedServiceFactory>>,
     /// Inactivity phases resolved once at startup and snapshotted per match.
     pub player_idle_config: PlayerIdleConfig,
     /// Maximum time a new match waits for every player to confirm readiness.
@@ -391,6 +434,7 @@ impl GameServer {
             replay_dir: _,
             redis_url,
             boost_config,
+            hosted_services,
             player_idle_config,
             match_ready_window_ms,
             test_mode,
@@ -748,6 +792,320 @@ impl GameServer {
             cancellation_token.child_token(),
         ));
 
+        // Analytics: the emitter feeds a bounded channel, the flusher drains it
+        // into the regional Valkey stream, and an elected exporter moves it to
+        // S3. Every hop sheds load rather than blocking, so a failure here can
+        // never reach gameplay.
+        let analytics_origin = Arc::new(crate::analytics::EventOrigin::from_env(
+            &region,
+            lifecycle.task_boot_id(),
+        ));
+        let (analytics_emitter, analytics_rx) =
+            crate::analytics::AnalyticsEmitter::new(crate::analytics::EmitterConfig::default());
+        let analytics_metrics = analytics_emitter.metrics();
+
+        crate::analytics::sink::install(analytics_emitter.clone(), (*analytics_origin).clone());
+
+        let analytics_redis = create_connection_manager_until_available(
+            redis_client.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        handles.push(crate::analytics::flusher::spawn(
+            analytics_redis,
+            analytics_rx,
+            analytics_metrics.clone(),
+            crate::analytics::flusher::FlusherConfig::from_env(
+                cluster_namespace.analytics_events(),
+            ),
+            cancellation_token.child_token(),
+        ));
+
+        // The two halves of the durable tier, resolved together because each is
+        // useless alone: the raw bucket the regional exporters write, and the
+        // S3 Tables bucket the elected committer folds them into. Empty is
+        // treated as absent — an empty bucket name reaches S3 as a request
+        // that can only fail.
+        let analytics_bucket = std::env::var("SNAKETRON_ANALYTICS_BUCKET")
+            .ok()
+            .filter(|bucket| !bucket.is_empty());
+        let analytics_table_bucket_arn = std::env::var("SNAKETRON_ANALYTICS_TABLE_BUCKET_ARN")
+            .ok()
+            .filter(|arn| !arn.is_empty());
+
+        // Pinned to the bucket's own region: the SDK does not follow S3 region
+        // redirects, and every region writes to the one US bucket. Resolved
+        // once and shared by everything that touches S3 below — the websocket
+        // exporter, the durable exporter, and the committer, whose table
+        // bucket is US-only for the same reason — because two resolutions
+        // could drift apart.
+        let analytics_s3_region = std::env::var("SNAKETRON_ANALYTICS_BUCKET_REGION")
+            .unwrap_or_else(|_| "us-east-1".to_owned());
+
+        // The non-durable websocket tier (PRD R5), deliberately not a hosted
+        // service: it is unelected and runs on every task, because only the
+        // task terminating a socket can see that socket's frames. Gated on the
+        // raw bucket alone — without one there is nowhere to write.
+        if let Some(bucket) = analytics_bucket.clone() {
+            let client = crate::analytics::object_store::S3ObjectStore::client_for_region(
+                &analytics_s3_region,
+            )
+            .await;
+            let store: Arc<dyn crate::analytics::object_store::ObjectStore> = Arc::new(
+                crate::analytics::object_store::S3ObjectStore::new(client, bucket),
+            );
+            let ws_export_config = crate::analytics::ws_exporter::WsExporterConfig::from_env(
+                crate::analytics::exporter::ExportTarget {
+                    // Its own dataset, so the raw prefix and therefore the
+                    // Iceberg table it folds into stay separate from
+                    // `game-events`.
+                    dataset: "websocket-events".to_owned(),
+                    // `server_id` comes from `register_server`, which mints a
+                    // fresh one per registration, so no two live tasks share
+                    // this partition. That has to hold: keys only carry their
+                    // write order WITHIN one `host=` prefix (`resume.rs`), and
+                    // two tasks interleaving under one label would let the
+                    // fold's mark skip the other's objects.
+                    host: format!("{}-{}", region, server_id),
+                },
+            );
+            let ws_sample_rate = ws_export_config.sample_rate;
+            let (ws_event_sink, ws_export_task) = crate::analytics::ws_exporter::create(
+                store,
+                ws_export_config,
+                cancellation_token.child_token(),
+            );
+            crate::analytics::ws_sink::install(
+                ws_event_sink,
+                (*analytics_origin).clone(),
+                ws_sample_rate,
+            );
+            // Registered here rather than spawned and forgotten: R5.4 makes the
+            // final flush the only thing standing between a graceful stop and
+            // the loss of everything this task has buffered.
+            handles.push(tokio::spawn(ws_export_task));
+        }
+
+        // Externally-registered background work. Supervised on exactly the same
+        // terms as the server's own tasks: a child token, a retained handle,
+        // and the shared shutdown budget. A hosted service that failed to be
+        // joined here would silently lose its final flush, which is the whole
+        // reason the registry exists rather than each operator spawning their
+        // own detached task.
+        if !hosted_services.is_empty()
+            || analytics_bucket.is_some()
+            || analytics_table_bucket_arn.is_some()
+        {
+            // Leases are short and their renewals must not queue behind
+            // another subsystem's traffic, so they get their own connection.
+            let hosted_services_kv_redis = create_connection_manager_until_available(
+                redis_client.clone(),
+                cancellation_token.clone(),
+            )
+            .await?;
+            // Lower is more preferred. Deployment policy, not game policy: the
+            // game has no opinion about which region should lead, so the
+            // default is a single flat rank (first-come-first-served) and the
+            // operator orders its regions by setting this per region.
+            let node_rank: u32 = std::env::var("SNAKETRON_HOSTED_SERVICE_RANK")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+
+            let kv: Arc<dyn KeyValueStore> = Arc::new(ValkeyKeyValueStore::new(
+                hosted_services_kv_redis,
+                DEFAULT_COORDINATION_OPERATION_TIMEOUT,
+            ));
+            let region_leases = ExclusionLeaseStore::new(
+                kv.clone(),
+                cluster_namespace.hosted_service_prefix(),
+                HOSTED_SERVICE_LEASE_TTL,
+                DEFAULT_COORDINATION_OPERATION_TIMEOUT,
+                node_rank,
+            )
+            .context("hosted-service lease store")?;
+            // Cross-region exclusion cannot use Valkey, which is per region.
+            // DynamoDB is the only substrate both regions share: every task
+            // already reaches the US table because AWS_REGION is pinned
+            // fleet-wide.
+            let global_leases = match std::env::var("SNAKETRON_HOSTED_SERVICE_GLOBAL_TABLE") {
+                Ok(table) if !table.is_empty() => {
+                    let client = crate::db::dynamodb::dynamodb_client().await;
+                    let store: Arc<dyn KeyValueStore> =
+                        Arc::new(DynamoKeyValueStore::new(client, table));
+                    Some(
+                        ExclusionLeaseStore::new(
+                            store,
+                            "snaketron:hosted",
+                            HOSTED_SERVICE_GLOBAL_LEASE_TTL,
+                            DEFAULT_COORDINATION_OPERATION_TIMEOUT,
+                            node_rank,
+                        )
+                        .context("global hosted-service lease store")?,
+                    )
+                }
+                _ => {
+                    // Absent rather than silently regional: a Global key must
+                    // fail loudly, because degrading it to per-region would
+                    // elect one holder per region and defeat the guarantee.
+                    info!(
+                        "no global hosted-service lease table configured; \
+                         Global exclusion keys will be refused"
+                    );
+                    None
+                }
+            };
+
+            let identity = TaskIdentity {
+                server_id: server_id as i32,
+                boot_id: boot_identity.to_string(),
+                task_boot_id: lifecycle.task_boot_id().to_owned(),
+            };
+            // The regional exporter is registered by the server itself rather
+            // than by the operator: it is the other half of the emitter above,
+            // and shipping one without the other would buffer events that
+            // nothing drains.
+            let mut factories = hosted_services;
+            if let Some(bucket) = analytics_bucket.clone() {
+                let exporter_redis = create_connection_manager_until_available(
+                    redis_client.clone(),
+                    cancellation_token.clone(),
+                )
+                .await?;
+                let client = crate::analytics::object_store::S3ObjectStore::client_for_region(
+                    &analytics_s3_region,
+                )
+                .await;
+                let store: Arc<dyn crate::analytics::object_store::ObjectStore> = Arc::new(
+                    crate::analytics::object_store::S3ObjectStore::new(client, bucket),
+                );
+                factories.push(Arc::new(
+                    crate::analytics::exporter_service::ExporterFactory::new(
+                        exporter_redis,
+                        store,
+                        analytics_metrics.clone(),
+                        cluster_namespace.analytics_events(),
+                        cluster_namespace.analytics_exporter_group(),
+                        region.clone(),
+                    ),
+                ));
+            }
+
+            // The Iceberg fold, registered on the same terms as the exporter:
+            // it is the far end of the same path, and objects nothing folds
+            // are objects nothing can query. One committer per dataset, since
+            // both tiers now have a producer; `IcebergCommitterFactory` keys
+            // its exclusion lease on the table, so the two fold concurrently
+            // rather than serializing behind one lock.
+            if let Some(table_bucket_arn) = analytics_table_bucket_arn {
+                match analytics_bucket {
+                    // The committer reads the raw tier, so an ARN without a
+                    // raw bucket can only produce nothing. Refusing to
+                    // register is the loud half of that: a committer pointed
+                    // at no bucket would fail every tick and read as a
+                    // pipeline that is merely quiet.
+                    None => error!(
+                        "SNAKETRON_ANALYTICS_TABLE_BUCKET_ARN is set but \
+                         SNAKETRON_ANALYTICS_BUCKET is not; there is nothing to fold, \
+                         so the Iceberg committer will not be registered"
+                    ),
+                    Some(raw_bucket) => {
+                        let config = crate::analytics::iceberg_catalog::S3TablesConfig {
+                            table_bucket_arn,
+                            namespace: std::env::var("SNAKETRON_ANALYTICS_NAMESPACE")
+                                .ok()
+                                .filter(|namespace| !namespace.is_empty())
+                                .unwrap_or_else(|| "snaketron".to_owned()),
+                            region: analytics_s3_region.clone(),
+                            catalog_name: "snaketron-analytics".to_owned(),
+                        };
+                        // Connecting only validates and builds a client — it
+                        // reaches nothing
+                        // (`iceberg-catalog-s3tables-0.10.1/src/catalog.rs:170-231`).
+                        // So a failure here is a permanently bad ARN or an
+                        // empty catalog name, not an outage a later attempt
+                        // would clear, and retrying would loop on the same
+                        // answer. Logged rather than propagated because
+                        // analytics must never stop a game server from
+                        // serving.
+                        match crate::analytics::iceberg_catalog::S3TablesIcebergCatalog::connect(
+                            &config,
+                        )
+                        .await
+                        {
+                            Ok(catalog) => {
+                                let client =
+                                    crate::analytics::object_store::S3ObjectStore::client_for_region(
+                                        &analytics_s3_region,
+                                    )
+                                    .await;
+                                let catalog: Arc<dyn crate::analytics::committer::IcebergCatalog> =
+                                    Arc::new(catalog);
+                                let listing: Arc<dyn crate::analytics::committer::SourceListing> =
+                                    Arc::new(
+                                        crate::analytics::source_listing::S3SourceListing::new(
+                                            client, raw_bucket,
+                                        ),
+                                    );
+                                for target in [
+                                    crate::analytics::committer::CommitTarget {
+                                        dataset: "game-events".to_owned(),
+                                        table: "game_events".to_owned(),
+                                    },
+                                    crate::analytics::committer::CommitTarget {
+                                        dataset: "websocket-events".to_owned(),
+                                        table: "websocket_events".to_owned(),
+                                    },
+                                ] {
+                                    factories.push(Arc::new(
+                                        crate::analytics::committer::IcebergCommitterFactory::new(
+                                            catalog.clone(),
+                                            listing.clone(),
+                                            target,
+                                            ICEBERG_COMMIT_INTERVAL,
+                                        ),
+                                    ));
+                                }
+                            }
+                            Err(error) => error!(
+                                "the analytics S3 Tables catalog could not be built from \
+                                 SNAKETRON_ANALYTICS_TABLE_BUCKET_ARN and \
+                                 SNAKETRON_ANALYTICS_NAMESPACE, so no event will reach the \
+                                 table until they are corrected and the task restarts: {error}"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            for factory in factories {
+                let context = ServiceContext::new(
+                    Environment(
+                        std::env::var("SNAKETRON_ENVIRONMENT").unwrap_or_else(|_| "dev".to_owned()),
+                    ),
+                    RegionId(region.clone()),
+                    std::env::var("SNAKETRON_AWS_REGION").unwrap_or_default(),
+                    identity.clone(),
+                    kv.clone(),
+                    Arc::new(TaskLifecycleView::new(lifecycle.clone())),
+                    service_config_from_env(factory.name()),
+                    None,
+                );
+                info!("registering hosted service {}", factory.name());
+                handles.push(spawn_supervisor(
+                    factory,
+                    SupervisorConfig {
+                        context,
+                        region_leases: Some(region_leases.clone()),
+                        global_leases: global_leases.clone(),
+                        holder_id: lifecycle.task_boot_id().to_owned(),
+                        stop_budget: HOSTED_SERVICE_STOP_BUDGET,
+                    },
+                    cancellation_token.child_token(),
+                ));
+            }
+        }
+
         // A bounded, independent Valkey probe drives readiness. Liveness is
         // intentionally unaffected so an outage cannot cause an ECS restart
         // storm. Use a write canary rather than PING: under Serverless capacity
@@ -829,6 +1187,10 @@ impl GameServer {
             lifecycle.clone(),
             cluster_namespace.clone(),
             Arc::new(ads_config),
+            Some(crate::api::auth::AnalyticsHandle {
+                emitter: analytics_emitter.clone(),
+                origin: analytics_origin.clone(),
+            }),
         )
         .await?;
 
@@ -1239,6 +1601,7 @@ pub async fn start_test_server_with_grpc_options(
 
     let config = GameServerConfig {
         db: db.clone(),
+        hosted_services: Vec::new(),
         http_addr: http_addr.clone(),
         grpc_addr,
         region: "test-region".to_string(),

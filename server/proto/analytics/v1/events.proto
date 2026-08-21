@@ -1,0 +1,262 @@
+syntax = "proto3";
+
+// Analytics event schema. This file is the single source of truth for both the
+// wire encoding and the derived Iceberg table schema.
+//
+// EVOLUTION RULES (enforced in CI, see analytics::schema tests):
+//   * Field names are append-only and NEVER reused or renamed. Iceberg's Rust
+//     writer supports only add_column/delete_column, so a rename would become
+//     drop+add and silently orphan the old column's data.
+//   * Field names must be lowercase. Athena makes a table with any uppercase
+//     column invisible to Glue, failing at query time far from the cause.
+//   * A message must never be the VALUE of a map: adding a field under
+//     <map>.value.<field> makes older Parquet files fail to read
+//     (apache/iceberg#14043) rather than null-fill.
+//   * Enums are carried as strings so adding a variant needs no schema change.
+package snaketron.analytics.v1;
+
+// Identity attached to every event. Nested rather than flattened so proto's
+// has_submessage() semantics survive into Iceberg: "identity absent" and
+// "identity present but user_id unset" are different facts.
+message Identity {
+  // Registered or guest account id. Preserved across guest upgrade, so
+  // conversion needs no stitching.
+  optional int64 user_id = 1;
+  // Pseudonymous browser id from localStorage. Never used for authorization.
+  optional string anon_id = 2;
+  // Server-minted, one per websocket session.
+  optional string session_id = 3;
+  // Only meaningful on a row that also names a `user_id`. Proto3 bools carry
+  // no presence, so this cannot say "unknown", and the two producers resolve
+  // that differently:
+  //
+  //   * `websocket_message` rows stamp `true` when no account is known, so
+  //     `false` is a positive claim backed by a verified account and a
+  //     pre-authentication frame can never be counted as registered activity.
+  //   * every other event — the durable ones in `raw/game-events/`, the
+  //     `connection_started` / `connection_ended` pair included — leaves this
+  //     `false` when no account is known, so `true` is the positive claim.
+  //
+  // Either way the rule for a query is the same: gate on
+  // `user_id IS NOT NULL` before reading this, or a guest-vs-registered split
+  // will be wrong under one convention or the other.
+  bool is_guest = 4;
+  // False when unknown, deliberately: a row with no account cannot be
+  // attributed to a load test, and marking unknown traffic synthetic would
+  // delete real traffic from every filtered view.
+  bool is_stress_test = 5;
+}
+
+message GuestCreated {
+  int64 mmr = 1;
+  string matchmaking_pool = 2;
+}
+
+message AccountRegistered {
+  int64 mmr = 1;
+}
+
+message GuestConverted {
+  int64 guest_age_ms = 1;
+}
+
+message UserLogin {}
+
+// A websocket was accepted, before a single frame was read from it.
+//
+// Named `connection_*` and NOT `websocket_*`: `websocket_message` is
+// non-durable and lands in a different external table (`raw/websocket-events/`)
+// while this pair is durable and lands in `raw/game-events/`. A shared prefix
+// would make two arms with opposite durability guarantees look like siblings
+// and read as queryable from one table, which they are not.
+//
+// Identity-free apart from `connection_id`: at accept nothing is known about
+// who is on the socket, and a placeholder account would be a join key to
+// nothing. It exists to be COUNTED — it is the denominator every
+// connection-level funnel divides by, and the one arm that no rejection can
+// suppress.
+//
+// `identity.is_guest` follows the MAJORITY convention, not `websocket_message`'s
+// inverted one: it is left `false` whenever no verified account is known, so a
+// `true` here is always a positive claim about a real guest account. An accept
+// knows no account at all, so this is always `false`. Stamping `true` for
+// "unknown" — which `websocket_message` does — would make every accept look
+// like a guest and inflate the guest side of any split taken over
+// `raw/game-events/`.
+message ConnectionStarted {
+  // The socket's own id, and the ONLY thing that makes an accept joinable to
+  // its own close. Sourced from `websocket_id`, a per-connection UUIDv4 minted
+  // where the socket is accepted, so it is unique per connection and shared by
+  // nothing else in the process.
+  //
+  // Number 1 because this message was empty: it is the lowest free number and
+  // sits in the single-tag-byte range. It deliberately does NOT match the
+  // number the same field takes on `ConnectionEnded` — proto numbers are
+  // per-message, readers key on the NAME, and burning 1-3 here to line them up
+  // would retire three numbers forever for a symmetry nobody can observe.
+  //
+  // Not on `Identity`, deliberately. `Identity` rides every event including
+  // `websocket_message`, which is emitted per FRAME; a per-connection value
+  // read once at close must not become a per-frame clone.
+  string connection_id = 1;
+}
+
+// That websocket closed. Emitted for every connection without exception, which
+// is what keeps a failed handshake countable: `session_started` now fires only
+// after authentication succeeds, so an attempt that was refused for its
+// protocol version or its token appears ONLY here. Dropping this event would
+// silently delete the failure arm of every authentication funnel.
+//
+// `identity.is_guest` follows the same majority convention as
+// `connection_started`: `false` unless a verified guest account is known. Both
+// halves of the pair must agree, or a guest-vs-registered split taken across
+// accepts and closes would disagree with itself.
+message ConnectionEnded {
+  int64 duration_ms = 1;
+  string close_reason = 2;
+  // The gameplay protocol the client reported, if it ever reported one.
+  //
+  // Optional rather than zero-defaulted because "never sent a handshake" and
+  // "reported version 0" are different facts, and a rollout counted by this
+  // column would read the second as a real cohort. This is what makes a
+  // version rollout countable from the rejections alone.
+  optional int64 protocol_version = 3;
+  // The same id the matching `connection_started` carried, so an accept joins
+  // to its own close. Without it "how long did sockets that never
+  // authenticated survive?" and "did this client retry?" are unanswerable
+  // rather than merely awkward: an unauthenticated socket has no session id and
+  // no account, so this is its only key.
+  //
+  // Number 4 as the next free number in this message. Present on EVERY close,
+  // never conditional: a pair that is sometimes joinable is a pair no query can
+  // rely on.
+  string connection_id = 4;
+}
+
+// An authenticated session began. Fires only after verification SUCCEEDS, so
+// the account behind it is known and rides the envelope's identity.
+message SessionStarted {
+  int64 protocol_version = 1;
+}
+
+// That session's connection closed. Emitted only for a connection that
+// actually carried a session, so `session_started` and `session_ended` pair
+// exactly; every other close is a `connection_ended` alone.
+message SessionEnded {
+  int64 duration_ms = 1;
+  string close_reason = 2;
+}
+
+message LobbyCreated {
+  string lobby_id = 1;
+  string pool = 2;
+}
+
+message LobbyJoined {
+  string lobby_id = 1;
+  int64 member_count = 2;
+}
+
+message LobbyLeft {
+  string lobby_id = 1;
+  int64 member_count = 2;
+}
+
+message LobbyPreferencesSet {
+  string game_type = 1;
+  string queue_mode = 2;
+}
+
+message QueueEntered {
+  string game_type = 1;
+  string queue_mode = 2;
+  string admission_result = 3;
+}
+
+message QueueLeft {
+  int64 waited_ms = 1;
+}
+
+message MatchCommitted {
+  int64 game_id = 1;
+  int64 wait_ms = 2;
+  int64 player_count = 3;
+}
+
+message GameStarted {
+  int64 game_id = 1;
+  string game_type = 2;
+  string queue_mode = 3;
+  int64 player_count = 4;
+}
+
+message GameCompleted {
+  int64 game_id = 1;
+  string game_type = 2;
+  string queue_mode = 3;
+  int64 duration_ms = 4;
+  int64 player_count = 5;
+  bool completed_by_inactivity = 6;
+  optional int64 winner_user_id = 7;
+  string end_reason = 8;
+}
+
+message GamePlayerResult {
+  int64 game_id = 1;
+  int64 user_id = 2;
+  int64 score = 3;
+  bool won = 4;
+  int64 mmr_delta = 5;
+  int64 xp_awarded = 6;
+  string game_type = 7;
+  string queue_mode = 8;
+}
+
+// Type and size only. Message bodies are never recorded.
+message WebsocketMessage {
+  string direction = 1;
+  string message_type = 2;
+  int64 byte_len = 3;
+  optional int64 game_id = 4;
+}
+
+// The envelope. Top-level fields are deliberately flat: Athena cannot
+// partition by a nested field, and dt/region partitioning depends on it.
+message Event {
+  // UUIDv7: unique and time-sortable, giving a naturally clustered dedup key.
+  string event_id = 1;
+  string event_name = 2;
+  int64 event_version = 3;
+  int64 occurred_at_ms = 4;
+  string environment = 5;
+  // Logical region (use1 / euw1).
+  string region = 6;
+  string aws_region = 7;
+  string instance_id = 8;
+  Identity identity = 9;
+
+  // One optional struct per arm rather than N flattened columns: adding an
+  // event type is then a root-level column add, and adding a field to an
+  // existing arm is a single-level nested add.
+  oneof payload {
+    GuestCreated guest_created = 100;
+    AccountRegistered account_registered = 101;
+    GuestConverted guest_converted = 102;
+    UserLogin user_login = 103;
+    SessionStarted session_started = 104;
+    SessionEnded session_ended = 105;
+    LobbyCreated lobby_created = 106;
+    LobbyJoined lobby_joined = 107;
+    LobbyLeft lobby_left = 108;
+    LobbyPreferencesSet lobby_preferences_set = 109;
+    QueueEntered queue_entered = 110;
+    QueueLeft queue_left = 111;
+    MatchCommitted match_committed = 112;
+    GameStarted game_started = 113;
+    GameCompleted game_completed = 114;
+    GamePlayerResult game_player_result = 115;
+    WebsocketMessage websocket_message = 116;
+    ConnectionStarted connection_started = 117;
+    ConnectionEnded connection_ended = 118;
+  }
+}

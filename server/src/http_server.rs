@@ -213,6 +213,9 @@ pub async fn install_http_application(
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
     ads_config: Arc<AdsConfig>,
+    // Present when analytics is configured. Optional so a deployment without
+    // it builds and runs unchanged.
+    analytics: Option<crate::api::auth::AnalyticsHandle>,
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
@@ -269,6 +272,7 @@ pub async fn install_http_application(
 
     // Create auth state for API routes
     let auth_state = AuthState {
+        analytics: analytics.clone(),
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: Some(state.user_cache.clone()),
@@ -944,7 +948,16 @@ async fn websocket_handler(
                 state.ads_config,
             )
             .await;
-            crate::resilience_metrics::record_websocket_session(session_started_at.elapsed());
+            let session_duration = session_started_at.elapsed();
+            // The resilience metric stays here. It is a transport fact with no
+            // identity in it, and it belongs beside the opened/closed counters
+            // and the connection-count bookkeeping in this same closure, which
+            // are its only peers. The ANALYTICS session events moved down into
+            // `handle_websocket`, where the connection context still exists —
+            // emitting them from here is what left them unattributed, because
+            // `handle_websocket` returns `()` and nothing about the user
+            // survives the call.
+            crate::resilience_metrics::record_websocket_session(session_duration);
 
             // Decrement connection count when connection closes
             let count = connection_count.fetch_sub(1, Ordering::Relaxed) - 1;

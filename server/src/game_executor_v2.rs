@@ -2044,6 +2044,10 @@ impl GameActor {
                 duration_ms,
                 record.final_state.players.len(),
             );
+            // The durable record is the authoritative business fact, so this
+            // is a projection of it rather than a second derivation that could
+            // disagree with what was actually paid out.
+            crate::analytics::sink::record_game_completed(&record);
         }
         self.pending_stream_ids.clear();
         // The immutable record and pending-effect index are now authoritative.

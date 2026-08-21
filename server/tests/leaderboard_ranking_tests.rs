@@ -56,6 +56,8 @@ async fn isolated_auth_state() -> Result<(Arc<dyn Database>, AuthState, Arc<JwtM
     let db = isolated_db().await?;
     let jwt_manager = Arc::new(JwtManager::new(JWT_SECRET));
     let auth_state = AuthState {
+        // Analytics is optional by construction; tests run without it.
+        analytics: None,
         db: db.clone(),
         jwt_manager: jwt_manager.clone(),
         user_cache: None,

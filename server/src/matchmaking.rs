@@ -1458,6 +1458,8 @@ async fn prepare_game_from_lobbies(
         matchmaking_pool,
     };
 
+    crate::analytics::sink::record_game_started(game_id, &game_state, match_info.players.len());
+
     Ok(PreparedMatch {
         game_id,
         partition_id,

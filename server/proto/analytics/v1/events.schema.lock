@@ -1,0 +1,142 @@
+# Analytics schema lock — GENERATED. Do not hand-edit.
+#
+# Every (message, field number) that has ever been committed is recorded here
+# with the name and type it carries. The Iceberg committer can only add and
+# delete columns, so a rename reaches the table as drop+add and silently
+# orphans everything already written under the old name; a retype and a number
+# reuse do the same. This file is what makes those unmergeable.
+#
+# Adding a new field number is always safe and needs no review of this file
+# beyond confirming the added lines.
+#
+# Regenerate deliberately (and only after the table itself has been migrated):
+#   UPDATE_SCHEMA_LOCK=1 cargo test -p server --lib analytics::schema
+#
+# Format, grouped by message and sorted by number:
+#   <field number> <name> <proto type> <iceberg type>
+
+message snaketron.analytics.v1.AccountRegistered
+  1 mmr int64 long
+
+message snaketron.analytics.v1.ConnectionEnded
+  1 duration_ms int64 long
+  2 close_reason string string
+  3 protocol_version int64 long
+  4 connection_id string string
+
+message snaketron.analytics.v1.ConnectionStarted
+  1 connection_id string string
+
+message snaketron.analytics.v1.Event
+  1 event_id string string
+  2 event_name string string
+  3 event_version int64 long
+  4 occurred_at_ms int64 long
+  5 environment string string
+  6 region string string
+  7 aws_region string string
+  8 instance_id string string
+  9 identity message:snaketron.analytics.v1.Identity struct
+  100 guest_created message:snaketron.analytics.v1.GuestCreated struct
+  101 account_registered message:snaketron.analytics.v1.AccountRegistered struct
+  102 guest_converted message:snaketron.analytics.v1.GuestConverted struct
+  103 user_login message:snaketron.analytics.v1.UserLogin struct
+  104 session_started message:snaketron.analytics.v1.SessionStarted struct
+  105 session_ended message:snaketron.analytics.v1.SessionEnded struct
+  106 lobby_created message:snaketron.analytics.v1.LobbyCreated struct
+  107 lobby_joined message:snaketron.analytics.v1.LobbyJoined struct
+  108 lobby_left message:snaketron.analytics.v1.LobbyLeft struct
+  109 lobby_preferences_set message:snaketron.analytics.v1.LobbyPreferencesSet struct
+  110 queue_entered message:snaketron.analytics.v1.QueueEntered struct
+  111 queue_left message:snaketron.analytics.v1.QueueLeft struct
+  112 match_committed message:snaketron.analytics.v1.MatchCommitted struct
+  113 game_started message:snaketron.analytics.v1.GameStarted struct
+  114 game_completed message:snaketron.analytics.v1.GameCompleted struct
+  115 game_player_result message:snaketron.analytics.v1.GamePlayerResult struct
+  116 websocket_message message:snaketron.analytics.v1.WebsocketMessage struct
+  117 connection_started message:snaketron.analytics.v1.ConnectionStarted struct
+  118 connection_ended message:snaketron.analytics.v1.ConnectionEnded struct
+
+message snaketron.analytics.v1.GameCompleted
+  1 game_id int64 long
+  2 game_type string string
+  3 queue_mode string string
+  4 duration_ms int64 long
+  5 player_count int64 long
+  6 completed_by_inactivity bool boolean
+  7 winner_user_id int64 long
+  8 end_reason string string
+
+message snaketron.analytics.v1.GamePlayerResult
+  1 game_id int64 long
+  2 user_id int64 long
+  3 score int64 long
+  4 won bool boolean
+  5 mmr_delta int64 long
+  6 xp_awarded int64 long
+  7 game_type string string
+  8 queue_mode string string
+
+message snaketron.analytics.v1.GameStarted
+  1 game_id int64 long
+  2 game_type string string
+  3 queue_mode string string
+  4 player_count int64 long
+
+message snaketron.analytics.v1.GuestConverted
+  1 guest_age_ms int64 long
+
+message snaketron.analytics.v1.GuestCreated
+  1 mmr int64 long
+  2 matchmaking_pool string string
+
+message snaketron.analytics.v1.Identity
+  1 user_id int64 long
+  2 anon_id string string
+  3 session_id string string
+  4 is_guest bool boolean
+  5 is_stress_test bool boolean
+
+message snaketron.analytics.v1.LobbyCreated
+  1 lobby_id string string
+  2 pool string string
+
+message snaketron.analytics.v1.LobbyJoined
+  1 lobby_id string string
+  2 member_count int64 long
+
+message snaketron.analytics.v1.LobbyLeft
+  1 lobby_id string string
+  2 member_count int64 long
+
+message snaketron.analytics.v1.LobbyPreferencesSet
+  1 game_type string string
+  2 queue_mode string string
+
+message snaketron.analytics.v1.MatchCommitted
+  1 game_id int64 long
+  2 wait_ms int64 long
+  3 player_count int64 long
+
+message snaketron.analytics.v1.QueueEntered
+  1 game_type string string
+  2 queue_mode string string
+  3 admission_result string string
+
+message snaketron.analytics.v1.QueueLeft
+  1 waited_ms int64 long
+
+message snaketron.analytics.v1.SessionEnded
+  1 duration_ms int64 long
+  2 close_reason string string
+
+message snaketron.analytics.v1.SessionStarted
+  1 protocol_version int64 long
+
+message snaketron.analytics.v1.UserLogin
+
+message snaketron.analytics.v1.WebsocketMessage
+  1 direction string string
+  2 message_type string string
+  3 byte_len int64 long
+  4 game_id int64 long

@@ -47,3 +47,26 @@ test('build targets map to their explicit client distributions', () => {
     /mutually exclusive release targets/,
   );
 });
+
+test('gameplay authentication carries an anon id when one is supplied', () => {
+  assert.deepEqual(
+    buildGameplayAuthentication('test-token', '3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607'),
+    {
+      Authenticate: {
+        token: 'test-token',
+        protocol_version: GAMEPLAY_PROTOCOL_VERSION,
+        distribution: CLIENT_DISTRIBUTION,
+        anon_id: '3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607',
+      },
+    }
+  );
+});
+
+// The anon id is additive and optional. Omitting it must produce exactly the
+// frame a client that predates the field sends, so a server that has never
+// seen it is byte-for-byte unaffected — which is why this addition does NOT
+// bump the protocol version, unlike the gameplay changes that do.
+test('omitting the anon id leaves the frame unchanged', () => {
+  assert.equal('anon_id' in buildGameplayAuthentication('t').Authenticate, false);
+  assert.equal('anon_id' in buildGameplayAuthentication('t', '').Authenticate, false);
+});

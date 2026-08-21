@@ -166,6 +166,18 @@ impl ClusterNamespace {
         RedisKeys::cluster_partition_assignment(&self.region, partition)
     }
 
+    pub fn analytics_events(&self) -> String {
+        RedisKeys::analytics_events(&self.region)
+    }
+
+    pub fn analytics_exporter_group(&self) -> String {
+        RedisKeys::analytics_exporter_group(&self.region)
+    }
+
+    pub fn hosted_service_prefix(&self) -> String {
+        RedisKeys::cluster_hosted_service_prefix(&self.region)
+    }
+
     pub fn assignment_lease(&self) -> String {
         RedisKeys::cluster_assignment_lease(&self.region)
     }

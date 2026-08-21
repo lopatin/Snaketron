@@ -359,6 +359,7 @@ async fn stale_protocol_is_denied_before_any_ad_frames() -> Result<()> {
     let mut client = TestClient::connect(&server_addr).await?;
     client
         .send_message(WSMessage::Authenticate {
+            anon_id: None,
             token: user_id.to_string(),
             protocol_version: WS_PROTOCOL_VERSION - 1,
             distribution: Some(ClientDistribution::Web),

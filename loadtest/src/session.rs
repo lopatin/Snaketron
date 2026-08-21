@@ -1443,6 +1443,7 @@ async fn prepare_pre_game_candidate(
         WSMessage::Authenticate {
             token: session.token.clone(),
             protocol_version: CLIENT_PROTOCOL_VERSION,
+            anon_id: None,
             distribution: None,
         },
         cancellation,
@@ -1902,6 +1903,7 @@ async fn authenticate_initial_admission_attempt(
             WSMessage::Authenticate {
                 token,
                 protocol_version: CLIENT_PROTOCOL_VERSION,
+                anon_id: None,
                 distribution: None,
             },
             cancellation,
@@ -4052,6 +4054,7 @@ async fn prepare_planned_candidate(
         WSMessage::Authenticate {
             token,
             protocol_version: CLIENT_PROTOCOL_VERSION,
+            anon_id: None,
             distribution: None,
         },
         cancellation,
@@ -5818,6 +5821,7 @@ impl LiveSession {
             WSMessage::Authenticate {
                 token,
                 protocol_version: CLIENT_PROTOCOL_VERSION,
+                anon_id: None,
                 distribution: None,
             },
             cancellation,
@@ -8130,6 +8134,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if value == "test-token"
             ));
@@ -8303,6 +8308,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if value == "test-token"
             ));
@@ -8503,6 +8509,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if value == "test-token"
             ));
@@ -8667,6 +8674,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if value == "test-token"
             ));
@@ -8781,6 +8789,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if value == "test-token"
             ));
@@ -8958,6 +8967,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token: value,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if value == "test-token"
             ));
@@ -9642,6 +9652,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if token == "stable-token"
             ));
@@ -9655,6 +9666,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if token == "stable-token"
             ));
@@ -9705,6 +9717,7 @@ mod tests {
                 WSMessage::Authenticate {
                     token,
                     protocol_version: CLIENT_PROTOCOL_VERSION,
+                    anon_id: None,
                     distribution: None,
                 } if token == "stable-token"
             ));

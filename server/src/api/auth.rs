@@ -22,6 +22,39 @@ pub struct AuthState {
     pub jwt_manager: Arc<JwtManager>,
     pub user_cache: Option<UserCache>,
     pub crazygames_verifier: Option<Arc<super::crazygames::CrazyGamesJwtVerifier>>,
+    /// Optional so tests and any deployment without analytics construct this
+    /// unchanged. Emitting is always non-blocking and drops under pressure, so
+    /// an auth handler never waits on it.
+    pub analytics: Option<AnalyticsHandle>,
+}
+
+/// Everything an HTTP handler needs to emit an analytics event.
+#[derive(Clone)]
+pub struct AnalyticsHandle {
+    pub emitter: crate::analytics::AnalyticsEmitter,
+    pub origin: std::sync::Arc<crate::analytics::EventOrigin>,
+}
+
+impl AnalyticsHandle {
+    /// Fire-and-forget. Deliberately returns nothing: no auth path may branch
+    /// on whether analytics accepted an event.
+    pub fn emit(
+        &self,
+        identity: crate::analytics::EventIdentity,
+        payload: crate::analytics::proto::event::Payload,
+    ) {
+        self.emitter
+            .emit(crate::analytics::envelope(&self.origin, identity, payload));
+    }
+}
+
+/// Reads the client-supplied anonymous id, which is how a returning browser is
+/// recognised before any account exists. Untrusted and advisory only.
+fn anon_id_from(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-snaketron-anon-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,6 +374,8 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<AuthState>,
+    // Must precede the body extractor: `Json` consumes the request.
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
     // Find user by username
@@ -373,6 +408,19 @@ pub async fn login(
         .generate_token(user_info.id, &user_info.username)?;
 
     info!("User logged in successfully: {}", user_info.username);
+
+    if let Some(analytics) = state.analytics.as_ref() {
+        analytics.emit(
+            crate::analytics::EventIdentity {
+                user_id: Some(i64::from(user_info.id)),
+                anon_id: anon_id_from(&headers),
+                ..Default::default()
+            },
+            crate::analytics::proto::event::Payload::UserLogin(
+                crate::analytics::proto::UserLogin {},
+            ),
+        );
+    }
 
     // Build response with cache-control headers
     let mut response = Json(AuthResponse {
@@ -517,6 +565,24 @@ pub async fn create_guest(
         "Guest user created successfully: {} (id: {}, pool: {})",
         user_info.username, user_info.id, matchmaking_pool
     );
+
+    if let Some(analytics) = state.analytics.as_ref() {
+        analytics.emit(
+            crate::analytics::EventIdentity {
+                user_id: Some(i64::from(user_info.id)),
+                anon_id: anon_id_from(&headers),
+                is_guest: true,
+                is_stress_test: matchmaking_pool == MatchmakingPool::Stress,
+                ..Default::default()
+            },
+            crate::analytics::proto::event::Payload::GuestCreated(
+                crate::analytics::proto::GuestCreated {
+                    mmr: i64::from(user_info.mmr),
+                    matchmaking_pool: matchmaking_pool.to_string(),
+                },
+            ),
+        );
+    }
 
     // Build response with cache-control headers
     let mut response = Json(CreateGuestResponse {

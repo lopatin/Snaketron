@@ -51,11 +51,15 @@ export const CLIENT_DISTRIBUTION: ClientDistribution = resolveClientDistribution
   process.env.ITCH_BUILD === 'true',
 );
 
-export const buildGameplayAuthentication = (token: string) => ({
+// `anon_id` is additive and optional on both ends: an older server ignores the
+// unknown field, and this server defaults it to absent for older clients, so it
+// is deliberately NOT part of the version gate above.
+export const buildGameplayAuthentication = (token: string, anonId?: string) => ({
   Authenticate: {
     token,
     protocol_version: GAMEPLAY_PROTOCOL_VERSION,
     distribution: CLIENT_DISTRIBUTION,
+    ...(anonId ? { anon_id: anonId } : {}),
   },
 } as const satisfies WSMessage);
 // Game speed mappings

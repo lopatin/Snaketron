@@ -96,6 +96,8 @@ impl TestClient {
             token: token.to_string(),
             protocol_version,
             distribution,
+            // Analytics-only and optional; integration clients send none.
+            anon_id: None,
         })
         .await?;
         tokio::time::timeout(Duration::from_secs(5), async {

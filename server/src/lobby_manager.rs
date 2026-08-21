@@ -1261,6 +1261,13 @@ impl LobbyManager {
         self.save_lobby_metadata(&lobby_metadata)
             .await
             .context("Failed to store lobby metadata")?;
+        // Emitted here rather than after initialization so the creation is
+        // stamped before the default-preferences event it causes.
+        crate::analytics::sink::record_lobby_created(
+            &lobby_metadata.lobby_code,
+            host_user_id,
+            matchmaking_pool,
+        );
 
         // Initialize lobby preferences
         let preferences = LobbyPreferences::default();
@@ -1599,6 +1606,7 @@ impl LobbyManager {
         drop(heartbeat_guard);
 
         info!("User {} joined lobby '{}'", user_id, lobby.lobby_code);
+        crate::analytics::sink::record_lobby_joined(&lobby.lobby_code, user_id, &lobby.members);
 
         // Subscribe to lobby updates
         let rx = {
@@ -2450,6 +2458,11 @@ impl LobbyManager {
                 .await
                 .context("Failed to remove lobby member transports")?;
 
+            // Emitted here because this is the only place the post-leave
+            // member count is exact; deriving it from LeaveLobbyResult later
+            // would turn "still active" into a guess.
+            crate::analytics::sink::record_lobby_left(lobby_code, member_user_id as i32, remaining);
+
             if remaining == 0 {
                 // Do not eagerly DEL cross-slot lobby keys. A concurrent join
                 // can legitimately reuse this code between separate deletes,
@@ -2612,6 +2625,7 @@ impl LobbyManager {
             )
             .await
             .context("Failed to store lobby preferences")?;
+        crate::analytics::sink::record_lobby_preferences_set(preferences);
 
         if let Err(e) = self.publish_lobby_update(lobby_code).await {
             warn!(

@@ -19,6 +19,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml ./server/
 COPY common/Cargo.toml ./common/
 COPY macros/Cargo.toml ./macros/
+COPY service-api/Cargo.toml ./service-api/
 COPY client/Cargo.toml ./client/
 COPY skin-schema/Cargo.toml ./skin-schema/
 COPY terminal/Cargo.toml ./terminal/
@@ -26,11 +27,12 @@ COPY bot/Cargo.toml ./bot/
 COPY loadtest/Cargo.toml ./loadtest/
 
 # Create dummy source files to build dependencies
-RUN mkdir -p server/src common/src macros/src client/src skin-schema/src terminal/src bot/src loadtest/src && \
+RUN mkdir -p server/src common/src macros/src service-api/src client/src skin-schema/src terminal/src bot/src loadtest/src && \
     echo "fn main() {}" > server/src/main.rs && \
     echo "fn main() {}" > server/src/lib.rs && \
     echo "fn main() {}" > common/src/lib.rs && \
     echo "fn main() {}" > macros/src/lib.rs && \
+    echo "fn main() {}" > service-api/src/lib.rs && \
     echo "fn main() {}" > client/src/lib.rs && \
     echo "fn main() {}" > skin-schema/src/lib.rs && \
     echo "fn main() {}" > terminal/src/main.rs && \

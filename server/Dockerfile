@@ -16,6 +16,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY macros ./macros
 COPY common ./common
+COPY service-api ./service-api
 COPY server ./server
 COPY client ./client
 COPY skin-schema ./skin-schema

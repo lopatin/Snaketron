@@ -2,9 +2,21 @@ version: '3.8'
 
 services:
   localstack:
-    image: localstack/localstack:3.0
+    # 4.x, not 3.x: the analytics pipeline's idempotency rests on S3
+    # conditional writes (If-None-Match), which AWS shipped in Aug 2024 and
+    # LocalStack implements only in its 4.x line. Verified against 4.0.3: the
+    # conditional-write test returns AlreadyPresent on the second PUT, and the
+    # DynamoDB-backed suite is unaffected by the bump.
+    #
+    # Keep this pin in lockstep with the two CI workflows
+    # (.github/workflows/github-action-test-simple-game.yml here, and
+    # snaketron-io's .github/workflows/test.yml) so a local run and a CI run
+    # exercise the same LocalStack.
+    image: localstack/localstack:4.0
     container_name: snaketron-localstack
     environment:
+      # s3 is required by the analytics pipeline tests, which write gzipped
+      # NDJSON and rely on conditional writes (If-None-Match) for idempotency.
       - SERVICES=dynamodb,s3
       - DEBUG=0
       - PERSISTENCE=0

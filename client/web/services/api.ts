@@ -14,6 +14,7 @@ import {
   UpdateRuntimeConfigRequest,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
+import { getOrCreateAnonId } from '../utils/anonId';
 import type { PlayerLobbyResponse } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
@@ -185,6 +186,13 @@ class API {
     const token = this.getToken();
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    // Advisory analytics identifier. Sent on every request, including
+    // unauthenticated ones, because the top of the signup funnel happens
+    // before any token exists. The server never uses it for authorization.
+    if (config.headers) {
+      config.headers['x-snaketron-anon-id'] = getOrCreateAnonId();
     }
 
     const response = await fetch(url, config);

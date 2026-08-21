@@ -7,8 +7,9 @@
 
 use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 use opentelemetry::{KeyValue, global};
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const LATENCY_BUCKETS_MS: &[f64] = &[
     1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
@@ -175,6 +176,16 @@ pub(crate) struct GaugeSnapshot {
 static METRICS: OnceLock<OtelMetrics> = OnceLock::new();
 static GAUGE_STATE: OnceLock<GaugeState> = OnceLock::new();
 
+/// Hosted-service exclusion leases currently held by this task, keyed by the
+/// service's own name, so cardinality is bounded by the factories this task
+/// registers at startup rather than by anything traffic can influence.
+///
+/// A name is inserted at zero as soon as this task starts contending and is
+/// never removed. Keeping the zero is the point: a task that is never elected
+/// still reports a comparable series, so a query can separate "elected" from
+/// "not elected" instead of from "no data".
+static HOSTED_SERVICE_LEASES: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+
 pub(crate) fn init() {
     let _ = metrics();
 }
@@ -185,6 +196,51 @@ fn metrics() -> &'static OtelMetrics {
 
 fn gauge_state() -> &'static GaugeState {
     GAUGE_STATE.get_or_init(GaugeState::default)
+}
+
+/// Every critical section below is a single map lookup plus an integer step,
+/// none of which can panic, so a poisoned lock cannot mean a half-updated map.
+/// Recovering rather than unwrapping keeps a telemetry mutex from being able to
+/// kill the metrics export thread.
+fn hosted_service_leases() -> MutexGuard<'static, BTreeMap<String, u64>> {
+    HOSTED_SERVICE_LEASES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Starts reporting zero for a service this task is contending for.
+pub(crate) fn register_hosted_service_lease(name: &str) {
+    let mut leases = hosted_service_leases();
+    if !leases.contains_key(name) {
+        leases.insert(name.to_owned(), 0);
+    }
+}
+
+/// Counts rather than latches, because one factory name can back several
+/// independently keyed leases.
+pub(crate) fn hosted_service_lease_acquired(name: &str) {
+    *hosted_service_leases().entry(name.to_owned()).or_insert(0) += 1;
+}
+
+pub(crate) fn hosted_service_lease_released(name: &str) {
+    let mut leases = hosted_service_leases();
+    match leases.get_mut(name) {
+        Some(held) => *held = held.saturating_sub(1),
+        // An unmatched release still has to leave the series behind, or a task
+        // that stood down would look like one that never contended.
+        None => {
+            leases.insert(name.to_owned(), 0);
+        }
+    }
+}
+
+/// `None` distinguishes "this task never contended for the service" from
+/// `Some(0)`, "it contended and lost" — the distinction the exported series
+/// depends on.
+#[cfg(test)]
+pub(crate) fn hosted_service_leases_held_for_test(name: &str) -> Option<u64> {
+    hosted_service_leases().get(name).copied()
 }
 
 fn counter(meter: &Meter, name: &'static str, description: &'static str) -> Counter<u64> {
@@ -374,6 +430,24 @@ impl OtelMetrics {
             active_websockets,
             "snaketron.active_web_sockets",
             "Active WebSocket sessions on this server task"
+        );
+        // The only gauge with an attribute. It has to be per-service, because
+        // services are elected independently and a single aggregate could not
+        // say which of them is the one sharing this task's CPU. The exclusion
+        // key is deliberately not the label: keys are operator-supplied and
+        // unbounded, while factory names are fixed at registration.
+        observable_gauges.push(
+            meter
+                .u64_observable_gauge("snaketron.hosted_service_leases_held")
+                .with_description("Exclusion leases this task holds for the named hosted service")
+                .with_unit("1")
+                .with_callback(|observer| {
+                    for (name, held) in hosted_service_leases().iter() {
+                        observer
+                            .observe(*held, &[KeyValue::new("hosted_service.name", name.clone())]);
+                    }
+                })
+                .build(),
         );
 
         Self {
@@ -1278,6 +1352,102 @@ mod tests {
         provider
             .shutdown()
             .expect("metric provider should shut down");
+    }
+
+    /// Collects the leadership gauge as it would actually be exported, keyed by
+    /// the service each point names.
+    fn exported_hosted_service_leases() -> BTreeMap<String, u64> {
+        let exporter = InMemoryMetricExporterBuilder::new()
+            .with_temporality(Temporality::Cumulative)
+            .build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        // The callback lives on the instrument handle, so this must outlive
+        // the flush below.
+        let _instruments = OtelMetrics::from_meter(provider.meter("snaketron-test"));
+        provider
+            .force_flush()
+            .expect("metric collection should flush");
+        let exported = exporter
+            .get_finished_metrics()
+            .expect("in-memory metrics should be readable");
+
+        let mut observed = BTreeMap::new();
+        for exported_metric in exported
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter(|candidate| candidate.name() == "snaketron.hosted_service_leases_held")
+        {
+            match exported_metric.data() {
+                AggregatedMetrics::U64(MetricData::Gauge(gauge)) => {
+                    for point in gauge.data_points() {
+                        let attributes = point.attributes().cloned().collect::<Vec<_>>();
+                        assert_eq!(
+                            attributes.len(),
+                            1,
+                            "the leadership gauge must carry only the service name"
+                        );
+                        assert_eq!(attributes[0].key.as_str(), "hosted_service.name");
+                        observed.insert(attributes[0].value.as_str().into_owned(), point.value());
+                    }
+                }
+                data => panic!("leadership gauge used the wrong aggregation: {data:?}"),
+            }
+        }
+        provider
+            .shutdown()
+            .expect("metric provider should shut down");
+        observed
+    }
+
+    /// A24 compares p99 gameplay latency on the elected task against the rest
+    /// of the fleet, so both sides of that split have to be exported: the
+    /// holder at one, and a task that merely contended at zero.
+    #[test]
+    fn leadership_gauge_distinguishes_a_holder_from_a_contender() {
+        // Names are unique to this test because the registry is process-global
+        // and the supervisor tests share this test binary.
+        const HOLDER: &str = "test-otel-holder";
+        const CONTENDER: &str = "test-otel-contender";
+
+        register_hosted_service_lease(CONTENDER);
+        hosted_service_lease_acquired(HOLDER);
+
+        let elected = exported_hosted_service_leases();
+        assert_eq!(elected.get(HOLDER), Some(&1));
+        assert_eq!(
+            elected.get(CONTENDER),
+            Some(&0),
+            "a contender must export zero, not nothing"
+        );
+
+        hosted_service_lease_released(HOLDER);
+        let stood_down = exported_hosted_service_leases();
+        assert_eq!(
+            stood_down.get(HOLDER),
+            Some(&0),
+            "standing down must clear the gauge without dropping the series"
+        );
+    }
+
+    /// One factory name can back several independently keyed leases, and an
+    /// unmatched release must not underflow into a permanently wrong reading.
+    #[test]
+    fn leadership_counts_concurrent_leases_and_never_underflows() {
+        const NAME: &str = "test-otel-multi-key";
+
+        hosted_service_lease_acquired(NAME);
+        hosted_service_lease_acquired(NAME);
+        assert_eq!(hosted_service_leases_held_for_test(NAME), Some(2));
+
+        hosted_service_lease_released(NAME);
+        assert_eq!(hosted_service_leases_held_for_test(NAME), Some(1));
+
+        hosted_service_lease_released(NAME);
+        hosted_service_lease_released(NAME);
+        assert_eq!(hosted_service_leases_held_for_test(NAME), Some(0));
     }
 
     #[test]

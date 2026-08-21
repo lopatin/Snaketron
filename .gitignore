@@ -24,6 +24,7 @@ __pycache__/
 
 # Machine-readable staging certification bundles.
 test-results/autoscaling-*/
+dump.rdb
 
 # Design-tool scratch: fetched texture originals and Python bytecode. The
 # sources are third-party downloads (see client/web/THIRD_PARTY_ASSETS.md) and

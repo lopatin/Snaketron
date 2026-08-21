@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::future::{Future, pending};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -69,6 +69,45 @@ fn validate_client_protocol_version(protocol_version: Option<u16>) -> Result<()>
     }
 }
 
+/// Canonical lowercase hyphenated UUID, matching `isValidAnonId` in
+/// `client/web/utils/anonId.ts`.
+fn is_canonical_uuid(value: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = value.split('-');
+    for expected in GROUPS {
+        match groups.next() {
+            Some(group)
+                if group.len() == expected
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
+            _ => return false,
+        }
+    }
+    groups.next().is_none()
+}
+
+/// Accepts the client-reported analytics identifier only in its exact expected
+/// shape, dropping anything else.
+///
+/// This is untrusted, attacker-controlled input that is destined for an
+/// analytics event, so it is validated at the boundary rather than downstream:
+/// an unbounded string here would become an unbounded column value, and a
+/// non-UUID value would silently pollute retention analysis. Rejection is
+/// deliberately silent — a malformed id is an analytics gap, never a reason to
+/// refuse a player's connection.
+/// A session identifier, minted server-side at authentication.
+///
+/// UUIDv7 so it sorts by creation time, which makes a session's events cluster
+/// naturally in the analytics table.
+pub fn new_session_id() -> String {
+    format!("s_{}", uuid::Uuid::now_v7())
+}
+
+fn sanitize_anon_id(anon_id: Option<String>) -> Option<String> {
+    anon_id.filter(|candidate| is_canonical_uuid(candidate))
+}
+
 // Snapshot-bearing messages are serialized envelopes; boxing would add churn without a win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +123,14 @@ pub enum WSMessage {
     Authenticate {
         token: String,
         protocol_version: u16,
+        /// Advisory pseudonymous browser identifier for product analytics.
+        /// Never used for authentication or authorization, and never trusted:
+        /// `sanitize_anon_id` validates it before anything downstream sees it.
+        /// Optional and defaulted so a client that predates the field — an
+        /// itch.io bundle cannot update itself — still authenticates.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-gen", ts(optional))]
+        anon_id: Option<String>,
         /// Session build channel. A missing value resolves to a disabled ad
         /// policy because the client's available SDK is unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +375,96 @@ pub enum WSMessage {
     //     username: String,
     // },
 }
+
+/// Declares [`WSMessage::variant_name`] and the closed set of names it can
+/// return, from one list.
+///
+/// One list rather than two: the outbound hook needs the reverse direction — a
+/// wire tag mapped back onto the same `&'static str` — and a separately
+/// maintained table of the same names would be free to drift from the match
+/// without anything saying so. The match stays exhaustive, so a new variant
+/// still does not compile until it is listed here.
+macro_rules! ws_message_variant_names {
+    ($($variant:ident),+ $(,)?) => {
+        impl WSMessage {
+            /// The variant's own name, for the analytics `message_type` column.
+            ///
+            /// Derived from the variant rather than supplied by the caller, on
+            /// the same discipline as `analytics::event::payload_name`: a
+            /// caller-supplied string is free to drift from the message it
+            /// labels, and nothing would say so.
+            ///
+            /// The names are the variant identifiers, which is also what
+            /// serde's default external tagging puts on the wire, so the two
+            /// hooks agree; see
+            /// `a_serialized_frame_reports_its_own_variant_name`.
+            pub fn variant_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => stringify!($variant),)+
+                }
+            }
+        }
+
+        /// Every name an application frame can report, and therefore the whole
+        /// vocabulary of the `message_type` column for one.
+        const WS_MESSAGE_TYPE_NAMES: &[&str] = &[$(stringify!($variant)),+];
+    };
+}
+
+ws_message_variant_names![
+    Token,
+    Authenticate,
+    JoinGame,
+    LeaveGame,
+    GameCommandV2,
+    GameEvent,
+    CommandOutcomes,
+    CommandOutcomesComplete,
+    Chat,
+    LobbyChatMessage,
+    GameChatMessage,
+    LobbyChatHistory,
+    GameChatHistory,
+    Authenticated,
+    AdConfiguration,
+    PlayerReady,
+    RequestResync,
+    Ping,
+    Pong,
+    QueueForMatch,
+    QueueForMatchMulti,
+    LeaveQueue,
+    MatchFound,
+    QueueUpdate,
+    QueueLeft,
+    AdBreakResolved,
+    UpdateNickname,
+    SpectatorJoined,
+    AccessDenied,
+    GameLoadFailed,
+    GameWarming,
+    SoloGameCreated,
+    Drain,
+    UserCountUpdate,
+    CreateLobby,
+    LobbyCreated,
+    JoinLobby,
+    JoinedLobby,
+    LeaveLobby,
+    LeftLobby,
+    LobbyUpdate,
+    UpdateLobbyPreferences,
+    LobbyRegionMismatch,
+    OnlinePlayers,
+    ChallengePlayer,
+    RespondToChallenge,
+    CancelChallenge,
+    Challenges,
+    ChallengeAccepted,
+    ChallengeFailed,
+    SetRematchIntent,
+    Rematch,
+];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserToken {
@@ -1000,6 +1137,22 @@ pub async fn handle_websocket(
 ) {
     info!("New WebSocket connection established");
 
+    // One analytics context for the connection, created HERE rather than
+    // inside the connection loop so that the close events below cannot be
+    // skipped. `handle_websocket_connection` propagates with `?` in a handful
+    // of places, and `connection_ended` has to fire for every connection
+    // without exception — it is the only event a refused handshake ever
+    // produces, so a path that skips it deletes that attempt from the funnel
+    // entirely.
+    let websocket_id = uuid::Uuid::new_v4().to_string();
+    let ws_analytics = Arc::new(crate::analytics::ws_sink::WsConnection::new(&websocket_id));
+    // Emitted before a single frame is read, because that is what makes it a
+    // count of CONNECTIONS rather than of connections that got far enough to
+    // say something. It reports the connection's own id, read back off the
+    // context rather than from `websocket_id` here, so the accept and the close
+    // below cannot drift onto different values.
+    crate::analytics::sink::record_connection_started(&ws_analytics);
+
     // Process the WebSocket connection
     if let Err(e) = handle_websocket_connection(
         socket,
@@ -1018,12 +1171,22 @@ pub async fn handle_websocket(
         lifecycle,
         cluster_namespace,
         ads_config,
+        websocket_id,
+        ws_analytics.clone(),
     )
     .await
     {
         crate::resilience_metrics::record_websocket_process_error(1);
+        // Last classification wins, and this one knows the most: the
+        // connection task itself failed.
+        ws_analytics.set_close_reason(crate::analytics::ws_sink::CloseReason::ConnectionError);
         error!("WebSocket connection error: {}", e);
     }
+
+    // Fire-and-forget, on the way out of a task that is already finished, so
+    // nothing here can reach gameplay. Emits `connection_ended` always, and
+    // `session_ended` only if this connection ever had a session.
+    crate::analytics::sink::record_connection_closed(&ws_analytics);
 }
 
 fn tungstenite_message_bytes(message: &Message) -> usize {
@@ -1051,6 +1214,85 @@ fn axum_message_bytes(message: &axum::extract::ws::Message) -> usize {
     }
 }
 
+/// Longest variant name the wire-tag reader will accept.
+///
+/// Every name in [`WSMessage::variant_name`] is far shorter; the bound exists
+/// so a malformed frame can never turn an unbounded string into an unbounded
+/// analytics column value.
+const MAX_WIRE_TAG_LEN: usize = 64;
+
+/// The label recorded when a frame carries no readable variant name.
+const UNNAMED_MESSAGE_TYPE: &str = "unknown";
+
+/// The variant name of an outbound frame, read back from the frame itself.
+///
+/// The forwarder is handed serialized frames rather than `WSMessage` values —
+/// it is a separate task draining a `Sender<Message>` — so the name has to
+/// come from the wire. Application frames therefore report a PascalCase
+/// variant name and transport frames report a snake_case label, which keeps
+/// the two kinds distinguishable in the `message_type` column.
+///
+/// The returned name is `&'static str`, never a slice of the frame: the tag is
+/// looked up in `WS_MESSAGE_TYPE_NAMES` and the matching static is returned, so
+/// describing a frame costs no allocation and the column's vocabulary is closed
+/// rather than whatever the frame happened to contain.
+fn outbound_message_type(message: &Message) -> &'static str {
+    match message {
+        Message::Text(text) => wire_tag(text)
+            .and_then(interned_message_type)
+            .unwrap_or(UNNAMED_MESSAGE_TYPE),
+        Message::Binary(_) => "binary_frame",
+        Message::Ping(_) => "ping_frame",
+        Message::Pong(_) => "pong_frame",
+        Message::Close(_) => "close_frame",
+        _ => UNNAMED_MESSAGE_TYPE,
+    }
+}
+
+/// The `WSMessage` name equal to `tag`, or `None` if there is none.
+///
+/// Sorted once and binary-searched rather than scanned, because this runs on
+/// every outbound frame; the table is built from `WS_MESSAGE_TYPE_NAMES` rather
+/// than kept sorted by hand so adding a variant cannot silently break the
+/// search's precondition.
+fn interned_message_type(tag: &str) -> Option<&'static str> {
+    static SORTED: OnceLock<Vec<&'static str>> = OnceLock::new();
+    let sorted = SORTED.get_or_init(|| {
+        let mut names = WS_MESSAGE_TYPE_NAMES.to_vec();
+        names.sort_unstable();
+        names
+    });
+    sorted
+        .binary_search_by(|candidate| (**candidate).cmp(tag))
+        .ok()
+        .map(|index| sorted[index])
+}
+
+/// The externally-tagged variant name at the head of a serialized `WSMessage`.
+///
+/// `WSMessage` carries no serde container attribute, so it uses the default
+/// external tagging: a unit variant is `"Name"` and every other variant is
+/// `{"Name":…}`. Either way the first JSON string in the frame is the variant
+/// name.
+///
+/// Scanning that one token is O(name) where a full parse would be O(frame),
+/// and the frames this runs on include whole game snapshots — the send path
+/// must not pay to describe itself.
+fn wire_tag(text: &str) -> Option<&str> {
+    let after_brace = text.strip_prefix('{').unwrap_or(text);
+    let opened = after_brace.trim_start().strip_prefix('"')?;
+    let tag = &opened[..opened.find('"')?];
+    // Variant names need no JSON escaping, so an escaped or oversized tag did
+    // not come from `WSMessage` and is reported as unnamed rather than
+    // recorded verbatim.
+    (!tag.is_empty()
+        && tag.len() <= MAX_WIRE_TAG_LEN
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(tag)
+}
+
 async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>) {
     if let Some(handle) = handle.take() {
         handle.abort();
@@ -1058,6 +1300,97 @@ async fn abort_and_join_game_event_forwarder(handle: &mut Option<JoinHandle<()>>
         // generation. Joining guarantees the old forwarder cannot enqueue its
         // barrier after a replacement forwarder enqueues a newer snapshot.
         let _ = handle.await;
+    }
+}
+
+/// Publishes everything a connection's analytics context can only learn from
+/// its state — the account it is authenticated as and the seat it is in — and
+/// returns that seat.
+///
+/// One function rather than a read at the top of the transition and a publish
+/// at the bottom, because the publish has to happen BEFORE anything acts on the
+/// transition. Entering a game spawns the game-event forwarder, and that
+/// forwarder's first frame is the anchor snapshot; it runs on its own task and
+/// can learn either fact only from here. A seat published afterwards would
+/// stamp the whole entry burst — the snapshot included — with the game this
+/// connection was in before, which on a rematch or a game switch is a wrong
+/// join key rather than a missing one. The account is published from the same
+/// point rather than a second one so it cannot acquire a weaker ordering than
+/// the seat already has.
+///
+/// Returning the seat is what keeps that order: the transition below cannot
+/// decide whether it is entering a game without calling this first.
+fn publish_analytics_context(
+    state: &ConnectionState,
+    analytics: &crate::analytics::ws_sink::WsConnection,
+) -> Option<u32> {
+    let (account, seat) = match state {
+        ConnectionState::Authenticated {
+            metadata, game_id, ..
+        } => (Some(analytics_account(metadata)), *game_id),
+        // Not "unknown": a connection in this state has no account behind it,
+        // and frames recorded from here must carry none.
+        ConnectionState::Unauthenticated => (None, None),
+    };
+    analytics.set_account(account);
+    analytics.set_game_id(seat);
+    seat
+}
+
+/// The analytics view of an authenticated player.
+///
+/// One mapping, used by both the per-frame publication and the session event,
+/// so the account a `session_started` names can never disagree with the one
+/// that session's frames are stamped with.
+fn analytics_account(metadata: &PlayerMetadata) -> crate::analytics::ws_sink::Account {
+    crate::analytics::ws_sink::Account {
+        user_id: metadata.user_id,
+        is_guest: metadata.is_guest,
+        // Load-test connections are seated in their own pool, so this is
+        // knowable exactly where the account is.
+        is_stress_test: metadata.matchmaking_pool
+            == crate::matchmaking_pool::MatchmakingPool::Stress,
+    }
+}
+
+/// Records what one authentication attempt produced.
+///
+/// ONE place, because the trap here is quiet and total. `session_started` used
+/// to fire before the token was verified, which made it the count of ATTEMPTS
+/// — protocol rejections included. Moving it behind verification, so it can
+/// carry an account, would delete the failure arm of every authentication
+/// funnel unless the failures land somewhere else. They land on
+/// `connection_ended`: the close reason set below travels on the connection to
+/// the socket's end, next to the protocol version the client reported, so a
+/// refused client is still a complete row and a version rollout is still
+/// countable.
+///
+/// A refusal never starts a session, so it never produces a `session_ended`
+/// either — the started/ended pair stays exact.
+fn record_authentication_outcome(
+    ws_analytics: &crate::analytics::ws_sink::WsConnection,
+    outcome: &Result<ConnectionState>,
+) {
+    use crate::analytics::ws_sink::CloseReason;
+    match outcome {
+        Ok(ConnectionState::Authenticated { metadata, .. }) => {
+            crate::analytics::sink::record_session_started(
+                ws_analytics,
+                analytics_account(metadata),
+            );
+            // A connection that authenticated is healthy; whatever ends it
+            // later is an ordinary close, not a refusal. Set explicitly rather
+            // than left at the default, so a retry after a refused handshake
+            // is not still described by the refusal it recovered from.
+            ws_analytics.set_close_reason(CloseReason::SocketClosed);
+        }
+        // `authenticate_ws_connection` returns an unauthenticated state from
+        // exactly one place: the protocol-version gate it applies before it
+        // looks at the token at all.
+        Ok(ConnectionState::Unauthenticated) => {
+            ws_analytics.set_close_reason(CloseReason::ProtocolRejected);
+        }
+        Err(_) => ws_analytics.set_close_reason(CloseReason::AuthenticationFailed),
     }
 }
 
@@ -1080,6 +1413,12 @@ async fn handle_websocket_connection(
     lifecycle: TaskLifecycle,
     cluster_namespace: ClusterNamespace,
     ads_config: Arc<AdsConfig>,
+    // Stable for the connection's whole life, and already the key the
+    // analytics context was sampled on. Minted by the caller so both can be.
+    websocket_id: String,
+    // Created by the caller so the connection's close events cannot be skipped
+    // by an early `?` return from this function.
+    ws_analytics: Arc<crate::analytics::ws_sink::WsConnection>,
 ) -> Result<()> {
     // Split the WebSocket into send and receive parts using futures_util
     let (mut ws_sink, mut ws_stream) = futures_util::StreamExt::split(ws_stream);
@@ -1091,8 +1430,6 @@ async fn handle_websocket_connection(
     let (ws_tx, mut ws_rx) = mpsc::channel::<Message>(1024);
     let (drain_tx, mut priority_drain_rx) = mpsc::channel::<Message>(1);
 
-    // Generate a unique websocket ID for this connection
-    let websocket_id = uuid::Uuid::new_v4().to_string();
     let socket_generation = lifecycle.next_socket_generation();
     let mut drain_rx = lifecycle.subscribe_to_drain();
 
@@ -1126,6 +1463,7 @@ async fn handle_websocket_connection(
     let mut social_session: Option<SocialSession> = None;
 
     // Spawn task to forward messages from channel to WebSocket
+    let ws_analytics_for_forwarder = ws_analytics.clone();
     let forward_task = tokio::spawn(async move {
         let mut drain_open = true;
         let mut ws_open = true;
@@ -1139,6 +1477,24 @@ async fn handle_websocket_connection(
         {
             let is_close = matches!(msg, Message::Close(_));
             let outbound_bytes = tungstenite_message_bytes(&msg);
+            // Every one of this gateway's outbound sends funnels through this
+            // drain, so recording here covers them all. Recorded before the
+            // write rather than after it — as the throughput metric below is —
+            // because the conversion consumes the frame the type name is read
+            // from; the two differ only for the single frame in flight when a
+            // socket dies.
+            //
+            // The gate is here rather than inside `record_outbound` because
+            // reading the type off the wire is an ARGUMENT: inside the call it
+            // would already have happened. A connection outside the sample, or
+            // a deployment with no sink installed, pays one bool per frame.
+            if ws_analytics_for_forwarder.records() {
+                crate::analytics::ws_sink::record_outbound(
+                    &ws_analytics_for_forwarder,
+                    outbound_message_type(&msg),
+                    outbound_bytes,
+                );
+            }
             // Convert to Axum WebSocket message
             let axum_msg = match msg {
                 Message::Text(text) => axum::extract::ws::Message::Text(text.to_string()),
@@ -1262,7 +1618,26 @@ async fn handle_websocket_connection(
 
                         // Process the message
                         if let Message::Text(text) = tungstenite_msg {
-                            match serde_json::from_str::<WSMessage>(&text) {
+                            let parsed = serde_json::from_str::<WSMessage>(&text);
+                            // Above the match rather than inside it, so the
+                            // arms that never reach `process_ws_message` — the
+                            // resync fast path and the in-lobby denial below —
+                            // are recorded too. A frame that failed to parse is
+                            // deliberately not recorded: its type name would be
+                            // attacker-supplied rather than a known variant.
+                            // The gate is the call site's, not `record_inbound`'s,
+                            // for the same reason as on the outbound side: the
+                            // hook's arguments are evaluated before the call.
+                            if ws_analytics.records()
+                                && let Ok(message) = &parsed
+                            {
+                                crate::analytics::ws_sink::record_inbound(
+                                    &ws_analytics,
+                                    message.variant_name(),
+                                    text.len(),
+                                );
+                            }
+                            match parsed {
                                 Ok(WSMessage::RequestResync { game_id: resync_game_id }) => {
                                     crate::resilience_metrics::record_websocket_resync_requested(1);
                                     // The client detected loss or divergence (stream
@@ -1372,13 +1747,23 @@ async fn handle_websocket_connection(
                                         &cluster_namespace,
                                         &cancellation_token,
                                         &ads_config,
+                                        &ws_analytics,
                                     ).await {
                                         Ok(mut new_state) => {
-                                            // Check if we're entering a game or lobby
-                                            let entered_game_id = match &new_state {
-                                                ConnectionState::Authenticated { game_id, .. } => *game_id,
-                                                ConnectionState::Unauthenticated => None,
-                                            };
+                                            // Check if we're entering a game or lobby.
+                                            // Reading the seat and publishing the
+                                            // whole analytics context are one
+                                            // step, and everything below that acts
+                                            // on the transition needs this value —
+                                            // so nothing can spawn a subscription
+                                            // or send a frame before the forwarder
+                                            // has been told which game it is now
+                                            // in and who is in it.
+                                            let entered_game_id =
+                                                publish_analytics_context(
+                                                    &new_state,
+                                                    &ws_analytics,
+                                                );
                                             let entering_game = match requested_game_id {
                                                 Some(requested_game_id) => {
                                                     entered_game_id == Some(requested_game_id)
@@ -1741,8 +2126,13 @@ async fn handle_websocket_connection(
                                         Err(e) => {
                                             crate::resilience_metrics::record_websocket_process_error(1);
                                             error!("Error processing message: {}", e);
-                                            // State was consumed, need to reset
+                                            // State was consumed, need to reset.
+                                            // The reset state is published the
+                                            // same way every other transition
+                                            // is, so the account and the seat
+                                            // cannot be cleared out of step.
                                             state = ConnectionState::Unauthenticated;
+                                            publish_analytics_context(&state, &ws_analytics);
                                             break;
                                         }
                                     }
@@ -4805,6 +5195,9 @@ async fn process_ws_message(
     cluster_namespace: &ClusterNamespace,
     cancellation_token: &CancellationToken,
     ads_config: &Arc<AdsConfig>,
+    // Taken only so the session id can be attached to the connection: it is
+    // minted inside this function and nowhere else.
+    ws_analytics: &crate::analytics::ws_sink::WsConnection,
 ) -> Result<ConnectionState> {
     use tracing::debug;
     let state_str = match &state {
@@ -4859,7 +5252,12 @@ async fn process_ws_message(
         ConnectionState::Unauthenticated => {
             match ws_message {
                 WSMessage::Token(jwt_token) => {
-                    authenticate_ws_connection(
+                    // The legacy shape reports no protocol version, so nothing
+                    // is recorded for it — and it is refused for exactly that.
+                    // It still runs through the same outcome recorder, because
+                    // a legacy client is a cohort a rollout wants counted, and
+                    // `connection_ended` is now the only place it can be.
+                    let outcome = authenticate_ws_connection(
                         jwt_token,
                         None,
                         None,
@@ -4875,14 +5273,44 @@ async fn process_ws_message(
                         cluster_namespace,
                         ads_config,
                     )
-                    .await
+                    .await;
+                    record_authentication_outcome(ws_analytics, &outcome);
+                    outcome
                 }
                 WSMessage::Authenticate {
                     token: jwt_token,
                     protocol_version,
+                    anon_id,
                     distribution,
                 } => {
-                    authenticate_ws_connection(
+                    // Validated at the boundary so a malformed or unbounded
+                    // client string can never reach an analytics event.
+                    let anon_id = sanitize_anon_id(anon_id);
+                    // Minted here because this is the first moment a
+                    // connection says anything about itself. The socket
+                    // existed earlier — `connection_started` already counted it
+                    // — but nothing was known about who was on it until now,
+                    // and after this arm it is still only a CLAIM until
+                    // verification below either admits it or refuses it.
+                    let session_id = new_session_id();
+                    debug!(
+                        "websocket handshake {session_id} received (anon_id present: {})",
+                        anon_id.is_some()
+                    );
+                    // Handed to the connection context BEFORE verification, and
+                    // deliberately. These are the facts the close event has to
+                    // report, and for a refused client the close event is the
+                    // only event there will ever be: this arm's scope is gone
+                    // long before the socket ends. Recording them is not a
+                    // claim that a session started — `session_started` is that
+                    // claim, and it is emitted below, only on success.
+                    ws_analytics.report_protocol_version(protocol_version);
+                    ws_analytics.bind_anon_id(anon_id.as_deref());
+                    // From here on this connection's frames carry this session
+                    // id, so the frames of one handshake group together whether
+                    // or not the token turns out to be good.
+                    ws_analytics.bind_session(&session_id);
+                    let outcome = authenticate_ws_connection(
                         jwt_token,
                         Some(protocol_version),
                         distribution,
@@ -4898,7 +5326,9 @@ async fn process_ws_message(
                         cluster_namespace,
                         ads_config,
                     )
-                    .await
+                    .await;
+                    record_authentication_outcome(ws_analytics, &outcome);
+                    outcome
                 }
                 WSMessage::Ping { client_time } => {
                     // Respond with Pong even in unauthenticated state to keep connection alive
@@ -5580,6 +6010,13 @@ async fn process_ws_message(
                     }
                     match removal_result {
                         Ok(Some(lobby_code)) => {
+                            // Only this arm means the lobby was genuinely in a
+                            // queue and left it; the Ok(None) arm below is a
+                            // cancel with nothing to cancel.
+                            crate::analytics::sink::record_queue_left(
+                                &lobby_code,
+                                authenticated_user_id as i32,
+                            );
                             info!(
                                 lobby_code,
                                 "Removed lobby from matchmaking queues after cancel"
@@ -6938,7 +7375,7 @@ mod lifecycle_protocol_tests {
         lobby_video_ad_targets, missing_game_join_failure, next_game_subscription_input,
         next_lobby_match, next_outbound_message, publish_game_chat_message,
         queue_planned_drain_notice, recovery_bridge_snapshot, refresh_connection_username,
-        repair_legacy_chat_history, require_game_command_publication,
+        repair_legacy_chat_history, require_game_command_publication, sanitize_anon_id,
         send_command_outcomes_from_resolved, send_completed_game_snapshot_from_resolved,
         send_recovery_bridge_snapshot, slow_command_publish_wait_ms,
         snapshot_requires_command_outcomes, subscribe_to_game_chat,
@@ -7204,6 +7641,7 @@ mod lifecycle_protocol_tests {
         let value = serde_json::to_value(WSMessage::Authenticate {
             token: "jwt".to_owned(),
             protocol_version: WS_PROTOCOL_VERSION,
+            anon_id: None,
             distribution: Some(ClientDistribution::Web),
         })
         .unwrap();
@@ -7212,7 +7650,75 @@ mod lifecycle_protocol_tests {
             value["Authenticate"]["protocol_version"],
             WS_PROTOCOL_VERSION
         );
+        // Absent rather than null, so the frame a version-less client sends is
+        // byte-identical to the one this server produces.
+        assert!(value["Authenticate"].get("anon_id").is_none());
         assert_eq!(value["Authenticate"]["distribution"], "web");
+    }
+
+    /// The analytics identifier is additive in both directions: a client that
+    /// predates it still authenticates, and a client that sends it is not
+    /// refused by a server that ignores it. A shipped bundle cannot update
+    /// itself, so neither direction may ever become a hard failure.
+    #[test]
+    fn the_anon_id_is_optional_in_both_directions() {
+        let without = serde_json::json!({
+            "Authenticate": { "token": "jwt", "protocol_version": WS_PROTOCOL_VERSION }
+        });
+        let parsed: WSMessage = serde_json::from_value(without).unwrap();
+        assert!(matches!(
+            parsed,
+            WSMessage::Authenticate { anon_id: None, .. }
+        ));
+
+        let with = serde_json::json!({
+            "Authenticate": {
+                "token": "jwt",
+                "protocol_version": WS_PROTOCOL_VERSION,
+                "anon_id": "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607"
+            }
+        });
+        let parsed: WSMessage = serde_json::from_value(with).unwrap();
+        assert!(matches!(
+            parsed,
+            WSMessage::Authenticate { anon_id: Some(ref id), .. }
+                if id == "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607"
+        ));
+    }
+
+    /// Untrusted client input destined for an analytics event. Anything that is
+    /// not a canonical lowercase UUID is dropped rather than propagated, and a
+    /// rejection never affects admission.
+    #[test]
+    fn only_canonical_uuids_survive_anon_id_sanitization() {
+        let good = "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607";
+        assert_eq!(
+            sanitize_anon_id(Some(good.to_owned())),
+            Some(good.to_owned())
+        );
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "3F1A2B4C-5D6E-4F70-8A91-B2C3D4E5F607", // uppercase
+            "3f1a2b4c5d6e4f708a91b2c3d4e5f607",     // unhyphenated
+            "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f60",  // short group
+            "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5f607-x", // trailing group
+            "3f1a2b4c-5d6e-4f70-8a91-b2c3d4e5g607", // non-hex
+        ] {
+            assert_eq!(
+                sanitize_anon_id(Some(bad.to_owned())),
+                None,
+                "accepted {bad:?}"
+            );
+        }
+        assert_eq!(sanitize_anon_id(None), None);
+    }
+
+    /// An unbounded string must never reach a column value.
+    #[test]
+    fn an_oversized_anon_id_is_rejected() {
+        assert_eq!(sanitize_anon_id(Some("a".repeat(100_000))), None);
     }
 
     #[test]
@@ -7958,5 +8464,664 @@ mod lifecycle_protocol_tests {
                 terminal_rejection_reason: None,
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_identity_tests {
+    use super::new_session_id;
+
+    /// Session ids must be unique and time-ordered so a session's events
+    /// cluster in the analytics table.
+    #[test]
+    fn session_ids_are_unique_prefixed_and_sortable() {
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            ids.push(new_session_id());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(ids.iter().all(|id| id.starts_with("s_")));
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "ids must be unique");
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "must sort in creation order");
+    }
+}
+
+#[cfg(test)]
+mod message_type_naming_tests {
+    use super::*;
+    use crate::ads::{AdBreakResolution, ClientAdsConfig};
+    use crate::challenges::ChallengeInbox;
+    use crate::presence::RegionRoster;
+    use common::{CommandId, Direction, GameCommand, GameType, QueueMode};
+
+    /// One value of every `WSMessage` variant.
+    ///
+    /// A variant added without a name does not reach this test at all —
+    /// `WSMessage::variant_name` matches exhaustively, so the crate stops
+    /// compiling first. This roster is what proves the names it returns are
+    /// the ones that actually appear on the wire.
+    fn every_variant() -> Vec<WSMessage> {
+        vec![
+            WSMessage::Token("jwt".to_owned()),
+            WSMessage::Authenticate {
+                token: "jwt".to_owned(),
+                protocol_version: WS_PROTOCOL_VERSION,
+                anon_id: None,
+                distribution: None,
+            },
+            WSMessage::JoinGame(1),
+            WSMessage::LeaveGame,
+            WSMessage::GameCommandV2 {
+                command_id: ClientCommandIdentityV2 {
+                    game_id: 1,
+                    user_id: 2,
+                    client_game_session_id: "session".to_owned(),
+                    sequence: 3,
+                },
+                command: GameCommandMessage {
+                    command_id_client: CommandId {
+                        tick: 1,
+                        user_id: 2,
+                        sequence_number: 3,
+                    },
+                    command_id_server: None,
+                    command: GameCommand::ActivateBoost { snake_id: 1 },
+                },
+            },
+            WSMessage::GameEvent(GameEventMessage {
+                game_id: 1,
+                tick: 2,
+                sequence: 3,
+                stream_seq: 4,
+                user_id: None,
+                event: GameEvent::SnakeTurned {
+                    snake_id: 1,
+                    direction: Direction::Up,
+                },
+            }),
+            WSMessage::CommandOutcomes {
+                game_id: 1,
+                client_game_session_id: "session".to_owned(),
+                contiguous_through: 0,
+                outcomes: BTreeMap::new(),
+                rejection_fence: None,
+            },
+            WSMessage::CommandOutcomesComplete {
+                game_id: 1,
+                terminal_rejection_reason: None,
+            },
+            WSMessage::Chat("hello".to_owned()),
+            WSMessage::LobbyChatMessage {
+                lobby_code: "ABCD".to_owned(),
+                message_id: "m".to_owned(),
+                user_id: 1,
+                username: "u".to_owned(),
+                message: "hi".to_owned(),
+                timestamp_ms: 0,
+            },
+            WSMessage::GameChatMessage {
+                game_id: 1,
+                message_id: "m".to_owned(),
+                user_id: 1,
+                username: "u".to_owned(),
+                message: "hi".to_owned(),
+                timestamp_ms: 0,
+            },
+            WSMessage::LobbyChatHistory {
+                lobby_code: "ABCD".to_owned(),
+                messages: Vec::new(),
+            },
+            WSMessage::GameChatHistory {
+                game_id: 1,
+                messages: Vec::new(),
+            },
+            WSMessage::Authenticated {
+                task_boot_id: "1:boot".to_owned(),
+                protocol_version: WS_PROTOCOL_VERSION,
+                capabilities: Vec::new(),
+                socket_generation: 1,
+            },
+            WSMessage::AdConfiguration(ClientAdsConfig::default()),
+            WSMessage::PlayerReady { game_id: 1 },
+            WSMessage::RequestResync { game_id: 1 },
+            WSMessage::Ping { client_time: 0 },
+            WSMessage::Pong {
+                client_time: 0,
+                server_time: 0,
+            },
+            WSMessage::QueueForMatch {
+                game_type: GameType::Solo,
+                queue_mode: QueueMode::Quickmatch,
+            },
+            WSMessage::QueueForMatchMulti {
+                game_types: Vec::new(),
+                queue_mode: QueueMode::Competitive,
+            },
+            WSMessage::LeaveQueue,
+            WSMessage::MatchFound { game_id: 1 },
+            WSMessage::QueueUpdate {
+                position: 1,
+                estimated_wait_seconds: 2,
+            },
+            WSMessage::QueueLeft,
+            WSMessage::AdBreakResolved {
+                break_id: "b".to_owned(),
+                resolution: AdBreakResolution::Completed,
+            },
+            WSMessage::UpdateNickname {
+                nickname: "n".to_owned(),
+            },
+            WSMessage::SpectatorJoined,
+            WSMessage::AccessDenied {
+                reason: "no".to_owned(),
+            },
+            WSMessage::GameLoadFailed {
+                game_id: 1,
+                reason: "no".to_owned(),
+            },
+            WSMessage::GameWarming {
+                game_id: 1,
+                retry_after_ms: 250,
+            },
+            WSMessage::SoloGameCreated { game_id: 1 },
+            WSMessage::Drain {
+                task_boot_id: "1:boot".to_owned(),
+                deadline_unix_ms: 0,
+            },
+            WSMessage::UserCountUpdate {
+                region_counts: HashMap::new(),
+            },
+            WSMessage::CreateLobby,
+            WSMessage::LobbyCreated {
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::JoinLobby {
+                lobby_code: "ABCD".to_owned(),
+                preferences: None,
+            },
+            WSMessage::JoinedLobby {
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::LeaveLobby,
+            WSMessage::LeftLobby,
+            WSMessage::LobbyUpdate {
+                lobby_code: "ABCD".to_owned(),
+                members: Vec::new(),
+                host_user_id: 1,
+                state: "waiting".to_owned(),
+                preferences: lobby_manager::LobbyPreferences::default(),
+                ad_break: None,
+            },
+            WSMessage::UpdateLobbyPreferences {
+                selected_modes: Vec::new(),
+                competitive: false,
+            },
+            WSMessage::LobbyRegionMismatch {
+                target_region: "euw1".to_owned(),
+                ws_url: "wss://euw1.example/ws".to_owned(),
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::OnlinePlayers(RegionRoster {
+                region: "use1".to_owned(),
+                players: Vec::new(),
+                total_online: 0,
+            }),
+            WSMessage::ChallengePlayer { user_id: 1 },
+            WSMessage::RespondToChallenge {
+                challenge_id: "c".to_owned(),
+                accept: true,
+            },
+            WSMessage::CancelChallenge {
+                challenge_id: "c".to_owned(),
+            },
+            WSMessage::Challenges(ChallengeInbox::default()),
+            WSMessage::ChallengeAccepted {
+                challenge_id: "c".to_owned(),
+                lobby_code: "ABCD".to_owned(),
+            },
+            WSMessage::ChallengeFailed {
+                reason: "no".to_owned(),
+            },
+            WSMessage::SetRematchIntent {
+                game_id: 1,
+                opt_in: true,
+            },
+            WSMessage::Rematch(RematchState {
+                game_id: 1,
+                participants: Vec::new(),
+                lobby_code: None,
+                host_user_id: None,
+                game_type: None,
+                queue_mode: QueueMode::Quickmatch,
+                expires_at_ms: 0,
+            }),
+        ]
+    }
+
+    /// The load-bearing property for the outbound hook: the forwarder never
+    /// sees a `WSMessage`, so the name it reads off the wire has to be the
+    /// same name the inbound hook reads off the value. If serde's
+    /// representation ever changes — a container attribute, a renamed variant
+    /// — this fails instead of quietly relabelling a column.
+    #[test]
+    fn a_serialized_frame_reports_its_own_variant_name() {
+        for message in every_variant() {
+            let expected = message.variant_name();
+            let frame = Message::Text(
+                serde_json::to_string(&message)
+                    .expect("every variant must serialize")
+                    .into(),
+            );
+            assert_eq!(
+                outbound_message_type(&frame),
+                expected,
+                "the wire tag and the variant name disagree for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_variant_has_a_distinct_name() {
+        let names: Vec<&str> = every_variant()
+            .iter()
+            .map(WSMessage::variant_name)
+            .collect();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "names must be distinct: {names:?}"
+        );
+        assert_eq!(names.len(), 52, "every variant must be covered");
+    }
+
+    /// The names go into an analytics column, so they must stay inside the
+    /// shape the wire-tag reader accepts — otherwise the two directions would
+    /// label the same message differently.
+    #[test]
+    fn every_name_survives_the_wire_tag_reader() {
+        for message in every_variant() {
+            let name = message.variant_name();
+            assert!(!name.is_empty());
+            assert!(name.len() <= MAX_WIRE_TAG_LEN, "{name} is too long");
+            assert_ne!(
+                name, UNNAMED_MESSAGE_TYPE,
+                "{name} collides with the fallback"
+            );
+        }
+    }
+
+    /// Transport frames carry no variant, and must not be confusable with the
+    /// application message that shares their word.
+    #[test]
+    fn transport_frames_are_labelled_apart_from_application_messages() {
+        let application_frame = Message::Text(
+            serde_json::to_string(&WSMessage::Ping { client_time: 0 })
+                .unwrap()
+                .into(),
+        );
+        let transport_frame = Message::Ping(Vec::new().into());
+        let application = outbound_message_type(&application_frame);
+        let transport = outbound_message_type(&transport_frame);
+        assert_eq!(application, "Ping");
+        assert_eq!(transport, "ping_frame");
+        assert_ne!(application, transport);
+        assert_eq!(outbound_message_type(&Message::Close(None)), "close_frame");
+    }
+
+    /// The interning table and the match must describe the same set. An
+    /// outbound frame is named by looking its wire tag up in the table, so a
+    /// name the table was missing would be reported as unknown while the
+    /// inbound half still named it — the two directions of one message would
+    /// stop joining.
+    #[test]
+    fn the_interning_table_holds_exactly_the_variant_names() {
+        let from_variants: std::collections::BTreeSet<&str> = every_variant()
+            .iter()
+            .map(WSMessage::variant_name)
+            .collect();
+        let from_table: std::collections::BTreeSet<&str> =
+            WS_MESSAGE_TYPE_NAMES.iter().copied().collect();
+        assert_eq!(from_variants, from_table);
+    }
+
+    /// A well-formed tag this gateway never authors is not a `WSMessage`, and
+    /// collapses into the one bounded label rather than becoming a column
+    /// value of its own.
+    #[test]
+    fn a_well_formed_tag_that_is_not_a_variant_is_not_recorded_verbatim() {
+        assert_eq!(interned_message_type("GameEvent"), Some("GameEvent"));
+        assert_eq!(interned_message_type("NotAWsMessage"), None);
+        assert_eq!(
+            outbound_message_type(&Message::Text("{\"NotAWsMessage\":1}".into())),
+            UNNAMED_MESSAGE_TYPE
+        );
+    }
+
+    /// A frame this gateway did not author must not become an unbounded or
+    /// attacker-chosen column value.
+    #[test]
+    fn an_unreadable_frame_falls_back_to_one_bounded_label() {
+        let oversized = format!("{{\"{}\":1}}", "A".repeat(MAX_WIRE_TAG_LEN + 1));
+        for text in [
+            String::new(),
+            "not json".to_owned(),
+            "{}".to_owned(),
+            "{123:1}".to_owned(),
+            "{\"has space\":1}".to_owned(),
+            "{\"\":1}".to_owned(),
+            oversized,
+        ] {
+            assert_eq!(
+                outbound_message_type(&Message::Text(text.clone().into())),
+                UNNAMED_MESSAGE_TYPE,
+                "{text} must not be recorded verbatim"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod analytics_publication_tests {
+    use super::*;
+    use crate::analytics::ws_sink::{Account, WsConnection};
+
+    fn seated(game_id: Option<u32>) -> ConnectionState {
+        seated_as(7, false, game_id)
+    }
+
+    fn seated_as(user_id: i32, is_guest: bool, game_id: Option<u32>) -> ConnectionState {
+        ConnectionState::Authenticated {
+            metadata: PlayerMetadata {
+                user_id,
+                username: "Player".to_owned(),
+                token: "session-token".to_owned(),
+                is_guest,
+                matchmaking_pool: MatchmakingPool::Public,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: Some(ClientDistribution::Web),
+            },
+            lobby_handle: None,
+            game_id,
+            websocket_id: "ws-seat".to_owned(),
+        }
+    }
+
+    /// The transition that reads this value goes on to spawn the game-event
+    /// forwarder, whose very first frame is the anchor snapshot. Publishing
+    /// therefore has to be complete before the value is returned: any window
+    /// between the two would stamp the entire game-entry burst with the game
+    /// this connection was in BEFORE, which on a rematch is a wrong join key
+    /// rather than a missing one.
+    #[test]
+    fn entering_a_game_publishes_the_new_seat_before_returning_it() {
+        let analytics = WsConnection::new("seat-order");
+        analytics.set_game_id(Some(11));
+
+        let entered = publish_analytics_context(&seated(Some(77)), &analytics);
+
+        assert_eq!(entered, Some(77));
+        assert_eq!(
+            analytics.game_id(),
+            Some(77),
+            "the caller cannot learn the new seat without the forwarder having \
+             learned it too"
+        );
+    }
+
+    #[test]
+    fn leaving_a_game_clears_the_seat() {
+        let analytics = WsConnection::new("seat-clear");
+        analytics.set_game_id(Some(11));
+        assert_eq!(publish_analytics_context(&seated(None), &analytics), None);
+        assert_eq!(analytics.game_id(), None);
+    }
+
+    /// A transition back to unauthenticated is a seat change too, and the
+    /// frames that follow it belong to no game.
+    #[test]
+    fn an_unauthenticated_transition_clears_the_seat() {
+        let analytics = WsConnection::new("seat-unauth");
+        analytics.set_game_id(Some(11));
+        assert_eq!(
+            publish_analytics_context(&ConnectionState::Unauthenticated, &analytics),
+            None
+        );
+        assert_eq!(analytics.game_id(), None);
+    }
+
+    /// The account has to be readable at the same instant the seat is, for the
+    /// same reason: the caller goes on to spawn the game-event forwarder, and
+    /// that task reads the analytics context from another thread. Anything the
+    /// forwarder's first frames could be stamped with must already be in place
+    /// when the caller receives the seat.
+    #[test]
+    fn a_transition_publishes_the_account_before_returning_the_seat() {
+        let analytics = WsConnection::new("account-order");
+        assert_eq!(
+            analytics.account(),
+            None,
+            "a fresh connection has authenticated as nobody"
+        );
+
+        let entered = publish_analytics_context(&seated_as(4242, false, Some(77)), &analytics);
+
+        assert_eq!(entered, Some(77));
+        assert_eq!(
+            analytics.account(),
+            Some(Account {
+                user_id: 4242,
+                is_guest: false,
+                is_stress_test: false,
+            }),
+            "the caller cannot learn the new seat without the forwarder having \
+             learned who is in it too"
+        );
+    }
+
+    /// A guest is an account like any other; the flag is the only thing that
+    /// distinguishes it, so it has to be published, not defaulted.
+    #[test]
+    fn a_guest_is_published_as_a_guest_account() {
+        let analytics = WsConnection::new("account-guest");
+        publish_analytics_context(&seated_as(1001, true, None), &analytics);
+        assert_eq!(
+            analytics.account(),
+            Some(Account {
+                user_id: 1001,
+                is_guest: true,
+                is_stress_test: false,
+            })
+        );
+    }
+
+    /// Who is on the connection does not change when they sit down or stand
+    /// up, so ordinary in-game transitions must leave the account alone.
+    #[test]
+    fn the_account_survives_entering_and_leaving_a_game() {
+        let analytics = WsConnection::new("account-seat-changes");
+        let expected = Some(Account {
+            user_id: 4242,
+            is_guest: false,
+            is_stress_test: false,
+        });
+
+        publish_analytics_context(&seated_as(4242, false, None), &analytics);
+        assert_eq!(analytics.account(), expected);
+
+        publish_analytics_context(&seated_as(4242, false, Some(77)), &analytics);
+        assert_eq!(analytics.account(), expected, "entering a game");
+        assert_eq!(analytics.game_id(), Some(77));
+
+        publish_analytics_context(&seated_as(4242, false, None), &analytics);
+        assert_eq!(analytics.account(), expected, "leaving a game");
+        assert_eq!(analytics.game_id(), None);
+    }
+
+    /// Falling back to unauthenticated ends the account, and the frames after
+    /// it must not keep naming the person who was there.
+    #[test]
+    fn an_unauthenticated_transition_clears_the_account() {
+        let analytics = WsConnection::new("account-unauth");
+        publish_analytics_context(&seated_as(4242, false, Some(77)), &analytics);
+        assert!(analytics.account().is_some(), "there was someone to clear");
+
+        publish_analytics_context(&ConnectionState::Unauthenticated, &analytics);
+
+        assert_eq!(analytics.account(), None);
+        assert_eq!(analytics.game_id(), None);
+    }
+}
+
+/// The authentication funnel's shape.
+///
+/// `session_started` used to fire before verification, which made it the count
+/// of ATTEMPTS. Now that it fires only on success, every refusal has to remain
+/// countable through the connection's close — and the way to break that is not
+/// to crash, it is to record nothing. These pin the two refusal shapes
+/// directly.
+#[cfg(test)]
+mod authentication_outcome_tests {
+    use super::*;
+    use crate::analytics::ws_sink::{Account, CloseReason, WsConnection};
+
+    fn authenticated(user_id: i32, is_guest: bool, pool: MatchmakingPool) -> ConnectionState {
+        ConnectionState::Authenticated {
+            metadata: PlayerMetadata {
+                user_id,
+                username: "Player".to_owned(),
+                token: "session-token".to_owned(),
+                is_guest,
+                matchmaking_pool: pool,
+                supports_ad_break: true,
+                can_show_video_ad: false,
+                distribution: Some(ClientDistribution::Web),
+            },
+            lobby_handle: None,
+            game_id: None,
+            websocket_id: "ws-auth".to_owned(),
+        }
+    }
+
+    /// A connection standing exactly where the handshake arm leaves one just
+    /// before it calls `authenticate_ws_connection`.
+    fn handshaken(key: &str, protocol_version: u16) -> WsConnection {
+        let connection = WsConnection::new(key);
+        connection.report_protocol_version(protocol_version);
+        connection.bind_anon_id(Some("2f1c2f1c-2f1c-2f1c-2f1c-2f1c2f1c2f1c"));
+        connection.bind_session("s_attempt");
+        connection
+    }
+
+    #[test]
+    fn a_successful_authentication_starts_a_session_naming_the_account() {
+        let connection = handshaken("auth-ok", WS_PROTOCOL_VERSION);
+
+        record_authentication_outcome(
+            &connection,
+            &Ok(authenticated(4242, true, MatchmakingPool::Public)),
+        );
+
+        assert_eq!(
+            connection.session_account(),
+            Some(Account {
+                user_id: 4242,
+                is_guest: true,
+                is_stress_test: false,
+            }),
+            "a started session has to name who it belongs to"
+        );
+        assert!(connection.has_session());
+        assert_eq!(connection.close_reason(), CloseReason::SocketClosed);
+    }
+
+    /// A load-test connection must be labelled at the session, so synthetic
+    /// traffic can be excluded from every funnel built on these events.
+    #[test]
+    fn a_stress_pool_session_is_flagged_at_its_start() {
+        let connection = handshaken("auth-stress", WS_PROTOCOL_VERSION);
+        record_authentication_outcome(
+            &connection,
+            &Ok(authenticated(9, false, MatchmakingPool::Stress)),
+        );
+        assert!(
+            connection
+                .session_account()
+                .is_some_and(|account| account.is_stress_test)
+        );
+    }
+
+    /// THE TRAP. A token that does not verify must start no session — that is
+    /// the whole reason the event moved — while remaining countable through
+    /// the close reason, which is now the only place the attempt appears.
+    #[test]
+    fn a_failed_authentication_starts_no_session_and_stays_countable() {
+        let connection = handshaken("auth-bad-token", WS_PROTOCOL_VERSION);
+
+        record_authentication_outcome(&connection, &Err(anyhow!("Authentication failed")));
+
+        assert!(
+            !connection.has_session(),
+            "an unverified token must never produce an authenticated session"
+        );
+        assert_eq!(connection.session_account(), None);
+        assert_eq!(connection.close_reason(), CloseReason::AuthenticationFailed);
+        assert_eq!(
+            connection.protocol_version(),
+            Some(WS_PROTOCOL_VERSION),
+            "the version has to reach the close event, or the attempt is \
+             uncountable by cohort"
+        );
+    }
+
+    /// The other refusal shape, and the one a version rollout is measured by:
+    /// `authenticate_ws_connection` returns an unauthenticated state from the
+    /// protocol gate alone.
+    #[test]
+    fn a_protocol_rejection_starts_no_session_and_keeps_its_version() {
+        let rejected = WS_PROTOCOL_VERSION.wrapping_sub(1);
+        let connection = handshaken("auth-old-client", rejected);
+
+        record_authentication_outcome(&connection, &Ok(ConnectionState::Unauthenticated));
+
+        assert!(
+            !connection.has_session(),
+            "a client that was never admitted has no session"
+        );
+        assert_eq!(connection.close_reason(), CloseReason::ProtocolRejected);
+        assert_eq!(connection.protocol_version(), Some(rejected));
+    }
+
+    /// The gate itself, asserted here so the refusal the test above simulates
+    /// is the refusal production actually produces.
+    #[test]
+    fn only_an_exact_protocol_match_is_admitted() {
+        assert!(validate_client_protocol_version(Some(WS_PROTOCOL_VERSION)).is_ok());
+        assert!(validate_client_protocol_version(Some(WS_PROTOCOL_VERSION - 1)).is_err());
+        assert!(
+            validate_client_protocol_version(None).is_err(),
+            "the legacy Token shape reports no version and is refused for it"
+        );
+    }
+
+    /// A client that retries after a refusal and succeeds is not still
+    /// described by the refusal it recovered from.
+    #[test]
+    fn a_retry_that_succeeds_is_no_longer_described_as_rejected() {
+        let connection = handshaken("auth-retry", WS_PROTOCOL_VERSION);
+        record_authentication_outcome(&connection, &Ok(ConnectionState::Unauthenticated));
+        assert_eq!(connection.close_reason(), CloseReason::ProtocolRejected);
+
+        record_authentication_outcome(
+            &connection,
+            &Ok(authenticated(7, false, MatchmakingPool::Public)),
+        );
+
+        assert_eq!(connection.close_reason(), CloseReason::SocketClosed);
+        assert!(connection.has_session());
     }
 }
