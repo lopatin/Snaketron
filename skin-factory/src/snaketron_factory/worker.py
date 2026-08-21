@@ -251,6 +251,18 @@ the deterministic factory driver.
                 request_id=request_id,
             )
         content = message.get("content")
+        structured_output_channel = "content"
+        # LM Studio's Qwen thinking parser can place the response-format JSON
+        # in reasoning_content while returning an explicitly empty content
+        # string. Accept that narrow representation only when the ordinary
+        # channel is empty; the candidate still has to validate as the exact
+        # closed WorkerResult schema below. Never prefer hidden reasoning over
+        # a nonempty content response.
+        if isinstance(content, str) and not content.strip():
+            reasoning_content = message.get("reasoning_content")
+            if isinstance(reasoning_content, str) and reasoning_content.strip():
+                content = reasoning_content
+                structured_output_channel = "reasoning_content"
         if not isinstance(content, str):
             raise ProviderError(
                 ProviderFailureKind.INVALID_OUTPUT,
@@ -296,6 +308,7 @@ the deterministic factory driver.
             sanitized_metadata={
                 "finish_reason": choices[0].get("finish_reason"),
                 "system_fingerprint": body.get("system_fingerprint"),
+                "structured_output_channel": structured_output_channel,
             },
             usage=usage_result,
         )

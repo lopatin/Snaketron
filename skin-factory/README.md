@@ -68,3 +68,6 @@ one digest in every Attempt's behavior snapshot.
 
 Production installation, service environment, Hermes cron setup, calibration,
 backup, recovery, and rollback are documented in `docs/hermes-operations.md`.
+For a safe real local checkout with isolated ports, automatic least-privilege
+account provisioning, and an explicit paid `run` boundary, use
+[`docs/local-calibration.md`](docs/local-calibration.md).

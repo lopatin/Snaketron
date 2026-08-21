@@ -190,20 +190,25 @@ or cross-checkout locator fails closed.
 
 ## Start the task worker
 
-The default worker is the exact `qwen3.8-27b` identifier served from LM Studio's
+The default worker is the exact `qwen/qwen3.8-27b` identifier served from LM Studio's
 OpenAI-compatible API at `http://localhost:1234/v1`. Load that exact model,
 enable the local server, and confirm that both `/v1/models` and
 `/v1/chat/completions` are available. The completion endpoint must support
 strict `json_schema` response format, reject tool execution, accept prototype
 images as data URLs for real authoring requests, and return the exact model id
-in its response. If the endpoint requires authentication, add
+in its response. LM Studio's Qwen thinking parser may return the schema-valid
+JSON in `reasoning_content` with an empty `content`; the adapter accepts only
+that narrow representation and still validates the exact closed
+`WorkerResult` schema. If the endpoint requires authentication, add
 `LMSTUDIO_API_KEY` to the owner-private service JSON.
 
 The online doctor does more than query `/models`: it sends one bounded
-side-effect-free WorkerRequest fixture with no artifacts, network, tools, or
-asset work. It requires a schema-valid WorkerResult, a procedural layer-only
-handoff, and an exact resolved-model match. Cron enablement fails if this real
-worker conformance request fails.
+side-effect-free WorkerRequest fixture with a generated image-only identifier
+but no artifact references, network, tools, or asset work. It requires the
+identifier in the returned document name, a schema-valid WorkerResult, a
+procedural layer-only handoff, deterministic SkinDoc gates, and an exact
+resolved-model match. Cron enablement fails if this real worker conformance
+request fails.
 
 ## Online smoke test
 

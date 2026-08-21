@@ -166,6 +166,58 @@ async def test_openai_worker_sends_no_tools_and_validates_strict_json(
 
 
 @pytest.mark.asyncio
+async def test_openai_worker_accepts_only_schema_valid_reasoning_content_when_content_is_empty(
+    factory_config,
+) -> None:
+    response = httpx.Response(
+        200,
+        json={
+            "model": "worker-test-resolved",
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": worker_result().model_dump_json(),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        },
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response))
+    result = await OpenAICompatibleWorker(factory_config, client=client).execute(worker_request())
+    await client.aclose()
+
+    assert isinstance(result.value, WorkerResult)
+    assert result.sanitized_metadata["structured_output_channel"] == "reasoning_content"
+
+
+@pytest.mark.asyncio
+async def test_openai_worker_never_replaces_nonempty_content_with_reasoning_content(factory_config) -> None:
+    response = httpx.Response(
+        200,
+        json={
+            "model": "worker-test-resolved",
+            "choices": [
+                {
+                    "message": {
+                        "content": "not-json",
+                        "reasoning_content": worker_result().model_dump_json(),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response))
+    adapter = OpenAICompatibleWorker(factory_config, client=client)
+    with pytest.raises(ProviderError, match="violated WorkerResult"):
+        await adapter.execute(worker_request())
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_openai_worker_missing_usage_keeps_the_full_reservation(factory_config) -> None:
     response = httpx.Response(
         200,
