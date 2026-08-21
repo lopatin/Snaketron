@@ -39,9 +39,9 @@ flag the disagreement to Alex.
 | --- | --- |
 | `~/Snaketron` | The repo. Builds happen in a dedicated worktree, never on master. |
 | `~/Snaketron/skin-factory/config.yaml` | Phase, caps, WIP limits, pinned model configs (chat, judges, embedder — model + version/quant), thresholds. The only file you read for policy. |
-| `~/Snaketron/skin-factory/state/` | `catalog.jsonl`, `lessons.jsonl`, `decisions.jsonl`, `escalations.jsonl`, `metrics.json`, `audit.md` (append-only), `loop-state.json` |
-| `~/Snaketron/skin-factory/prompts/` | GEPA-tuned slot prompts (ideation, build slots). Read-only to you — edited only in maintenance sessions. |
-| `~/Snaketron/skin-factory/judges/` | Judge rubrics (concept + craft) + the pinned judge config. Read-only to you. |
+| `~/Snaketron/skin-factory/state/` | `catalog.jsonl`, `lessons.jsonl`, `decisions.jsonl`, `escalations.jsonl`, `metrics.json`, `audit.md` (append-only), `loop-state.json`, `prototypes/<concept-id>/` (approved prototypes + alternates — committed, they are build targets and taste data) |
+| `~/Snaketron/skin-factory/prompts/` | GEPA-tuned slot prompts (ideation, prototype, build slots). Read-only to you — edited only in maintenance sessions. |
+| `~/Snaketron/skin-factory/judges/` | Judge rubrics (concept + prototype + craft) + the pinned judge config. Read-only to you. |
 | `~/Snaketron/skin-factory/runs/<id>/` | Per-attempt traces (gitignored): slot inputs/outputs, gate reports, judge outputs |
 
 ## Preflight (every invocation)
@@ -50,9 +50,13 @@ flag the disagreement to Alex.
    carve-out: an explicit **"dry-run a tick"** request from Alex is allowed in
    `m1` (submissions stubbed, no state mutation beyond the audit note). Any
    other invocation outside m2/m3: dormant — report and stop.
-2. LM Studio serving the pinned chat model **and** the pinned embedding model
-   (config names both; a different model/quant than pinned is a halt, not a
-   substitution).
+2. LM Studio serving the pinned chat model, the pinned embedding model, **and
+   the judge model with its vision projector loaded** (config names all three,
+   projector file included). Probe the vision path with a trivial image before
+   the first judge call of the tick — the prototype and craft judges read
+   images, and a projector that silently failed to load produces confident
+   text-only guesses instead of an error. A different model/quant than pinned,
+   or a missing projector, is a halt — never a substitution.
 3. `factory budget` passes — if a cap is exceeded, record a no-op tick in the
    audit log and stop. (The CLI meters every external call itself and refuses
    over-budget ones; this check is the outer layer, not the only one.)
@@ -68,10 +72,16 @@ never left sitting while the factory produces more of the same mistake.
 
 ### 1. Ingest — `factory ingest`
 
-Polls the decision feed, advances the cursor, appends decision rows, assigns
-the 1-in-5 **holdout label at ingest** (PRD §7.3), and recomputes
-`metrics.json` (trailing agreement, error split, approval rate) — all
-deterministic code. You read its report; you do not redo its math.
+Polls the decision feed, advances the cursor, and appends the rows it finds —
+queue verdicts on submitted skins, plus per-image verdicts on any prototype
+batch that went to Alex through the sampling lane. Every row carries `stage`
+(prototype | implementation | queue) and `rater` (alex | judge:<config-id>);
+only `rater: alex` rows are ever calibration data (PRD §5.5). It resumes any
+concept whose prototype review has come back, and recomputes `metrics.json`
+(per-stream trailing agreement, error split, approval rate, prototype yield) —
+all deterministic code. You read its report; you do not redo its math.
+Holdout labels are assigned per-stream by `factory append`, wherever a row is
+written — not here (PRD §7.3).
 
 ### 2. Retrospect — locally, risk-tiered (PRD §11.5)
 
@@ -85,7 +95,10 @@ count. For the rest, split what the retrospective proposes by tier:
   attached as a quote. Via `factory append` only.
 - **Pending:** any *inferred* lesson (the model's reading of *why*) is
   appended with status `pending` — inert, excluded from every prompt context,
-  until a maintenance session activates it.
+  until a maintenance session activates it. An ideation negative exemplar is
+  written **only** when the retrospective routed the rejection to a
+  concept-level layer (1, 2, 3, or taste-flavored 3a); an execution failure
+  says nothing about the idea.
 - **Escalate:** anything behavioral — proposed edits to slot prompts, skills,
   judge rubrics, gates; specific→general promotions; taste proposals; any
   low-confidence or unroutable retrospective. Full evidence bundle to
@@ -98,11 +111,14 @@ the build worktree changed. If something did: revert it and halt
 
 ### 3. Check halts — `factory halt-check`
 
-Evaluates PRD §12.4 mechanically: 3 consecutive rejections · 5 consecutive
-kills (the CLI re-runs the deterministic holdout builds and reports only
-pass/fail per brief + the bisected suspect change — never holdout traces) ·
-trailing-20 agreement < 0.60 · repeat root cause · budgets · stale queue
-(> 14 days) · 3 halts in 7 days → full stop. On any: set `halted` + reason in
+Evaluates PRD §12.4 mechanically: 3 consecutive rejections · 3 consecutive
+zero-approval prototype kills or a trailing-10 clean-batch rate under the
+floor (the taste stream's own alarm — the agreement rule cannot fire on a
+stream the judge labels alone) · 5 consecutive build kills (the CLI re-runs
+the deterministic holdout builds and reports only pass/fail per brief + the
+bisected suspect change — never holdout traces) · trailing-20 agreement
+< 0.60 · repeat root cause · budgets · stale queue including unreviewed
+prototype batches (> 14 days) · 3 halts in 7 days → full stop. On any: set `halted` + reason in
 `loop-state.json`, `factory append` a `# HALT` to the audit log, notify Alex
 with the reason and the one action that unblocks (usually "start a maintenance
 session"). Never auto-resume.
@@ -115,14 +131,39 @@ session"). Never auto-resume.
    deterministically (novelty distance, then least-recently-used tag family,
    then seed priority). No winner above threshold → log and skip building
    this tick.
-2. **Build** (PRD §9): fresh worktree; run the `factory` driver on the brief.
-   The driver owns the mechanics (image calls — metered against the caps —
-   sprite tooling, validator, render, capture) and consults the local model
-   only at its defined slots with the tuned prompts. The trace lands in
-   `runs/<id>/`.
-3. **Outcome**: gates green → submit via the API (origin marker `factory`).
-   Dead after allowed repairs → mark `killed` and run step 2's retrospective
-   on the kill trace this same tick.
+2. **Prototype** (PRD §9.1): the prototype-prompt slot turns the brief +
+   design-direction doc + reference anchors (owned assets from
+   `direction/anchors/` only) into a Gemini prompt; `factory` runs a batch of
+   **5 independent generations** (metered); each image gets an individual
+   verdict + reason, recorded as a `stage: prototype` decision with its
+   `rater`. The reviewer follows `config.yaml`'s `prototype_review` lane:
+   `judge`, `alex`, or `sampled` — the default — where every Nth batch and
+   any batch the judge would kill outright goes to Alex instead. **An
+   Alex-routed batch suspends the concept rather than blocking the tick**:
+   `factory` persists the images under `state/prototypes/<concept-id>/`, sets
+   `creative_status: awaiting_prototype_review`, drops it from the WIP count,
+   notifies, and the tick moves on; a later `factory ingest` resumes it.
+   Otherwise: any rejection → fold that batch's reasons into a revised prompt
+   and rerun **a full fresh batch of 5**, ≤ 3 iterations (earlier approvals
+   carry as alternates, not as members of the new batch). Clean batch or ≥ 1
+   approval after 3 → proceed with the highest-scoring approved prototype as
+   the build reference. Zero approvals → the concept dies here (cost: images,
+   not a build); set `creative_status: prototype_killed` and retrospect the
+   kill this tick.
+3. **Build** (PRD §9.2): fresh worktree; run the `factory` driver on the
+   brief + approved prototype. The driver owns the mechanics (image calls —
+   metered against the caps — sprite tooling, validator, render, capture)
+   and consults the local model only at its defined slots with the tuned
+   prompts; self-review judges **prototype fidelity first**. The trace lands
+   in `runs/<id>/`.
+4. **Outcome**: gates green → submit via the API (origin marker `factory`),
+   setting `execution_status: submitted`. Dead after allowed repairs → set
+   `execution_status: killed` and run step 2's retrospective on the kill
+   trace this same tick. A concept whose queue rejection the retrospective
+   routed to build craft (layer 4) keeps its `creative_status:
+   prototype_approved` and is re-queued for **one** rebuild from the same
+   approved prototype once the lesson lands — no new ideation, no new
+   prototype pass.
 
 ### 5. Close — `factory commit-tick`
 
@@ -136,7 +177,8 @@ consolidated notification — never one ping per item.
 ## Special invocations
 
 - **"Status"**: phase, approved count vs target, pending, trailing approval
-  rate, judge agreement + error split, repeat-root-cause count, spend vs caps,
+  rate, prototype yield (clean-batch rate, approvals per batch), per-stream
+  judge agreement + error split, repeat-root-cause count, spend vs caps,
   active halts, escalation-queue depth and age. All numbers from
   `factory metrics` output, none recomputed by you.
 - **"Dry-run a tick"**: the export-gate rehearsal (PRD §12.2 item 4) — allowed
