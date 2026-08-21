@@ -418,6 +418,39 @@ class ReviewService:
             raise VersionConflict("approval must name a prototype from the exact attempt")
         if artifact["content_hash"] != content_hash:
             raise VersionConflict("prototype approval hash differs from retained bytes")
+        behavior = json.loads(attempt["behavior_json"])
+        snapshot_version = int(behavior.get("snapshot_version", 0))
+        if 0 < snapshot_version < 6:
+            raise VersionConflict(
+                "legacy prototype cannot authorize a build; retry from prototype under the shared geometry rules"
+            )
+        if snapshot_version >= 6:
+            expected = {
+                "design_guidelines_sha256": behavior.get("design_guidelines_sha"),
+                "prototype_geometry_sha256": behavior.get("prototype_geometry_sha"),
+                "prototype_guide_sha256": behavior.get("prototype_guide_sha"),
+            }
+            manifest_payload: dict[str, Any] | None = None
+            lineage_attempt = attempt
+            while lineage_attempt is not None:
+                for manifest in self.database.artifacts_for_attempt(
+                    lineage_attempt["id"],
+                    stage=Stage.PROTOTYPE,
+                    kind=ArtifactKind.PROTOTYPE_MANIFEST,
+                ):
+                    payload = self.persistence.load_json(manifest["object_ref"])
+                    if payload.get("image_sha256") == content_hash:
+                        manifest_payload = payload
+                        break
+                if manifest_payload is not None or not lineage_attempt.get("parent_attempt_id"):
+                    break
+                lineage_attempt = self.database.get_attempt(lineage_attempt["parent_attempt_id"])
+            if manifest_payload is None:
+                raise VersionConflict("prototype approval requires its exact contract-bound manifest")
+            if any(manifest_payload.get(key) != value for key, value in expected.items()):
+                raise VersionConflict(
+                    "legacy or mismatched prototype cannot authorize a build; retry from prototype under current rules"
+                )
         self._assert_no_blocking_failure(attempt_id, artifact_id)
         self._assert_blind_prototype_label(artifact_id)
         existing = self.database.find_exact_decision(

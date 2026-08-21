@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from snaketron_factory.domain import (
     GateResult,
     GateVerdict,
     OperationStatus,
+    Purpose,
     Stage,
 )
 from snaketron_factory.gallery import create_app
@@ -80,6 +82,72 @@ def auth(secret: str, actor: str = "human:alex") -> dict[str, str]:
     return {"authorization": f"Bearer {secret}", "x-review-actor": actor}
 
 
+def prototype_review_attempt_with_evidence(
+    database: Database,
+    objects: ObjectStore,
+    *,
+    contract_guide_sha: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes]:
+    guide = b"\x89PNG\r\n\x1a\nexact behavior-pinned blank snake guide"
+    guide_object = objects.put(guide)
+    contract = {
+        "schema_version": 1,
+        "id": "prototype-geometry-gallery-test-v1",
+        "guide": "fixtures/blank-snake.png",
+        "guide_sha256": contract_guide_sha or guide_object.sha256,
+        "renderer_source": {
+            "body_cells": 16,
+            "native_cell_px": 15,
+            "head_direction": "right",
+        },
+        "presentation_transform": {"type": "nearest_neighbor_integer_upscale", "scale": 4},
+    }
+    contract_bytes = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+    contract_object = objects.put(contract_bytes)
+    concept = database.create_concept(
+        name="Pinned geometry gallery evidence",
+        brief="Review the exact candidate against its retained blank snake geometry input.",
+        seed="pinned-geometry-gallery",
+        source="test",
+        tags=["test", "geometry"],
+    )
+    attempt = database.create_attempt(
+        concept_id=concept["id"],
+        purpose=Purpose.PRODUCTION,
+        stage=Stage.PROTOTYPE_REVIEW,
+        idempotency_key="pinned-geometry-gallery",
+        behavior={
+            "snapshot_version": 6,
+            "prototype_geometry_sha": contract_object.sha256,
+            "prototype_geometry_ref": contract_object.uri,
+            "prototype_guide_sha": guide_object.sha256,
+            "prototype_guide_ref": guide_object.uri,
+        },
+        direction_sha="1" * 64,
+        skill_sha="2" * 64,
+        capability_sha="3" * 64,
+        gate_sha="4" * 64,
+        model_config_sha="5" * 64,
+    )
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        disposition=Disposition.NEEDS_HUMAN,
+        review_kind="prototype",
+    )
+    candidate = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"exact candidate pixels",
+        media_type="image/png",
+        metadata={"prototype_index": 0},
+    )
+    return attempt, candidate, contract_bytes, guide
+
+
 def test_gallery_requires_distinct_human_auth_and_sets_security_headers(
     factory_config, database, objects, monkeypatch
 ) -> None:
@@ -97,6 +165,81 @@ def test_gallery_requires_distinct_human_auth_and_sets_security_headers(
         assert forbidden.status_code == 403
         assert client.get("/api/gallery/all", headers=auth(secret)).status_code == 200
         assert client.get("/api/gallery/not-a-view", headers=auth(secret)).status_code == 404
+
+
+def test_prototype_review_shows_and_serves_exact_behavior_pinned_geometry_evidence(
+    factory_config, database, objects, monkeypatch
+) -> None:
+    app, secret = review_app(factory_config, database, objects, monkeypatch)
+    attempt, candidate, contract_bytes, guide = prototype_review_attempt_with_evidence(database, objects)
+    behavior = json.loads(attempt["behavior_json"])
+    contract_hash = f"sha256:{behavior['prototype_geometry_sha']}"
+    guide_hash = f"sha256:{behavior['prototype_guide_sha']}"
+    guide_url = f"/attempts/{attempt['id']}/prototype-evidence/guide"
+    contract_url = f"/attempts/{attempt['id']}/prototype-evidence/contract"
+
+    with TestClient(app) as client:
+        assert client.get(guide_url).status_code == 401
+        assert client.get(contract_url).status_code == 401
+
+        page = client.get(f"/attempts/{attempt['id']}", headers=auth(secret))
+        assert page.status_code == 200
+        assert "Prototype geometry evidence" in page.text
+        assert "Exact retained blank snake geometry guide" in page.text
+        assert "15px native real-render cell" in page.text
+        assert "4\u00d7 review presentation" in page.text
+        assert contract_hash in page.text
+        assert guide_hash in page.text
+        assert guide_url in page.text
+        assert contract_url in page.text
+        assert f"/artifacts/{candidate['id']}" in page.text
+
+        detail = client.get(f"/api/attempts/{attempt['id']}", headers=auth(secret)).json()
+        assert detail["prototype_review_evidence"] == {
+            "contract_id": "prototype-geometry-gallery-test-v1",
+            "contract_hash": contract_hash,
+            "guide_hash": guide_hash,
+            "contract_url": contract_url,
+            "guide_url": guide_url,
+            "body_cells": 16,
+            "native_cell_px": 15,
+            "presentation_scale": 4,
+            "head_direction": "right",
+        }
+
+        guide_response = client.get(guide_url, headers=auth(secret))
+        assert guide_response.content == guide
+        assert guide_response.headers["content-type"] == "image/png"
+        assert guide_response.headers["etag"] == f'"{behavior["prototype_guide_sha"]}"'
+        assert guide_response.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+        contract_response = client.get(contract_url, headers=auth(secret))
+        assert contract_response.content == contract_bytes
+        assert contract_response.headers["content-type"] == "application/json"
+        assert contract_response.headers["etag"] == f'"{behavior["prototype_geometry_sha"]}"'
+        assert (
+            client.get(
+                f"/attempts/{attempt['id']}/prototype-evidence/not-a-part",
+                headers=auth(secret),
+            ).status_code
+            == 404
+        )
+
+
+def test_prototype_review_refuses_a_contract_that_does_not_name_the_retained_guide(
+    factory_config, database, objects, monkeypatch
+) -> None:
+    app, secret = review_app(factory_config, database, objects, monkeypatch)
+    attempt, _, _, _ = prototype_review_attempt_with_evidence(
+        database,
+        objects,
+        contract_guide_sha="0" * 64,
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        page = client.get(f"/attempts/{attempt['id']}", headers=auth(secret))
+        assert page.status_code == 422
+        assert page.json()["detail"] == ("pinned prototype geometry contract does not name the retained guide bytes")
 
 
 def test_gallery_exposes_exact_retained_artifacts_but_keeps_shadow_scores_blind(

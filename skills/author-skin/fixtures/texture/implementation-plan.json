@@ -1,6 +1,14 @@
 {
   "path": "texture",
   "rationale": "A static coat retains irregular material detail; role-readable layers remain underneath and around it.",
+  "design_guidelines": {
+    "artistic_direction": "A polished shell mosaic with irregular facets and a clean role-coloured contour.",
+    "concept_twist": "A familiar armored shell surface is stretched into a continuously growing snake mosaic.",
+    "structure": "sprite",
+    "body_strategy": "Large facets reduce to a clear material cue at 4 cells, become legible by 6-7 cells, and x-tile across long turns without covering the head glow.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Use one production-quality 64-texel-per-cell coat; its x join must remain visually seamless after every served transformation."
+  },
   "fidelity_features": [
     "irregular shell facets",
     "long non-obvious repeat",

@@ -550,6 +550,58 @@ async def test_exact_prototype_approval_is_the_only_transition_into_authoring(
         )
 
 
+def test_legacy_prototype_cannot_authorize_a_new_build_after_shared_geometry_contract(
+    database, objects, review: ReviewService
+) -> None:
+    concept = database.create_concept(
+        name="Legacy wide prototype",
+        brief="A retained pre-contract image remains reviewable but cannot seed new authoring.",
+        seed="legacy-wide-prototype",
+        source="test",
+        tags=["legacy"],
+    )
+    attempt = database.create_attempt(
+        concept_id=concept["id"],
+        purpose=Purpose.PRODUCTION,
+        stage=Stage.PROTOTYPE_REVIEW,
+        idempotency_key="legacy-wide-prototype",
+        behavior={"snapshot_version": 5},
+        direction_sha="1" * 64,
+        skill_sha="2" * 64,
+        capability_sha="3" * 64,
+        gate_sha="4" * 64,
+        model_config_sha="5" * 64,
+    )
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        disposition=Disposition.NEEDS_HUMAN,
+        review_kind="prototype",
+    )
+    prototype = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"pre-contract articulated prototype",
+        media_type="image/png",
+    )
+
+    with pytest.raises(VersionConflict, match="retry from prototype under the shared geometry rules"):
+        review.approve_prototype(
+            attempt_id=attempt["id"],
+            artifact_id=prototype["id"],
+            content_hash=prototype["content_hash"],
+            feedback="do not allow this old geometry into a new build",
+            actor="human:alex",
+        )
+    retained = database.get_attempt(attempt["id"])
+    assert retained["stage"] == Stage.PROTOTYPE_REVIEW
+    assert retained["disposition"] == Disposition.NEEDS_HUMAN
+    assert database.decisions_for_attempt(attempt["id"]) == []
+
+
 @pytest.mark.asyncio
 async def test_blocking_safety_ip_gate_cannot_be_overridden_or_published(
     database, objects, make_attempt, review: ReviewService

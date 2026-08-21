@@ -4,9 +4,12 @@ Validate in this order and retain every report, including failures.
 
 1. **Input binding:** approval hash equals prototype hash; direction, skill,
    capability, schema, renderer, and gate SHAs are pinned.
-2. **Plan:** validate `implementation-plan.json`; every fidelity feature has an
-   owner, image layer has a fallback, asset X/Y and wrap use agree, and the path
-   matches its requests.
+2. **Plan:** validate `implementation-plan.json`; its exact bounded
+   `design_guidelines` object names one artistic direction, primary structure,
+   four-cell/early-growth/long-turn behavior, supported head-zone polarity, and
+   an asset strategy that agrees with executable seams and cadence. Every
+   fidelity feature has an owner, every image layer has a fallback, asset X/Y
+   and wrap use agree, and the path matches its requests.
 3. **Document:** parse and validate SkinDoc v2 with the repository binary. Do
    not use a test-name filter that can match zero tests.
 4. **References:** resolve owned/shareable immutable texture descriptors, kinds,

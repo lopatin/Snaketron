@@ -106,6 +106,9 @@ class PrototypeManifest(StrictModel):
     prompt: str
     provider_config: str = Field(alias="model_config", serialization_alias="model_config")
     image_sha256: str
+    design_guidelines_sha256: str | None = None
+    prototype_geometry_sha256: str | None = None
+    prototype_guide_sha256: str | None = None
 
 
 class AssetPlan(StrictModel):
@@ -138,6 +141,17 @@ class AssetPlan(StrictModel):
         return self
 
 
+class DesignGuidelinesEvidence(StrictModel):
+    """Bounded proof that the locked visual contract informed authoring."""
+
+    artistic_direction: str = Field(min_length=1, max_length=240)
+    concept_twist: str = Field(min_length=1, max_length=240)
+    structure: Literal["pattern", "sprite"]
+    body_strategy: str = Field(min_length=1, max_length=320)
+    head_zone: Literal["light_field_dark_core", "dark_field_light_disc_dark_core"]
+    asset_strategy: str = Field(min_length=1, max_length=320)
+
+
 class ImplementationPlan(StrictModel):
     path: Literal["layers", "texture", "sprite_sheet", "hybrid"]
     rationale: str
@@ -147,6 +161,7 @@ class ImplementationPlan(StrictModel):
     animation_plan: list[str]
     required_wrap_axes: list[Literal["x", "y"]]
     risks: list[str]
+    design_guidelines: DesignGuidelinesEvidence
 
     @model_validator(mode="after")
     def route_matches_assets(self) -> ImplementationPlan:

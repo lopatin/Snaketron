@@ -10,6 +10,7 @@ paths:
   skill_dir: ../skills/author-skin
   capability_manifest: ../skin-schema/capabilities-v2.json
   direction: direction/design-direction.md
+  prototype_geometry: ../skin-schema/prototype-geometry-v1.json
   gate_manifest: config/gates.yaml
   lama_manifest: lama/manifest.json
   lama_model: var/lama/big-lama-v0.1.0.pt

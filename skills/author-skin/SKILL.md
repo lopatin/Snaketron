@@ -26,7 +26,10 @@ regenerate the approved direction.
 ## Load the contract
 
 Read [references/contract.md](references/contract.md) completely. It is locked
-policy. Then read only the craft references needed for this build:
+policy. Always read the locked shared
+[Skin Design Guidelines](references/design-guidelines.md) completely and apply
+them in the implementation plan. Then read only the other craft references
+needed for this build:
 
 - Always read [references/prototypes.md](references/prototypes.md) and
   [references/playbook.md](references/playbook.md).
@@ -45,6 +48,9 @@ policy. Then read only the craft references needed for this build:
    rules in the playbook. Prefer layers for patterns and formula-driven motion.
 3. Before requesting or generating assets, emit `implementation-plan.json`
    conforming to [schemas/implementation-plan.schema.json](schemas/implementation-plan.schema.json).
+   Fill its bounded `design_guidelines` object from the shared guidelines;
+   these decisions must agree with the executable layer, asset, wrap, and
+   animation plan.
    Record every image asset's natural X length and frame count Y, plus its
    placement and wrap axes. Name each image layer's fallback in `layer_plan`,
    and put the reason for changing the prototype hint in `rationale`.

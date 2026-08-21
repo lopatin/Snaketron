@@ -7,6 +7,15 @@ engine. Gemini supplies the configured smart-text, visual-judge, and image
 roles, while any conforming local or API task worker can consume the canonical
 `skills/author-skin` package.
 
+Prototype generation and downstream authoring share one locked visual contract:
+`skills/author-skin/references/design-guidelines.md`. Each new Attempt also
+pins the machine-readable runtime geometry contract and its repository-owned
+blank snake guide. Gemini receives that guide as an image reference and may
+paint only its continuous round-capped body; the exact same rules, contract,
+guide bytes, and hashes follow a human-approved prototype into the authoring
+worker. A legacy or mismatched prototype is retained but cannot authorize a
+new build.
+
 The image-generator role may instead use an explicitly configured
 `openai_compatible` provider. Its adapter sends strict JSON-schema and
 multimodal requests to Chat Completions, new images to Images generations, and

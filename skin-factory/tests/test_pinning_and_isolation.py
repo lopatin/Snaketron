@@ -204,6 +204,14 @@ def _author_result() -> WorkerResult:
             animation_plan=["time-based highlight"],
             required_wrap_axes=[],
             risks=[],
+            design_guidelines={
+                "artistic_direction": "One procedural direction.",
+                "concept_twist": "Original retained fixture.",
+                "structure": "pattern",
+                "body_strategy": "Works at four cells and while the body grows and turns.",
+                "head_zone": "light_field_dark_core",
+                "asset_strategy": "Procedural layers require no raster seams.",
+            },
         ),
         skin_document={
             "schema_version": 2,
@@ -376,6 +384,14 @@ async def test_snapshots_survive_repo_file_changes_and_model_drift_fails_before_
 ) -> None:
     factory = _snapshot_factory(factory_config, database, objects, renderer=_PinnedRenderer())
     snapshot = factory.behavior_snapshot()
+    assert (
+        objects.get(snapshot["design_guidelines_ref"])
+        == (factory_config.paths.skill_dir / "references" / "design-guidelines.md").read_bytes()
+    )
+    assert objects.get(snapshot["prototype_geometry_ref"]) == factory_config.paths.prototype_geometry.read_bytes()
+    geometry = json.loads(factory_config.paths.prototype_geometry.read_text(encoding="utf-8"))
+    guide_path = factory_config.paths.prototype_geometry.parent / geometry["guide"]
+    assert objects.get(snapshot["prototype_guide_ref"]) == guide_path.read_bytes()
     concept = database.create_concept(
         name="Pinned inputs",
         brief="Immutable execution inputs are loaded from retained object bytes.",
@@ -426,6 +442,75 @@ async def test_snapshots_survive_repo_file_changes_and_model_drift_fails_before_
         assert (
             connection.execute("SELECT count(*) FROM operation WHERE attempt_id=?", (attempt["id"],)).fetchone()[0] == 0
         )
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_prototype_geometry_or_guide_drift_blocks_before_operation_intent_or_provider_call(
+    factory_config, database: Database, objects: ObjectStore
+) -> None:
+    factory = _snapshot_factory(factory_config, database, objects)
+    snapshot = factory.behavior_snapshot()
+    concept = database.create_concept(
+        name="Geometry pinned",
+        brief="The exact blank guide and geometry rules must stay immutable before spend.",
+        seed="geometry-pinned",
+        source="test",
+        tags=[],
+    )
+    attempt = database.create_attempt(
+        concept_id=concept["id"],
+        purpose=Purpose.PRODUCTION,
+        stage=Stage.PROTOTYPE,
+        idempotency_key="geometry-pinned",
+        behavior=snapshot,
+        direction_sha=snapshot["direction_sha"],
+        skill_sha=snapshot["skill_sha"],
+        capability_sha=snapshot["capability_sha"],
+        gate_sha=snapshot["gate_sha"],
+        model_config_sha=snapshot["model_config_sha"],
+    )
+    contract = json.loads(factory_config.paths.prototype_geometry.read_text(encoding="utf-8"))
+    guide_path = factory_config.paths.prototype_geometry.parent / contract["guide"]
+    original_guide = guide_path.read_bytes()
+    guide_path.write_bytes(original_guide + b"drift")
+    invoked = False
+
+    async def invoke() -> ProviderResult:
+        nonlocal invoked
+        invoked = True
+        return ProviderResult(value={"image": b"never"}, resolved_model="gemini-3-pro-image")
+
+    with pytest.raises(BehaviorDrift, match="prototype geometry guide hash"):
+        await factory._provider_call(
+            attempt=attempt,
+            stage=Stage.PROTOTYPE,
+            key="geometry-must-not-run",
+            role="image_generator",
+            side_effect="generate_prototype_image",
+            request={"prompt": "never"},
+            invoke=invoke,
+        )
+    assert not invoked
+    with database.connect() as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM operation WHERE attempt_id=?", (attempt["id"],)).fetchone()[0] == 0
+        )
+
+    guide_path.write_bytes(original_guide)
+    contract["invariants"] = [*contract["invariants"], "checkout-only drift"]
+    factory_config.paths.prototype_geometry.write_text(json.dumps(contract), encoding="utf-8")
+    with pytest.raises(BehaviorDrift, match="prototype geometry contract changed"):
+        await factory._provider_call(
+            attempt=attempt,
+            stage=Stage.PROTOTYPE,
+            key="contract-must-not-run",
+            role="image_generator",
+            side_effect="generate_prototype_image",
+            request={"prompt": "never"},
+            invoke=invoke,
+        )
+    assert not invoked
     await factory.close()
 
 

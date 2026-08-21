@@ -7,7 +7,7 @@
   "operation": "generate",
   "kind": "sheet",
   "input_artifacts": [],
-  "prompt": "Describe exact art, axes, grid, scale, transparency, and exclusions.",
+  "prompt": "Production-quality art in one confident style; describe exact snake-space grid, mark scale, transparency, required seamless axes, and exclusions. For a sheet, each row is one full frame with no gutters and row zero is a complete resting pose.",
   "width_px": 640,
   "height_px": 768,
   "grid": {

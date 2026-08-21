@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "prototype-geometry-v1",
+  "guide": "fixtures/prototype-geometry-guide-v1.png",
+  "guide_sha256": "620c98c34f9d4cf0b7366954d48ab964653639d0b5e2a866110093b3de4d19ae",
+  "live_cell_sizes_px": [5, 10, 15],
+  "renderer_source": {
+    "fixture": "prototype_straight_16",
+    "compressed_cells_head_first": [[16, 1], [1, 1]],
+    "role": "own",
+    "native_cell_px": 15,
+    "canvas_cells": [18, 3],
+    "native_canvas": { "width_px": 270, "height_px": 45 },
+    "native_image": "fixtures/prototype-geometry-native-v1.png",
+    "native_sha256": "f7787181df0c3f3addd9f49f9e654f610996adac8d655d7569e6081752aa0999",
+    "skin_document": "fixtures/prototype-geometry-blank.skin.json",
+    "skin_document_sha256": "5deb17e404d1894ce195c5e43ba02e29ed562f88b7be58813a8ea83e75862829",
+    "body_cells": 16,
+    "head_direction": "right",
+    "head_core_ratio": 0.38
+  },
+  "presentation_transform": {
+    "type": "nearest_neighbor_integer_upscale",
+    "scale": 4
+  },
+  "guide_canvas": {
+    "width_px": 1080,
+    "height_px": 180,
+    "background": "#666666",
+    "body_mask": "#ffffff",
+    "system_head_core": "#1c1c1c"
+  },
+  "invariants": [
+    "orthographic flat side view",
+    "one continuous one-cell-wide capsule-union silhouette",
+    "rightmost rounded cell is the head",
+    "leftmost endpoint is a rounded tail cap",
+    "centered system-owned head-core disc remains topmost",
+    "all authored body imagery stays inside the round silhouette",
+    "no articulated modules, gaps, perspective, oversized head, or pointed tail"
+  ]
+}

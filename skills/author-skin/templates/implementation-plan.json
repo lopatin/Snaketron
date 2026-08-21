@@ -1,6 +1,14 @@
 {
   "path": "layers",
   "rationale": "Replace with the measured reason this route is faithful.",
+  "design_guidelines": {
+    "artistic_direction": "Replace with one confident visual direction.",
+    "concept_twist": "Original concept, or name the abstract familiar premise and its distinct twist.",
+    "structure": "pattern",
+    "body_strategy": "Read clearly at the 4-cell spawn and early 6-7 cells, then grow and turn without hiding the head cue.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Procedural layers only; raster seams and sprite cadence are not applicable."
+  },
   "fidelity_features": [
     "Replace with the highest-priority game-scale feature"
   ],

@@ -99,9 +99,27 @@ async def test_service_doctor_does_not_require_operator_authority(tmp_path: Path
     names = {item.name for item in report.checks}
     assert report.ok is True
     assert "cached_renderer_bundle" in names
+    assert "prototype_geometry_contract" in names
+    assert "prototype_geometry" in names
     assert "credential:SKIN_FACTORY_REVIEW_TOKEN" not in names
     assert "credential:SNAKETRON_FACTORY_OPERATOR_TOKEN" not in names
     assert "credential:SNAKETRON_FACTORY_SERVICE_TOKEN" in names
+
+
+@pytest.mark.asyncio
+async def test_doctor_fails_closed_when_the_blank_prototype_guide_differs_from_its_contract(
+    factory_config,
+) -> None:
+    factory = Factory(factory_config)
+    contract = json.loads(factory_config.paths.prototype_geometry.read_text(encoding="utf-8"))
+    guide = factory_config.paths.prototype_geometry.parent / contract["guide"]
+    guide.write_bytes(guide.read_bytes() + b"drift")
+
+    check = FactoryDoctor(factory_config, factory=factory)._prototype_geometry_check()
+    assert check.name == "prototype_geometry"
+    assert check.ok is False
+    assert "guide hash" in check.detail
+    await factory.close()
 
 
 @pytest.mark.asyncio
@@ -224,6 +242,14 @@ async def test_online_doctor_executes_side_effect_free_worker_contract(factory_c
                         animation_plan=[],
                         required_wrap_axes=[],
                         risks=[],
+                        design_guidelines={
+                            "artistic_direction": "One procedural conformance direction.",
+                            "concept_twist": "Original doctor fixture.",
+                            "structure": "pattern",
+                            "body_strategy": "Reads at four cells and across growth and turns.",
+                            "head_zone": "light_field_dark_core",
+                            "asset_strategy": "Procedural layers require no raster seams.",
+                        },
                     ),
                     skin_document={
                         "schema_version": 2,

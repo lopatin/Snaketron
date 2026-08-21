@@ -64,8 +64,11 @@ is no second set of derived build prompts that can drift from the skill.
 
 The product and review decisions are explicit:
 
-1. A prototype is a medium-length, horizontal snake strip showing a distinct
-   head, representative body, and tail on a neutral or transparent background.
+1. A prototype is generated against the repository-owned blank geometry guide:
+   one flat, right-facing, continuous, round-capped 16-cell review strip with a
+   one-cell head and small centered core. The pose is a review fixture, not a
+   live spawn-length claim. The exact geometry/rules hashes follow the selected
+   prototype into authoring.
 2. Machine triage never starts a build. A human `prototype_approval` selects
    the exact prototype artifact that becomes the build reference.
 3. The final human action `publish_approval` publishes a completed skin
@@ -464,12 +467,33 @@ promoted.
 
 The prototype contract is exact:
 
-- one medium-length snake, horizontal;
-- visibly distinct head, representative body, and tail;
+- one flat, orthographic, right-facing snake in the pinned 16-cell review pose;
+- one continuous, one-cell-wide capsule silhouette with a rounded one-cell
+  head, small centered system core, representative body, and rounded tail;
+- no detached/articulated plates, gaps, perspective, oversized separate head,
+  pointed tail, or paint outside the round body;
 - neutral or transparent background;
 - composed to remain legible at game scale, not as poster art;
 - no UI chrome, labels, unrelated scenery, or multiple alternatives in one
   image.
+
+Every generation receives the exact repository-owned blank guide as an image
+reference. Its white capsule is the only paintable body. The guide is rendered
+from the same runtime geometry contract used by the browser fixtures, retained
+in the content-addressed store, and pinned with the machine-readable contract
+and locked `skills/author-skin/references/design-guidelines.md`. The same three
+authorities are supplied to the downstream authoring worker. A legacy or
+mismatched prototype cannot authorize a build.
+
+The shared design guidelines preserve creative range while recording the
+non-negotiable game facts: one confident artistic direction; fun, weird, or
+silly concepts are welcome; abstract twists may draw on familiar genres without
+copying protected identity; textures must be production-quality and seamless;
+sprite cadence derives a useful tall sheet from desired FPS; and pattern versus
+sprite structure is selected deliberately. Designs must work at the four-cell
+default spawn, common early six- and seven-cell lengths, turns, overlap, and
+long growth. The first roughly 1.5 headward cells use one legible light or dark
+field with a compatible opposite-polarity marker under the engine-owned core.
 
 Each prototype also has a manifest:
 
@@ -482,7 +506,10 @@ Each prototype also has a manifest:
   "hint_rationale": "...",
   "prompt": "...",
   "model_config": "...",
-  "image_sha256": "..."
+  "image_sha256": "...",
+  "design_guidelines_sha256": "...",
+  "prototype_geometry_sha256": "...",
+  "prototype_guide_sha256": "..."
 }
 ```
 
@@ -564,6 +591,7 @@ moves its canonical content to a neutral package such as:
 skills/author-skin/
   SKILL.md                    # short workflow and routing
   references/contract.md     # locked schema, safety, performance invariants
+  references/design-guidelines.md # locked prototype/build visual contract
   references/playbook.md     # GEPA-tunable recipes and heuristics
   references/prototypes.md
   references/layers-effects.md

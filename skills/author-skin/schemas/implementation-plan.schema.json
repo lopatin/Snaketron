@@ -7,6 +7,7 @@
   "required": [
     "path",
     "rationale",
+    "design_guidelines",
     "fidelity_features",
     "layer_plan",
     "asset_plan",
@@ -17,6 +18,7 @@
   "properties": {
     "path": { "enum": ["layers", "texture", "sprite_sheet", "hybrid"] },
     "rationale": { "type": "string", "minLength": 1 },
+    "design_guidelines": { "$ref": "#/$defs/designGuidelines" },
     "fidelity_features": {
       "type": "array",
       "minItems": 1,
@@ -86,6 +88,31 @@
     }
   ],
   "$defs": {
+    "designGuidelines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artistic_direction",
+        "concept_twist",
+        "structure",
+        "body_strategy",
+        "head_zone",
+        "asset_strategy"
+      ],
+      "properties": {
+        "artistic_direction": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "concept_twist": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "structure": { "enum": ["pattern", "sprite"] },
+        "body_strategy": { "type": "string", "minLength": 1, "maxLength": 320 },
+        "head_zone": {
+          "enum": [
+            "light_field_dark_core",
+            "dark_field_light_disc_dark_core"
+          ]
+        },
+        "asset_strategy": { "type": "string", "minLength": 1, "maxLength": 320 }
+      }
+    },
     "wrapAxes": {
       "type": "array",
       "maxItems": 2,

@@ -283,6 +283,14 @@ def author_result() -> WorkerResult:
             animation_plan=["time-based highlight"],
             required_wrap_axes=[],
             risks=["highlight contrast"],
+            design_guidelines={
+                "artistic_direction": "One glass pattern direction.",
+                "concept_twist": "Original glass-flow treatment.",
+                "structure": "pattern",
+                "body_strategy": "Reads at four cells and across early growth, turns, and overlap.",
+                "head_zone": "light_field_dark_core",
+                "asset_strategy": "Procedural layers require no raster seams.",
+            },
         ),
         skin_document={
             "schema_version": 2,
@@ -341,6 +349,12 @@ async def test_prototype_retry_sends_literal_human_feedback_in_journaled_prompt(
     assert updated["stage"] == Stage.PROTOTYPE_TRIAGE
     prompt = image.calls[0]["prompt"]
     assert canonical_json([correction]) in prompt
+    assert "Locked Skin Design Guidelines" in prompt
+    assert "Keep one continuous thin rounded snake body." in prompt
+    assert '"id":"prototype-geometry-test-v1"' in prompt
+    assert "Treat its white capsule as the only paintable snake" in prompt
+    assert "body. Fill that body with the proposed skin" in prompt
+    assert "Do not create gaps, articulated modules, diamonds, plates" in prompt
     with database.connect() as connection:
         operation = dict(
             connection.execute(
@@ -348,15 +362,23 @@ async def test_prototype_retry_sends_literal_human_feedback_in_journaled_prompt(
                 (child["id"],),
             ).fetchone()
         )
-    assert operation["request_hash"] == factory.journal.request_hash(
-        {"prompt": prompt, "aspect_ratio": "16:9", "image_size": "2K"}
-    )
     operation_metadata = json.loads(operation["metadata_json"])
-    assert json.loads(objects.get(operation_metadata["request_ref"])) == {
-        "aspect_ratio": "16:9",
-        "image_size": "2K",
-        "prompt": prompt,
-    }
+    retained_request = json.loads(objects.get(operation_metadata["request_ref"]))
+    assert operation["request_hash"] == factory.journal.request_hash(retained_request)
+    assert retained_request["prompt"] == prompt
+    assert retained_request["aspect_ratio"] == "16:9"
+    assert retained_request["image_size"] == "2K"
+    assert retained_request["references"] == [
+        {
+            "content_hash": f"sha256:{json.loads(child['behavior_json'])['prototype_guide_sha']}",
+            "contract_id": "prototype-geometry-test-v1",
+            "contract_sha256": json.loads(child["behavior_json"])["prototype_geometry_sha"],
+            "media_type": "image/png",
+            "object_ref": json.loads(child["behavior_json"])["prototype_guide_ref"],
+            "role": "strict_snake_body_geometry_guide",
+        }
+    ]
+    assert image.calls[0]["references"] == [("image/png", objects.get(retained_request["references"][0]["object_ref"]))]
     await factory.close()
 
 
@@ -462,6 +484,14 @@ async def test_extreme_tall_sheet_is_journaled_in_no_crop_slices_and_resumes_bef
         animation_plan=["sample the loop into sixty frame rows"],
         required_wrap_axes=["y"],
         risks=["temporal seam"],
+        design_guidelines={
+            "artistic_direction": "One electric pulse direction.",
+            "concept_twist": "Original pulse treatment.",
+            "structure": "sprite",
+            "body_strategy": "Reads at four cells and across growth, turns, and headward overlap.",
+            "head_zone": "light_field_dark_core",
+            "asset_strategy": "Tall fast rows loop seamlessly on y.",
+        },
     )
     add_artifact(
         database,
@@ -633,6 +663,14 @@ def _asset_plan() -> ImplementationPlan:
         animation_plan=[],
         required_wrap_axes=["x"],
         risks=["seam"],
+        design_guidelines={
+            "artistic_direction": "One exact coat direction.",
+            "concept_twist": "Original retained texture fixture.",
+            "structure": "pattern",
+            "body_strategy": "Reads at four cells and across growth, turns, and overlap.",
+            "head_zone": "light_field_dark_core",
+            "asset_strategy": "The coat tiles seamlessly on x.",
+        },
     )
 
 
@@ -1024,6 +1062,14 @@ def test_ownership_gate_requires_exact_authenticated_upload_authority(
         animation_plan=[],
         required_wrap_axes=["x"],
         risks=["seams"],
+        design_guidelines={
+            "artistic_direction": "One painterly scale direction.",
+            "concept_twist": "Original scale treatment.",
+            "structure": "pattern",
+            "body_strategy": "Reads at four cells and across growth, turns, and overlap.",
+            "head_zone": "light_field_dark_core",
+            "asset_strategy": "The exact coat tiles seamlessly on x.",
+        },
     )
     document = {
         "textures": [
@@ -1353,13 +1399,21 @@ async def test_linked_child_prototype_re_evaluation_is_consumed_and_remains_exac
         media_type="image/png",
         metadata={"prototype_index": 0},
     )
+    current_contract = factory.behavior_snapshot()
     manifest = add_artifact(
         database,
         objects,
         parent["id"],
         stage=Stage.PROTOTYPE,
         kind=ArtifactKind.PROTOTYPE_MANIFEST,
-        value=json.dumps({"image_sha256": prototype["content_hash"]}).encode(),
+        value=json.dumps(
+            {
+                "image_sha256": prototype["content_hash"],
+                "design_guidelines_sha256": current_contract["design_guidelines_sha"],
+                "prototype_geometry_sha256": current_contract["prototype_geometry_sha"],
+                "prototype_guide_sha256": current_contract["prototype_guide_sha"],
+            }
+        ).encode(),
         media_type="application/json",
         metadata={"prototype_index": 0, "image_artifact_id": prototype["id"]},
     )
@@ -1679,6 +1733,7 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     attempts = database.list_gallery("all")
     assert len(attempts) == 1
     attempt = database.get_attempt(attempts[0]["id"])
+    behavior = json.loads(attempt["behavior_json"])
     assert attempt["stage"] == Stage.PROTOTYPE_REVIEW
     assert attempt["disposition"] == Disposition.NEEDS_HUMAN
     assert attempt["review_kind"] == "prototype"
@@ -1693,6 +1748,18 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     assert api.create_calls == []
 
     prototype = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE)[0]
+    manifest_artifact = database.artifacts_for_attempt(
+        attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST
+    )[0]
+    manifest = json.loads(objects.get(manifest_artifact["object_ref"]))
+    assert manifest["design_guidelines_sha256"] == behavior["design_guidelines_sha"]
+    assert manifest["prototype_geometry_sha256"] == behavior["prototype_geometry_sha"]
+    assert manifest["prototype_guide_sha256"] == behavior["prototype_guide_sha"]
+    assert judge.calls[0]["images"] == [
+        ("image/png", objects.get(behavior["prototype_guide_ref"])),
+        (prototype["media_type"], objects.get(prototype["object_ref"])),
+    ]
+    assert judge.calls[0]["system"].startswith("The first image is the pinned blank Snaketron geometry guide")
     review = ReviewService(
         database,
         factory.journal,
@@ -1732,6 +1799,17 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     assert len(worker.requests) == 1
     request = worker.requests[0]
     assert request.inline_artifacts["approved_prototype"].content_hash == prototype["content_hash"]
+    assert request.inline_artifacts["prototype_geometry_guide"].content_hash == (
+        f"sha256:{behavior['prototype_guide_sha']}"
+    )
+    assert request.artifact_refs["prototype_geometry"] == behavior["prototype_geometry_ref"]
+    assert request.artifact_refs["prototype_geometry_guide"] == behavior["prototype_guide_ref"]
+    assert request.authoring_inputs["design_guidelines"] == {
+        "sha256": behavior["design_guidelines_sha"],
+        "text": objects.get(behavior["design_guidelines_ref"]).decode("utf-8"),
+    }
+    assert request.authoring_inputs["prototype_geometry"]["contract_sha256"] == behavior["prototype_geometry_sha"]
+    assert request.authoring_inputs["prototype_geometry"]["guide_sha256"] == behavior["prototype_guide_sha"]
     assert request.authoring_inputs["prototype_approval"]["decision_id"] == approved["prototype_decision_id"]
     assert api.create_calls[0]["idempotency_key"].startswith("factory-concept:")
     assert api.create_calls[0]["evaluation_only"] is False

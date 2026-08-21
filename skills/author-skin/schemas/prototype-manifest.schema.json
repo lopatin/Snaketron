@@ -27,6 +27,18 @@
     "image_sha256": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "design_guidelines_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "prototype_geometry_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "prototype_guide_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[a-f0-9]{64}$"
     }
   }
 }

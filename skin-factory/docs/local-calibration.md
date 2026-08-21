@@ -92,6 +92,30 @@ factory tick:
 ./skin-factory/scripts/local-calibration.py run
 ```
 
+The first prototype tick sends Gemini the exact repository-owned blank snake
+guide plus the locked
+`skills/author-skin/references/design-guidelines.md`. The guide is a flat,
+right-facing, continuous, round-capped 16-cell *review pose* derived from the
+real renderer at its maximum live cell size; it is not the live spawn length.
+Gemini is instructed to paint only that body. The selected prototype's manifest
+binds the guide, geometry contract, and shared-guideline hashes, and the local
+task worker receives those same retained inputs during the later build.
+
+After the tick reaches prototype review, open the gallery, record the blind
+prototype label, and separately approve the exact candidate you want built:
+
+```sh
+./skin-factory/scripts/local-calibration.py open
+./skin-factory/scripts/local-calibration.py run
+```
+
+The second `run` resumes the retained approved Attempt through the same worker,
+forge, private-registration, exact-browser, and final-review path used by the
+Hermes job. At final review, record the blind build-quality label before the
+separate publish or reject action. Repeat `run` only when `status` shows a
+retained Attempt that still has machine work to advance; human review states do
+not spend or advance themselves.
+
 `--generate` is an alias. The first paid cycle for an exact behavior/config
 must reach a retained `prototype_review` transition before the launcher writes
 the paid-smoke readiness marker. A stale marker is not refreshed from a later

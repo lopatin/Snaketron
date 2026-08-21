@@ -20,12 +20,29 @@ DRAFT_FIXTURE_DIR = "worker-drafts"
 PLAN_PATHS = {"layers", "texture", "sprite_sheet", "hybrid"}
 ASSET_KINDS = {"coat", "sheet", "overlay"}
 AXES = {"x", "y"}
+DESIGN_GUIDELINE_START = "<!-- SKIN_DESIGN_LOCKED:START -->"
+DESIGN_GUIDELINE_END = "<!-- SKIN_DESIGN_LOCKED:END -->"
+DESIGN_GUIDELINE_KEYS = {
+    "artistic_direction",
+    "concept_twist",
+    "structure",
+    "body_strategy",
+    "head_zone",
+    "asset_strategy",
+}
+DESIGN_GUIDELINE_TEXT_LIMITS = {
+    "artistic_direction": 240,
+    "concept_twist": 240,
+    "body_strategy": 320,
+    "asset_strategy": 320,
+}
 
 REQUIRED_FILES = {
     "SKILL.md",
     "agents/openai.yaml",
     "optimization-boundary.json",
     "references/contract.md",
+    "references/design-guidelines.md",
     "references/integration.md",
     "references/layers-effects.md",
     "references/playbook.md",
@@ -43,6 +60,7 @@ REQUIRED_FILES = {
 PLAN_KEYS = {
     "path",
     "rationale",
+    "design_guidelines",
     "fidelity_features",
     "layer_plan",
     "asset_plan",
@@ -110,6 +128,15 @@ def validate_boundaries(errors: list[str]) -> None:
     boundary = read_json(PACKAGE / "optimization-boundary.json")
     playbook = (PACKAGE / boundary["editable_path"]).read_text(encoding="utf-8")
     contract = (PACKAGE / "references/contract.md").read_text(encoding="utf-8")
+    guidelines_path = "references/design-guidelines.md"
+    guidelines = (PACKAGE / guidelines_path).read_text(encoding="utf-8")
+    skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+    prototypes_reference = (PACKAGE / "references/prototypes.md").read_text(
+        encoding="utf-8"
+    )
+    validation_reference = (PACKAGE / "references/validation.md").read_text(
+        encoding="utf-8"
+    )
     start = boundary["start_marker"]
     end = boundary["end_marker"]
     add(
@@ -146,6 +173,93 @@ def validate_boundaries(errors: list[str]) -> None:
             required_safety_term in contract,
             f"locked contract is missing safety invariant: {required_safety_term}",
         )
+    add(
+        errors,
+        guidelines.count(DESIGN_GUIDELINE_START) == 1,
+        "design guidelines must have exactly one locked start marker",
+    )
+    add(
+        errors,
+        guidelines.count(DESIGN_GUIDELINE_END) == 1,
+        "design guidelines must have exactly one locked end marker",
+    )
+    add(
+        errors,
+        guidelines.find(DESIGN_GUIDELINE_START) < guidelines.find(DESIGN_GUIDELINE_END),
+        "design-guideline markers are out of order",
+    )
+    if (
+        guidelines.count(DESIGN_GUIDELINE_START) == 1
+        and guidelines.count(DESIGN_GUIDELINE_END) == 1
+    ):
+        locked_guidelines = guidelines.split(DESIGN_GUIDELINE_START, 1)[1].split(
+            DESIGN_GUIDELINE_END, 1
+        )[0]
+        for required_design_term in (
+            "fun, weird, or silly",
+            "one-cell-wide path that continuously",
+            "5–15 CSS px",
+            "four cells",
+            "Six- and seven-cell snakes",
+            "compressed head, turn, and tail points",
+            "head-ward run",
+            "cannot paint arbitrary pixels outside it",
+            "Pattern",
+            "Sprite",
+            "production quality",
+            "seamless",
+            "first 1.5 cells",
+            "light_field_dark_core",
+            "dark_field_light_disc_dark_core",
+            "Do not set a white `head_core`",
+            "`artifact_refs.prototype_geometry`",
+            "`artifact_refs.prototype_geometry_guide`",
+            "`authoring_inputs.prototype_geometry`",
+            "exact inline guide bytes",
+            "`contract_sha256`",
+            "`guide_sha256`",
+            "`prototype_geometry_sha256`",
+            "`prototype_guide_sha256`",
+        ):
+            add(
+                errors,
+                required_design_term in locked_guidelines,
+                "locked design guidelines are missing invariant: "
+                f"{required_design_term}",
+            )
+    for required_geometry_term in (
+        "exact pinned `prototype_geometry` contract and guide",
+        "`prototype_geometry` and `prototype_geometry_guide` artifact",
+        "`artifact_refs` and `authoring_inputs`",
+        "exact inline guide bytes",
+        "`contract_sha256`",
+        "`guide_sha256`",
+        "`prototype_geometry_sha256`",
+        "`prototype_guide_sha256`",
+        "`invalid_input`",
+    ):
+        add(
+            errors,
+            required_geometry_term in prototypes_reference,
+            "prototype reference is missing pinned geometry handoff: "
+            f"{required_geometry_term}",
+        )
+    add(
+        errors,
+        guidelines_path in boundary["locked_paths"],
+        "design guidelines must be in the optimizer's locked paths",
+    )
+    add(
+        errors,
+        "[Skin Design Guidelines](references/design-guidelines.md)" in skill
+        and "completely and apply" in skill,
+        "SKILL.md must require reading and applying the shared design guidelines",
+    )
+    add(
+        errors,
+        "`design_guidelines` object" in validation_reference,
+        "validation reference must gate the design-guideline evidence",
+    )
     add(
         errors,
         boundary["editable_path"] not in boundary["locked_paths"],
@@ -206,6 +320,84 @@ def validate_manifest(manifest: dict[str, Any], label: str, errors: list[str]) -
         isinstance(manifest.get("model_config"), str)
         and bool(manifest["model_config"]),
         f"{label}: model_config must name a stored configuration",
+    )
+
+
+def validate_design_guidelines(evidence: Any, label: str, errors: list[str]) -> None:
+    if not isinstance(evidence, dict):
+        errors.append(f"{label}: design_guidelines must be an object")
+        return
+    add(
+        errors,
+        set(evidence) == DESIGN_GUIDELINE_KEYS,
+        f"{label}: design_guidelines fields drifted",
+    )
+    for field, maximum in DESIGN_GUIDELINE_TEXT_LIMITS.items():
+        value = evidence.get(field)
+        add(
+            errors,
+            isinstance(value, str) and bool(value.strip()),
+            f"{label}: design_guidelines.{field} must be a non-empty string",
+        )
+        if isinstance(value, str):
+            add(
+                errors,
+                len(value) <= maximum,
+                f"{label}: design_guidelines.{field} exceeds {maximum} characters",
+            )
+    add(
+        errors,
+        evidence.get("structure") in {"pattern", "sprite"},
+        f"{label}: design_guidelines.structure is invalid",
+    )
+    add(
+        errors,
+        evidence.get("head_zone")
+        in {"light_field_dark_core", "dark_field_light_disc_dark_core"},
+        f"{label}: design_guidelines.head_zone is invalid",
+    )
+
+
+def validate_implementation_plan_schema(
+    schema: dict[str, Any], errors: list[str]
+) -> None:
+    add(
+        errors,
+        "design_guidelines" in schema.get("required", []),
+        "implementation-plan schema must require design_guidelines",
+    )
+    definition = schema.get("$defs", {}).get("designGuidelines", {})
+    add(
+        errors,
+        definition.get("additionalProperties") is False,
+        "design-guideline schema must forbid extra fields",
+    )
+    add(
+        errors,
+        set(definition.get("required", [])) == DESIGN_GUIDELINE_KEYS
+        and set(definition.get("properties", {})) == DESIGN_GUIDELINE_KEYS,
+        "design-guideline schema fields drifted",
+    )
+    properties = definition.get("properties", {})
+    for field, maximum in DESIGN_GUIDELINE_TEXT_LIMITS.items():
+        field_schema = properties.get(field, {})
+        add(
+            errors,
+            field_schema.get("type") == "string"
+            and field_schema.get("minLength") == 1
+            and field_schema.get("maxLength") == maximum,
+            f"design-guideline schema bound drifted: {field}",
+        )
+    add(
+        errors,
+        set(properties.get("structure", {}).get("enum", [])) == {"pattern", "sprite"},
+        "design-guideline structure enum drifted",
+    )
+    add(
+        errors,
+        set(properties.get("head_zone", {}).get("enum", []))
+        == {"light_field_dark_core", "dark_field_light_disc_dark_core"},
+        "design-guideline head-zone enum drifted",
     )
 
 
@@ -363,6 +555,7 @@ def validate_plan(
         f"{label}: approval decision id is required",
     )
     add(errors, bool(plan.get("rationale")), f"{label}: route rationale is required")
+    validate_design_guidelines(plan.get("design_guidelines"), label, errors)
 
     axes = plan.get("required_wrap_axes", [])
     add(
@@ -407,13 +600,17 @@ def validate_plan(
             isinstance(asset.get("frames"), int) and 1 <= asset["frames"] <= 120,
             f"{asset_label}: invalid independent Y frame count",
         )
-        if isinstance(asset.get("natural_length_cells"), int) and isinstance(asset.get("texels_per_cell"), int):
+        if isinstance(asset.get("natural_length_cells"), int) and isinstance(
+            asset.get("texels_per_cell"), int
+        ):
             add(
                 errors,
                 asset["natural_length_cells"] * asset["texels_per_cell"] <= 2048,
                 f"{asset_label}: width exceeds the current capability bound",
             )
-        if isinstance(asset.get("frames"), int) and isinstance(asset.get("texels_per_cell"), int):
+        if isinstance(asset.get("frames"), int) and isinstance(
+            asset.get("texels_per_cell"), int
+        ):
             rows = asset["frames"] if kind == "sheet" else 1
             add(
                 errors,
@@ -790,13 +987,27 @@ def validate_package() -> list[str]:
     validate_frontmatter(PACKAGE / "SKILL.md", errors)
     validate_boundaries(errors)
 
-    for schema in (PACKAGE / "schemas").glob("*.json"):
-        read_json(schema)
-    validate_asset_request(
-        read_json(PACKAGE / "templates/asset-request.json"),
-        "asset template",
-        errors,
+    schemas = {
+        schema.name: read_json(schema)
+        for schema in (PACKAGE / "schemas").glob("*.json")
+    }
+    validate_implementation_plan_schema(
+        schemas.get("implementation-plan.schema.json", {}), errors
     )
+    asset_template = read_json(PACKAGE / "templates/asset-request.json")
+    validate_asset_request(asset_template, "asset template", errors)
+    for required_prompt_term in (
+        "Production-quality",
+        "one confident style",
+        "seamless axes",
+        "no gutters",
+        "row zero",
+    ):
+        add(
+            errors,
+            required_prompt_term in asset_template.get("prompt", ""),
+            f"asset template prompt is missing design invariant: {required_prompt_term}",
+        )
     validate_plan(
         read_json(PACKAGE / "templates/implementation-plan.json"),
         {
@@ -830,9 +1041,13 @@ def validate_package() -> list[str]:
         validate_manifest(manifest, route, errors)
         validate_plan(plan, manifest, approval, route, errors)
         for asset_index, asset in enumerate(plan.get("asset_plan", [])):
-            if asset.get("kind") != "sheet" or not isinstance(asset.get("desired_fps"), (int, float)):
+            if asset.get("kind") != "sheet" or not isinstance(
+                asset.get("desired_fps"), (int, float)
+            ):
                 continue
-            derived_rows = max(2, math.ceil(document["period_ms"] * asset["desired_fps"] / 1_000))
+            derived_rows = max(
+                2, math.ceil(document["period_ms"] * asset["desired_fps"] / 1_000)
+            )
             add(
                 errors,
                 asset.get("frames") == derived_rows,
