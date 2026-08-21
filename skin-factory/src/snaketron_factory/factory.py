@@ -703,6 +703,9 @@ class Factory:
 
     async def _advance(self, attempt: dict[str, Any]) -> dict[str, Any]:
         stage = Stage(attempt["stage"])
+        authority_failure = self._shared_prototype_authority_failure(attempt, stage)
+        if authority_failure is not None:
+            return self._block_attempt(attempt, authority_failure)
         drift = self._behavior_drift_reason(attempt, stage)
         if drift is not None:
             return self._block_attempt(attempt, drift)
@@ -725,6 +728,82 @@ class Factory:
         if stage == Stage.BUILD_TRIAGE:
             return await self._build_triage(attempt)
         return attempt
+
+    def _shared_prototype_authority_failure(
+        self,
+        attempt: dict[str, Any],
+        stage: Stage,
+    ) -> str | None:
+        """Fail closed before legacy geometry can spend or drive a build."""
+
+        if attempt["purpose"] != Purpose.PRODUCTION:
+            return None
+        behavior = json.loads(attempt["behavior_json"])
+        snapshot_version = int(behavior.get("snapshot_version", 0))
+        if snapshot_version < 6 and stage in {
+            Stage.CONCEPT,
+            Stage.PROTOTYPE,
+            Stage.PROTOTYPE_TRIAGE,
+            Stage.AUTHOR,
+            Stage.ASSETS,
+            Stage.BUILD_GATE,
+            Stage.REGISTER,
+            Stage.RENDER,
+            Stage.BUILD_TRIAGE,
+        }:
+            return "legacy production Attempt must retry under the shared design and geometry contract"
+        if stage not in {
+            Stage.AUTHOR,
+            Stage.ASSETS,
+            Stage.BUILD_GATE,
+            Stage.REGISTER,
+            Stage.RENDER,
+            Stage.BUILD_TRIAGE,
+        }:
+            return None
+        approved_hash = attempt.get("approved_prototype_hash")
+        if not approved_hash:
+            return None
+        if snapshot_version < 6:
+            return "legacy approved prototype cannot drive a build under the shared geometry contract"
+        prototype = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.PROTOTYPE,
+            content_hash=str(approved_hash),
+        )
+        if prototype is None:
+            return "approved prototype bytes are not retained"
+        manifest_artifact = self._prototype_manifest_for(attempt, prototype)
+        if manifest_artifact is None:
+            return "approved prototype has no contract-bound manifest"
+        try:
+            manifest = self.persistence.load_json(manifest_artifact["object_ref"])
+        except (FileNotFoundError, RuntimeError, ValueError) as error:
+            return f"approved prototype manifest is unreadable: {error}"
+        required = {
+            "design_guidelines_sha256": behavior.get("design_guidelines_sha"),
+            "prototype_geometry_sha256": behavior.get("prototype_geometry_sha"),
+            "prototype_guide_sha256": behavior.get("prototype_guide_sha"),
+        }
+        if any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in required.values()
+        ):
+            return "Attempt behavior lacks exact shared design and geometry authority hashes"
+        if any(manifest.get(key) != value for key, value in required.items()):
+            return "approved prototype manifest does not bind the pinned design and geometry contract"
+        decision_id = attempt.get("prototype_decision_id")
+        approval = next(
+            (
+                decision
+                for candidate in self._lineage(attempt)
+                for decision in self.database.decisions_for_attempt(candidate["id"])
+                if decision["id"] == decision_id and decision["action"] == "prototype_approval"
+            ),
+            None,
+        )
+        if approval is None or approval["content_hash"] != approved_hash:
+            return "prototype approval decision cannot be verified"
+        return None
 
     async def _ideate(self, attempt: dict[str, Any]) -> dict[str, Any]:
         concept = self.database.get_concept(attempt["concept_id"])

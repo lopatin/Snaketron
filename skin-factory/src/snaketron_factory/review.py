@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
@@ -281,6 +282,71 @@ class ReviewService:
             gates = sorted({str(evaluation["gate_name"]) for evaluation in failures})
             raise PermissionError("blocking gates cannot be overridden or published: " + ", ".join(gates))
 
+    def _assert_shared_prototype_authority(
+        self,
+        attempt: dict[str, Any],
+        *,
+        content_hash: str,
+        require_approval_decision: bool,
+    ) -> None:
+        behavior = json.loads(attempt["behavior_json"])
+        if int(behavior.get("snapshot_version", 0)) < 6:
+            raise VersionConflict(
+                "legacy prototype cannot authorize a build; retry from prototype under the shared geometry rules"
+            )
+        expected = {
+            "design_guidelines_sha256": behavior.get("design_guidelines_sha"),
+            "prototype_geometry_sha256": behavior.get("prototype_geometry_sha"),
+            "prototype_guide_sha256": behavior.get("prototype_guide_sha"),
+        }
+        if any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in expected.values()
+        ):
+            raise VersionConflict("prototype approval behavior lacks exact shared design and geometry authority hashes")
+
+        lineage: list[dict[str, Any]] = []
+        current = attempt
+        seen: set[str] = set()
+        manifest_payload: dict[str, Any] | None = None
+        while current["id"] not in seen:
+            lineage.append(current)
+            seen.add(current["id"])
+            for manifest in self.database.artifacts_for_attempt(
+                current["id"],
+                stage=Stage.PROTOTYPE,
+                kind=ArtifactKind.PROTOTYPE_MANIFEST,
+            ):
+                payload = self.persistence.load_json(manifest["object_ref"])
+                if payload.get("image_sha256") == content_hash:
+                    manifest_payload = payload
+                    break
+            if manifest_payload is not None:
+                break
+            parent_id = current.get("parent_attempt_id")
+            if not parent_id:
+                break
+            current = self.database.get_attempt(parent_id)
+        if manifest_payload is None:
+            raise VersionConflict("prototype authority requires its exact contract-bound manifest")
+        if any(manifest_payload.get(key) != value for key, value in expected.items()):
+            raise VersionConflict(
+                "legacy or mismatched prototype cannot authorize a build; retry from prototype under current rules"
+            )
+        if not require_approval_decision:
+            return
+        decision_id = attempt.get("prototype_decision_id")
+        approval = next(
+            (
+                decision
+                for candidate in lineage
+                for decision in self.database.decisions_for_attempt(candidate["id"])
+                if decision["id"] == decision_id and decision["action"] == "prototype_approval"
+            ),
+            None,
+        )
+        if approval is None or approval["content_hash"] != content_hash:
+            raise VersionConflict("final review lacks the exact shared-contract prototype approval decision")
+
     def _assert_publication_authority_has_no_blocking_failure(self, attempt: dict[str, Any]) -> None:
         """Check only artifacts that authorize this exact immutable revision.
 
@@ -418,39 +484,11 @@ class ReviewService:
             raise VersionConflict("approval must name a prototype from the exact attempt")
         if artifact["content_hash"] != content_hash:
             raise VersionConflict("prototype approval hash differs from retained bytes")
-        behavior = json.loads(attempt["behavior_json"])
-        snapshot_version = int(behavior.get("snapshot_version", 0))
-        if 0 < snapshot_version < 6:
-            raise VersionConflict(
-                "legacy prototype cannot authorize a build; retry from prototype under the shared geometry rules"
-            )
-        if snapshot_version >= 6:
-            expected = {
-                "design_guidelines_sha256": behavior.get("design_guidelines_sha"),
-                "prototype_geometry_sha256": behavior.get("prototype_geometry_sha"),
-                "prototype_guide_sha256": behavior.get("prototype_guide_sha"),
-            }
-            manifest_payload: dict[str, Any] | None = None
-            lineage_attempt = attempt
-            while lineage_attempt is not None:
-                for manifest in self.database.artifacts_for_attempt(
-                    lineage_attempt["id"],
-                    stage=Stage.PROTOTYPE,
-                    kind=ArtifactKind.PROTOTYPE_MANIFEST,
-                ):
-                    payload = self.persistence.load_json(manifest["object_ref"])
-                    if payload.get("image_sha256") == content_hash:
-                        manifest_payload = payload
-                        break
-                if manifest_payload is not None or not lineage_attempt.get("parent_attempt_id"):
-                    break
-                lineage_attempt = self.database.get_attempt(lineage_attempt["parent_attempt_id"])
-            if manifest_payload is None:
-                raise VersionConflict("prototype approval requires its exact contract-bound manifest")
-            if any(manifest_payload.get(key) != value for key, value in expected.items()):
-                raise VersionConflict(
-                    "legacy or mismatched prototype cannot authorize a build; retry from prototype under current rules"
-                )
+        self._assert_shared_prototype_authority(
+            attempt,
+            content_hash=content_hash,
+            require_approval_decision=False,
+        )
         self._assert_no_blocking_failure(attempt_id, artifact_id)
         self._assert_blind_prototype_label(artifact_id)
         existing = self.database.find_exact_decision(
@@ -531,6 +569,14 @@ class ReviewService:
 
         operation: dict[str, Any] | None = None
         if attempt["stage"] == Stage.FINAL_REVIEW:
+            approved_hash = attempt.get("approved_prototype_hash")
+            if not isinstance(approved_hash, str) or not approved_hash:
+                raise VersionConflict("final override lacks an exact approved prototype authority")
+            self._assert_shared_prototype_authority(
+                attempt,
+                content_hash=approved_hash,
+                require_approval_decision=True,
+            )
             skin_id = attempt["production_skin_id"]
             revision = attempt["production_revision"]
             content_hash = attempt["production_content_hash"]
@@ -927,6 +973,14 @@ class ReviewService:
             and attempt["review_kind"] == "final"
         ):
             raise VersionConflict("publication requires the exact final review state")
+        approved_hash = attempt.get("approved_prototype_hash")
+        if not isinstance(approved_hash, str) or not approved_hash:
+            raise VersionConflict("final review lacks an exact approved prototype authority")
+        self._assert_shared_prototype_authority(
+            attempt,
+            content_hash=approved_hash,
+            require_approval_decision=True,
+        )
         decision = existing or self.database.add_human_decision(
             artifact_id=None,
             attempt_id=attempt_id,

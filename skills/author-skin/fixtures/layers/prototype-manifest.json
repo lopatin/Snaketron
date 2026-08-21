@@ -4,7 +4,10 @@
   "motion_intent": "The checker stays fixed while one shine travels head to tail.",
   "implementation_hint": "layers",
   "hint_rationale": "The identity is geometric, role-aware, and formula-driven.",
-  "prompt": "One medium horizontal checker-pattern snake, distinct head/body/tail, neutral background.",
+  "prompt": "Fill the exact pinned blank geometry guide with a crisp two-lane checker pattern: one flat right-facing continuous 16-cell-by-1-cell capsule, one-cell rounded head with a small centered dark core, rounded tail, neutral background, and no gaps, detached plates, perspective, or outside paint.",
   "model_config": "prototype-gemini-3-pro-image-v1",
-  "image_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  "image_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "design_guidelines_sha256": "42b83d8ce03f5b9d3e5ce9a547287ddc9868ed22e3682b159179f1d9b94d23d4",
+  "prototype_geometry_sha256": "29a052f780a761b78d8c1e87777e37fbe52acdb2b9749bef18bfeee0f214fa22",
+  "prototype_guide_sha256": "620c98c34f9d4cf0b7366954d48ab964653639d0b5e2a866110093b3de4d19ae"
 }
