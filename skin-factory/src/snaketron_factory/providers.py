@@ -34,6 +34,15 @@ def _usage_count(value: Any) -> int:
     return max(parsed, 0)
 
 
+def _valid_usage_count(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return int(value) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _image_media_type(data: bytes) -> str | None:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -113,6 +122,7 @@ class GeminiProvider:
             "temperature": temperature,
             "responseMimeType": "application/json",
             "responseJsonSchema": schema_value,
+            "maxOutputTokens": self.role.max_output_tokens,
         }
         if self.role.thinking_level:
             generation["thinkingConfig"] = {"thinkingLevel": self.role.thinking_level}
@@ -166,6 +176,7 @@ class GeminiProvider:
             "generationConfig": {
                 "responseModalities": ["TEXT", "IMAGE"],
                 "imageConfig": {"aspectRatio": aspect_ratio, "imageSize": image_size},
+                "maxOutputTokens": self.role.max_output_tokens,
             },
         }
         response = await self._send("POST", f"/models/{quote(self.model, safe='')}:generateContent", json=payload)
@@ -266,19 +277,46 @@ class GeminiProvider:
         return body
 
     def _result(self, value: Any, response: httpx.Response, body: Mapping[str, Any]) -> ProviderResult:
+        resolved_model = body.get("modelVersion")
+        if not isinstance(resolved_model, str) or not resolved_model.strip():
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "Gemini response omitted its resolved modelVersion",
+                request_id=self._request_id(response),
+            )
         usage = body.get("usageMetadata", {})
-        input_tokens = int(usage.get("promptTokenCount", 0))
-        output_tokens = int(usage.get("candidatesTokenCount", 0))
-        cost = (
-            input_tokens * self.role.cost_per_million_input_micros
-            + output_tokens * self.role.cost_per_million_output_micros
-        ) // 1_000_000
-        if isinstance(value, dict) and "image" in value:
-            cost += self.role.cost_per_image_micros
+        usage = usage if isinstance(usage, Mapping) else {}
+        input_tokens = _usage_count(usage.get("promptTokenCount", 0))
+        candidate_tokens = _usage_count(usage.get("candidatesTokenCount", 0))
+        thought_tokens = _usage_count(usage.get("thoughtsTokenCount", 0))
+        output_tokens = candidate_tokens + thought_tokens
+        complete_usage = _valid_usage_count(usage.get("promptTokenCount")) and _valid_usage_count(
+            usage.get("candidatesTokenCount")
+        )
+        if "thoughtsTokenCount" in usage:
+            complete_usage = complete_usage and _valid_usage_count(usage.get("thoughtsTokenCount"))
+        image_result = isinstance(value, dict) and "image" in value
+        usage_result = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "candidate_tokens": candidate_tokens,
+            "thought_tokens": thought_tokens,
+            "usage_complete": complete_usage,
+        }
+        if complete_usage:
+            cost = (
+                input_tokens * self.role.cost_per_million_input_micros
+                + output_tokens * self.role.cost_per_million_output_micros
+            ) // 1_000_000
+            if image_result:
+                cost += self.role.cost_per_image_micros
+            usage_result["cost_micros"] = cost
+        elif image_result:
+            usage_result["known_image_cost_micros"] = self.role.cost_per_image_micros
         return ProviderResult(
             value=value,
             request_id=self._request_id(response),
-            resolved_model=body.get("modelVersion", self.model),
+            resolved_model=resolved_model,
             sanitized_metadata={
                 "finish_reasons": [x.get("finishReason") for x in body.get("candidates", [])],
                 "response_sha_headers": {
@@ -287,11 +325,7 @@ class GeminiProvider:
                     if key.lower() in {"etag", "date", "x-request-id", "x-goog-request-id"}
                 },
             },
-            usage={
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cost_micros": cost,
-            },
+            usage=usage_result,
         )
 
     @classmethod
@@ -415,6 +449,7 @@ class OpenAICompatibleProvider:
                 {"role": "user", "content": content},
             ],
             "temperature": temperature,
+            "max_tokens": self.role.max_output_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -730,15 +765,32 @@ class OpenAICompatibleProvider:
         image_count: int = 0,
         metadata: Mapping[str, Any] | None = None,
     ) -> ProviderResult:
+        resolved_model = body.get("model")
+        if not isinstance(resolved_model, str) or not resolved_model.strip():
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "OpenAI-compatible response omitted its resolved model",
+                request_id=self._request_id(response),
+            )
         usage = body.get("usage")
         usage = usage if isinstance(usage, Mapping) else {}
         input_tokens = _usage_count(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
         output_tokens = _usage_count(usage.get("completion_tokens", usage.get("output_tokens", 0)))
-        cost = (
-            input_tokens * self.role.cost_per_million_input_micros
-            + output_tokens * self.role.cost_per_million_output_micros
-        ) // 1_000_000
-        cost += image_count * self.role.cost_per_image_micros
+        input_value = usage.get("prompt_tokens", usage.get("input_tokens"))
+        output_value = usage.get("completion_tokens", usage.get("output_tokens"))
+        complete_usage = _valid_usage_count(input_value) and _valid_usage_count(output_value)
+        usage_result = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "usage_complete": complete_usage,
+        }
+        if complete_usage:
+            usage_result["cost_micros"] = (
+                input_tokens * self.role.cost_per_million_input_micros
+                + output_tokens * self.role.cost_per_million_output_micros
+            ) // 1_000_000 + image_count * self.role.cost_per_image_micros
+        elif image_count:
+            usage_result["known_image_cost_micros"] = image_count * self.role.cost_per_image_micros
         clean_metadata = {key: item for key, item in dict(metadata or {}).items() if item is not None}
         clean_metadata["response_headers"] = {
             key.lower(): item for key, item in response.headers.items() if key.lower() in self._RESPONSE_HEADERS
@@ -746,13 +798,9 @@ class OpenAICompatibleProvider:
         return ProviderResult(
             value=value,
             request_id=self._request_id(response),
-            resolved_model=str(body.get("model") or self.model),
+            resolved_model=resolved_model,
             sanitized_metadata=clean_metadata,
-            usage={
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cost_micros": cost,
-            },
+            usage=usage_result,
         )
 
 

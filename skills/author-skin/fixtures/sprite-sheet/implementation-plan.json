@@ -16,6 +16,7 @@
       "kind": "sheet",
       "natural_length_cells": 41,
       "frames": 48,
+      "desired_fps": 20,
       "texels_per_cell": 16,
       "anchor": "whole",
       "fit": "tile",

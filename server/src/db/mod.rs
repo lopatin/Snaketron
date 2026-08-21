@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 use crate::completion::{CompletionEffect, CompletionRecordV1, EffectApplyResult};
+use crate::factory_service::FactoryServiceCredential;
 use crate::generation::GenerationJob;
 use crate::season::Season;
 use crate::skin_store::{
@@ -95,6 +96,49 @@ pub trait Database: Send + Sync {
     ) -> Result<User>;
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
+
+    // ---- Durable Skin Factory service credentials -----------------------
+    //
+    // These records contain only a one-way digest of the opaque bearer
+    // secret. Defaults keep narrow test databases source-compatible; any
+    // production implementation must override them or service-token
+    // provisioning and authentication fail closed.
+    async fn create_factory_service_credential(
+        &self,
+        _credential: &FactoryServiceCredential,
+    ) -> Result<()> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
+    async fn get_factory_service_credential(
+        &self,
+        _credential_id: &str,
+    ) -> Result<Option<FactoryServiceCredential>> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
+    /// Atomically activate `replacement` and revoke the old credential.
+    async fn rotate_factory_service_credential(
+        &self,
+        _old_credential_id: &str,
+        _replacement: &FactoryServiceCredential,
+        _actor_user_id: i32,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
+    /// Revoke one credential. Repeating an already-completed revocation is an
+    /// idempotent success; a missing credential is an error.
+    async fn revoke_factory_service_credential(
+        &self,
+        _credential_id: &str,
+        _actor_user_id: i32,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP

@@ -14,6 +14,8 @@ from snaketron_factory.db import Database
 from snaketron_factory.domain import (
     ArtifactKind,
     Disposition,
+    GateResult,
+    GateVerdict,
     OperationStatus,
     ProviderError,
     ProviderFailureKind,
@@ -77,9 +79,9 @@ def test_optimizer_examples_require_authoring_route_at_configured_confidence(
     factory_config, database, objects, make_attempt
 ) -> None:
     def labeled(target: str | None, confidence: float) -> str:
-        attempt = make_attempt(stage=Stage.COMPLETE)
+        attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
         stored = objects.put(f"prototype:{attempt['id']}".encode())
-        artifact = database.add_artifact(
+        database.add_artifact(
             attempt_id=attempt["id"],
             stage=Stage.PROTOTYPE,
             kind=ArtifactKind.PROTOTYPE,
@@ -93,15 +95,38 @@ def test_optimizer_examples_require_authoring_route_at_configured_confidence(
             attempt["version"],
             approved_prototype_hash=stored.uri,
             prototype_decision_id=f"approval:{attempt['id']}",
+            review_kind="final",
         )
-        decision = database.add_human_decision(
-            artifact_id=artifact["id"],
+        contact_bytes = objects.put(f"contact:{attempt['id']}".encode())
+        contact = database.add_artifact(
+            attempt_id=attempt["id"],
+            stage=Stage.RENDER,
+            kind=ArtifactKind.CONTACT_SHEET,
+            content_hash=contact_bytes.uri,
+            object_ref=contact_bytes.uri,
+            media_type="image/png",
+            size_bytes=contact_bytes.size,
+        )
+        database.add_evaluation(
+            artifact_id=contact["id"],
+            attempt_id=attempt["id"],
+            evaluator="visual_judge",
+            result=GateResult(
+                gate="visual_fidelity",
+                gate_version="judge-v1",
+                blocking=False,
+                verdict=GateVerdict.CANDIDATE,
+            ),
+            hidden_until_label=True,
+        )
+        decision = database.add_blind_human_label(
+            artifact_id=contact["id"],
             attempt_id=attempt["id"],
             action="build_quality_label",
             feedback="literal retained feedback",
             tags=["outcome:accept"],
             actor="human:reviewer",
-            attempt_version=attempt["version"],
+            content_hash=contact["content_hash"],
         )
         if target is not None:
             database.add_feedback_route(
@@ -121,6 +146,29 @@ def test_optimizer_examples_require_authoring_route_at_configured_confidence(
     labeled("platform", 0.99)
     labeled(None, 0)
 
+    # A plausible human row plus a high-confidence route is still excluded
+    # when it was not atomically bound to hidden pre-existing judge evidence.
+    accepted_attempt = database.get_attempt(accepted)
+    prototype = database.artifacts_for_attempt(accepted, kind=ArtifactKind.PROTOTYPE)[0]
+    untrusted = database.add_human_decision(
+        artifact_id=prototype["id"],
+        attempt_id=accepted,
+        action="build_quality_label",
+        feedback="unblinded direct row",
+        tags=["outcome:accept"],
+        actor="human:legacy",
+        attempt_version=accepted_attempt["version"],
+        content_hash=prototype["content_hash"],
+    )
+    database.add_feedback_route(
+        decision_id=untrusted["id"],
+        target="authoring_playbook",
+        signature="must not train",
+        confidence=1.0,
+        classifier_version="resolved-router-v1",
+        evidence={"authority": False},
+    )
+
     factory = SimpleNamespace(database=database, config=factory_config)
     optimizer = Optimizer(factory)
 
@@ -130,10 +178,11 @@ def test_optimizer_examples_require_authoring_route_at_configured_confidence(
 
 def test_technique_sources_also_require_high_confidence_authoring_authority(database, objects, make_attempt) -> None:
     def source(target: str, confidence: float) -> str:
-        attempt = make_attempt(stage=Stage.FINAL_REVIEW)
+        attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
         attempt = database.update_attempt(
             attempt["id"],
             attempt["version"],
+            review_kind="final",
             production_skin_id=f"skin-{attempt['id']}",
             production_revision="1",
             production_content_hash="sha256:" + "c" * 64,
@@ -149,14 +198,36 @@ def test_technique_sources_also_require_high_confidence_authoring_authority(data
             size_bytes=stored.size,
             metadata={"novelty_candidate": True},
         )
-        decision = database.add_human_decision(
-            artifact_id=artifact["id"],
+        contact_bytes = objects.put(f"contact:{attempt['id']}".encode())
+        contact = database.add_artifact(
+            attempt_id=attempt["id"],
+            stage=Stage.RENDER,
+            kind=ArtifactKind.CONTACT_SHEET,
+            content_hash=contact_bytes.uri,
+            object_ref=contact_bytes.uri,
+            media_type="image/png",
+            size_bytes=contact_bytes.size,
+        )
+        database.add_evaluation(
+            artifact_id=contact["id"],
+            attempt_id=attempt["id"],
+            evaluator="visual_judge",
+            result=GateResult(
+                gate="visual_fidelity",
+                gate_version="judge-v1",
+                blocking=False,
+                verdict=GateVerdict.CANDIDATE,
+            ),
+            hidden_until_label=True,
+        )
+        decision = database.add_blind_human_label(
+            artifact_id=contact["id"],
             attempt_id=attempt["id"],
             action="build_quality_label",
             feedback="A novel animation technique succeeded.",
             tags=["outcome:accept"],
             actor="human:reviewer",
-            attempt_version=attempt["version"],
+            content_hash=contact["content_hash"],
         )
         database.add_feedback_route(
             decision_id=decision["id"],

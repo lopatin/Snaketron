@@ -28,6 +28,9 @@ class NoPublishApi:
     async def publish_exact(self, **_: Any):
         raise AssertionError("gallery authentication tests must not publish")
 
+    async def cancel_publication_request_exact(self, **_: Any):
+        raise AssertionError("bulk preflight must finish before any final-review cancellation")
+
 
 class Runtime:
     def __init__(self, database: Database, objects: ObjectStore) -> None:
@@ -61,6 +64,7 @@ def review_app(factory_config, database, objects, monkeypatch):
         runtime.api,  # type: ignore[arg-type]
         runtime.persistence,
         runtime.behavior_snapshot,
+        mode=factory_config.mode,
     )
     templates = Path(__file__).resolve().parents[1] / "templates"
     app = create_app(
@@ -130,6 +134,9 @@ def test_gallery_exposes_exact_retained_artifacts_but_keeps_shadow_scores_blind(
         detail = client.get(f"/api/attempts/{attempt['id']}", headers=auth(secret)).json()
         assert detail["evaluations_blind"] is True
         assert detail["evaluations"] == []
+        before_html = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" in before_html
+        assert "Approve exact bytes and start build" not in before_html
 
         response = client.get(f"/artifacts/{artifact['id']}", headers=auth(secret))
         assert response.content == b"exact browseable pixels"
@@ -154,6 +161,273 @@ def test_gallery_exposes_exact_retained_artifacts_but_keeps_shadow_scores_blind(
         assert detail["evaluations_blind"] is False
         assert detail["evaluations"][0]["reasons_json"] == ["blind until label"]
         assert detail["decisions"][0]["tags_json"] == ["muddy", "outcome:reject"]
+        after_html = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" not in after_html
+        assert "Approve exact bytes and start build" in after_html
+
+
+def test_shadow_gallery_reveals_publish_form_only_after_exact_build_label(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    app, secret = review_app(factory_config, database, objects, monkeypatch)
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        review_kind="final",
+        production_skin_id="skin-shadow-gallery",
+        production_revision="4",
+        production_content_hash="sha256:" + "4" * 64,
+    )
+    contact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"exact gallery build pixels",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=contact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
+    )
+
+    with TestClient(app) as client:
+        before = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" in before
+        assert "Publish exact revision/hash" not in before
+        labeled = client.post(
+            "/actions/label",
+            headers=auth(secret),
+            data={
+                "attempt_id": attempt["id"],
+                "artifact_id": contact["id"],
+                "kind": "build_quality_label",
+                "outcome": "reject",
+                "feedback": "blind build label remains separate from publication authority",
+            },
+        )
+        assert labeled.status_code == 200
+        after = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" not in after
+        assert "Publish exact revision/hash" in after
+
+
+def test_production_final_visible_judge_evidence_hides_blind_label_form_and_post_rejects(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    config = factory_config.model_copy(update={"mode": "production"})
+    app, secret = review_app(config, database, objects, monkeypatch)
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        review_kind="final",
+        production_skin_id="skin-visible-production",
+        production_revision="3",
+        production_content_hash="sha256:" + "3" * 64,
+    )
+    contact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"visible production build pixels",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=contact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=False,
+    )
+
+    with TestClient(app) as client:
+        page = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" not in page
+        assert "Publish exact revision/hash" in page
+        assert "Human reject" in page
+        rejected = client.post(
+            "/actions/label",
+            headers={**auth(secret), "accept": "application/json"},
+            data={
+                "attempt_id": attempt["id"],
+                "artifact_id": contact["id"],
+                "kind": "build_quality_label",
+                "outcome": "accept",
+                "feedback": "this visible review must not become blind authority",
+            },
+        )
+        assert rejected.status_code == 409
+        assert "unblinded visual_judge" in rejected.json()["detail"]
+
+
+def test_production_calibration_fallback_uses_hidden_evidence_for_label_and_publish_ui(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    config = factory_config.model_copy(update={"mode": "production"})
+    app, secret = review_app(config, database, objects, monkeypatch)
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        review_kind="final",
+        production_skin_id="skin-fallback-production",
+        production_revision="5",
+        production_content_hash="sha256:" + "5" * 64,
+    )
+    contact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"hidden fallback build pixels",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=contact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
+    )
+
+    with TestClient(app) as client:
+        before = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" in before
+        assert "Publish exact revision/hash" not in before
+        labeled = client.post(
+            "/actions/label",
+            headers=auth(secret),
+            data={
+                "attempt_id": attempt["id"],
+                "artifact_id": contact["id"],
+                "kind": "build_quality_label",
+                "outcome": "accept",
+                "feedback": "independent production fallback label",
+            },
+        )
+        assert labeled.status_code == 200
+        after = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" not in after
+        assert "Publish exact revision/hash" in after
+
+
+def test_production_sampled_reject_keeps_blind_label_form_but_hides_human_reject(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    config = factory_config.model_copy(update={"mode": "production"})
+    app, secret = review_app(config, database, objects, monkeypatch)
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.MACHINE_REJECTED)
+    attempt = database.update_attempt(attempt["id"], attempt["version"], review_kind="build_label")
+    contact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"sampled rejected build pixels",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=contact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.MACHINE_REJECTED,
+        ),
+        hidden_until_label=True,
+    )
+
+    with TestClient(app) as client:
+        page = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Record training label" in page
+        assert "<h4>Human reject</h4>" not in page
+        labeled = client.post(
+            "/actions/label",
+            headers=auth(secret),
+            data={
+                "attempt_id": attempt["id"],
+                "artifact_id": contact["id"],
+                "kind": "build_quality_label",
+                "outcome": "reject",
+                "feedback": "independent sampled-reject label",
+            },
+        )
+        assert labeled.status_code == 200
+
+
+def test_rejected_artifact_annotation_form_posts_authenticated_idempotent_feedback_only_decision(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    app, secret = review_app(factory_config, database, objects, monkeypatch)
+    attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
+    artifact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"annotated rejected pixels",
+        media_type="image/png",
+    )
+    values = {
+        "attempt_id": attempt["id"],
+        "artifact_id": artifact["id"],
+        "content_hash": artifact["content_hash"],
+        "feedback": "Keep the crisp head and remove the noisy body stripe.",
+        "tags": "readability, stripe",
+        "idempotency_key": "browser-annotation-1",
+    }
+
+    with TestClient(app) as client:
+        page = client.get(f"/attempts/{attempt['id']}", headers=auth(secret)).text
+        assert "Annotate exact rejected artifact" in page
+        assert "<h4>Human reject</h4>" not in page
+        assert client.post("/actions/annotate-reject", data=values).status_code == 401
+
+        headers = {**auth(secret), "accept": "application/json"}
+        first = client.post("/actions/annotate-reject", headers=headers, data=values)
+        replay = client.post("/actions/annotate-reject", headers=headers, data=values)
+        assert first.status_code == replay.status_code == 200
+        assert replay.json()["decision"]["id"] == first.json()["decision"]["id"]
+        current = database.get_attempt(attempt["id"])
+        assert current["disposition"] == Disposition.MACHINE_REJECTED
+        assert current["version"] == attempt["version"]
+        assert len(database.decisions_for_attempt(attempt["id"])) == 1
+        assert database.unlabeled_feedback_routes()[0]["action"] == "feedback_only"
+
+        conflict = client.post(
+            "/actions/annotate-reject",
+            headers=headers,
+            data={**values, "feedback": "changed replay"},
+        )
+        assert conflict.status_code == 409
 
 
 def test_cookie_sessions_require_csrf_while_bearer_actions_do_not(
@@ -161,6 +435,7 @@ def test_cookie_sessions_require_csrf_while_bearer_actions_do_not(
 ) -> None:
     app, secret = review_app(factory_config, database, objects, monkeypatch)
     attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(attempt["id"], attempt["version"], review_kind="prototype")
     artifact = add_artifact(
         database,
         objects,
@@ -168,6 +443,18 @@ def test_cookie_sessions_require_csrf_while_bearer_actions_do_not(
         stage=Stage.PROTOTYPE,
         kind=ArtifactKind.PROTOTYPE,
         value=b"pixels",
+    )
+    database.add_evaluation(
+        artifact_id=artifact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
     )
     with TestClient(app) as client:
         login = client.post(
@@ -225,19 +512,61 @@ def test_gallery_maps_not_found_conflict_and_invalid_actions_to_safe_http_status
         assert invalid.status_code == 422
 
 
+def test_bulk_retry_preflights_every_final_review_before_any_server_cancellation(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    app, secret = review_app(factory_config, database, objects, monkeypatch)
+    exact = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    exact = database.update_attempt(
+        exact["id"],
+        exact["version"],
+        review_kind="final",
+        production_skin_id="skin-bulk-exact",
+        production_revision="5",
+        production_content_hash="sha256:" + "5" * 64,
+    )
+    incomplete = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    incomplete = database.update_attempt(incomplete["id"], incomplete["version"], review_kind="final")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/actions/bulk-retry",
+            headers={**auth(secret), "accept": "application/json"},
+            data={
+                "attempt_ids": [exact["id"], incomplete["id"]],
+                "from_stage": "prototype",
+                "feedback": "preflight the whole batch",
+                "idempotency_key": "bulk-final-preflight",
+            },
+        )
+    assert response.status_code == 409
+    assert "registered revision authority" in response.json()["detail"]
+    assert database.decisions_for_attempt(exact["id"]) == []
+    with database.connect() as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM operation WHERE attempt_id=?", (exact["id"],)).fetchone()[0] == 0
+        )
+
+
 def test_gallery_recovered_operation_requires_an_existing_verified_cas_object(
     factory_config, database, objects, make_attempt, monkeypatch
 ) -> None:
     app, secret = review_app(factory_config, database, objects, monkeypatch)
     attempt = make_attempt(stage=Stage.CONCEPT)
+    request = {"probe": "gallery recovery"}
+    retained_request = objects.put(OperationJournal.request_payload(request))
     operation, _ = database.begin_operation(
         attempt_id=attempt["id"],
         stage=Stage.CONCEPT,
         idempotency_key="gallery-recovery",
         side_effect="generate",
         provider_role="smart_text",
-        request_hash="a" * 64,
+        request_hash=OperationJournal.request_hash(request),
         cost_reserved_micros=100,
+        metadata={
+            "request_ref": retained_request.uri,
+            "request_sha256": retained_request.sha256,
+        },
     )
     database.transition_operation(
         operation["id"],
@@ -264,14 +593,39 @@ def test_gallery_recovered_operation_requires_an_existing_verified_cas_object(
         assert absent.status_code == 422
         assert database.get_operation(operation["id"])["status"] == OperationStatus.RECONCILIATION_REQUIRED
 
+        corrupt = objects.put(b"not-json")
+        invalid_payload = client.post(
+            "/actions/resolve-operation",
+            headers=auth(secret),
+            data={
+                **base,
+                "result_hash": corrupt.uri,
+                "resolved_model": "gemini-3.7-flash",
+            },
+        )
+        assert invalid_payload.status_code == 422
+        assert database.get_operation(operation["id"])["status"] == OperationStatus.RECONCILIATION_REQUIRED
+
         recovered = objects.put(b'{"recovered":true}')
+        wrong_model = client.post(
+            "/actions/resolve-operation",
+            headers=auth(secret),
+            data={
+                **base,
+                "result_hash": recovered.uri,
+                "resolved_model": "unapproved-fallback",
+            },
+        )
+        assert wrong_model.status_code == 422
+        assert database.get_operation(operation["id"])["status"] == OperationStatus.RECONCILIATION_REQUIRED
+
         accepted = client.post(
             "/actions/resolve-operation",
             headers={**auth(secret), "accept": "application/json"},
             data={
                 **base,
                 "result_hash": recovered.uri,
-                "resolved_model": "gemini-3.7-flash-20260801",
+                "resolved_model": "gemini-3.7-flash",
                 "provider_request_id": "provider-result-123",
             },
         )
@@ -279,4 +633,4 @@ def test_gallery_recovered_operation_requires_an_existing_verified_cas_object(
         resolved = database.get_operation(operation["id"])
         assert resolved["status"] == OperationStatus.SUCCEEDED
         assert resolved["result_hash"] == recovered.uri
-        assert resolved["resolved_model"] == "gemini-3.7-flash-20260801"
+        assert resolved["resolved_model"] == "gemini-3.7-flash"

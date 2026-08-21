@@ -1535,6 +1535,142 @@ mod tests {
         ));
     }
 
+    /// Phase 0 regression: equipping is an account-local choice, while the
+    /// resolved game state is shared with every opponent. An author must be
+    /// able to keep working on a text skin without that account reference
+    /// smuggling the unreviewed document hash (and therefore its words) into a
+    /// match snapshot. The authenticated preview path remains available to the
+    /// creator and administrators, but the public/opponent by-ref path stays a
+    /// uniform 404-equivalent `Hidden` result.
+    #[test]
+    fn equipped_unapproved_v2_text_never_enters_an_opponents_snapshot_or_by_ref_view() {
+        use common::{GameState, GameType, QueueMode};
+        use skin_schema::v2::{
+            ClipV2, ColorRef, CornerV2, LayerBodyV2, LayerV2, PropExpr, RegionV2, SlotName,
+            SourceV2, SpanV2, TransformV2,
+        };
+
+        const CREATOR_ID: i32 = 42;
+        const OPPONENT_ID: i32 = 7;
+        const PRIVATE_WORDS: &str = "NOT YET REVIEWED";
+
+        let v1: skin_schema::SkinDoc =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
+                .expect("the shipped classic skin parses");
+        let mut v2 = skin_schema::v2::upgrade(&v1);
+        v2.id = "private-text-regression".to_string();
+        v2.name = "Private text regression".to_string();
+        // The v2 conformance fixtures make this same small readability repair
+        // when deriving a new id from the exempt classic document.
+        v2.palette.free_for_all[2].fill = "#93a3b5".to_string();
+        v2.palette.free_for_all[2].outline = "#5d6e81".to_string();
+        v2.palette.friendly[0].accent = Some("#0b2033".to_string());
+        v2.palette.friendly[1].accent = Some("#0b2033".to_string());
+        v2.palette.enemy[0].accent = Some("#2a0b0b".to_string());
+        v2.palette.enemy[1].accent = Some("#2a0b0b".to_string());
+        for slot in &mut v2.palette.free_for_all {
+            slot.accent = Some("#141a20".to_string());
+        }
+        v2.layers.push(LayerV2 {
+            name: "unreviewed words".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr::constant(0.9),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Cells,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Text {
+                    content: PRIVATE_WORDS.to_string(),
+                    color: ColorRef::slot(SlotName::Accent),
+                    scale: 0.8,
+                },
+            },
+        });
+        let accepted =
+            accept_document(&serde_json::to_value(v2).expect("the v2 text document serializes"))
+                .expect("the shared v2 validator accepts the text document");
+        assert!(accepted.contains_text, "save-time text detection must run");
+        assert!(accepted.canonical.contains(PRIVATE_WORDS));
+
+        let mut skin = stored_skin(1_000, CREATOR_ID, Publication::Private, None);
+        skin.head_revision = 1;
+        skin.head_content_ref = accepted.content_ref.clone();
+        let revision = crate::skin_store::SkinRevision {
+            skin_id: skin.skin_id,
+            revision: skin.head_revision,
+            content_ref: accepted.content_ref.clone(),
+            document: accepted.canonical.clone(),
+            texture_refs: Vec::new(),
+            validated_schema: accepted.schema_version,
+            exposed_at_ms: None,
+            review_approved: false,
+            contains_text: accepted.contains_text,
+            created_at_ms: 0,
+        };
+
+        let equipped = wearable_reference(&skin, CREATOR_ID, SkinKind::Snake, true)
+            .expect("the creator may store an account-local reference to their draft");
+        assert_eq!(equipped, "skin:1000");
+        let match_revision = crate::matchmaking::match_visible_revision(&revision, None);
+        assert!(
+            match_revision.is_none(),
+            "without a separately hashed approved fallback, the text draft is not match-visible"
+        );
+
+        let mut snapshot = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 2 },
+            QueueMode::Quickmatch,
+            Some(99),
+            123,
+        );
+        snapshot
+            .add_player(CREATOR_ID as u32, Some("creator".to_string()))
+            .expect("creator joins");
+        snapshot
+            .add_player(OPPONENT_ID as u32, Some("opponent".to_string()))
+            .expect("opponent joins");
+        // Exercise the same final resolver `apply_player_skin` uses: an
+        // authored account reference is not a built-in, so the match receives
+        // classic rather than the draft hash.
+        snapshot.set_player_skin(
+            CREATOR_ID as u32,
+            Some(crate::matchmaking::snapshot_skin_reference(
+                Some(&equipped),
+                match_revision.map(|revision| revision.content_ref.as_str()),
+            )),
+        );
+        assert_eq!(
+            snapshot.skins.get(&(CREATOR_ID as u32)).map(String::as_str),
+            Some(skin_catalog::DEFAULT_SKIN_REF)
+        );
+        let wire_snapshot = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(!wire_snapshot.contains(PRIVATE_WORDS));
+        assert!(!wire_snapshot.contains(&accepted.content_ref));
+        assert!(!wire_snapshot.contains(&equipped));
+
+        let candidates = vec![(skin, revision)];
+        for viewer in [None, Some((OPPONENT_ID, false))] {
+            assert!(matches!(
+                resolve_document_visibility(&accepted.content_ref, &candidates, viewer),
+                DocumentVisibility::Hidden
+            ));
+        }
+        for viewer in [(CREATOR_ID, false), (OPPONENT_ID, true)] {
+            let DocumentVisibility::Private(visible) =
+                resolve_document_visibility(&accepted.content_ref, &candidates, Some(viewer))
+            else {
+                panic!("creator/admin should retain the authenticated private preview");
+            };
+            assert_eq!(visible.document, accepted.canonical);
+            assert!(visible.document.contains(PRIVATE_WORDS));
+        }
+    }
+
     #[test]
     fn duplicate_hash_visibility_is_order_independent_and_enabled_public_wins() {
         let content_ref = "sha256:published";

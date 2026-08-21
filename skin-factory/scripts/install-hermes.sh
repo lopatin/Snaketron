@@ -8,13 +8,28 @@ unset SKIN_FACTORY_REVIEW_TOKEN
 unset SKIN_FACTORY_REVIEW_ACTOR
 unset SNAKETRON_FACTORY_OPERATOR_TOKEN
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  printf 'usage: %s /absolute/path/to/service-env.json [schedule]\n' "$0" >&2
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+  printf 'usage: %s /absolute/path/to/service-env.json [schedule] [--enable-cron]\n' "$0" >&2
   exit 2
 fi
 
 source_env="$1"
-schedule="${2:-every 6h}"
+schedule="every 6h"
+enable_cron=false
+if [[ $# -ge 2 ]]; then
+  if [[ "$2" == "--enable-cron" ]]; then
+    enable_cron=true
+  else
+    schedule="$2"
+  fi
+fi
+if [[ $# -eq 3 ]]; then
+  [[ "$3" == "--enable-cron" ]] || {
+    printf 'third argument must be --enable-cron\n' >&2
+    exit 2
+  }
+  enable_cron=true
+fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 package="$(cd "$script_dir/.." && pwd -P)"
 repo_root="$(cd "$package/.." && pwd -P)"
@@ -87,12 +102,15 @@ if any(not value[name] for name in required):
     raise SystemExit("required service credentials cannot be empty")
 PY
 
-install -d -m 700 "$package/var"
+factory_var="$package/var"
+[[ ! -L "$factory_var" ]] || { printf 'factory data directory cannot be a symlink\n' >&2; exit 1; }
+install -d -m 700 "$factory_var"
 "$uv_bin" sync --project "$package" --frozen --no-dev --extra production
-"$uv_bin" run --project "$package" --frozen --no-dev playwright install chromium
+"$package/.venv/bin/playwright" install chromium
 "$package/scripts/build-renderer-bundle.sh"
 
-lama_dir="$package/var/lama-venv"
+lama_dir="$factory_var/lama-venv"
+[[ ! -L "$lama_dir" ]] || { printf 'LaMa environment directory cannot be a symlink\n' >&2; exit 1; }
 UV_PROJECT_ENVIRONMENT="$lama_dir" "$uv_bin" sync \
   --project "$package/lama" \
   --frozen \
@@ -184,6 +202,66 @@ else
   chmod 600 "$environment"
 fi
 
+# Hermes v0.14 kills no-agent scripts after 120 seconds unless explicitly
+# configured. A factory tick may legitimately use the full configured wall
+# budget, so persist a non-secret scheduler timeout with a shutdown margin.
+# The enable phase restarts the installed gateway after this file is written,
+# ensuring an already-running scheduler reloads the value before the job can
+# exist.
+hermes_home="${HERMES_HOME:-$HOME/.hermes}"
+[[ ! -L "$hermes_home" ]] || { printf 'Hermes home cannot be a symlink\n' >&2; exit 1; }
+install -d -m 700 "$hermes_home"
+hermes_dotenv="$hermes_home/.env"
+required_script_timeout="$("$package/.venv/bin/python" - "$package/config/factory.yaml" "$hermes_dotenv" <<'PY'
+import math, os, pathlib, re, stat, sys, tempfile, yaml
+
+factory_path = pathlib.Path(sys.argv[1])
+env_path = pathlib.Path(sys.argv[2])
+if env_path.is_symlink():
+    raise SystemExit("Hermes .env cannot be a symlink")
+factory = yaml.safe_load(factory_path.read_text(encoding="utf-8")) or {}
+wall = float(factory["budgets"]["wall_seconds_per_run"])
+required = int(math.ceil(wall)) + 120
+name = "HERMES_CRON_SCRIPT_TIMEOUT"
+lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+pattern = re.compile(r"^\s*(?:export\s+)?HERMES_CRON_SCRIPT_TIMEOUT\s*=\s*(.*?)\s*$")
+matches = [(index, pattern.match(line)) for index, line in enumerate(lines)]
+matches = [(index, match) for index, match in matches if match is not None]
+if len(matches) > 1:
+    raise SystemExit("Hermes .env declares HERMES_CRON_SCRIPT_TIMEOUT more than once")
+if matches:
+    index, match = matches[0]
+    assert match is not None
+    raw = match.group(1).strip().strip("'\"")
+    try:
+        current = int(float(raw))
+    except ValueError as error:
+        raise SystemExit("Hermes .env has an invalid HERMES_CRON_SCRIPT_TIMEOUT") from error
+    lines[index] = f"{name}={max(current, required)}"
+else:
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.append(f"{name}={required}")
+payload = "\n".join(lines) + "\n"
+env_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+fd, temporary_name = tempfile.mkstemp(prefix=".factory-hermes-env.", dir=env_path.parent, text=True)
+try:
+    os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_name, env_path)
+    os.chmod(env_path, 0o600)
+finally:
+    if os.path.exists(temporary_name):
+        os.unlink(temporary_name)
+print(required)
+PY
+)"
+printf '%s\n' "$required_script_timeout" > "$factory_var/hermes-script-timeout-seconds"
+chmod 600 "$factory_var/hermes-script-timeout-seconds"
+
 "$package/.venv/bin/factory" doctor \
   --config "$package/config/factory.yaml" \
   --env-file "$environment" \
@@ -192,14 +270,58 @@ fi
   --json
 
 hermes_scripts="${HERMES_HOME:-$HOME/.hermes}/scripts"
-installed="$hermes_scripts/snaketron-skin-factory.sh"
-mkdir -p "$hermes_scripts"
+installed_name="snaketron-skin-factory.sh"
+installed="$hermes_scripts/$installed_name"
+locator="$hermes_scripts/snaketron-skin-factory.workdir"
+install -d -m 700 "$hermes_scripts"
 if [[ -e "$installed" && ! "$installed" -ef "$package/scripts/hermes-run-once.sh" ]] && \
    ! cmp -s "$package/scripts/hermes-run-once.sh" "$installed"; then
   printf 'refusing to overwrite a different Hermes script: %s\n' "$installed" >&2
   exit 1
 fi
+if [[ -e "$locator" ]]; then
+  [[ ! -L "$locator" && -f "$locator" ]] || {
+    printf 'refusing an irregular Hermes workdir locator: %s\n' "$locator" >&2
+    exit 1
+  }
+  existing_workdir="$(tr -d '\n' < "$locator")"
+  [[ "$existing_workdir" == "$repo_root" && "$(wc -l < "$locator" | tr -d ' ')" == 1 ]] || {
+    printf 'refusing to replace a Hermes locator for a different checkout: %s\n' "$locator" >&2
+    exit 1
+  }
+fi
 install -m 700 "$package/scripts/hermes-run-once.sh" "$installed"
+locator_temporary="$(mktemp "$hermes_scripts/.snaketron-workdir.XXXXXX")"
+trap 'rm -f "$locator_temporary"' EXIT
+printf '%s\n' "$repo_root" > "$locator_temporary"
+chmod 600 "$locator_temporary"
+mv -f "$locator_temporary" "$locator"
+trap - EXIT
+
+if [[ "$enable_cron" != true ]]; then
+  printf 'Prepared Skin Factory without a live cron. Start local services, run scripts/hermes-smoke.sh --run-once, then rerun this installer with --enable-cron.\n'
+  exit 0
+fi
+
+# Enabling a live spender requires current online provider/API/browser checks,
+# a side-effect-free real-worker schema fixture, and a behavior-bound marker
+# written only after the operator explicitly requested the paid smoke cycle.
+"$package/.venv/bin/factory" doctor \
+  --config "$package/config/factory.yaml" \
+  --env-file "$environment" \
+  --identity service \
+  --json
+"$package/.venv/bin/factory" readiness-pin \
+  --config "$package/config/factory.yaml" \
+  --env-file "$environment" \
+  --check-paid-smoke \
+  --json
+
+# Reload ~/.hermes/.env into the actual long-running scheduler. Failure is
+# fatal: creating a job under Hermes's 120-second default would turn an
+# ordinary image call into a false unknown-outcome reconciliation incident.
+"$hermes_bin" gateway restart
+"$hermes_bin" gateway status
 
 if "$hermes_bin" cron list --all | grep -Fq 'snaketron-skin-factory'; then
   printf 'a snaketron-skin-factory cron already exists; refusing to create a duplicate\n' >&2
@@ -208,7 +330,7 @@ fi
 
 creation="$($hermes_bin cron create "$schedule" \
   --name snaketron-skin-factory \
-  --script "$installed" \
+  --script "$installed_name" \
   --no-agent \
   --workdir "$repo_root")"
 printf '%s\n' "$creation"
@@ -220,4 +342,4 @@ fi
 printf '%s\n' "$job_id" > "$package/var/hermes-job-id"
 chmod 600 "$package/var/hermes-job-id"
 
-printf 'Installed one no-agent Hermes job %s. Run scripts/hermes-smoke.sh before calibration.\n' "$job_id"
+printf 'Installed one behavior-gated no-agent Hermes job %s. Monitor with scripts/hermes-status.sh.\n' "$job_id"

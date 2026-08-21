@@ -10,18 +10,64 @@ from pathlib import Path
 
 import pytest
 from test_gallery_cli import seeded_factory
+from typer.testing import CliRunner
 
+from snaketron_factory.cli import app
 from snaketron_factory.config import ModelRole, load_config
-from snaketron_factory.db import Database
+from snaketron_factory.db import Database, canonical_json
 from snaketron_factory.doctor import FactoryDoctor, _safe_error
-from snaketron_factory.domain import DoctorCheck
+from snaketron_factory.domain import (
+    DoctorCheck,
+    GateResult,
+    GateVerdict,
+    ImplementationPlan,
+    OperationStatus,
+    ProviderResult,
+    Stage,
+    WorkerRequest,
+    WorkerResult,
+)
+from snaketron_factory.factory import Factory
 from snaketron_factory.promotion import GitPromoter, _run
+from snaketron_factory.readiness import ReadinessError, check_paid_smoke, record_paid_smoke
+from snaketron_factory.worker import SkillBundle
 
 
 def _write_executable(path: Path, source: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(source, encoding="utf-8")
     path.chmod(0o700)
+
+
+def _factory_capabilities(
+    *,
+    user_id: int = 41,
+    credential_id: str = "0123456789abcdef0123456789abcdef",
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "identity": {
+            "userId": user_id,
+            "username": "skin-factory",
+            "registeredAccount": True,
+            "isGuest": False,
+            "isAdmin": False,
+        },
+        "credential": {
+            "credentialType": "factoryService",
+            "credentialId": credential_id,
+            "revocable": True,
+            "expiresAt": None,
+        },
+        "capabilities": {
+            "createPrivateSkins": True,
+            "createEvaluationSkins": True,
+            "uploadPrivateForgeTextures": True,
+            "requestPublicationReview": True,
+            "publishSkins": False,
+            "administerSkins": False,
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -46,6 +92,70 @@ async def test_service_doctor_does_not_require_operator_authority(tmp_path: Path
     assert "credential:SKIN_FACTORY_REVIEW_TOKEN" not in names
     assert "credential:SNAKETRON_FACTORY_OPERATOR_TOKEN" not in names
     assert "credential:SNAKETRON_FACTORY_SERVICE_TOKEN" in names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identity_update", "capability_update", "expected"),
+    [
+        ({}, {}, True),
+        ({"isAdmin": True}, {"publishSkins": True, "administerSkins": True}, False),
+        ({"isGuest": True, "registeredAccount": False}, {}, False),
+        ({}, {"uploadPrivateForgeTextures": False}, False),
+    ],
+)
+async def test_doctor_requires_a_useful_non_admin_snaketron_service_identity(
+    factory_config,
+    identity_update: dict[str, object],
+    capability_update: dict[str, object],
+    expected: bool,
+) -> None:
+    identity = {
+        "userId": 41,
+        "username": "skin-factory",
+        "registeredAccount": True,
+        "isGuest": False,
+        "isAdmin": False,
+        **identity_update,
+    }
+    capabilities = {
+        "createPrivateSkins": True,
+        "createEvaluationSkins": True,
+        "uploadPrivateForgeTextures": True,
+        "requestPublicationReview": True,
+        "publishSkins": False,
+        "administerSkins": False,
+        **capability_update,
+    }
+    credential = {
+        "credentialType": "factoryService",
+        "credentialId": "0123456789abcdef0123456789abcdef",
+        "revocable": True,
+        "expiresAt": None,
+    }
+
+    class Api:
+        @staticmethod
+        async def service_capabilities():
+            return {
+                "schemaVersion": 1,
+                "identity": identity,
+                "credential": credential,
+                "capabilities": capabilities,
+            }
+
+    factory = Factory(factory_config)
+    await factory.api.close()
+    factory.api = Api()  # type: ignore[assignment]
+    check = await FactoryDoctor(factory_config, factory=factory)._api_capability_check()
+    await factory.close()
+
+    assert check.name == "snaketron_service_capabilities"
+    assert check.ok is expected
+    if expected:
+        assert "publish/admin authority absent" in check.detail
+    else:
+        assert "non-admin factory identity" in check.detail
 
 
 @pytest.mark.asyncio
@@ -85,6 +195,300 @@ async def test_content_model_preflight_accepts_configurable_openai_image_provide
     assert "image_generator(openai_compatible)=operator-image-v1" in check.detail
 
 
+@pytest.mark.asyncio
+async def test_online_doctor_executes_side_effect_free_worker_contract(factory_config) -> None:
+    received: list[WorkerRequest] = []
+
+    class Worker:
+        async def execute(self, request: WorkerRequest) -> ProviderResult:
+            received.append(request)
+            return ProviderResult(
+                value=WorkerResult(
+                    implementation_plan=ImplementationPlan(
+                        path="layers",
+                        rationale="A procedural fixture requires no external assets.",
+                        fidelity_features=["clear stripe"],
+                        layer_plan=["base stripe"],
+                        asset_plan=[],
+                        animation_plan=[],
+                        required_wrap_axes=[],
+                        risks=[],
+                    ),
+                    skin_document={
+                        "schema_version": 2,
+                        "name": "Doctor Procedural Stripe",
+                        "palette": {
+                            "friendly": [{"fill": "#25c776", "outline": "#155c3d", "accent": "#d9fff0"}],
+                            "enemy": [{"fill": "#e45d6a", "outline": "#7c2832", "accent": "#ffd0d5"}],
+                            "free_for_all": [{"fill": "#25c776", "outline": "#155c3d", "accent": "#d9fff0"}],
+                        },
+                        "period_ms": 1000,
+                        "head_core": {"ratio": 0.38, "color": "#155c3d"},
+                        "textures": [],
+                        "layers": [
+                            {
+                                "name": "Swatch body",
+                                "type": "ribbon",
+                                "region": "body",
+                                "color": {"slot": "fill"},
+                                "extra_px": 0,
+                                "joints": True,
+                                "tail_cap": True,
+                            }
+                        ],
+                    },
+                    tool_requests=[],
+                ),
+                resolved_model="worker-test",
+                usage={"cost_micros": 0},
+            )
+
+    factory = Factory(factory_config)
+    factory.worker = Worker()  # type: ignore[assignment]
+
+    class ConformanceGates:
+        @staticmethod
+        def validate_document(_document, _plan):
+            return [
+                GateResult(
+                    gate="document_schema",
+                    gate_version="doctor-test-v1",
+                    blocking=True,
+                    verdict=GateVerdict.PASS,
+                )
+            ]
+
+        @staticmethod
+        def blocking_failure(results):
+            return any(result.blocking and result.verdict == GateVerdict.FAIL for result in results)
+
+    factory.gates = ConformanceGates()  # type: ignore[assignment]
+    check = await FactoryDoctor(factory_config, factory=factory)._worker_conformance_check()
+    await factory.close()
+
+    assert check.ok is True
+    assert "exact model 'worker-test'" in check.detail
+    assert len(received) == 1
+    request = received[0]
+    assert request.attempt_id == "doctor-side-effect-free-fixture"
+    assert request.artifact_refs == {}
+    assert set(request.inline_artifacts) == {"approved_prototype"}
+    swatch = request.inline_artifacts["approved_prototype"]
+    assert swatch.media_type == "image/png"
+    assert swatch.content_hash.startswith("sha256:")
+    assert request.pure_tools == []
+
+
+@pytest.mark.asyncio
+async def test_paid_smoke_marker_is_owner_private_and_behavior_bound(factory_config) -> None:
+    factory = Factory(factory_config)
+    bundle = SkillBundle.load(factory_config.paths.skill_dir)
+    factory.active_skill_bundle = lambda: (bundle, "HEAD", "a" * 40)  # type: ignore[method-assign]
+    factory._current_renderer_sha = lambda: "renderer-test-sha"  # type: ignore[method-assign]
+
+    capabilities = _factory_capabilities()
+    marker = record_paid_smoke(factory, capabilities)
+    path = factory_config.paths.data_dir / "hermes-paid-smoke.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert marker["version"] == 3
+    assert marker["factory_service_user_id"] == 41
+    assert check_paid_smoke(factory, capabilities) == marker
+
+    factory_config.paths.direction.write_text("changed behavior\n", encoding="utf-8")
+    with pytest.raises(ReadinessError, match="stale"):
+        check_paid_smoke(factory, capabilities)
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_paid_smoke_pins_account_identity_but_allows_credential_rotation(factory_config) -> None:
+    factory = Factory(factory_config)
+    bundle = SkillBundle.load(factory_config.paths.skill_dir)
+    factory.active_skill_bundle = lambda: (bundle, "HEAD", "a" * 40)  # type: ignore[method-assign]
+    factory._current_renderer_sha = lambda: "renderer-test-sha"  # type: ignore[method-assign]
+    original = _factory_capabilities(
+        user_id=41,
+        credential_id="0123456789abcdef0123456789abcdef",
+    )
+    marker = record_paid_smoke(factory, original)
+
+    rotated = _factory_capabilities(
+        user_id=41,
+        credential_id="fedcba9876543210fedcba9876543210",
+    )
+    assert check_paid_smoke(factory, rotated) == marker
+    assert "0123456789abcdef0123456789abcdef" not in json.dumps(marker)
+
+    substituted = _factory_capabilities(
+        user_id=42,
+        credential_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    with pytest.raises(ReadinessError, match="account differs"):
+        check_paid_smoke(factory, substituted)
+    await factory.close()
+
+
+def test_readiness_cli_rechecks_pinned_account_before_enable_or_tick(factory_config, monkeypatch) -> None:
+    factory_config.source_path.write_text("config_version: 1\n", encoding="utf-8")
+    live = {"capabilities": _factory_capabilities(user_id=41)}
+
+    class DatabaseFixture:
+        @staticmethod
+        def migrate() -> None:
+            return None
+
+    class ApiFixture:
+        @staticmethod
+        async def service_capabilities() -> dict[str, object]:
+            return live["capabilities"]
+
+    class FactoryFixture:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.database = DatabaseFixture()
+            self.api = ApiFixture()
+
+        @staticmethod
+        def behavior_snapshot() -> dict[str, str]:
+            return {
+                "config_sha": "config-sha",
+                "skill_sha": "skill-sha",
+                "skill_git_ref": "HEAD",
+                "skill_git_sha": "a" * 40,
+                "model_config_sha": "model-sha",
+                "renderer_config_sha": "renderer-sha",
+                "lama_bundle_sha": "lama-sha",
+            }
+
+        @staticmethod
+        async def close() -> None:
+            return None
+
+    monkeypatch.setattr("snaketron_factory.cli._load", lambda *_args, **_kwargs: factory_config)
+    monkeypatch.setattr("snaketron_factory.cli.Factory", FactoryFixture)
+    runner = CliRunner()
+    common = ["--config", str(factory_config.source_path), "--json"]
+
+    recorded = runner.invoke(app, ["readiness-pin", "--record-paid-smoke", *common])
+    assert recorded.exit_code == 0, recorded.output
+    assert json.loads(recorded.stdout)["marker"]["factory_service_user_id"] == 41
+
+    live["capabilities"] = _factory_capabilities(
+        user_id=41,
+        credential_id="fedcba9876543210fedcba9876543210",
+    )
+    rotated = runner.invoke(app, ["readiness-pin", "--check-paid-smoke", *common])
+    assert rotated.exit_code == 0, rotated.output
+    assert json.loads(rotated.stdout)["service_identity"]["credential_id"] == ("fedcba9876543210fedcba9876543210")
+
+    live["capabilities"] = _factory_capabilities(
+        user_id=42,
+        credential_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    substituted = runner.invoke(app, ["readiness-pin", "--check-paid-smoke", *common])
+    assert substituted.exit_code == 1
+    assert json.loads(substituted.stderr)["error"] == "ReadinessError"
+    assert "account differs" in substituted.stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["config", "model", "renderer", "lama"])
+async def test_paid_smoke_pin_rejects_runtime_drift_before_a_scheduled_run(factory_config, drift: str) -> None:
+    factory = Factory(factory_config)
+    bundle = SkillBundle.load(factory_config.paths.skill_dir)
+    factory.active_skill_bundle = lambda: (bundle, "HEAD", "a" * 40)  # type: ignore[method-assign]
+    factory._current_renderer_sha = lambda: "renderer-test-sha"  # type: ignore[method-assign]
+    capabilities = _factory_capabilities()
+    record_paid_smoke(factory, capabilities)
+
+    if drift == "config":
+        factory_config.version_sha256 = "changed-config-sha"
+    elif drift == "model":
+        factory_config.models.image_generator.model = "changed-image-model"
+    elif drift == "renderer":
+        factory_config.browser.timeout_seconds += 1
+    else:
+        runtime = factory_config.paths.lama_manifest.parent / "sitecustomize.py"
+        runtime.write_text("# changed pinned LaMa runtime\n", encoding="utf-8")
+
+    with pytest.raises(ReadinessError, match="stale"):
+        check_paid_smoke(factory, capabilities)
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_paid_smoke_pin_allows_only_an_exact_journaled_author_skill_promotion(factory_config) -> None:
+    factory = Factory(factory_config)
+    original = SkillBundle.load(factory_config.paths.skill_dir)
+    factory.active_skill_bundle = lambda: (original, "HEAD", "a" * 40)  # type: ignore[method-assign]
+    factory._current_renderer_sha = lambda: "renderer-test-sha"  # type: ignore[method-assign]
+    capabilities = _factory_capabilities()
+    marker = record_paid_smoke(factory, capabilities)
+
+    coordinator = factory.control_attempt("readiness-promotion")
+    run = factory.database.create_optimization_run(
+        target="authoring_playbook",
+        dataset_version="sha256:" + "d" * 64,
+        teacher_config={"model": "gemini-3.7-flash"},
+        student_config={"model": "worker-test"},
+    )
+    git_ref = f"refs/tags/skin-authoring/{run['id']}"
+    git_sha = "b" * 40
+    factory.database.set_active_behavior("author-skin", git_ref, git_sha)
+    factory_config.paths.skill_dir.joinpath("playbook.md").write_text(
+        "Automatically promoted, gate-validated playbook.\n",
+        encoding="utf-8",
+    )
+    promoted = SkillBundle.load(factory_config.paths.skill_dir)
+    factory.active_skill_bundle = lambda: (promoted, git_ref, git_sha)  # type: ignore[method-assign]
+
+    result = factory.objects.put(
+        canonical_json({"git_ref": git_ref, "sha": git_sha, "branch": f"bot/skin-authoring/{run['id']}"}).encode()
+    )
+    operation, created = factory.database.begin_operation(
+        attempt_id=coordinator["id"],
+        stage=Stage.COMPLETE,
+        idempotency_key=f"gepa:{run['id']}:promote:winner:{'a' * 40}",
+        side_effect="promote_authoring_playbook",
+        provider_role="git_promotion",
+        request_hash="request-sha",
+        cost_reserved_micros=0,
+    )
+    assert created
+    operation = factory.database.transition_operation(
+        operation["id"],
+        OperationStatus.INTENT,
+        OperationStatus.RUNNING,
+    )
+    factory.database.transition_operation(
+        operation["id"],
+        OperationStatus.RUNNING,
+        OperationStatus.SUCCEEDED,
+        result_hash=result.uri,
+        retry_class="complete",
+        cost_charged_micros=0,
+    )
+    current_run = factory.database.get_optimization_run(run["id"])
+    factory.database.update_optimization_run(
+        run["id"],
+        current_run["version"],
+        state="promoted",
+        promoted_ref=git_ref,
+        promoted_sha=git_sha,
+    )
+
+    assert check_paid_smoke(factory, capabilities) == marker
+
+    # Repointing the same bounded package without a matching promotion result
+    # is arbitrary behavior drift, not an optimizer promotion.
+    unverified_sha = "c" * 40
+    factory.database.set_active_behavior("author-skin", "refs/tags/skin-authoring/unverified", unverified_sha)
+    factory.active_skill_bundle = lambda: (promoted, "refs/tags/skin-authoring/unverified", unverified_sha)  # type: ignore[method-assign]
+    with pytest.raises(ReadinessError, match="without an exact verified automatic promotion"):
+        check_paid_smoke(factory, capabilities)
+    await factory.close()
+
+
 def test_doctor_redacts_secret_values(monkeypatch) -> None:
     monkeypatch.setenv("DOCTOR_TEST_SECRET", "sufficiently-long-secret-value")
     detail = _safe_error(RuntimeError("failed with sufficiently-long-secret-value"))
@@ -98,8 +502,10 @@ def test_hermes_scripts_enforce_locked_no_agent_service_only_install() -> None:
     wrapper = (root / "scripts/hermes-run-once.sh").read_text(encoding="utf-8")
     renderer_builder = (root / "scripts/build-renderer-bundle.sh").read_text(encoding="utf-8")
     assert 'sync --project "$package" --frozen --no-dev --extra production' in installer
-    assert 'run --project "$package" --frozen --no-dev playwright install chromium' in installer
+    assert '"$package/.venv/bin/playwright" install chromium' in installer
     assert 'UV_PROJECT_ENVIRONMENT="$lama_dir" "$uv_bin" sync' in installer
+    assert "factory data directory cannot be a symlink" in installer
+    assert "LaMa environment directory cannot be a symlink" in installer
     assert '--project "$package/lama"' in installer
     assert "--no-install-project" in installer
     assert "--no-python-downloads" in installer
@@ -111,14 +517,18 @@ def test_hermes_scripts_enforce_locked_no_agent_service_only_install() -> None:
     assert "wasm-pack" in renderer_builder
     assert '"$npm_bin" ci' in renderer_builder
     assert 'SNAKETRON_FACTORY_RENDERER_BUILD=true "$npm_bin" run build:prod' in renderer_builder
-    assert '--script "$installed"' in installer
+    assert '--script "$installed_name"' in installer
     assert "--no-agent" in installer
     assert '--workdir "$repo_root"' in installer
+    assert "HERMES_CRON_SCRIPT_TIMEOUT" in installer
+    assert '"$hermes_bin" gateway restart' in installer
+    assert '"$hermes_bin" gateway status' in installer
     assert "forbidden" in installer
     assert "SKIN_FACTORY_REVIEW_TOKEN" in installer
     assert "SNAKETRON_FACTORY_OPERATOR_TOKEN" in installer
     assert "source " not in wrapper
     assert "eval " not in wrapper
+    assert "--check-paid-smoke" in wrapper
     assert "run-once" in wrapper
 
 
@@ -199,6 +609,23 @@ def test_promotion_subprocess_environment_scrubs_custom_service_secrets_and_keep
         _run(tmp_path, "git", "status")  # type: ignore[call-arg]
 
 
+def test_promotion_subprocess_timeout_is_one_shared_absolute_deadline(tmp_path: Path, monkeypatch) -> None:
+    observed: list[float] = []
+
+    def fake_run(*_args, timeout: float, **_kwargs):
+        observed.append(timeout)
+        return subprocess.CompletedProcess(["git"], 0, "", "")
+
+    monotonic = iter([100.0, 103.5])
+    monkeypatch.setattr("snaketron_factory.promotion.time.monotonic", lambda: next(monotonic))
+    monkeypatch.setattr("snaketron_factory.promotion.subprocess.run", fake_run)
+
+    _run(tmp_path, "git", "status", env={}, deadline=110.0)
+    _run(tmp_path, "git", "status", env={}, deadline=110.0)
+
+    assert observed == [10.0, 6.5]
+
+
 def test_no_agent_wrapper_uses_explicit_workdir_env_and_one_command(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     package = tmp_path / "skin-factory"
@@ -214,6 +641,12 @@ test -z "${SKIN_FACTORY_REVIEW_ACTOR:-}"
 test -z "${SNAKETRON_FACTORY_OPERATOR_TOKEN:-}"
 test -z "${GEMINI_API_KEY:-}"
 test -z "${SNAKETRON_FACTORY_SERVICE_TOKEN:-}"
+if [ "${1:-}" = readiness-pin ] && [ "${FAIL_READINESS_PIN:-}" = 1 ]; then
+  exit 1
+fi
+if [ "${1:-}" = run-once ] && [ -n "${RUN_ONCE_SENTINEL:-}" ]; then
+  : > "$RUN_ONCE_SENTINEL"
+fi
 printf '%s\n' "$@"
 """,
         encoding="utf-8",
@@ -247,6 +680,20 @@ printf '%s\n' "$@"
         str(package / ".factory.env"),
         "--json",
     ]
+
+    sentinel = tmp_path / "provider-spend-started"
+    environment["FAIL_READINESS_PIN"] = "1"
+    environment["RUN_ONCE_SENTINEL"] = str(sentinel)
+    refused = subprocess.run(
+        [str(root / "scripts/hermes-run-once.sh")],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert refused.returncode != 0
+    assert not sentinel.exists(), "run-once/provider spend started after readiness drift"
 
 
 def test_installer_rejects_operator_credentials_before_install(tmp_path: Path) -> None:
@@ -336,7 +783,7 @@ test -z "${CUSTOM_INHERITED_PROVIDER_CREDENTIAL:-}"
 printf '%s\n' "$*" >> "$FAKE_UV_LOG"
 if [ -n "${UV_PROJECT_ENVIRONMENT:-}" ]; then
   mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
-  ln -s "$FAKE_LAMA_PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
+  ln -sf "$FAKE_LAMA_PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
 fi
 """,
     )
@@ -460,7 +907,49 @@ test -z "${LMSTUDIO_API_KEY:-}"
 test -z "${SNAKETRON_FACTORY_SERVICE_TOKEN:-}"
 test -z "${CUSTOM_INHERITED_PROVIDER_CREDENTIAL:-}"
 printf '%s\n' "$*" >> "$FAKE_FACTORY_LOG"
+case "${1:-}" in
+  doctor)
+    case " $* " in
+      *" --offline "*) ;;
+      *)
+        if [ "${FAKE_WORKER_CONFORMANCE_READY:-}" != 1 ]; then
+          printf '%s\n' '{"ok":false,"checks":[{"name":"task_worker_conformance","ok":false}]}'
+          exit 1
+        fi
+        ;;
+    esac
+    ;;
+  run-once)
+    if [ "${FAKE_PAID_SMOKE_FAIL:-}" = 1 ]; then
+      printf '%s\n' '{"advanced":[{"failure":"provider failed","state":"blocked","to":"prototype"}],"halt":null}'
+    else
+      printf '%s\n' \
+        '{"advanced":[{"from":"prototype_triage","state":"needs_human","to":"prototype_review"}],"halt":null}'
+    fi
+    exit 0
+    ;;
+  readiness-pin)
+    case "$*" in
+      *--record-paid-smoke*) printf '%s\n' ready > "$FAKE_READY_MARKER" ;;
+      *--check-paid-smoke*) test -f "$FAKE_READY_MARKER" ;;
+    esac
+    ;;
+esac
 printf '%s\n' '{"ok":true}'
+""",
+    )
+    _write_executable(
+        venv / "playwright",
+        """#!/bin/sh
+set -eu
+test -z "${SKIN_FACTORY_REVIEW_TOKEN:-}"
+test -z "${SKIN_FACTORY_REVIEW_ACTOR:-}"
+test -z "${SNAKETRON_FACTORY_OPERATOR_TOKEN:-}"
+test -z "${GEMINI_API_KEY:-}"
+test -z "${LMSTUDIO_API_KEY:-}"
+test -z "${SNAKETRON_FACTORY_SERVICE_TOKEN:-}"
+test -z "${CUSTOM_INHERITED_PROVIDER_CREDENTIAL:-}"
+printf 'playwright %s\n' "$*" >> "$FAKE_RENDERER_BUILD_LOG"
 """,
     )
 
@@ -487,6 +976,7 @@ printf '%s\n' '{"ok":true}'
             "FAKE_HERMES_LOG": str(hermes_log),
             "FAKE_HERMES_STATE": str(hermes_state),
             "FAKE_FACTORY_LOG": str(factory_log),
+            "FAKE_READY_MARKER": str(tmp_path / "paid-smoke-ready"),
             "FAKE_RENDERER_BUILD_LOG": str(renderer_build_log),
             "FAKE_LAMA_PYTHON": "/usr/bin/true",
             "FAKE_LAMA_MODEL_SOURCE": str(fake_lama_model),
@@ -513,23 +1003,34 @@ printf '%s\n' '{"ok":true}'
             check=False,
         )
 
-    installed = run("install-hermes.sh", str(service_env), "every 17m")
-    assert installed.returncode == 0, installed.stderr
-    assert "Installed one no-agent Hermes job abc123" in installed.stdout
+    prepared = run("install-hermes.sh", str(service_env), "every 17m")
+    assert prepared.returncode == 0, prepared.stderr
+    assert "Prepared Skin Factory without a live cron" in prepared.stdout
+    assert not hermes_state.exists()
 
     copied_env = package / ".factory.env"
+    hermes_env = hermes_home / ".env"
     wrapper = hermes_home / "scripts/snaketron-skin-factory.sh"
+    locator = hermes_home / "scripts/snaketron-skin-factory.workdir"
     job_id = package / "var/hermes-job-id"
     lama_python = package / "var/lama-venv/bin/python"
     assert copied_env.stat().st_mode & 0o777 == 0o600
     assert json.loads(copied_env.read_text(encoding="utf-8")) == json.loads(service_env.read_text(encoding="utf-8"))
+    assert hermes_env.stat().st_mode & 0o777 == 0o600
+    assert hermes_env.read_text(encoding="utf-8") == "HERMES_CRON_SCRIPT_TIMEOUT=1920\n"
+    timeout_pin = package / "var/hermes-script-timeout-seconds"
+    assert timeout_pin.stat().st_mode & 0o777 == 0o600
+    assert timeout_pin.read_text(encoding="utf-8") == "1920\n"
     assert wrapper.stat().st_mode & 0o777 == 0o700
-    assert job_id.read_text(encoding="utf-8").strip() == "abc123"
+    assert locator.stat().st_mode & 0o777 == 0o600
+    assert locator.read_text(encoding="utf-8").strip() == str(repo.resolve())
+    assert not job_id.exists()
     assert lama_python.is_symlink()
     installed_lama = package / "var/lama/big-lama-v0.1.0.pt"
     assert installed_lama.read_bytes() == fake_lama_model.read_bytes()
     assert installed_lama.stat().st_mode & 0o777 == 0o400
     assert renderer_build_log.read_text(encoding="utf-8").splitlines() == [
+        "playwright install chromium",
         "wasm-pack build --target web --out-dir pkg --release -- --locked",
         "npm ci",
         "npm run build:prod",
@@ -538,39 +1039,37 @@ printf '%s\n' '{"ok":true}'
     uv_calls = uv_log.read_text(encoding="utf-8").splitlines()
     assert uv_calls == [
         f"sync --project {package} --frozen --no-dev --extra production",
-        f"run --project {package} --frozen --no-dev playwright install chromium",
         (
             f"sync --project {package / 'lama'} --frozen --no-dev --no-install-project "
             "--python 3.11 --no-python-downloads"
         ),
     ]
-    create_call = next(
-        call for call in hermes_log.read_text(encoding="utf-8").splitlines() if call.startswith("cron create")
-    )
-    assert "--name snaketron-skin-factory" in create_call
-    assert f"--script {wrapper}" in create_call
-    assert "--no-agent" in create_call
-    assert f"--workdir {repo}" in create_call
-
     wrapped = subprocess.run(
         [str(wrapper)],
-        cwd=repo,
+        cwd=hermes_home / "scripts",
         env=environment,
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
-    assert wrapped.returncode == 0, wrapped.stderr
+    assert wrapped.returncode != 0
     assert factory_log.read_text(encoding="utf-8").splitlines()[-1] == (
-        f"run-once --config {package / 'config/factory.yaml'} --env-file {copied_env} --json"
+        f"readiness-pin --config {package / 'config/factory.yaml'} --env-file {copied_env} --check-paid-smoke --json"
     )
+
+    refused_enable = run("install-hermes.sh", str(service_env), "every 17m", "--enable-cron")
+    assert refused_enable.returncode != 0
+    assert not hermes_state.exists()
+    assert not job_id.exists()
+    assert "task_worker_conformance" in refused_enable.stdout
 
     # Status/smoke/rollback are explicit operator commands rather than the
     # installed no-agent path under test, so return to an uncredentialed shell.
     environment.pop("SKIN_FACTORY_REVIEW_TOKEN")
     environment.pop("SKIN_FACTORY_REVIEW_ACTOR")
     environment.pop("SNAKETRON_FACTORY_OPERATOR_TOKEN")
+    environment["FAKE_WORKER_CONFORMANCE_READY"] = "1"
     environment.pop("GEMINI_API_KEY")
     environment.pop("LMSTUDIO_API_KEY")
     environment.pop("SNAKETRON_FACTORY_SERVICE_TOKEN")
@@ -581,10 +1080,51 @@ printf '%s\n' '{"ok":true}'
     assert "scheduler: healthy" in status.stdout
     smoke = run("hermes-smoke.sh")
     assert smoke.returncode == 0, smoke.stderr
+    environment["FAKE_PAID_SMOKE_FAIL"] = "1"
+    failed_paid_smoke = run("hermes-smoke.sh", "--run-once", cwd=repo)
+    assert failed_paid_smoke.returncode != 0
+    assert not Path(environment["FAKE_READY_MARKER"]).exists()
+    environment.pop("FAKE_PAID_SMOKE_FAIL")
     paid_smoke = run("hermes-smoke.sh", "--run-once", cwd=repo)
     assert paid_smoke.returncode == 0, paid_smoke.stderr
+    assert Path(environment["FAKE_READY_MARKER"]).is_file()
+
+    wrapped = subprocess.run(
+        [str(wrapper)],
+        cwd=hermes_home / "scripts",
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert wrapped.returncode == 0, wrapped.stderr
+    assert json.loads(wrapped.stdout)["advanced"][0]["to"] == "prototype_review"
+
+    environment.pop("FAKE_WORKER_CONFORMANCE_READY")
+    refused_without_worker = run("install-hermes.sh", str(service_env), "every 17m", "--enable-cron")
+    assert refused_without_worker.returncode != 0
+    assert "task_worker_conformance" in refused_without_worker.stdout
+    assert not hermes_state.exists()
+    assert not job_id.exists()
+    environment["FAKE_WORKER_CONFORMANCE_READY"] = "1"
+
+    enabled = run("install-hermes.sh", str(service_env), "every 17m", "--enable-cron")
+    assert enabled.returncode == 0, enabled.stderr
+    assert "Installed one behavior-gated no-agent Hermes job abc123" in enabled.stdout
+    assert job_id.read_text(encoding="utf-8").strip() == "abc123"
+    create_call = next(
+        call for call in hermes_log.read_text(encoding="utf-8").splitlines() if call.startswith("cron create")
+    )
+    assert "--name snaketron-skin-factory" in create_call
+    assert "--script snaketron-skin-factory.sh" in create_call
+    assert "--no-agent" in create_call
+    assert f"--workdir {repo}" in create_call
+    hermes_calls = hermes_log.read_text(encoding="utf-8").splitlines()
+    assert hermes_calls.index("gateway restart") < hermes_calls.index("gateway status")
+    assert hermes_calls.index("gateway status") < hermes_calls.index(create_call)
     calls = factory_log.read_text(encoding="utf-8").splitlines()
-    assert sum(call.startswith("run-once ") for call in calls) == 2
+    assert sum(call.startswith("run-once ") for call in calls) == 3
     assert any(call.startswith("doctor ") and "--identity service" in call for call in calls)
     assert any(call.startswith("status ") for call in calls)
 
@@ -592,6 +1132,7 @@ printf '%s\n' '{"ok":true}'
     assert rolled_back.returncode == 0, rolled_back.stderr
     assert "Factory data, backups, env, and virtual environments were preserved" in rolled_back.stdout
     assert not wrapper.exists()
+    assert not locator.exists()
     assert not job_id.exists()
     assert not hermes_state.exists()
     assert copied_env.exists()

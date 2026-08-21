@@ -16,6 +16,7 @@
       "kind": "coat",
       "natural_length_cells": 29,
       "frames": 1,
+      "desired_fps": null,
       "texels_per_cell": 64,
       "anchor": "whole",
       "fit": "tile",

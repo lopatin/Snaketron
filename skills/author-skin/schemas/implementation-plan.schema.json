@@ -99,6 +99,7 @@
         "kind",
         "natural_length_cells",
         "frames",
+        "desired_fps",
         "texels_per_cell",
         "anchor",
         "fit",
@@ -114,6 +115,11 @@
         },
         "frames": {
           "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "desired_fps": {
+          "type": ["number", "null"],
           "minimum": 1,
           "maximum": 120
         },
@@ -133,12 +139,14 @@
           "then": {
             "properties": {
               "frames": { "minimum": 2 },
+              "desired_fps": { "type": "number" },
               "texels_per_cell": { "const": 16 }
             }
           },
           "else": {
             "properties": {
               "frames": { "const": 1 },
+              "desired_fps": { "const": null },
               "texels_per_cell": { "const": 64 }
             }
           }

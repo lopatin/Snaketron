@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -54,6 +55,7 @@ ASSET_KEYS = {
     "kind",
     "natural_length_cells",
     "frames",
+    "desired_fps",
     "texels_per_cell",
     "anchor",
     "fit",
@@ -131,6 +133,19 @@ def validate_boundaries(errors: list[str]) -> None:
         and contract.count("<!-- FACTORY_LOCKED:END -->") == 1,
         "contract must have one locked boundary",
     )
+    for required_safety_term in (
+        "protected marks",
+        "public-figure likeness",
+        "unsafe content",
+        "unlicensed references",
+        "blocking `safety_ip`",
+        "non-waivable",
+    ):
+        add(
+            errors,
+            required_safety_term in contract,
+            f"locked contract is missing safety invariant: {required_safety_term}",
+        )
     add(
         errors,
         boundary["editable_path"] not in boundary["locked_paths"],
@@ -445,12 +460,24 @@ def validate_plan(
                 asset["frames"] >= 2,
                 f"{asset_label}: sheet needs multiple frames",
             )
+            add(
+                errors,
+                isinstance(asset.get("desired_fps"), (int, float))
+                and not isinstance(asset.get("desired_fps"), bool)
+                and 1 <= asset["desired_fps"] <= 120,
+                f"{asset_label}: sheet needs a bounded desired_fps",
+            )
             derived_axes.add("y")
         else:
             add(
                 errors,
                 asset.get("frames") == 1,
                 f"{asset_label}: static asset has one frame",
+            )
+            add(
+                errors,
+                asset.get("desired_fps") is None,
+                f"{asset_label}: static asset desired_fps must be null",
             )
     add(
         errors,
@@ -802,6 +829,15 @@ def validate_package() -> list[str]:
         document = read_json(directory / "skin.skin.json")
         validate_manifest(manifest, route, errors)
         validate_plan(plan, manifest, approval, route, errors)
+        for asset_index, asset in enumerate(plan.get("asset_plan", [])):
+            if asset.get("kind") != "sheet" or not isinstance(asset.get("desired_fps"), (int, float)):
+                continue
+            derived_rows = max(2, math.ceil(document["period_ms"] * asset["desired_fps"] / 1_000))
+            add(
+                errors,
+                asset.get("frames") == derived_rows,
+                f"{route}: asset_plan[{asset_index}] frames must derive from period_ms and desired_fps",
+            )
         expected_path = route.replace("-", "_")
         add(
             errors,

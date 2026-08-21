@@ -14,6 +14,21 @@ class PackageValidationTests(unittest.TestCase):
     def test_repository_package_is_valid(self):
         self.assertEqual(validator.validate_package(), [])
 
+    def test_safety_ip_invariants_live_inside_the_locked_contract(self):
+        contract = (validator.PACKAGE / "references/contract.md").read_text(encoding="utf-8")
+        locked = contract.split("<!-- FACTORY_LOCKED:START -->", 1)[1].split(
+            "<!-- FACTORY_LOCKED:END -->", 1
+        )[0]
+        for term in (
+            "protected marks",
+            "public-figure likeness",
+            "unsafe content",
+            "unlicensed references",
+            "blocking `safety_ip`",
+            "non-waivable",
+        ):
+            self.assertIn(term, locked)
+
     def test_approval_must_bind_the_manifest_and_plan_hash(self):
         fixture = validator.PACKAGE / "fixtures/layers"
         manifest = validator.read_json(fixture / "prototype-manifest.json")

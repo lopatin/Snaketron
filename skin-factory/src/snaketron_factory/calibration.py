@@ -17,11 +17,15 @@ JudgeKind = Literal["prototype", "build"]
 
 PROTOTYPE_JUDGE_RUBRIC = (
     "Judge this prototype as a game-scale Snaketron direction. Return candidate, "
-    "uncertain, or machine_rejected. Machine judgment only routes; it never approves."
+    "uncertain, or machine_rejected. Flag protected marks, public-figure likeness, "
+    "unsafe content, or an apparently unlicensed reference. Any flag routes to "
+    "machine_rejected for human review; machine judgment never approves or waives it."
 )
 BUILD_JUDGE_RUBRIC = (
     "Compare the real Snaketron render to the human-selected prototype. Judge fidelity, "
-    "game-scale readability, role clarity, animation, and craft. This is soft routing only."
+    "game-scale readability, role clarity, animation, and craft. Independently flag protected "
+    "marks, public-figure likeness, unsafe content, or an apparently unlicensed reference in "
+    "the completed build. Fidelity is soft routing; any safety/IP flag is a blocking gate."
 )
 
 _ACTIONS: dict[JudgeKind, str] = {
@@ -120,23 +124,37 @@ class JudgeCalibrationService:
         for kind in ("prototype", "build"):
             typed_kind: JudgeKind = kind
             configured = judge_evaluator_version(self.config, typed_kind)
+            active_version = self.active_evaluator_version(typed_kind)
             observed = self.database.judge_evaluator_versions(action=_ACTIONS[typed_kind])
             # Refresh every actual resolved-model/rubric identity independently.
             # The configured alias is also retained as a fail-closed status row
             # until a provider reports the concrete dated model behind it.
             versions = [*observed]
-            if configured not in versions:
-                versions.append(configured)
+            for version in (active_version, configured):
+                if version not in versions:
+                    versions.append(version)
             refreshed = {
                 version: self.refresh(typed_kind, evaluator_version=version, at=at).as_report() for version in versions
             }
-            active = refreshed[configured]
+            active = refreshed[active_version]
             report[kind] = {
                 **active,
+                "active_evaluator_version": active_version,
+                "configured_evaluator_alias": configured,
                 "observed_evaluator_versions": observed,
                 "calibrations": refreshed,
             }
         return report
+
+    def active_evaluator_version(self, kind: JudgeKind) -> str:
+        """Resolve the evaluator identity currently routing this judge kind."""
+
+        configured = judge_evaluator_version(self.config, kind)
+        _model, separator, rubric = configured.partition("+rubric:")
+        if not separator:
+            return configured
+        actual = self.database.latest_judge_evaluator_version(rubric_suffix=f"+rubric:{rubric}")
+        return actual or configured
 
     def refresh(
         self,
@@ -272,7 +290,7 @@ class JudgeCalibrationService:
     ) -> RoutingStatus:
         """Assess calibration independent of the deployment's routing mode."""
 
-        expected = evaluator_version or judge_evaluator_version(self.config, kind)
+        expected = evaluator_version or self.active_evaluator_version(kind)
         row = self.database.judge_calibration(kind, expected)
         if row is None:
             previous = self.database.judge_calibration(kind)

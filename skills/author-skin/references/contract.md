@@ -107,18 +107,20 @@ binding. Only the exact forge manifest may replace the sentinel before gates.
 A sprite sheet is an X-by-Y grid:
 
 - X is the independently chosen number of body cells in each frame;
-- Y is the independently chosen number of animation frames;
+- `desired_fps` records the requested motion sampling rate and Y is derived as
+  `ceil(period_ms * desired_fps / 1000)`, clamped by the pinned row,
+  dimension, and decoded-memory limits;
 - each row spans the full X cells from head toward tail;
 - row zero is the resting/reduced-motion frame;
 - metadata records X, Y, texels per cell, period, and wrap axes separately;
 - every row, including the final-to-zero transition, must be reachable and
   verified in the real renderer.
 
-Choose X from repeat length, mark scale, and body fixtures. Choose Y from the
-motion and requested frame rate/period, then stay within the pinned dimension,
-byte, memory, and runtime-row limits. Never make a sheet square merely to encode
-one number twice. A loop always requires `y`; repeating along the body also
-requires `x`.
+Choose X from repeat length, mark scale, and body fixtures. Choose a
+`desired_fps` from the motion, then compute Y from that rate and the document
+period using the formula above. Record the derived Y; never freely choose both
+FPS and rows. Never make a sheet square merely to encode one number twice. A
+loop always requires `y`; repeating along the body also requires `x`.
 
 ## Security and review invariants
 
@@ -133,6 +135,10 @@ requires `x`.
   readiness and proof that image pixels, not just fallback pixels, painted.
 - Deterministic blocking gates cannot be waived by a visual judge. Visual
   fidelity is soft triage and cannot publish.
+- protected marks, public-figure likeness, unsafe content, and apparently
+  unlicensed references are a blocking `safety_ip` failure at both prototype
+  and completed-build review. This gate is non-waivable: humans may inspect or
+  retry the retained idea, but cannot override it into authoring or publication.
 - Publication is outside this skill and requires a human approval bound to an
   exact revision/content hash.
 

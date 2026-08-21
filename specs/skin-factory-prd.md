@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Draft for review |
+| Status | Implemented in PR #90; shadow calibration ready after deployment |
 | Product | A Hermes-operated process that proposes, prototypes, builds, reviews, publishes, and improves Snaketron skins |
 | Supersedes | PR #89's skin-factory plan |
 | Depends on | PR #84's first-class skin and SkinDoc v2 work, after the Phase 0 audit in this document |
@@ -282,9 +282,19 @@ An authenticated operator resolves an unknown operation with immutable evidence
 using exactly one outcome: `confirmed_not_executed` releases the reservation
 and permits retry; `executed_result_recovered` attaches the recovered result and
 its exact resolved model, request id when available, and image media type, then
-continues; `executed_output_lost` or `indeterminate` charges the reservation and
-leaves the attempt terminally blocked. The cron service identity cannot create
-an operation resolution.
+continues only after the exact retained CAS bytes, expected provider role/model,
+complete image decode or side-effect-specific structured schema all validate;
+`executed_output_lost` or `indeterminate` charges the reservation and leaves the
+attempt terminally blocked. Invalid recovery evidence remains immutable but
+cannot remain a replayable success: the operator path leaves it unresolved, and
+a legacy/direct invalid success is terminally quarantined on first replay with
+actionable evidence. Every recovered result, including structured and image
+content, additionally requires the exact immutable journaled request CAS and
+request hash. Snaketron registration and review/publication
+effects require authenticated exact-state readback before local advancement;
+recovered Git promotion is accepted only when its deterministic ref/SHA already
+matches the committed active-behavior pointer. The cron service identity cannot
+create an operation resolution.
 
 At the end of each cycle, `run-once` checks optimizer readiness and enqueues or
 advances one budgeted, resumable optimization job when eligible. The operator
@@ -366,6 +376,13 @@ The gallery supports two distinct recovery operations:
    and decision id into the child and remains authorized only for that exact
    artifact, unless a human selects a different one.
 
+For a production Attempt already in final review, either action first journals
+cancellation of the exact pending skin/revision/content hash. A child is
+created atomically only after cancellation succeeds or authenticated recovery
+readback proves that revision is neither pending nor published. Bulk retry
+preflights every selected Attempt, including exact final-revision authority,
+before it begins any cancellation.
+
 Humans may also override soft triage by issuing `prototype_approval` for the
 exact rejected artifact. Re-evaluation that changes a machine verdict still
 does not start a build without this human transition.
@@ -401,7 +418,17 @@ store. Cron must not assume an interactive shell has sourced `~/.zshrc`, and
 keys are never committed or copied into run artifacts. A non-secret service-env
 manifest declares required variables, and `factory doctor --json` verifies
 provider roles, DB/object storage, browser capture, and LaMa without printing
-credential values.
+credential values. The Snaketron credential is a dedicated opaque 256-bit
+factory-service token, not the account's 24-hour login JWT. The server stores
+only its hash, reloads its revocation state and account on every request, and
+accepts it only on a fixed factory-route allowlist. It has no time-based expiry,
+so unattended operation survives ordinary login expiry; administrator-only
+provision, atomic rotation, and revocation provide its lifecycle. The online
+doctor also calls an authenticated,
+side-effect-free Snaketron capability endpoint: the dedicated durable account
+must be able to create private and evaluation skins and upload private forge
+textures, while its live DB-derived identity has neither administrator nor
+publication authority.
 
 Gemini 3.7 Flash is the teacher in GEPA: it reads failed student traces and
 proposes improved instructions. The task worker remains the student and runs
@@ -596,6 +623,12 @@ There are two animation paths:
   remain smooth in slow motion. Row zero must be a valid resting and
   reduced-motion frame. Grid alignment, temporal continuity, frame translation,
   loop seam, dimensions, bytes, and palette are gated before upload.
+  If the full grid is substantially taller than provider-supported image
+  ratios, generate bounded contiguous Y ranges instead of center-cropping one
+  portrait image. Journal and retain every slice request/output, bind global
+  frame ranges and continuity references in each prompt, normalize without
+  cropping, and deterministically assemble the exact full grid before forge.
+  Ordinary sheets that map closely to a provider ratio remain one call.
 
 Gemini 3.7 Flash periodically mines successful novel traces and feedback
 clusters into `TechniqueCandidate` records. Each candidate materializes an
@@ -776,6 +809,11 @@ evaluation. A judge's own decisions are never its labels.
 ### Production
 
 - Hermes runs `factory run-once` on schedule.
+- Immediately before every scheduled invocation, the fixed wrapper verifies
+  the owner-private paid-smoke marker against the current config/model,
+  renderer, and LaMa behavior and repeats the live least-privilege Snaketron
+  probe. Drift exits before provider spend. An exact journaled, held-out,
+  immutable author-playbook promotion is the sole skill-only exception.
 - Machine triage routes the prototype inbox, final inbox, and rejected gallery.
 - Only a human-approved prototype proceeds to build.
 - Human remains the only publication authority.
@@ -784,7 +822,12 @@ evaluation. A judge's own decisions are never its labels.
 Hard caps live in versioned config and are enforced before spend: concurrent
 attempts, pending prototype reviews, pending final reviews, images per
 prototype, provider retries, wall time, per-attempt cost, daily
-cost, and total program cost.
+cost, and total program cost. Each model role supplies pinned input-context and
+output-token ceilings; requests transmit the output ceiling, reservations use
+both full ceilings, and billed thinking tokens count as output. Missing usage
+keeps the conservative reservation charged. Signed Git promotion has one
+overall subprocess deadline plus cleanup budget and cannot start late in a
+Hermes tick.
 
 Pause new generation when any of these occurs:
 
@@ -925,3 +968,7 @@ idea succeeds on a linked retry, and `publish_approval` publishes immediately.
 18. Optimizer and technique rollouts use approved fixtures in an isolated,
     non-publishable namespace and never append unpromoted output to production
     skins.
+19. Every Hermes tick revalidates its paid-smoke behavior pin and live
+    Snaketron service capabilities before spend; config/model, renderer, LaMa,
+    administrator-authority, or storage-capability drift fails closed, while an
+    exactly retained automatic author-playbook promotion remains runnable.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from typing import Any
 
 import httpx
@@ -12,6 +13,60 @@ import httpx
 from .assets import ForgeBundle
 from .config import FactoryConfig
 from .domain import ProviderError, ProviderFailureKind, ProviderResult
+
+
+def validate_service_capabilities(value: dict[str, Any]) -> dict[str, Any]:
+    """Require the exact useful-but-non-authoritative factory identity."""
+
+    identity = value.get("identity") if isinstance(value, dict) else None
+    credential = value.get("credential") if isinstance(value, dict) else None
+    capabilities = value.get("capabilities") if isinstance(value, dict) else None
+    if (
+        value.get("schemaVersion") != 1
+        or not isinstance(identity, dict)
+        or not isinstance(credential, dict)
+        or not isinstance(capabilities, dict)
+    ):
+        raise ValueError("Snaketron factory capability envelope has an unsupported schema")
+    required_identity = {
+        "registeredAccount": True,
+        "isGuest": False,
+        "isAdmin": False,
+    }
+    required_capabilities = {
+        "createPrivateSkins": True,
+        "createEvaluationSkins": True,
+        "uploadPrivateForgeTextures": True,
+        "requestPublicationReview": True,
+        "publishSkins": False,
+        "administerSkins": False,
+    }
+    required_credential = {
+        "credentialType": "factoryService",
+        "revocable": True,
+        "expiresAt": None,
+    }
+    identity_drift = {
+        key: identity.get(key) for key, expected in required_identity.items() if identity.get(key) is not expected
+    }
+    capability_drift = {
+        key: capabilities.get(key)
+        for key, expected in required_capabilities.items()
+        if capabilities.get(key) is not expected
+    }
+    credential_drift = {
+        key: credential.get(key) for key, expected in required_credential.items() if credential.get(key) != expected
+    }
+    credential_id = credential.get("credentialId")
+    if not isinstance(credential_id, str) or re.fullmatch(r"[0-9a-f]{32}", credential_id) is None:
+        credential_drift["credentialId"] = credential_id
+    if identity_drift or credential_drift or capability_drift:
+        raise PermissionError(
+            "service token is not the required registered, non-admin factory identity; "
+            f"identity mismatches={sorted(identity_drift)}, credential mismatches={sorted(credential_drift)}, "
+            f"capability mismatches={sorted(capability_drift)}"
+        )
+    return value
 
 
 class SnaketronApi:
@@ -46,6 +101,30 @@ class SnaketronApi:
             return response.json()
         except ValueError:
             return {"status": response.text.strip() or "ok"}
+
+    async def service_capabilities(self) -> dict[str, Any]:
+        """Read the DB-derived service envelope without creating a canary."""
+
+        response = await self._request(
+            "GET",
+            "/api/factory/capabilities",
+            headers=self._headers(),
+        )
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "Snaketron factory capability response is not JSON",
+                request_id=self._request_id(response),
+            ) from error
+        if not isinstance(value, dict):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "Snaketron factory capability response is not an object",
+                request_id=self._request_id(response),
+            )
+        return value
 
     async def upload_forge_bundle(self, bundle: ForgeBundle) -> ProviderResult:
         if not bundle.variants:
@@ -200,6 +279,35 @@ class SnaketronApi:
         )
         return self._result(response, response.json() if response.content else {"cancelled": True})
 
+    async def get_skin_authority(
+        self,
+        skin_id: str | int,
+        *,
+        operator: bool = False,
+    ) -> ProviderResult:
+        """Read the server's current immutable revision/review authority."""
+
+        response = await self._request(
+            "GET",
+            f"/api/skins/{skin_id}",
+            headers=self._headers(operator=operator),
+        )
+        try:
+            value = response.json()
+        except ValueError as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "Snaketron skin authority readback is not JSON",
+                request_id=self._request_id(response),
+            ) from error
+        if not isinstance(value, dict):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "Snaketron skin authority readback is not an object",
+                request_id=self._request_id(response),
+            )
+        return self._result(response, value)
+
     async def get_skin_document(self, content_ref: str, *, as_operator: bool = False) -> bytes:
         response = await self._request(
             "GET",
@@ -241,6 +349,11 @@ class SnaketronApi:
         request_id = self._request_id(response)
         if response.status_code == 429:
             kind = ProviderFailureKind.QUOTA
+        elif response.status_code in {401, 403}:
+            # Authentication/authorization rejection proves the requested
+            # mutation did not execute. A human may refresh the short-lived
+            # operator credential and explicitly retry the exact authority.
+            kind = ProviderFailureKind.AUTHENTICATION
         elif response.status_code == 408 or response.status_code >= 500:
             kind = ProviderFailureKind.UNAVAILABLE
         elif response.status_code in {400, 404, 409, 410, 422}:

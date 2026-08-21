@@ -9,11 +9,15 @@ import pytest
 
 from snaketron_factory.calibration import judge_evaluator_version
 from snaketron_factory.db import LeaseBusy, VersionConflict
-from snaketron_factory.domain import ArtifactKind, Disposition, Purpose, Stage
+from snaketron_factory.domain import ArtifactKind, Disposition, GateResult, GateVerdict, Purpose, Stage
 from snaketron_factory.factory import Factory
 from snaketron_factory.gallery import VIEW_MAP
 from snaketron_factory.optimizer import Optimizer, _pareto_winner
-from snaketron_factory.techniques import TechniqueMiner, TechniqueProposal
+from snaketron_factory.techniques import (
+    TechniqueMiner,
+    TechniqueProposal,
+    fixture_structural_signature,
+)
 from snaketron_factory.worker import SkillBundle
 
 
@@ -32,6 +36,26 @@ def _visual_metric(version: str, score: float = 0.9) -> dict[str, Any]:
             }
         ),
     }
+
+
+def _technique_structure(index: int) -> dict[str, Any]:
+    kinds = ("layers", "texture", "sprite_sheet")
+    path = kinds[index]
+    asset_kind = {"layers": None, "texture": "coat", "sprite_sheet": "sheet"}[path]
+    plan = {
+        "path": path,
+        "asset_plan": [] if asset_kind is None else [{"kind": asset_kind}],
+    }
+    document = {
+        "textures": [] if asset_kind is None else [{"name": f"texture-{index}", "kind": asset_kind}],
+        "layers": [],
+    }
+    return fixture_structural_signature(
+        plan,
+        document,
+        plan_content_hash=f"sha256:plan-{index}",
+        document_content_hash=f"sha256:document-{index}",
+    )
 
 
 def test_holdout_ledger_is_idempotent_but_never_reuses_a_concept_in_an_epoch(database, make_attempt) -> None:
@@ -285,7 +309,12 @@ def test_novel_trace_mining_requires_positive_completed_build_and_versioned_evid
     database, objects, make_attempt
 ) -> None:
     def retained_trace(*, outcome: str, complete: bool, marker: bool):
-        attempt = make_attempt(stage=Stage.FINAL_REVIEW)
+        attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+        attempt = database.update_attempt(
+            attempt["id"],
+            attempt["version"],
+            review_kind="final",
+        )
         if complete:
             attempt = database.update_attempt(
                 attempt["id"],
@@ -305,14 +334,36 @@ def test_novel_trace_mining_requires_positive_completed_build_and_versioned_evid
             size_bytes=stored.size,
             metadata={"novelty_candidate": marker},
         )
-        decision = database.add_human_decision(
-            artifact_id=artifact["id"],
+        contact_bytes = objects.put(f"contact:{attempt['id']}".encode())
+        contact = database.add_artifact(
+            attempt_id=attempt["id"],
+            stage=Stage.RENDER,
+            kind=ArtifactKind.CONTACT_SHEET,
+            content_hash=contact_bytes.uri,
+            object_ref=contact_bytes.uri,
+            media_type="image/png",
+            size_bytes=contact_bytes.size,
+        )
+        database.add_evaluation(
+            artifact_id=contact["id"],
+            attempt_id=attempt["id"],
+            evaluator="visual_judge",
+            result=GateResult(
+                gate="visual_fidelity",
+                gate_version="judge-v1",
+                blocking=False,
+                verdict=GateVerdict.CANDIDATE,
+            ),
+            hidden_until_label=True,
+        )
+        decision = database.add_blind_human_label(
+            artifact_id=contact["id"],
             attempt_id=attempt["id"],
             action="build_quality_label",
             feedback="The motion has unusually effective craft.",
             tags=[f"outcome:{outcome}"],
             actor="human:alex",
-            attempt_version=attempt["version"],
+            content_hash=contact["content_hash"],
         )
         return attempt, artifact, decision
 
@@ -381,6 +432,7 @@ def test_technique_trials_always_pair_candidate_with_pinned_baseline(factory_con
             "attempt_id": f"attempt-{index}",
             "approved_prototype_hash": f"sha256:{index:064x}",
             "prototype_decision_id": f"approval-{index}",
+            "fixture_structure": _technique_structure(index),
         }
         for index in range(3)
     ]
@@ -524,6 +576,39 @@ async def test_generation_wip_halt_still_dispatches_optimizer_from_one_run_once(
         "run_id": "optimization-ready",
     }
     assert report["advanced"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_wall_time_halt_skips_optimizer_and_all_new_model_spend(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    make_attempt(stage=Stage.CONCEPT)
+    config = factory_config.model_copy(
+        update={"optimizer": factory_config.optimizer.model_copy(update={"enabled": True})}
+    )
+    factory = Factory(config, database=database, objects=objects)
+    optimizer_called = False
+
+    async def advance(_self):
+        nonlocal optimizer_called
+        optimizer_called = True
+        return {"state": "must-not-run"}
+
+    monotonic_calls = 0
+
+    def monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 0.0 if monotonic_calls == 1 else float(config.budgets.wall_seconds_per_run + 1)
+
+    monkeypatch.setattr(Optimizer, "advance_if_ready", advance)
+    monkeypatch.setattr("snaketron_factory.factory.time.monotonic", monotonic)
+    report = await factory.run_once()
+
+    assert report["halt"] == {"reason": "run_wall_time_budget"}
+    assert optimizer_called is False
+    assert "optimizer" not in report
+    await factory.close()
 
 
 @pytest.mark.asyncio

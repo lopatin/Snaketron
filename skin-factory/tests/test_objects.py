@@ -101,6 +101,9 @@ def test_result_persistence_preserves_exact_images_and_canonicalizes_json(object
                 motion_intent="flow",
                 implementation_hint="layers",
                 implementation_rationale="The pattern is best expressed procedurally.",
+                novelty_score=0.9,
+                direction_score=0.9,
+                novelty_rationale="The crystalline river rhythm is distinct from the retained examples.",
             ),
             resolved_model="smart",
         )

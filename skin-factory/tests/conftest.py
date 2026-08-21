@@ -18,11 +18,14 @@ GATE_NAMES = (
     "document_schema",
     "reference_integrity",
     "ownership",
+    "safety_ip",
     "asset_dimensions",
     "asset_exact_hash",
     "seam",
     "sprite_grid",
     "temporal_loop",
+    "palette_chroma",
+    "detail_density",
     "operation_budget",
     "renderer_conformance",
     "browser_pixels_ready",
@@ -137,6 +140,7 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
                     "provider": "fake",
                     "model": "worker-test",
                     "base_url": "https://worker.test/v1",
+                    "max_output_tokens": 1024,
                 },
                 "smart_text": {
                     "provider": "gemini",
@@ -168,7 +172,9 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
                 "max_pending_final_reviews": 4,
                 "prototypes_per_attempt": 1,
                 "provider_retries": 1,
-                "wall_seconds_per_run": 30,
+                # Match production so every configured external timeout fits
+                # inside one tick's admission budget.
+                "wall_seconds_per_run": 1800,
                 "max_cost_micros_per_attempt": 1_000_000,
                 "max_cost_micros_per_day": 2_000_000,
                 "max_cost_micros_program": 3_000_000,

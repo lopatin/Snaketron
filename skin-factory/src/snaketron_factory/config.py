@@ -34,16 +34,44 @@ class PathsConfig(ConfigModel):
 class ModelRole(ConfigModel):
     provider: Literal["gemini", "openai_compatible", "local_lama", "fake"]
     model: str | None = None
+    # Provider aliases may resolve to a dated immutable build. The first
+    # response must match this explicit full-string pattern, and every later
+    # response for the same role/Attempt must use that exact resolved id.
+    # Omitting it requires byte-for-byte equality with ``model``.
+    resolved_model_pattern: str | None = None
     thinking_level: Literal["minimal", "low", "medium", "high"] | None = None
     base_url: str | None = None
     api_key_env: str | None = None
     timeout_seconds: float = Field(default=120, ge=1, le=1800)
+    # Pinned model context ceiling. Reservations use the full value because
+    # multimodal tokenization is provider-specific and cannot be estimated
+    # safely from PNG byte length before spend.
+    max_input_tokens: int = Field(default=131_072, ge=1, le=2_097_152)
+    # Exact generation cap used both in provider requests and pre-spend cost
+    # reservations. Thinking tokens are billed output and share this budget.
+    max_output_tokens: int = Field(default=16_384, ge=1, le=131_072)
     cost_per_million_input_micros: int = Field(default=0, ge=0)
     cost_per_million_output_micros: int = Field(default=0, ge=0)
     cost_per_image_micros: int = Field(default=0, ge=0)
 
+    @model_validator(mode="after")
+    def validate_model_identity(self) -> ModelRole:
+        if self.resolved_model_pattern is not None:
+            try:
+                re.compile(self.resolved_model_pattern)
+            except re.error as error:
+                raise ValueError(f"invalid resolved_model_pattern: {error}") from error
+        return self
+
     def secret(self) -> str | None:
         return os.environ.get(self.api_key_env) if self.api_key_env else None
+
+    def accepts_resolved_model(self, value: str) -> bool:
+        if not value:
+            return False
+        if self.resolved_model_pattern is None:
+            return self.model is not None and value == self.model
+        return re.fullmatch(self.resolved_model_pattern, value) is not None
 
 
 class ModelsConfig(ConfigModel):
@@ -60,10 +88,37 @@ class BudgetConfig(ConfigModel):
     max_pending_final_reviews: int = Field(default=8, ge=1)
     prototypes_per_attempt: int = Field(default=3, ge=1, le=6)
     provider_retries: int = Field(default=2, ge=0, le=8)
+    # A tall sprite sheet may need several provider-native aspect-ratio
+    # slices.  These hard bounds are checked before the first paid image call;
+    # the attempt-wide value includes the worst-case safe transport retries
+    # and strict-gate regeneration rounds.
+    max_image_slices_per_asset: int = Field(default=16, ge=1, le=64)
+    max_asset_image_calls_per_attempt: int = Field(default=128, ge=1, le=1024)
     wall_seconds_per_run: int = Field(default=1800, ge=30)
-    max_cost_micros_per_attempt: int = Field(default=5_000_000, ge=0)
+    max_cost_micros_per_attempt: int = Field(default=10_000_000, ge=0)
     max_cost_micros_per_day: int = Field(default=25_000_000, ge=0)
     max_cost_micros_program: int = Field(default=500_000_000, ge=0)
+
+
+class ProgramConfig(ConfigModel):
+    """Terminal program objective, independent of spend and per-stage WIP."""
+
+    target_published_skins: int = Field(default=100, ge=1)
+
+
+class IdeationConfig(ConfigModel):
+    """Bounded novelty context and soft concept-ranking policy."""
+
+    context_limit: int = Field(default=40, ge=5, le=200)
+    minimum_rank_score: float = Field(default=0.55, ge=0, le=1)
+
+
+class HaltConfig(ConfigModel):
+    """Evidence thresholds that pause only new concept generation."""
+
+    deterministic_failure_window: int = Field(default=12, ge=3, le=500)
+    repeated_blocking_gate_limit: int = Field(default=3, ge=2, le=100)
+    repeated_root_cause_after_promotion_limit: int = Field(default=2, ge=2, le=100)
 
 
 class ServiceConfig(ConfigModel):
@@ -71,6 +126,21 @@ class ServiceConfig(ConfigModel):
     service_token_env: str = "SNAKETRON_FACTORY_SERVICE_TOKEN"
     operator_token_env: str = "SNAKETRON_FACTORY_OPERATOR_TOKEN"
     request_timeout_seconds: float = Field(default=60, ge=1)
+    # Reconciliation never trusts an operator-typed service identity. The
+    # default adapter identity is exact; deployments that expose an immutable
+    # ``x-snaketron-version`` must pin that full value/pattern explicitly.
+    resolved_model_pattern: str = r"^snaketron-api$"
+
+    @model_validator(mode="after")
+    def validate_resolved_model_pattern(self) -> ServiceConfig:
+        try:
+            re.compile(self.resolved_model_pattern)
+        except re.error as error:
+            raise ValueError(f"invalid service resolved_model_pattern: {error}") from error
+        return self
+
+    def accepts_resolved_model(self, value: str) -> bool:
+        return re.fullmatch(self.resolved_model_pattern, value) is not None
 
 
 class BrowserConfig(ConfigModel):
@@ -150,12 +220,20 @@ class OptimizerConfig(ConfigModel):
     gepa_generations: int = Field(default=2, ge=1, le=5)
     gepa_candidates_per_generation: int = Field(default=3, ge=1, le=5)
     technique_min_fixtures: int = Field(default=3, ge=2)
+    # Concept ids alone do not make a varied technique corpus. Require the
+    # retained production builds to cover distinct implementation/asset/effect
+    # topologies before a recipe can consume provider budget or be promoted.
+    technique_min_structural_signatures: int = Field(default=3, ge=2)
     # Bumping this version is the explicit human authorization to retire the
     # current sealed holdout and deterministically create a fresh partition.
     # A concept can be queried at most once inside an epoch.
     holdout_epoch: str = Field(default="v1", min_length=1, max_length=80, pattern=r"^[A-Za-z0-9._-]+$")
     active_skill_ref: str = "HEAD"
     promotion_remote: str = "origin"
+    # One signed promotion contains several local/Git/remote subprocesses.
+    # This is an overall deadline, not a per-command timeout, so a late tick
+    # cannot be killed by Hermes in the middle of a branch/tag push.
+    promotion_timeout_seconds: int = Field(default=1200, ge=60, le=1800)
 
 
 class FactoryConfig(ConfigModel):
@@ -164,6 +242,9 @@ class FactoryConfig(ConfigModel):
     lease_seconds: int = Field(default=3600, ge=60)
     paths: PathsConfig
     models: ModelsConfig
+    program: ProgramConfig = ProgramConfig()
+    ideation: IdeationConfig = IdeationConfig()
+    halts: HaltConfig = HaltConfig()
     budgets: BudgetConfig = BudgetConfig()
     service: ServiceConfig = ServiceConfig()
     browser: BrowserConfig = BrowserConfig()
@@ -193,6 +274,12 @@ class FactoryConfig(ConfigModel):
         overlap = sorted(self.service_environment_names().intersection(self.human_authority_environment_names()))
         if overlap:
             raise ValueError(f"service and human authority environment names overlap: {overlap}")
+        if self.optimizer.promotion_timeout_seconds + 31 > self.budgets.wall_seconds_per_run:
+            raise ValueError(
+                "optimizer promotion timeout plus cleanup/settlement must fit inside the run wall-time budget"
+            )
+        if self.worker.max_output_tokens != self.models.task_worker.max_output_tokens:
+            raise ValueError("worker max_output_tokens must equal the task_worker model reservation ceiling")
         return self
 
     def resolve_paths(self, config_file: Path) -> FactoryConfig:
@@ -201,7 +288,17 @@ class FactoryConfig(ConfigModel):
         paths = raw["paths"]
         for key, value in paths.items():
             path = Path(value)
-            paths[key] = str(path if path.is_absolute() else (base / path).resolve())
+            candidate = path if path.is_absolute() else base / path
+            if key == "lama_python":
+                # uv virtual environments deliberately expose bin/python as a
+                # symlink to the base interpreter.  Resolve and normalize its
+                # parent directories, but retain that final entrypoint: fully
+                # resolving it loses the virtualenv identity and makes Python
+                # run against the base environment instead of the frozen LaMa
+                # dependency closure.
+                paths[key] = str(candidate.parent.resolve() / candidate.name)
+            else:
+                paths[key] = str(candidate.resolve())
         updated = FactoryConfig.model_validate(raw)
         updated.source_path = config_file.resolve()
         updated.version_sha256 = self.version_sha256

@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import shutil
+import socket
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import typer
 
+from .backup import build_manifest, verify_backup
 from .calibration import JudgeCalibrationService
 from .config import FactoryConfig, load_config
 from .db import Database, VersionConflict
@@ -24,6 +26,9 @@ from .environment import apply_environment, load_service_environment, read_priva
 from .factory import Factory
 from .gallery import _prevalidate_bulk_retry, build_review_service, create_app
 from .objects import ObjectStore
+from .readiness import check_paid_smoke, current_readiness_pin, record_paid_smoke
+from .recovery import validate_recovered_result
+from .snaketron_api import validate_service_capabilities
 
 app = typer.Typer(
     name="factory",
@@ -192,12 +197,24 @@ def status(
                 row[0]: row[1]
                 for row in connection.execute("SELECT status,count(*) FROM outbox_message GROUP BY status")
             }
-        prototype_calibration = database.judge_calibration("prototype")
-        build_calibration = database.judge_calibration("build")
         calibration = JudgeCalibrationService(database, settings)
+        prototype_evaluator = calibration.active_evaluator_version("prototype")
+        build_evaluator = calibration.active_evaluator_version("build")
+        prototype_calibration = database.judge_calibration("prototype", prototype_evaluator)
+        build_calibration = database.judge_calibration("build", build_evaluator)
+        factory = Factory(settings, database=database)
+        try:
+            generation_halt = factory._generation_halt_detail()
+        finally:
+            asyncio.run(factory.close())
         result = {
             "ok": not database.integrity_check(),
             "mode": settings.mode,
+            "program": {
+                "published_concepts": database.published_concept_count(),
+                "target_published_skins": settings.program.target_published_skins,
+                "target_reached": (database.published_concept_count() >= settings.program.target_published_skins),
+            },
             "database": str(database.path),
             "dispositions": dispositions,
             "stages": stages,
@@ -206,11 +223,19 @@ def status(
                 "final": database.count_attempts(disposition="needs_human", review_kind="final"),
             },
             "unresolved_operations": database.unresolved_operations(),
+            "program_halt": database.unresolved_program_halt(),
+            "generation_halt": generation_halt,
             "cost_micros": {"program": database.total_cost()},
             "active_authoring": database.active_behavior("author-skin"),
             "judge_calibration": {
-                "prototype": prototype_calibration,
-                "build": build_calibration,
+                "prototype": {
+                    "active_evaluator_version": prototype_evaluator,
+                    "metrics": prototype_calibration,
+                },
+                "build": {
+                    "active_evaluator_version": build_evaluator,
+                    "metrics": build_calibration,
+                },
             },
             "judge_routing": {
                 "prototype": calibration.routing_status("prototype").as_report(),
@@ -459,12 +484,12 @@ def bulk_retry(
         settings = _load(config, env_file)
         human = _human(settings, actor)
 
-        def action(review: Any, factory: Factory) -> Any:
+        async def action(review: Any, factory: Factory) -> Any:
             _prevalidate_bulk_retry(factory.database, attempt_ids, from_stage)
             literal = _feedback(feedback, feedback_file)
             return {
                 "results": [
-                    review.retry(
+                    await review.retry(
                         attempt_id=item,
                         from_stage=from_stage,
                         feedback=literal,
@@ -561,7 +586,15 @@ def resolve_operation(
                 raise ValueError("executed_result_recovered requires a result hash")
             if not resolved_model:
                 raise ValueError("executed_result_recovered requires the exact resolved model")
-            ObjectStore(settings.paths.objects).get(result_hash)
+            validate_recovered_result(
+                config=settings,
+                operation=database.get_operation(operation_id),
+                database=database,
+                objects=ObjectStore(settings.paths.objects),
+                result_hash=result_hash,
+                resolved_model=resolved_model,
+                media_type=media_type,
+            )
         result = database.resolve_operation(
             operation_id=operation_id,
             resolution=resolution,
@@ -572,6 +605,55 @@ def resolve_operation(
             media_type=media_type,
             actor=human,
         )
+        _emit(result, json_output)
+    except Exception as error:
+        _fail(error, json_output)
+
+
+@app.command("resume-generation")
+def resume_generation(
+    halt: str,
+    reason: str = typer.Option("", "--reason"),
+    reason_file: Path | None = typer.Option(None, "--reason-file", exists=True),
+    actor: str | None = typer.Option(None, "--actor"),
+    config: Path = CONFIG_OPTION,
+    env_file: Path | None = ENV_OPTION,
+    json_output: bool = JSON_OPTION,
+) -> None:
+    """Acknowledge the exact current provider/browser/cluster halt after repair."""
+
+    try:
+        settings = _load(config, env_file)
+        human = _human(settings, actor)
+        database = Database(settings.paths.database)
+        database.migrate()
+        factory = Factory(settings, database=database)
+        try:
+            current = factory._generation_halt_detail()
+        finally:
+            asyncio.run(factory.close())
+        if current is None or not current.get("acknowledgeable"):
+            raise ValueError("there is no human-acknowledgeable generation halt")
+        if halt not in {current["reason"], current.get("attempt_id")}:
+            raise VersionConflict("requested halt is not the exact current generation halt")
+        feedback = _feedback(reason, reason_file)
+        if current.get("attempt_id"):
+            decision = database.resume_program_halt(
+                attempt_id=str(current["attempt_id"]),
+                actor=human,
+                reason=feedback,
+            )
+            result = {"halt": current, "decision": decision, "resume": database.latest_generation_resume()}
+        else:
+            result = {
+                "halt": current,
+                "resume": database.record_generation_resume(
+                    halt_key=str(current["reason"]),
+                    evidence_at=str(current["evidence_at"]),
+                    actor=human,
+                    reason=feedback,
+                ),
+            }
         _emit(result, json_output)
     except Exception as error:
         _fail(error, json_output)
@@ -594,11 +676,18 @@ def optimize(
             raise ValueError("the first bounded optimizer target is authoring-playbook")
         factory = Factory(_load(config, env_file))
         factory.database.migrate()
+        owner = f"operator-optimize:{socket.gethostname()}:{os.getpid()}"
+        token = factory.database.acquire_lease("production", owner, factory.config.lease_seconds)
+        factory._lease_token = token
+        factory._run_deadline = time.monotonic() + factory.config.budgets.wall_seconds_per_run
         try:
             from .optimizer import Optimizer
 
             return await Optimizer(factory).advance_if_ready()
         finally:
+            factory.database.release_lease("production", token)
+            factory._lease_token = None
+            factory._run_deadline = None
             await factory.close()
 
     try:
@@ -639,19 +728,76 @@ def backup(
             shutil.copytree(settings.paths.objects, objects_target, copy_function=shutil.copy2)
         else:
             objects_target.mkdir()
-        object_files = [path for path in objects_target.rglob("*") if path.is_file()]
-        manifest = {
-            "version": 1,
-            "created_at": datetime.now(UTC).isoformat(),
-            "config_sha256": settings.version_sha256,
-            "database_sha256": hashlib.sha256(database_target.read_bytes()).hexdigest(),
-            "object_count": len(object_files),
-            "object_bytes": sum(path.stat().st_size for path in object_files),
-        }
-        (destination / "manifest.json").write_text(
-            json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        manifest = build_manifest(
+            database_path=database_target,
+            objects_root=objects_target,
+            config_sha256=settings.version_sha256,
+            created_at=datetime.now(UTC).isoformat(),
         )
+        manifest_path = destination / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
         _emit({"ok": True, "target": str(destination), "manifest": manifest}, json_output)
+    except Exception as error:
+        _fail(error, json_output)
+
+
+@app.command("verify-backup")
+def verify_backup_command(
+    source: Path = typer.Option(..., "--source", exists=True, file_okay=False),
+    json_output: bool = JSON_OPTION,
+) -> None:
+    """Verify the database, complete CAS inventory, and every retained DB reference."""
+
+    try:
+        _emit({"source": str(source.resolve()), **verify_backup(source.resolve())}, json_output)
+    except Exception as error:
+        _fail(error, json_output)
+
+
+@app.command("readiness-pin")
+def readiness_pin(
+    record: bool = typer.Option(False, "--record-paid-smoke"),
+    check: bool = typer.Option(False, "--check-paid-smoke"),
+    config: Path = CONFIG_OPTION,
+    env_file: Path | None = ENV_OPTION,
+    json_output: bool = JSON_OPTION,
+) -> None:
+    """Record or verify an explicit paid smoke against current behavior."""
+
+    async def run() -> dict[str, Any]:
+        if record and check:
+            raise ValueError("choose either --record-paid-smoke or --check-paid-smoke")
+        factory = Factory(_load(config, env_file, service_command="readiness-pin"))
+        factory.database.migrate()
+        try:
+            if record:
+                capabilities = validate_service_capabilities(await factory.api.service_capabilities())
+                marker = record_paid_smoke(factory, capabilities)
+                return {"ok": True, "recorded": True, "marker": marker}
+            if check:
+                capabilities = validate_service_capabilities(await factory.api.service_capabilities())
+                marker = check_paid_smoke(factory, capabilities)
+                return {
+                    "ok": True,
+                    "ready": True,
+                    "marker": marker,
+                    "service_identity": {
+                        "user_id": capabilities["identity"].get("userId"),
+                        "username": capabilities["identity"].get("username"),
+                        "credential_id": capabilities["credential"].get("credentialId"),
+                        "credential_type": capabilities["credential"].get("credentialType"),
+                        "expires_at": capabilities["credential"].get("expiresAt"),
+                        "revocable": capabilities["credential"].get("revocable"),
+                        "least_privilege": True,
+                    },
+                }
+            return {"ok": True, "pin": current_readiness_pin(factory)}
+        finally:
+            await factory.close()
+
+    try:
+        _emit(asyncio.run(run()), json_output)
     except Exception as error:
         _fail(error, json_output)
 

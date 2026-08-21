@@ -24,12 +24,17 @@ models:
     base_url: http://localhost:1234/v1
     api_key_env: LMSTUDIO_API_KEY
     timeout_seconds: 300
+    max_input_tokens: 131072
+    max_output_tokens: 16384
   smart_text:
     provider: gemini
     model: gemini-3.7-flash
+    resolved_model_pattern: '^gemini-3\.7-flash(?:-[0-9]{6,8})?$'
     thinking_level: high
     api_key_env: GEMINI_API_KEY
     timeout_seconds: 300
+    max_input_tokens: 1048576
+    max_output_tokens: 65536
     # Conservative accounting reservations, not a claim about provider list
     # price. Keep them versioned and raise them before a pricing increase.
     cost_per_million_input_micros: 2000000
@@ -37,9 +42,12 @@ models:
   visual_judge:
     provider: gemini
     model: gemini-3.7-flash
+    resolved_model_pattern: '^gemini-3\.7-flash(?:-[0-9]{6,8})?$'
     thinking_level: high
     api_key_env: GEMINI_API_KEY
     timeout_seconds: 300
+    max_input_tokens: 1048576
+    max_output_tokens: 65536
     cost_per_million_input_micros: 2000000
     cost_per_million_output_micros: 12000000
   image_generator:
@@ -50,8 +58,11 @@ models:
     # base64 results; it never fetches provider URLs or falls back to Gemini.
     provider: gemini
     model: gemini-3-pro-image
+    resolved_model_pattern: '^gemini-3-pro-image(?:-[0-9]{6,8})?$'
     api_key_env: GEMINI_API_KEY
     timeout_seconds: 600
+    max_input_tokens: 1048576
+    max_output_tokens: 65536
     cost_per_million_input_micros: 2000000
     cost_per_million_output_micros: 12000000
     cost_per_image_micros: 750000
@@ -59,6 +70,30 @@ models:
     provider: local_lama
     model: simple-lama
     timeout_seconds: 600
+    max_input_tokens: 1
+    max_output_tokens: 1
+
+program:
+  # Stop creating new concepts after this many distinct concepts have a
+  # human-approved published Attempt. Existing retained/review work remains
+  # available, and changing the target is an explicit versioned config edit.
+  target_published_skins: 100
+
+ideation:
+  # Gemini supplies direction/novelty scores, while a deterministic token
+  # similarity score prevents a model from simply declaring a duplicate novel.
+  # Low-ranked briefs are retained in the rejected gallery before image spend.
+  context_limit: 40
+  minimum_rank_score: 0.55
+
+halts:
+  # Pause only new concept generation when recent production attempts repeat
+  # the same blocking gate, or when the same high-confidence authoring root
+  # cause recurs after an author-skin promotion. Retained review/recovery and
+  # already-active work remain available.
+  deterministic_failure_window: 12
+  repeated_blocking_gate_limit: 3
+  repeated_root_cause_after_promotion_limit: 2
 
 budgets:
   max_concurrent_attempts: 1
@@ -66,8 +101,10 @@ budgets:
   max_pending_final_reviews: 8
   prototypes_per_attempt: 3
   provider_retries: 2
+  max_image_slices_per_asset: 16
+  max_asset_image_calls_per_attempt: 128
   wall_seconds_per_run: 1800
-  max_cost_micros_per_attempt: 5000000
+  max_cost_micros_per_attempt: 10000000
   max_cost_micros_per_day: 25000000
   max_cost_micros_program: 500000000
 
@@ -76,6 +113,7 @@ service:
   service_token_env: SNAKETRON_FACTORY_SERVICE_TOKEN
   operator_token_env: SNAKETRON_FACTORY_OPERATOR_TOKEN
   request_timeout_seconds: 60
+  resolved_model_pattern: '^snaketron-api$'
 
 browser:
   # This endpoint must serve client/web/dist with SPA fallback. Capture hashes
@@ -139,9 +177,15 @@ optimizer:
   gepa_generations: 2
   gepa_candidates_per_generation: 3
   technique_min_fixtures: 3
+  # A different Concept is not necessarily a different authoring test. This
+  # minimum counts stable implementation/asset/animation topology hashes.
+  technique_min_structural_signatures: 3
   # Change only after a human deliberately retires the sealed promotion set.
   # Within one epoch, a concept is queried as holdout at most once and never
   # later exposed to the teacher/development selector.
   holdout_epoch: v1
   active_skill_ref: HEAD
   promotion_remote: origin
+  # Overall signed commit/tag/push/clean-clone deadline. The factory reserves
+  # this plus cleanup time before it creates a promotion operation intent.
+  promotion_timeout_seconds: 1200

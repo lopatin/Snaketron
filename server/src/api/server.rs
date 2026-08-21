@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     Router, middleware,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -46,6 +46,10 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
     // Build router with protected routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
+        .route(
+            "/api/factory/capabilities",
+            get(auth::get_factory_capabilities),
+        )
         .route("/api/history", get(admin::get_user_history))
         .route(
             "/api/auth/crazygames/preferences",
@@ -59,6 +63,18 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
 
     let admin_routes = Router::new()
         .route("/api/admin/history", get(admin::get_admin_history))
+        .route(
+            "/api/admin/factory-credentials",
+            post(auth::create_factory_credential),
+        )
+        .route(
+            "/api/admin/factory-credentials/:credential_id/rotate",
+            post(auth::rotate_factory_credential),
+        )
+        .route(
+            "/api/admin/factory-credentials/:credential_id",
+            delete(auth::revoke_factory_credential),
+        )
         .route(
             "/api/admin/config",
             get(admin::get_admin_config)
