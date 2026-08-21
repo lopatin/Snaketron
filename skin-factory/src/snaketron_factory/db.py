@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from .domain import (
     ArtifactKind,
     Disposition,
     GateResult,
+    GateVerdict,
     OperationStatus,
     Purpose,
     Stage,
@@ -410,6 +412,77 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE UNIQUE INDEX human_decision_idempotency
         ON human_decision(idempotency_key) WHERE idempotency_key IS NOT NULL;
     """,
+    """
+    CREATE TABLE generation_resume (
+        id TEXT PRIMARY KEY,
+        halt_key TEXT NOT NULL,
+        evidence_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(halt_key, evidence_at)
+    );
+    CREATE INDEX generation_resume_latest ON generation_resume(created_at DESC);
+    """,
+    """
+    -- requires-foreign-keys-off
+    CREATE TABLE artifact_with_occurrence (
+        id TEXT PRIMARY KEY,
+        attempt_id TEXT NOT NULL REFERENCES attempt(id),
+        stage TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        object_ref TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        provenance_json TEXT NOT NULL DEFAULT '{}',
+        occurrence_key TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO artifact_with_occurrence(
+        id,attempt_id,stage,kind,content_hash,object_ref,media_type,size_bytes,
+        metadata_json,provenance_json,occurrence_key,created_at
+    ) SELECT
+        id,attempt_id,stage,kind,content_hash,object_ref,media_type,size_bytes,
+        metadata_json,provenance_json,NULL,created_at
+      FROM artifact;
+    DROP TABLE artifact;
+    ALTER TABLE artifact_with_occurrence RENAME TO artifact;
+    CREATE INDEX artifact_attempt ON artifact(attempt_id, stage, created_at);
+    CREATE INDEX artifact_hash ON artifact(content_hash);
+    CREATE UNIQUE INDEX artifact_singleton_content
+        ON artifact(attempt_id,stage,kind,content_hash)
+        WHERE occurrence_key IS NULL;
+    CREATE UNIQUE INDEX artifact_occurrence
+        ON artifact(attempt_id,stage,kind,occurrence_key)
+        WHERE occurrence_key IS NOT NULL;
+    """,
+    """
+    ALTER TABLE evaluation ADD COLUMN idempotency_key TEXT;
+    CREATE UNIQUE INDEX evaluation_idempotency
+        ON evaluation(idempotency_key) WHERE idempotency_key IS NOT NULL;
+    """,
+    """
+    ALTER TABLE human_decision ADD COLUMN authority_evaluation_id TEXT REFERENCES evaluation(id);
+    CREATE UNIQUE INDEX human_decision_blind_artifact_authority
+        ON human_decision(artifact_id, action)
+        WHERE authority_evaluation_id IS NOT NULL
+          AND action IN ('prototype_label','build_quality_label');
+    CREATE UNIQUE INDEX human_decision_blind_evaluation_authority
+        ON human_decision(authority_evaluation_id)
+        WHERE authority_evaluation_id IS NOT NULL;
+    CREATE TRIGGER human_decision_one_label_per_artifact
+    BEFORE INSERT ON human_decision
+    WHEN NEW.action IN ('prototype_label','build_quality_label')
+      AND EXISTS (
+        SELECT 1 FROM human_decision d
+        WHERE d.artifact_id=NEW.artifact_id AND d.action=NEW.action
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'human label already exists for exact artifact');
+    END;
+    """,
 )
 
 
@@ -463,6 +536,9 @@ class Database:
                     # the script itself so schema changes and the migration
                     # marker remain one crash-safe unit.
                     applied_at = now().replace("'", "''")
+                    foreign_keys_off = "-- requires-foreign-keys-off" in sql
+                    if foreign_keys_off:
+                        connection.execute("PRAGMA foreign_keys = OFF")
                     connection.executescript(
                         "BEGIN IMMEDIATE;\n"
                         f"{sql}\n"
@@ -470,9 +546,15 @@ class Database:
                         f"VALUES ({version}, '{applied_at}');\n"
                         "COMMIT;"
                     )
+                    if foreign_keys_off:
+                        connection.execute("PRAGMA foreign_keys = ON")
+                        violations = list(connection.execute("PRAGMA foreign_key_check"))
+                        if violations:
+                            raise RuntimeError(f"migration {version} introduced foreign-key violations")
                 except BaseException:
                     if connection.in_transaction:
                         connection.execute("ROLLBACK")
+                    connection.execute("PRAGMA foreign_keys = ON")
                     raise
         finally:
             connection.close()
@@ -820,6 +902,163 @@ class Database:
         assert row is not None
         return int(row[0])
 
+    def published_concept_count(self) -> int:
+        """Count terminal target progress once per production concept."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT count(DISTINCT concept_id) FROM attempt WHERE purpose=? AND disposition=?",
+                (Purpose.PRODUCTION, Disposition.PUBLISHED),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def repeated_blocking_gate_failure(
+        self,
+        *,
+        window: int,
+        threshold: int,
+        after: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a recent production gate cluster large enough to halt generation."""
+
+        cutoff = after or ""
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT gate_name,count(*) AS failures,max(created_at) AS latest_at
+                   FROM (
+                     SELECT e.gate_name,e.attempt_id,max(e.created_at) AS created_at
+                     FROM evaluation e JOIN attempt a ON a.id=e.attempt_id
+                     WHERE a.purpose=? AND e.blocking=1 AND e.verdict=? AND e.created_at>?
+                     GROUP BY e.gate_name,e.attempt_id
+                     ORDER BY created_at DESC LIMIT ?
+                   ) recent
+                   GROUP BY gate_name HAVING count(*)>=?
+                   ORDER BY failures DESC,latest_at DESC,gate_name ASC LIMIT 1""",
+                (Purpose.PRODUCTION, GateVerdict.FAIL, cutoff, window, threshold),
+            ).fetchone()
+        return self._dict(row)
+
+    def repeated_root_cause_after_promotion(
+        self,
+        *,
+        target: str,
+        min_confidence: float,
+        threshold: int,
+        after: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a high-confidence feedback signature recurring after promotion."""
+
+        with self.connect() as connection:
+            active = connection.execute("SELECT updated_at FROM active_behavior WHERE name='author-skin'").fetchone()
+            if active is None:
+                return None
+            cutoff = max(str(active["updated_at"]), after or "")
+            row = connection.execute(
+                """SELECT r.signature,count(*) AS occurrences,max(r.created_at) AS latest_at
+                   FROM feedback_route r
+                   JOIN human_decision d ON d.id=r.decision_id
+                   JOIN attempt a ON a.id=d.attempt_id
+                   WHERE a.purpose=? AND r.target=? AND r.confidence>=?
+                     AND r.created_at>?
+                   GROUP BY r.signature HAVING count(*)>=?
+                   ORDER BY occurrences DESC,latest_at DESC,r.signature ASC LIMIT 1""",
+                (
+                    Purpose.PRODUCTION,
+                    target,
+                    min_confidence,
+                    cutoff,
+                    threshold,
+                ),
+            ).fetchone()
+        return self._dict(row)
+
+    def latest_generation_resume(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM generation_resume ORDER BY created_at DESC,id DESC LIMIT 1"
+            ).fetchone()
+        return self._dict(row)
+
+    def record_generation_resume(
+        self,
+        *,
+        halt_key: str,
+        evidence_at: str,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        if not actor.startswith("human:") or not actor.removeprefix("human:").strip():
+            raise PermissionError("generation resume requires an authenticated human actor")
+        if not halt_key.strip() or not evidence_at.strip() or not reason.strip():
+            raise ValueError("halt key, evidence timestamp, and reason are required")
+        resume_id = new_id("resume")
+        timestamp = now()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM generation_resume WHERE halt_key=? AND evidence_at=?",
+                (halt_key, evidence_at),
+            ).fetchone()
+            if existing is not None:
+                if existing["actor"] != actor or existing["reason"] != reason.strip():
+                    raise VersionConflict("generation halt acknowledgement already exists with different authority")
+                return dict(existing)
+            connection.execute(
+                "INSERT INTO generation_resume(id,halt_key,evidence_at,actor,reason,created_at) VALUES(?,?,?,?,?,?)",
+                (resume_id, halt_key, evidence_at, actor, reason.strip(), timestamp),
+            )
+            row = connection.execute("SELECT * FROM generation_resume WHERE id=?", (resume_id,)).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def unresolved_program_halt(self, *, after: str | None = None) -> dict[str, Any] | None:
+        """Return the newest explicit program halt not acknowledged by a human."""
+
+        cutoff = after or ""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT a.* FROM attempt a WHERE a.purpose=? AND a.disposition=? "
+                "AND NOT EXISTS (SELECT 1 FROM human_decision d WHERE d.attempt_id=a.id "
+                "AND d.action='human_resume') AND a.updated_at>? ORDER BY a.updated_at DESC",
+                (Purpose.PRODUCTION, Disposition.BLOCKED, cutoff),
+            ).fetchall()
+        for row in rows:
+            try:
+                failure = json.loads(row["failure_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            kind = failure.get("program_halt")
+            if isinstance(kind, str) and kind:
+                return {**dict(row), "program_halt": kind, "failure": failure}
+        return None
+
+    def resume_program_halt(self, *, attempt_id: str, actor: str, reason: str) -> dict[str, Any]:
+        if not actor.startswith("human:") or not actor.removeprefix("human:").strip():
+            raise PermissionError("generation resume requires an authenticated human actor")
+        attempt = self.get_attempt(attempt_id)
+        active = self.unresolved_program_halt()
+        if active is None or active["id"] != attempt_id:
+            raise VersionConflict("attempt is not the current unresolved program halt")
+        if not reason.strip():
+            raise ValueError("generation resume requires a nonempty reason")
+        decision = self.add_human_decision(
+            artifact_id=None,
+            attempt_id=attempt_id,
+            action="human_resume",
+            feedback=reason.strip(),
+            tags=[f"halt:{active['program_halt']}"],
+            actor=actor,
+            attempt_version=attempt["version"],
+            idempotency_key=f"program-resume:{attempt_id}",
+        )
+        self.record_generation_resume(
+            halt_key=f"program_halt:{active['program_halt']}:{attempt_id}",
+            evidence_at=str(active["updated_at"]),
+            actor=actor,
+            reason=reason,
+        )
+        return decision
+
     def add_artifact(
         self,
         *,
@@ -832,20 +1071,42 @@ class Database:
         size_bytes: int,
         metadata: Mapping[str, Any] | None = None,
         provenance: Mapping[str, Any] | None = None,
+        occurrence_key: str | None = None,
     ) -> dict[str, Any]:
+        if occurrence_key is not None and not occurrence_key.strip():
+            raise ValueError("artifact occurrence_key must be non-empty when supplied")
         artifact_id = new_id("artifact")
+        encoded_metadata = canonical_json(dict(metadata or {}))
+        encoded_provenance = canonical_json(dict(provenance or {}))
         with self.transaction() as connection:
-            existing = connection.execute(
-                "SELECT * FROM artifact WHERE attempt_id=? AND stage=? AND kind=? AND content_hash=?",
-                (attempt_id, stage, kind, content_hash),
-            ).fetchone()
+            if occurrence_key is None:
+                existing = connection.execute(
+                    "SELECT * FROM artifact WHERE attempt_id=? AND stage=? AND kind=? "
+                    "AND content_hash=? AND occurrence_key IS NULL",
+                    (attempt_id, stage, kind, content_hash),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT * FROM artifact WHERE attempt_id=? AND stage=? AND kind=? AND occurrence_key=?",
+                    (attempt_id, stage, kind, occurrence_key),
+                ).fetchone()
             if existing:
+                expected = {
+                    "content_hash": content_hash,
+                    "object_ref": object_ref,
+                    "media_type": media_type,
+                    "size_bytes": size_bytes,
+                    "metadata_json": encoded_metadata,
+                    "provenance_json": encoded_provenance,
+                }
+                if occurrence_key is not None and any(existing[name] != value for name, value in expected.items()):
+                    raise VersionConflict(f"artifact occurrence key reused with different evidence: {occurrence_key}")
                 return dict(existing)
             connection.execute(
                 """INSERT INTO artifact(
                     id,attempt_id,stage,kind,content_hash,object_ref,media_type,size_bytes,
-                    metadata_json,provenance_json,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    metadata_json,provenance_json,occurrence_key,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     artifact_id,
                     attempt_id,
@@ -855,8 +1116,9 @@ class Database:
                     object_ref,
                     media_type,
                     size_bytes,
-                    canonical_json(dict(metadata or {})),
-                    canonical_json(dict(provenance or {})),
+                    encoded_metadata,
+                    encoded_provenance,
+                    occurrence_key,
                     now(),
                 ),
             )
@@ -922,12 +1184,27 @@ class Database:
         hidden_until_label: bool = False,
     ) -> dict[str, Any]:
         evaluation_id = new_id("eval")
+        identity = canonical_json(
+            {
+                "artifact_id": artifact_id,
+                "attempt_id": attempt_id,
+                "evaluator": evaluator,
+                "result": result.model_dump(mode="json"),
+                "hidden_until_label": hidden_until_label,
+            }
+        )
+        idempotency_key = "evaluation:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
         with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM evaluation WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
             connection.execute(
                 """INSERT INTO evaluation(
                     id,artifact_id,attempt_id,evaluator,evaluator_version,gate_name,blocking,
-                    verdict,reasons_json,measurements_json,hidden_until_label,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    verdict,reasons_json,measurements_json,hidden_until_label,created_at,idempotency_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     evaluation_id,
                     artifact_id,
@@ -941,6 +1218,7 @@ class Database:
                     canonical_json(result.measurements),
                     int(hidden_until_label),
                     now(),
+                    idempotency_key,
                 ),
             )
             row = connection.execute("SELECT * FROM evaluation WHERE id=?", (evaluation_id,)).fetchone()
@@ -953,7 +1231,8 @@ class Database:
             condition = (
                 " AND (e.hidden_until_label=0 OR EXISTS ("
                 "SELECT 1 FROM human_decision d WHERE d.artifact_id=e.artifact_id "
-                "AND d.action IN ('prototype_label','build_quality_label')))"
+                "AND d.action IN ('prototype_label','build_quality_label') "
+                "AND d.authority_evaluation_id IS NOT NULL))"
             )
         with self.connect() as connection:
             rows = connection.execute(
@@ -970,6 +1249,7 @@ class Database:
                      AND NOT EXISTS (
                        SELECT 1 FROM human_decision d WHERE d.artifact_id=e.artifact_id
                          AND d.action IN ('prototype_label','build_quality_label')
+                         AND d.authority_evaluation_id IS NOT NULL
                      ) LIMIT 1""",
                 (attempt_id,),
             ).fetchone()
@@ -1497,6 +1777,13 @@ class Database:
                 raise RecordNotFound(attempt_id)
             if attempt["version"] != attempt_version:
                 raise VersionConflict(attempt_id)
+            if action in {"prototype_label", "build_quality_label"}:
+                prior_label = connection.execute(
+                    "SELECT 1 FROM human_decision WHERE artifact_id=? AND action=? LIMIT 1",
+                    (artifact_id, action),
+                ).fetchone()
+                if prior_label is not None:
+                    raise VersionConflict("human label already exists for exact artifact")
             if artifact_id:
                 artifact = connection.execute(
                     "SELECT * FROM artifact WHERE id=? AND attempt_id=?", (artifact_id, attempt_id)
@@ -1528,6 +1815,179 @@ class Database:
             row = connection.execute("SELECT * FROM human_decision WHERE id=?", (decision_id,)).fetchone()
         assert row is not None
         return dict(row)
+
+    def add_blind_human_label(
+        self,
+        *,
+        artifact_id: str,
+        attempt_id: str,
+        action: str,
+        feedback: str,
+        tags: Sequence[str],
+        actor: str,
+        content_hash: str,
+    ) -> dict[str, Any]:
+        """Atomically bind one blind human label to pre-existing judge evidence.
+
+        The deterministic key makes an exact browser/CLI retry a read.  Any
+        changed duplicate is rejected, and the state/evaluation checks live in
+        the same immediate transaction as the insert so two reviewers cannot
+        both create apparent ground truth for one artifact.
+        """
+
+        contracts: dict[str, tuple[str, str, set[tuple[str, str]]]] = {
+            "prototype_label": (
+                ArtifactKind.PROTOTYPE,
+                Stage.PROTOTYPE_REVIEW,
+                {
+                    (Disposition.NEEDS_HUMAN, "prototype"),
+                    (Disposition.MACHINE_REJECTED, "prototype_label"),
+                },
+            ),
+            "build_quality_label": (
+                ArtifactKind.CONTACT_SHEET,
+                Stage.FINAL_REVIEW,
+                {
+                    (Disposition.NEEDS_HUMAN, "final"),
+                    (Disposition.MACHINE_REJECTED, "build_label"),
+                },
+            ),
+        }
+        if action not in contracts:
+            raise ValueError("blind labels are prototype_label or build_quality_label")
+        if not actor.startswith("human:") or not actor.removeprefix("human:").strip():
+            raise PermissionError("blind-label authority requires a nonempty human actor")
+        expected_kind, expected_stage, allowed_states = contracts[action]
+        encoded_tags = canonical_json(list(tags))
+        idempotency_key = f"blind-label:v1:{attempt_id}:{artifact_id}:{action}"
+        decision_id = new_id("decision")
+        timestamp = now()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM human_decision WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "artifact_id": artifact_id,
+                    "attempt_id": attempt_id,
+                    "action": action,
+                    "feedback": feedback,
+                    "tags_json": encoded_tags,
+                    "actor": actor,
+                    "revision": None,
+                    "content_hash": content_hash,
+                }
+                if existing["authority_evaluation_id"] is None or any(
+                    existing[name] != value for name, value in expected.items()
+                ):
+                    raise VersionConflict("blind label already exists with different exact input")
+                return dict(existing)
+
+            attempt = connection.execute("SELECT * FROM attempt WHERE id=?", (attempt_id,)).fetchone()
+            if attempt is None:
+                raise RecordNotFound(attempt_id)
+            if (
+                attempt["stage"] != expected_stage
+                or (attempt["disposition"], attempt["review_kind"]) not in allowed_states
+            ):
+                raise VersionConflict(f"{action} requires its exact eligible {expected_stage} review state")
+            artifact = connection.execute(
+                "SELECT * FROM artifact WHERE id=? AND attempt_id=?",
+                (artifact_id, attempt_id),
+            ).fetchone()
+            if artifact is None:
+                raise RecordNotFound(artifact_id)
+            if artifact["kind"] != expected_kind:
+                raise VersionConflict(f"{action} must name the exact retained {expected_kind} artifact")
+            if artifact["content_hash"] != content_hash:
+                raise VersionConflict("blind label content hash does not name the exact artifact")
+
+            prior = connection.execute(
+                "SELECT * FROM human_decision WHERE artifact_id=? "
+                "AND action IN ('prototype_label','build_quality_label') ORDER BY created_at LIMIT 1",
+                (artifact_id,),
+            ).fetchone()
+            if prior is not None:
+                raise VersionConflict("artifact was already revealed by a different blind-label request")
+
+            visible_evaluation = connection.execute(
+                """SELECT 1 FROM evaluation
+                   WHERE artifact_id=? AND attempt_id=? AND evaluator='visual_judge'
+                     AND gate_name='visual_fidelity' AND hidden_until_label=0
+                   LIMIT 1""",
+                (artifact_id, attempt_id),
+            ).fetchone()
+            if visible_evaluation is not None:
+                raise VersionConflict("blind label rejects an artifact with an unblinded visual_judge evaluation")
+
+            evaluation = connection.execute(
+                """SELECT * FROM evaluation
+                   WHERE artifact_id=? AND attempt_id=? AND evaluator='visual_judge'
+                     AND gate_name='visual_fidelity' AND hidden_until_label=1
+                   ORDER BY created_at DESC,id DESC LIMIT 1""",
+                (artifact_id, attempt_id),
+            ).fetchone()
+            if evaluation is None:
+                raise VersionConflict(
+                    "blind label requires a hidden pre-existing visual_judge evaluation of the exact artifact"
+                )
+            if evaluation["created_at"] > timestamp:
+                raise VersionConflict("blind label cannot precede its visual_judge evaluation")
+
+            connection.execute(
+                """INSERT INTO human_decision(
+                    id,artifact_id,attempt_id,action,feedback,tags_json,actor,attempt_version,
+                    revision,content_hash,created_at,idempotency_key,authority_evaluation_id
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    decision_id,
+                    artifact_id,
+                    attempt_id,
+                    action,
+                    feedback,
+                    encoded_tags,
+                    actor,
+                    attempt["version"],
+                    None,
+                    content_hash,
+                    timestamp,
+                    idempotency_key,
+                    evaluation["id"],
+                ),
+            )
+            row = connection.execute("SELECT * FROM human_decision WHERE id=?", (decision_id,)).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def authoritative_blind_label(self, *, artifact_id: str, action: str) -> dict[str, Any] | None:
+        """Return the one label created against retained hidden judge evidence."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT d.* FROM human_decision d
+                   JOIN evaluation e ON e.id=d.authority_evaluation_id
+                   WHERE d.artifact_id=? AND d.action=? AND d.actor LIKE 'human:%'
+                     AND e.artifact_id=d.artifact_id AND e.attempt_id=d.attempt_id
+                     AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                     AND e.hidden_until_label=1 AND e.created_at<=d.created_at
+                   LIMIT 1""",
+                (artifact_id, action),
+            ).fetchone()
+        return self._dict(row)
+
+    def has_hidden_visual_evaluation(self, artifact_id: str) -> bool:
+        """Return whether exact pixels carry blind visual-fidelity evidence."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM evaluation
+                   WHERE artifact_id=? AND evaluator='visual_judge'
+                     AND gate_name='visual_fidelity' AND hidden_until_label=1
+                   LIMIT 1""",
+                (artifact_id,),
+            ).fetchone()
+        return row is not None
 
     def decisions_for_attempt(self, attempt_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1861,7 +2321,10 @@ class Database:
 
     def human_label_count(self, action: str = "build_quality_label") -> int:
         with self.connect() as connection:
-            row = connection.execute("SELECT count(*) FROM human_decision WHERE action=?", (action,)).fetchone()
+            row = connection.execute(
+                "SELECT count(*) FROM human_decision WHERE action=? AND authority_evaluation_id IS NOT NULL",
+                (action,),
+            ).fetchone()
         assert row is not None
         return int(row[0])
 
@@ -1871,12 +2334,12 @@ class Database:
         action: str,
         evaluator_version: str,
     ) -> list[dict[str, Any]]:
-        """Return only independent labels made after a deliberately blind evaluation.
+        """Return labels transactionally authorized by exact hidden judge evidence.
 
-        The calibration service performs final exact-pixel deduplication
-        because an immutable history may contain linked re-evaluations and
-        repeated labels. Service-authored rows are excluded defensively;
-        the review service also refuses to create them.
+        The calibration service still performs final exact-pixel deduplication
+        because linked attempts can retain the same content-addressed pixels.
+        Service-authored, pre-judge, unblinded, and legacy direct rows have no
+        authority link and are excluded defensively.
         """
 
         with self.connect() as connection:
@@ -1887,11 +2350,13 @@ class Database:
                           e.created_at AS evaluation_created_at
                    FROM human_decision d
                    JOIN artifact a ON a.id=d.artifact_id
-                   JOIN evaluation e ON e.artifact_id=d.artifact_id
+                   JOIN evaluation e ON e.id=d.authority_evaluation_id
                    WHERE d.action=? AND d.actor LIKE 'human:%'
                      AND e.evaluator='visual_judge' AND e.evaluator_version=?
-                     AND e.hidden_until_label=1 AND e.created_at<=d.created_at
-                   ORDER BY d.created_at ASC,e.created_at DESC""",
+                     AND e.gate_name='visual_fidelity' AND e.hidden_until_label=1
+                     AND e.artifact_id=d.artifact_id AND e.attempt_id=d.attempt_id
+                     AND e.created_at<=d.created_at
+                   ORDER BY d.created_at ASC""",
                 (action, evaluator_version),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -1904,9 +2369,11 @@ class Database:
                 """SELECT e.evaluator_version,max(d.created_at) AS latest_label
                    FROM human_decision d
                    JOIN artifact a ON a.id=d.artifact_id
-                   JOIN evaluation e ON e.artifact_id=d.artifact_id
+                   JOIN evaluation e ON e.id=d.authority_evaluation_id
                    WHERE d.action=? AND d.actor LIKE 'human:%'
-                     AND e.evaluator='visual_judge' AND e.hidden_until_label=1
+                     AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                     AND e.hidden_until_label=1
+                     AND e.artifact_id=d.artifact_id AND e.attempt_id=d.attempt_id
                      AND e.created_at<=d.created_at
                    GROUP BY e.evaluator_version
                    ORDER BY latest_label ASC,e.evaluator_version ASC""",
@@ -1914,11 +2381,25 @@ class Database:
             ).fetchall()
         return [str(row["evaluator_version"]) for row in rows]
 
+    def latest_judge_evaluator_version(self, *, rubric_suffix: str) -> str | None:
+        """Return the actual model/rubric identity most recently used on pixels."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT evaluator_version FROM evaluation WHERE evaluator='visual_judge' "
+                "AND gate_name='visual_fidelity' AND evaluator_version LIKE ? "
+                "ORDER BY created_at DESC,id DESC LIMIT 1",
+                (f"%{rubric_suffix}",),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
     def unlabeled_feedback_routes(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT d.*,a.concept_id FROM human_decision d JOIN attempt a ON a.id=d.attempt_id "
                 "LEFT JOIN feedback_route r ON r.decision_id=d.id WHERE r.id IS NULL "
+                "AND (d.action NOT IN ('prototype_label','build_quality_label') "
+                "OR d.authority_evaluation_id IS NOT NULL) "
                 "AND length(trim(d.feedback))>0 ORDER BY d.created_at LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -1939,7 +2420,12 @@ class Database:
                    JOIN attempt a ON a.id=d.attempt_id
                    JOIN concept c ON c.id=a.concept_id
                    JOIN feedback_route r ON r.decision_id=d.id
+                   JOIN evaluation e ON e.id=d.authority_evaluation_id
                    WHERE d.action=? AND r.target=? AND r.confidence>=?
+                     AND d.actor LIKE 'human:%'
+                     AND e.artifact_id=d.artifact_id AND e.attempt_id=d.attempt_id
+                     AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                     AND e.hidden_until_label=1 AND e.created_at<=d.created_at
                    ORDER BY d.created_at""",
                 (action, target, min_confidence),
             ).fetchall()
@@ -2273,10 +2759,15 @@ class Database:
                    JOIN attempt a ON a.id=ar.attempt_id
                    JOIN human_decision d ON d.attempt_id=a.id AND d.action='build_quality_label'
                    JOIN feedback_route r ON r.decision_id=d.id
+                   JOIN evaluation e ON e.id=d.authority_evaluation_id
                    WHERE ar.kind=? AND a.purpose=?
                      AND a.stage IN ('final_review','complete')
                      AND a.production_revision IS NOT NULL
                      AND a.production_content_hash IS NOT NULL
+                     AND d.actor LIKE 'human:%'
+                     AND e.artifact_id=d.artifact_id AND e.attempt_id=d.attempt_id
+                     AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                     AND e.hidden_until_label=1 AND e.created_at<=d.created_at
                      AND d.tags_json LIKE '%"outcome:accept"%'
                      AND r.target='authoring_playbook' AND r.confidence>=?
                      AND (

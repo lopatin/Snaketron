@@ -40,6 +40,14 @@ def test_image_generator_role_is_configurable_while_gemini_remains_the_default(f
     assert configured.models.image_generator.model == "operator-selected-image-model"
 
 
+def test_task_worker_request_and_reservation_output_ceilings_cannot_drift(factory_config) -> None:
+    payload = factory_config.model_dump(mode="python")
+    payload["worker"]["max_output_tokens"] += 1
+
+    with pytest.raises(ValidationError, match="task_worker model reservation ceiling"):
+        FactoryConfig.model_validate(payload)
+
+
 def openai_role(**overrides: Any) -> ModelRole:
     values: dict[str, Any] = {
         "provider": "openai_compatible",
@@ -108,6 +116,8 @@ def test_worker_request_rejects_every_side_effecting_tool(tool: str) -> None:
 async def test_openai_worker_sends_no_tools_and_validates_strict_json(
     factory_config,
 ) -> None:
+    factory_config.models.task_worker.cost_per_million_input_micros = 100
+    factory_config.models.task_worker.cost_per_million_output_micros = 200
     captured: dict[str, Any] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -124,7 +134,7 @@ async def test_openai_worker_sends_no_tools_and_validates_strict_json(
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 25},
+                "usage": {"prompt_tokens": 2_000_000, "completion_tokens": 1_000_000},
             },
         )
 
@@ -134,6 +144,7 @@ async def test_openai_worker_sends_no_tools_and_validates_strict_json(
     await client.aclose()
 
     assert captured["tools"] == []
+    assert captured["max_tokens"] == factory_config.models.task_worker.max_output_tokens
     assert captured["response_format"]["json_schema"]["strict"] is True
     assert captured["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
     assert "no tools" in captured["messages"][0]["content"].lower()
@@ -146,7 +157,46 @@ async def test_openai_worker_sends_no_tools_and_validates_strict_json(
     assert isinstance(result.value, WorkerResult)
     assert result.request_id == "worker-http-1"
     assert result.resolved_model == "worker-test-resolved"
-    assert result.usage == {"input_tokens": 50, "output_tokens": 25, "cost_micros": 0}
+    assert result.usage == {
+        "usage_complete": True,
+        "input_tokens": 2_000_000,
+        "output_tokens": 1_000_000,
+        "cost_micros": 400,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_worker_missing_usage_keeps_the_full_reservation(factory_config) -> None:
+    response = httpx.Response(
+        200,
+        json={
+            "model": "worker-test-resolved",
+            "choices": [{"message": {"content": worker_result().model_dump_json()}, "finish_reason": "stop"}],
+            "usage": {},
+        },
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response))
+    result = await OpenAICompatibleWorker(factory_config, client=client).execute(worker_request())
+    await client.aclose()
+
+    assert result.usage == {"usage_complete": False}
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_success_response_without_observed_model(factory_config) -> None:
+    response = httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": worker_result().model_dump_json()}, "finish_reason": "stop"}],
+            "usage": {},
+        },
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response))
+    adapter = OpenAICompatibleWorker(factory_config, client=client)
+    with pytest.raises(ProviderError, match="omitted its resolved model") as captured:
+        await adapter.execute(worker_request())
+    await client.aclose()
+    assert captured.value.kind == ProviderFailureKind.INVALID_OUTPUT
 
 
 @pytest.mark.asyncio
@@ -285,7 +335,11 @@ async def test_gemini_structured_contract_pins_schema_thinking_model_and_cost(fa
             json={
                 "modelVersion": "gemini-3.7-flash-202608",
                 "candidates": [{"content": {"parts": [{"text": '{"answer":"yes"}'}]}, "finishReason": "STOP"}],
-                "usageMetadata": {"promptTokenCount": 2_000_000, "candidatesTokenCount": 1_000_000},
+                "usageMetadata": {
+                    "promptTokenCount": 2_000_000,
+                    "candidatesTokenCount": 1_000_000,
+                    "thoughtsTokenCount": 500_000,
+                },
             },
         )
 
@@ -301,13 +355,39 @@ async def test_gemini_structured_contract_pins_schema_thinking_model_and_cost(fa
 
     generation = captured["generationConfig"]
     assert generation["thinkingConfig"] == {"thinkingLevel": "high"}
+    assert generation["maxOutputTokens"] == factory_config.models.smart_text.max_output_tokens
     assert generation["responseMimeType"] == "application/json"
     assert generation["responseJsonSchema"]["type"] == "object"
     assert captured["contents"][0]["parts"][1]["inlineData"]["data"] == "cGl4ZWxz"
     assert result.value == {"answer": "yes"}
     assert result.request_id == "gemini-request"
     assert result.resolved_model == "gemini-3.7-flash-202608"
-    assert result.usage["cost_micros"] == 400
+    assert result.usage["candidate_tokens"] == 1_000_000
+    assert result.usage["thought_tokens"] == 500_000
+    assert result.usage["output_tokens"] == 1_500_000
+    assert result.usage["cost_micros"] == 500
+
+
+@pytest.mark.asyncio
+async def test_gemini_rejects_success_response_without_observed_model(factory_config) -> None:
+    client = httpx.AsyncClient()
+    provider = GeminiProvider(factory_config.models.smart_text, client=client)
+    response = httpx.Response(200, json={})
+    with pytest.raises(ProviderError, match="omitted its resolved modelVersion") as captured:
+        provider._result({"answer": "yes"}, response, {})
+    await client.aclose()
+    assert captured.value.kind == ProviderFailureKind.INVALID_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_rejects_success_response_without_observed_model() -> None:
+    client = httpx.AsyncClient()
+    provider = OpenAICompatibleProvider(openai_role(), client=client)
+    response = httpx.Response(200, json={})
+    with pytest.raises(ProviderError, match="omitted its resolved model") as captured:
+        provider._result({"answer": "yes"}, response, {})
+    await client.aclose()
+    assert captured.value.kind == ProviderFailureKind.INVALID_OUTPUT
 
 
 @pytest.mark.asyncio
@@ -373,7 +453,9 @@ async def test_gemini_image_returns_exact_bytes_and_image_cost(factory_config, m
     await client.aclose()
     assert result.value["image"] == exact
     assert result.value["media_type"] == "image/png"
-    assert result.usage["cost_micros"] == 10_000
+    assert result.usage["usage_complete"] is False
+    assert result.usage["known_image_cost_micros"] == 10_000
+    assert "cost_micros" not in result.usage
 
 
 @pytest.mark.asyncio
@@ -548,6 +630,7 @@ async def test_openai_content_structured_contract_is_strict_multimodal_and_coste
         "input_tokens": 2_000_000,
         "output_tokens": 1_000_000,
         "cost_micros": 400,
+        "usage_complete": True,
     }
     assert result.sanitized_metadata == {
         "finish_reason": "stop",
@@ -668,7 +751,10 @@ async def test_openai_content_reference_generation_uses_standard_multipart_edit(
         captured["body"] = request.content
         return httpx.Response(
             200,
-            json={"data": [{"b64_json": base64.b64encode(exact).decode()}]},
+            json={
+                "model": "pinned-image-model",
+                "data": [{"b64_json": base64.b64encode(exact).decode()}],
+            },
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

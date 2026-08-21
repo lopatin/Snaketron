@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -8,10 +9,13 @@ from typing import Any
 import pytest
 from conftest import add_artifact
 
-from snaketron_factory.db import Database, VersionConflict
+from snaketron_factory.db import Database, VersionConflict, canonical_json
 from snaketron_factory.domain import (
     ArtifactKind,
     Disposition,
+    GateResult,
+    GateVerdict,
+    OperationStatus,
     ProviderError,
     ProviderFailureKind,
     ProviderResult,
@@ -33,6 +37,7 @@ class FakeApi:
         self.publish_errors: list[ProviderError] = []
         self.request_errors: list[ProviderError] = []
         self.cancel_errors: list[ProviderError] = []
+        self.skin_authority: dict[str, Any] | None = None
 
     async def publish_exact(self, **request: Any) -> ProviderResult:
         self.publish_calls.append(request)
@@ -66,6 +71,19 @@ class FakeApi:
             resolved_model="snaketron-api",
         )
 
+    async def get_skin_authority(self, skin_id: str | int, *, operator: bool = False) -> ProviderResult:
+        assert operator is True
+        return ProviderResult(
+            value=self.skin_authority
+            or {
+                "skinId": skin_id,
+                "publication": "private",
+                "publishedRevision": None,
+                "pendingRevision": None,
+            },
+            resolved_model="snaketron-api",
+        )
+
 
 @pytest.fixture
 def api() -> FakeApi:
@@ -90,10 +108,30 @@ def review(database: Database, objects: ObjectStore, api: FakeApi) -> ReviewServ
     )
 
 
+@pytest.fixture
+def shadow_review(database: Database, objects: ObjectStore, api: FakeApi) -> ReviewService:
+    return ReviewService(
+        database,
+        OperationJournal(database),
+        api,  # type: ignore[arg-type]
+        ResultPersistence(objects),
+        lambda: {
+            "direction_sha": "a" * 64,
+            "skill_sha": "b" * 64,
+            "capability_sha": "c" * 64,
+            "gate_sha": "d" * 64,
+            "model_config_sha": "e" * 64,
+        },
+        provider_retries=1,
+        mode="shadow",
+    )
+
+
 def test_labels_are_human_only_training_records_and_do_not_advance_attempt(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(attempt["id"], attempt["version"], review_kind="prototype")
     artifact = add_artifact(
         database,
         objects,
@@ -101,6 +139,18 @@ def test_labels_are_human_only_training_records_and_do_not_advance_attempt(
         stage=Stage.PROTOTYPE,
         kind=ArtifactKind.PROTOTYPE,
         value=b"pixels",
+    )
+    database.add_evaluation(
+        artifact_id=artifact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
     )
     decision = review.label(
         attempt_id=attempt["id"],
@@ -136,6 +186,294 @@ def test_labels_are_human_only_training_records_and_do_not_advance_attempt(
             tags=[],
             actor="human:alex",
         )
+
+
+def test_blind_label_requires_hidden_prejudge_exact_state_and_has_one_idempotent_authority(
+    database, objects, make_attempt, shadow_review: ReviewService
+) -> None:
+    attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(attempt["id"], attempt["version"], review_kind="prototype")
+    prototype = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"blind authority pixels",
+        media_type="image/png",
+    )
+    request = {
+        "attempt_id": attempt["id"],
+        "artifact_id": prototype["id"],
+        "kind": "prototype_label",
+        "outcome": "accept",
+        "feedback": "independent exact label",
+        "tags": ["readable"],
+        "actor": "human:alex",
+    }
+    with pytest.raises(VersionConflict, match="hidden pre-existing"):
+        shadow_review.label(**request)
+
+    database.add_evaluation(
+        artifact_id=prototype["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-visible-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=False,
+    )
+    with pytest.raises(VersionConflict, match="unblinded"):
+        shadow_review.label(**request)
+
+    prototype = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"eligible blind authority pixels",
+        media_type="image/png",
+    )
+    request = {**request, "artifact_id": prototype["id"]}
+    hidden = database.add_evaluation(
+        artifact_id=prototype["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-hidden-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
+    )
+    decision = shadow_review.label(**request)
+    replay = shadow_review.label(**request)
+    assert replay["id"] == decision["id"]
+    assert decision["authority_evaluation_id"] == hidden["id"]
+    assert len(database.decisions_for_attempt(attempt["id"])) == 1
+    assert database.evaluations_for_attempt(attempt["id"])
+
+    with pytest.raises(VersionConflict, match="different exact input"):
+        shadow_review.label(**{**request, "outcome": "reject"})
+    with pytest.raises(VersionConflict, match="different exact input"):
+        shadow_review.label(**{**request, "actor": "human:other"})
+
+    wrong = make_attempt(stage=Stage.PROTOTYPE_TRIAGE, disposition=Disposition.ACTIVE)
+    wrong_artifact = add_artifact(
+        database,
+        objects,
+        wrong["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"wrong state",
+    )
+    database.add_evaluation(
+        artifact_id=wrong_artifact["id"],
+        attempt_id=wrong["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
+    )
+    with pytest.raises(VersionConflict, match="eligible prototype_review"):
+        shadow_review.label(
+            attempt_id=wrong["id"],
+            artifact_id=wrong_artifact["id"],
+            kind="prototype_label",
+            outcome="accept",
+            feedback="too early",
+            tags=[],
+            actor="human:alex",
+        )
+
+
+def test_hidden_visual_evidence_requires_blind_label_before_prototype_approval_in_every_mode(
+    database,
+    objects,
+    make_attempt,
+    review: ReviewService,
+    shadow_review: ReviewService,
+) -> None:
+    def candidate(value: bytes, *, hidden: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+        attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+        attempt = database.update_attempt(attempt["id"], attempt["version"], review_kind="prototype")
+        artifact = add_artifact(
+            database,
+            objects,
+            attempt["id"],
+            stage=Stage.PROTOTYPE,
+            kind=ArtifactKind.PROTOTYPE,
+            value=value,
+            media_type="image/png",
+        )
+        database.add_evaluation(
+            artifact_id=artifact["id"],
+            attempt_id=attempt["id"],
+            evaluator="visual_judge",
+            result=GateResult(
+                gate="visual_fidelity",
+                gate_version="judge-v1",
+                blocking=False,
+                verdict=GateVerdict.CANDIDATE,
+            ),
+            hidden_until_label=hidden,
+        )
+        return attempt, artifact
+
+    shadow_attempt, shadow_artifact = candidate(b"shadow", hidden=True)
+    with pytest.raises(VersionConflict, match="prototype approval requires"):
+        shadow_review.approve_prototype(
+            attempt_id=shadow_attempt["id"],
+            artifact_id=shadow_artifact["id"],
+            content_hash=shadow_artifact["content_hash"],
+            feedback="premature",
+            actor="human:alex",
+        )
+    label = shadow_review.label(
+        attempt_id=shadow_attempt["id"],
+        artifact_id=shadow_artifact["id"],
+        kind="prototype_label",
+        outcome="accept",
+        feedback="blind first",
+        tags=[],
+        actor="human:alex",
+    )
+    approved = shadow_review.approve_prototype(
+        attempt_id=shadow_attempt["id"],
+        artifact_id=shadow_artifact["id"],
+        content_hash=shadow_artifact["content_hash"],
+        feedback="separate approval",
+        actor="human:alex",
+    )
+    assert approved["attempt"]["stage"] == Stage.AUTHOR
+    assert (
+        shadow_review.label(
+            attempt_id=shadow_attempt["id"],
+            artifact_id=shadow_artifact["id"],
+            kind="prototype_label",
+            outcome="accept",
+            feedback="blind first",
+            tags=[],
+            actor="human:alex",
+        )["id"]
+        == label["id"]
+    )
+
+    fallback_attempt, fallback_artifact = candidate(b"production fallback", hidden=True)
+    with pytest.raises(VersionConflict, match="prototype approval requires"):
+        review.approve_prototype(
+            attempt_id=fallback_attempt["id"],
+            artifact_id=fallback_artifact["id"],
+            content_hash=fallback_artifact["content_hash"],
+            feedback="calibration fallback is effectively blind",
+            actor="human:alex",
+        )
+    review.label(
+        attempt_id=fallback_attempt["id"],
+        artifact_id=fallback_artifact["id"],
+        kind="prototype_label",
+        outcome="accept",
+        feedback="independent fallback label",
+        tags=[],
+        actor="human:alex",
+    )
+    assert (
+        review.approve_prototype(
+            attempt_id=fallback_attempt["id"],
+            artifact_id=fallback_artifact["id"],
+            content_hash=fallback_artifact["content_hash"],
+            feedback="approve after the fallback label",
+            actor="human:alex",
+        )["attempt"]["stage"]
+        == Stage.AUTHOR
+    )
+
+    production_attempt, production_artifact = candidate(b"ordinary production", hidden=False)
+    assert (
+        review.approve_prototype(
+            attempt_id=production_attempt["id"],
+            artifact_id=production_artifact["id"],
+            content_hash=production_artifact["content_hash"],
+            feedback="production approval remains a separate action",
+            actor="human:alex",
+        )["attempt"]["stage"]
+        == Stage.AUTHOR
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_calibration_fallback_requires_blind_label_for_exact_latest_contact_sheet(
+    database,
+    objects,
+    make_attempt,
+    review: ReviewService,
+    api: FakeApi,
+) -> None:
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        review_kind="final",
+        production_skin_id="skin-shadow",
+        production_revision="1",
+        production_content_hash="sha256:" + "8" * 64,
+    )
+    contact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"exact final browser pixels",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=contact["id"],
+        attempt_id=attempt["id"],
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version="judge-v1",
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
+    )
+    with pytest.raises(VersionConflict, match="publication requires one blind label"):
+        await review.publish(
+            attempt_id=attempt["id"],
+            revision="1",
+            content_hash=attempt["production_content_hash"],
+            feedback="premature",
+            actor="human:alex",
+        )
+    review.label(
+        attempt_id=attempt["id"],
+        artifact_id=contact["id"],
+        kind="build_quality_label",
+        outcome="accept",
+        feedback="blind build label",
+        tags=[],
+        actor="human:alex",
+    )
+    result = await review.publish(
+        attempt_id=attempt["id"],
+        revision="1",
+        content_hash=attempt["production_content_hash"],
+        feedback="separate exact publication",
+        actor="human:alex",
+    )
+    assert result["attempt"]["disposition"] == Disposition.PUBLISHED
+    assert len(api.publish_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -211,6 +549,80 @@ async def test_exact_prototype_approval_is_the_only_transition_into_authoring(
             actor="human:alex",
         )
 
+
+@pytest.mark.asyncio
+async def test_blocking_safety_ip_gate_cannot_be_overridden_or_published(
+    database, objects, make_attempt, review: ReviewService
+) -> None:
+    prototype_attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
+    prototype = add_artifact(
+        database,
+        objects,
+        prototype_attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"flagged exact prototype",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=prototype["id"],
+        attempt_id=prototype_attempt["id"],
+        evaluator="visual_judge_safety_ip",
+        result=GateResult(
+            gate="safety_ip",
+            gate_version="test-v1",
+            blocking=True,
+            verdict=GateVerdict.FAIL,
+            reasons=["protected mark"],
+        ),
+    )
+    with pytest.raises(PermissionError, match="safety_ip"):
+        await review.override_triage(
+            attempt_id=prototype_attempt["id"],
+            artifact_id=prototype["id"],
+            feedback="do not waive this gate",
+            actor="human:alex",
+        )
+
+    final = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    final = database.update_attempt(
+        final["id"],
+        final["version"],
+        review_kind="final",
+        production_skin_id="skin-unsafe",
+        production_revision="2",
+        production_content_hash="sha256:" + "7" * 64,
+    )
+    render = add_artifact(
+        database,
+        objects,
+        final["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"flagged exact build",
+        media_type="image/png",
+    )
+    database.add_evaluation(
+        artifact_id=render["id"],
+        attempt_id=final["id"],
+        evaluator="visual_judge_safety_ip",
+        result=GateResult(
+            gate="safety_ip",
+            gate_version="test-v1",
+            blocking=True,
+            verdict=GateVerdict.FAIL,
+            reasons=["unsafe content"],
+        ),
+    )
+    with pytest.raises(PermissionError, match="safety_ip"):
+        await review.publish(
+            attempt_id=final["id"],
+            revision="2",
+            content_hash="sha256:" + "7" * 64,
+            feedback="do not publish",
+            actor="human:alex",
+        )
+
     other = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
     with pytest.raises(VersionConflict):
         review.approve_prototype(
@@ -257,6 +669,110 @@ async def test_exact_prototype_approval_is_the_only_transition_into_authoring(
             feedback="forbidden",
             actor="human:alex",
         )
+
+
+@pytest.mark.asyncio
+async def test_failed_siblings_and_superseded_asset_generation_do_not_poison_exact_publication(
+    database, objects, make_attempt, review: ReviewService, api: FakeApi
+) -> None:
+    final = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    safe = add_artifact(
+        database,
+        objects,
+        final["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"selected safe prototype",
+        media_type="image/png",
+    )
+    unsafe_sibling = add_artifact(
+        database,
+        objects,
+        final["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"unsafe unselected sibling",
+        media_type="image/png",
+    )
+    rejected_asset = add_artifact(
+        database,
+        objects,
+        final["id"],
+        stage=Stage.ASSETS,
+        kind=ArtifactKind.TEXTURE_VARIANT,
+        value=b"superseded failed seam bytes",
+        media_type="image/png",
+    )
+    document = add_artifact(
+        database,
+        objects,
+        final["id"],
+        stage=Stage.BUILD_GATE,
+        kind=ArtifactKind.SKIN_DOCUMENT,
+        value=b'{"exact":"published revision"}',
+        media_type="application/json",
+    )
+    render = add_artifact(
+        database,
+        objects,
+        final["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"accepted exact final browser pixels",
+        media_type="image/png",
+    )
+    for artifact, gate in ((unsafe_sibling, "safety_ip"), (rejected_asset, "seam")):
+        database.add_evaluation(
+            artifact_id=artifact["id"],
+            attempt_id=final["id"],
+            evaluator="deterministic",
+            result=GateResult(
+                gate=gate,
+                gate_version="test-v1",
+                blocking=True,
+                verdict=GateVerdict.FAIL,
+                reasons=["retained historical rejection"],
+            ),
+        )
+    for artifact, gate in ((safe, "safety_ip"), (document, "document_schema"), (render, "safety_ip")):
+        database.add_evaluation(
+            artifact_id=artifact["id"],
+            attempt_id=final["id"],
+            evaluator="deterministic",
+            result=GateResult(
+                gate=gate,
+                gate_version="test-v1",
+                blocking=True,
+                verdict=GateVerdict.PASS,
+            ),
+        )
+    final = database.update_attempt(
+        final["id"],
+        final["version"],
+        review_kind="final",
+        approved_prototype_hash=safe["content_hash"],
+        production_skin_id="skin-safe-regeneration",
+        production_revision="3",
+        production_content_hash=document["content_hash"],
+    )
+
+    published = await review.publish(
+        attempt_id=final["id"],
+        revision="3",
+        content_hash=document["content_hash"],
+        feedback="publish only the exact accepted authority",
+        actor="human:alex",
+    )
+
+    assert published["attempt"]["disposition"] == Disposition.PUBLISHED
+    assert api.publish_calls == [
+        {
+            "skin_id": "skin-safe-regeneration",
+            "revision": 3,
+            "content_ref": document["content_hash"],
+            "reason": "publish only the exact accepted authority",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -574,12 +1090,106 @@ async def test_reject_cannot_turn_an_experiment_into_a_human_production_decision
     assert database.decisions_for_attempt(attempt["id"]) == []
 
 
-def test_retry_creates_linked_child_and_never_rewrites_parent_history(
+def test_feedback_only_annotation_is_exact_idempotent_and_disposition_neutral(
+    database, objects, make_attempt, review: ReviewService
+) -> None:
+    attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
+    artifact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"retained rejected pixels",
+    )
+    other = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
+    foreign = add_artifact(
+        database,
+        objects,
+        other["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"foreign rejected pixels",
+    )
+
+    with pytest.raises(VersionConflict, match="does not belong"):
+        review.annotate_reject(
+            attempt_id=attempt["id"],
+            artifact_id=foreign["id"],
+            content_hash=foreign["content_hash"],
+            feedback="must stay bound to owned pixels",
+            tags=[],
+            actor="human:alex",
+            idempotency_key="annotation-1",
+        )
+    with pytest.raises(VersionConflict, match="exact retained artifact"):
+        review.annotate_reject(
+            attempt_id=attempt["id"],
+            artifact_id=artifact["id"],
+            content_hash="sha256:" + "0" * 64,
+            feedback="must stay bound to exact pixels",
+            tags=[],
+            actor="human:alex",
+            idempotency_key="annotation-1",
+        )
+
+    request = {
+        "attempt_id": attempt["id"],
+        "artifact_id": artifact["id"],
+        "content_hash": artifact["content_hash"],
+        "feedback": "Keep the silhouette, but remove the muddy inner stripe.",
+        "tags": ["readability"],
+        "actor": "human:alex",
+        "idempotency_key": "annotation-1",
+    }
+    first = review.annotate_reject(**request)
+    replay = review.annotate_reject(**request)
+
+    assert replay["decision"]["id"] == first["decision"]["id"]
+    assert first["decision"]["action"] == "feedback_only"
+    assert first["decision"]["content_hash"] == artifact["content_hash"]
+    assert first["attempt"]["disposition"] == Disposition.MACHINE_REJECTED
+    assert first["attempt"]["version"] == attempt["version"]
+    assert [row["id"] for row in database.unlabeled_feedback_routes()] == [first["decision"]["id"]]
+    database.add_feedback_route(
+        decision_id=first["decision"]["id"],
+        target="authoring_playbook",
+        signature="muddy inner stripe",
+        confidence=1.0,
+        classifier_version="router-v1",
+        evidence={"artifact_id": artifact["id"]},
+    )
+    assert database.optimizer_examples() == []
+    with pytest.raises(VersionConflict, match="key reused with different request"):
+        review.annotate_reject(**{**request, "feedback": "changed replay"})
+
+    waiting = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    waiting_artifact = add_artifact(
+        database,
+        objects,
+        waiting["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"not rejected",
+    )
+    with pytest.raises(VersionConflict, match="retained machine or human reject"):
+        review.annotate_reject(
+            attempt_id=waiting["id"],
+            artifact_id=waiting_artifact["id"],
+            content_hash=waiting_artifact["content_hash"],
+            feedback="not eligible",
+            tags=[],
+            actor="human:alex",
+        )
+
+
+@pytest.mark.asyncio
+async def test_retry_creates_linked_child_and_never_rewrites_parent_history(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     parent = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.HUMAN_REJECTED)
     parent_before = dict(parent)
-    child_result = review.retry(
+    child_result = await review.retry(
         attempt_id=parent["id"],
         from_stage="prototype",
         feedback="try brighter colors",
@@ -598,7 +1208,7 @@ def test_retry_creates_linked_child_and_never_rewrites_parent_history(
     unauthorized = make_attempt(stage=Stage.BUILD_GATE, disposition=Disposition.MACHINE_REJECTED)
     decisions_before = database.decisions_for_attempt(unauthorized["id"])
     with pytest.raises(VersionConflict, match="no exact prototype authority"):
-        review.retry(
+        await review.retry(
             attempt_id=unauthorized["id"],
             from_stage="assets",
             feedback="this must not persist",
@@ -607,18 +1217,184 @@ def test_retry_creates_linked_child_and_never_rewrites_parent_history(
     assert database.decisions_for_attempt(unauthorized["id"]) == decisions_before
 
 
+@pytest.mark.asyncio
+async def test_final_review_retry_cancels_exact_request_across_reauthentication_before_child_can_request(
+    database, objects, make_attempt, review: ReviewService, api: FakeApi
+) -> None:
+    parent = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    parent = database.update_attempt(
+        parent["id"],
+        parent["version"],
+        review_kind="final",
+        production_skin_id="skin-retry-old",
+        production_revision="7",
+        production_content_hash="sha256:" + "7" * 64,
+    )
+    api.cancel_errors.extend(
+        ProviderError(
+            ProviderFailureKind.AUTHENTICATION,
+            "Snaketron API HTTP 401: operator session expired",
+            outcome_known=True,
+        )
+        for _ in range(review.provider_retries + 1)
+    )
+
+    with pytest.raises(ProviderError, match="401"):
+        await review.retry(
+            attempt_id=parent["id"],
+            from_stage="prototype",
+            feedback="restart after exact final review",
+            actor="human:alex",
+            idempotency_key="final-retry-reauth",
+        )
+    assert database.decisions_for_attempt(parent["id"]) == []
+
+    result = await review.retry(
+        attempt_id=parent["id"],
+        from_stage="prototype",
+        feedback="restart after exact final review",
+        actor="human:alex",
+        idempotency_key="final-retry-reauth",
+    )
+    assert result["operation"]["idempotency_key"].endswith(":reauth:1")
+    assert len(api.cancel_calls) == review.provider_retries + 2
+    assert all(
+        call
+        == {
+            "skin_id": "skin-retry-old",
+            "revision": 7,
+            "content_ref": "sha256:" + "7" * 64,
+        }
+        for call in api.cancel_calls
+    )
+
+    child = result["attempt"]
+    child = database.update_attempt(
+        child["id"],
+        child["version"],
+        stage=Stage.FINAL_REVIEW,
+        disposition=Disposition.MACHINE_REJECTED,
+        production_skin_id="skin-retry-old",
+        production_revision="8",
+        production_content_hash="sha256:" + "8" * 64,
+    )
+    contact = add_artifact(
+        database,
+        objects,
+        child["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"child exact final render",
+        media_type="image/png",
+    )
+    opened = await review.override_triage(
+        attempt_id=child["id"],
+        artifact_id=contact["id"],
+        feedback="open the child's exact revision",
+        actor="human:alex",
+    )
+    assert opened["attempt"]["disposition"] == Disposition.NEEDS_HUMAN
+    assert api.request_calls[-1] == {
+        "skin_id": "skin-retry-old",
+        "revision": 8,
+        "content_ref": "sha256:" + "8" * 64,
+        "operator": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_review_re_evaluation_requires_recovered_exact_cancellation_before_atomic_child(
+    database, objects, make_attempt, review: ReviewService, api: FakeApi
+) -> None:
+    parent = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    parent = database.update_attempt(
+        parent["id"],
+        parent["version"],
+        review_kind="final",
+        production_skin_id="skin-reeval-old",
+        production_revision="9",
+        production_content_hash="sha256:" + "9" * 64,
+    )
+    contact = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.RENDER,
+        kind=ArtifactKind.CONTACT_SHEET,
+        value=b"retained exact final contact sheet",
+        media_type="image/png",
+    )
+    api.cancel_errors.append(
+        ProviderError(
+            ProviderFailureKind.UNKNOWN_OUTCOME,
+            "response lost after exact cancellation",
+            outcome_known=False,
+        )
+    )
+
+    with pytest.raises(ProviderError, match="response lost"):
+        await review.re_evaluate(
+            attempt_id=parent["id"],
+            artifact_id=contact["id"],
+            feedback="re-run the current visual rubric",
+            actor="human:alex",
+            idempotency_key="final-reeval-recovery",
+        )
+    assert database.decisions_for_attempt(parent["id"]) == []
+    operation = database.unresolved_operations()[0]
+    recovered = objects.put(
+        canonical_json(
+            {
+                "cancelled": True,
+                "skinId": "skin-reeval-old",
+                "revision": 9,
+                "contentRef": "sha256:" + "9" * 64,
+            }
+        ).encode()
+    )
+    database.resolve_operation(
+        operation_id=operation["id"],
+        resolution="executed_result_recovered",
+        evidence_ref="provider:audit:cancelled-9",
+        result_hash=recovered.uri,
+        resolved_model="snaketron-api",
+        provider_request_id="cancel-audit-9",
+        actor="human:operator",
+    )
+    api.skin_authority = {
+        "skinId": "skin-reeval-old",
+        "publication": "private",
+        "publishedRevision": None,
+        "pendingRevision": None,
+    }
+
+    result = await review.re_evaluate(
+        attempt_id=parent["id"],
+        artifact_id=contact["id"],
+        feedback="re-run the current visual rubric",
+        actor="human:alex",
+        idempotency_key="final-reeval-recovery",
+    )
+    assert result["attempt"]["parent_attempt_id"] == parent["id"]
+    assert result["artifact"]["content_hash"] == contact["content_hash"]
+    assert result["operation"]["id"] == operation["id"]
+    assert len(api.cancel_calls) == 1
+
+
 def test_retry_double_submit_and_lost_response_return_one_paid_child(
     database, make_attempt, review: ReviewService
 ) -> None:
     parent = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.HUMAN_REJECTED)
 
     def submit() -> dict[str, Any]:
-        return review.retry(
-            attempt_id=parent["id"],
-            from_stage="prototype",
-            feedback="try one brighter pass",
-            actor="human:alex",
-            idempotency_key="browser-form-7",
+        return asyncio.run(
+            review.retry(
+                attempt_id=parent["id"],
+                from_stage="prototype",
+                feedback="try one brighter pass",
+                actor="human:alex",
+                idempotency_key="browser-form-7",
+            )
         )
 
     # Two concurrent browser POSTs serialize at BEGIN IMMEDIATE. The second
@@ -640,16 +1416,19 @@ def test_retry_double_submit_and_lost_response_return_one_paid_child(
     assert len(database.decisions_for_attempt(parent["id"])) == 1
 
     with pytest.raises(VersionConflict, match="different decision"):
-        review.retry(
-            attempt_id=parent["id"],
-            from_stage="prototype",
-            feedback="changed payload under the same request key",
-            actor="human:alex",
-            idempotency_key="browser-form-7",
+        asyncio.run(
+            review.retry(
+                attempt_id=parent["id"],
+                from_stage="prototype",
+                feedback="changed payload under the same request key",
+                actor="human:alex",
+                idempotency_key="browser-form-7",
+            )
         )
 
 
-def test_re_evaluation_link_is_atomic_and_replayable_after_response_loss(
+@pytest.mark.asyncio
+async def test_re_evaluation_link_is_atomic_and_replayable_after_response_loss(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     parent = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
@@ -670,7 +1449,7 @@ def test_re_evaluation_link_is_atomic_and_replayable_after_response_loss(
                 BEGIN SELECT RAISE(ABORT, 'injected link crash'); END"""
         )
     with pytest.raises(sqlite3.IntegrityError, match="injected link crash"):
-        review.re_evaluate(
+        await review.re_evaluate(
             attempt_id=parent["id"],
             artifact_id=prototype["id"],
             feedback="use the current rubric",
@@ -686,14 +1465,14 @@ def test_re_evaluation_link_is_atomic_and_replayable_after_response_loss(
 
     with database.connect() as connection:
         connection.execute("DROP TRIGGER fail_re_evaluation_link")
-    committed = review.re_evaluate(
+    committed = await review.re_evaluate(
         attempt_id=parent["id"],
         artifact_id=prototype["id"],
         feedback="use the current rubric",
         actor="human:alex",
         idempotency_key="reeval-form-3",
     )
-    replayed = review.re_evaluate(
+    replayed = await review.re_evaluate(
         attempt_id=parent["id"],
         artifact_id=prototype["id"],
         feedback="use the current rubric",
@@ -734,12 +1513,14 @@ def test_bulk_retry_resumes_a_committed_prefix_without_duplicate_children(
     parents = [make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.HUMAN_REJECTED) for _ in range(3)]
 
     def submit(parent: dict[str, Any]) -> dict[str, Any]:
-        return review.retry(
-            attempt_id=parent["id"],
-            from_stage="prototype",
-            feedback="bulk retry retained rejects",
-            actor="human:alex",
-            idempotency_key="bulk-request-11",
+        return asyncio.run(
+            review.retry(
+                attempt_id=parent["id"],
+                from_stage="prototype",
+                feedback="bulk retry retained rejects",
+                actor="human:alex",
+                idempotency_key="bulk-request-11",
+            )
         )
 
     committed_prefix = [submit(parent) for parent in parents[:2]]
@@ -757,7 +1538,8 @@ def test_bulk_retry_resumes_a_committed_prefix_without_duplicate_children(
     assert all(len(database.decisions_for_attempt(parent["id"])) == 1 for parent in parents)
 
 
-def test_retry_and_re_evaluation_preserve_trial_namespace_and_non_publishability(
+@pytest.mark.asyncio
+async def test_retry_and_re_evaluation_preserve_trial_namespace_and_non_publishability(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     trial = make_attempt(
@@ -773,7 +1555,7 @@ def test_retry_and_re_evaluation_preserve_trial_namespace_and_non_publishability
         kind=ArtifactKind.PROTOTYPE,
         value=b"optimizer pixels",
     )
-    reevaluated = review.re_evaluate(
+    reevaluated = await review.re_evaluate(
         attempt_id=trial["id"],
         artifact_id=prototype["id"],
         feedback="measure with current rubric",
@@ -789,17 +1571,20 @@ def test_retry_and_re_evaluation_preserve_trial_namespace_and_non_publishability
             actor="human:alex",
         )
 
-    retried = review.retry(
-        attempt_id=trial["id"],
-        from_stage="prototype",
-        feedback="new isolated rollout",
-        actor="human:alex",
+    retried = (
+        await review.retry(
+            attempt_id=trial["id"],
+            from_stage="prototype",
+            feedback="new isolated rollout",
+            actor="human:alex",
+        )
     )["attempt"]
     assert retried["purpose"] == Purpose.OPTIMIZER
     assert retried["parent_attempt_id"] == trial["id"]
 
 
-def test_asset_retry_inherits_only_exact_prototype_authority(
+@pytest.mark.asyncio
+async def test_asset_retry_inherits_only_exact_prototype_authority(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     parent = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
@@ -819,18 +1604,21 @@ def test_asset_retry_inherits_only_exact_prototype_authority(
         actor="human:alex",
     )["attempt"]
     approved = database.update_attempt(approved["id"], approved["version"], disposition=Disposition.MACHINE_REJECTED)
-    child = review.retry(
-        attempt_id=approved["id"],
-        from_stage="assets",
-        feedback="regenerate the texture",
-        actor="human:alex",
+    child = (
+        await review.retry(
+            attempt_id=approved["id"],
+            from_stage="assets",
+            feedback="regenerate the texture",
+            actor="human:alex",
+        )
     )["attempt"]
     assert child["stage"] == Stage.ASSETS
     assert child["approved_prototype_hash"] == prototype["content_hash"]
     assert child["prototype_decision_id"] == approved["prototype_decision_id"]
 
 
-def test_re_evaluate_uses_existing_bytes_and_routes_documents_through_current_hard_gates(
+@pytest.mark.asyncio
+async def test_re_evaluate_uses_existing_bytes_and_routes_documents_through_current_hard_gates(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     prototype_attempt = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
@@ -842,7 +1630,7 @@ def test_re_evaluate_uses_existing_bytes_and_routes_documents_through_current_ha
         kind=ArtifactKind.PROTOTYPE,
         value=b"old prototype",
     )
-    prototype_result = review.re_evaluate(
+    prototype_result = await review.re_evaluate(
         attempt_id=prototype_attempt["id"],
         artifact_id=prototype["id"],
         feedback="new judge rubric",
@@ -867,7 +1655,7 @@ def test_re_evaluate_uses_existing_bytes_and_routes_documents_through_current_ha
         value=b'{"schema_version":2}',
         media_type="application/json",
     )
-    build_result = review.re_evaluate(
+    build_result = await review.re_evaluate(
         attempt_id=build_attempt["id"],
         artifact_id=document["id"],
         feedback="rerun current deterministic gates",
@@ -877,6 +1665,89 @@ def test_re_evaluate_uses_existing_bytes_and_routes_documents_through_current_ha
     assert build_child["stage"] == Stage.BUILD_GATE
     assert build_child["restart_stage"] == f"re_evaluate:{build_result['artifact']['id']}"
     assert build_result["artifact"]["content_hash"] == document["content_hash"]
+
+
+@pytest.mark.asyncio
+async def test_asset_re_evaluation_targets_link_the_exact_human_selected_artifact(
+    database, objects, make_attempt, review: ReviewService
+) -> None:
+    parent = make_attempt(stage=Stage.ASSETS, disposition=Disposition.MACHINE_REJECTED)
+    provider = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.ASSETS,
+        kind=ArtifactKind.SOURCE_ASSET,
+        value=b"provider bytes",
+        media_type="image/webp",
+        metadata={"asset_index": 0, "generation": 1, "phase": "provider_output"},
+    )
+    normalized = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.ASSETS,
+        kind=ArtifactKind.SOURCE_ASSET,
+        value=b"exact normalized PNG",
+        media_type="image/png",
+        metadata={
+            "asset_index": 0,
+            "generation": 1,
+            "phase": "normalized_forge_input",
+            "provider_artifact_id": provider["id"],
+        },
+    )
+    manifest = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.ASSETS,
+        kind=ArtifactKind.FORGE_MANIFEST,
+        value=json.dumps({"descriptor": {"variants": [{"content_ref": "sha256:" + "a" * 64}]}}).encode(),
+        media_type="application/json",
+        metadata={
+            "asset_index": 0,
+            "generation": 1,
+            "uploaded": False,
+            "normalized_artifact_id": normalized["id"],
+        },
+    )
+    variant = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.ASSETS,
+        kind=ArtifactKind.TEXTURE_VARIANT,
+        value=b"rejected exact rung",
+        media_type="image/png",
+        metadata={
+            "asset_index": 0,
+            "generation": 1,
+            "phase": "forge_ladder_candidate",
+            "normalized_artifact_id": normalized["id"],
+            "forge_manifest_artifact_id": manifest["id"],
+        },
+    )
+
+    for target in (provider, normalized, manifest, variant):
+        result = await review.re_evaluate(
+            attempt_id=parent["id"],
+            artifact_id=target["id"],
+            feedback="rerun only the current deterministic asset gates",
+            actor="human:alex",
+            idempotency_key=f"asset-reeval-{target['id']}",
+        )
+        child = result["attempt"]
+        linked = result["artifact"]
+        assert child["stage"] == Stage.ASSETS
+        assert child["restart_stage"] == f"re_evaluate:{linked['id']}"
+        assert linked["kind"] == target["kind"]
+        assert linked["content_hash"] == target["content_hash"]
+        assert linked["object_ref"] == target["object_ref"]
+        linked_metadata = json.loads(linked["metadata_json"])
+        assert linked_metadata["asset_index"] == 0
+        assert linked_metadata["re_evaluation_requested_artifact_id"] == target["id"]
+        assert linked_metadata["re_evaluation_requested_kind"] == target["kind"]
 
 
 @pytest.mark.asyncio
@@ -1064,6 +1935,55 @@ async def test_later_publish_click_resumes_numbered_retry_from_persisted_decisio
 
 
 @pytest.mark.asyncio
+async def test_expired_operator_credential_can_retry_exact_publish_after_reauthentication(
+    database, make_attempt, review: ReviewService, api: FakeApi
+) -> None:
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        review_kind="final",
+        production_skin_id="skin-reauth-publish",
+        production_revision="13",
+        production_content_hash="sha256:" + "d" * 64,
+    )
+    api.publish_errors.extend(
+        ProviderError(
+            ProviderFailureKind.AUTHENTICATION,
+            "Snaketron API HTTP 401: operator session expired",
+            outcome_known=True,
+        )
+        for _ in range(review.provider_retries + 1)
+    )
+
+    with pytest.raises(ProviderError, match="session expired"):
+        await review.publish(
+            attempt_id=attempt["id"],
+            revision="13",
+            content_hash=attempt["production_content_hash"],
+            feedback="one exact retained approval",
+            actor="human:alex",
+        )
+
+    # The operator refreshes their ordinary JWT outside the factory. The next
+    # explicit click opens one new audit epoch without changing the decision,
+    # revision, content hash, or reason.
+    result = await review.publish(
+        attempt_id=attempt["id"],
+        revision="13",
+        content_hash=attempt["production_content_hash"],
+        feedback="must not replace retained approval",
+        actor="human:alex",
+    )
+
+    assert result["attempt"]["disposition"] == Disposition.PUBLISHED
+    assert len(database.decisions_for_attempt(attempt["id"])) == 1
+    assert len(api.publish_calls) == review.provider_retries + 2
+    assert result["operation"]["idempotency_key"].endswith(":reauth:1")
+    assert {call["reason"] for call in api.publish_calls} == {"one exact retained approval"}
+
+
+@pytest.mark.asyncio
 async def test_publish_unknown_outcome_persists_one_decision_and_requires_reconciliation(
     database, make_attempt, review: ReviewService, api: FakeApi
 ) -> None:
@@ -1106,6 +2026,77 @@ async def test_publish_unknown_outcome_persists_one_decision_and_requires_reconc
         )
     assert len(api.publish_calls) == 1
     assert len(database.decisions_for_attempt(attempt["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_publish_cannot_advance_local_state_without_exact_server_readback(
+    database, objects, make_attempt, review: ReviewService, api: FakeApi
+) -> None:
+    attempt = make_attempt(stage=Stage.FINAL_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        review_kind="final",
+        production_skin_id="skin-recovery-readback",
+        production_revision="11",
+        production_content_hash="sha256:" + "b" * 64,
+    )
+    api.publish_errors.append(
+        ProviderError(
+            ProviderFailureKind.UNKNOWN_OUTCOME,
+            "response lost after exact publication request",
+            outcome_known=False,
+        )
+    )
+    with pytest.raises(ProviderError, match="response lost"):
+        await review.publish(
+            attempt_id=attempt["id"],
+            revision="11",
+            content_hash=attempt["production_content_hash"],
+            feedback="exact recovered approval",
+            actor="human:alex",
+        )
+    operation = database.unresolved_operations()[0]
+    recovered = objects.put(
+        canonical_json(
+            {
+                "skinId": "skin-recovery-readback",
+                "publication": "published",
+                "publishedRevision": 11,
+                "contentRef": attempt["production_content_hash"],
+            }
+        ).encode()
+    )
+    database.resolve_operation(
+        operation_id=operation["id"],
+        resolution="executed_result_recovered",
+        evidence_ref="provider:audit:published-11",
+        result_hash=recovered.uri,
+        resolved_model="snaketron-api",
+        provider_request_id="publish-audit-11",
+        actor="human:operator",
+    )
+    api.skin_authority = {
+        "skinId": "skin-recovery-readback",
+        "publication": "private",
+        "publishedRevision": None,
+        "contentRef": attempt["production_content_hash"],
+    }
+
+    with pytest.raises(ProviderError, match="authenticated Snaketron readback"):
+        await review.publish(
+            attempt_id=attempt["id"],
+            revision="11",
+            content_hash=attempt["production_content_hash"],
+            feedback="must not bypass readback",
+            actor="human:alex",
+        )
+    current = database.get_attempt(attempt["id"])
+    assert current["disposition"] == Disposition.NEEDS_HUMAN
+    assert current["review_kind"] == "final"
+    terminal = database.get_operation(operation["id"])
+    assert terminal["status"] == OperationStatus.FAILED_TERMINAL
+    assert json.loads(terminal["failure_json"])["quarantined_result_hash"] == recovered.uri
 
 
 @pytest.mark.asyncio

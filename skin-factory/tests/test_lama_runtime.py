@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from snaketron_factory.assets import AssetProcessor
+from snaketron_factory.config import load_config
 from snaketron_factory.doctor import FactoryDoctor
 from snaketron_factory.domain import AssetPlan
 from snaketron_factory.factory import Factory
@@ -21,6 +22,22 @@ from snaketron_factory.lama import (
     lama_subprocess_environment,
 )
 from snaketron_factory.worker import SkillBundle
+
+
+def test_loaded_config_preserves_virtualenv_python_entrypoint_symlink(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1]
+    package = tmp_path / "skin-factory"
+    config_path = package / "config/factory.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_bytes((source / "config/factory.yaml").read_bytes())
+    entrypoint = package / "var/lama-venv/bin/python"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.symlink_to(sys.executable)
+
+    config = load_config(config_path)
+
+    assert config.paths.lama_python == entrypoint
+    assert config.paths.lama_python != entrypoint.resolve()
 
 
 def test_lama_bundle_hashes_lock_loader_and_private_model(factory_config) -> None:

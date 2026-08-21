@@ -20,6 +20,36 @@ RENDERER_BUNDLE_ROOT = Path("client/web/dist")
 RENDERER_BUNDLE_SUFFIXES = frozenset({".css", ".html", ".js", ".wasm"})
 RENDERER_BUNDLE_MANIFEST_ENV = "SNAKETRON_FACTORY_RENDERER_BUNDLE_MANIFEST"
 RENDERER_BUNDLE_SHA_ENV = "SNAKETRON_FACTORY_RENDERER_BUNDLE_SHA256"
+RENDERER_SERVICE_TOKEN_ENV = "SNAKETRON_FACTORY_SERVICE_TOKEN"
+
+# Node needs a few operating-system paths to locate its executable, Playwright
+# browser cache, and temporary directory.  Everything else is denied by
+# default: in particular provider, worker, webhook, and human-authority
+# credentials must not cross this subprocess boundary.  The configured
+# Snaketron service token is normalized to ``RENDERER_SERVICE_TOKEN_ENV``
+# below instead of forwarding its (potentially custom) parent name.
+RENDERER_RUNTIME_ENV_ALLOWLIST = frozenset(
+    {
+        "APPDATA",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USERPROFILE",
+        "WINDIR",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+    }
+)
 
 
 class RendererDrift(RuntimeError):
@@ -214,6 +244,53 @@ class BrowserRenderer:
     def execution_config_sha(snapshot: dict[str, Any]) -> str:
         return renderer_execution_config_sha(snapshot)
 
+    def _capture_environment(self, bundle_manifest: dict[str, Any], bundle_sha: str) -> dict[str, str]:
+        """Build the complete, least-privilege environment for capture Node.
+
+        This intentionally starts empty rather than attempting to scrub the
+        ambient environment.  Configured credential names are also removed
+        from the small runtime allowlist, so a custom manifest cannot smuggle
+        a provider or operator secret through a normally harmless name.
+        """
+
+        service_token_source = self.config.service.service_token_env
+        non_renderer_sources = {
+            *(
+                role.api_key_env
+                for role in (
+                    self.config.models.task_worker,
+                    self.config.models.smart_text,
+                    self.config.models.visual_judge,
+                    self.config.models.image_generator,
+                    self.config.models.image_editor,
+                )
+            ),
+            self.config.worker.api_key_env,
+            self.config.outbox.webhook_url_env,
+            self.config.outbox.webhook_token_env,
+            self.config.service.operator_token_env,
+            self.config.review.operator_secret_env,
+            "SKIN_FACTORY_REVIEW_ACTOR",
+        }
+        if service_token_source in non_renderer_sources:
+            raise RendererDrift("renderer service-token environment name overlaps another credential capability")
+        credentials = self.config.credential_environment_names()
+        environment = {
+            name: value
+            for name in RENDERER_RUNTIME_ENV_ALLOWLIST.difference(credentials)
+            if (value := os.environ.get(name)) is not None
+        }
+        service_token = os.environ.get(service_token_source)
+        if service_token is not None:
+            environment[RENDERER_SERVICE_TOKEN_ENV] = service_token
+        environment[RENDERER_BUNDLE_MANIFEST_ENV] = json.dumps(
+            bundle_manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        environment[RENDERER_BUNDLE_SHA_ENV] = bundle_sha
+        return environment
+
     def capture(
         self,
         content_ref: str,
@@ -237,15 +314,9 @@ class BrowserRenderer:
                 content_ref,
                 str(output),
             ]
-            environment = os.environ.copy()
             bundle_manifest = execution_config["browser_bundle"]
             bundle_sha = execution_config["browser_bundle_sha256"]
-            environment[RENDERER_BUNDLE_MANIFEST_ENV] = json.dumps(
-                bundle_manifest,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            environment[RENDERER_BUNDLE_SHA_ENV] = bundle_sha
+            environment = self._capture_environment(bundle_manifest, bundle_sha)
             completed = subprocess.run(
                 command,
                 cwd=execution_config["repo_root"],

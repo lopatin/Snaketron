@@ -18,12 +18,25 @@ contract is 64 texels per cell for coats/overlays and 16 for sheets; it derives
 the smaller delivery rungs automatically. Do not trade X/Y metadata for a
 different density or ask the provider to generate the delivery ladder.
 
-For a sheet, X is body cells and Y is frames. Each row is one complete frame of
+For a sheet, X is body cells and Y is derived frames. Set `desired_fps`, then
+compute `Y = ceil(period_ms * desired_fps / 1000)` and clamp it to the pinned
+row, dimension, and decoded-memory limits. Each row is one complete frame of
 the same X-cell snake strip; rows advance down the image. Do not ask for a film
 strip with whitespace or a set of independent poses. Row zero is the resting
 and reduced-motion art. Prefer tall sheets when more frames are supported and
-useful, but derive Y from motion/period and the pinned runtime rather than from
-a slogan. X comes from pattern/repeat needs and is independent of Y.
+useful, but never specify a free-standing Y that disagrees with the requested
+rate, period, or pinned runtime. X comes from pattern/repeat needs and is
+independent of Y. Static coats and overlays use `desired_fps: null`.
+
+Do not squeeze an extreme tall grid into one provider image. The deterministic
+driver compares the full X:Y grid with the configured provider aspect ratios.
+When they are not close, it divides Y into the largest contiguous frame-row
+slices that are close, journals and retains each call, supplies the preceding
+slice (and row-zero slice for final loop closure) as continuity references,
+normalizes each slice without cropping, and vertically assembles the exact
+X-by-Y forge input. Slice count and worst-case image calls are hard-bounded
+before spend. The implementation plan still declares one logical sheet; never
+fabricate independent texture descriptors for its provider slices.
 
 ## Choose the required joins from use
 

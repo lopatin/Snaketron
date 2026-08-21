@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -24,6 +25,16 @@ def seam(*, cleared: bool = True) -> forge.Measurement:
         complaint=None if cleared else "fine seam still 2.00x",
         structural=None,
     )
+
+
+def moving_band(*, columns: int = 2, rows: int = 4, cell: int = 16) -> Image.Image:
+    width = columns * cell
+    pixels = np.full((rows * cell, width, 3), (12, 24, 36), dtype=np.uint8)
+    x = np.arange(width)
+    for frame in range(rows):
+        selected = ((x - frame * width // rows) % width) < width // rows
+        pixels[frame * cell : (frame + 1) * cell, selected] = (245, 210, 32)
+    return Image.fromarray(pixels)
 
 
 class ParseAxesTests(unittest.TestCase):
@@ -110,16 +121,11 @@ class ForgeTests(unittest.TestCase):
         self.assertEqual(repaired.getchannel("A").getextrema(), (128, 128))
 
     def test_manifest_records_shape_and_only_checks_requested_axes(self):
-        image = Image.new("RGB", (2 * 16, 3 * 16))
+        image = moving_band(rows=3)
         with tempfile.TemporaryDirectory() as temporary:
             with (
                 mock.patch.object(forge, "measure", return_value=seam()) as measure,
                 mock.patch.object(forge, "build_ladder", return_value=[]),
-                mock.patch.object(
-                    forge.sheets,
-                    "frames_from_period",
-                    return_value=(image, 16, 3, 0),
-                ) as frames,
             ):
                 manifest = forge.forge(
                     image, "sheet", 2, 3, (0,), Path(temporary)
@@ -130,7 +136,30 @@ class ForgeTests(unittest.TestCase):
         self.assertEqual(manifest.frame_rows, 3)
         self.assertEqual(manifest.seam_axes, ["y"])
         self.assertEqual(measure.call_args_list, [mock.call(image, 0), mock.call(image, 0)])
-        frames.assert_called_once_with(image, 3, forge.sheets.CELL, 2)
+
+    def test_static_declared_frame_cells_are_rejected_as_non_animation(self):
+        image = Image.new("RGB", (2 * 16, 64 * 16), (20, 40, 60))
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(forge, "measure", return_value=seam()),
+            mock.patch.object(forge, "build_ladder") as ladder,
+        ):
+            manifest = forge.forge(
+                image, "sheet", 2, 64, (0,), Path(temporary)
+            )
+
+        self.assertFalse(manifest.accepted)
+        self.assertIn("no measurable frame-to-frame animation", manifest.rejection)
+        ladder.assert_not_called()
+
+    def test_horizontal_motion_with_constant_row_means_is_valid_temporal_art(self):
+        image = moving_band(rows=4)
+
+        # Every scanline has the same mean; the obsolete 1-D period inference
+        # therefore called this a one-frame image despite four distinct cells.
+        profile = np.asarray(image, dtype=np.float64).mean(axis=(1, 2))
+        self.assertTrue(np.allclose(profile, profile[0]))
+        self.assertIsNone(forge.temporal_problem(image, 4))
 
     def test_ladder_dimensions_follow_real_image_shape(self):
         image = Image.new("RGB", (2 * 16, 4 * 16), (20, 40, 60))
@@ -158,6 +187,54 @@ class ForgeTests(unittest.TestCase):
         self.assertFalse(manifest.accepted)
         self.assertIn("shipping 16-texel rung", manifest.rejection)
         self.assertEqual(measure.call_count, 5)
+        self.assertEqual([rung.texels_per_cell for rung in manifest.rungs], [64, 32, 16])
+        self.assertIsNotNone(manifest.failed_output)
+
+    def test_failed_post_lama_pixels_are_written_and_hashed(self):
+        image = Image.new("RGB", (2 * 64, 64), (20, 40, 60))
+        repaired = Image.new("RGB", image.size, (211, 17, 99))
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            with (
+                mock.patch.object(
+                    forge,
+                    "measure",
+                    side_effect=[seam(cleared=False), seam(cleared=False)],
+                ),
+                mock.patch.object(forge.sheets, "load_lama", return_value=object()),
+                mock.patch.object(forge, "repair", return_value=(repaired, True)),
+            ):
+                manifest = forge.forge(image, "coat", 2, None, (1,), output)
+
+            self.assertFalse(manifest.accepted)
+            self.assertTrue(manifest.repaired)
+            self.assertEqual(manifest.repair_methods, ["roll:x"])
+            self.assertIsNotNone(manifest.failed_output)
+            failed = manifest.failed_output
+            assert failed is not None
+            exact = Path(failed.path).read_bytes()
+            self.assertEqual(hashlib.sha256(exact).hexdigest(), failed.sha256)
+            self.assertEqual(len(exact), failed.bytes)
+            with Image.open(failed.path) as retained:
+                self.assertEqual(retained.getpixel((0, 0)), (211, 17, 99))
+
+    def test_exact_inspection_never_repairs_resizes_or_builds_a_ladder(self):
+        image = Image.new("RGB", (2 * 64, 64), (20, 40, 60))
+        before = np.asarray(image).copy()
+        with (
+            mock.patch.object(forge, "measure", return_value=seam()),
+            mock.patch.object(forge, "repair") as repair,
+            mock.patch.object(forge, "repair_crop_tx_t") as crop_repair,
+            mock.patch.object(forge, "build_ladder") as ladder,
+        ):
+            result = forge.inspect_existing(image, "coat", 2, None, (1,), 64)
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["mode"], "inspect_existing")
+        self.assertTrue(np.array_equal(np.asarray(image), before))
+        repair.assert_not_called()
+        crop_repair.assert_not_called()
+        ladder.assert_not_called()
 
 
 if __name__ == "__main__":

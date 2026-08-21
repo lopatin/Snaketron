@@ -1,4 +1,4 @@
-version: 1
+version: 2
 gates:
   - name: document_schema
     version: v2
@@ -8,6 +8,9 @@ gates:
     blocking: true
   - name: ownership
     version: v1
+    blocking: true
+  - name: safety_ip
+    version: gemini-flash-v1
     blocking: true
   - name: asset_dimensions
     version: v2
@@ -19,10 +22,16 @@ gates:
     version: v2
     blocking: true
   - name: sprite_grid
-    version: v2
+    version: exact-pixels-v3
     blocking: true
   - name: temporal_loop
-    version: v2
+    version: exact-pixels-v3
+    blocking: true
+  - name: palette_chroma
+    version: exact-pixels-v1
+    blocking: true
+  - name: detail_density
+    version: exact-pixels-v1
     blocking: true
   - name: operation_budget
     version: v1
@@ -34,10 +43,10 @@ gates:
     version: v1
     blocking: true
   - name: contrast_diagnostic
-    version: v1
+    version: exact-pixels-v2
     blocking: false
   - name: detail_retention_diagnostic
-    version: v1
+    version: exact-pixels-v2
     blocking: false
   - name: visual_fidelity
     version: gemini-flash-v1

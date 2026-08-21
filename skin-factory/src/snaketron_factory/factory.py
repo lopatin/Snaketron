@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import math
 import os
+import re
 import socket
 import time
 import uuid
@@ -15,9 +17,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
 from pydantic import BaseModel
 
-from .assets import AssetProcessor, ForgeBundle
+from .assets import AssetProcessor, ForgeBundle, ForgeVariant
 from .calibration import (
     BUILD_JUDGE_RUBRIC,
     PROTOTYPE_JUDGE_RUBRIC,
@@ -28,6 +31,7 @@ from .config import FactoryConfig
 from .db import Database, canonical_json
 from .domain import (
     ArtifactKind,
+    AssetPlan,
     ConceptProposal,
     Disposition,
     GateResult,
@@ -52,6 +56,7 @@ from .operations import ExistingOperation, OperationJournal
 from .outbox import OutboxDispatcher
 from .persistence import SUPPORTED_IMAGE_MEDIA_TYPES, ResultPersistence
 from .providers import ProviderRegistry
+from .recovery import RecoveredResultError, validate_recovered_result, validate_skin_authority_readback
 from .renderer import (
     BrowserRenderer,
     RendererDrift,
@@ -73,8 +78,24 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
+class RunWallTimeExceeded(BudgetExceeded):
+    """The current leased tick exhausted its wall-time allowance."""
+
+
 class BehaviorDrift(RuntimeError):
     """An in-flight Attempt no longer matches its immutable execution inputs."""
+
+
+_PROVIDER_IMAGE_ASPECTS = {
+    "1:1": 1.0,
+    "4:3": 4 / 3,
+    "3:4": 3 / 4,
+    "16:9": 16 / 9,
+    "9:16": 9 / 16,
+}
+# A direct, no-crop resize corrects at most fifteen percent of aspect drift.
+# Anything taller is divided into independently journaled temporal slices.
+_PROVIDER_SLICE_ASPECT_LOG_TOLERANCE = math.log(1.15)
 
 
 class Factory:
@@ -103,6 +124,7 @@ class Factory:
         self.persistence = ResultPersistence(self.objects)
         self.calibration = JudgeCalibrationService(self.database, config)
         self._lease_token: str | None = None
+        self._run_deadline: float | None = None
 
     async def close(self) -> None:
         for owner in (self.providers, self.worker, self.api):
@@ -197,6 +219,7 @@ class Factory:
             {
                 "models": public["models"],
                 "worker": public["worker"],
+                "snaketron_resolved_model_pattern": self.config.service.resolved_model_pattern,
             }
         ).encode("utf-8")
 
@@ -368,6 +391,7 @@ class Factory:
         token = self.database.acquire_lease("production", owner, self.config.lease_seconds)
         self._lease_token = token
         started = time.monotonic()
+        self._run_deadline = started + self.config.budgets.wall_seconds_per_run
         report: dict[str, Any] = {"owner": owner, "advanced": [], "halt": None}
         try:
             report["calibration"] = self.calibration.refresh_all()
@@ -395,7 +419,26 @@ class Factory:
                 attempt["disposition"] == Disposition.ACTIVE
                 and time.monotonic() - started < self.config.budgets.wall_seconds_per_run
             ):
-                if attempt["stage"] in {Stage.AUTHOR, Stage.ASSETS}:
+                if attempt["stage"] in {
+                    Stage.CONCEPT,
+                    Stage.PROTOTYPE,
+                    Stage.PROTOTYPE_TRIAGE,
+                }:
+                    prototype_pending = self.database.count_attempts(
+                        disposition=Disposition.NEEDS_HUMAN,
+                        review_kind="prototype",
+                    )
+                    if prototype_pending >= self.config.budgets.max_pending_prototype_reviews:
+                        report["halt"] = {"reason": "prototype_review_wip_cap"}
+                        break
+                if attempt["stage"] in {
+                    Stage.AUTHOR,
+                    Stage.ASSETS,
+                    Stage.BUILD_GATE,
+                    Stage.REGISTER,
+                    Stage.RENDER,
+                    Stage.BUILD_TRIAGE,
+                }:
                     final_pending = self.database.count_attempts(
                         disposition=Disposition.NEEDS_HUMAN, review_kind="final"
                     )
@@ -415,7 +458,11 @@ class Factory:
                         }
                         return report
                     failure_detail = f"known external failure at {before[0]}: {error.kind}: {error}"
-                    attempt = self._block_attempt(attempt, failure_detail)
+                    attempt = self._block_attempt(
+                        attempt,
+                        failure_detail,
+                        program_halt="provider_model_mismatch" if error.halt_generation else None,
+                    )
                 except ExistingOperation as error:
                     unresolved = self.database.unresolved_operations()
                     if unresolved:
@@ -439,13 +486,13 @@ class Factory:
                 if after == before:
                     break
                 self.database.renew_lease("production", token, self.config.lease_seconds)
-            if time.monotonic() - started >= self.config.budgets.wall_seconds_per_run:
+            if self._wall_time_exhausted():
                 report["halt"] = {"reason": "run_wall_time_budget"}
 
             # Optimizer readiness is part of this same scheduled command. The
             # optimizer module advances at most one resumable job and is loaded
             # lazily so ordinary production does not require DSPy import time.
-            if self.config.optimizer.enabled:
+            if self.config.optimizer.enabled and not self._wall_time_exhausted():
                 from .optimizer import Optimizer
                 from .techniques import TechniqueMiner
 
@@ -462,21 +509,66 @@ class Factory:
                         "operations": [operation["id"] for operation in unresolved],
                     }
             return report
+        except RunWallTimeExceeded as error:
+            report["halt"] = {"reason": "run_wall_time_budget", "detail": str(error)}
+            return report
         except BudgetExceeded as error:
             report["halt"] = {"reason": "budget", "detail": str(error)}
             return report
         finally:
             self.database.release_lease("production", token)
             self._lease_token = None
+            self._run_deadline = None
 
     def _generation_halt(self) -> str | None:
+        detail = self._generation_halt_detail()
+        return str(detail["reason"]) if detail is not None else None
+
+    def _generation_halt_detail(self) -> dict[str, Any] | None:
+        """Return the exact current generation pause and its acknowledgement boundary."""
+
+        resume = self.database.latest_generation_resume()
+        after = str(resume["created_at"]) if resume is not None else None
+        explicit = self.database.unresolved_program_halt(after=after)
+        if explicit is not None:
+            return {
+                "reason": f"program_halt:{explicit['program_halt']}:{explicit['id']}",
+                "evidence_at": explicit["updated_at"],
+                "attempt_id": explicit["id"],
+                "acknowledgeable": True,
+            }
+        if self.database.published_concept_count() >= self.config.program.target_published_skins:
+            return {"reason": "published_target_reached", "acknowledgeable": False}
+        gate_cluster = self.database.repeated_blocking_gate_failure(
+            window=self.config.halts.deterministic_failure_window,
+            threshold=self.config.halts.repeated_blocking_gate_limit,
+            after=after,
+        )
+        if gate_cluster is not None:
+            return {
+                "reason": f"repeated_blocking_gate:{gate_cluster['gate_name']}",
+                "evidence_at": gate_cluster["latest_at"],
+                "acknowledgeable": True,
+            }
+        root_cause = self.database.repeated_root_cause_after_promotion(
+            target="authoring_playbook",
+            min_confidence=self.config.optimizer.feedback_min_confidence,
+            threshold=self.config.halts.repeated_root_cause_after_promotion_limit,
+            after=after,
+        )
+        if root_cause is not None:
+            return {
+                "reason": f"repeated_root_cause_after_promotion:{root_cause['signature']}",
+                "evidence_at": root_cause["latest_at"],
+                "acknowledgeable": True,
+            }
         prototype_pending = self.database.count_attempts(disposition=Disposition.NEEDS_HUMAN, review_kind="prototype")
         if prototype_pending >= self.config.budgets.max_pending_prototype_reviews:
-            return "prototype_review_wip_cap"
+            return {"reason": "prototype_review_wip_cap", "acknowledgeable": False}
         if self.database.count_attempts(disposition=Disposition.ACTIVE) >= (
             self.config.budgets.max_concurrent_attempts
         ):
-            return "active_attempt_cap"
+            return {"reason": "active_attempt_cap", "acknowledgeable": False}
         self._check_budget(None, 0)
         return None
 
@@ -534,28 +626,31 @@ class Factory:
             direction = self.pinned_direction(attempt).decode("utf-8")
         except (FileNotFoundError, RuntimeError, UnicodeDecodeError, ValueError) as error:
             return self._block_attempt(attempt, str(error))
-        recent = [
-            {"name": row["concept_name"], "brief": row["concept_brief"]}
-            for row in self.database.list_gallery("all", limit=20)
-            if row["concept_id"] != concept["id"]
-        ]
+        recent = self._ideation_context(concept["id"])
         request = {
             "direction": direction,
-            "recent_concepts": recent,
+            "retained_concepts": recent,
             "seed": concept["seed"],
+            "scoring_contract": {
+                "novelty_score": "0..1 against every retained concept and its human feedback",
+                "direction_score": "0..1 against repository-canonical direction",
+                "scores_rank_but_never_delete": True,
+            },
         }
         provider = self.providers.role("smart_text")
         operation, result = await self._provider_call(
             attempt=attempt,
             stage=Stage.CONCEPT,
-            key=f"{attempt['id']}:ideate:v1",
+            key=f"{attempt['id']}:ideate:v2",
             role="smart_text",
             side_effect="generate_concept",
             request=request,
             invoke=lambda: provider.generate_structured(
                 system=(
                     "Propose one original Snaketron skin direction. It must obey the canonical "
-                    "direction, differ from recent concepts, and be implementable as SkinDoc v2."
+                    "direction, differ from published and rejected retained concepts, learn from literal "
+                    "human feedback without copying it, and be implementable as SkinDoc v2. Return "
+                    "honest direction and novelty scores with a short comparison rationale."
                 ),
                 prompt=canonical_json(request),
                 schema=ConceptProposal,
@@ -563,6 +658,12 @@ class Factory:
             ),
         )
         proposal = self._model_result(operation, result, ConceptProposal)
+        similarity = self._concept_similarity(proposal, recent)
+        rank_score = round(
+            0.4 * proposal.novelty_score + 0.4 * proposal.direction_score + 0.2 * (1.0 - similarity["score"]),
+            6,
+        )
+        selected = rank_score >= self.config.ideation.minimum_rank_score
         concept = self.database.get_concept(concept["id"])
         if attempt["purpose"] == Purpose.PRODUCTION and concept["current_attempt_id"] == attempt["id"]:
             concept = self.database.update_concept(
@@ -574,15 +675,121 @@ class Factory:
                 tags_json=proposal.tags,
                 source="gemini_ideation",
             )
-        self._store_json_artifact(
+        concept_artifact = self._store_json_artifact(
             attempt,
             Stage.CONCEPT,
             ArtifactKind.CONCEPT_BRIEF,
-            proposal.model_dump(mode="json"),
-            metadata={"operation_id": operation["id"]},
+            {
+                **proposal.model_dump(mode="json"),
+                "ranking": {
+                    "version": "concept-rank-v1",
+                    "rank_score": rank_score,
+                    "minimum_rank_score": self.config.ideation.minimum_rank_score,
+                    "max_text_similarity": similarity["score"],
+                    "most_similar_concept_id": similarity["concept_id"],
+                    "most_similar_name": similarity["name"],
+                    "selected_for_prototype": selected,
+                    "context_concepts": len(recent),
+                },
+            },
+            metadata={"operation_id": operation["id"], "rank_score": rank_score},
+        )
+        self.database.add_evaluation(
+            artifact_id=concept_artifact["id"],
+            attempt_id=attempt["id"],
+            evaluator="smart_text+deterministic_similarity",
+            result=GateResult(
+                gate="concept_rank",
+                gate_version=f"{operation['resolved_model']}+concept-rank-v1",
+                blocking=False,
+                verdict=GateVerdict.CANDIDATE if selected else GateVerdict.MACHINE_REJECTED,
+                reasons=[
+                    (
+                        "ranked for prototype generation"
+                        if selected
+                        else "retained below the configured prototype-spend threshold"
+                    ),
+                    proposal.novelty_rationale,
+                ],
+                measurements={
+                    "rank_score": rank_score,
+                    "minimum_rank_score": self.config.ideation.minimum_rank_score,
+                    "gemini_novelty_score": proposal.novelty_score,
+                    "gemini_direction_score": proposal.direction_score,
+                    "max_text_similarity": similarity["score"],
+                    "most_similar_concept_id": similarity["concept_id"],
+                    "context_dispositions": self._disposition_counts(recent),
+                },
+            ),
         )
         current = self.database.get_attempt(attempt["id"])
+        if not selected:
+            return self.database.update_attempt(
+                current["id"],
+                current["version"],
+                stage=Stage.COMPLETE,
+                disposition=Disposition.MACHINE_REJECTED,
+                review_kind=None,
+            )
         return self.database.update_attempt(current["id"], current["version"], stage=Stage.PROTOTYPE)
+
+    def _ideation_context(self, current_concept_id: str) -> list[dict[str, Any]]:
+        """Return bounded, categorized retained directions with literal feedback."""
+
+        limit = self.config.ideation.context_limit
+        rows = self.database.list_gallery("all", limit=min(500, limit * 6))
+        by_concept: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row["concept_id"] == current_concept_id or row["purpose"] != Purpose.PRODUCTION:
+                continue
+            if row["concept_id"] not in by_concept and len(by_concept) >= limit:
+                continue
+            item = by_concept.setdefault(
+                row["concept_id"],
+                {
+                    "concept_id": row["concept_id"],
+                    "name": row["concept_name"],
+                    "brief": row["concept_brief"],
+                    "tags": json.loads(row["tags_json"]),
+                    "disposition": row["disposition"],
+                    "human_feedback": [],
+                },
+            )
+            # The newest Attempt supplies the current disposition, while all
+            # literal feedback in its retained lineage remains useful context.
+            feedback = item["human_feedback"]
+            for decision in self.database.decisions_for_attempt(row["id"]):
+                value = str(decision["feedback"]).strip()
+                if value and value not in feedback:
+                    feedback.append(value)
+        return list(by_concept.values())[:limit]
+
+    @staticmethod
+    def _concept_similarity(proposal: ConceptProposal, context: list[dict[str, Any]]) -> dict[str, Any]:
+        def tokens(value: str) -> set[str]:
+            return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if len(token) > 2}
+
+        proposed = tokens(" ".join([proposal.name, proposal.brief, *proposal.tags]))
+        best = {"score": 0.0, "concept_id": None, "name": None}
+        for item in context:
+            retained = tokens(" ".join([item["name"], item["brief"], *item["tags"]]))
+            union = proposed | retained
+            score = len(proposed & retained) / len(union) if union else 0.0
+            if score > best["score"]:
+                best = {
+                    "score": round(score, 6),
+                    "concept_id": item["concept_id"],
+                    "name": item["name"],
+                }
+        return best
+
+    @staticmethod
+    def _disposition_counts(context: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in context:
+            key = str(item["disposition"])
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     async def _prototype(self, attempt: dict[str, Any]) -> dict[str, Any]:
         existing = self.database.artifacts_for_attempt(
@@ -596,9 +803,23 @@ class Factory:
             if index in by_index and by_index[index]["content_hash"] != item["content_hash"]:
                 return self._block_attempt(attempt, f"prototype index {index} names multiple retained images")
             by_index[index] = item
+        completed_indices: set[int] = set()
+        prototypes_by_id = {item["id"]: item for item in existing}
+        for manifest in self.database.artifacts_for_attempt(
+            attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST
+        ):
+            metadata = json.loads(manifest["metadata_json"])
+            index = metadata.get("prototype_index")
+            image_id = metadata.get("image_artifact_id")
+            if not isinstance(index, int) or image_id not in prototypes_by_id:
+                return self._block_attempt(attempt, "retained prototype manifest has invalid slot linkage")
+            completed_indices.add(index)
+            by_index[index] = prototypes_by_id[image_id]
         concept = self.database.get_concept(attempt["concept_id"])
         provider = self.providers.role("image_generator")
         for index in range(self.config.budgets.prototypes_per_attempt):
+            if index in completed_indices:
+                continue
             if index in by_index:
                 # Artifact rows and their companion manifests are two durable
                 # writes. A crash between them must complete the manifest from
@@ -638,10 +859,32 @@ class Factory:
                     "operation_id": operation["id"],
                     "provider_role": "image_generator",
                     "resolved_model": operation["resolved_model"],
-                    "owned_or_licensed_references": True,
+                    # The default prototype path supplies no external image
+                    # references. Never fabricate a licensing attestation;
+                    # future reference assets must add their own immutable
+                    # owner/license provenance here.
+                    "reference_policy": "prompt_only_no_external_reference_assets",
+                    "references": [],
                 },
             )
-            self._store_prototype_manifest(attempt, concept, image_artifact, index)
+            # Content-addressed artifacts intentionally deduplicate identical
+            # provider bytes.  A duplicate output is still a completed paid
+            # slot, so retain a distinct manifest that binds the exact prompt,
+            # operation and slot to the shared immutable image.
+            artifact_metadata = json.loads(image_artifact["metadata_json"])
+            self._store_prototype_manifest(
+                attempt,
+                concept,
+                image_artifact,
+                index,
+                prompt=prompt,
+                operation_id=operation["id"],
+                duplicate_of_index=(
+                    artifact_metadata.get("prototype_index")
+                    if artifact_metadata.get("prototype_index") != index
+                    else None
+                ),
+            )
         current = self.database.get_attempt(attempt["id"])
         return self.database.update_attempt(current["id"], current["version"], stage=Stage.PROTOTYPE_TRIAGE)
 
@@ -651,10 +894,16 @@ class Factory:
         concept: dict[str, Any],
         image_artifact: dict[str, Any],
         index: int,
+        *,
+        prompt: str | None = None,
+        operation_id: str | None = None,
+        duplicate_of_index: int | None = None,
     ) -> dict[str, Any]:
         metadata = json.loads(image_artifact["metadata_json"])
-        prompt = metadata.get("prompt")
-        if metadata.get("prototype_index") != index or not isinstance(prompt, str) or not prompt:
+        retained_prompt = metadata.get("prompt") if prompt is None else prompt
+        if prompt is None and metadata.get("prototype_index") != index:
+            raise RuntimeError(f"retained prototype index {index} lacks its exact generation prompt")
+        if not isinstance(retained_prompt, str) or not retained_prompt:
             raise RuntimeError(f"retained prototype index {index} lacks its exact generation prompt")
         behavior = json.loads(attempt["behavior_json"])
         image_config = behavior.get("models", {}).get("image_generator")
@@ -673,7 +922,7 @@ class Factory:
                 "implementation_rationale",
                 "The implementation route is advisory until the authoring probe.",
             ),
-            prompt=prompt,
+            prompt=retained_prompt,
             provider_config=canonical_json(image_config),
             image_sha256=image_artifact["content_hash"],
         )
@@ -685,6 +934,8 @@ class Factory:
             metadata={
                 "prototype_index": index,
                 "image_artifact_id": image_artifact["id"],
+                "operation_id": operation_id,
+                "duplicate_of_index": duplicate_of_index,
             },
         )
 
@@ -704,6 +955,7 @@ class Factory:
         concept = self.database.get_concept(attempt["concept_id"])
         judgments: list[VisualJudgment] = []
         evaluated: list[tuple[dict[str, Any], GateResult]] = []
+        safety_evaluated: list[tuple[dict[str, Any], GateResult]] = []
         for artifact in prototypes:
             judgment, operation = await self._judge(
                 attempt,
@@ -715,6 +967,8 @@ class Factory:
                 },
                 key=f"{attempt['id']}:prototype-judge:{artifact['content_hash']}:v1",
             )
+            if judgment.review_flags and judgment.verdict != "machine_rejected":
+                judgment = judgment.model_copy(update={"verdict": "machine_rejected"})
             judgments.append(judgment)
             result = GateResult(
                 gate="visual_fidelity",
@@ -732,12 +986,33 @@ class Factory:
                 },
             )
             evaluated.append((artifact, result))
+            safety_evaluated.append(
+                (
+                    artifact,
+                    self.gates.manifest.result(
+                        "safety_ip",
+                        not judgment.review_flags,
+                        reasons=[f"judge flagged {flag}" for flag in judgment.review_flags],
+                        measurements={
+                            "review_flags": judgment.review_flags,
+                            "resolved_model": operation["resolved_model"],
+                            "scope": "prototype_exact_pixels",
+                        },
+                    ),
+                )
+            )
         current = self.database.get_attempt(attempt["id"])
         evaluator_versions = {result.gate_version for _, result in evaluated}
         actual_evaluator = evaluator_versions.pop() if len(evaluator_versions) == 1 else "mixed-evaluator-versions"
         routing = self.calibration.routing_status("prototype", evaluator_version=actual_evaluator)
         all_rejected = all(judgment.verdict == "machine_rejected" for judgment in judgments)
-        sampled = routing.enabled and all_rejected and self.calibration.should_sample_reject(attempt["id"], "prototype")
+        safety_failed = any(result.verdict == GateVerdict.FAIL for _, result in safety_evaluated)
+        sampled = (
+            not safety_failed
+            and routing.enabled
+            and all_rejected
+            and self.calibration.should_sample_reject(attempt["id"], "prototype")
+        )
         for artifact, result in evaluated:
             self.database.add_evaluation(
                 artifact_id=artifact["id"],
@@ -746,7 +1021,15 @@ class Factory:
                 result=result,
                 hidden_until_label=not routing.enabled or sampled,
             )
-        routed = not routing.enabled or not all_rejected
+        for artifact, result in safety_evaluated:
+            self.database.add_evaluation(
+                artifact_id=artifact["id"],
+                attempt_id=attempt["id"],
+                evaluator="visual_judge_safety_ip",
+                result=result,
+                hidden_until_label=False,
+            )
+        routed = not safety_failed and (not routing.enabled or not all_rejected)
         disposition = Disposition.NEEDS_HUMAN if routed else Disposition.MACHINE_REJECTED
         review_kind = "prototype" if routed else ("prototype_label" if sampled else None)
         transition = {
@@ -935,29 +1218,272 @@ class Factory:
         next_stage = Stage.ASSETS if worker_result.implementation_plan.asset_plan else Stage.BUILD_GATE
         return self.database.update_attempt(current["id"], current["version"], stage=next_stage)
 
+    def _retain_forge_bundle(
+        self,
+        *,
+        attempt: dict[str, Any],
+        asset_index: int,
+        generation: int,
+        bundle: ForgeBundle,
+        normalized: dict[str, Any],
+        provider_artifact_id: str | None,
+        re_evaluation_target_id: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Retain all exact forge outputs before any accept/upload decision."""
+
+        gate_accepted = self.assets.accepted(bundle)
+        evidence_payload = {
+            **(
+                bundle.manifest
+                or {
+                    "schema_version": 1,
+                    "accepted": False,
+                    "rejection": [reason for gate in bundle.gate_results for reason in gate.reasons],
+                }
+            ),
+            # This is factory evidence, not the exact upload manifest.  Keeping
+            # it distinct prevents the later authenticated manifest from CAS-
+            # deduplicating into an immutable ``uploaded: false`` row.
+            "factory_gate_accepted": gate_accepted,
+        }
+        evidence = self._store_json_artifact(
+            attempt,
+            Stage.ASSETS,
+            ArtifactKind.FORGE_MANIFEST,
+            evidence_payload,
+            metadata={
+                "asset_index": asset_index,
+                "generation": generation,
+                "uploaded": False,
+                "normalized_artifact_id": normalized["id"],
+                "provider_artifact_id": provider_artifact_id,
+                "repair_methods": list(bundle.repair_methods),
+                "gate_accepted": gate_accepted,
+                "re_evaluation_target_id": re_evaluation_target_id,
+            },
+            occurrence_key=f"asset:{asset_index}:generation:{generation}:forge-evidence",
+        )
+        for gate in bundle.gate_results:
+            self.database.add_evaluation(
+                artifact_id=evidence["id"],
+                attempt_id=attempt["id"],
+                evaluator="deterministic",
+                result=gate,
+            )
+
+        common_metadata = {
+            "asset_index": asset_index,
+            "generation": generation,
+            "uploaded": False,
+            "gate_accepted": gate_accepted,
+            "normalized_artifact_id": normalized["id"],
+            "forge_manifest_artifact_id": evidence["id"],
+            "repair_methods": list(bundle.repair_methods),
+            "re_evaluation_target_id": re_evaluation_target_id,
+        }
+        common_provenance = {
+            "provider_artifact_id": provider_artifact_id,
+            "normalized_artifact_id": normalized["id"],
+            "forge_manifest_artifact_id": evidence["id"],
+            "repair_methods": list(bundle.repair_methods),
+            "re_evaluation_target_id": re_evaluation_target_id,
+        }
+        for variant_index, variant in enumerate(bundle.variants):
+            self._store_bytes_artifact(
+                attempt,
+                Stage.ASSETS,
+                ArtifactKind.TEXTURE_VARIANT,
+                variant.data,
+                "image/png",
+                metadata={
+                    **common_metadata,
+                    "phase": "forge_ladder_candidate",
+                    "variant_index": variant_index,
+                    "content_ref": variant.content_ref,
+                    "width_px": variant.width_px,
+                    "height_px": variant.height_px,
+                    "bytes": variant.bytes,
+                    "texels_per_cell": variant.texels_per_cell,
+                },
+                provenance=common_provenance,
+                occurrence_key=(f"asset:{asset_index}:generation:{generation}:variant:{variant_index}"),
+            )
+        if bundle.rejected_output is not None:
+            rejected = bundle.rejected_output
+            self._store_bytes_artifact(
+                attempt,
+                Stage.ASSETS,
+                ArtifactKind.SOURCE_ASSET,
+                rejected.data,
+                "image/png",
+                metadata={
+                    **common_metadata,
+                    "phase": "forge_rejected_output",
+                    "content_ref": rejected.content_ref,
+                    "width_px": rejected.width_px,
+                    "height_px": rejected.height_px,
+                    "bytes": rejected.bytes,
+                    "texels_per_cell": rejected.texels_per_cell,
+                },
+                provenance={**common_provenance, "post_repair": bundle.repaired},
+                occurrence_key=f"asset:{asset_index}:generation:{generation}:rejected-output",
+            )
+        return evidence, gate_accepted
+
+    async def _re_evaluate_asset(
+        self,
+        attempt: dict[str, Any],
+        plan: ImplementationPlan,
+    ) -> dict[str, Any]:
+        """Run current deterministic gates over the selected immutable bytes."""
+
+        target_id = str(attempt.get("restart_stage") or "").removeprefix("re_evaluate:")
+        target = self.database.get_artifact(target_id)
+        supported = {
+            ArtifactKind.SOURCE_ASSET,
+            ArtifactKind.FORGE_MANIFEST,
+            ArtifactKind.TEXTURE_VARIANT,
+        }
+        if target["attempt_id"] != attempt["id"] or target["kind"] not in supported:
+            return self._block_attempt(attempt, "asset re-evaluation does not bind a retained asset artifact")
+        metadata = json.loads(target["metadata_json"])
+        asset_index = metadata.get("asset_index")
+        if not isinstance(asset_index, int) or not 0 <= asset_index < len(plan.asset_plan):
+            return self._block_attempt(attempt, "asset re-evaluation has no valid retained plan index")
+        asset = plan.asset_plan[asset_index]
+
+        def variant_from_artifact(artifact: dict[str, Any]) -> ForgeVariant:
+            exact = self.objects.get(artifact["object_ref"])
+            item_metadata = json.loads(artifact["metadata_json"])
+            try:
+                with Image.open(io.BytesIO(exact)) as opened:
+                    width, height = opened.size
+            except Exception:
+                width = int(item_metadata.get("width_px", 0))
+                height = int(item_metadata.get("height_px", 0))
+            texels = int(item_metadata.get("texels_per_cell", asset.texels_per_cell))
+            return ForgeVariant(
+                content_ref=artifact["content_hash"],
+                url=f"/artifacts/{artifact['id']}",
+                width_px=int(item_metadata.get("width_px", width)),
+                height_px=int(item_metadata.get("height_px", height)),
+                bytes=int(item_metadata.get("bytes", len(exact))),
+                texels_per_cell=texels,
+                data=exact,
+            )
+
+        selected: list[dict[str, Any]] = []
+        if target["kind"] in {ArtifactKind.SOURCE_ASSET, ArtifactKind.TEXTURE_VARIANT}:
+            selected = [target]
+        else:
+            manifest = self.persistence.load_json(target["object_ref"])
+            refs = {
+                item.get("content_ref")
+                for item in manifest.get("descriptor", {}).get("variants", [])
+                if isinstance(item, dict) and isinstance(item.get("content_ref"), str)
+            }
+            generation = metadata.get("generation")
+            for lineage_attempt in self._lineage(attempt):
+                for candidate in self.database.artifacts_for_attempt(
+                    lineage_attempt["id"], stage=Stage.ASSETS, kind=ArtifactKind.TEXTURE_VARIANT
+                ):
+                    candidate_metadata = json.loads(candidate["metadata_json"])
+                    if (
+                        candidate["content_hash"] in refs
+                        and candidate_metadata.get("asset_index") == asset_index
+                        and (generation is None or candidate_metadata.get("generation") == generation)
+                    ):
+                        selected.append(candidate)
+            if not selected:
+                original_manifest_id = metadata.get("re_evaluates_artifact_id", target["id"])
+                for lineage_attempt in self._lineage(attempt):
+                    for candidate in self.database.artifacts_for_attempt(
+                        lineage_attempt["id"], stage=Stage.ASSETS, kind=ArtifactKind.SOURCE_ASSET
+                    ):
+                        candidate_metadata = json.loads(candidate["metadata_json"])
+                        if (
+                            candidate_metadata.get("phase") == "forge_rejected_output"
+                            and candidate_metadata.get("forge_manifest_artifact_id") == original_manifest_id
+                        ):
+                            selected.append(candidate)
+        # Preserve one occurrence of each selected row. Equal content hashes
+        # may legitimately belong to different asset indices/generations.
+        selected = list({artifact["id"]: artifact for artifact in selected}.values())
+        if not selected:
+            return self._block_attempt(attempt, "asset re-evaluation target has no retained exact pixels")
+        variants = tuple(variant_from_artifact(artifact) for artifact in selected)
+        self._assert_wall_time_before_spend(
+            required_seconds=120 * len(variants),
+            boundary="exact asset re-evaluation",
+        )
+        results = await asyncio.to_thread(self.assets.re_evaluate_exact, asset, variants)
+        for result in results:
+            self.database.add_evaluation(
+                artifact_id=target["id"],
+                attempt_id=attempt["id"],
+                evaluator="deterministic",
+                result=result,
+            )
+        accepted = not any(result.blocking and result.verdict == GateVerdict.FAIL for result in results)
+        current = self.database.get_attempt(attempt["id"])
+        if accepted:
+            return self._transition_to_review(
+                current,
+                stage=Stage.COMPLETE,
+                disposition=Disposition.NEEDS_HUMAN,
+                review_kind="re_evaluation",
+            )
+        return self.database.update_attempt(
+            current["id"],
+            current["version"],
+            stage=Stage.COMPLETE,
+            disposition=Disposition.MACHINE_REJECTED,
+            review_kind="re_evaluation",
+            failure_json={
+                "stage": Stage.ASSETS,
+                "re_evaluation": True,
+                "artifact_id": target["id"],
+                "selected_content_hashes": [artifact["content_hash"] for artifact in selected],
+                "gates": [result.model_dump(mode="json") for result in results],
+            },
+        )
+
     async def _build_assets(self, attempt: dict[str, Any]) -> dict[str, Any]:
         try:
             pinned_gates = self.pinned_gates(attempt)
         except (FileNotFoundError, RuntimeError, ValueError) as error:
             return self._block_attempt(attempt, str(error))
         self.assets.gates = pinned_gates.manifest
+        self.assets.runtime_gates = pinned_gates
         plan_artifact = self._find_lineage_artifact(attempt, ArtifactKind.IMPLEMENTATION_PLAN)
+        if not plan_artifact:
+            return self._block_attempt(attempt, "asset stage is missing an implementation plan")
+        plan = ImplementationPlan.model_validate(self.persistence.load_json(plan_artifact["object_ref"]))
+        try:
+            validate_plan_resource_limits(plan, pinned_gates.capabilities)
+            self._validate_asset_image_call_budget(plan)
+        except WorkerContractError as error:
+            return self._reject_attempt(
+                self.database.get_attempt(attempt["id"]),
+                f"retained asset plan exceeds pinned capabilities: {error}",
+            )
+        except ValueError as error:
+            return self._reject_attempt(
+                self.database.get_attempt(attempt["id"]),
+                f"retained asset plan exceeds provider image-call bounds: {error}",
+            )
+        if str(attempt.get("restart_stage") or "").startswith("re_evaluate:"):
+            return await self._re_evaluate_asset(attempt, plan)
+
         document_artifact = self._find_lineage_artifact(attempt, ArtifactKind.SKIN_DOCUMENT)
         prototype = self._find_lineage_artifact(
             attempt, ArtifactKind.PROTOTYPE, content_hash=attempt["approved_prototype_hash"]
         )
         if not plan_artifact or not document_artifact or not prototype:
             return self._block_attempt(attempt, "asset stage is missing plan, document, or prototype")
-        plan = ImplementationPlan.model_validate(self.persistence.load_json(plan_artifact["object_ref"]))
-        try:
-            validate_plan_resource_limits(plan, pinned_gates.capabilities)
-        except WorkerContractError as error:
-            return self._reject_attempt(
-                self.database.get_attempt(attempt["id"]),
-                f"retained asset plan exceeds pinned capabilities: {error}",
-            )
         document = self.persistence.load_json(document_artifact["object_ref"])
         prototype_bytes = self.objects.get(prototype["object_ref"])
+        human_feedback = self._stage_feedback(attempt, "assets")
         trace = self._find_lineage_artifact(attempt, ArtifactKind.WORKER_TRACE)
         tool_requests = self.persistence.load_json(trace["object_ref"]).get("tool_requests", []) if trace else []
         generated_textures: list[dict[str, Any]] = []
@@ -985,42 +1511,30 @@ class Factory:
                 base_prompt = f"Create the final {asset.kind} art faithful to the approved snake prototype."
             rejection_feedback = ""
             accepted: ForgeBundle | None = None
+            accepted_evidence: dict[str, Any] | None = None
+            accepted_normalized: dict[str, Any] | None = None
+            accepted_generation: int | None = None
             for generation in range(self.config.budgets.provider_retries + 1):
-                prompt = self._asset_prompt(asset, base_prompt, rejection_feedback)
-                provider = self.providers.role("image_generator")
-                operation, result = await self._provider_call(
-                    attempt=self.database.get_attempt(attempt["id"]),
-                    stage=Stage.ASSETS,
-                    key=f"{attempt['id']}:asset:{index}:generation:{generation}",
-                    role="image_generator",
-                    side_effect="generate_build_asset",
-                    request={
-                        "asset_index": index,
-                        "prompt": prompt,
-                        "prototype": prototype["content_hash"],
-                    },
-                    invoke=lambda prompt=prompt, provider=provider, asset=asset: provider.generate_image(
+                prompt = self._asset_prompt(asset, base_prompt, rejection_feedback, human_feedback)
+                try:
+                    raw, raw_artifact = await self._generate_asset_provider_source(
+                        attempt=attempt,
+                        asset=asset,
+                        asset_index=index,
+                        generation=generation,
                         prompt=prompt,
-                        references=[(prototype["media_type"], prototype_bytes)],
-                        aspect_ratio=self._asset_aspect(asset),
-                        image_size="2K",
-                    ),
-                )
-                raw, media_type = self._image_result(operation, result)
-                raw_artifact = self._store_bytes_artifact(
-                    attempt,
-                    Stage.ASSETS,
-                    ArtifactKind.SOURCE_ASSET,
-                    raw,
-                    media_type,
-                    metadata={
-                        "asset_index": index,
-                        "generation": generation,
-                        "phase": "provider_output",
-                        "prompt": prompt,
-                    },
-                    provenance={"operation_id": operation["id"]},
-                )
+                        prototype=prototype,
+                        prototype_bytes=prototype_bytes,
+                    )
+                except ProviderError as error:
+                    if error.outcome_known and error.kind == ProviderFailureKind.INVALID_OUTPUT:
+                        # The journal retained/quarantined the exact paid
+                        # response. Continue only at the next bounded
+                        # generation key; never replay the failed operation.
+                        rejection_feedback = f"provider output failed exact validation: {error}"
+                        continue
+                    raise
+                self._assert_wall_time_before_spend(required_seconds=900, boundary="local forge")
                 bundle = await self._with_lease_heartbeat(asyncio.to_thread(self.assets.forge, raw, asset))
                 normalized = self._store_bytes_artifact(
                     attempt,
@@ -1034,34 +1548,21 @@ class Factory:
                         "phase": "normalized_forge_input",
                         "provider_artifact_id": raw_artifact["id"],
                     },
+                    occurrence_key=f"asset:{index}:generation:{generation}:normalized-input",
                 )
-                evidence_payload = bundle.manifest or {
-                    "schema_version": 1,
-                    "accepted": False,
-                    "rejection": [reason for gate in bundle.gate_results for reason in gate.reasons],
-                }
-                evidence = self._store_json_artifact(
-                    attempt,
-                    Stage.ASSETS,
-                    ArtifactKind.FORGE_MANIFEST,
-                    evidence_payload,
-                    metadata={
-                        "asset_index": index,
-                        "generation": generation,
-                        "uploaded": False,
-                        "normalized_artifact_id": normalized["id"],
-                        "repair_methods": list(bundle.repair_methods),
-                    },
+                evidence, gate_accepted = self._retain_forge_bundle(
+                    attempt=attempt,
+                    asset_index=index,
+                    generation=generation,
+                    bundle=bundle,
+                    normalized=normalized,
+                    provider_artifact_id=raw_artifact["id"],
                 )
-                for gate in bundle.gate_results:
-                    self.database.add_evaluation(
-                        artifact_id=evidence["id"],
-                        attempt_id=attempt["id"],
-                        evaluator="deterministic",
-                        result=gate,
-                    )
-                if self.assets.accepted(bundle):
+                if gate_accepted:
                     accepted = bundle
+                    accepted_evidence = evidence
+                    accepted_normalized = normalized
+                    accepted_generation = generation
                     break
                 rejection_feedback = "; ".join(reason for gate in bundle.gate_results for reason in gate.reasons)
             if accepted is None:
@@ -1081,21 +1582,14 @@ class Factory:
             )
             # Read-after-write compares exact bytes and prevents a revision from
             # naming server-generated/re-encoded derivatives.
+            self._assert_wall_time_before_spend(
+                required_seconds=(self.config.service.request_timeout_seconds * max(1, len(accepted.variants))),
+                boundary="forge readback",
+            )
             await self._with_lease_heartbeat(self.api.verify_forge_bundle(accepted))
-            for variant in accepted.variants:
-                self._store_bytes_artifact(
-                    attempt,
-                    Stage.ASSETS,
-                    ArtifactKind.TEXTURE_VARIANT,
-                    variant.data,
-                    "image/png",
-                    metadata={
-                        "asset_index": index,
-                        "content_ref": variant.content_ref,
-                        "texels_per_cell": variant.texels_per_cell,
-                    },
-                    provenance={"upload_operation_id": upload_operation["id"]},
-                )
+            assert accepted_evidence is not None
+            assert accepted_normalized is not None
+            assert accepted_generation is not None
             persisted_manifest = self._store_json_artifact(
                 attempt,
                 Stage.ASSETS,
@@ -1103,10 +1597,14 @@ class Factory:
                 accepted.manifest,
                 metadata={
                     "asset_index": index,
+                    "generation": accepted_generation,
                     "uploaded": True,
                     "operation_id": upload_operation["id"],
+                    "normalized_artifact_id": accepted_normalized["id"],
+                    "source_forge_manifest_artifact_id": accepted_evidence["id"],
                     "repair_methods": list(accepted.repair_methods),
                 },
+                occurrence_key=(f"asset:{index}:generation:{accepted_generation}:uploaded-manifest"),
             )
             _ = persisted_manifest
             generated_textures.append(accepted.manifest)
@@ -1151,7 +1649,12 @@ class Factory:
         except WorkerContractError as error:
             return self._reject_attempt(attempt, str(error))
         plan = ImplementationPlan.model_validate(self.persistence.load_json(plan_artifact["object_ref"]))
+        self._assert_wall_time_before_spend(
+            required_seconds=120,
+            boundary="deterministic document gates",
+        )
         results = pinned_gates.validate_document(document, plan)
+        results.append(self._ownership_gate(attempt, document, plan, pinned_gates))
         for result in results:
             self.database.add_evaluation(
                 artifact_id=document_artifact["id"],
@@ -1179,6 +1682,75 @@ class Factory:
             )
             return updated
         return self.database.update_attempt(current["id"], current["version"], stage=Stage.REGISTER)
+
+    def _ownership_gate(
+        self,
+        attempt: dict[str, Any],
+        document: dict[str, Any],
+        plan: ImplementationPlan,
+        gates: GateRunner,
+    ) -> GateResult:
+        """Bind every generated document ref to its authenticated upload intent."""
+
+        document_refs: set[str] = set()
+        for texture in document.get("textures", []):
+            descriptor = texture.get("descriptor")
+            if not isinstance(descriptor, dict):
+                continue
+            for variant in descriptor.get("variants", []):
+                ref = variant.get("content_ref")
+                if isinstance(ref, str):
+                    document_refs.add(ref)
+
+        uploaded_refs: set[str] = set()
+        upload_operations: list[str] = []
+        reasons: list[str] = []
+        for candidate in self._lineage(attempt):
+            for artifact in self.database.artifacts_for_attempt(candidate["id"], kind=ArtifactKind.FORGE_MANIFEST):
+                metadata = json.loads(artifact["metadata_json"])
+                if metadata.get("uploaded") is not True:
+                    continue
+                operation_id = metadata.get("operation_id")
+                if not isinstance(operation_id, str):
+                    reasons.append(f"uploaded forge manifest {artifact['id']} has no operation authority")
+                    continue
+                operation = self.database.get_operation(operation_id)
+                if not (
+                    operation["status"] == OperationStatus.SUCCEEDED
+                    and operation["provider_role"] == "snaketron_api"
+                    and operation["side_effect"] == "upload_exact_forge_ladder"
+                ):
+                    reasons.append(f"forge manifest {artifact['id']} does not name a successful authenticated upload")
+                    continue
+                upload_operations.append(operation_id)
+                payload = self.persistence.load_json(artifact["object_ref"])
+                for variant in payload.get("descriptor", {}).get("variants", []):
+                    ref = variant.get("content_ref")
+                    if isinstance(ref, str):
+                        uploaded_refs.add(ref)
+
+        expected_assets = bool(plan.asset_plan)
+        if expected_assets and not upload_operations:
+            reasons.append("asset-backed document has no successful authenticated forge upload")
+        missing = sorted(document_refs - uploaded_refs)
+        extra = sorted(uploaded_refs - document_refs)
+        if missing:
+            reasons.append(f"document refs lack owned upload authority: {missing}")
+        if not expected_assets and document_refs:
+            reasons.append("layers-only plan unexpectedly names generated upload refs")
+        return gates.manifest.result(
+            "ownership",
+            not reasons,
+            reasons=reasons,
+            measurements={
+                "authenticated_identity": "snaketron_factory_service",
+                "document_content_refs": sorted(document_refs),
+                "uploaded_content_refs": sorted(uploaded_refs),
+                "retained_but_unreferenced_content_refs": extra,
+                "upload_operation_ids": sorted(upload_operations),
+                "applicable": expected_assets,
+            },
+        )
 
     async def _register(self, attempt: dict[str, Any]) -> dict[str, Any]:
         document_artifact = self._find_lineage_artifact(attempt, ArtifactKind.SKIN_DOCUMENT)
@@ -1266,6 +1838,10 @@ class Factory:
         pinned_renderer = behavior.get("renderer_sha")
         pinned_renderer_config = behavior.get("renderer_config_sha")
         try:
+            self._assert_wall_time_before_spend(
+                required_seconds=self.config.browser.timeout_seconds,
+                boundary="browser capture",
+            )
             if isinstance(self.renderer, BrowserRenderer):
                 capture = asyncio.to_thread(
                     self.renderer.capture,
@@ -1277,11 +1853,12 @@ class Factory:
                 capture = asyncio.to_thread(self.renderer.capture, attempt["production_content_hash"])
             evidence = await self._with_lease_heartbeat(capture)
         except RendererDrift as error:
-            return self._block_attempt(attempt, str(error))
+            return self._block_attempt(attempt, str(error), program_halt="renderer_drift")
         if pinned_renderer and evidence.renderer_sha != pinned_renderer:
             return self._block_attempt(
                 attempt,
                 "browser evidence was produced by a renderer tree other than the pinned tree",
+                program_halt="renderer_drift",
             )
         if (
             isinstance(self.renderer, BrowserRenderer)
@@ -1291,6 +1868,7 @@ class Factory:
             return self._block_attempt(
                 attempt,
                 "browser evidence was produced with renderer configuration other than the pinned snapshot",
+                program_halt="renderer_drift",
             )
         if evidence.contact_sheet:
             rendered = self._store_bytes_artifact(
@@ -1326,14 +1904,11 @@ class Factory:
         )
         current = self.database.get_attempt(attempt["id"])
         if evidence.gate_result.verdict == GateVerdict.FAIL:
-            return self.database.update_attempt(
-                current["id"],
-                current["version"],
-                disposition=Disposition.MACHINE_REJECTED,
-                failure_json={
-                    "stage": Stage.RENDER,
-                    "gate": evidence.gate_result.model_dump(mode="json"),
-                },
+            return self._block_attempt(
+                current,
+                "required real-browser evidence gate failed: " + "; ".join(evidence.gate_result.reasons),
+                program_halt="required_browser_evidence",
+                evidence={"gate": evidence.gate_result.model_dump(mode="json")},
             )
         return self.database.update_attempt(current["id"], current["version"], stage=Stage.BUILD_TRIAGE)
 
@@ -1375,6 +1950,16 @@ class Factory:
                 "resolved_model": operation["resolved_model"],
             },
         )
+        safety_result = self.gates.manifest.result(
+            "safety_ip",
+            not judgment.review_flags,
+            reasons=[f"judge flagged {flag}" for flag in judgment.review_flags],
+            measurements={
+                "review_flags": judgment.review_flags,
+                "resolved_model": operation["resolved_model"],
+                "scope": "completed_build_exact_browser_pixels",
+            },
+        )
         current = self.database.get_attempt(attempt["id"])
         if re_evaluation:
             self.database.add_evaluation(
@@ -1382,6 +1967,13 @@ class Factory:
                 attempt_id=attempt["id"],
                 evaluator="visual_judge",
                 result=result,
+                hidden_until_label=False,
+            )
+            self.database.add_evaluation(
+                artifact_id=render["id"],
+                attempt_id=attempt["id"],
+                evaluator="visual_judge_safety_ip",
+                result=safety_result,
                 hidden_until_label=False,
             )
             updated = self._transition_to_review(
@@ -1399,6 +1991,13 @@ class Factory:
                 result=result,
                 hidden_until_label=False,
             )
+            self.database.add_evaluation(
+                artifact_id=render["id"],
+                attempt_id=attempt["id"],
+                evaluator="visual_judge_safety_ip",
+                result=safety_result,
+                hidden_until_label=False,
+            )
             return self.database.update_attempt(
                 current["id"],
                 current["version"],
@@ -1407,8 +2006,14 @@ class Factory:
                 review_kind=None,
             )
         routing = self.calibration.routing_status("build", evaluator_version=result.gate_version)
+        safety_failed = safety_result.verdict == GateVerdict.FAIL
         rejected = judgment.verdict == "machine_rejected"
-        sampled = routing.enabled and rejected and self.calibration.should_sample_reject(attempt["id"], "build")
+        sampled = (
+            not safety_failed
+            and routing.enabled
+            and rejected
+            and self.calibration.should_sample_reject(attempt["id"], "build")
+        )
         self.database.add_evaluation(
             artifact_id=render["id"],
             attempt_id=attempt["id"],
@@ -1416,7 +2021,14 @@ class Factory:
             result=result,
             hidden_until_label=not routing.enabled or sampled,
         )
-        routed = not routing.enabled or not rejected
+        self.database.add_evaluation(
+            artifact_id=render["id"],
+            attempt_id=attempt["id"],
+            evaluator="visual_judge_safety_ip",
+            result=safety_result,
+            hidden_until_label=False,
+        )
+        routed = not safety_failed and (not routing.enabled or not rejected)
         transition = {
             "stage": Stage.FINAL_REVIEW,
             "disposition": Disposition.NEEDS_HUMAN if routed else Disposition.MACHINE_REJECTED,
@@ -1477,15 +2089,20 @@ class Factory:
             raise BehaviorDrift(drift)
         reserve = self._reservation(role, side_effect)
         safe_failures = {
+            ProviderFailureKind.AUTHENTICATION,
             ProviderFailureKind.TIMEOUT,
             ProviderFailureKind.UNAVAILABLE,
             ProviderFailureKind.QUOTA,
         }
         request_hash = self.journal.request_hash(request)
+        request_object = self.objects.put(self.journal.request_payload(request))
         retries = self.config.budgets.provider_retries
 
+        def validate_result(result: ProviderResult) -> None:
+            self._validate_resolved_model(attempt, role, result)
+
         async def run_journal(operation_key: str, retry: int):
-            return await self._with_lease_heartbeat(
+            operation, result = await self._with_lease_heartbeat(
                 self.journal.run_provider(
                     attempt_id=attempt["id"],
                     stage=stage,
@@ -1496,9 +2113,75 @@ class Factory:
                     reserve_micros=reserve,
                     invoke=invoke,
                     persist_result=self.persistence,
-                    metadata={"config_sha": self.config.version_sha256, "retry": retry},
+                    validate_result=validate_result,
+                    metadata={
+                        "config_sha": self.config.version_sha256,
+                        "retry": retry,
+                        "request_ref": request_object.uri,
+                        "request_sha256": request_object.sha256,
+                    },
                 )
             )
+            operation_metadata = json.loads(operation.get("metadata_json") or "{}")
+            readback_effects = {
+                "create_private_skin_revision",
+                "append_private_skin_revision",
+                "request_exact_publication_review",
+            }
+            if (
+                result is None
+                and side_effect in readback_effects
+                and isinstance(operation_metadata, dict)
+                and isinstance(operation_metadata.get("recovery"), dict)
+            ):
+                authority_request = dict(request)
+                skin_id = authority_request.get("skin_id")
+                if skin_id is None:
+                    recovered_value = self.persistence.load_json(operation["result_hash"])
+                    if isinstance(recovered_value, dict):
+                        skin_id = recovered_value.get("skinId", recovered_value.get("skin_id"))
+                        authority_request["skin_id"] = skin_id
+                if skin_id is None:
+                    raise ProviderError(
+                        ProviderFailureKind.INVALID_OUTPUT,
+                        f"recovered {side_effect} result omitted exact skin authority",
+                        halt_generation=True,
+                    )
+                authority = await self._with_lease_heartbeat(self.api.get_skin_authority(skin_id))
+                try:
+                    validate_skin_authority_readback(
+                        side_effect=side_effect,
+                        request=authority_request,
+                        authority=authority.value,
+                    )
+                except RecoveredResultError as error:
+                    operation_metadata["recovery_validation"] = {
+                        "status": "failed_terminal",
+                        "message": str(error),
+                        "result_hash": operation.get("result_hash"),
+                        "authority": "authenticated_snaketron_readback",
+                    }
+                    self.database.transition_operation(
+                        operation["id"],
+                        OperationStatus.SUCCEEDED,
+                        OperationStatus.FAILED_TERMINAL,
+                        retry_class="terminal",
+                        metadata_json=operation_metadata,
+                        failure_json={
+                            "kind": ProviderFailureKind.INVALID_OUTPUT,
+                            "message": str(error),
+                            "quarantined_result_hash": operation.get("result_hash"),
+                            "operator_action": "reconcile the exact Snaketron revision/request state",
+                        },
+                    )
+                    raise ProviderError(
+                        ProviderFailureKind.INVALID_OUTPUT,
+                        f"recovered {side_effect} failed authenticated Snaketron readback: {error}",
+                        request_id=authority.request_id,
+                        resolved_model=authority.resolved_model,
+                        halt_generation=True,
+                    ) from error
+            return operation, result
 
         for retry in range(retries + 1):
             operation_key = key if retry == 0 else f"{key}:retry:{retry}"
@@ -1529,8 +2212,13 @@ class Factory:
                 # Its reservation already committed. Re-entering the journal
                 # either reconstructs success, safely starts an INTENT, or
                 # fails closed for RUNNING/reconciliation/terminal states.
+                if existing["status"] == OperationStatus.SUCCEEDED:
+                    self._validate_replayed_operation_model(attempt, role, existing)
+                if existing["status"] == OperationStatus.INTENT:
+                    self._assert_wall_time_before_spend(role=role)
                 return await run_journal(operation_key, retry)
 
+            self._assert_wall_time_before_spend(role=role)
             self._check_budget(self.database.get_attempt(attempt["id"]), reserve)
             try:
                 return await run_journal(operation_key, retry)
@@ -1539,6 +2227,188 @@ class Factory:
                     continue
                 raise
         raise AssertionError("provider retry loop did not return or raise")
+
+    def _wall_time_exhausted(self) -> bool:
+        return self._run_deadline is not None and time.monotonic() >= self._run_deadline
+
+    def _assert_wall_time_before_spend(
+        self,
+        *,
+        role: str | None = None,
+        required_seconds: float = 0,
+        boundary: str = "external spend",
+    ) -> None:
+        """Admit a boundary only when its configured timeout fits this tick.
+
+        Checking only that the deadline has not *yet* elapsed lets a 600-second
+        image request start in the final second of a tick. Hermes would then
+        kill the no-agent script before the adapter's own timeout, converting
+        an avoidable late call into an unknown external outcome. Model and API
+        roles therefore reserve their full configured timeout before creating
+        an operation intent. Exact successful replay remains available even
+        after the deadline because it performs no external work.
+        """
+
+        if role is not None:
+            config_role_name = "task_worker" if role == "task_worker" else role
+            role_config = getattr(self.config.models, config_role_name, None)
+            if role_config is not None:
+                required_seconds = max(required_seconds, float(role_config.timeout_seconds))
+            elif role == "snaketron_api":
+                required_seconds = max(required_seconds, float(self.config.service.request_timeout_seconds))
+            elif role == "git_promotion":
+                # GitPromoter owns a single absolute deadline across its
+                # validator, signed commit/tag, both pushes, remote check, and
+                # clean-clone verification. Reserve its bounded cleanup too.
+                required_seconds = max(
+                    required_seconds,
+                    float(self.config.optimizer.promotion_timeout_seconds + 30),
+                )
+            boundary = role
+        if self._run_deadline is None:
+            return
+        remaining = self._run_deadline - time.monotonic()
+        # One second is deliberately kept for persisting the terminal result,
+        # renewing/releasing the process lease, and serializing the run report.
+        required_with_settlement = max(0.0, float(required_seconds)) + 1.0
+        if remaining < required_with_settlement:
+            raise RunWallTimeExceeded(
+                f"run wall-time cap leaves {max(0.0, remaining):.3f}s before {boundary}; "
+                f"requires {required_with_settlement:.3f}s including settlement"
+            )
+
+    def _validate_resolved_model(
+        self,
+        attempt: dict[str, Any],
+        role: str,
+        result: ProviderResult,
+    ) -> None:
+        """Reject provider fallback before its output can become a successful operation.
+
+        A configured alias may explicitly allow a dated immutable provider id.
+        The first accepted id becomes the exact per-role pin for the Attempt;
+        subsequent calls cannot move even within the allowed family.
+        """
+
+        config_role_name = "task_worker" if role == "task_worker" else role
+        role_config = getattr(self.config.models, config_role_name, None)
+        if role_config is None:
+            # Snaketron storage/API and human-operator calls are versioned
+            # external services, not content-model roles.
+            return
+        resolved = result.resolved_model
+        if not role_config.accepts_resolved_model(resolved):
+            expected = role_config.resolved_model_pattern or role_config.model
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"{role} resolved model {resolved!r} violates pinned identity {expected!r}",
+                request_id=result.request_id,
+                resolved_model=resolved,
+                halt_generation=True,
+            )
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT resolved_model FROM operation WHERE attempt_id=? "
+                "AND provider_role=? AND status=? AND resolved_model IS NOT NULL",
+                (attempt["id"], role, OperationStatus.SUCCEEDED),
+            ).fetchall()
+        prior = {str(row[0]) for row in rows}
+        if prior and prior != {resolved}:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"{role} resolved model changed within Attempt from {sorted(prior)!r} to {resolved!r}",
+                request_id=result.request_id,
+                resolved_model=resolved,
+                halt_generation=True,
+            )
+
+    def _validate_replayed_operation_model(
+        self,
+        attempt: dict[str, Any],
+        role: str,
+        operation: dict[str, Any],
+    ) -> None:
+        """Validate replay authority and terminally quarantine bad recovery.
+
+        An authenticated recovery is still untrusted provider output. It may
+        become replayable only while its retained bytes, media/structured
+        contract, role, and exact model identity all remain valid.
+        """
+
+        metadata: dict[str, Any] = {}
+        try:
+            parsed_metadata = json.loads(operation.get("metadata_json") or "{}")
+            if not isinstance(parsed_metadata, dict):
+                raise RecoveredResultError("operation metadata is not a JSON object")
+            metadata = parsed_metadata
+            resolved = operation.get("resolved_model")
+            config_role_name = "task_worker" if role == "task_worker" else role
+            if hasattr(self.config.models, config_role_name):
+                if not isinstance(resolved, str) or not resolved:
+                    raise RecoveredResultError(f"replayed {role} operation omitted its resolved model identity")
+                self._validate_resolved_model(
+                    attempt,
+                    role,
+                    ProviderResult(
+                        value={},
+                        request_id=operation.get("provider_request_id"),
+                        resolved_model=resolved,
+                    ),
+                )
+            recovery = metadata.get("recovery")
+            if recovery is None:
+                return
+            if not isinstance(recovery, dict):
+                raise RecoveredResultError("authenticated recovery metadata is malformed")
+            result_hash = operation.get("result_hash")
+            if not isinstance(result_hash, str):
+                raise RecoveredResultError("authenticated recovery omitted its retained result hash")
+            if not isinstance(resolved, str) or not resolved:
+                raise RecoveredResultError("authenticated recovery omitted its resolved model identity")
+            validate_recovered_result(
+                config=self.config,
+                operation=operation,
+                database=self.database,
+                objects=self.objects,
+                result_hash=result_hash,
+                resolved_model=resolved,
+                media_type=recovery.get("media_type"),
+            )
+        except (ProviderError, RecoveredResultError, TypeError, ValueError) as error:
+            evidence_ref = None
+            recovered_metadata = metadata.get("recovery")
+            if isinstance(recovered_metadata, dict):
+                evidence_ref = recovered_metadata.get("evidence_ref")
+            metadata["recovery_validation"] = {
+                "status": "failed_terminal",
+                "message": str(error),
+                "result_hash": operation.get("result_hash"),
+            }
+            message = f"replayed operation {operation['id']} failed exact recovery validation: {error}"
+            self.database.transition_operation(
+                operation["id"],
+                OperationStatus.SUCCEEDED,
+                OperationStatus.FAILED_TERMINAL,
+                retry_class="terminal",
+                metadata_json=metadata,
+                failure_json={
+                    "kind": ProviderFailureKind.INVALID_OUTPUT,
+                    "message": message,
+                    "quarantined_result_hash": operation.get("result_hash"),
+                    "recovery_evidence_ref": evidence_ref,
+                    "operator_action": (
+                        "inspect the retained CAS object and provider audit evidence; the invalid result "
+                        "will never be replayed"
+                    ),
+                },
+            )
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                message,
+                request_id=operation.get("provider_request_id"),
+                resolved_model=operation.get("resolved_model"),
+                halt_generation=True,
+            ) from error
 
     async def _with_lease_heartbeat(self, awaitable: Any) -> Any:
         """Keep the process lease alive around a potentially long boundary."""
@@ -1572,13 +2442,14 @@ class Factory:
             return 0
         model = getattr(self.config.models, role)
         text_reservation = (
-            32_000 * model.cost_per_million_input_micros
-            + self.config.worker.max_output_tokens * model.cost_per_million_output_micros
+            model.max_input_tokens * model.cost_per_million_input_micros
+            + model.max_output_tokens * model.cost_per_million_output_micros
         ) // 1_000_000
         if "image" in side_effect or "asset" in side_effect:
             return model.cost_per_image_micros + text_reservation
-        # Reserve a conservative 32K input + configured max output. Actual
-        # usage replaces it after the provider responds.
+        # Reserve the pinned model's full context/output ceilings. Exact,
+        # complete provider usage replaces it after the response; absent or
+        # malformed usage leaves the conservative reservation charged.
         return text_reservation
 
     def _check_budget(self, attempt: dict[str, Any] | None, reserve: int) -> None:
@@ -1685,6 +2556,7 @@ class Factory:
         *,
         metadata: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
+        occurrence_key: str | None = None,
     ) -> dict[str, Any]:
         if hasattr(value, "model_dump"):
             value = value.model_dump(mode="json", by_alias=True)
@@ -1697,6 +2569,7 @@ class Factory:
             "application/json",
             metadata=metadata,
             provenance=provenance,
+            occurrence_key=occurrence_key,
         )
 
     def _store_bytes_artifact(
@@ -1709,6 +2582,7 @@ class Factory:
         *,
         metadata: dict[str, Any] | None = None,
         provenance: dict[str, Any] | None = None,
+        occurrence_key: str | None = None,
     ) -> dict[str, Any]:
         stored = self.objects.put(data)
         return self.database.add_artifact(
@@ -1721,6 +2595,7 @@ class Factory:
             size_bytes=stored.size,
             metadata=metadata,
             provenance=provenance,
+            occurrence_key=occurrence_key,
         )
 
     def _lineage(self, attempt: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1784,6 +2659,44 @@ class Factory:
                     feedback.append(decision["feedback"].strip())
         return feedback[-20:]
 
+    def _stage_feedback(self, attempt: dict[str, Any], target: str) -> list[str]:
+        """Select literal human corrections relevant to one regenerated stage."""
+
+        if target not in {"prototype", "assets"}:
+            raise ValueError(f"unknown feedback target {target}")
+        values: list[str] = []
+        for candidate in reversed(self._lineage(attempt)):
+            for decision in self.database.decisions_for_attempt(candidate["id"]):
+                value = str(decision["feedback"]).strip()
+                if not value:
+                    continue
+                action = str(decision["action"])
+                tags = {str(tag) for tag in json.loads(decision["tags_json"])}
+                relevant = False
+                if action == "retry":
+                    relevant = (
+                        "from:prototype" in tags
+                        if target == "prototype"
+                        else bool(tags & {"from:assets", "from:build"})
+                    )
+                elif target == "prototype":
+                    relevant = action in {
+                        "prototype_label",
+                        "human_rejection",
+                        "soft_triage_override",
+                        "feedback_only",
+                    }
+                else:
+                    relevant = action in {
+                        "build_quality_label",
+                        "human_rejection",
+                        "soft_triage_override",
+                        "feedback_only",
+                    }
+                if relevant and value not in values:
+                    values.append(value)
+        return values[-12:]
+
     def _concept_field(self, attempt: dict[str, Any], name: str, fallback: str) -> str:
         artifact = self._find_lineage_artifact(attempt, ArtifactKind.CONCEPT_BRIEF)
         if artifact:
@@ -1799,11 +2712,19 @@ class Factory:
         index: int,
     ) -> str:
         direction = self.pinned_direction(attempt).decode("utf-8")
+        feedback = self._stage_feedback(attempt, "prototype")
+        feedback_block = (
+            "\nLiteral human corrections for this retry (JSON strings; preserve meaning, do not invent more):\n"
+            + canonical_json(feedback)
+            if feedback
+            else ""
+        )
         return f"""Create prototype variation {index + 1} for this Snaketron skin.
 
 Brief: {concept["brief"]}
 Canonical direction:
 {direction}
+{feedback_block}
 
 Depict exactly one medium-length snake in a horizontal head + representative
 body + tail strip. The head and tail must be visibly distinct. Use a neutral or
@@ -1812,7 +2733,339 @@ UI chrome, words, labels, scenery, framing, or alternate concepts. This is a
 visual implementation reference, not poster art."""
 
     @staticmethod
-    def _asset_prompt(asset: Any, base: str, rejection: str) -> str:
+    def _nearest_provider_aspect(width: int, height: int) -> tuple[str, float]:
+        ratio = width / height
+        aspect = min(
+            _PROVIDER_IMAGE_ASPECTS,
+            key=lambda key: abs(math.log(ratio / _PROVIDER_IMAGE_ASPECTS[key])),
+        )
+        return aspect, abs(math.log(ratio / _PROVIDER_IMAGE_ASPECTS[aspect]))
+
+    @classmethod
+    def _asset_image_slices(cls, asset: AssetPlan) -> list[dict[str, Any]]:
+        """Map a tall sheet to contiguous provider-native frame ranges.
+
+        The supported image APIs expose a small fixed aspect-ratio set.  A
+        full sheet uses one call when it maps within the bounded correction;
+        otherwise the largest close temporal slice is chosen repeatedly.
+        """
+
+        total_rows = asset.frames if asset.kind == "sheet" else 1
+        width = asset.natural_length_cells
+        full_aspect, full_error = cls._nearest_provider_aspect(width, total_rows)
+        if asset.kind != "sheet" or full_error <= _PROVIDER_SLICE_ASPECT_LOG_TOLERANCE:
+            return [
+                {
+                    "slice_index": 0,
+                    "start_frame": 0,
+                    "end_frame": total_rows,
+                    "frame_rows": total_rows,
+                    "aspect_ratio": full_aspect,
+                }
+            ]
+
+        # Vertical slicing cannot improve an already-too-wide grid.  Retain
+        # the ordinary single-call behavior for that uncommon case.
+        if width / total_rows > max(_PROVIDER_IMAGE_ASPECTS.values()):
+            return [
+                {
+                    "slice_index": 0,
+                    "start_frame": 0,
+                    "end_frame": total_rows,
+                    "frame_rows": total_rows,
+                    "aspect_ratio": full_aspect,
+                }
+            ]
+
+        slices: list[dict[str, Any]] = []
+        start = 0
+        while start < total_rows:
+            remaining = total_rows - start
+            candidates: list[tuple[int, str, float]] = []
+            for rows in range(1, remaining + 1):
+                aspect, error = cls._nearest_provider_aspect(width, rows)
+                if error <= _PROVIDER_SLICE_ASPECT_LOG_TOLERANCE:
+                    candidates.append((rows, aspect, error))
+            if not candidates:
+                # This can only be a short, too-wide tail.  Keeping it intact
+                # is deterministic and never increases the number of calls.
+                rows = remaining
+                aspect, _error = cls._nearest_provider_aspect(width, rows)
+            else:
+                rows, aspect, _error = max(candidates, key=lambda candidate: candidate[0])
+            end = start + rows
+            slices.append(
+                {
+                    "slice_index": len(slices),
+                    "start_frame": start,
+                    "end_frame": end,
+                    "frame_rows": rows,
+                    "aspect_ratio": aspect,
+                }
+            )
+            start = end
+        return slices
+
+    def _validate_asset_image_call_budget(self, plan: ImplementationPlan) -> None:
+        slice_counts = [len(self._asset_image_slices(asset)) for asset in plan.asset_plan]
+        per_asset = self.config.budgets.max_image_slices_per_asset
+        for index, count in enumerate(slice_counts):
+            if count > per_asset:
+                raise ValueError(f"asset {index} needs {count} slices; configured maximum is {per_asset}")
+        # The same configured retry count bounds both known-safe transport
+        # retries and image regeneration after a strict deterministic reject.
+        rounds = self.config.budgets.provider_retries + 1
+        worst_case_calls = sum(slice_counts) * rounds * rounds
+        maximum = self.config.budgets.max_asset_image_calls_per_attempt
+        if worst_case_calls > maximum:
+            raise ValueError(f"worst-case image calls {worst_case_calls} exceed configured attempt maximum {maximum}")
+
+    async def _generate_asset_provider_source(
+        self,
+        *,
+        attempt: dict[str, Any],
+        asset: AssetPlan,
+        asset_index: int,
+        generation: int,
+        prompt: str,
+        prototype: dict[str, Any],
+        prototype_bytes: bytes,
+    ) -> tuple[bytes, dict[str, Any]]:
+        """Generate one exact forge input, batching only extreme tall sheets."""
+
+        slices = self._asset_image_slices(asset)
+        maximum = self.config.budgets.max_image_slices_per_asset
+        if len(slices) > maximum:
+            raise ValueError(f"asset {asset_index} needs {len(slices)} slices; configured maximum is {maximum}")
+        provider = self.providers.role("image_generator")
+        # Static coats/overlays keep the original one-call path. Every sheet,
+        # including an ordinary one-slice sheet, uses the no-crop temporal
+        # normalizer below; only extreme tall sheets multiply provider calls.
+        if asset.kind != "sheet":
+            aspect = str(slices[0]["aspect_ratio"])
+            request = {
+                "asset_index": asset_index,
+                "generation": generation,
+                "prompt": prompt,
+                "prototype": prototype["content_hash"],
+                "aspect_ratio": aspect,
+                "image_size": "2K",
+            }
+
+            operation, result = await self._provider_call(
+                attempt=self.database.get_attempt(attempt["id"]),
+                stage=Stage.ASSETS,
+                key=f"{attempt['id']}:asset:{asset_index}:generation:{generation}",
+                role="image_generator",
+                side_effect="generate_build_asset",
+                request=request,
+                invoke=lambda: provider.generate_image(
+                    prompt=prompt,
+                    references=[(prototype["media_type"], prototype_bytes)],
+                    aspect_ratio=aspect,
+                    image_size="2K",
+                ),
+            )
+            raw, media_type = self._image_result(operation, result)
+            artifact = self._store_bytes_artifact(
+                attempt,
+                Stage.ASSETS,
+                ArtifactKind.SOURCE_ASSET,
+                raw,
+                media_type,
+                metadata={
+                    "asset_index": asset_index,
+                    "generation": generation,
+                    "phase": "provider_output",
+                    "prompt": prompt,
+                    "aspect_ratio": aspect,
+                    "image_size": "2K",
+                    "slice_count": 1,
+                },
+                provenance={"operation_id": operation["id"]},
+                occurrence_key=f"asset:{asset_index}:generation:{generation}:provider-output",
+            )
+            return raw, artifact
+
+        normalized_slices: list[bytes] = []
+        normalized_artifacts: list[dict[str, Any]] = []
+        raw_artifacts: list[dict[str, Any]] = []
+        operation_ids: list[str] = []
+        for spec in slices:
+            slice_index = int(spec["slice_index"])
+            start = int(spec["start_frame"])
+            end = int(spec["end_frame"])
+            frame_rows = int(spec["frame_rows"])
+            aspect = str(spec["aspect_ratio"])
+            continuity_artifacts: list[dict[str, Any]] = []
+            if normalized_artifacts:
+                continuity_artifacts.append(normalized_artifacts[-1])
+            if end == asset.frames and normalized_artifacts:
+                first = normalized_artifacts[0]
+                if all(candidate["id"] != first["id"] for candidate in continuity_artifacts):
+                    continuity_artifacts.append(first)
+            continuity_refs = [candidate["content_hash"] for candidate in continuity_artifacts]
+            slice_prompt = self._asset_slice_prompt(
+                prompt,
+                asset=asset,
+                slice_index=slice_index,
+                slice_count=len(slices),
+                start_frame=start,
+                end_frame=end,
+                has_previous=bool(normalized_artifacts),
+            )
+            request = {
+                "asset_index": asset_index,
+                "generation": generation,
+                "prompt": slice_prompt,
+                "prototype": prototype["content_hash"],
+                "slice": {
+                    **spec,
+                    "slice_count": len(slices),
+                    "full_frame_rows": asset.frames,
+                    "body_columns": asset.natural_length_cells,
+                },
+                "continuity_refs": continuity_refs,
+                "aspect_ratio": aspect,
+                "image_size": "2K",
+            }
+            references = [(prototype["media_type"], prototype_bytes)] + [
+                ("image/png", self.objects.get(candidate["object_ref"])) for candidate in continuity_artifacts
+            ]
+
+            operation, result = await self._provider_call(
+                attempt=self.database.get_attempt(attempt["id"]),
+                stage=Stage.ASSETS,
+                key=(f"{attempt['id']}:asset:{asset_index}:generation:{generation}:slice:{slice_index}:{start}-{end}"),
+                role="image_generator",
+                side_effect="generate_build_asset_slice",
+                request=request,
+                invoke=lambda slice_prompt=slice_prompt, references=references, aspect=aspect: provider.generate_image(
+                    prompt=slice_prompt,
+                    references=references,
+                    aspect_ratio=aspect,
+                    image_size="2K",
+                ),
+            )
+            raw, media_type = self._image_result(operation, result)
+            raw_artifact = self._store_bytes_artifact(
+                attempt,
+                Stage.ASSETS,
+                ArtifactKind.SOURCE_ASSET,
+                raw,
+                media_type,
+                metadata={
+                    "asset_index": asset_index,
+                    "generation": generation,
+                    "phase": "provider_slice_output",
+                    "prompt": slice_prompt,
+                    "slice": request["slice"],
+                    "continuity_refs": continuity_refs,
+                    "aspect_ratio": aspect,
+                    "image_size": "2K",
+                },
+                provenance={"operation_id": operation["id"]},
+                occurrence_key=(
+                    f"asset:{asset_index}:generation:{generation}:slice:{slice_index}:{start}-{end}:provider-output"
+                ),
+            )
+            normalized = self.assets.normalize_sheet_slice(
+                raw,
+                body_columns=asset.natural_length_cells,
+                frame_rows=frame_rows,
+                texels_per_cell=asset.texels_per_cell,
+            )
+            normalized_artifact = self._store_bytes_artifact(
+                attempt,
+                Stage.ASSETS,
+                ArtifactKind.SOURCE_ASSET,
+                normalized,
+                "image/png",
+                metadata={
+                    "asset_index": asset_index,
+                    "generation": generation,
+                    "phase": "normalized_provider_slice",
+                    "slice": request["slice"],
+                    "provider_artifact_id": raw_artifact["id"],
+                    "target_width_px": asset.natural_length_cells * asset.texels_per_cell,
+                    "target_height_px": frame_rows * asset.texels_per_cell,
+                    "normalization": "no_crop_direct_resize",
+                },
+                provenance={"operation_id": operation["id"], "provider_artifact_id": raw_artifact["id"]},
+                occurrence_key=(
+                    f"asset:{asset_index}:generation:{generation}:slice:{slice_index}:{start}-{end}:normalized"
+                ),
+            )
+            raw_artifacts.append(raw_artifact)
+            normalized_artifacts.append(normalized_artifact)
+            normalized_slices.append(normalized)
+            operation_ids.append(operation["id"])
+
+        self._assert_wall_time_before_spend()
+        assembled = self.assets.assemble_sheet_slices(normalized_slices, asset)
+        assembled_artifact = self._store_bytes_artifact(
+            attempt,
+            Stage.ASSETS,
+            ArtifactKind.SOURCE_ASSET,
+            assembled,
+            "image/png",
+            metadata={
+                "asset_index": asset_index,
+                "generation": generation,
+                "phase": "assembled_provider_output",
+                "prompt": prompt,
+                "slice_count": len(slices),
+                "frame_ranges": [[spec["start_frame"], spec["end_frame"]] for spec in slices],
+                "provider_artifact_ids": [artifact["id"] for artifact in raw_artifacts],
+                "normalized_slice_artifact_ids": [artifact["id"] for artifact in normalized_artifacts],
+                "width_px": asset.natural_length_cells * asset.texels_per_cell,
+                "height_px": asset.frames * asset.texels_per_cell,
+                "assembly": "vertical_exact_no_crop",
+            },
+            provenance={
+                "operation_ids": operation_ids,
+                "provider_slice_refs": [artifact["content_hash"] for artifact in raw_artifacts],
+                "normalized_slice_refs": [artifact["content_hash"] for artifact in normalized_artifacts],
+            },
+            occurrence_key=f"asset:{asset_index}:generation:{generation}:assembled-provider-output",
+        )
+        return assembled, assembled_artifact
+
+    @staticmethod
+    def _asset_slice_prompt(
+        prompt: str,
+        *,
+        asset: AssetPlan,
+        slice_index: int,
+        slice_count: int,
+        start_frame: int,
+        end_frame: int,
+        has_previous: bool,
+    ) -> str:
+        row_count = end_frame - start_frame
+        continuity = (
+            "The immediately preceding normalized time slice is supplied after the prototype; "
+            "its last row must flow directly into this slice's first row."
+            if has_previous
+            else "Global row 0 is the valid resting and reduced-motion frame."
+        )
+        loop = (
+            "This is the final slice: its last row must flow cleanly back into global row 0, "
+            "whose first slice is also supplied when distinct from the preceding slice."
+            if end_frame == asset.frames
+            else "Its last row must anticipate the next global frame without a jump."
+        )
+        return f"""{prompt}
+
+Bounded sprite generation call {slice_index + 1} of {slice_count}. For this call,
+emit only the {asset.natural_length_cells}-column by {row_count}-row cell grid for
+global animation frames [{start_frame}, {end_frame}) out of [0, {asset.frames}).
+Do not emit, miniaturize, stack, label, border, or summarize any frames outside
+that exact half-open range. {continuity} {loop} Preserve the same snake,
+palette, lighting, cell registration, and motion phase across every slice."""
+
+    @staticmethod
+    def _asset_prompt(asset: Any, base: str, rejection: str, human_feedback: list[str]) -> str:
         grid = (
             f"The output is an X-by-Y sprite grid with X={asset.natural_length_cells} body "
             f"cells and Y={asset.frames} animation rows. Row zero is a valid resting and "
@@ -1826,6 +3079,12 @@ visual implementation reference, not poster art."""
         if asset.fit == "tile":
             seams.append("horizontal/body")
         retry = f"\nPrevious strict-gate rejection to correct: {rejection}" if rejection else ""
+        corrections = (
+            "\nLiteral human corrections for this retry (JSON strings; preserve meaning): "
+            + canonical_json(human_feedback)
+            if human_feedback
+            else ""
+        )
         return f"""{base}
 
 Generate only the final texture pixels, without labels or UI. {grid}
@@ -1833,21 +3092,13 @@ The exact forge density is {asset.texels_per_cell} texels per cell. Required
 seamless axes: {", ".join(seams) if seams else "none"}. Preserve cell
 alignment, temporal continuity, a clean loop, and fidelity to the supplied
 approved prototype. The deterministic driver will crop/resample to the exact
-grid and then measure the bytes.{retry}"""
+grid and then measure the bytes.{corrections}{retry}"""
 
     @staticmethod
     def _asset_aspect(asset: Any) -> str:
         width = asset.natural_length_cells or 1
         height = asset.frames if asset.kind == "sheet" else 1
-        ratio = width / height
-        candidates = {
-            "1:1": 1.0,
-            "4:3": 4 / 3,
-            "3:4": 3 / 4,
-            "16:9": 16 / 9,
-            "9:16": 9 / 16,
-        }
-        return min(candidates, key=lambda key: abs(math.log(ratio / candidates[key])))
+        return Factory._nearest_provider_aspect(width, height)[0]
 
     @staticmethod
     def _bind_textures(
@@ -1919,13 +3170,25 @@ grid and then measure the bytes.{retry}"""
             review_kind=None,
         )
 
-    def _block_attempt(self, attempt: dict[str, Any], reason: str) -> dict[str, Any]:
+    def _block_attempt(
+        self,
+        attempt: dict[str, Any],
+        reason: str,
+        *,
+        program_halt: str | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         current = self.database.get_attempt(attempt["id"])
+        failure: dict[str, Any] = {"stage": current["stage"], "reason": reason}
+        if program_halt is not None:
+            failure["program_halt"] = program_halt
+        if evidence:
+            failure["evidence"] = evidence
         return self.database.update_attempt(
             current["id"],
             current["version"],
             disposition=Disposition.BLOCKED,
-            failure_json={"stage": current["stage"], "reason": reason},
+            failure_json=failure,
             review_kind=None,
         )
 

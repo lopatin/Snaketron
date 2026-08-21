@@ -7,6 +7,8 @@ copies a secret into a diagnostic result, exception, log, or provider request.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -17,7 +19,7 @@ from typing import Literal
 
 from .config import FactoryConfig
 from .db import Database
-from .domain import DoctorCheck, DoctorReport
+from .domain import DoctorCheck, DoctorReport, InlineArtifact, Purpose, WorkerRequest, WorkerResult
 from .factory import Factory
 from .lama import (
     LamaRuntimeError,
@@ -28,6 +30,9 @@ from .lama import (
 )
 from .objects import ObjectStore
 from .renderer import renderer_bundle_manifest, renderer_bundle_manifest_sha
+from .snaketron_api import validate_service_capabilities
+from .worker import SkillBundle
+from .worker_validation import validate_worker_handoff
 
 DoctorIdentity = Literal["service", "operator", "all"]
 
@@ -93,6 +98,12 @@ class FactoryDoctor:
                         detail="network probe skipped by --offline",
                     ),
                     DoctorCheck(
+                        name="task_worker_conformance",
+                        ok=True,
+                        required=False,
+                        detail="side-effect-free worker request skipped by --offline",
+                    ),
+                    DoctorCheck(
                         name="content_models",
                         ok=True,
                         required=False,
@@ -104,15 +115,23 @@ class FactoryDoctor:
                         required=False,
                         detail="network probe skipped by --offline",
                     ),
+                    DoctorCheck(
+                        name="snaketron_service_capabilities",
+                        ok=True,
+                        required=False,
+                        detail="authenticated least-privilege probe skipped by --offline",
+                    ),
                 ]
             )
         else:
-            worker, content_models, api = await asyncio.gather(
+            worker, worker_conformance, content_models, api, api_capabilities = await asyncio.gather(
                 self._worker_check(),
+                self._worker_conformance_check(),
                 self._content_models_check(),
                 self._api_check(),
+                self._api_capability_check(),
             )
-            checks.extend([worker, content_models, api])
+            checks.extend([worker, worker_conformance, content_models, api, api_capabilities])
 
         ok = all(check.ok or not check.required for check in checks)
         return DoctorReport(
@@ -504,6 +523,99 @@ class FactoryDoctor:
         except Exception as error:
             return DoctorCheck(name="task_worker_model", ok=False, detail=_safe_error(error))
 
+    async def _worker_conformance_check(self) -> DoctorCheck:
+        """Exercise the real worker contract without granting any side effect."""
+
+        try:
+            swatch = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGNUPV72n4GBgYEJRIAwACP3AmWUVESEAAAAAElFTkSuQmCC"
+            )
+            swatch_ref = f"sha256:{hashlib.sha256(swatch).hexdigest()}"
+            bundle = SkillBundle.load(self.config.paths.skill_dir)
+            capabilities = json.loads(self.config.paths.capability_manifest.read_text(encoding="utf-8"))
+            limits = capabilities["limits"]
+            request = WorkerRequest(
+                request_id="doctor-worker-conformance-v1",
+                attempt_id="doctor-side-effect-free-fixture",
+                purpose=Purpose.CONTROL,
+                skill_sha256=bundle.sha256,
+                skill_files=bundle.files,
+                capability_manifest=capabilities,
+                artifact_refs={},
+                authoring_inputs={
+                    "conformance_fixture": {
+                        "name": "Doctor Procedural Stripe",
+                        "brief": (
+                            "Inspect the attached approved_prototype swatch. Return one valid, nonempty "
+                            "SkinDoc v2 procedural layer-only draft whose first friendly palette fill "
+                            "matches the swatch's exact opaque RGB value. Use no textures, assets, "
+                            "tool requests, or external actions. Do not infer the color from text."
+                        ),
+                        "implementation_path": "layers",
+                    }
+                },
+                inline_artifacts={
+                    "approved_prototype": InlineArtifact(
+                        content_hash=swatch_ref,
+                        media_type="image/png",
+                        base64_data=base64.b64encode(swatch).decode("ascii"),
+                    )
+                },
+                pure_tools=[],
+                budget={
+                    "max_layers": int(limits["max_flattened_layers"]),
+                    "max_texture_refs": 0,
+                },
+                output_schemas={"worker_result": WorkerResult.model_json_schema()},
+                feedback=["This is a side-effect-free protocol conformance fixture, not a production build."],
+            )
+            result = await self.factory.worker.execute(request)
+            expected = self.config.models.task_worker.model or ""
+            if result.resolved_model != expected:
+                raise ValueError(
+                    f"worker execution resolved {result.resolved_model!r}, expected exact model {expected!r}"
+                )
+            if not isinstance(result.value, WorkerResult):
+                raise ValueError("worker execution did not return a validated WorkerResult")
+            validate_worker_handoff(result.value, bundle.files, capabilities)
+            if (
+                result.value.implementation_plan.path != "layers"
+                or result.value.implementation_plan.asset_plan
+                or result.value.tool_requests
+            ):
+                raise ValueError("worker conformance fixture requested asset or tool side effects")
+            document = result.value.skin_document
+            deterministic = self.factory.gates.validate_document(
+                document,
+                result.value.implementation_plan,
+            )
+            if self.factory.gates.blocking_failure(deterministic):
+                failures = [
+                    f"{gate.gate}: {gate.reasons}" for gate in deterministic if gate.blocking and gate.verdict == "fail"
+                ]
+                raise ValueError("worker returned a SkinDoc that fails deterministic gates: " + "; ".join(failures))
+            layers = document.get("layers")
+            try:
+                sampled_fill = str(document["palette"]["friendly"][0]["fill"]).lower()
+            except (KeyError, IndexError, TypeError) as error:
+                raise ValueError("worker conformance SkinDoc has no inspectable friendly palette fill") from error
+            if not isinstance(layers, list) or not layers:
+                raise ValueError("worker conformance SkinDoc has no procedural layer")
+            if sampled_fill != "#25c776":
+                raise ValueError(
+                    f"worker did not read the exact prototype swatch; first friendly fill was {sampled_fill!r}"
+                )
+            return DoctorCheck(
+                name="task_worker_conformance",
+                ok=True,
+                detail=(
+                    f"vision WorkerRequest/WorkerResult and deterministic SkinDoc gates passed with "
+                    f"exact model {result.resolved_model!r}"
+                ),
+            )
+        except Exception as error:
+            return DoctorCheck(name="task_worker_conformance", ok=False, detail=_safe_error(error))
+
     async def _content_models_check(self) -> DoctorCheck:
         failures: list[str] = []
         resolved: list[str] = []
@@ -536,6 +648,30 @@ class FactoryDoctor:
             )
         except Exception as error:
             return DoctorCheck(name="snaketron_api", ok=False, detail=_safe_error(error))
+
+    async def _api_capability_check(self) -> DoctorCheck:
+        """Prove the scheduled token is useful and cannot publish."""
+
+        try:
+            value = validate_service_capabilities(await self.factory.api.service_capabilities())
+            identity = value["identity"]
+            credential = value["credential"]
+            user_id = identity.get("userId")
+            return DoctorCheck(
+                name="snaketron_service_capabilities",
+                ok=True,
+                detail=(
+                    f"durable revocable credential {credential['credentialId']!r} for account {user_id!r} "
+                    "can create private/evaluation skins and upload private forge textures; "
+                    "publish/admin authority absent"
+                ),
+            )
+        except Exception as error:
+            return DoctorCheck(
+                name="snaketron_service_capabilities",
+                ok=False,
+                detail=_safe_error(error),
+            )
 
 
 def _safe_error(error: Exception) -> str:

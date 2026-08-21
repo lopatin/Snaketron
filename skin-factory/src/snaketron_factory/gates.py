@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
 import tempfile
@@ -10,10 +11,68 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
+from PIL import Image
 
 from .config import FactoryConfig
-from .domain import GateResult, GateVerdict, ImplementationPlan
+from .domain import AssetPlan, GateResult, GateVerdict, ImplementationPlan
+from .worker_validation import WorkerContractError, effective_sheet_frame_rows
+
+# This registry is intentionally code-owned.  The manifest controls versions
+# and blocking policy, while this list makes it impossible to add a configured
+# gate with no runtime producer and accidentally treat its absence as a pass.
+RUNTIME_GATE_PRODUCERS = {
+    "document_schema": "GateRunner.validate_document",
+    "reference_integrity": "GateRunner.validate_document",
+    "ownership": "Factory._ownership_gate",
+    "safety_ip": "Factory._prototype_triage/Factory._build_triage",
+    "asset_dimensions": "GateRunner.validate_document",
+    "asset_exact_hash": "AssetProcessor.forge",
+    "seam": "AssetProcessor.forge",
+    "sprite_grid": "GateRunner.validate_asset_bytes",
+    "temporal_loop": "GateRunner.validate_asset_bytes",
+    "palette_chroma": "GateRunner.validate_asset_bytes",
+    "detail_density": "GateRunner.validate_asset_bytes",
+    "operation_budget": "GateRunner.validate_document",
+    "renderer_conformance": "GateRunner.validate_document",
+    "browser_pixels_ready": "BrowserRenderer.capture",
+    "contrast_diagnostic": "GateRunner.validate_asset_bytes",
+    "detail_retention_diagnostic": "GateRunner.validate_asset_bytes",
+    "visual_fidelity": "SkinFactory",
+}
+
+ASSET_BYTE_GATE_NAMES = (
+    "sprite_grid",
+    "temporal_loop",
+    "palette_chroma",
+    "detail_density",
+    "contrast_diagnostic",
+    "detail_retention_diagnostic",
+)
+
+ASSET_RUNTIME_GATE_NAMES = ("seam", "asset_exact_hash", *ASSET_BYTE_GATE_NAMES)
+
+
+@dataclass(frozen=True)
+class _ExactVariant:
+    content_ref: str
+    declared_content_ref: str
+    served_url: str
+    width_px: int
+    height_px: int
+    texels_per_cell: int
+    pixels: np.ndarray
+
+    def identity(self) -> dict[str, Any]:
+        return {
+            "content_ref": self.content_ref,
+            "declared_content_ref": self.declared_content_ref,
+            "served_url": self.served_url,
+            "width_px": self.width_px,
+            "height_px": self.height_px,
+            "texels_per_cell": self.texels_per_cell,
+        }
 
 
 @dataclass(frozen=True)
@@ -84,6 +143,362 @@ class GateRunner:
         results.append(self._operation_budget(document))
         return results
 
+    def validate_asset_bytes(self, asset: AssetPlan, variants: list[Any] | tuple[Any, ...]) -> list[GateResult]:
+        """Measure every asset gate on the immutable PNG bytes that ship.
+
+        The variant content references are hashes of these same bytes.  The
+        upload path subsequently performs an exact read-after-write comparison,
+        so these measurements apply to the bytes returned by the public texture
+        endpoint rather than to a provider preview or an in-memory precursor.
+        """
+        exact, byte_errors = self._decode_exact_variants(variants)
+        identities = [item.identity() for item in exact]
+        common = {
+            "asset_kind": asset.kind,
+            "declared_body_columns": asset.natural_length_cells,
+            "declared_frame_rows": asset.frames if asset.kind == "sheet" else None,
+            "byte_scope": "content-addressed-shipping-png",
+            "variants": identities,
+        }
+
+        grid_errors = list(byte_errors)
+        grid_measurements: list[dict[str, Any]] = []
+        for item in exact:
+            expected_width = asset.natural_length_cells * item.texels_per_cell
+            expected_height = (asset.frames if asset.kind == "sheet" else 1) * item.texels_per_cell
+            grid_measurements.append(
+                {
+                    "content_ref": item.content_ref,
+                    "body_columns": item.width_px / item.texels_per_cell,
+                    "frame_rows": item.height_px / item.texels_per_cell,
+                    "expected_width_px": expected_width,
+                    "expected_height_px": expected_height,
+                    "actual_width_px": item.width_px,
+                    "actual_height_px": item.height_px,
+                }
+            )
+            if item.width_px != expected_width or item.height_px != expected_height:
+                grid_errors.append(
+                    f"{item.content_ref}: exact grid is {item.width_px}x{item.height_px}px; "
+                    f"declared grid requires {expected_width}x{expected_height}px"
+                )
+        if not exact:
+            grid_errors.append("no exact shipping PNG variants were available for grid measurement")
+        grid = self.manifest.result(
+            "sprite_grid",
+            not grid_errors,
+            reasons=grid_errors,
+            measurements={**common, "grid": grid_measurements},
+        )
+
+        temporal = self._temporal_loop_result(asset, exact, byte_errors, common, grid_errors)
+        pixel_metrics = [self._pixel_metrics(item) for item in exact]
+        palette = self._palette_chroma_result(pixel_metrics, byte_errors, common)
+        detail = self._detail_density_result(pixel_metrics, byte_errors, common)
+        contrast = self._contrast_result(pixel_metrics, byte_errors, common)
+        scale = self._scale_result(pixel_metrics, byte_errors, common)
+        return [grid, temporal, palette, detail, contrast, scale]
+
+    @staticmethod
+    def _decode_exact_variants(variants: list[Any] | tuple[Any, ...]) -> tuple[list[_ExactVariant], list[str]]:
+        decoded: list[_ExactVariant] = []
+        errors: list[str] = []
+        for index, variant in enumerate(variants):
+            label = f"variant {index}"
+            try:
+                data = bytes(variant.data)
+                declared_ref = str(variant.content_ref)
+                served_url = str(variant.url)
+                declared_width = int(variant.width_px)
+                declared_height = int(variant.height_px)
+                texels_per_cell = int(variant.texels_per_cell)
+            except (AttributeError, TypeError, ValueError) as error:
+                errors.append(f"{label}: malformed exact variant metadata: {error}")
+                continue
+            actual_ref = f"sha256:{hashlib.sha256(data).hexdigest()}"
+            label = actual_ref
+            if actual_ref != declared_ref:
+                errors.append(f"{label}: declared content ref is {declared_ref}")
+            if texels_per_cell <= 0:
+                errors.append(f"{label}: texels_per_cell must be positive")
+                continue
+            try:
+                with Image.open(io.BytesIO(data)) as opened:
+                    opened.load()
+                    if opened.format != "PNG":
+                        errors.append(f"{label}: exact shipping bytes are {opened.format}, not PNG")
+                    image = opened.convert("RGBA")
+            except Exception as error:  # Pillow exposes several decoder-specific exceptions.
+                errors.append(f"{label}: cannot decode exact shipping PNG: {error}")
+                continue
+            if image.width != declared_width or image.height != declared_height:
+                errors.append(
+                    f"{label}: decoded size {image.width}x{image.height}px differs from "
+                    f"declared {declared_width}x{declared_height}px"
+                )
+            decoded.append(
+                _ExactVariant(
+                    content_ref=actual_ref,
+                    declared_content_ref=declared_ref,
+                    served_url=served_url,
+                    width_px=image.width,
+                    height_px=image.height,
+                    texels_per_cell=texels_per_cell,
+                    pixels=np.asarray(image, dtype=np.uint8).copy(),
+                )
+            )
+        return decoded, errors
+
+    def _temporal_loop_result(
+        self,
+        asset: AssetPlan,
+        exact: list[_ExactVariant],
+        byte_errors: list[str],
+        common: dict[str, Any],
+        grid_errors: list[str],
+    ) -> GateResult:
+        if asset.kind != "sheet":
+            return self.manifest.result(
+                "temporal_loop",
+                True,
+                measurements={**common, "applicable": False, "loops": []},
+            )
+
+        reasons = list(byte_errors)
+        if grid_errors:
+            reasons.extend(item for item in grid_errors if item not in reasons)
+        loops: list[dict[str, Any]] = []
+        if not exact:
+            reasons.append("no exact shipping PNG variants were available for temporal measurement")
+        for item in exact:
+            if item.height_px != asset.frames * item.texels_per_cell:
+                continue
+            luma = _premultiplied_luma(item.pixels)
+            raw_frames = item.pixels.reshape(
+                asset.frames,
+                item.texels_per_cell,
+                item.width_px,
+                4,
+            )
+            frame_pixels = _premultiplied_channels(item.pixels).reshape(
+                asset.frames,
+                item.texels_per_cell,
+                item.width_px,
+                4,
+            )
+            frame_steps = [
+                float(np.mean(np.abs(frame_pixels[(index + 1) % asset.frames] - frame_pixels[index])) / 255.0)
+                for index in range(asset.frames)
+            ]
+            edge_steps = [
+                float(
+                    np.mean(np.abs(frame_pixels[index, -1, :, :] - frame_pixels[(index + 1) % asset.frames, 0, :, :]))
+                    / 255.0
+                )
+                for index in range(asset.frames)
+            ]
+            internal_frame = frame_steps[:-1]
+            internal_edge = edge_steps[:-1]
+            change_floor = 1.0 / 1_024.0
+            changed_steps = [step for step in frame_steps if step > change_floor]
+            material_internal_frames = [step for step in internal_frame if step > change_floor]
+            material_internal_edges = [step for step in internal_edge if step > change_floor]
+            frame_baseline = float(np.median(material_internal_frames)) if material_internal_frames else 0.0
+            edge_baseline = float(np.median(material_internal_edges)) if material_internal_edges else 0.0
+            loop_frame = frame_steps[-1]
+            loop_edge = edge_steps[-1]
+            frame_allowance = max(0.02, frame_baseline * 2.5)
+            edge_allowance = max(0.02, edge_baseline * 2.5)
+            translation_px = _frame_translation(luma, asset.frames)
+            translation_limit = max(1, item.texels_per_cell // 8)
+            distinct_frames = len({hashlib.sha256(frame.tobytes()).digest() for frame in raw_frames})
+            loops.append(
+                {
+                    "content_ref": item.content_ref,
+                    "declared_frame_rows": asset.frames,
+                    "measured_frame_rows": item.height_px // item.texels_per_cell,
+                    "distinct_frame_cells": distinct_frames,
+                    "changed_frame_transitions": len(changed_steps),
+                    "minimum_change_mae": _rounded(change_floor),
+                    "frame_step_mae": [_rounded(step) for step in frame_steps],
+                    "loop_frame_mae": _rounded(loop_frame),
+                    "median_internal_frame_mae": _rounded(frame_baseline),
+                    "loop_frame_allowance": _rounded(frame_allowance),
+                    "loop_edge_mae": _rounded(loop_edge),
+                    "median_internal_edge_mae": _rounded(edge_baseline),
+                    "loop_edge_allowance": _rounded(edge_allowance),
+                    "median_frame_translation_px": translation_px,
+                    "frame_translation_limit_px": translation_limit,
+                }
+            )
+            if distinct_frames < 2 or len(changed_steps) < 2:
+                reasons.append(
+                    f"{item.content_ref}: declared frame cells contain no measurable frame-to-frame animation"
+                )
+            if loop_frame > frame_allowance:
+                reasons.append(
+                    f"{item.content_ref}: loop frame discontinuity {_rounded(loop_frame)} exceeds "
+                    f"{_rounded(frame_allowance)}"
+                )
+            if loop_edge > edge_allowance:
+                reasons.append(
+                    f"{item.content_ref}: loop edge discontinuity {_rounded(loop_edge)} exceeds "
+                    f"{_rounded(edge_allowance)}"
+                )
+            if abs(translation_px) > translation_limit:
+                reasons.append(
+                    f"{item.content_ref}: frames translate {translation_px}px; limit is {translation_limit}px"
+                )
+        return self.manifest.result(
+            "temporal_loop",
+            not reasons,
+            reasons=reasons,
+            measurements={**common, "applicable": True, "loops": loops},
+        )
+
+    @staticmethod
+    def _pixel_metrics(item: _ExactVariant) -> dict[str, Any]:
+        rgba = item.pixels.astype(np.float32) / 255.0
+        alpha = rgba[..., 3]
+        visible = alpha > (1.0 / 255.0)
+        rgb = rgba[..., :3]
+        visible_rgb = rgb[visible]
+        if visible_rgb.size:
+            visible_luma = visible_rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+            chroma = np.max(visible_rgb, axis=1) - np.min(visible_rgb, axis=1)
+            maximum = np.max(visible_rgb, axis=1)
+            saturation = np.divide(chroma, maximum, out=np.zeros_like(chroma), where=maximum > 0)
+            p05, p50, p95 = np.percentile(visible_luma, [5, 50, 95])
+            quantized = np.floor(visible_rgb * 7.999).astype(np.uint16)
+            packed = (quantized[:, 0] << 6) | (quantized[:, 1] << 3) | quantized[:, 2]
+            palette_bins = int(np.unique(packed).size)
+            mean_chroma = float(np.mean(chroma))
+            p90_chroma = float(np.percentile(chroma, 90))
+            mean_saturation = float(np.mean(saturation))
+        else:
+            p05 = p50 = p95 = 0.0
+            palette_bins = 0
+            mean_chroma = p90_chroma = mean_saturation = 0.0
+
+        luma = _premultiplied_luma(item.pixels) / 255.0
+        dx = np.abs(np.diff(luma, axis=1))
+        dy = np.abs(np.diff(luma, axis=0))
+        mean_gradient = float((np.mean(dx) + np.mean(dy)) / 2.0)
+        detail_per_cell = mean_gradient * item.texels_per_cell
+        dynamic_range = float(p95 - p05)
+        contrast_ratio = float((p95 + 0.05) / (p05 + 0.05))
+        return {
+            "content_ref": item.content_ref,
+            "texels_per_cell": item.texels_per_cell,
+            "visible_fraction": _rounded(float(np.mean(visible))),
+            "palette_bins_3bit": palette_bins,
+            "mean_chroma": _rounded(mean_chroma),
+            "p90_chroma": _rounded(p90_chroma),
+            "mean_saturation": _rounded(mean_saturation),
+            "luminance_p05": _rounded(float(p05)),
+            "luminance_p50": _rounded(float(p50)),
+            "luminance_p95": _rounded(float(p95)),
+            "dynamic_range": _rounded(dynamic_range),
+            "contrast_ratio": _rounded(contrast_ratio),
+            "mean_gradient": _rounded(mean_gradient),
+            "detail_per_cell": _rounded(detail_per_cell),
+        }
+
+    def _palette_chroma_result(
+        self,
+        metrics: list[dict[str, Any]],
+        byte_errors: list[str],
+        common: dict[str, Any],
+    ) -> GateResult:
+        threshold = 0.55
+        reasons = list(byte_errors)
+        enriched = _with_retention(metrics, "mean_chroma", "chroma_retention", floor=0.03)
+        for item in enriched[1:]:
+            if item["chroma_retention"] < threshold:
+                reasons.append(
+                    f"{item['content_ref']}: chroma retention {item['chroma_retention']} is below {threshold}"
+                )
+        if not enriched:
+            reasons.append("no exact shipping PNG variants were available for chroma measurement")
+        return self.manifest.result(
+            "palette_chroma",
+            not reasons,
+            reasons=reasons,
+            measurements={**common, "minimum_retention": threshold, "palette": enriched},
+        )
+
+    def _detail_density_result(
+        self,
+        metrics: list[dict[str, Any]],
+        byte_errors: list[str],
+        common: dict[str, Any],
+    ) -> GateResult:
+        threshold = 0.20
+        reasons = list(byte_errors)
+        enriched = _with_retention(metrics, "detail_per_cell", "detail_retention", floor=0.02)
+        for item in enriched[1:]:
+            if item["detail_retention"] < threshold:
+                reasons.append(
+                    f"{item['content_ref']}: per-cell detail retention {item['detail_retention']} is below {threshold}"
+                )
+        if not enriched:
+            reasons.append("no exact shipping PNG variants were available for detail measurement")
+        return self.manifest.result(
+            "detail_density",
+            not reasons,
+            reasons=reasons,
+            measurements={**common, "minimum_retention": threshold, "detail": enriched},
+        )
+
+    def _contrast_result(
+        self,
+        metrics: list[dict[str, Any]],
+        byte_errors: list[str],
+        common: dict[str, Any],
+    ) -> GateResult:
+        minimum_range = 0.08
+        reasons = list(byte_errors)
+        for item in metrics:
+            if item["dynamic_range"] < minimum_range:
+                reasons.append(
+                    f"{item['content_ref']}: luminance range {item['dynamic_range']} is below {minimum_range}"
+                )
+        if not metrics:
+            reasons.append("no exact shipping PNG variants were available for contrast measurement")
+        return self.manifest.result(
+            "contrast_diagnostic",
+            not reasons,
+            reasons=reasons,
+            measurements={**common, "minimum_dynamic_range": minimum_range, "contrast": metrics},
+        )
+
+    def _scale_result(
+        self,
+        metrics: list[dict[str, Any]],
+        byte_errors: list[str],
+        common: dict[str, Any],
+    ) -> GateResult:
+        threshold = 0.50
+        reasons = list(byte_errors)
+        detail = _with_retention(metrics, "detail_per_cell", "detail_retention", floor=0.02)
+        contrast = _with_retention(detail, "dynamic_range", "contrast_retention", floor=0.08)
+        for item in contrast[1:]:
+            item["scale_readability"] = _rounded(min(item["detail_retention"], item["contrast_retention"]))
+            if item["scale_readability"] < threshold:
+                reasons.append(
+                    f"{item['content_ref']}: scale readability {item['scale_readability']} is below {threshold}"
+                )
+        if contrast:
+            contrast[0]["scale_readability"] = 1.0
+        else:
+            reasons.append("no exact shipping PNG variants were available for scale measurement")
+        return self.manifest.result(
+            "detail_retention_diagnostic",
+            not reasons,
+            reasons=reasons,
+            measurements={**common, "minimum_scale_readability": threshold, "scales": contrast},
+        )
+
     def _rust_schema(self, document: dict[str, Any]) -> GateResult:
         with tempfile.TemporaryDirectory(prefix="skin-factory-schema-") as directory:
             path = Path(directory) / "skin.skin.json"
@@ -134,6 +549,10 @@ class GateRunner:
         required_axes: set[str] = set()
         image_count = 0
         limits = self.capabilities["limits"]
+        sheet_plans = [asset for asset in plan.asset_plan if asset.kind == "sheet"]
+        used_sheet_plans: set[int] = set()
+        processed_sheet_textures: set[str] = set()
+        animation_sampling: list[dict[str, Any]] = []
 
         for index, layer in enumerate(layers):
             source = layer.get("source", {})
@@ -191,6 +610,52 @@ class GateRunner:
                             f"sheet {texture_name!r} declares {frame_rows} rows but only {reachable} "
                             "are reachable for this period"
                         )
+                    if texture_name not in processed_sheet_textures:
+                        candidates = [
+                            (candidate_index, candidate)
+                            for candidate_index, candidate in enumerate(sheet_plans)
+                            if candidate_index not in used_sheet_plans
+                            and candidate.natural_length_cells == body_columns
+                        ]
+                        if not candidates:
+                            shape_failures.append(f"sheet {texture_name!r} has no matching implementation plan asset")
+                            processed_sheet_textures.add(str(texture_name))
+                        else:
+                            candidate_index, asset = next(
+                                (
+                                    (candidate_index, candidate)
+                                    for candidate_index, candidate in candidates
+                                    if candidate.frames == frame_rows
+                                ),
+                                candidates[0],
+                            )
+                            used_sheet_plans.add(candidate_index)
+                            processed_sheet_textures.add(str(texture_name))
+                            try:
+                                derived_rows = effective_sheet_frame_rows(
+                                    asset,
+                                    document.get("period_ms"),
+                                    self.capabilities,
+                                )
+                            except WorkerContractError as error:
+                                shape_failures.append(f"sheet {texture_name!r}: {error}")
+                            else:
+                                animation_sampling.append(
+                                    {
+                                        "texture": texture_name,
+                                        "desired_fps": asset.desired_fps,
+                                        "period_ms": document.get("period_ms"),
+                                        "derived_frame_rows": derived_rows,
+                                        "effective_fps": round(derived_rows * 1_000 / float(document["period_ms"]), 6),
+                                        "renderer_max_fps": limits["max_sprite_frame_rate_fps"],
+                                    }
+                                )
+                                if frame_rows != derived_rows or asset.frames != derived_rows:
+                                    shape_failures.append(
+                                        f"sheet {texture_name!r} declares {frame_rows} rows but desired_fps="
+                                        f"{asset.desired_fps:g} and period_ms={float(document['period_ms']):g} "
+                                        f"derive {derived_rows}"
+                                    )
             elif frame_rows is not None:
                 shape_failures.append(f"non-sheet texture {texture_name!r} declares frame_rows")
 
@@ -226,6 +691,8 @@ class GateRunner:
             shape_failures.append(
                 f"plan wrap axes {sorted(plan.required_wrap_axes)} differ from usage {sorted(required_axes)}"
             )
+        if len(used_sheet_plans) != len(sheet_plans):
+            shape_failures.append("one or more planned sheet assets are absent from the resolved SkinDoc")
 
         return [
             self.manifest.result(
@@ -238,7 +705,10 @@ class GateRunner:
                 "asset_dimensions",
                 not shape_failures,
                 reasons=shape_failures,
-                measurements={"required_wrap_axes": sorted(required_axes)},
+                measurements={
+                    "required_wrap_axes": sorted(required_axes),
+                    "animation_sampling": animation_sampling,
+                },
             ),
             self.manifest.result(
                 "renderer_conformance",
@@ -280,3 +750,59 @@ def _numeric_constant(value: Any) -> bool:
             return False
         return True
     return False
+
+
+def _premultiplied_luma(rgba: np.ndarray) -> np.ndarray:
+    channels = _premultiplied_channels(rgba)
+    return channels[..., :3] @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+
+def _premultiplied_channels(rgba: np.ndarray) -> np.ndarray:
+    pixels = rgba.astype(np.float32)
+    alpha = pixels[..., 3:4] / 255.0
+    return np.concatenate((pixels[..., :3] * alpha, pixels[..., 3:4]), axis=2)
+
+
+def _frame_translation(luma: np.ndarray, rows: int) -> int:
+    frame_height = luma.shape[0] // rows
+    if frame_height < 4:
+        return 0
+    shifts: list[int] = []
+    for row in range(rows):
+        first = luma[row * frame_height : (row + 1) * frame_height]
+        next_start = ((row + 1) % rows) * frame_height
+        second = luma[next_start : next_start + frame_height]
+        if second.shape[0] != frame_height:
+            continue
+        a = first.mean(axis=1) - first.mean()
+        b = second.mean(axis=1) - second.mean()
+        if float(np.max(np.abs(a))) <= 1e-5 or float(np.max(np.abs(b))) <= 1e-5:
+            continue
+        correlation = np.fft.irfft(np.fft.rfft(b) * np.conj(np.fft.rfft(a)), n=frame_height)
+        lag = int(np.argmax(correlation))
+        shifts.append(lag - frame_height if lag > frame_height // 2 else lag)
+    if not shifts:
+        return 0
+    return int(np.median(shifts))
+
+
+def _with_retention(
+    metrics: list[dict[str, Any]],
+    value_name: str,
+    retention_name: str,
+    *,
+    floor: float,
+) -> list[dict[str, Any]]:
+    ordered = sorted((dict(item) for item in metrics), key=lambda item: int(item["texels_per_cell"]), reverse=True)
+    if not ordered:
+        return []
+    baseline = float(ordered[0][value_name])
+    for item in ordered:
+        value = float(item[value_name])
+        retention = 1.0 if baseline < floor else value / baseline
+        item[retention_name] = _rounded(retention)
+    return ordered
+
+
+def _rounded(value: float) -> float:
+    return round(float(value), 6)

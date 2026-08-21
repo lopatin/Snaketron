@@ -151,14 +151,13 @@ def _blind_label(
         ),
         hidden_until_label=True,
     )
-    database.add_human_decision(
+    database.add_blind_human_label(
         artifact_id=artifact["id"],
         attempt_id=attempt["id"],
         action="prototype_label",
         feedback="blind calibration label",
         tags=["outcome:accept"],
         actor="human:calibrator",
-        attempt_version=attempt["version"],
         content_hash=artifact["content_hash"],
     )
 
@@ -174,6 +173,13 @@ def test_calibration_accumulates_each_resolved_model_and_rubric_identity(
         tags=[],
     )
     attempt = database.create_attempt(**_attempt_values(concept["id"], "calibration-versions", Purpose.PRODUCTION))
+    attempt = database.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        stage=Stage.PROTOTYPE_REVIEW,
+        disposition=Disposition.NEEDS_HUMAN,
+        review_kind="prototype",
+    )
     old = judge_evaluator_version(factory_config, "prototype", resolved_model="gemini-3.7-flash-20260801")
     new = judge_evaluator_version(factory_config, "prototype", resolved_model="gemini-3.7-flash-20260815")
     _blind_label(database, objects, attempt, index=1, evaluator_version=old)
@@ -213,7 +219,7 @@ def _author_result() -> WorkerResult:
 async def test_experiment_author_uses_retained_candidate_before_git_and_resumes_same_request(
     factory_config, database: Database, objects: ObjectStore
 ) -> None:
-    worker = FakeWorker([_author_result()])
+    worker = FakeWorker([_author_result()], model="worker-test")
     factory = Factory(
         factory_config,
         database=database,

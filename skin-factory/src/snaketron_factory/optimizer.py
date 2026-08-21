@@ -12,6 +12,7 @@ optimizer library call.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -618,6 +619,15 @@ class Optimizer:
                 contract = ExpectedPropertyContract.model_validate(row.get("expected_property_contract"))
                 _assert_expected_property_contract(contract)
                 parent = self.database.get_attempt(row["attempt_id"])
+                behavior = {
+                    **snapshot,
+                    "skill_sha": candidate["skill_sha"],
+                    "expected_property_contract": contract.model_dump(mode="json"),
+                }
+                # Technique mining freezes a semantic fixture-topology hash in
+                # every paired trial. Ordinary GEPA rows omit this field.
+                if row.get("fixture_structure") is not None:
+                    behavior["fixture_structural_signature"] = row["fixture_structure"]
                 child = self.database.create_attempt(
                     concept_id=row["concept_id"],
                     purpose=purpose,
@@ -625,11 +635,7 @@ class Optimizer:
                     restart_stage=("optimizer_rollout" if purpose == Purpose.OPTIMIZER else "technique_trial"),
                     stage=Stage.AUTHOR,
                     idempotency_key=(f"optimizer:{run['id']}:{candidate['id']}:{row['concept_id']}:{row['split']}"),
-                    behavior={
-                        **snapshot,
-                        "skill_sha": candidate["skill_sha"],
-                        "expected_property_contract": contract.model_dump(mode="json"),
-                    },
+                    behavior=behavior,
                     direction_sha=snapshot["direction_sha"],
                     skill_sha=candidate["skill_sha"],
                     capability_sha=snapshot["capability_sha"],
@@ -1267,6 +1273,17 @@ class Optimizer:
             active = self.database.active_behavior("author-skin")
         assert active is not None
         coordinator = holdout_attempts[0]
+
+        async def promote_candidate() -> ProviderResult:
+            promoted = await asyncio.to_thread(
+                GitPromoter(self.config, self.database).promote_playbook,
+                candidate_playbook=payload["playbook"],
+                run_id=run["id"],
+                expected_head=active["sha"],
+                expected_active_sha=active["sha"],
+            )
+            return _promotion_provider_result(promoted)
+
         operation, result = await self.factory._provider_call(
             attempt=coordinator,
             stage=Stage.COMPLETE,
@@ -1279,14 +1296,7 @@ class Optimizer:
                 "candidate_skill_sha": selected["skill_sha"],
                 "expected_active_sha": active["sha"],
             },
-            invoke=lambda: _promotion_provider_result(
-                GitPromoter(self.config, self.database).promote_playbook(
-                    candidate_playbook=payload["playbook"],
-                    run_id=run["id"],
-                    expected_head=active["sha"],
-                    expected_active_sha=active["sha"],
-                )
-            ),
+            invoke=promote_candidate,
         )
         promotion = self.factory._json_result(operation, result)
         current = self.database.get_optimization_run(run["id"])

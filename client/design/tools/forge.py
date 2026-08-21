@@ -96,6 +96,10 @@ class Manifest:
     repaired: bool
     repair_methods: list[str] = field(default_factory=list)
     rungs: list[Rung] = field(default_factory=list)
+    # A refusal after repair must not discard the exact pixels that were
+    # measured.  This is deliberately separate from ``rungs``: it is evidence,
+    # not a shippable ladder member.
+    failed_output: Rung | None = None
     # Present only on a refusal, and written to be read by a person: which
     # axis, by how much, and against what limit.
     rejection: str | None = None
@@ -277,8 +281,14 @@ def rejected_manifest(
     ratios: dict[int, float],
     repaired: bool,
     rejection: str,
+    out_dir: Path,
     repair_methods: list[str] | None = None,
+    rungs: list[Rung] | None = None,
 ) -> Manifest:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    failed_path = out_dir / "rejected.png"
+    image.save(failed_path, format="PNG", optimize=True)
+    failed_data = failed_path.read_bytes()
     return Manifest(
         kind=kind,
         accepted=False,
@@ -291,6 +301,15 @@ def rejected_manifest(
         vertical_ratio=ratios[0],
         repaired=repaired,
         repair_methods=list(repair_methods or []),
+        rungs=list(rungs or []),
+        failed_output=Rung(
+            texels_per_cell=LADDERS[kind][0],
+            width_px=image.width,
+            height_px=image.height,
+            bytes=len(failed_data),
+            sha256=digest(failed_data),
+            path=str(failed_path),
+        ),
         rejection=rejection,
     )
 
@@ -300,9 +319,10 @@ def shape_problem(
     kind: str,
     body_columns: int | None,
     frame_rows: int | None,
+    texels_per_cell: int | None = None,
 ) -> str | None:
     """Validate X body cells and Y animation frames independently."""
-    canonical, _ = LADDERS[kind]
+    canonical = texels_per_cell or LADDERS[kind][0]
     if body_columns is not None and body_columns <= 0:
         return "body columns must be positive"
     if frame_rows is not None and frame_rows <= 0:
@@ -327,6 +347,112 @@ def shape_problem(
         return f"a coat is one {canonical}px body cell tall, not {image.height}px"
     if kind == "overlay" and image.height % canonical != 0:
         return f"an overlay height must contain whole {canonical}px cells"
+    return None
+
+
+def inspect_existing(
+    image: Image.Image,
+    kind: str,
+    body_columns: int | None,
+    frame_rows: int | None,
+    seam_axes: tuple[int, ...],
+    texels_per_cell: int,
+) -> dict[str, object]:
+    """Measure exact retained pixels without repair, resize, or generation."""
+
+    reasons: list[str] = []
+    ratios = {0: 0.0, 1: 0.0}
+    measurements: list[dict[str, object]] = []
+    if texels_per_cell <= 0:
+        reasons.append("texels_per_cell must be positive")
+    if len(set(seam_axes)) != len(seam_axes) or any(axis not in AXIS_NAMES for axis in seam_axes):
+        reasons.append("seam axes must be a unique subset of x and y")
+    if kind == "sheet" and 0 not in seam_axes:
+        reasons.append("a sheet must check the y seam between its first and last frame")
+    problem = shape_problem(image, kind, body_columns, frame_rows, texels_per_cell)
+    if problem:
+        reasons.append(problem)
+    if not reasons:
+        for axis in seam_axes:
+            measured = measure(image, axis)
+            ratios[axis] = measured.ratio
+            measurements.append(
+                {
+                    "axis": "y" if axis == 0 else "x",
+                    "ratio": measured.ratio,
+                    "rank": measured.rank,
+                    "cleared": measured.cleared,
+                    "complaint": measured.complaint,
+                    "structural": measured.structural,
+                }
+            )
+            if not measured.cleared:
+                reasons.append(
+                    f"the exact retained {AXIS_NAMES[axis]} join fails at "
+                    f"{measured.rank:.2f} percentile / {measured.ratio:.2f}x "
+                    f"({measured.complaint or 'not cleared'})"
+                )
+        if kind == "sheet" and frame_rows:
+            temporal = temporal_problem(image, frame_rows)
+            if temporal:
+                reasons.append(f"the temporal cells are invalid: {temporal}")
+    return {
+        "schema_version": 1,
+        "mode": "inspect_existing",
+        "accepted": not reasons,
+        "kind": kind,
+        "width_px": image.width,
+        "height_px": image.height,
+        "body_columns": body_columns,
+        "frame_rows": frame_rows,
+        "texels_per_cell": texels_per_cell,
+        "seam_axes": ["y" if axis == 0 else "x" for axis in seam_axes],
+        "horizontal_ratio": ratios[1],
+        "vertical_ratio": ratios[0],
+        "measurements": measurements,
+        "reasons": reasons,
+    }
+
+
+def temporal_problem(image: Image.Image, frame_rows: int) -> str | None:
+    """Validate the declared 2-D frame cells without inferring their count.
+
+    Frame count is a grid fact established by ``shape_problem``.  A vertical
+    mean profile is not a frame-count measurement: horizontal motion preserves
+    that mean exactly.  Temporal validation therefore compares the full RGBA
+    cells, their last-to-first step, and unwanted translation around the
+    one-cell body cross-section.
+    """
+    frame_height = image.height // frame_rows
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.float64)
+    alpha = rgba[..., 3:4] / 255.0
+    pixels = np.concatenate((rgba[..., :3] * alpha, rgba[..., 3:4]), axis=2)
+    frames = pixels.reshape(frame_rows, frame_height, image.width, 4)
+    steps = [
+        float(np.mean(np.abs(frames[(index + 1) % frame_rows] - frames[index])) / 255.0)
+        for index in range(frame_rows)
+    ]
+    change_floor = 1.0 / 1_024.0
+    material = [step for step in steps if step > change_floor]
+    if len(material) < 2:
+        return "declared frame cells contain no measurable frame-to-frame animation"
+
+    internal = [step for step in steps[:-1] if step > change_floor]
+    baseline = float(np.median(internal)) if internal else 0.0
+    allowance = max(0.02, baseline * 2.5)
+    if steps[-1] > allowance:
+        return (
+            f"last-to-first frame discontinuity {steps[-1]:.4f} exceeds "
+            f"{allowance:.4f}"
+        )
+
+    drift = sheets.frame_translation(image, frame_rows)
+    drift_limit = max(1, frame_height // 8)
+    if abs(drift) > drift_limit:
+        return (
+            f"frames translate {drift}px around the body cross-section; "
+            f"limit is {drift_limit}px"
+        )
     return None
 
 
@@ -356,6 +482,7 @@ def forge(
             ratios,
             False,
             "seam axes must be a unique subset of x and y",
+            out_dir,
         )
     if kind == "sheet" and 0 not in seam_axes:
         return rejected_manifest(
@@ -367,6 +494,7 @@ def forge(
             ratios,
             False,
             "a sheet must check the y seam between its first and last frame",
+            out_dir,
         )
 
     problem = shape_problem(image, kind, body_columns, frame_rows)
@@ -380,6 +508,7 @@ def forge(
             ratios,
             False,
             problem,
+            out_dir,
         )
 
     for axis in seam_axes:
@@ -415,6 +544,7 @@ def forge(
                     f"[T,X,T] repair ({measured.structural}; "
                     f"{measured_after.complaint or 'not cleared'}); regenerate the source"
                 ),
+                out_dir,
                 repair_methods,
             )
 
@@ -439,6 +569,7 @@ def forge(
                     f"{measured.rank:.2f} percentile / {measured.ratio:.2f}x "
                     f"after repair ({measured.complaint or 'not cleared'})"
                 ),
+                out_dir,
                 repair_methods,
             )
 
@@ -462,19 +593,16 @@ def forge(
                     f"{measured.rank:.2f} percentile / {measured.ratio:.2f}x "
                     f"({measured.complaint or 'not cleared'})"
                 ),
+                out_dir,
                 repair_methods,
             )
 
-    # A sheet whose frames slide reads as the snake rotating rather than the
-    # pattern animating, which is why the shipping tooling makes it a build
-    # error rather than a warning.
+    # Validate the actual declared frame cells.  Frame count was already proven
+    # by shape_problem; reconstructing frames from a 1-D vertical profile would
+    # misclassify legitimate horizontal motion as a one-frame sheet.
     if kind == "sheet" and frame_rows:
-        assert body_columns is not None
-        try:
-            sheets.frames_from_period(
-                image, frame_rows, sheets.CELL, body_columns
-            )
-        except ValueError as error:
+        problem = temporal_problem(image, frame_rows)
+        if problem:
             return rejected_manifest(
                 image,
                 kind,
@@ -483,7 +611,8 @@ def forge(
                 seam_axes,
                 ratios,
                 repaired,
-                f"the frames travel rather than animating in place: {error}",
+                f"the temporal cells are invalid: {problem}",
+                out_dir,
                 repair_methods,
             )
 
@@ -511,7 +640,9 @@ def forge(
                         f"percentile / {measured.ratio:.2f}x "
                         f"({measured.complaint or 'not cleared'})"
                     ),
+                    out_dir,
                     repair_methods,
+                    rungs,
                 )
 
     return Manifest(
@@ -555,6 +686,16 @@ def main() -> int:
         help="joins exposed by the eventual SkinDoc usage",
     )
     parser.add_argument("--report", action="store_true", help="print the manifest")
+    parser.add_argument(
+        "--inspect-existing",
+        action="store_true",
+        help="measure the exact input without repair, resampling, or ladder creation",
+    )
+    parser.add_argument(
+        "--texels-per-cell",
+        type=int,
+        help="exact retained rung density (required by --inspect-existing)",
+    )
     args = parser.parse_args()
 
     if args.kind in {"coat", "sheet"} and args.body_columns is None:
@@ -565,8 +706,24 @@ def main() -> int:
         parser.error("--frame-rows is only valid for a sheet")
     if args.kind == "sheet" and 0 not in args.axes:
         parser.error("a sheet must include y in --axes")
+    if args.inspect_existing and args.texels_per_cell is None:
+        parser.error("--texels-per-cell is required by --inspect-existing")
 
     image = Image.open(args.source).convert("RGBA" if args.kind == "overlay" else "RGB")
+    if args.inspect_existing:
+        inspected = inspect_existing(
+            image,
+            args.kind,
+            args.body_columns,
+            args.frame_rows,
+            args.axes,
+            args.texels_per_cell,
+        )
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        (args.out_dir / "manifest.json").write_text(json.dumps(inspected, indent=2) + "\n")
+        if args.report or not inspected["accepted"]:
+            print(json.dumps(inspected, indent=2))
+        return 0 if inspected["accepted"] else 1
     manifest = forge(
         image,
         args.kind,

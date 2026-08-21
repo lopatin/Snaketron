@@ -8,6 +8,7 @@ driver stores it or performs any asset/provider operation.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -26,10 +27,14 @@ def validate_worker_handoff(
 ) -> None:
     if result.failure is not None:
         raise WorkerContractError(f"worker reported failure: {result.failure}")
-    validate_plan_resource_limits(result.implementation_plan, capabilities)
     document = result.skin_document
     if document.get("schema_version") != 2:
         raise WorkerContractError("worker draft must be a SkinDoc v2 document")
+    validate_plan_resource_limits(
+        result.implementation_plan,
+        capabilities,
+        period_ms=document.get("period_ms"),
+    )
 
     try:
         schema = json.loads(skill_files["schemas/asset-request.schema.json"])
@@ -100,7 +105,43 @@ def validate_worker_handoff(
         raise WorkerContractError(f"pending texture refs differ from planned assets: {sorted(actual_pending)}")
 
 
-def validate_plan_resource_limits(plan: Any, capabilities: dict[str, Any]) -> None:
+def effective_sheet_frame_rows(asset: AssetPlan, period_ms: Any, capabilities: dict[str, Any]) -> int:
+    """Derive Y from requested motion rate, period, and immutable runtime bounds."""
+
+    if asset.kind != "sheet" or asset.desired_fps is None:
+        raise WorkerContractError("sheet frame derivation requires a sheet asset with desired_fps")
+    try:
+        period = float(period_ms)
+        limits = capabilities["limits"]
+        max_fps = float(limits["max_sprite_frame_rate_fps"])
+        max_rows = int(limits["max_sprite_frame_rows"])
+        max_dimension = int(limits["max_texture_dimension_px"])
+        max_decoded = int(limits["max_texture_decoded_bytes"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise WorkerContractError("pinned capabilities do not declare sprite sampling limits") from error
+    if not math.isfinite(period) or period <= 0:
+        raise WorkerContractError("SkinDoc period_ms must be positive for sprite sampling")
+    if float(asset.desired_fps) > max_fps:
+        raise WorkerContractError(f"sheet desired_fps {asset.desired_fps:g} exceeds pinned renderer limit {max_fps:g}")
+    width_px = asset.natural_length_cells * asset.texels_per_cell
+    decoded_per_row = width_px * asset.texels_per_cell * 4
+    bounded_rows = min(
+        max_rows,
+        max_dimension // asset.texels_per_cell,
+        max_decoded // decoded_per_row,
+    )
+    if bounded_rows < 2:
+        raise WorkerContractError("pinned image limits cannot hold a two-frame sprite sheet")
+    requested_rows = max(2, math.ceil(period * float(asset.desired_fps) / 1_000))
+    return min(requested_rows, bounded_rows)
+
+
+def validate_plan_resource_limits(
+    plan: Any,
+    capabilities: dict[str, Any],
+    *,
+    period_ms: Any | None = None,
+) -> None:
     """Reject dangerous image geometry before a provider call or allocation."""
 
     assets = plan.asset_plan
@@ -123,6 +164,13 @@ def validate_plan_resource_limits(plan: Any, capabilities: dict[str, Any]) -> No
         height = rows * asset.texels_per_cell
         if asset.kind == "sheet" and rows > max_rows:
             raise WorkerContractError(f"asset {index} has {rows} frame rows; pinned limit is {max_rows}")
+        if asset.kind == "sheet" and period_ms is not None:
+            derived = effective_sheet_frame_rows(asset, period_ms, capabilities)
+            if rows != derived:
+                raise WorkerContractError(
+                    f"asset {index} declares {rows} frame rows; desired_fps={asset.desired_fps:g} "
+                    f"and period_ms={float(period_ms):g} derive {derived}"
+                )
         if width > max_dimension or height > max_dimension:
             raise WorkerContractError(
                 f"asset {index} grid is {width}x{height}px; pinned per-axis limit is {max_dimension}px"

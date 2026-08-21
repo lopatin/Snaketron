@@ -17,6 +17,7 @@ from snaketron_factory.domain import (
     Disposition,
     GateResult,
     GateVerdict,
+    OperationStatus,
     Purpose,
     Stage,
 )
@@ -24,6 +25,7 @@ from snaketron_factory.environment import load_service_environment
 from snaketron_factory.factory import Factory
 from snaketron_factory.gallery import create_app
 from snaketron_factory.objects import ObjectStore
+from snaketron_factory.operations import OperationJournal
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -200,6 +202,18 @@ def test_exact_prototype_approval_rejects_wrong_hash(tmp_path: Path, monkeypatch
             data=form,
         )
         assert wrong.status_code == 409
+        labeled = client.post(
+            "/actions/label",
+            headers={**headers(), "accept": "application/json"},
+            data={
+                "attempt_id": attempt["id"],
+                "artifact_id": artifact["id"],
+                "kind": "prototype_label",
+                "outcome": "accept",
+                "feedback": "blind first",
+            },
+        )
+        assert labeled.status_code == 200
         form["content_hash"] = artifact["content_hash"]
         accepted = client.post(
             "/actions/approve-prototype",
@@ -414,7 +428,8 @@ def test_run_once_rejects_configured_or_actor_human_authority(tmp_path: Path, mo
 
 
 def test_cli_status_backup_and_command_surface(tmp_path: Path) -> None:
-    config = make_config(tmp_path)
+    factory, _attempt, artifact, _image = seeded_factory(tmp_path)
+    config = factory.config
     # The command uses the checked-in behavior files but a test DB is supplied
     # through a minimal copied config.
     raw = config.model_dump(mode="json", exclude={"source_path", "version_sha256"})
@@ -425,7 +440,14 @@ def test_cli_status_backup_and_command_surface(tmp_path: Path) -> None:
     runner = CliRunner()
     status_result = runner.invoke(app, ["status", "--config", str(generated), "--json"])
     assert status_result.exit_code == 0, status_result.output
-    assert json.loads(status_result.stdout)["ok"] is True
+    status = json.loads(status_result.stdout)
+    assert status["ok"] is True
+    assert status["program"] == {
+        "published_concepts": 0,
+        "target_published_skins": 100,
+        "target_reached": False,
+    }
+    assert status["generation_halt"] is None
 
     backup_target = tmp_path / "backup"
     backup_result = runner.invoke(
@@ -441,7 +463,29 @@ def test_cli_status_backup_and_command_surface(tmp_path: Path) -> None:
     )
     assert backup_result.exit_code == 0, backup_result.output
     assert (backup_target / "factory.sqlite3").is_file()
-    assert json.loads((backup_target / "manifest.json").read_text())["version"] == 1
+    manifest = json.loads((backup_target / "manifest.json").read_text())
+    assert manifest["version"] == 2
+    assert manifest["referenced_object_count"] >= 1
+    assert manifest["objects_sha256"]
+
+    verified = runner.invoke(
+        app,
+        ["verify-backup", "--source", str(backup_target), "--json"],
+    )
+    assert verified.exit_code == 0, verified.output
+    assert json.loads(verified.stdout)["ok"] is True
+
+    # An omitted DB-referenced object is detected by both the signed inventory
+    # and the restored database authority graph, even when totals could be
+    # forged to look superficially plausible.
+    digest = artifact["object_ref"].removeprefix("sha256:")
+    (backup_target / "objects/sha256" / digest[:2] / digest).unlink()
+    corrupt = runner.invoke(
+        app,
+        ["verify-backup", "--source", str(backup_target), "--json"],
+    )
+    assert corrupt.exit_code == 1
+    assert "inventory differs" in corrupt.output or "missing" in corrupt.output
 
     help_result = runner.invoke(app, ["--help"])
     for command in (
@@ -454,7 +498,125 @@ def test_cli_status_backup_and_command_surface(tmp_path: Path) -> None:
         "bulk-retry",
         "publish",
         "resolve-operation",
+        "resume-generation",
         "optimize",
         "backup",
+        "verify-backup",
+        "readiness-pin",
     ):
         assert command in help_result.output
+
+
+def test_manual_optimizer_cannot_overlap_the_scheduled_production_lease(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    raw = config.model_dump(mode="json", exclude={"source_path", "version_sha256"})
+    generated = tmp_path / "factory.yaml"
+    generated.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    database = Database(config.paths.database)
+    database.migrate()
+    token = database.acquire_lease("production", "service:scheduled-run", 60)
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                "optimize",
+                "--if-ready",
+                "--target",
+                "authoring-playbook",
+                "--config",
+                str(generated),
+                "--json",
+            ],
+        )
+    finally:
+        database.release_lease("production", token)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stderr)
+    assert payload["ok"] is False
+    assert payload["error"] == "LeaseBusy"
+    assert "production" in payload["detail"]
+
+
+def test_cli_recovery_validates_exact_payload_and_model_before_database_success(tmp_path: Path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    raw = config.model_dump(mode="json", exclude={"source_path", "version_sha256"})
+    generated = tmp_path / "factory.yaml"
+    generated.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    database = Database(config.paths.database)
+    database.migrate()
+    concept = database.create_concept(
+        name="Recovery boundary",
+        brief="A retained control record for authenticated recovery validation.",
+        seed="recovery",
+        source="test",
+        tags=["recovery"],
+    )
+    attempt = database.create_attempt(
+        concept_id=concept["id"],
+        purpose=Purpose.PRODUCTION,
+        stage=Stage.CONCEPT,
+        idempotency_key=f"recovery:{concept['id']}",
+        behavior={},
+        direction_sha="direction",
+        skill_sha="skill",
+        capability_sha="capability",
+        gate_sha="gates",
+        model_config_sha="models",
+    )
+    objects = ObjectStore(config.paths.objects)
+    request = {"probe": "CLI recovery"}
+    retained_request = objects.put(OperationJournal.request_payload(request))
+    operation, _ = database.begin_operation(
+        attempt_id=attempt["id"],
+        stage=Stage.CONCEPT,
+        idempotency_key="cli-recovery",
+        side_effect="generic_structured_probe",
+        provider_role="smart_text",
+        request_hash=OperationJournal.request_hash(request),
+        cost_reserved_micros=10,
+        metadata={
+            "request_ref": retained_request.uri,
+            "request_sha256": retained_request.sha256,
+        },
+    )
+    database.transition_operation(
+        operation["id"],
+        OperationStatus.INTENT,
+        OperationStatus.RECONCILIATION_REQUIRED,
+    )
+    invalid = objects.put(b"not-json")
+    valid = objects.put(b'{"recovered":true}')
+    monkeypatch.setenv(config.review.operator_secret_env, "test-review-secret-at-least-16")
+
+    def resolve(result_hash: str, model: str):
+        return CliRunner().invoke(
+            app,
+            [
+                "resolve-operation",
+                operation["id"],
+                "--resolution",
+                "executed_result_recovered",
+                "--evidence-ref",
+                "provider:audit:cli",
+                "--result-hash",
+                result_hash,
+                "--resolved-model",
+                model,
+                "--actor",
+                "human:operator",
+                "--config",
+                str(generated),
+                "--json",
+            ],
+        )
+
+    bad_payload = resolve(invalid.uri, "gemini-3.7-flash")
+    assert bad_payload.exit_code == 1
+    assert database.get_operation(operation["id"])["status"] == OperationStatus.RECONCILIATION_REQUIRED
+    bad_model = resolve(valid.uri, "unapproved-fallback")
+    assert bad_model.exit_code == 1
+    assert database.get_operation(operation["id"])["status"] == OperationStatus.RECONCILIATION_REQUIRED
+    accepted = resolve(valid.uri, "gemini-3.7-flash")
+    assert accepted.exit_code == 0, accepted.output
+    assert database.get_operation(operation["id"])["status"] == OperationStatus.SUCCEEDED

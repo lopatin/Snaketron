@@ -89,6 +89,7 @@ class OperationStatus(StrEnum):
 
 class ProviderFailureKind(StrEnum):
     REFUSAL = "refusal"
+    AUTHENTICATION = "authentication"
     UNAVAILABLE = "unavailable"
     TIMEOUT = "timeout"
     QUOTA = "quota"
@@ -114,6 +115,7 @@ class AssetPlan(StrictModel):
     # manifest before any provider spend or image allocation.
     natural_length_cells: int = Field(ge=1, le=128)
     frames: int = Field(ge=1, le=120)
+    desired_fps: float | None = Field(default=None, ge=1, le=120)
     texels_per_cell: int = Field(default=16, ge=4, le=128)
     anchor: Literal["whole", "head", "tail"] = "whole"
     fit: Literal["tile", "clip", "stretch", "cutout"] = "clip"
@@ -124,8 +126,12 @@ class AssetPlan(StrictModel):
     def sheet_has_shape(self) -> AssetPlan:
         if self.kind == "sheet" and self.frames < 2:
             raise ValueError("sheet assets require at least two independent frame rows")
+        if self.kind == "sheet" and self.desired_fps is None:
+            raise ValueError("sheet assets require a desired_fps used to derive frame rows")
         if self.kind != "sheet" and self.frames != 1:
             raise ValueError("static coat and overlay assets require exactly one frame")
+        if self.kind != "sheet" and self.desired_fps is not None:
+            raise ValueError("static coat and overlay assets cannot declare desired_fps")
         required_tpc = 16 if self.kind == "sheet" else 64
         if self.texels_per_cell != required_tpc:
             raise ValueError(f"{self.kind} requires {required_tpc} texels_per_cell in the current forge ladder")
@@ -203,7 +209,7 @@ class WorkerResult(StrictModel):
     skin_document: dict[str, Any]
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     trace: list[dict[str, Any]] = Field(default_factory=list)
-    usage: dict[str, int | float] = Field(default_factory=dict)
+    usage: dict[str, bool | int | float] = Field(default_factory=dict)
     failure: dict[str, Any] | None = None
 
 
@@ -212,7 +218,7 @@ class ProviderResult(StrictModel):
     request_id: str | None = None
     resolved_model: str
     sanitized_metadata: dict[str, Any] = Field(default_factory=dict)
-    usage: dict[str, int | float] = Field(default_factory=dict)
+    usage: dict[str, bool | int | float] = Field(default_factory=dict)
 
 
 class ProviderError(RuntimeError):
@@ -223,11 +229,15 @@ class ProviderError(RuntimeError):
         *,
         outcome_known: bool = True,
         request_id: str | None = None,
+        resolved_model: str | None = None,
+        halt_generation: bool = False,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         self.outcome_known = outcome_known
         self.request_id = request_id
+        self.resolved_model = resolved_model
+        self.halt_generation = halt_generation
 
 
 class GateResult(StrictModel):
@@ -247,6 +257,15 @@ class VisualJudgment(StrictModel):
     role_clarity: float = Field(ge=0, le=1)
     animation_quality: float = Field(ge=0, le=1)
     craft: float = Field(ge=0, le=1)
+    review_flags: list[
+        Literal[
+            "protected_mark",
+            "public_figure_likeness",
+            "unsafe_content",
+            "unlicensed_reference",
+            "other",
+        ]
+    ] = Field(default_factory=list)
 
 
 class ConceptProposal(StrictModel):
@@ -258,6 +277,9 @@ class ConceptProposal(StrictModel):
     motion_intent: str
     implementation_hint: Literal["layers", "texture", "sprite_sheet", "hybrid"]
     implementation_rationale: str
+    novelty_score: float = Field(ge=0, le=1)
+    direction_score: float = Field(ge=0, le=1)
+    novelty_rationale: str = Field(min_length=10, max_length=1_000)
 
 
 class DoctorCheck(StrictModel):

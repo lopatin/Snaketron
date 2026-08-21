@@ -51,10 +51,10 @@ def _config(tmp_path: Path, *, mode: str = "production") -> FactoryConfig:
 
 def _attempt(db: Database) -> dict[str, object]:
     concept = db.create_concept(name="calibration", brief="calibration fixture", seed="1", source="test", tags=[])
-    return db.create_attempt(
+    attempt = db.create_attempt(
         concept_id=concept["id"],
         purpose=Purpose.PRODUCTION,
-        stage=Stage.PROTOTYPE_TRIAGE,
+        stage=Stage.PROTOTYPE_REVIEW,
         idempotency_key="calibration-attempt",
         behavior={},
         direction_sha="d",
@@ -62,6 +62,12 @@ def _attempt(db: Database) -> dict[str, object]:
         capability_sha="c",
         gate_sha="g",
         model_config_sha="m",
+    )
+    return db.update_attempt(
+        attempt["id"],
+        attempt["version"],
+        disposition=Disposition.NEEDS_HUMAN,
+        review_kind="prototype",
     )
 
 
@@ -97,16 +103,22 @@ def _labeled_evaluation(
         ),
         hidden_until_label=True,
     )
-    db.add_human_decision(
-        artifact_id=artifact["id"],
-        attempt_id=str(attempt["id"]),
-        action="prototype_label",
-        feedback="independent blind label",
-        tags=[f"outcome:{'accept' if human_accepts else 'reject'}"],
-        actor=actor,
-        attempt_version=int(attempt["version"]),
-        content_hash=digest,
-    )
+    label = {
+        "artifact_id": artifact["id"],
+        "attempt_id": str(attempt["id"]),
+        "action": "prototype_label",
+        "feedback": "independent blind label",
+        "tags": [f"outcome:{'accept' if human_accepts else 'reject'}"],
+        "actor": actor,
+        "content_hash": digest,
+    }
+    if actor.startswith("human:"):
+        db.add_blind_human_label(**label)
+    else:
+        db.add_human_decision(
+            **label,
+            attempt_version=int(attempt["version"]),
+        )
     return artifact
 
 
@@ -189,22 +201,69 @@ def test_blind_reveal_and_calibration_are_per_artifact_and_use_first_label(tmp_p
     assert [row["artifact_id"] for row in visible] == [first["id"]]
     assert db.has_hidden_unlabeled_evaluations(str(attempt["id"]))
 
-    # A second opinion is retained but is no longer a blind label, so it does
-    # not replace or duplicate the first calibration sample.
-    db.add_human_decision(
-        artifact_id=str(first["id"]),
-        attempt_id=str(attempt["id"]),
-        action="prototype_label",
-        feedback="later non-blind disagreement",
-        tags=["outcome:reject"],
-        actor="human:second-reviewer",
-        attempt_version=int(attempt["version"]),
-        content_hash=str(first["content_hash"]),
-    )
+    # A later, now-unblinded opinion cannot become a second label for the
+    # artifact or replace its first calibration authority.
+    with pytest.raises(VersionConflict, match="already exists"):
+        db.add_human_decision(
+            artifact_id=str(first["id"]),
+            attempt_id=str(attempt["id"]),
+            action="prototype_label",
+            feedback="later non-blind disagreement",
+            tags=["outcome:reject"],
+            actor="human:second-reviewer",
+            attempt_version=int(attempt["version"]),
+            content_hash=str(first["content_hash"]),
+        )
     metrics = JudgeCalibrationService(db, config).refresh("prototype")
     assert metrics.sample_size == 1
     assert metrics.true_positive == 1
     assert metrics.false_positive == 0
+
+
+def test_calibration_ignores_human_rows_without_transactional_blind_authority(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    db = Database(config.paths.database)
+    db.migrate()
+    attempt = _attempt(db)
+    digest = hashlib.sha256(b"prejudged-label-order").hexdigest()
+    artifact = db.add_artifact(
+        attempt_id=str(attempt["id"]),
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        content_hash=digest,
+        object_ref=f"sha256:{digest}",
+        media_type="image/png",
+        size_bytes=1,
+    )
+    # This immutable legacy/direct row was written before there was any judge
+    # evidence. A later hidden evaluation must not retroactively make it blind
+    # or eligible optimizer/calibration ground truth.
+    db.add_human_decision(
+        artifact_id=artifact["id"],
+        attempt_id=str(attempt["id"]),
+        action="prototype_label",
+        feedback="saw no judge result, but arrived too early",
+        tags=["outcome:accept"],
+        actor="human:legacy",
+        attempt_version=int(attempt["version"]),
+        content_hash=digest,
+    )
+    db.add_evaluation(
+        artifact_id=artifact["id"],
+        attempt_id=str(attempt["id"]),
+        evaluator="visual_judge",
+        result=GateResult(
+            gate="visual_fidelity",
+            gate_version=PROTOTYPE_EVALUATOR_VERSION,
+            blocking=False,
+            verdict=GateVerdict.CANDIDATE,
+        ),
+        hidden_until_label=True,
+    )
+
+    metrics = JudgeCalibrationService(db, config).refresh("prototype")
+    assert metrics.sample_size == 0
+    assert db.evaluations_for_attempt(str(attempt["id"])) == []
 
 
 def test_production_routing_requires_current_low_reversal_calibration(tmp_path: Path) -> None:
@@ -238,6 +297,43 @@ def test_production_routing_requires_current_low_reversal_calibration(tmp_path: 
     )
     assert not changed.enabled
     assert "evaluator_version_changed" in changed.reasons
+
+
+def test_current_dated_gemini_evaluator_is_authoritative_over_configured_alias(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    db = Database(config.paths.database)
+    db.migrate()
+    attempt = _attempt(db)
+    dated = judge_evaluator_version(
+        config,
+        "prototype",
+        resolved_model="gemini-3.7-flash-20260801",
+    )
+    for index in range(40):
+        _labeled_evaluation(
+            db,
+            attempt,
+            index,
+            verdict=GateVerdict.CANDIDATE,
+            human_accepts=True,
+            evaluator_version=dated,
+        )
+    for index in range(40, 80):
+        _labeled_evaluation(
+            db,
+            attempt,
+            index,
+            verdict=GateVerdict.MACHINE_REJECTED,
+            human_accepts=False,
+            evaluator_version=dated,
+        )
+    service = JudgeCalibrationService(db, config)
+    report = service.refresh_all()
+
+    assert service.active_evaluator_version("prototype") == dated
+    assert report["prototype"]["active_evaluator_version"] == dated
+    assert report["prototype"]["evaluator_version"] == dated
+    assert service.quality_status("prototype").enabled
 
 
 def test_production_routing_falls_back_to_shadow_on_sample_or_reversal_bound(tmp_path: Path) -> None:

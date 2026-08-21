@@ -11,7 +11,8 @@ credentials.
 - `prototype-review-detail.png` shows an exact retained prototype, its content
   hash/provenance, and blind-evaluation protection before a human label.
 - `soft-triage-override.png` shows a retained machine-rejected prototype and
-  the exact-artifact human override that can route it back to prototype review.
+  the exact-artifact human override, feedback-only annotation, re-evaluation,
+  and linked-retry actions.
 
 Regenerate from `skin-factory/` with:
 
@@ -26,8 +27,8 @@ losslessly recompresses the PNGs with Pillow.
 The final PR #90 captures reproduced byte-for-byte on two consecutive runs:
 
 ```text
-1c85fbf47af220709f750487ff2e161c2e82b5a8f0232bfb19607d4a73cb87c6  gallery-all.png
-fccd940022ba246aac3087cb2d86cfd052e59ec5505bf3f1b34e83326327a599  gallery-machine-rejected.png
+d190532f193712f69b42893a746781f0383a3b36564671ce8016c2da1c996a72  gallery-all.png
+7e275adf5a757ea074dd443767c0cce6f4fb85e4ee3460d2659f6316a99e58a3  gallery-machine-rejected.png
 2c54a1beebc23d837a09da5e03ad6578fbfebc80706cc55c16815d7934322d79  prototype-review-detail.png
-b4bf591ecfbb12618e800761fc91098b7c0fc30dd762c22f220c41414bd8ef70  soft-triage-override.png
+c6f154fd49a822bdc6122043bf7c9561c234890681977a86d212359d07edf593  soft-triage-override.png
 ```

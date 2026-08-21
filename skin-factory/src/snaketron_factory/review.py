@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from .db import Database, VersionConflict, canonical_json
 from .domain import (
@@ -19,6 +19,7 @@ from .domain import (
 )
 from .operations import ExistingOperation, OperationJournal
 from .persistence import ResultPersistence
+from .recovery import validate_skin_authority_readback
 from .snaketron_api import SnaketronApi
 
 
@@ -31,6 +32,7 @@ class ReviewService:
         persistence: ResultPersistence,
         behavior_snapshot: Callable[[], dict[str, Any]],
         provider_retries: int = 2,
+        mode: Literal["shadow", "production"] = "production",
     ) -> None:
         if provider_retries < 0:
             raise ValueError("provider_retries must be non-negative")
@@ -40,6 +42,7 @@ class ReviewService:
         self.persistence = persistence
         self.behavior_snapshot = behavior_snapshot
         self.provider_retries = provider_retries
+        self.mode = mode
 
     @staticmethod
     def _child_request_key(
@@ -78,14 +81,16 @@ class ReviewService:
         """Run one exact review effect with bounded, durable safe retries."""
 
         safe_failures = {
+            ProviderFailureKind.AUTHENTICATION,
             ProviderFailureKind.TIMEOUT,
             ProviderFailureKind.UNAVAILABLE,
             ProviderFailureKind.QUOTA,
         }
         request_hash = self.journal.request_hash(request)
+        request_object = self.persistence.objects.put(self.journal.request_payload(request))
 
         async def run(key: str) -> tuple[dict[str, Any], Any]:
-            return await self.journal.run_provider(
+            operation, result = await self.journal.run_provider(
                 attempt_id=attempt_id,
                 stage=stage,
                 idempotency_key=key,
@@ -95,10 +100,93 @@ class ReviewService:
                 reserve_micros=0,
                 invoke=invoke,
                 persist_result=self.persistence,
+                metadata={
+                    "request_ref": request_object.uri,
+                    "request_sha256": request_object.sha256,
+                },
             )
+            metadata = json.loads(operation.get("metadata_json") or "{}")
+            if result is None and isinstance(metadata, dict) and isinstance(metadata.get("recovery"), dict):
+                skin_id = request.get("skin_id")
+                if skin_id is None:
+                    raise ValueError(f"recovered {side_effect} operation omitted exact skin_id authority")
+                authority = await self.api.get_skin_authority(skin_id, operator=True)
+                try:
+                    validate_skin_authority_readback(
+                        side_effect=side_effect,
+                        request=request,
+                        authority=authority.value,
+                    )
+                except ValueError as error:
+                    metadata["recovery_validation"] = {
+                        "status": "failed_terminal",
+                        "message": str(error),
+                        "result_hash": operation.get("result_hash"),
+                        "authority": "authenticated_snaketron_readback",
+                    }
+                    self.database.transition_operation(
+                        operation["id"],
+                        OperationStatus.SUCCEEDED,
+                        OperationStatus.FAILED_TERMINAL,
+                        retry_class="terminal",
+                        metadata_json=metadata,
+                        failure_json={
+                            "kind": ProviderFailureKind.INVALID_OUTPUT,
+                            "message": str(error),
+                            "quarantined_result_hash": operation.get("result_hash"),
+                            "operator_action": "reconcile the exact Snaketron revision/request state",
+                        },
+                    )
+                    raise ProviderError(
+                        ProviderFailureKind.INVALID_OUTPUT,
+                        f"recovered {side_effect} failed authenticated Snaketron readback: {error}",
+                        request_id=authority.request_id,
+                        resolved_model=authority.resolved_model,
+                    ) from error
+            return operation, result
+
+        # A 401/403 is known not to have executed. Preserve the failed bounded
+        # chain, but let a later *human action* after credential refresh open a
+        # new audited reauthentication epoch for the same immutable request.
+        # Other terminal/exhausted failures remain closed.
+        epoch = 0
+        while True:
+            prefix = base_key if epoch == 0 else f"{base_key}:reauth:{epoch}"
+            keys = [prefix, *(f"{prefix}:retry:{retry}" for retry in range(1, self.provider_retries + 1))]
+            with self.database.connect() as connection:
+                rows = connection.execute(
+                    f"SELECT * FROM operation WHERE idempotency_key IN ({','.join('?' for _ in keys)})",
+                    keys,
+                ).fetchall()
+            existing_by_key = {str(row["idempotency_key"]): dict(row) for row in rows}
+            success = next(
+                (
+                    operation
+                    for operation in existing_by_key.values()
+                    if operation["status"] == OperationStatus.SUCCEEDED and operation["request_hash"] == request_hash
+                ),
+                None,
+            )
+            if success is not None:
+                return await run(str(success["idempotency_key"]))
+            if len(existing_by_key) != len(keys):
+                break
+            authentication_chain = True
+            for operation in existing_by_key.values():
+                try:
+                    failure = json.loads(operation.get("failure_json") or "{}")
+                except json.JSONDecodeError:
+                    failure = {}
+                authentication_chain = authentication_chain and (
+                    operation["status"] == OperationStatus.FAILED_RETRYABLE
+                    and failure.get("kind") == ProviderFailureKind.AUTHENTICATION
+                )
+            if not authentication_chain:
+                break
+            epoch += 1
 
         for retry in range(self.provider_retries + 1):
-            key = base_key if retry == 0 else f"{base_key}:retry:{retry}"
+            key = prefix if retry == 0 else f"{prefix}:retry:{retry}"
             with self.database.connect() as connection:
                 row = connection.execute("SELECT * FROM operation WHERE idempotency_key=?", (key,)).fetchone()
             existing = dict(row) if row is not None else None
@@ -128,6 +216,120 @@ class ReviewService:
         if not actor.startswith("human:") or not actor.removeprefix("human:").strip():
             raise PermissionError("this transition requires an authenticated human actor")
 
+    async def _cancel_final_review_request(
+        self,
+        attempt: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Close one exact server review request before forking its Attempt.
+
+        Production Attempts in final review own a server-side pending revision.
+        A retry/re-evaluation must release that authority before its child can
+        eventually request a different exact revision. The same journal key is
+        shared with rejection, so known success, 401 reauthentication epochs,
+        and authenticated unknown-outcome recovery remain idempotent.
+        """
+
+        if attempt["stage"] != Stage.FINAL_REVIEW or attempt["purpose"] != Purpose.PRODUCTION:
+            return attempt, None
+        skin_id = attempt["production_skin_id"]
+        revision = attempt["production_revision"]
+        content_hash = attempt["production_content_hash"]
+        if not skin_id or not revision or not content_hash:
+            raise VersionConflict("final review child requires the exact registered revision authority")
+        request = {
+            "skin_id": skin_id,
+            "revision": int(revision),
+            "content_ref": content_hash,
+        }
+        operation, _ = await self._journaled_call(
+            attempt_id=attempt["id"],
+            stage=Stage.FINAL_REVIEW,
+            base_key=(f"cancel-publish-request:{attempt['id']}:{skin_id}:{revision}:{content_hash}"),
+            side_effect="cancel_exact_publication_request",
+            request=request,
+            invoke=lambda: self.api.cancel_publication_request_exact(
+                skin_id=skin_id,
+                revision=int(revision),
+                content_ref=content_hash,
+            ),
+        )
+        current = self.database.get_attempt(attempt["id"])
+        stable_fields = (
+            "stage",
+            "purpose",
+            "disposition",
+            "review_kind",
+            "production_skin_id",
+            "production_revision",
+            "production_content_hash",
+            "approved_prototype_hash",
+            "prototype_decision_id",
+        )
+        if any(str(current.get(field)) != str(attempt.get(field)) for field in stable_fields):
+            raise VersionConflict("final review changed while cancelling its exact server request")
+        return current, operation
+
+    def _assert_no_blocking_failure(self, attempt_id: str, artifact_id: str | None = None) -> None:
+        failures = [
+            evaluation
+            for evaluation in self.database.evaluations_for_attempt(attempt_id, reveal=True)
+            if bool(evaluation["blocking"])
+            and evaluation["verdict"] == "fail"
+            and (artifact_id is None or evaluation["artifact_id"] == artifact_id)
+        ]
+        if failures:
+            gates = sorted({str(evaluation["gate_name"]) for evaluation in failures})
+            raise PermissionError("blocking gates cannot be overridden or published: " + ", ".join(gates))
+
+    def _assert_publication_authority_has_no_blocking_failure(self, attempt: dict[str, Any]) -> None:
+        """Check only artifacts that authorize this exact immutable revision.
+
+        Failed prototype siblings and failed asset generations stay retained,
+        but cannot poison a later selected prototype or accepted regeneration.
+        The exact selected prototype, registered document, and current render
+        evidence remain non-overrideable.
+        """
+
+        lineage: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = attempt
+        seen: set[str] = set()
+        while current is not None and current["id"] not in seen:
+            lineage.append(current)
+            seen.add(current["id"])
+            parent_id = current.get("parent_attempt_id")
+            current = self.database.get_attempt(parent_id) if parent_id else None
+
+        authoritative: set[str] = set()
+        for lineage_attempt in lineage:
+            for artifact in self.database.artifacts_for_attempt(lineage_attempt["id"]):
+                if artifact["kind"] == ArtifactKind.PROTOTYPE and artifact["content_hash"] == attempt.get(
+                    "approved_prototype_hash"
+                ):
+                    authoritative.add(artifact["id"])
+                if artifact["kind"] == ArtifactKind.SKIN_DOCUMENT and artifact["content_hash"] == attempt.get(
+                    "production_content_hash"
+                ):
+                    authoritative.add(artifact["id"])
+        # Final browser evidence is produced on the publishing Attempt. Older
+        # retry renders in ancestors are historical, not publication inputs.
+        for kind in (ArtifactKind.CONTACT_SHEET, ArtifactKind.ANIMATION_CAPTURE):
+            artifacts = self.database.artifacts_for_attempt(attempt["id"], kind=kind)
+            if artifacts:
+                authoritative.add(artifacts[-1]["id"])
+
+        failures: list[dict[str, Any]] = []
+        for lineage_attempt in lineage:
+            failures.extend(
+                evaluation
+                for evaluation in self.database.evaluations_for_attempt(lineage_attempt["id"], reveal=True)
+                if evaluation["artifact_id"] in authoritative
+                and bool(evaluation["blocking"])
+                and evaluation["verdict"] == "fail"
+            )
+        if failures:
+            gates = sorted({str(evaluation["gate_name"]) for evaluation in failures})
+            raise PermissionError("blocking gates cannot be overridden or published: " + ", ".join(gates))
+
     def label(
         self,
         *,
@@ -144,7 +346,6 @@ class ReviewService:
             raise ValueError("labels are prototype_label or build_quality_label")
         if outcome not in {"accept", "reject"}:
             raise ValueError("blind-label outcome must be accept or reject")
-        attempt = self.database.get_attempt(attempt_id)
         artifact = self.database.get_artifact(artifact_id)
         if artifact["attempt_id"] != attempt_id:
             raise VersionConflict("label artifact does not belong to attempt")
@@ -154,7 +355,7 @@ class ReviewService:
         }[kind]
         if artifact["kind"] != expected_kind:
             raise ValueError(f"{kind} must label a retained {expected_kind} artifact")
-        return self.database.add_human_decision(
+        return self.database.add_blind_human_label(
             artifact_id=artifact_id,
             attempt_id=attempt_id,
             action=kind,
@@ -164,9 +365,40 @@ class ReviewService:
                 f"outcome:{outcome}",
             ],
             actor=actor,
-            attempt_version=attempt["version"],
             content_hash=artifact["content_hash"],
         )
+
+    def _assert_blind_prototype_label(self, artifact_id: str) -> None:
+        if not self.database.has_hidden_visual_evaluation(artifact_id):
+            return
+        if (
+            self.database.authoritative_blind_label(
+                artifact_id=artifact_id,
+                action="prototype_label",
+            )
+            is None
+        ):
+            raise VersionConflict(
+                "prototype approval requires one blind label bound to its hidden visual_judge evaluation"
+            )
+
+    def _assert_blind_build_label(self, attempt_id: str) -> None:
+        contact_sheets = self.database.artifacts_for_attempt(attempt_id, kind=ArtifactKind.CONTACT_SHEET)
+        if not contact_sheets:
+            return
+        contact_sheet = contact_sheets[-1]
+        if not self.database.has_hidden_visual_evaluation(contact_sheet["id"]):
+            return
+        if (
+            self.database.authoritative_blind_label(
+                artifact_id=contact_sheet["id"],
+                action="build_quality_label",
+            )
+            is None
+        ):
+            raise VersionConflict(
+                "publication requires one blind label bound to the exact contact sheet's hidden visual_judge evaluation"
+            )
 
     def approve_prototype(
         self,
@@ -186,6 +418,8 @@ class ReviewService:
             raise VersionConflict("approval must name a prototype from the exact attempt")
         if artifact["content_hash"] != content_hash:
             raise VersionConflict("prototype approval hash differs from retained bytes")
+        self._assert_no_blocking_failure(attempt_id, artifact_id)
+        self._assert_blind_prototype_label(artifact_id)
         existing = self.database.find_exact_decision(
             attempt_id=attempt_id,
             action="prototype_approval",
@@ -249,6 +483,7 @@ class ReviewService:
         artifact = self.database.get_artifact(artifact_id)
         if artifact["attempt_id"] != attempt_id or artifact["kind"] != expected[0]:
             raise VersionConflict(f"triage override must name the exact {expected[0]} from this attempt")
+        self._assert_no_blocking_failure(attempt_id, artifact_id)
         existing = self.database.find_exact_decision(
             attempt_id=attempt_id,
             action="soft_triage_override",
@@ -403,7 +638,53 @@ class ReviewService:
             result["operation"] = operation
         return result
 
-    def retry(
+    def annotate_reject(
+        self,
+        *,
+        attempt_id: str,
+        artifact_id: str,
+        content_hash: str,
+        feedback: str,
+        tags: Sequence[str],
+        actor: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach literal feedback to exact retained reject bytes without changing state."""
+
+        self._human(actor)
+        attempt = self.database.get_attempt(attempt_id)
+        if attempt["purpose"] != Purpose.PRODUCTION:
+            raise PermissionError("optimizer and technique artifacts cannot receive production annotations")
+        if attempt["disposition"] not in {Disposition.MACHINE_REJECTED, Disposition.HUMAN_REJECTED}:
+            raise VersionConflict("feedback-only annotation requires a retained machine or human reject")
+        if not feedback.strip():
+            raise ValueError("feedback-only annotation requires nonempty literal feedback")
+        artifact = self.database.get_artifact(artifact_id)
+        if artifact["attempt_id"] != attempt_id:
+            raise VersionConflict("annotation artifact does not belong to attempt")
+        if artifact["content_hash"] != content_hash:
+            raise VersionConflict("annotation content hash does not name the exact retained artifact")
+        request_key = self._child_request_key(
+            action="feedback_only",
+            actor=actor,
+            parent_attempt_id=attempt_id,
+            exact_input={"artifact_id": artifact_id, "content_hash": content_hash},
+            idempotency_key=idempotency_key,
+        )
+        decision = self.database.add_human_decision(
+            artifact_id=artifact_id,
+            attempt_id=attempt_id,
+            action="feedback_only",
+            feedback=feedback,
+            tags=tags,
+            actor=actor,
+            attempt_version=attempt["version"],
+            content_hash=content_hash,
+            idempotency_key=f"review-decision:{request_key}",
+        )
+        return {"decision": decision, "attempt": self.database.get_attempt(attempt_id)}
+
+    async def retry(
         self,
         *,
         attempt_id: str,
@@ -438,6 +719,7 @@ class ReviewService:
             idempotency_key=idempotency_key,
         )
         snapshot = self.behavior_snapshot()
+        parent, cancellation = await self._cancel_final_review_request(parent)
         decision, child, linked = self.database.create_review_child(
             parent_attempt_id=attempt_id,
             expected_parent_version=parent["version"],
@@ -461,9 +743,32 @@ class ReviewService:
             prototype_decision_id=approval_id,
         )
         assert linked is None
-        return {"decision": decision, "attempt": child}
+        result = {"decision": decision, "attempt": child}
+        if cancellation is not None:
+            result["operation"] = cancellation
+        return result
 
-    def re_evaluate(
+    def _asset_re_evaluation_source(
+        self,
+        *,
+        attempt_id: str,
+        artifact: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Validate and preserve the exact artifact selected by the human."""
+
+        del attempt_id
+        metadata = json.loads(artifact["metadata_json"])
+        asset_index = metadata.get("asset_index")
+        if not isinstance(asset_index, int) or asset_index < 0:
+            raise VersionConflict("asset re-evaluation artifact has no valid asset index")
+        return artifact, {
+            **metadata,
+            "asset_index": asset_index,
+            "re_evaluation_requested_artifact_id": artifact["id"],
+            "re_evaluation_requested_kind": artifact["kind"],
+        }
+
+    async def re_evaluate(
         self,
         *,
         attempt_id: str,
@@ -478,6 +783,7 @@ class ReviewService:
         if artifact["attempt_id"] != attempt_id:
             raise VersionConflict("re-evaluation artifact must belong to the named attempt")
         evaluation_artifact = artifact
+        asset_metadata: dict[str, Any] | None = None
         if artifact["kind"] == ArtifactKind.PROTOTYPE_MANIFEST:
             metadata = json.loads(artifact["metadata_json"])
             image_artifact_id = metadata.get("image_artifact_id")
@@ -494,6 +800,16 @@ class ReviewService:
             stage = Stage.BUILD_GATE
         elif artifact["kind"] in {ArtifactKind.CONTACT_SHEET, ArtifactKind.ANIMATION_CAPTURE}:
             stage = Stage.BUILD_TRIAGE
+        elif artifact["kind"] in {
+            ArtifactKind.SOURCE_ASSET,
+            ArtifactKind.FORGE_MANIFEST,
+            ArtifactKind.TEXTURE_VARIANT,
+        }:
+            evaluation_artifact, asset_metadata = self._asset_re_evaluation_source(
+                attempt_id=attempt_id,
+                artifact=artifact,
+            )
+            stage = Stage.ASSETS
         else:
             raise ValueError(f"artifact kind {artifact['kind']} has no re-evaluation gate")
         request_key = self._child_request_key(
@@ -507,8 +823,17 @@ class ReviewService:
             idempotency_key=idempotency_key,
         )
         snapshot = self.behavior_snapshot()
-        metadata = json.loads(evaluation_artifact["metadata_json"])
+        if artifact["kind"] in {
+            ArtifactKind.SOURCE_ASSET,
+            ArtifactKind.FORGE_MANIFEST,
+            ArtifactKind.TEXTURE_VARIANT,
+        }:
+            assert asset_metadata is not None
+            metadata = asset_metadata
+        else:
+            metadata = json.loads(evaluation_artifact["metadata_json"])
         provenance = json.loads(evaluation_artifact["provenance_json"])
+        parent, cancellation = await self._cancel_final_review_request(parent)
         decision, child, linked = self.database.create_review_child(
             parent_attempt_id=attempt_id,
             expected_parent_version=parent["version"],
@@ -535,7 +860,10 @@ class ReviewService:
             linked_provenance={**provenance, "linked_from_attempt_id": attempt_id},
         )
         assert linked is not None
-        return {"decision": decision, "attempt": child, "artifact": linked}
+        result = {"decision": decision, "attempt": child, "artifact": linked}
+        if cancellation is not None:
+            result["operation"] = cancellation
+        return result
 
     async def publish(
         self,
@@ -552,6 +880,8 @@ class ReviewService:
             raise PermissionError("trial skins are non-publishable")
         if str(attempt["production_revision"]) != str(revision) or attempt["production_content_hash"] != content_hash:
             raise VersionConflict("publication must bind the exact reviewed revision and content hash")
+        self._assert_publication_authority_has_no_blocking_failure(attempt)
+        self._assert_blind_build_label(attempt_id)
         existing = self.database.find_exact_decision(
             attempt_id=attempt_id,
             action="publish_approval",

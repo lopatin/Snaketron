@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, options, post, put},
+    routing::{delete, get, options, post, put},
 };
 use common::{GAMEPLAY_REPLAY_VERSION, HIGHLIGHT_CLIP_FORMAT_VERSION, HighlightClip};
 use serde::Serialize;
@@ -341,6 +341,10 @@ pub async fn install_http_application(
     // Build protected API routes
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::get_current_user))
+        .route(
+            "/api/factory/capabilities",
+            get(auth::get_factory_capabilities),
+        )
         .route("/api/history", get(admin::get_user_history))
         .route(
             "/api/auth/crazygames/preferences",
@@ -431,6 +435,18 @@ pub async fn install_http_application(
 
     let admin_routes = Router::new()
         .route("/api/admin/history", get(admin::get_admin_history))
+        .route(
+            "/api/admin/factory-credentials",
+            post(auth::create_factory_credential),
+        )
+        .route(
+            "/api/admin/factory-credentials/:credential_id/rotate",
+            post(auth::rotate_factory_credential),
+        )
+        .route(
+            "/api/admin/factory-credentials/:credential_id",
+            delete(auth::revoke_factory_credential),
+        )
         .route("/api/admin/skins", get(skins::admin_review_queue))
         .route(
             "/api/admin/skins/:skin_id/status",

@@ -9,7 +9,31 @@ import pytest
 from snaketron_factory.assets import ForgeBundle, ForgeVariant
 from snaketron_factory.config import FactoryConfig
 from snaketron_factory.domain import ProviderError, ProviderFailureKind
-from snaketron_factory.snaketron_api import SnaketronApi
+from snaketron_factory.snaketron_api import SnaketronApi, validate_service_capabilities
+
+
+def test_capability_validator_rejects_an_ordinary_account_envelope_without_service_credential() -> None:
+    with pytest.raises(ValueError, match="unsupported schema"):
+        validate_service_capabilities(
+            {
+                "schemaVersion": 1,
+                "identity": {
+                    "userId": 41,
+                    "username": "skin-factory",
+                    "registeredAccount": True,
+                    "isGuest": False,
+                    "isAdmin": False,
+                },
+                "capabilities": {
+                    "createPrivateSkins": True,
+                    "createEvaluationSkins": True,
+                    "uploadPrivateForgeTextures": True,
+                    "requestPublicationReview": True,
+                    "publishSkins": False,
+                    "administerSkins": False,
+                },
+            }
+        )
 
 
 def _bundle(data: bytes = b"exact canonical png bytes") -> ForgeBundle:
@@ -259,6 +283,59 @@ async def test_health_accepts_a_plain_text_probe(factory_config: FactoryConfig) 
 
 
 @pytest.mark.asyncio
+async def test_service_capability_probe_is_authenticated_and_side_effect_free(
+    factory_config: FactoryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SNAKETRON_FACTORY_SERVICE_TOKEN", "service-secret")
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        assert request.headers["authorization"] == "Bearer service-secret"
+        assert request.content == b""
+        return httpx.Response(
+            200,
+            json={
+                "schemaVersion": 1,
+                "identity": {
+                    "userId": 41,
+                    "username": "skin-factory",
+                    "registeredAccount": True,
+                    "isGuest": False,
+                    "isAdmin": False,
+                },
+                "credential": {
+                    "credentialType": "factoryService",
+                    "credentialId": "0123456789abcdef0123456789abcdef",
+                    "revocable": True,
+                    "expiresAt": None,
+                },
+                "capabilities": {
+                    "createPrivateSkins": True,
+                    "createEvaluationSkins": True,
+                    "uploadPrivateForgeTextures": True,
+                    "requestPublicationReview": True,
+                    "publishSkins": False,
+                    "administerSkins": False,
+                },
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = SnaketronApi(factory_config, client=client)
+    report = await api.service_capabilities()
+    await client.aclose()
+
+    assert report["identity"]["isAdmin"] is False
+    assert report["credential"]["credentialType"] == "factoryService"
+    assert report["credential"]["expiresAt"] is None
+    assert report["capabilities"]["createEvaluationSkins"] is True
+    assert report["capabilities"]["publishSkins"] is False
+    assert calls == [("GET", "/api/factory/capabilities")]
+
+
+@pytest.mark.asyncio
 async def test_missing_service_or_operator_tokens_fail_closed(
     factory_config: FactoryConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,7 +358,7 @@ async def test_missing_service_or_operator_tokens_fail_closed(
         (429, ProviderFailureKind.QUOTA),
         (503, ProviderFailureKind.UNAVAILABLE),
         (409, ProviderFailureKind.INVALID_OUTPUT),
-        (403, ProviderFailureKind.REFUSAL),
+        (403, ProviderFailureKind.AUTHENTICATION),
     ],
 )
 async def test_http_failures_are_typed_and_keep_the_request_id(
@@ -417,3 +494,34 @@ async def test_human_override_publication_request_uses_operator_authority(
     )
     await client.aclose()
     assert result.value == {"accepted": True}
+
+
+@pytest.mark.asyncio
+async def test_skin_authority_readback_is_authenticated_and_retains_server_identity(
+    factory_config: FactoryConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SNAKETRON_FACTORY_OPERATOR_TOKEN", "operator-secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/skins/17"
+        assert request.headers["authorization"] == "Bearer operator-secret"
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "authority-17", "x-snaketron-version": "snaketron-api"},
+            json={
+                "skinId": 17,
+                "publication": "published",
+                "publishedRevision": 4,
+                "pendingRevision": None,
+                "contentRef": "sha256:" + "4" * 64,
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = SnaketronApi(factory_config, client=client)
+    result = await api.get_skin_authority(17, operator=True)
+    await client.aclose()
+    assert result.value["publishedRevision"] == 4
+    assert result.request_id == "authority-17"
+    assert result.resolved_model == "snaketron-api"

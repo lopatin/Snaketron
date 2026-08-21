@@ -5317,6 +5317,7 @@ dependencies = [
  "skin-schema",
  "snaketron-service-api",
  "tempfile",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

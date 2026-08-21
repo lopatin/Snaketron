@@ -30,6 +30,7 @@ use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
     canonical_json_bytes, match_history_summary,
 };
+use crate::factory_service::FactoryServiceCredential;
 use crate::generation::{GenerationJob, JobState};
 use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
 use crate::season::{Season, get_season_at};
@@ -1270,6 +1271,49 @@ impl DynamoDatabase {
         DateTime::parse_from_rfc3339(&value)
             .map(|datetime| Some(datetime.with_timezone(&Utc)))
             .with_context(|| format!("Invalid datetime for key: {}", key))
+    }
+
+    fn factory_service_credential_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<FactoryServiceCredential> {
+        Ok(FactoryServiceCredential {
+            credential_id: Self::extract_string(item, "credentialId")
+                .context("Factory credential is missing credentialId")?,
+            user_id: Self::extract_number(item, "userId")
+                .context("Factory credential is missing userId")?,
+            token_hash: Self::extract_string(item, "tokenHash")
+                .context("Factory credential is missing tokenHash")?,
+            created_at: Self::extract_optional_datetime(item, "createdAt")?
+                .context("Factory credential is missing createdAt")?,
+            created_by: Self::extract_number(item, "createdBy")
+                .context("Factory credential is missing createdBy")?,
+            revoked_at: Self::extract_optional_datetime(item, "revokedAt")?,
+            revoked_by: Self::extract_number(item, "revokedBy"),
+            replaced_by: Self::extract_string(item, "replacedBy"),
+        })
+    }
+
+    fn factory_service_credential_item(
+        credential: &FactoryServiceCredential,
+    ) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                "pk".to_string(),
+                Self::av_s(format!("FACTORY_CREDENTIAL#{}", credential.credential_id)),
+            ),
+            ("sk".to_string(), Self::av_s("META")),
+            (
+                "credentialId".to_string(),
+                Self::av_s(&credential.credential_id),
+            ),
+            ("userId".to_string(), Self::av_n(credential.user_id)),
+            ("tokenHash".to_string(), Self::av_s(&credential.token_hash)),
+            (
+                "createdAt".to_string(),
+                Self::av_s(credential.created_at.to_rfc3339()),
+            ),
+            ("createdBy".to_string(), Self::av_n(credential.created_by)),
+        ])
     }
 
     fn game_from_item(game_id: i32, item: &HashMap<String, AttributeValue>) -> Result<Game> {
@@ -3394,6 +3438,131 @@ impl Database for DynamoDatabase {
             }
             None => Ok(None),
         }
+    }
+
+    async fn create_factory_service_credential(
+        &self,
+        credential: &FactoryServiceCredential,
+    ) -> Result<()> {
+        if credential.revoked_at.is_some()
+            || credential.revoked_by.is_some()
+            || credential.replaced_by.is_some()
+        {
+            return Err(anyhow!("A new factory credential must be active"));
+        }
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(Self::factory_service_credential_item(credential)))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .send()
+            .await
+            .context("Failed to create factory service credential")?;
+        Ok(())
+    }
+
+    async fn get_factory_service_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<FactoryServiceCredential>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(format!("FACTORY_CREDENTIAL#{credential_id}")),
+            )
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to load factory service credential")?;
+        response
+            .item
+            .as_ref()
+            .map(Self::factory_service_credential_from_item)
+            .transpose()
+    }
+
+    async fn rotate_factory_service_credential(
+        &self,
+        old_credential_id: &str,
+        replacement: &FactoryServiceCredential,
+        actor_user_id: i32,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        if old_credential_id == replacement.credential_id
+            || replacement.revoked_at.is_some()
+            || replacement.revoked_by.is_some()
+            || replacement.replaced_by.is_some()
+        {
+            return Err(anyhow!("Invalid factory credential rotation"));
+        }
+        let put = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(Self::factory_service_credential_item(replacement)))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build replacement factory credential")?;
+        let revoke = Update::builder()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(format!("FACTORY_CREDENTIAL#{old_credential_id}")),
+            )
+            .key("sk", Self::av_s("META"))
+            .update_expression("SET revokedAt=:at, revokedBy=:actor, replacedBy=:replacement")
+            .condition_expression(concat!(
+                "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                "attribute_not_exists(revokedAt) AND userId=:user_id"
+            ))
+            .expression_attribute_values(":at", Self::av_s(at.to_rfc3339()))
+            .expression_attribute_values(":actor", Self::av_n(actor_user_id))
+            .expression_attribute_values(":replacement", Self::av_s(&replacement.credential_id))
+            .expression_attribute_values(":user_id", Self::av_n(replacement.user_id))
+            .build()
+            .context("Failed to build old factory credential revocation")?;
+        self.client
+            .transact_write_items()
+            .client_request_token(uuid::Uuid::new_v4().to_string())
+            .transact_items(TransactWriteItem::builder().put(put).build())
+            .transact_items(TransactWriteItem::builder().update(revoke).build())
+            .send()
+            .await
+            .context("Failed to atomically rotate factory service credential")?;
+        Ok(())
+    }
+
+    async fn revoke_factory_service_credential(
+        &self,
+        credential_id: &str,
+        actor_user_id: i32,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let current = self
+            .get_factory_service_credential(credential_id)
+            .await?
+            .context("Factory service credential not found")?;
+        if current.revoked_at.is_some() {
+            return Ok(());
+        }
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(format!("FACTORY_CREDENTIAL#{credential_id}")),
+            )
+            .key("sk", Self::av_s("META"))
+            .update_expression("SET revokedAt=:at, revokedBy=:actor")
+            .condition_expression("attribute_exists(pk) AND attribute_not_exists(revokedAt)")
+            .expression_attribute_values(":at", Self::av_s(at.to_rfc3339()))
+            .expression_attribute_values(":actor", Self::av_n(actor_user_id))
+            .send()
+            .await
+            .context("Failed to revoke factory service credential")?;
+        Ok(())
     }
 
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()> {
@@ -8307,6 +8476,18 @@ mod tests {
         HighlightReason, HighlightScoreBreakdown, HighlightWindow, QueueMode, ReplayAnchor,
         ReplayVisibility,
     };
+
+    #[test]
+    fn factory_service_credential_dynamo_item_round_trips_without_raw_secret() {
+        let issued = crate::factory_service::issue_factory_service_credential(41, 7, Utc::now());
+        let encoded = DynamoDatabase::factory_service_credential_item(&issued.record);
+        let debug = format!("{encoded:?}");
+        assert!(!debug.contains(&issued.token));
+        assert!(debug.contains("sha256:"));
+
+        let decoded = DynamoDatabase::factory_service_credential_from_item(&encoded).unwrap();
+        assert_eq!(decoded, issued.record);
+    }
 
     fn completion_with_recording(game_id: u32) -> CompletionRecordV1 {
         let mut final_state = GameState::new(

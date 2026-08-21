@@ -18,9 +18,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.templating import Jinja2Templates
 
 from .config import FactoryConfig
-from .db import Database, RecordNotFound, VersionConflict
+from .db import Database, RecordNotFound, VersionConflict, now
+from .domain import Purpose, Stage
 from .factory import Factory
 from .objects import ObjectStore
+from .recovery import validate_recovered_result
 from .review import ReviewService
 
 VIEW_MAP: dict[str, tuple[str, str]] = {
@@ -48,6 +50,7 @@ def build_review_service(factory: Factory) -> ReviewService:
         factory.persistence,
         factory.behavior_snapshot,
         provider_retries=factory.config.budgets.provider_retries,
+        mode=factory.config.mode,
     )
 
 
@@ -265,6 +268,16 @@ def create_app(
         concept = _decode_concept(db.get_concept(attempt["concept_id"]))
         artifacts = [_decode_artifact(row) for row in db.artifacts_for_attempt(attempt_id)]
         decisions = [_decode_decision(row) for row in db.decisions_for_attempt(attempt_id)]
+        authoritative_label_artifact_ids = _authoritative_label_artifact_ids(db, attempt_id)
+        eligible_blind_label_artifact_ids = _eligible_blind_label_artifact_ids(db, attempt_id)
+        blind_label_required_artifact_ids = _blind_label_required_artifact_ids(db, attempt_id)
+        contact_sheet_ids = [artifact["id"] for artifact in artifacts if artifact["kind"] == "contact_sheet"]
+        publication_label_required = bool(
+            contact_sheet_ids and contact_sheet_ids[-1] in blind_label_required_artifact_ids
+        )
+        shadow_publication_label_ready = bool(
+            contact_sheet_ids and contact_sheet_ids[-1] in authoritative_label_artifact_ids
+        )
         blind = _has_hidden_unlabeled_evaluation(db, attempt_id)
         evaluations = [_decode_evaluation(row) for row in db.evaluations_for_attempt(attempt_id, reveal=False)]
         lineage = [_decode_attempt(row) for row in _lineage(db, attempt)]
@@ -289,6 +302,12 @@ def create_app(
                 evaluations=evaluations,
                 evaluations_blind=blind,
                 decisions=decisions,
+                shadow_mode=config.mode == "shadow",
+                authoritative_label_artifact_ids=authoritative_label_artifact_ids,
+                eligible_blind_label_artifact_ids=eligible_blind_label_artifact_ids,
+                blind_label_required_artifact_ids=blind_label_required_artifact_ids,
+                publication_label_required=publication_label_required,
+                shadow_publication_label_ready=shadow_publication_label_ready,
                 lineage=lineage,
                 children=children,
             ),
@@ -299,15 +318,30 @@ def create_app(
         del actor
         attempt = _decode_attempt(db.get_attempt(attempt_id))
         decisions = [_decode_decision(row) for row in db.decisions_for_attempt(attempt_id)]
+        authoritative_label_artifact_ids = _authoritative_label_artifact_ids(db, attempt_id)
+        eligible_blind_label_artifact_ids = _eligible_blind_label_artifact_ids(db, attempt_id)
+        blind_label_required_artifact_ids = _blind_label_required_artifact_ids(db, attempt_id)
+        artifacts = [_decode_artifact(row) for row in db.artifacts_for_attempt(attempt_id)]
+        contact_sheet_ids = [artifact["id"] for artifact in artifacts if artifact["kind"] == "contact_sheet"]
         blind = _has_hidden_unlabeled_evaluation(db, attempt_id)
         evaluations = [_decode_evaluation(row) for row in db.evaluations_for_attempt(attempt_id, reveal=False)]
         return {
             "attempt": attempt,
             "concept": _decode_concept(db.get_concept(attempt["concept_id"])),
-            "artifacts": [_decode_artifact(row) for row in db.artifacts_for_attempt(attempt_id)],
+            "artifacts": artifacts,
             "evaluations": evaluations,
             "evaluations_blind": blind,
             "decisions": decisions,
+            "shadow_mode": config.mode == "shadow",
+            "authoritative_label_artifact_ids": sorted(authoritative_label_artifact_ids),
+            "eligible_blind_label_artifact_ids": sorted(eligible_blind_label_artifact_ids),
+            "blind_label_required_artifact_ids": sorted(blind_label_required_artifact_ids),
+            "publication_label_required": bool(
+                contact_sheet_ids and contact_sheet_ids[-1] in blind_label_required_artifact_ids
+            ),
+            "shadow_publication_label_ready": bool(
+                contact_sheet_ids and contact_sheet_ids[-1] in authoritative_label_artifact_ids
+            ),
         }
 
     @app.get("/artifacts/{artifact_id}")
@@ -413,6 +447,30 @@ def create_app(
         )
         return _action_response(request, result, attempt_id)
 
+    @app.post("/actions/annotate-reject")
+    async def action_annotate_reject(
+        request: Request,
+        actor: Actor,
+        attempt_id: Annotated[str, Form()],
+        artifact_id: Annotated[str, Form()],
+        content_hash: Annotated[str, Form()],
+        feedback: Annotated[str, Form()] = "",
+        tags: Annotated[str, Form()] = "",
+        idempotency_key: Annotated[str | None, Form()] = None,
+        csrf: Annotated[str | None, Form()] = None,
+    ):
+        require_csrf(request, actor, csrf)
+        result = review.annotate_reject(
+            attempt_id=attempt_id,
+            artifact_id=artifact_id,
+            content_hash=content_hash,
+            feedback=feedback,
+            tags=_tags(tags),
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
+        return _action_response(request, result, attempt_id)
+
     @app.post("/actions/override-triage")
     async def action_override_triage(
         request: Request,
@@ -442,7 +500,7 @@ def create_app(
         csrf: Annotated[str | None, Form()] = None,
     ):
         require_csrf(request, actor, csrf)
-        result = review.re_evaluate(
+        result = await review.re_evaluate(
             attempt_id=attempt_id,
             artifact_id=artifact_id,
             feedback=feedback,
@@ -462,7 +520,7 @@ def create_app(
         csrf: Annotated[str | None, Form()] = None,
     ):
         require_csrf(request, actor, csrf)
-        result = review.retry(
+        result = await review.retry(
             attempt_id=attempt_id,
             from_stage=from_stage,
             feedback=feedback,
@@ -484,7 +542,7 @@ def create_app(
         require_csrf(request, actor, csrf)
         _prevalidate_bulk_retry(db, attempt_ids, from_stage)
         results = [
-            review.retry(
+            await review.retry(
                 attempt_id=attempt_id,
                 from_stage=from_stage,
                 feedback=feedback,
@@ -535,10 +593,15 @@ def create_app(
                 raise ValueError("executed_result_recovered requires a result hash")
             if not resolved_model:
                 raise ValueError("executed_result_recovered requires the exact resolved model")
-            try:
-                store.get(recovered)
-            except (OSError, RuntimeError, ValueError) as error:
-                raise ValueError(f"recovered result is not a valid retained object: {error}") from error
+            validate_recovered_result(
+                config=config,
+                operation=db.get_operation(operation_id),
+                database=db,
+                objects=store,
+                result_hash=recovered,
+                resolved_model=resolved_model,
+                media_type=media_type or None,
+            )
         result = db.resolve_operation(
             operation_id=operation_id,
             resolution=resolution,
@@ -598,6 +661,7 @@ def _gallery_rows(database: Database, view: str, limit: int) -> list[dict[str, A
                        SELECT 1 FROM human_decision d
                        WHERE d.attempt_id=a.id AND d.artifact_id=e.artifact_id
                          AND d.action IN ('prototype_label','build_quality_label')
+                         AND d.authority_evaluation_id IS NOT NULL
                      )
                  )
                ORDER BY a.updated_at DESC LIMIT ?""",
@@ -618,10 +682,79 @@ def _has_hidden_unlabeled_evaluation(database: Database, attempt_id: str) -> boo
                    SELECT 1 FROM human_decision d
                    WHERE d.attempt_id=e.attempt_id AND d.artifact_id=e.artifact_id
                      AND d.action IN ('prototype_label','build_quality_label')
+                     AND d.authority_evaluation_id IS NOT NULL
                  ) LIMIT 1""",
             (attempt_id,),
         ).fetchone()
     return row is not None
+
+
+def _authoritative_label_artifact_ids(database: Database, attempt_id: str) -> set[str]:
+    with database.connect() as connection:
+        rows = connection.execute(
+            """SELECT DISTINCT d.artifact_id
+               FROM human_decision d
+               JOIN evaluation e ON e.id=d.authority_evaluation_id
+               WHERE d.attempt_id=? AND d.actor LIKE 'human:%'
+                 AND d.action IN ('prototype_label','build_quality_label')
+                 AND e.artifact_id=d.artifact_id AND e.attempt_id=d.attempt_id
+                 AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                 AND e.hidden_until_label=1 AND e.created_at<=d.created_at""",
+            (attempt_id,),
+        ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def _eligible_blind_label_artifact_ids(database: Database, attempt_id: str) -> set[str]:
+    """Return artifacts whose current state can create exact blind-label authority."""
+
+    with database.connect() as connection:
+        rows = connection.execute(
+            """SELECT DISTINCT ar.id
+               FROM artifact ar JOIN attempt a ON a.id=ar.attempt_id
+               WHERE a.id=?
+                 AND (
+                   (ar.kind='prototype' AND a.stage='prototype_review' AND (
+                     (a.disposition='needs_human' AND a.review_kind='prototype')
+                     OR (a.disposition='machine_rejected' AND a.review_kind='prototype_label')
+                   ))
+                   OR
+                   (ar.kind='contact_sheet' AND a.stage='final_review' AND (
+                     (a.disposition='needs_human' AND a.review_kind='final')
+                     OR (a.disposition='machine_rejected' AND a.review_kind='build_label')
+                   ))
+                 )
+                 AND EXISTS (
+                   SELECT 1 FROM evaluation e
+                   WHERE e.artifact_id=ar.id AND e.attempt_id=a.id
+                     AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                     AND e.hidden_until_label=1 AND e.created_at<=?
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM evaluation e
+                   WHERE e.artifact_id=ar.id AND e.attempt_id=a.id
+                     AND e.evaluator='visual_judge' AND e.gate_name='visual_fidelity'
+                     AND e.hidden_until_label=0
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM human_decision d
+                   WHERE d.artifact_id=ar.id
+                     AND d.action IN ('prototype_label','build_quality_label')
+                 )""",
+            (attempt_id, now()),
+        ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def _blind_label_required_artifact_ids(database: Database, attempt_id: str) -> set[str]:
+    with database.connect() as connection:
+        rows = connection.execute(
+            """SELECT DISTINCT artifact_id FROM evaluation
+               WHERE attempt_id=? AND evaluator='visual_judge'
+                 AND gate_name='visual_fidelity' AND hidden_until_label=1""",
+            (attempt_id,),
+        ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 def _tags(value: str) -> list[str]:
@@ -705,6 +838,18 @@ def _prevalidate_bulk_retry(database: Database, attempt_ids: list[str], from_sta
             not attempt["approved_prototype_hash"] or not attempt["prototype_decision_id"]
         ):
             raise VersionConflict(f"attempt {attempt_id} has no exact prototype approval for {from_stage} retry")
+        if (
+            attempt["stage"] == Stage.FINAL_REVIEW
+            and attempt["purpose"] == Purpose.PRODUCTION
+            and (
+                not attempt["production_skin_id"]
+                or not attempt["production_revision"]
+                or not attempt["production_content_hash"]
+            )
+        ):
+            raise VersionConflict(
+                f"attempt {attempt_id} has no exact registered revision authority for final-review retry"
+            )
 
 
 def _action_response(

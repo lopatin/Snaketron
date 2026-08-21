@@ -171,7 +171,7 @@ the deterministic factory driver.
                 {"role": "user", "content": content},
             ],
             "temperature": 0.2,
-            "max_tokens": self.config.worker.max_output_tokens,
+            "max_tokens": self.config.models.task_worker.max_output_tokens,
             "tools": [],
             "response_format": {
                 "type": "json_schema",
@@ -265,27 +265,51 @@ the deterministic factory driver.
                 f"task worker violated WorkerResult: {error}",
                 request_id=request_id,
             ) from error
-        usage = body.get("usage", {})
+        usage = body.get("usage")
+        resolved_model = body.get("model")
+        if not isinstance(resolved_model, str) or not resolved_model.strip():
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "task worker response omitted its resolved model",
+                request_id=request_id,
+            )
+        usage_result: dict[str, bool | int | float] = {}
+        usage_complete = isinstance(usage, dict) and all(
+            _valid_usage_count(usage.get(key)) for key in ("prompt_tokens", "completion_tokens")
+        )
+        usage_result["usage_complete"] = usage_complete
+        if isinstance(usage, dict):
+            if _valid_usage_count(usage.get("prompt_tokens")):
+                usage_result["input_tokens"] = int(usage["prompt_tokens"])
+            if _valid_usage_count(usage.get("completion_tokens")):
+                usage_result["output_tokens"] = int(usage["completion_tokens"])
+        if usage_complete:
+            role = self.config.models.task_worker
+            usage_result["cost_micros"] = (
+                int(usage["prompt_tokens"]) * role.cost_per_million_input_micros
+                + int(usage["completion_tokens"]) * role.cost_per_million_output_micros
+            ) // 1_000_000
         return ProviderResult(
             value=result,
             request_id=request_id,
-            resolved_model=body.get("model", self.model),
+            resolved_model=resolved_model,
             sanitized_metadata={
                 "finish_reason": choices[0].get("finish_reason"),
                 "system_fingerprint": body.get("system_fingerprint"),
             },
-            usage={
-                "input_tokens": int(usage.get("prompt_tokens", 0)),
-                "output_tokens": int(usage.get("completion_tokens", 0)),
-                "cost_micros": 0,
-            },
+            usage=usage_result,
         )
 
 
+def _valid_usage_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 class FakeWorker:
-    def __init__(self, results: list[WorkerResult] | None = None) -> None:
+    def __init__(self, results: list[WorkerResult] | None = None, *, model: str = "fake-worker-v1") -> None:
         self.results = list(results or [])
         self.requests: list[WorkerRequest] = []
+        self.model = model
 
     async def describe_model(self) -> dict[str, Any]:
         return {"id": "fake-worker", "owned_by": "test"}
@@ -297,7 +321,7 @@ class FakeWorker:
         return ProviderResult(
             value=self.results.pop(0),
             request_id=f"fake-worker-{len(self.requests)}",
-            resolved_model="fake-worker-v1",
+            resolved_model=self.model,
             sanitized_metadata={"fake": True},
             usage={"cost_micros": 0},
         )
@@ -305,5 +329,5 @@ class FakeWorker:
 
 def build_worker(config: FactoryConfig) -> WorkerAdapter:
     if config.worker.adapter == "fake":
-        return FakeWorker()
+        return FakeWorker(model=config.models.task_worker.model or "fake-worker-v1")
     return OpenAICompatibleWorker(config)
