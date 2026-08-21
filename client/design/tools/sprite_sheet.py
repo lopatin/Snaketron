@@ -640,7 +640,7 @@ def rotate_field(image, degrees):
     """
     if not degrees % 360:
         return image
-    wide = Image.new("RGB", (image.width * 3, image.height * 3))
+    wide = Image.new(image.mode, (image.width * 3, image.height * 3))
     for row in range(3):
         for column in range(3):
             wide.paste(image, (column * image.width, row * image.height))
@@ -701,7 +701,7 @@ def wrapped_resize(image, size, width=None):
     versus 1.0 when it was first left out, so it is not theoretical.
     """
     width = width or size
-    wide = Image.new("RGB", (image.width * 3, image.height * 3))
+    wide = Image.new(image.mode, (image.width * 3, image.height * 3))
     for row in range(3):
         for column in range(3):
             wide.paste(image, (column * image.width, row * image.height))
@@ -1068,9 +1068,12 @@ def render_report(name, source, before_rolled, after_rolled, report, path):
 
 
 def load_lama():
-    from simple_lama_inpainting import SimpleLama
+    # Production injects only the checked-in offline loader on PYTHONPATH. It
+    # requires an absolute, preloaded model with the pinned size and SHA; the
+    # upstream package's download-on-first-use branch is never reachable.
+    from snaketron_lama_runtime import load_lama as load_verified_lama
 
-    return SimpleLama()
+    return load_verified_lama()
 
 
 def describe(report):

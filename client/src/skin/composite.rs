@@ -333,6 +333,23 @@ impl CompositeSkin {
         (step.rem_euclid(steps)) as usize % self.frames.len()
     }
 
+    /// Continuous presentation clock for image sampling.
+    ///
+    /// Expression parameters intentionally use the small baked ring; sprite
+    /// rows do not. Keeping this clock independent means a 64/120-row sheet
+    /// can address every row without increasing expression storage or aliasing
+    /// it down to the ring's step count.
+    fn texture_time_turns(&self, anim_ms: f64, reduced_motion: bool) -> f64 {
+        if reduced_motion
+            || !anim_ms.is_finite()
+            || !self.period_ms.is_finite()
+            || self.period_ms <= 0.0
+        {
+            return 0.0;
+        }
+        (anim_ms / self.period_ms).rem_euclid(1.0)
+    }
+
     fn swatch<'a>(&self, frame: &'a Frame, identity: &SkinIdentity) -> &'a Swatch {
         let shade = (identity.shade_slot % 2) as usize;
         match identity.role {
@@ -869,6 +886,7 @@ impl SnakeSkin for CompositeSkin {
         }
 
         let frame = &self.frames[self.frame_index(pose.anim_ms, pose.reduced_motion)];
+        let texture_time_turns = self.texture_time_turns(pose.anim_ms, pose.reduced_motion);
         let swatch = self.swatch(frame, identity);
         let body_len = arc_length(pose.cells);
         let env = binding_env(pose, frame, body_len);
@@ -917,6 +935,7 @@ impl SnakeSkin for CompositeSkin {
                 pose,
                 layer,
                 frame,
+                texture_time_turns,
                 &env,
                 swatch,
                 allocations[index],
@@ -1025,6 +1044,7 @@ impl CompositeSkin {
         pose: &SnakePose,
         layer: &Layer,
         frame: &Frame,
+        texture_time_turns: f64,
         env: &skin_schema::expr::Env,
         swatch: &Swatch,
         allocation: Option<Allocation>,
@@ -1151,7 +1171,16 @@ impl CompositeSkin {
                 // never disagree about which track is in force.
                 let base_alpha = layer.opacity.get(&frame.params, env, 1.0);
                 self.paint_span(
-                    ctx, pose, env, source, *corner, allocation, swatch, frame, body_len,
+                    ctx,
+                    pose,
+                    env,
+                    source,
+                    *corner,
+                    allocation,
+                    swatch,
+                    frame,
+                    texture_time_turns,
+                    body_len,
                     base_alpha,
                 )
             }
@@ -1170,6 +1199,7 @@ impl CompositeSkin {
         allocation: Allocation,
         swatch: &Swatch,
         frame: &Frame,
+        texture_time_turns: f64,
         _body_len: f64,
         // The layer's own opacity, already set on the context. Sources that
         // modulate alpha multiply into it and restore to it, so a layer that
@@ -1345,7 +1375,7 @@ impl CompositeSkin {
                     // the whole region for still art. This is the only place
                     // the clock touches an image layer, and it moves numbers
                     // rather than op structure.
-                    let (sx, sy, sw, sh) = region.source_rect(frame.time_turns);
+                    let (sx, sy, sw, sh) = region.source_rect(texture_time_turns);
                     let faded = fade.is_some_and(|fade| !fade.is_noop());
 
                     let failed = match fit {
@@ -1369,7 +1399,7 @@ impl CompositeSkin {
                             // it lands on zero — and that is frame one, so the
                             // very first sample would disagree with every other.
                             let drifts = drift_cells.is_finite() && *drift_cells != 0.0;
-                            let phase = drift_phase(*drift_cells, repeat_cells, frame.time_turns);
+                            let phase = drift_phase(*drift_cells, repeat_cells, texture_time_turns);
                             // Scratch for the two-blit split, so a drifting
                             // pattern allocates nothing per frame.
                             let mut pair;

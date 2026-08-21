@@ -5213,6 +5213,7 @@ mod tests {
         unused_database_method!(create_skin(draft: crate::skin_store::NewSkin<'_>) -> crate::skin_store::Skin);
         unused_database_method!(put_skin_revision(
             skin_id: i32,
+            expected_head: u32,
             revision: crate::skin_store::NewRevision<'_>
         ) -> crate::skin_store::Skin);
         unused_database_method!(update_skin_metadata(
@@ -5227,7 +5228,7 @@ mod tests {
         ) -> Option<crate::skin_store::SkinRevision>);
         unused_database_method!(resolve_content_ref(
             content_ref: &str
-        ) -> Option<(crate::skin_store::Skin, crate::skin_store::SkinRevision)>);
+        ) -> Vec<(crate::skin_store::Skin, crate::skin_store::SkinRevision)>);
         unused_database_method!(list_published_skins(
             kind: crate::skin_store::SkinKind,
             cursor: Option<&str>,
@@ -5249,10 +5250,22 @@ mod tests {
             skin_id: i32,
             revision: Option<u32>
         ) -> ());
+        unused_database_method!(clear_skin_pending_revision_exact(
+            skin_id: i32,
+            expected_revision: u32
+        ) -> ());
         unused_database_method!(list_skins_awaiting_review(
             limit: usize
         ) -> Vec<crate::skin_store::Skin>);
         unused_database_method!(approve_skin_revision(skin_id: i32, revision: u32) -> ());
+        unused_database_method!(decide_skin_review(
+            skin_id: i32,
+            publication: crate::skin_store::Publication,
+            revision: Option<u32>,
+            content_ref: Option<&str>,
+            actor_user_id: i32,
+            reason: Option<&str>
+        ) -> ());
         unused_database_method!(mark_revision_exposed(
             skin_id: i32,
             revision: u32,
@@ -5284,8 +5297,22 @@ mod tests {
             texture: &crate::texture::Texture
         ) -> crate::texture::Texture);
         unused_database_method!(get_texture(texture_id: i32) -> Option<crate::texture::Texture>);
+        unused_database_method!(set_texture_shareable(texture_id: i32, shareable: bool) -> ());
+        unused_database_method!(update_texture_verification(
+            texture_id: i32,
+            shareable: bool,
+            verified_seam_axes: &[crate::texture::SeamAxis],
+            seams: crate::texture::SeamReport
+        ) -> ());
         unused_database_method!(get_texture_by_ref(
             content_ref: &str
+        ) -> Option<crate::texture::Texture>);
+        unused_database_method!(get_texture_for_use(
+            content_ref: &str,
+            descriptor: &skin_schema::v2::TextureDescriptorV2,
+            user_id: i32,
+            is_admin: bool,
+            required_seam_axes: &[crate::texture::SeamAxis]
         ) -> Option<crate::texture::Texture>);
         unused_database_method!(list_textures_by_owner(
             user_id: i32,

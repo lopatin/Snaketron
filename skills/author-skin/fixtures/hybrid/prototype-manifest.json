@@ -1,0 +1,10 @@
+{
+  "brief": "A nebula body with drawn drifting clouds and a precise procedural star glint.",
+  "palette_intent": "Role body and contour remain visible beneath translucent space art.",
+  "motion_intent": "Sixty drawn cloud frames plus an independently timed layer shine.",
+  "implementation_hint": "texture",
+  "hint_rationale": "The body material is painterly, though the glint may be procedural.",
+  "prompt": "One medium horizontal nebula snake, distinct head/body/tail, neutral background.",
+  "model_config": "prototype-gemini-3-pro-image-v1",
+  "image_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+}

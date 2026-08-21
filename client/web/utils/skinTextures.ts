@@ -12,6 +12,22 @@ export interface BuiltinTexture {
   label: string;
   kind: string;
   contentRef: string;
+  /** Resolved immutable metadata for generated/uploaded art. Built-ins omit. */
+  descriptor?: TextureDescriptor;
+}
+
+export interface TextureDescriptor extends Record<string, unknown> {
+  kind: string;
+  body_columns?: number;
+  frame_rows?: number;
+  variants: Array<{
+    content_ref: string;
+    url: string;
+    width_px: number;
+    height_px: number;
+    bytes: number;
+    texels_per_cell: number;
+  }>;
 }
 
 /** A declaration as it goes over the wire: `ref`, not `contentRef`. */
@@ -72,7 +88,12 @@ export const reconcileTextures = (doc: Document, catalogue: BuiltinTexture[]): D
     .filter((name) => !kept.some((each) => each?.name === name))
     .map((name) => catalogue.find((art) => art.id === name))
     .filter((art): art is BuiltinTexture => Boolean(art))
-    .map((art) => ({ name: art.id, ref: art.contentRef, kind: art.kind }));
+    .map((art) => ({
+      name: art.id,
+      ref: art.contentRef,
+      kind: art.kind,
+      ...(art.descriptor ? { descriptor: art.descriptor } : {}),
+    }));
 
   const next = [...kept, ...missing];
   // Same object when nothing moved, so an unrelated keystroke elsewhere in the

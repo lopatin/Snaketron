@@ -1,0 +1,33 @@
+{
+  "path": "sprite_sheet",
+  "rationale": "Distinct drawn caustic states need frames; the 41-cell repeat and 48-frame loop are independent decisions.",
+  "fidelity_features": [
+    "morphing caustic shapes without whole-image translation",
+    "calm complete resting frame",
+    "long body repeat"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons preserve role readability",
+    "Water sheet tiles across the body above Body fallback",
+    "Head glow preserves direction"
+  ],
+  "asset_plan": [
+    {
+      "kind": "sheet",
+      "natural_length_cells": 41,
+      "frames": 48,
+      "texels_per_cell": 16,
+      "anchor": "whole",
+      "fit": "tile",
+      "fade": "none",
+      "prompt": "656x768 grid: 41 body cells by 48 frame rows, no gutters; each row is one complete view, x and final-to-zero y seamless, row zero calm, features morph in place instead of translating."
+    }
+  ],
+  "animation_plan": [
+    "Play all 48 rows once over 2400ms; row zero is reduced motion"
+  ],
+  "required_wrap_axes": ["x", "y"],
+  "risks": [
+    "Generated rows may translate the whole field or make the loop seam visible"
+  ]
+}

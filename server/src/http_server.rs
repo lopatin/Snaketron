@@ -361,7 +361,9 @@ pub async fn install_http_application(
         )
         .route(
             "/api/skins/:skin_id/publish-request",
-            post(skins::request_publication),
+            post(skins::request_publication)
+                .delete(skins::cancel_publication_request)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
             "/api/skins/:skin_id/report",
@@ -370,6 +372,10 @@ pub async fn install_http_application(
         .route("/api/wallet", get(wallet_api::get_wallet))
         .route("/api/wallet/packs", get(wallet_api::list_packs))
         .route("/api/textures", get(textures::list_mine))
+        .route(
+            "/api/textures/:texture_id",
+            put(textures::update_texture).layer(axum::extract::DefaultBodyLimit::max(2 * 1024)),
+        )
         // Generation is slow and costs money per attempt, so the route that
         // starts one is rate limited as well as quota'd inside the handler.
         .route(
@@ -389,6 +395,15 @@ pub async fn install_http_application(
             "/api/textures",
             post(textures::upload)
                 .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    upload_limiter.clone(),
+                    rate_limit_middleware,
+                )),
+        )
+        .route(
+            "/api/textures/forge",
+            post(textures::ingest_forge_manifest)
+                .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024))
                 .layer(middleware::from_fn_with_state(
                     upload_limiter,
                     rate_limit_middleware,

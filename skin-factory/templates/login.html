@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Skin Factory sign in</title>
+<style>body{font-family:system-ui;background:#10131a;color:#edf1fa;max-width:30rem;margin:8vh auto;padding:1rem}form{background:#191f2b;padding:1.3rem;border-radius:.6rem}label,input,button{display:block;box-sizing:border-box;width:100%;margin:.6rem 0;padding:.65rem}input,button{background:#0e1219;color:#fff;border:1px solid #46516a;border-radius:.3rem}button{background:#245a9c}.error{color:#ff9da9}</style></head>
+<body><h1>Human review sign in</h1><p>Use the distinct review credential. The Hermes service credential is not accepted.</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form action="/login" method="post"><label>Human actor<input name="actor" value="human:reviewer" required></label><label>Review token<input name="token" type="password" autocomplete="current-password" required></label><button type="submit">Sign in</button></form></body></html>

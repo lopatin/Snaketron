@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "dependency_lock": "uv.lock",
+  "model": {
+    "filename": "big-lama-v0.1.0.pt",
+    "sha256": "7ba7aa7ac37a4d41fdbbeba3a2af7ead18058552997e3a3cd1a3b2210c9e6b4c",
+    "size_bytes": 205803670,
+    "url": "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
+  },
+  "runtime_files": [
+    "sitecustomize.py",
+    "snaketron_lama_runtime.py"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "request_id": "request_replace_me",
+  "asset_index": 0,
+  "texture_name": "texture_replace_me",
+  "capability_role": "image_generator",
+  "operation": "generate",
+  "kind": "sheet",
+  "input_artifacts": [],
+  "prompt": "Describe exact art, axes, grid, scale, transparency, and exclusions.",
+  "width_px": 640,
+  "height_px": 768,
+  "grid": {
+    "body_columns": 40,
+    "frame_rows": 48,
+    "texels_per_cell": 16
+  },
+  "required_wrap_axes": ["x", "y"],
+  "transparency": "allowed",
+  "row_zero": "resting_and_reduced_motion",
+  "repair": {
+    "method": "none",
+    "mask_artifact": null
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "id": "worker-draft-wrong-index@1",
+  "name": "Invalid wrong-index worker draft",
+  "textures": [
+    { "name": "shell_coat", "ref": "pending:asset:1", "kind": "coat" }
+  ],
+  "layers": [
+    { "name": "Body fallback", "type": "ribbon", "region": "body" },
+    {
+      "name": "Shell coat",
+      "type": "span",
+      "region": "body",
+      "source": { "type": "image", "texture": "shell_coat" }
+    }
+  ]
+}

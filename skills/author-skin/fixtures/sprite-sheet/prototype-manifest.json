@@ -1,0 +1,10 @@
+{
+  "brief": "A dark water coat whose painted caustics evolve without translating down the body.",
+  "palette_intent": "Water art is subtle; the role fallback and contour dominate side reading.",
+  "motion_intent": "Forty-eight-frame seamless loop with a calm resting first frame.",
+  "implementation_hint": "sprite_sheet",
+  "hint_rationale": "The caustic shapes morph between drawn states rather than sliding as one formula.",
+  "prompt": "One medium horizontal water-caustic snake, distinct head/body/tail, neutral background.",
+  "model_config": "prototype-gemini-3-pro-image-v1",
+  "image_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+}

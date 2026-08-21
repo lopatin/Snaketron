@@ -11,6 +11,9 @@ const isProduction = process.env.NODE_ENV === 'production';
 // href "./" in index.html) and routing must not rely on the History API.
 const isItchBuild = process.env.ITCH_BUILD === 'true';
 const isCrazyGamesBuild = process.env.CRAZYGAMES_BUILD === 'true';
+// Factory evidence must not execute mutable third-party analytics code. The
+// resulting cached bundle is otherwise the normal production web renderer.
+const isFactoryRendererBuild = process.env.SNAKETRON_FACTORY_RENDERER_BUILD === 'true';
 
 if (isItchBuild && isCrazyGamesBuild) {
   throw new Error('ITCH_BUILD and CRAZYGAMES_BUILD are mutually exclusive release targets');
@@ -88,6 +91,7 @@ module.exports = {
         itchBuild: isItchBuild,
         crazyGamesBuild: isCrazyGamesBuild,
         embeddedBuild: isEmbeddedBuild,
+        factoryRendererBuild: isFactoryRendererBuild,
       },
     }),
     new webpack.DefinePlugin({

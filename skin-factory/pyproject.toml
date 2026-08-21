@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snaketron-skin-factory"
+version = "0.1.0"
+description = "Provider-neutral, retained and self-improving Snaketron skin factory"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = { text = "Proprietary" }
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "jinja2>=3.1,<4",
+  "jsonschema>=4.23,<5",
+  "numpy>=2.1,<3",
+  "pillow>=11,<13",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "python-multipart>=0.0.20,<1",
+  "pyyaml>=6.0,<7",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.50,<2"]
+production = [
+  "playwright>=1.50,<2",
+]
+
+[dependency-groups]
+dev = [
+  "coverage[toml]>=7.6,<8",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=1,<2",
+  "pytest-cov>=6,<7",
+  "respx>=0.22,<1",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+factory = "snaketron_factory.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snaketron_factory"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --cov=snaketron_factory --cov-branch --cov-report=term-missing"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.coverage.run]
+branch = true
+source = ["snaketron_factory"]
+
+[tool.coverage.report]
+fail_under = 70
+precision = 2
+show_missing = true

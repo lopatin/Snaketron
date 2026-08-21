@@ -1,0 +1,27 @@
+[
+  {
+    "kind": "generate_asset",
+    "arguments": {
+      "schema_version": 1,
+      "request_id": "fixture_shell_coat",
+      "asset_index": 0,
+      "texture_name": "shell_coat",
+      "capability_role": "image_generator",
+      "operation": "generate",
+      "kind": "coat",
+      "input_artifacts": [],
+      "prompt": "1856x64 opaque x-seamless coat with irregular shell facets and no background.",
+      "width_px": 1856,
+      "height_px": 64,
+      "grid": {
+        "body_columns": 29,
+        "frame_rows": 1,
+        "texels_per_cell": 64
+      },
+      "required_wrap_axes": ["x"],
+      "transparency": "opaque",
+      "row_zero": "not_applicable",
+      "repair": { "method": "none", "mask_artifact": null }
+    }
+  }
+]
