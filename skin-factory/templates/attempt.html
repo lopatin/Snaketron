@@ -4,6 +4,37 @@
 <p><span class="pill">{{ attempt.stage }}</span><span class="pill">{{ attempt.disposition }}</span><span class="pill">{{ attempt.purpose }}</span></p>
 <p class="muted">Attempt {{ attempt.id }} · version {{ attempt.version }}</p>
 
+{% if prototype_review_evidence %}<section class="prototype-evidence-section" aria-labelledby="prototype-evidence-title">
+  <div class="evidence-heading">
+    <div><p class="eyebrow">Retained generation input</p><h3 id="prototype-evidence-title">Prototype geometry evidence</h3></div>
+    <p>Compare every candidate with the exact blank body guide supplied to the image model. The guide is loaded from this Attempt's immutable behavior snapshot.</p>
+  </div>
+  <div class="prototype-evidence">
+    <article class="geometry-guide-card">
+      <div class="evidence-card-heading"><span class="evidence-marker">Strict body mask</span><strong>{{ prototype_review_evidence.contract_id }}</strong></div>
+      <a class="geometry-guide-frame" href="{{ prototype_review_evidence.guide_url }}">
+        <img src="{{ prototype_review_evidence.guide_url }}" alt="Exact retained blank snake geometry guide">
+      </a>
+      <dl class="evidence-facts">
+        {% if prototype_review_evidence.body_cells %}<div><dt>Body</dt><dd>{{ prototype_review_evidence.body_cells }} cells{% if prototype_review_evidence.native_cell_px %} · {{ prototype_review_evidence.native_cell_px }}px native real-render cell{% endif %}{% if prototype_review_evidence.presentation_scale %} · {{ prototype_review_evidence.presentation_scale }}× review presentation{% endif %}</dd></div>{% endif %}
+        {% if prototype_review_evidence.head_direction %}<div><dt>Head</dt><dd>{{ prototype_review_evidence.head_direction }}</dd></div>{% endif %}
+        <div><dt>Contract SHA-256</dt><dd><code>{{ prototype_review_evidence.contract_hash }}</code></dd></div>
+        <div><dt>Guide SHA-256</dt><dd><code>{{ prototype_review_evidence.guide_hash }}</code></dd></div>
+      </dl>
+      <p><a href="{{ prototype_review_evidence.contract_url }}">Open exact retained contract JSON</a></p>
+    </article>
+    <div class="candidate-column">
+      <div class="evidence-card-heading"><span class="evidence-marker">Model output</span><strong>Candidate prototypes</strong></div>
+      {% if prototype_artifacts %}<div class="prototype-candidate-grid">
+        {% for artifact in prototype_artifacts %}<article class="prototype-candidate">
+          <a href="/artifacts/{{ artifact.id }}"><img src="/artifacts/{{ artifact.id }}" alt="Candidate prototype {{ artifact.metadata.prototype_index if artifact.metadata.prototype_index is defined else loop.index }}"></a>
+          <p><strong>Candidate {{ artifact.metadata.prototype_index + 1 if artifact.metadata.prototype_index is defined else loop.index }}</strong><br><code>{{ artifact.content_hash }}</code></p>
+        </article>{% endfor %}
+      </div>{% else %}<p class="muted">No candidate prototype bytes are retained for this Attempt.</p>{% endif %}
+    </div>
+  </div>
+</section>{% endif %}
+
 <section><h3>Artifacts</h3><div class="grid">
 {% for artifact in artifacts %}<article class="card"><h4>{{ artifact.kind }}</h4>
   {% if artifact.media_type.startswith('image/') %}<a href="/artifacts/{{ artifact.id }}"><img src="/artifacts/{{ artifact.id }}" alt="{{ artifact.kind }} {{ artifact.content_hash }}"></a>

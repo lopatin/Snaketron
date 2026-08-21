@@ -137,19 +137,30 @@ class Factory:
     def behavior_snapshot(self) -> dict[str, Any]:
         skill, skill_git_ref, skill_git_sha = self.active_skill_bundle()
         direction = self.config.paths.direction.read_bytes()
+        guideline_text = self._skill_guidelines(skill)
+        prototype_geometry, prototype_guide, _ = self._current_prototype_geometry()
         capability = self.config.paths.capability_manifest.read_bytes()
         gates = self.config.paths.gate_manifest.read_bytes()
         model_config = self._model_config_bytes()
         direction_object = self.objects.put(direction)
+        guideline_object = self.objects.put(guideline_text)
+        prototype_geometry_object = self.objects.put(prototype_geometry)
+        prototype_guide_object = self.objects.put(prototype_guide)
         capability_object = self.objects.put(capability)
         gate_object = self.objects.put(gates)
         model_config_object = self.objects.put(model_config)
         renderer_config = renderer_execution_config(self.config)
         lama_bundle = lama_bundle_manifest(self.config)
         return {
-            "snapshot_version": 5,
+            "snapshot_version": 6,
             "direction_sha": direction_object.sha256,
             "direction_ref": direction_object.uri,
+            "design_guidelines_sha": guideline_object.sha256,
+            "design_guidelines_ref": guideline_object.uri,
+            "prototype_geometry_sha": prototype_geometry_object.sha256,
+            "prototype_geometry_ref": prototype_geometry_object.uri,
+            "prototype_guide_sha": prototype_guide_object.sha256,
+            "prototype_guide_ref": prototype_guide_object.uri,
             "skill_sha": skill.sha256,
             "skill_git_ref": skill_git_ref,
             "skill_git_sha": skill_git_sha,
@@ -265,6 +276,92 @@ class Factory:
             self.config.paths.direction,
         )
 
+    @staticmethod
+    def _skill_guidelines(skill: SkillBundle) -> bytes:
+        text = skill.files.get("references/design-guidelines.md")
+        if not isinstance(text, str) or not text.strip():
+            raise FileNotFoundError("canonical authoring skill lacks references/design-guidelines.md")
+        return text.encode("utf-8")
+
+    def pinned_design_guidelines(self, attempt: dict[str, Any]) -> bytes:
+        behavior = json.loads(attempt["behavior_json"])
+        if int(behavior.get("snapshot_version", 0)) < 6:
+            return b""
+        return self._snapshot_bytes(
+            attempt,
+            "design_guidelines",
+            str(behavior.get("design_guidelines_sha", "")),
+            self.config.paths.skill_dir / "references" / "design-guidelines.md",
+        )
+
+    def pinned_prototype_geometry(self, attempt: dict[str, Any]) -> tuple[dict[str, Any], bytes] | None:
+        behavior = json.loads(attempt["behavior_json"])
+        if int(behavior.get("snapshot_version", 0)) < 6:
+            return None
+        contract_payload = self._snapshot_bytes(
+            attempt,
+            "prototype_geometry",
+            str(behavior.get("prototype_geometry_sha", "")),
+            self.config.paths.prototype_geometry,
+        )
+        guide_ref = behavior.get("prototype_guide_ref")
+        expected_guide_sha = behavior.get("prototype_guide_sha")
+        if not isinstance(guide_ref, str) or not isinstance(expected_guide_sha, str):
+            raise FileNotFoundError("pinned prototype geometry guide reference is absent")
+        guide = self.objects.get(guide_ref)
+        actual = hashlib.sha256(guide).hexdigest()
+        if actual != expected_guide_sha:
+            raise FileNotFoundError(f"pinned prototype guide {expected_guide_sha} differs from retained bytes {actual}")
+        return self._validate_prototype_geometry(contract_payload, guide), guide
+
+    def _current_prototype_geometry(self) -> tuple[bytes, bytes, dict[str, Any]]:
+        contract_path = self.config.paths.prototype_geometry
+        contract_payload = contract_path.read_bytes()
+        try:
+            contract = json.loads(contract_payload)
+            relative_guide = contract["guide"]
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"prototype geometry contract is malformed: {error}") from error
+        if not isinstance(relative_guide, str) or not relative_guide:
+            raise ValueError("prototype geometry contract has no guide path")
+        guide_path = (contract_path.parent / relative_guide).resolve()
+        try:
+            guide_path.relative_to(self.config.paths.repo_root.resolve())
+        except ValueError as error:
+            raise ValueError("prototype geometry guide must remain inside the repository") from error
+        guide = guide_path.read_bytes()
+        return contract_payload, guide, self._validate_prototype_geometry(contract_payload, guide)
+
+    @staticmethod
+    def _validate_prototype_geometry(contract_payload: bytes, guide: bytes) -> dict[str, Any]:
+        try:
+            contract = json.loads(contract_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"prototype geometry contract is not exact UTF-8 JSON: {error}") from error
+        if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+            raise ValueError("prototype geometry contract must use schema_version 1")
+        expected = contract.get("guide_sha256")
+        actual = hashlib.sha256(guide).hexdigest()
+        if not isinstance(expected, str) or expected != actual:
+            raise ValueError(f"prototype geometry guide hash {actual} differs from contract {expected!r}")
+        canvas = contract.get("guide_canvas")
+        if not isinstance(canvas, dict):
+            raise ValueError("prototype geometry contract has no guide_canvas")
+        try:
+            with Image.open(io.BytesIO(guide)) as opened:
+                opened.load()
+                image_format = opened.format
+                image_size = opened.size
+        except Exception as error:
+            raise ValueError(f"prototype geometry guide is not a decodable image: {error}") from error
+        expected_size = (canvas.get("width_px"), canvas.get("height_px"))
+        if image_format != "PNG" or image_size != expected_size:
+            raise ValueError(
+                f"prototype geometry guide must be PNG {expected_size[0]}x{expected_size[1]}, "
+                f"got {image_format} {image_size[0]}x{image_size[1]}"
+            )
+        return contract
+
     def pinned_gates(self, attempt: dict[str, Any]) -> GateRunner:
         if not isinstance(self.gates, GateRunner):
             # Explicit test/in-process adapters remain injectable. Installed
@@ -310,6 +407,15 @@ class Factory:
             return str(error)
         if retained_model_config != self._model_config_bytes():
             return "model or task-worker configuration changed during an in-flight Attempt"
+        if int(behavior.get("snapshot_version", 0)) >= 6:
+            try:
+                current_geometry, current_guide, _ = self._current_prototype_geometry()
+            except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+                return str(error)
+            if hashlib.sha256(current_geometry).hexdigest() != behavior.get("prototype_geometry_sha"):
+                return "prototype geometry contract changed during an in-flight Attempt"
+            if hashlib.sha256(current_guide).hexdigest() != behavior.get("prototype_guide_sha"):
+                return "prototype geometry guide changed during an in-flight Attempt"
         current_lama: dict[str, Any] | None = None
         if int(behavior.get("snapshot_version", 0)) >= 5:
             pinned_lama = behavior.get("lama_bundle")
@@ -830,18 +936,39 @@ class Factory:
                 continue
             try:
                 prompt = self._prototype_prompt(attempt, concept, index)
+                geometry = self.pinned_prototype_geometry(attempt)
             except (FileNotFoundError, RuntimeError, UnicodeDecodeError, ValueError) as error:
                 return self._block_attempt(attempt, str(error))
-            request = {"prompt": prompt, "aspect_ratio": "16:9", "image_size": "2K"}
+            references: list[tuple[str, bytes]] = []
+            request: dict[str, Any] = {"prompt": prompt, "aspect_ratio": "16:9", "image_size": "2K"}
+            operation_version = "v1"
+            if geometry is not None:
+                contract, guide = geometry
+                behavior = json.loads(attempt["behavior_json"])
+                references = [("image/png", guide)]
+                request["references"] = [
+                    {
+                        "role": "strict_snake_body_geometry_guide",
+                        "media_type": "image/png",
+                        "contract_id": contract["id"],
+                        "contract_sha256": behavior["prototype_geometry_sha"],
+                        "content_hash": f"sha256:{behavior['prototype_guide_sha']}",
+                        "object_ref": behavior["prototype_guide_ref"],
+                    }
+                ]
+                operation_version = "v2"
             operation, result = await self._provider_call(
                 attempt=self.database.get_attempt(attempt["id"]),
                 stage=Stage.PROTOTYPE,
-                key=f"{attempt['id']}:prototype:{index}:v1",
+                key=f"{attempt['id']}:prototype:{index}:{operation_version}",
                 role="image_generator",
                 side_effect="generate_prototype_image",
                 request=request,
-                invoke=lambda prompt=prompt: provider.generate_image(
-                    prompt=prompt, aspect_ratio="16:9", image_size="2K"
+                invoke=lambda prompt=prompt, references=references: provider.generate_image(
+                    prompt=prompt,
+                    references=references or None,
+                    aspect_ratio="16:9",
+                    image_size="2K",
                 ),
             )
             image, media_type = self._image_result(operation, result)
@@ -854,17 +981,22 @@ class Factory:
                 object_ref=stored.uri,
                 media_type=media_type,
                 size_bytes=stored.size,
-                metadata={"prototype_index": index, "prompt": prompt},
+                metadata={
+                    "prototype_index": index,
+                    "prompt": prompt,
+                    "prototype_geometry_sha256": request.get("references", [{}])[0].get("contract_sha256"),
+                    "prototype_guide_content_hash": request.get("references", [{}])[0].get("content_hash"),
+                },
                 provenance={
                     "operation_id": operation["id"],
                     "provider_role": "image_generator",
                     "resolved_model": operation["resolved_model"],
-                    # The default prototype path supplies no external image
-                    # references. Never fabricate a licensing attestation;
-                    # future reference assets must add their own immutable
-                    # owner/license provenance here.
-                    "reference_policy": "prompt_only_no_external_reference_assets",
-                    "references": [],
+                    "reference_policy": (
+                        "repository_owned_renderer_geometry_guide"
+                        if references
+                        else "legacy_prompt_only_no_external_reference_assets"
+                    ),
+                    "references": request.get("references", []),
                 },
             )
             # Content-addressed artifacts intentionally deduplicate identical
@@ -925,6 +1057,9 @@ class Factory:
             prompt=retained_prompt,
             provider_config=canonical_json(image_config),
             image_sha256=image_artifact["content_hash"],
+            design_guidelines_sha256=behavior.get("design_guidelines_sha"),
+            prototype_geometry_sha256=behavior.get("prototype_geometry_sha"),
+            prototype_guide_sha256=behavior.get("prototype_guide_sha"),
         )
         return self._store_json_artifact(
             attempt,
@@ -956,6 +1091,17 @@ class Factory:
         judgments: list[VisualJudgment] = []
         evaluated: list[tuple[dict[str, Any], GateResult]] = []
         safety_evaluated: list[tuple[dict[str, Any], GateResult]] = []
+        geometry = self.pinned_prototype_geometry(attempt)
+        behavior = json.loads(attempt["behavior_json"])
+        geometry_comparison = (
+            {
+                "media_type": "image/png",
+                "object_ref": behavior["prototype_guide_ref"],
+                "content_hash": f"sha256:{behavior['prototype_guide_sha']}",
+            }
+            if geometry is not None
+            else None
+        )
         for artifact in prototypes:
             judgment, operation = await self._judge(
                 attempt,
@@ -963,9 +1109,19 @@ class Factory:
                 system=PROTOTYPE_JUDGE_RUBRIC,
                 context={
                     "brief": concept["brief"],
-                    "prototype_contract": "horizontal head-body-tail",
+                    "prototype_contract": geometry[0] if geometry is not None else "legacy horizontal head-body-tail",
+                    "image_order": (
+                        ["pinned_blank_geometry_guide", "candidate_prototype"]
+                        if geometry is not None
+                        else ["candidate_prototype"]
+                    ),
                 },
-                key=f"{attempt['id']}:prototype-judge:{artifact['content_hash']}:v1",
+                key=(
+                    f"{attempt['id']}:prototype-judge:{artifact['content_hash']}:v2"
+                    if geometry is not None
+                    else f"{attempt['id']}:prototype-judge:{artifact['content_hash']}:v1"
+                ),
+                comparison=geometry_comparison,
             )
             if judgment.review_flags and judgment.verdict != "machine_rejected":
                 judgment = judgment.model_copy(update={"verdict": "machine_rejected"})
@@ -1056,6 +1212,18 @@ class Factory:
         if prototype_manifest_artifact is None:
             return self._block_attempt(attempt, "approved prototype has no matching manifest")
         prototype_manifest = self.persistence.load_json(prototype_manifest_artifact["object_ref"])
+        attempt_behavior = json.loads(attempt["behavior_json"])
+        if int(attempt_behavior.get("snapshot_version", 0)) >= 6:
+            required_manifest_authority = {
+                "design_guidelines_sha256": attempt_behavior.get("design_guidelines_sha"),
+                "prototype_geometry_sha256": attempt_behavior.get("prototype_geometry_sha"),
+                "prototype_guide_sha256": attempt_behavior.get("prototype_guide_sha"),
+            }
+            if any(prototype_manifest.get(key) != value for key, value in required_manifest_authority.items()):
+                return self._block_attempt(
+                    attempt,
+                    "approved prototype manifest does not bind the pinned design and geometry contract",
+                )
         approval = next(
             (
                 decision
@@ -1070,6 +1238,8 @@ class Factory:
         try:
             direction_bytes = self.pinned_direction(attempt)
             pinned_gates = self.pinned_gates(attempt)
+            guideline_bytes = self.pinned_design_guidelines(attempt)
+            prototype_geometry = self.pinned_prototype_geometry(attempt)
         except (FileNotFoundError, RuntimeError, ValueError) as error:
             return self._block_attempt(attempt, str(error))
         direction_object = self.objects.put(direction_bytes)
@@ -1105,6 +1275,9 @@ class Factory:
                 attempt,
                 f"pinned skill {attempt['skill_sha']} is unavailable; checkout changed to {bundle.sha256}",
             )
+        if guideline_bytes and self._skill_guidelines(bundle) != guideline_bytes:
+            return self._block_attempt(attempt, "pinned shared design guidelines differ from the authoring skill")
+        behavior = json.loads(attempt["behavior_json"])
         feedback = self._lineage_feedback(attempt)
         request_identity = canonical_json(
             {
@@ -1114,8 +1287,42 @@ class Factory:
                 "direction_sha": attempt["direction_sha"],
                 "capability_sha": attempt["capability_sha"],
                 "gate_sha": attempt["gate_sha"],
+                "design_guidelines_sha": behavior.get("design_guidelines_sha"),
+                "prototype_geometry_sha": behavior.get("prototype_geometry_sha"),
+                "prototype_guide_sha": behavior.get("prototype_guide_sha"),
             }
         )
+        artifact_refs = {
+            "approved_prototype": prototype["object_ref"],
+            "prototype_manifest": prototype_manifest_artifact["object_ref"],
+            "canonical_direction": direction_object.uri,
+        }
+        inline_artifacts = {
+            "approved_prototype": InlineArtifact(
+                content_hash=prototype["content_hash"],
+                media_type=prototype["media_type"],
+                base64_data=base64.b64encode(self.objects.get(prototype["object_ref"])).decode("ascii"),
+            )
+        }
+        geometry_input: dict[str, Any] | None = None
+        if prototype_geometry is not None:
+            geometry_contract, geometry_guide = prototype_geometry
+            artifact_refs.update(
+                {
+                    "prototype_geometry": str(behavior["prototype_geometry_ref"]),
+                    "prototype_geometry_guide": str(behavior["prototype_guide_ref"]),
+                }
+            )
+            inline_artifacts["prototype_geometry_guide"] = InlineArtifact(
+                content_hash=f"sha256:{behavior['prototype_guide_sha']}",
+                media_type="image/png",
+                base64_data=base64.b64encode(geometry_guide).decode("ascii"),
+            )
+            geometry_input = {
+                "contract": geometry_contract,
+                "contract_sha256": behavior["prototype_geometry_sha"],
+                "guide_sha256": behavior["prototype_guide_sha"],
+            }
         request = WorkerRequest(
             request_id=f"worker_{hashlib.sha256(request_identity.encode()).hexdigest()}",
             attempt_id=attempt["id"],
@@ -1123,11 +1330,7 @@ class Factory:
             skill_sha256=bundle.sha256,
             skill_files=bundle.files,
             capability_manifest=pinned_gates.capabilities,
-            artifact_refs={
-                "approved_prototype": prototype["object_ref"],
-                "prototype_manifest": prototype_manifest_artifact["object_ref"],
-                "canonical_direction": direction_object.uri,
-            },
+            artifact_refs=artifact_refs,
             authoring_inputs={
                 "prototype_manifest": prototype_manifest,
                 "prototype_approval": {
@@ -1146,14 +1349,13 @@ class Factory:
                     "manifest": pinned_gates.capabilities,
                 },
                 "gates": {"expected_sha256": attempt["gate_sha"]},
+                "design_guidelines": {
+                    "sha256": behavior.get("design_guidelines_sha"),
+                    "text": guideline_bytes.decode("utf-8") if guideline_bytes else None,
+                },
+                "prototype_geometry": geometry_input,
             },
-            inline_artifacts={
-                "approved_prototype": InlineArtifact(
-                    content_hash=prototype["content_hash"],
-                    media_type=prototype["media_type"],
-                    base64_data=base64.b64encode(self.objects.get(prototype["object_ref"])).decode("ascii"),
-                )
-            },
+            inline_artifacts=inline_artifacts,
             pure_tools=["color_math", "schema_lookup"],
             budget={
                 "max_layers": pinned_gates.capabilities["limits"]["max_flattened_layers"],
@@ -2712,6 +2914,9 @@ class Factory:
         index: int,
     ) -> str:
         direction = self.pinned_direction(attempt).decode("utf-8")
+        guidelines = self.pinned_design_guidelines(attempt).decode("utf-8")
+        geometry = self.pinned_prototype_geometry(attempt)
+        geometry_block = canonical_json(geometry[0]) if geometry is not None else "legacy attempt: no image guide"
         feedback = self._stage_feedback(attempt, "prototype")
         feedback_block = (
             "\nLiteral human corrections for this retry (JSON strings; preserve meaning, do not invent more):\n"
@@ -2724,13 +2929,27 @@ class Factory:
 Brief: {concept["brief"]}
 Canonical direction:
 {direction}
+Locked Skin Design Guidelines (obey verbatim; shared with the downstream authoring worker):
+{guidelines}
+
+Pinned renderer geometry contract:
+{geometry_block}
 {feedback_block}
 
-Depict exactly one medium-length snake in a horizontal head + representative
-body + tail strip. The head and tail must be visibly distinct. Use a neutral or
-transparent background. Keep it legible at actual game scale. Do not include
-UI chrome, words, labels, scenery, framing, or alternate concepts. This is a
-visual implementation reference, not poster art."""
+The attached repository-owned guide is a strict geometry reference, not an
+optional style reference. Treat its white capsule as the only paintable snake
+body. Fill that body with the proposed skin while preserving its exact thin
+16-cells-by-1-cell, right-facing, flat orthographic silhouette and the small
+centered head core. The body must remain one continuous rounded strip. The
+rounded head may not become larger than one cell; the tail may not become a
+point. Do not create gaps, articulated modules, diamonds, plates, separate
+segments, perspective, 3D body geometry, or paint outside the round body.
+
+Depict exactly one snake on a neutral or transparent background. Show how the
+idea reads at actual game scale, including the first 1.5 headward cells and a
+representative repeating/growing body treatment. Do not include UI chrome,
+words, labels, scenery, framing, alternate concepts, or a montage. This is a
+constrained visual implementation reference, not poster art."""
 
     @staticmethod
     def _nearest_provider_aspect(width: int, height: int) -> tuple[str, float]:

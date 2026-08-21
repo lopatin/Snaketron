@@ -93,6 +93,14 @@ def _plan(asset: AssetPlan, *, axes: list[str] | None = None) -> ImplementationP
         animation_plan=["loop sprite rows"] if asset.kind == "sheet" else [],
         required_wrap_axes=axes if axes is not None else AssetProcessor._asset_axes(asset),
         risks=[],
+        design_guidelines={
+            "artistic_direction": "One clear deterministic test direction.",
+            "concept_twist": "Original fixture with no popular basis.",
+            "structure": "sprite" if asset.kind == "sheet" else "pattern",
+            "body_strategy": "Reads at four cells, early six to seven cells, turns, growth, and headward overlap.",
+            "head_zone": "light_field_dark_core",
+            "asset_strategy": "Uses exact seamless axes and a tall row cadence when animated.",
+        },
     )
 
 

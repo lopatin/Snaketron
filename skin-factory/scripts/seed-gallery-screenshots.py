@@ -51,6 +51,7 @@ def main() -> None:
             "skill_dir": str(REPO / "skills/author-skin"),
             "capability_manifest": str(REPO / "skin-schema/capabilities-v2.json"),
             "direction": str(PACKAGE / "direction/design-direction.md"),
+            "prototype_geometry": str(REPO / "skin-schema/prototype-geometry-v1.json"),
             "gate_manifest": str(PACKAGE / "config/gates.yaml"),
         }
     )
@@ -78,6 +79,7 @@ def main() -> None:
     database = Database(state / "var/factory.sqlite3")
     database.migrate()
     objects = ObjectStore(state / "var/objects")
+    prototype_behavior = retained_prototype_geometry_behavior(objects)
 
     review_attempt, review_artifact = add_attempt(
         database,
@@ -93,6 +95,7 @@ def main() -> None:
         review_kind="prototype",
         image=snake_image("neon"),
         artifact_kind=ArtifactKind.PROTOTYPE,
+        behavior=prototype_behavior,
     )
     database.add_evaluation(
         artifact_id=review_artifact["id"],
@@ -288,6 +291,7 @@ def add_attempt(
     artifact_kind: ArtifactKind,
     purpose: Purpose = Purpose.PRODUCTION,
     review_kind: str | None = None,
+    behavior: dict | None = None,
 ) -> tuple[dict, dict]:
     seed = hashlib.sha256(name.encode()).hexdigest()[:16]
     concept = database.create_concept(
@@ -302,7 +306,7 @@ def add_attempt(
         purpose=purpose,
         stage=stage,
         idempotency_key=f"screenshot:{seed}",
-        behavior={"fixture": True, "mode": "shadow"},
+        behavior=behavior or {"fixture": True, "mode": "shadow"},
         direction_sha="fixture-direction-v2",
         skill_sha="fixture-author-skin-v2",
         capability_sha="fixture-capabilities-v2",
@@ -324,10 +328,37 @@ def add_attempt(
         object_ref=stored.uri,
         media_type="image/png",
         size_bytes=stored.size,
-        metadata={"width": 1000, "height": 320, "fixture": True},
+        metadata={
+            "width": 1000,
+            "height": 320,
+            "fixture": True,
+            **({"prototype_index": 0} if artifact_kind == ArtifactKind.PROTOTYPE else {}),
+        },
         provenance={"source": "deterministic_documentation_fixture"},
     )
     return attempt, artifact
+
+
+def retained_prototype_geometry_behavior(objects: ObjectStore) -> dict[str, object]:
+    contract_path = REPO / "skin-schema/prototype-geometry-v1.json"
+    contract_bytes = contract_path.read_bytes()
+    contract = json.loads(contract_bytes)
+    guide_path = contract_path.parent / contract["guide"]
+    guide_bytes = guide_path.read_bytes()
+    actual_guide_sha = hashlib.sha256(guide_bytes).hexdigest()
+    if contract.get("guide_sha256") != actual_guide_sha:
+        raise ValueError("documentation fixture geometry contract does not name its exact guide bytes")
+    contract_object = objects.put(contract_bytes)
+    guide_object = objects.put(guide_bytes)
+    return {
+        "fixture": True,
+        "mode": "shadow",
+        "snapshot_version": 6,
+        "prototype_geometry_sha": contract_object.sha256,
+        "prototype_geometry_ref": contract_object.uri,
+        "prototype_guide_sha": guide_object.sha256,
+        "prototype_guide_ref": guide_object.uri,
+    }
 
 
 def snake_image(style: str) -> bytes:
@@ -342,30 +373,50 @@ def snake_image(style: str) -> bytes:
     image = Image.new("RGB", (1000, 320), "#090c13")
     draw = ImageDraw.Draw(image)
     draw.rounded_rectangle((25, 25, 975, 295), radius=28, fill="#111722", outline="#293750", width=3)
-    centers = [(150 + index * 82, 160) for index in range(9)]
-    for index, (x, y) in enumerate(reversed(centers)):
-        radius = 52 if index < 7 else 46 - (index - 7) * 12
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=background, outline=shadow, width=6)
-        if style == "checker":
-            for offset in (-28, 8):
-                draw.rectangle(
-                    (x + offset, y - 42, x + offset + 22, y + 42),
-                    fill=primary if (index + offset) % 2 else highlight,
-                )
-        else:
-            draw.arc((x - 38, y - 38, x + 38, y + 38), 205, 345, fill=primary, width=13)
-            draw.arc((x - 27, y - 27, x + 27, y + 27), 30, 160, fill=highlight, width=6)
-    head_x, head_y = centers[0]
-    draw.ellipse((head_x - 61, head_y - 61, head_x + 61, head_y + 61), fill=background, outline=primary, width=7)
-    draw.ellipse((head_x - 29, head_y - 28, head_x - 14, head_y - 13), fill=highlight)
-    draw.ellipse((head_x + 14, head_y - 28, head_x + 29, head_y - 13), fill=highlight)
-    draw.arc((head_x - 27, head_y - 9, head_x + 27, head_y + 35), 20, 160, fill=primary, width=5)
-    tail_x, tail_y = centers[-1]
-    draw.polygon(
-        [(tail_x + 33, tail_y - 33), (tail_x + 86, tail_y), (tail_x + 33, tail_y + 33)],
-        fill=background,
-        outline=primary,
-    )
+
+    # Mirror the real one-cell-wide renderer silhouette instead of the old
+    # linked-circle documentation schematic. Sixteen 50px review cells form a
+    # continuous capsule; all authored texture is clipped to that body mask.
+    body_box = (90, 135, 890, 185)
+    mask = Image.new("L", image.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(body_box, radius=25, fill=255)
+    coat = Image.new("RGB", image.size, background)
+    coat_draw = ImageDraw.Draw(coat)
+    if style == "checker":
+        for index, x in enumerate(range(body_box[0], body_box[2], 25)):
+            coat_draw.rectangle(
+                (x, body_box[1], x + 25, body_box[3]),
+                fill=primary if index % 2 == 0 else highlight,
+            )
+    elif style == "ember":
+        for index, x in enumerate(range(body_box[0] - 25, body_box[2] + 25, 50)):
+            offset = 9 if index % 2 else -9
+            coat_draw.polygon(
+                [(x, 160 + offset), (x + 25, 136), (x + 50, 160 + offset), (x + 25, 184)],
+                fill=primary,
+            )
+            coat_draw.line((x, 160 + offset, x + 50, 160 + offset), fill=highlight, width=4)
+    elif style == "prism":
+        for x in range(body_box[0], body_box[2]):
+            phase = (x - body_box[0]) / (body_box[2] - body_box[0])
+            color = primary if int(phase * 12) % 2 == 0 else shadow
+            coat_draw.line((x, body_box[1], x, body_box[3]), fill=color)
+        coat_draw.line((body_box[0], 150, body_box[2], 150), fill=highlight, width=5)
+    elif style == "comet":
+        for x in range(body_box[0] - 30, body_box[2], 70):
+            coat_draw.line((x, 184, x + 55, 136), fill=primary, width=13)
+            coat_draw.line((x + 18, 184, x + 73, 136), fill=highlight, width=4)
+    else:
+        coat_draw.line((body_box[0], 160, body_box[2], 160), fill=primary, width=15)
+        for x in range(body_box[0] + 20, body_box[2], 75):
+            coat_draw.ellipse((x, 148, x + 24, 172), fill=highlight)
+            coat_draw.ellipse((x + 6, 154, x + 18, 166), fill=shadow)
+
+    image.paste(coat, mask=mask)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(body_box, radius=25, outline=primary, width=3)
+    head_x, head_y = 865, 160
+    draw.ellipse((head_x - 13, head_y - 13, head_x + 13, head_y + 13), fill=highlight, outline=primary, width=3)
     return encode_png(image)
 
 

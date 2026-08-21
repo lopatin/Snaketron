@@ -16,10 +16,15 @@ from .db import Database
 JudgeKind = Literal["prototype", "build"]
 
 PROTOTYPE_JUDGE_RUBRIC = (
-    "Judge this prototype as a game-scale Snaketron direction. Return candidate, "
-    "uncertain, or machine_rejected. Flag protected marks, public-figure likeness, "
-    "unsafe content, or an apparently unlicensed reference. Any flag routes to "
-    "machine_rejected for human review; machine judgment never approves or waives it."
+    "The first image is the pinned blank Snaketron geometry guide and the second is the candidate. "
+    "Judge the candidate as a game-scale Snaketron direction. The candidate must preserve one flat, "
+    "orthographic, right-facing, continuous one-cell-wide capsule body, a rounded one-cell head with "
+    "a small centered core, and a rounded tail. Detached or articulated pieces, gaps, perspective, "
+    "an oversized separate head, pointed tail, multiple snakes, or paint outside the round body are "
+    "machine_rejected geometry violations. Return candidate, uncertain, or machine_rejected. Flag "
+    "protected marks, public-figure likeness, unsafe content, or an apparently unlicensed reference. "
+    "Any safety/IP flag routes to machine_rejected for human review; machine judgment never approves "
+    "or waives it."
 )
 BUILD_JUDGE_RUBRIC = (
     "Compare the real Snaketron render to the human-selected prototype. Judge fidelity, "

@@ -32,6 +32,31 @@
     .actions form { min-width: 0; }
     form.inline { display: inline; }
     form.inline button { width: auto; margin-left: .6rem; padding: .3rem .6rem; }
+    .prototype-evidence-section { border-color: #426584; background: #151d29; }
+    .evidence-heading { display: flex; align-items: end; justify-content: space-between; gap: 2rem; border-bottom: 1px solid #33475d; padding-bottom: .8rem; margin-bottom: 1rem; }
+    .evidence-heading h3, .evidence-heading p { margin: 0; }
+    .evidence-heading > p { max-width: 48rem; color: #c2cada; }
+    .eyebrow { color: #70c9ff; font-size: .72rem; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    .prototype-evidence { display: grid; grid-template-columns: minmax(300px, .85fr) minmax(0, 1.65fr); gap: 1rem; }
+    .geometry-guide-card, .candidate-column { min-width: 0; border: 1px solid #344b62; border-radius: .55rem; padding: .8rem; background: #101722; }
+    .evidence-card-heading { display: flex; align-items: center; gap: .55rem; min-height: 1.7rem; margin-bottom: .7rem; }
+    .evidence-marker { display: inline-block; border: 1px solid #70c9ff; border-radius: 999px; color: #b9e3ff; padding: .12rem .45rem; font-size: .68rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .geometry-guide-frame { display: block; padding: .4rem; border: 1px dashed #67809b; border-radius: .45rem; background-color: #283444; background-image: linear-gradient(#344358 1px, transparent 1px), linear-gradient(90deg, #344358 1px, transparent 1px); background-size: 16px 16px; }
+    .geometry-guide-frame img { width: 100%; max-height: none; border-radius: .25rem; }
+    .evidence-facts { margin: .7rem 0 0; }
+    .evidence-facts div { display: grid; grid-template-columns: 8.2rem minmax(0, 1fr); gap: .5rem; padding: .4rem 0; border-bottom: 1px solid #29394b; }
+    .evidence-facts dt { color: #8fa3ba; font-size: .72rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+    .evidence-facts dd { margin: 0; }
+    .evidence-facts code, .prototype-candidate code { color: #b8c8da; font-size: .72rem; overflow-wrap: anywhere; }
+    .prototype-candidate-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .8rem; }
+    .prototype-candidate { min-width: 0; padding: .55rem; border: 1px solid #2c3c50; border-radius: .45rem; background: #0b1018; }
+    .prototype-candidate img { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; border-radius: .25rem; }
+    .prototype-candidate p { margin: .55rem 0 0; }
+    @media (max-width: 780px) {
+      .evidence-heading { display: block; }
+      .evidence-heading > p { margin-top: .65rem; }
+      .prototype-evidence { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>

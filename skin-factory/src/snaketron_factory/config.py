@@ -25,6 +25,7 @@ class PathsConfig(ConfigModel):
     skill_dir: Path = Path("../skills/author-skin")
     capability_manifest: Path = Path("../skin-schema/capabilities-v2.json")
     direction: Path = Path("direction/design-direction.md")
+    prototype_geometry: Path = Path("../skin-schema/prototype-geometry-v1.json")
     gate_manifest: Path = Path("config/gates.yaml")
     lama_manifest: Path = Path("lama/manifest.json")
     lama_model: Path = Path("var/lama/big-lama-v0.1.0.pt")

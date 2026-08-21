@@ -2,14 +2,17 @@
 
 These screenshots use deterministic disposable SQLite/object-store fixtures and
 the real authenticated FastAPI gallery. They do not contain production data or
-credentials.
+credentials. Their snake previews use the same thin, round-capped, continuous
+body geometry as the live renderer rather than the earlier linked-circle
+schematic.
 
 - `gallery-all.png` shows retained production, rejected, published, and
   experimental attempts together with visual previews and lineage state.
 - `gallery-machine-rejected.png` shows rejected prototype and completed-build
   artifacts plus the bulk retry-from-stage workflow.
-- `prototype-review-detail.png` shows an exact retained prototype, its content
-  hash/provenance, and blind-evaluation protection before a human label.
+- `prototype-review-detail.png` shows the exact behavior-pinned blank geometry
+  guide beside the candidate, contract/guide hashes, native and presentation
+  scales, retained candidate provenance, and blind-evaluation protection.
 - `soft-triage-override.png` shows a retained machine-rejected prototype and
   the exact-artifact human override, feedback-only annotation, re-evaluation,
   and linked-retry actions.
@@ -33,10 +36,10 @@ losslessly recompresses the PNGs with Pillow.
 The final PR #90 captures reproduced byte-for-byte on two consecutive runs:
 
 ```text
-d190532f193712f69b42893a746781f0383a3b36564671ce8016c2da1c996a72  gallery-all.png
-7e275adf5a757ea074dd443767c0cce6f4fb85e4ee3460d2659f6316a99e58a3  gallery-machine-rejected.png
-2c54a1beebc23d837a09da5e03ad6578fbfebc80706cc55c16815d7934322d79  prototype-review-detail.png
-c6f154fd49a822bdc6122043bf7c9561c234890681977a86d212359d07edf593  soft-triage-override.png
+cc65be2da7d38590f557e1ae4da74641757c7337a75df6717682a2e142981497  gallery-all.png
+46d0cc17bbb955e2a02be4aa0583fdad1d29b0381dabff0148067b1e883dbcf4  gallery-machine-rejected.png
+c9c9a39e88ab0f1e86674611da4ec35e02ca200eb3ff69a4e4a02bd241473aae  prototype-review-detail.png
+df1fbbb3e3b3e5fc9f78041629bcbbb1efc41a304d17b6efb15a2a916d94641f  soft-triage-override.png
 ```
 
 The retained real-run montage is:

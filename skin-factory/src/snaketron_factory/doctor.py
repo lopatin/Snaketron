@@ -82,6 +82,7 @@ class FactoryDoctor:
             )
         )
         checks.extend(self._canonical_file_checks())
+        checks.append(self._prototype_geometry_check())
         checks.extend(self._credential_checks(identity))
         checks.append(self._database_check())
         checks.append(self._object_store_check())
@@ -150,6 +151,7 @@ class FactoryDoctor:
             "capability_manifest": self.config.paths.capability_manifest,
             "design_direction": self.config.paths.direction,
             "gate_manifest": self.config.paths.gate_manifest,
+            "prototype_geometry_contract": self.config.paths.prototype_geometry,
         }
         return [
             DoctorCheck(
@@ -159,6 +161,20 @@ class FactoryDoctor:
             )
             for name, path in paths.items()
         ]
+
+    def _prototype_geometry_check(self) -> DoctorCheck:
+        try:
+            contract_payload, guide, contract = self.factory._current_prototype_geometry()
+            contract_sha = hashlib.sha256(contract_payload).hexdigest()
+            guide_sha = hashlib.sha256(guide).hexdigest()
+            source = contract.get("renderer_source", {})
+            detail = (
+                f"{contract.get('id')} contract sha256:{contract_sha}; guide sha256:{guide_sha}; "
+                f"{source.get('body_cells')} cells at {source.get('native_cell_px')}px native"
+            )
+            return DoctorCheck(name="prototype_geometry", ok=True, detail=detail)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+            return DoctorCheck(name="prototype_geometry", ok=False, detail=_safe_error(error))
 
     def _credential_checks(self, identity: DoctorIdentity) -> list[DoctorCheck]:
         required: set[str] = set()

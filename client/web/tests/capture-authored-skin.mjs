@@ -21,6 +21,7 @@ import {
   browserRuntimeEnvironment,
   fetchPrivateSkin,
 } from "./renderer-process-environment.mjs";
+import { validateAuthoredSkinCaptureFixtures } from "./authored-skin-capture-contract.mjs";
 
 const [webUrl, apiUrl, contentRef, outputDir] = process.argv.slice(2);
 const token = process.env.SNAKETRON_FACTORY_SERVICE_TOKEN;
@@ -111,11 +112,14 @@ const document = await fetchPrivateSkin(
   token,
 );
 const periodMs = Number(JSON.parse(document).period_ms || 1000);
+const fixtures = await page.evaluate(() =>
+  JSON.parse(window.wasm.skinFixtures()),
+);
+const capturePlan = validateAuthoredSkinCaptureFixtures(fixtures);
 
 const setup = await page.evaluate(
-  ({ ref, documentJson, periodMs }) => {
+  ({ ref, documentJson, periodMs, fixtures, capturePlan }) => {
     window.wasm.registerAuthoredSkin(ref, documentJson);
-    const fixtures = JSON.parse(window.wasm.skinFixtures());
     const root = document.createElement("main");
     root.id = "factory-skin-evidence";
     root.style.cssText =
@@ -126,26 +130,21 @@ const setup = await page.evaluate(
     const poseByName = Object.fromEntries(
       fixtures.poses.map((pose) => [pose.name, pose]),
     );
-    const requestedPoses = [
-      "single_cell",
-      "short_straight",
-      "longer_than_head_gradient",
-      "zigzag",
-    ].filter((name) => poseByName[name]);
+    const requestedPoses = capturePlan.poses;
     const tiles = [];
-    const add = (pose, role, animMs, boost, dead, label) => {
+    const add = (pose, role, animMs, boost, dead, label, cellSize = 15) => {
       const fixture = poseByName[pose];
       const figure = document.createElement("figure");
       figure.style.margin = "0";
       const canvas = document.createElement("canvas");
-      canvas.width = Math.max(220, (fixture.cellsWide + 4) * 16);
-      canvas.height = Math.max(160, (fixture.cellsHigh + 4) * 16);
+      canvas.width = Math.max(220, (fixture.cellsWide + 4) * cellSize);
+      canvas.height = Math.max(160, (fixture.cellsHigh + 4) * cellSize);
       canvas.dataset.label = label;
       const caption = document.createElement("figcaption");
       caption.textContent = label;
       figure.append(canvas, caption);
       root.append(figure);
-      tiles.push({ canvas, pose, role, animMs, boost, dead, label });
+      tiles.push({ canvas, pose, role, animMs, boost, dead, label, cellSize });
     };
 
     for (const role of fixtures.roles) {
@@ -153,6 +152,16 @@ const setup = await page.evaluate(
     }
     for (const pose of requestedPoses)
       add(pose, "own", 0, false, false, `pose: ${pose}`);
+    for (const cellSize of capturePlan.liveCellSizes)
+      add(
+        "starting_length",
+        "own",
+        0,
+        false,
+        false,
+        `live scale: ${cellSize}px/cell`,
+        cellSize,
+      );
     add(
       "longer_than_head_gradient",
       "enemy",
@@ -182,7 +191,7 @@ const setup = await page.evaluate(
           ref,
           tile.pose,
           tile.role,
-          16,
+          tile.cellSize,
           tile.boost,
           tile.dead,
           tile.animMs + clockOffset,
@@ -204,10 +213,11 @@ const setup = await page.evaluate(
     return {
       poses: requestedPoses,
       roles: fixtures.roles,
+      liveCellSizes: capturePlan.liveCellSizes,
       tiles: tiles.length,
     };
   },
-  { ref: contentRef, documentJson: document, periodMs },
+  { ref: contentRef, documentJson: document, periodMs, fixtures, capturePlan },
 );
 
 await page.waitForFunction(

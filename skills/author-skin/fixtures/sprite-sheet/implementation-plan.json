@@ -1,6 +1,14 @@
 {
   "path": "sprite_sheet",
   "rationale": "Distinct drawn caustic states need frames; the 41-cell repeat and 48-frame loop are independent decisions.",
+  "design_guidelines": {
+    "artistic_direction": "A calm illustrated water surface whose caustics morph in place.",
+    "concept_twist": "A familiar pool-caustic texture becomes a continuous, role-readable moving snake surface.",
+    "structure": "sprite",
+    "body_strategy": "Caustics stay broad enough to read at 4 cells, develop by 6-7 cells, and tile through long turns while the head glow retains head-over-tail priority.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Request a production-quality 20 fps sheet with 48 derived rows; both x and final-to-zero y joins must be seamless, with a complete calm row zero."
+  },
   "fidelity_features": [
     "morphing caustic shapes without whole-image translation",
     "calm complete resting frame",

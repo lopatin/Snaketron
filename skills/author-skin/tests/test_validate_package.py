@@ -14,8 +14,122 @@ class PackageValidationTests(unittest.TestCase):
     def test_repository_package_is_valid(self):
         self.assertEqual(validator.validate_package(), [])
 
+    def test_skin_design_guidelines_are_required_and_optimizer_locked(self):
+        boundary = validator.read_json(validator.PACKAGE / "optimization-boundary.json")
+        guideline_path = "references/design-guidelines.md"
+        self.assertIn(guideline_path, boundary["locked_paths"])
+        self.assertNotEqual(guideline_path, boundary["editable_path"])
+
+        skill = (validator.PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "[Skin Design Guidelines](references/design-guidelines.md)", skill
+        )
+        self.assertIn("completely and apply", skill)
+        validation = (validator.PACKAGE / "references/validation.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("`design_guidelines` object", validation)
+
+        guidelines = (validator.PACKAGE / guideline_path).read_text(encoding="utf-8")
+        self.assertEqual(guidelines.count(validator.DESIGN_GUIDELINE_START), 1)
+        self.assertEqual(guidelines.count(validator.DESIGN_GUIDELINE_END), 1)
+
+    def test_locked_guidelines_preserve_renderer_truth(self):
+        guidelines = (validator.PACKAGE / "references/design-guidelines.md").read_text(
+            encoding="utf-8"
+        )
+        locked = guidelines.split(validator.DESIGN_GUIDELINE_START, 1)[1].split(
+            validator.DESIGN_GUIDELINE_END, 1
+        )[0]
+        for term in (
+            "DEFAULT_SNAKE_LENGTH",
+            "GameArena.tsx",
+            "one-cell-wide path that continuously",
+            "5–15 CSS px",
+            "canonical texel density of a sprite-sheet cell",
+            "coats and overlays use 64 texels per cell",
+            "compressed head, turn, and tail points",
+            "Manhattan arc",
+            "not a visual cell plate",
+            "light_field_dark_core",
+            "dark_field_light_disc_dark_core",
+        ):
+            self.assertIn(term, locked)
+
+    def test_geometry_authority_handoff_is_required_in_both_references(self):
+        references = (
+            validator.PACKAGE / "references/design-guidelines.md",
+            validator.PACKAGE / "references/prototypes.md",
+        )
+        for path in references:
+            text = path.read_text(encoding="utf-8")
+            for term in (
+                "prototype_geometry",
+                "prototype_geometry_guide",
+                "artifact_refs",
+                "authoring_inputs",
+                "exact inline guide bytes",
+                "contract_sha256",
+                "guide_sha256",
+                "prototype_geometry_sha256",
+                "prototype_guide_sha256",
+                "invalid_input",
+            ):
+                self.assertIn(term, text, f"{path}: missing {term}")
+
+    def test_plan_requires_exact_bounded_design_guideline_evidence(self):
+        fixture = validator.PACKAGE / "fixtures/layers"
+        manifest = validator.read_json(fixture / "prototype-manifest.json")
+        approval = validator.read_json(fixture / "approval.json")
+        plan = validator.read_json(fixture / "implementation-plan.json")
+
+        missing = copy.deepcopy(plan)
+        missing.pop("design_guidelines")
+        errors = []
+        validator.validate_plan(missing, manifest, approval, "probe", errors)
+        self.assertTrue(
+            any("design_guidelines must be an object" in error for error in errors),
+            errors,
+        )
+
+        malformed = copy.deepcopy(plan)
+        malformed["design_guidelines"]["unexpected"] = "not allowed"
+        malformed["design_guidelines"]["artistic_direction"] = " "
+        malformed["design_guidelines"]["body_strategy"] = "x" * 321
+        malformed["design_guidelines"]["structure"] = "mixed"
+        malformed["design_guidelines"]["head_zone"] = "white_head_core"
+        errors = []
+        validator.validate_plan(malformed, manifest, approval, "probe", errors)
+        for expected in (
+            "design_guidelines fields drifted",
+            "artistic_direction must be a non-empty string",
+            "body_strategy exceeds 320 characters",
+            "design_guidelines.structure is invalid",
+            "design_guidelines.head_zone is invalid",
+        ):
+            self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_plan_schema_cannot_relax_the_guideline_boundary(self):
+        schema = copy.deepcopy(
+            validator.read_json(
+                validator.PACKAGE / "schemas/implementation-plan.schema.json"
+            )
+        )
+        schema["$defs"]["designGuidelines"]["additionalProperties"] = True
+        schema["$defs"]["designGuidelines"]["properties"]["body_strategy"][
+            "maxLength"
+        ] = 321
+        errors = []
+        validator.validate_implementation_plan_schema(schema, errors)
+        self.assertTrue(any("forbid extra fields" in error for error in errors), errors)
+        self.assertTrue(
+            any("bound drifted: body_strategy" in error for error in errors), errors
+        )
+
     def test_safety_ip_invariants_live_inside_the_locked_contract(self):
-        contract = (validator.PACKAGE / "references/contract.md").read_text(encoding="utf-8")
+        contract = (validator.PACKAGE / "references/contract.md").read_text(
+            encoding="utf-8"
+        )
         locked = contract.split("<!-- FACTORY_LOCKED:START -->", 1)[1].split(
             "<!-- FACTORY_LOCKED:END -->", 1
         )[0]
@@ -144,7 +258,10 @@ class PackageValidationTests(unittest.TestCase):
         errors = []
         validator.validate_plan(plan, manifest, approval, "probe", errors)
         self.assertTrue(
-            any("width exceeds the current capability bound" in error for error in errors),
+            any(
+                "width exceeds the current capability bound" in error
+                for error in errors
+            ),
             errors,
         )
 

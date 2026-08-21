@@ -9,6 +9,7 @@
     "agents/openai.yaml",
     "optimization-boundary.json",
     "references/contract.md",
+    "references/design-guidelines.md",
     "references/integration.md",
     "references/layers-effects.md",
     "references/prototypes.md",

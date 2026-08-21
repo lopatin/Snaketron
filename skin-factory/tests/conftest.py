@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sys
 from collections.abc import Callable
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from snaketron_factory.config import FactoryConfig
 from snaketron_factory.db import Database
@@ -42,6 +44,12 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text("# Test authoring contract\n", encoding="utf-8")
     (skill / "playbook.md").write_text("Prefer clear, small-scale silhouettes.\n", encoding="utf-8")
+    references = skill / "references"
+    references.mkdir()
+    (references / "design-guidelines.md").write_text(
+        "# Skin Design Guidelines\nKeep one continuous thin rounded snake body.\n",
+        encoding="utf-8",
+    )
     schemas = skill / "schemas"
     schemas.mkdir()
     (schemas / "asset-request.schema.json").write_text(
@@ -77,6 +85,31 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
         for name in GATE_NAMES
     )
     gates.write_text(f"version: 1\ngates:\n{entries}\n", encoding="utf-8")
+
+    geometry_dir = repo / "skin-schema"
+    geometry_fixtures = geometry_dir / "fixtures"
+    geometry_fixtures.mkdir(parents=True)
+    guide_buffer = io.BytesIO()
+    Image.new("RGB", (16, 9), (255, 255, 255)).save(guide_buffer, format="PNG")
+    guide = guide_buffer.getvalue()
+    guide_path = geometry_fixtures / "prototype-guide.png"
+    guide_path.write_bytes(guide)
+    geometry = geometry_dir / "prototype-geometry.json"
+    geometry.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "id": "prototype-geometry-test-v1",
+                "guide": "fixtures/prototype-guide.png",
+                "guide_sha256": hashlib.sha256(guide).hexdigest(),
+                "guide_canvas": {"width_px": 16, "height_px": 9},
+                "renderer_source": {"fixture": "straight_16"},
+                "invariants": ["one continuous capsule"],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
     # Browser evidence is accepted only against an exact cached HTML/JS/WASM
     # build.  Keep the fixture deliberately tiny while exercising that pin.
@@ -130,6 +163,7 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
                 "skill_dir": str(skill),
                 "capability_manifest": str(capability),
                 "direction": str(direction),
+                "prototype_geometry": str(geometry),
                 "gate_manifest": str(gates),
                 "lama_manifest": str(lama_project / "manifest.json"),
                 "lama_model": str(lama_model),
