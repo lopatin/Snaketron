@@ -11,7 +11,9 @@
 
 ## 1. Executive decision
 
-Build the factory as an **agentic pipeline whose every stage is a separately versioned, separately evaluable artifact** — DSPy's program-of-modules discipline without DSPy as the runtime — and apply **GEPA where GEPA is actually affordable**: first to the judge rubrics (one LLM call per rollout, metric = agreement with Alex's recorded decisions), then to execution-stage prompts (metric = the deterministic gate stack that already exists), and only later to ideation (metric = the judge panel, once the judges have *earned* metric status by demonstrated agreement with Alex). Everything the human gates — the whole-pipeline level where one decision costs Alex a review — runs the same reflective move GEPA makes, but as a **single-sample Reflexion retrospective**: read the trace, root-cause the failure to the artifact that should have prevented it, edit that artifact, validate the edit against held-out labeled data.
+Build the factory as an **agentic pipeline whose every stage is a separately versioned, separately evaluable artifact** — DSPy's program-of-modules discipline without DSPy as the runtime — and apply **GEPA where GEPA is actually affordable**: first to the judge rubrics (one LLM call per rollout, metric = agreement with Alex's recorded decisions), then to execution-stage prompts (metric = the deterministic gate stack that already exists, plus a frozen craft judge for what gates cannot see), and only later to ideation (metric = the calibrated judges, once they have *earned* metric status by demonstrated agreement with Alex). Everything the human gates — the whole-pipeline level where one decision costs Alex a review — runs the same reflective move GEPA makes, but as a **single-sample Reflexion retrospective**: read the trace, root-cause the failure to the artifact that should have prevented it, edit that artifact, validate the edit against held-out labeled data.
+
+**Where the intelligence lives — two homes, one workspace.** Claude is scaffolding, not a runtime dependency. It is used interactively in Claude Code, with Alex present, to build the factory, run calibration (M0–M1), and periodically maintain it. The production loop that ships skins runs **entirely in Hermes on the local model** (qwen via LM Studio), reading the same `skin-factory/` workspace in the repo. The bridge between the two is GEPA itself: run 2 optimizes the build-stage prompts *for the local task model* — reflection by Claude, execution by qwen, scored by the deterministic gates and a frozen craft judge — which is precisely the distillation step that makes a small local model viable as the production executor. "Export to Hermes" is therefore not a packaging step but a **phase flip**: when the export gate (section 12.2) passes — holdout briefs build green under the local model, a judge configuration clears the agreement threshold — `config.yaml` flips to production and Hermes takes over. Claude reappears only in maintenance sessions Alex starts (section 11.6), which drain the escalation queue and re-run GEPA when the loop's own alarms ask for it.
 
 The direct answers to the framing questions:
 
@@ -61,7 +63,7 @@ Skins are Snaketron's content treadmill, and today each one costs a full human-s
 
 **Specced but not landed (PR #84, open):** SkinDoc schema v2 (patterns/images/text as document vocabulary), the Texture entity and S3 ladder, skin submission APIs, the admin review gate with publication/`pending_revision` as separate dimensions, content addressing. The factory's production phases depend on a subset of this (section 10.3); its calibration phase does not (section 12.1).
 
-**Missing entirely (this PRD's scope):** the judge panel and its calibration machinery; the ideation engine and catalog; the stage decomposition of execution with GEPA harnesses; review-decision feedback capture and the decision feed; the assimilation engine; the Hermes loop skill; the factory workspace.
+**Missing entirely (this PRD's scope):** the judges and their calibration machinery; the ideation engine and catalog; the stage decomposition of execution with GEPA harnesses; review-decision feedback capture and the decision feed; the assimilation engine; the Hermes loop skill; the factory workspace.
 
 ## 5. The training question, answered precisely
 
@@ -77,9 +79,9 @@ GEPA (Agrawal et al., arXiv:2507.19457) evolves the instruction text of a progra
 
 | Stage | Rollout cost | μ available? | Verdict |
 | --- | --- | --- | --- |
-| Judge scoring (rubric text → verdict on one example) | 1 LLM call, ~$0.01, seconds | Yes, from day one: agreement with Alex's recorded decision on that example | **True GEPA, immediately.** The cheapest rollouts and the cleanest metric in the whole system. |
-| Execution stages (brief → doc/assets → render) | Agent episode, ~$2–8, 10–30 min | Yes: the deterministic gate stack (validator errors, op counts, seam/detail/chroma ratios, conformance results) — dense, textual, hard to game | **True GEPA, budget-limited.** ~100 rollouts ≈ a weekend and low hundreds of dollars. Run offline between phases, not inline. |
-| Ideation (seed → brief) | 1–3 LLM calls, cheap | Only after calibration: the judge panel is μ *only once it demonstrably agrees with Alex* (κ ≥ 0.7 holdout, section 7.4) | **True GEPA, gated on judge calibration.** Before that, optimizing ideation against uncalibrated judges optimizes toward a rubric nobody validated. |
+| Judge scoring (rubric text → verdict on one example) | 1 LLM call, near-free locally (~$0.01 only under the API fallback), seconds | Yes, from day one: agreement with Alex's recorded decision on that example | **True GEPA, immediately.** The cheapest rollouts and the cleanest metric in the whole system. |
+| Execution stages (brief → doc/assets → render) | Driver-run pipeline with LLM creative slots, 10–30 min; near-free once the task LM is local | Yes: the deterministic gate stack (validator errors, op counts, seam/detail/chroma ratios, conformance results) — dense, textual, hard to game | **True GEPA, with the local model as task LM.** ~100 rollouts ≈ a weekend of local compute plus Claude reflection calls. Run offline in maintenance sessions, not inline. |
+| Ideation (seed → brief) | 1–3 LLM calls, cheap | Only after calibration: the judges are μ *only once they demonstrably agree with Alex* (the 7.4 holdout agreement gate) | **True GEPA, gated on judge calibration.** Before that, optimizing ideation against uncalibrated judges optimizes toward a rubric nobody validated. |
 | Whole pipeline (seed → approved skin) | Build + **one Alex review** | No. μ is a human; ~17 calibration instances; each rollout costs the scarcest resource | **Not GEPA.** Reflexion retrospective per decision (section 11) — the same reflective move, batch size 1, audited. |
 
 This ordering is the answer to "calibrate (and/or train?) the judges": *calibrate*, meaning optimize their rubric text against Alex's frozen decisions — which is training in the GEPA sense and requires no weights. Fine-tuning a judge model is unjustified below several hundred labels and would freeze taste into weights that can't be diffed or audited.
@@ -88,21 +90,21 @@ This ordering is the answer to "calibrate (and/or train?) the judges": *calibrat
 
 If Alex runs the DSPy program himself, these are the signatures. Each row is a DSPy module (or an agent episode wrapped to look like one); the *genome* column is what GEPA rewrites.
 
-**Judge (per dimension d):**
-- **Input x:** artifact under judgment (brief text, or contact-sheet images + doc summary), design-direction doc, dimension rubric.
-- **Output y:** per-dimension score 1–5, verdict ∈ {approve, reject}, critique text.
-- **μ:** verdict agreement with Alex's decision on labeled example x (train split); report κ on holdout.
+**Judge (concept or craft):**
+- **Input x:** artifact under judgment (brief text, or contact-sheet images + doc summary), design-direction doc, the judge's rubric.
+- **Output y:** structured sub-scores 1–5 (the rubric's dimensions), verdict ∈ {approve, reject}, critique text.
+- **μ:** verdict agreement with Alex's decision on labeled example x (train split); report agreement and the false-approve/false-reject split on holdout.
 - **μf:** where they disagreed, Alex's recorded reason vs. the judge's critique.
-- **Genome:** the dimension's rubric text.
+- **Genome:** the judge's rubric text (GEPA may rewrite individual sub-sections).
 
 **Ideation:**
 - **Input x:** seed (fan-out entry, trend, or open), design-direction doc, catalog digest (recent + nearest concepts with outcomes), active ideation lessons.
 - **Output y:** brief = `{name, description}` in the eval-set register (2–6 sentences naming structure: head/body/tail treatment, pattern vs sprite, palette intent, motion intent).
-- **μ (post-calibration):** concept-judge panel score + novelty distance (section 8.2).
+- **μ (post-calibration):** calibrated concept-judge score + novelty distance (section 8.2).
 - **μf:** judge critiques + nearest-neighbor collision report.
 - **Genome:** the ideation prompt and the brief-writing rubric.
 
-**Build (the agent episode, treated as one module):**
+**Build (the driver-run pipeline, treated as one module):**
 - **Input x:** brief, design-direction doc, active execution lessons, platform constraints digest.
 - **Output y:** skin bundle = SkinDoc (+ texture PNGs if sprite) + contact sheet + gate report.
 - **μ:** weighted gate pass rate: validator clean, op count ≤ 200, seam ≤ target, detail/chroma in band, conformance green, goldens untouched, palette distances ≥ 0.10 — plus craft-judge score on the render.
@@ -112,10 +114,10 @@ If Alex runs the DSPy program himself, these are the signatures. Each row is a D
 ### 5.4 The three sanctioned GEPA runs
 
 1. **Judge rubrics** (during and after calibration, repeatable): μ = train-split agreement; promotion gate = holdout agreement did not regress. First run as soon as ≥ 40 labeled decisions exist (~2 calibration rounds over 17 briefs).
-2. **Execution stage prompts** (between phases M1→M2 and on execution-regression halts): μ = deterministic gates + frozen craft judge; instances = the 13 calibration briefs; holdout = the 4 holdout briefs (section 7.3) which GEPA never sees.
-3. **Ideation prompt** (M2+, once judge κ ≥ 0.7 holds for two consecutive audits): μ = calibrated concept panel + novelty; holdout = a reserved seed list.
+2. **Execution stage prompts** (between phases M1→M2 and on execution-regression halts): **task LM = the local production model, reflection LM = Claude** — this run is the export step's engine (section 12.2), the point where Claude's craft is distilled into prompts the local model executes well. μ = deterministic gates + frozen craft judge; instances = the 13 calibration briefs; holdout = the 4 holdout briefs (section 7.3) which GEPA never sees.
+3. **Ideation prompt** (M2+, once the 7.4 holdout agreement gate has held for two consecutive audits): μ = calibrated concept judge + novelty; holdout = a reserved seed list.
 
-Each run is an offline batch job with an explicit cost cap, its config and result committed to the audit log. GEPA never runs inline in the production loop, and no GEPA run's μ includes a judge whose rubric changed since its last validation.
+Each run is an offline batch job with an explicit cost cap, its config and result committed to the audit log. GEPA runs happen inside Claude Code calibration or maintenance sessions, never inside the Hermes loop, and no GEPA run's μ includes a judge whose rubric changed since its last validation.
 
 ## 6. System architecture
 
@@ -139,20 +141,26 @@ Each run is an offline batch job with an explicit cost cap, its config and resul
               lessons     │  route to artifact, validate, apply, audit) │
                           └─────────────────────────────────────────────┘
 
-   Orchestration: Hermes cron (local model) drives the state machine and dispatches
-   each box to Claude Code (`claude -p`) or to pinned-model API calls (judges).
+   Orchestration: in production (M2+) everything above runs in Hermes on the local
+   model over deterministic rails; Claude appears only in the calibration phase and
+   in maintenance sessions Alex starts in Claude Code.
 ```
 
-### 6.1 Who runs what
+### 6.1 Who runs what — two homes, one workspace
 
-| Component | Runtime | Model | Why |
+Design constraint, stated once: **no Claude and no API LLM in the production loop.** The two exceptions are data-plane, not intelligence: image generation (no local image model exists here), and judges *only if* calibration proves the local model cannot clear the agreement threshold (the fallback is a recorded export-gate decision, not a default).
+
+| Activity | Runtime | Model | When |
 | --- | --- | --- | --- |
-| Loop driver (state machine, polling, caps, notifications) | Hermes cron skill | Local qwen (Hermes default) | Always-on, cheap; makes no quality-bearing decisions |
-| Ideation, retrospectives | `claude -p` headless session | Claude (session default) | Needs repo + ledger context and judgment |
-| Build | `claude -p` with `author-skin`-derived stage skills | Claude | Tool-using agent episode: validators, renders, screenshots |
-| Judges | Direct API calls | **Pinned** model + version per judge | Reproducibility of μ; a silent model upgrade would invalidate calibration |
-| Image generation | API | `gemini-3.1-flash-image` (Nano Banana 2) for iteration; `gemini-3-pro-image` for final assets when flash quality is insufficient; never 2.5 | Standing preference; the Notion plan's "Gemini 3 Pro Image" maps to the finals tier |
-| GEPA runs | Offline Python (DSPy) | Reflection LM: Claude; task LMs as above | Section 5.4 |
+| Factory construction; calibration builds; M0–M1 retrospectives; GEPA reflection; maintenance sessions | Claude Code, interactive (sessions Alex starts — like this one) | Claude | M0–M1, then periodic maintenance (11.6) |
+| Loop driver (sequencing `factory` subcommands, retrospective routing, notification prose — no arithmetic, no direct ledger writes) | Hermes cron skill | Local qwen | M2+ |
+| Ideation, build creative slots, self-review orchestration, low-risk retrospectives (11.5) | Hermes-dispatched local sessions with GEPA-optimized prompts | Local qwen | M2+ |
+| Mechanical rails: build stages (asset tooling, validation, render, capture, packaging) **and** tick bookkeeping (`factory ingest\|metrics\|halt-check\|append\|budget\|commit-tick` — polling and cursors, ledger appends, agreement math, halt evaluation, spend metering with hard refusal of over-budget external calls, the per-tick state commit) | The `factory` CLI driver — deterministic Python/Rust, no LLM at all | — | Always |
+| Judges | Local qwen first — verified feasible: the pinned local model serves a vision projector (probed against the running LM Studio server), so craft judging of contact-sheet images stays local. API model only as a recorded export-gate fallback; either way **pinned** (model + version/quant) because a silent change invalidates calibration | Calibrated per-model (7.4) | Always |
+| Image generation | Gemini API — `gemini-3.1-flash-image` (Nano Banana 2) for iteration, `gemini-3-pro-image` for finals; never 2.5 | — | Always (the one unavoidable external call) |
+| GEPA runs | Offline DSPy jobs inside Claude Code sessions | Reflection LM: Claude; task LM: whatever will run in production (5.4) | Calibration + maintenance only |
+
+Why a 3B-active local model can hold the build: the pipeline is **deterministic rails with narrow creative slots**. The `factory` driver does everything mechanical — invoking the image API, `sprite_sheet.py`, the validator, the render harness — and the LLM is consulted only at defined decision points (structure plan, image prompts, document field values, repair choices), each with a GEPA-tuned prompt optimized *for that model* against the gates. The gates then verify everything the model produced. A small model inside verified rails is a different proposition from a small model running free.
 
 ### 6.2 The artifact registry — every mutable thing, who may change it, what validates the change
 
@@ -162,40 +170,35 @@ This table is the heart of the self-improvement design. **Only the target artifa
 | --- | --- | --- | --- |
 | `design-direction.md` (taste spec) | `skin-factory/direction/` | Alex directly; assimilation may **propose** (PR-style diff surfaced to Alex) | Alex's sign-off, always — taste changes are never auto-applied |
 | Judge rubrics | `skin-factory/judges/*.md` | GEPA calibration runs; assimilation (calibration passes only) | Frozen labeled set: train-split improvement AND no holdout regression |
-| Ideation prompt + brief rubric | `skin-factory/prompts/ideation/` | GEPA (run 3); assimilation lessons | Concept-panel score on reserved seeds must not regress |
-| Execution stage prompts | `skin-factory/prompts/build/` | GEPA (run 2); assimilation lessons | Deterministic gates on the 4 holdout briefs must not regress |
-| `author-skin` skill + checklists | `.claude/skills/author-skin/` | Assimilation, as ordinary reviewed commits | Repo review; conformance + goldens stay green |
+| Ideation prompt + brief rubric | `skin-factory/prompts/ideation/` | GEPA (run 3); assimilation lessons — maintenance sessions only | Concept-judge score on reserved seeds must not regress |
+| Execution stage prompts | `skin-factory/prompts/build/` | GEPA (run 2); assimilation lessons — maintenance sessions only | Deterministic gates on the 4 holdout briefs must not regress, executed by the production task LM |
+| `author-skin` skill + checklists | `.claude/skills/author-skin/` | Maintenance sessions, as ordinary reviewed commits | Repo review; conformance + goldens stay green |
 | Deterministic gates (new checks) | validator / test suites / tools | Assimilation → **spawned as repo tasks with tests** | Normal CI; a gate change that fails existing skins needs explicit adjudication |
-| Lessons ledger, catalog, decisions | `skin-factory/state/` | Append-only by their owning stages | Schema check; never rewritten, only superseded |
+| Lessons ledger, catalog, decisions, escalation queue | `skin-factory/state/` | Append-only by their owning stages | Schema check; never rewritten, only superseded |
 | Audit log | `skin-factory/state/audit.md` | Append-only, every mutation above logs here | Never edited |
 | This PRD, the Hermes skill | `specs/`, `hermes/skills/` | Humans (and proposals) | Repo review |
 
 Hard rules inherited from the self-improvement literature, non-negotiable here: judges and the processes they evaluate are edited in separate passes (an assimilation triggered by a failing skin may never touch a judge to make that skin pass); every self-modification is a diff in git plus an audit-log row; holdout data gates every promotion; cost caps are enforced by the driver, not by convention.
 
-## 7. Judge panel and calibration
+## 7. Judges and calibration
 
-### 7.1 The panel
+### 7.1 The judges
 
-Two sub-panels, judging different objects at different times:
+**Two calibrated judges**, not a panel of seven. Seven separately-tuned rubrics, each calibrated against Alex's single approve/reject label, is over-parameterized for a ~40-label budget: a narrow judge (say, IP risk) can only "agree with Alex" by learning to predict overall approval, so per-dimension calibration either overfits the 13 calibration briefs or converges on seven copies of one approval predictor. Instead, each judge is one rubric with **structured sub-scores**, one calibrated verdict, and one agreement number — GEPA can still rewrite individual sub-sections, and Alex's recorded reason (not the sub-score split) is the real μf.
 
-**Concept judges** (pre-build, on briefs — cheap, run on every candidate):
+**Concept judge** (pre-build, on briefs — cheap, run on every candidate). Sub-scores:
 
-| Judge | Question | Notes |
+| Sub-score | Question | Notes |
 | --- | --- | --- |
-| Uniqueness | Is this meaningfully distinct from everything in the catalog? | Receives the nearest-neighbor report (section 8.2); scores the *twist*, not just distance |
-| Direction fit | Is it "chill" and confidently in one artistic direction, per the guidelines? | The operational definition of *chill* is seeded in 7.5 and owned by calibration |
-| Feasibility | Can the pipeline express it well? Pattern vs sprite correctly chosen; repeat length sane; reads at 16px cells; head/tail treatment respects the 1.5-cell light/dark rule; op budget plausible | Encodes the craft constraints so bad briefs die before costing a build |
-| IP risk | Does it use a protected mark/likeness, or the style-not-mark transform? | The Notion Hello Kitty entry is the worked example: style yes, mark no. Celebrity fan-out requires likeness caution |
+| Uniqueness | Meaningfully distinct from everything in the catalog? | Receives the nearest-neighbor report (8.2); scores the *twist*, not just distance |
+| Direction fit | "Chill" and confidently in one artistic direction, per the guidelines? | The operational definition of *chill* is seeded in 7.5 and owned by calibration |
+| Feasibility | Can the pipeline express it well? Pattern vs sprite; repeat length; reads at 16px cells; head/tail respects the 1.5-cell light/dark rule; op budget plausible | Encodes the craft constraints so bad briefs die before costing a build |
 
-**Craft judges** (post-build, on the contact sheet + doc summary):
+Plus an **IP-risk flag** — deliberately *uncalibrated*: protected mark/likeness vs the style-not-mark transform (the Notion Hello Kitty entry is the worked example; celebrity fan-out requires likeness caution). It is not scored against Alex's verdicts; anything flagged goes to the queue with the flag visible (8.4), so Alex's decision calibrates the *policy*, not the flag.
 
-| Judge | Question |
-| --- | --- |
-| Guideline conformance | Head light/dark rule with correct core color; no seams; team sides legible; readable at cell sizes 5–15; production quality, no mush |
-| Brief fidelity | Does the render deliver what the brief promised — the named structure, palette, and motion? |
-| Overall quality | Would this embarrass us on the Skins page? The catch-all that calibration teaches |
+**Craft judge** (post-build, on the contact sheet + doc summary — this judge reads images, which the pinned local model can do, per 6.1). Sub-scores: guideline conformance (head light/dark rule with correct core color; no seams; team sides legible; readable at cell sizes 5–15; no mush), brief fidelity (does the render deliver the named structure, palette, and motion?), and overall quality (would this embarrass us on the Skins page? — the catch-all that calibration teaches).
 
-Protocol for all judges: pinned model and version; structured output (per-dimension 1–5, verdict, critique — the critique is μf); blind to which pipeline version produced the input; pairwise comparisons (used in ideation tournaments) always run both orders, and an order-flip disagreement rate above 25% in any batch is a halt-and-audit signal, not noise to average away.
+Protocol for both: pinned model and version; structured output (sub-scores 1–5, verdict, critique — the critique is μf); blind to which pipeline version produced the input; absolute rubric scoring only (no pairwise mode — see 8.1).
 
 ### 7.2 Calibration = Notion Training steps 1–3, instrumented
 
@@ -203,11 +206,11 @@ Each calibration round: build every non-holdout eval brief through the current p
 
 ### 7.3 The split
 
-Of the 17 eval briefs: **13 calibration** (judges and GEPA see them), **4 holdout** (never used to tune anything; used only to gate promotions). Suggested holdouts, chosen to cover the structural space: one pure-sprite (surfing), one pattern (shark), one head/tail-anchored (wizard wand), one full-scene (christmas). Alex may swap the assignment before round 1; after round 1 the split is frozen. Production-phase decisions (section 10) continuously grow the labeled set, with every 5th decision assigned to holdout.
+Of the 17 eval briefs: **13 calibration** (judges and GEPA see them), **4 holdout** (never used to tune anything; used only to gate promotions). Suggested holdouts, chosen to cover the structural space: one pure-sprite (surfing), one pattern (shark), one head/tail-anchored (wizard wand), one full-scene (christmas). Alex may swap the assignment before round 1; after round 1 the split is frozen. Production-phase decisions (section 10) continuously grow the labeled set, with **every 5th decision assigned to holdout at ingest, before any retrospective runs** — and holdout-assigned decisions are *record-only*: decision row and catalog status, no lesson, no exemplar, no escalation content beyond a count. A holdout that feeds lessons or rubric edits isn't held out; this is the line that keeps rail 2 real. The halt-time holdout bisect likewise reports only pass/fail per brief plus the suspect change, never the holdout build traces.
 
 ### 7.4 The standing metric
 
-Judge–Alex agreement (raw + Cohen's κ) on the trailing 20 decisions and on holdout, recomputed at every decision and reported in the audit log. **κ ≥ 0.7 on holdout** is the gate for: using judges as GEPA μ for ideation; entering cruise phase. Trailing agreement < 60% at any point triggers a recalibration pass and pauses submissions.
+Judge–Alex agreement on the trailing 20 decisions and on holdout, recomputed at every decision (by `factory metrics`, deterministically) and reported in the audit log — as **raw agreement plus the error split**, false-approves and false-rejects counted separately, because the two directions cost differently: a false-approve pollutes the queue with Alex's time, a false-reject silently narrows the factory's taste. The **agreement gate** is: holdout raw agreement ≥ 80% at n ≥ 10, with at most one false-approve in the window (thresholds in `config.yaml`). It licenses: using judges as GEPA μ for ideation, and export-gate item 2 (12.2). Cohen's κ is computed and logged as a *diagnostic only* — at these sample sizes and skewed approval rates it is unstable (prevalence paradox; undefined when either rater is constant in the window), so it informs maintenance sessions but gates nothing. Trailing-20 agreement < 60% at any point pauses submissions and requests a maintenance session (recalibration).
 
 ### 7.5 The interview (feature 2)
 
@@ -219,11 +222,11 @@ Format rules: batched, ≤ 10 questions; every question grounded in a concrete i
 
 ### 8.1 Generate → judge → select
 
-Per cycle: draw a seed (weighted: fan-out backlog, trending themes, open creativity — weights tunable), generate K=5 candidate briefs with the ideation prompt + catalog digest + active ideation lessons; concept panel scores each (absolute rubric scoring; pairwise tournament with order-swap when scores tie); top brief above threshold proceeds to build, the rest land in the catalog as `not_selected` with their critiques (Reflexion memory — next cycle's generator reads why its siblings died).
+Per cycle: draw a seed (weighted: fan-out backlog, trending themes, open creativity — weights tunable), generate K=5 candidate briefs with the ideation prompt + catalog digest + active ideation lessons; the concept judge scores each on the absolute rubric; ties break **deterministically** — higher novelty distance, then least-recently-used tag family, then seed priority. (No pairwise tournament: at K=5 a tie is one or two comparisons, order-bias controls on batches that small fire spuriously, and the cost of an arbitrary tie-break is at most one budget-capped attempt that Alex's queue filters anyway.) Top brief above threshold proceeds to build; the rest land in the catalog as `not_selected` with their critiques (Reflexion memory — next cycle's generator reads why its siblings died).
 
 ### 8.2 The catalog
 
-`skin-factory/state/catalog.jsonl`, append-only: `{id, name, description, tags, seed, status: approved|rejected|killed|not_selected|shipped, embedding_key, judge_scores, feedback_digest, date}`. Embeddings stored beside it. Novelty check = min cosine distance to all prior entries plus tag-collision report, fed to the Uniqueness judge (the judge interprets the distance — a low distance with a genuinely new twist can pass; a high distance that's still "another animal print" can fail). Bootstrap: the 19 shipped catalog skins, the 17 eval briefs, and concepts mined from conversation history all enter on day one, so the factory never re-pitches what exists.
+`skin-factory/state/catalog.jsonl`, append-only: `{id, name, description, tags, seed, status: approved|rejected|killed|not_selected|shipped, embedding_key, judge_scores, feedback_digest, date}`. Embeddings stored beside it, produced by a **pinned local embedding model** served by LM Studio and named (model + version) in `config.yaml` alongside the judge config — changing it is a maintenance decision that re-embeds the whole catalog, because distances across embedder versions are not comparable. Novelty check = min cosine distance to all prior entries plus tag-collision report, fed to the Uniqueness sub-score (the judge interprets the distance — a low distance with a genuinely new twist can pass; a high distance that's still "another animal print" can fail). Bootstrap: the 19 shipped catalog skins, the 17 eval briefs, and concepts mined from conversation history all enter on day one, so the factory never re-pitches what exists.
 
 ### 8.3 Reflexion
 
@@ -231,13 +234,13 @@ Every terminal outcome writes a lesson candidate back into ideation's view: reje
 
 ### 8.4 IP guardrails
 
-The eval set is IP-heavy by design and **never ships** (calibration fixtures only). For production skins the IP-risk judge enforces the style-not-mark transform; the celebrity fan-out line additionally requires no likeness, no name — themes *around* a persona, not the persona. Anything the judge flags as borderline goes to the queue with the flag visible, so Alex's decision doubles as IP calibration.
+The eval set is IP-heavy by design and **never ships** (calibration fixtures only). For production skins the IP-risk flag (7.1) enforces the style-not-mark transform; the celebrity fan-out line additionally requires no likeness, no name — themes *around* a persona, not the persona. Anything flagged as borderline goes to the queue with the flag visible, so Alex's decision calibrates the policy.
 
 ## 9. Execution engine (feature 4)
 
 ### 9.1 Stages and gates
 
-The build is one Claude agent episode internally structured as gated stages; every inter-stage gate is deterministic and its failure text is preserved (it is μf for GEPA and evidence for retrospectives).
+The build is run by the **`factory` CLI driver** — a deterministic script that owns the mechanical work and consults the LLM only at defined creative slots (structure decisions, image prompts, document field values, repair choices). In M0 the LLM behind the slots is Claude working interactively; from M2 it is the local model with GEPA-tuned slot prompts. Same driver, same gates, different model — which is what makes "does the local model clear the holdouts" a runnable experiment rather than a judgment call. Every inter-stage gate is deterministic and its failure text is preserved (it is μf for GEPA and evidence for retrospectives).
 
 | Stage | Output | Gate |
 | --- | --- | --- |
@@ -251,11 +254,11 @@ The build is one Claude agent episode internally structured as gated stages; eve
 
 ### 9.2 The genome vs the skill
 
-`author-skin/SKILL.md` stays the canonical, human-maintained craft document. The build stages consume **stage prompts compiled from it** (`skin-factory/prompts/build/`), which is what GEPA optimizes — so an optimization can never silently rewrite the skill humans read, and a skill edit (by assimilation or by hand) triggers recompilation of stage prompts followed by a holdout-brief regression run. Divergence between skill and stage prompts is checked by a freshness hash.
+`author-skin/SKILL.md` stays the canonical, human/Claude-side craft document, used during calibration and maintenance. The production artifact is `skin-factory/prompts/build/` — the slot prompts GEPA optimizes and Hermes executes. The two are kept in sync by a maintenance-session checklist item (a skill edit prompts a review of the affected slot prompts, and vice versa), not by machinery: with all edits to either happening inside maintenance sessions (6.2), a freshness-hash system would be automation guarding against a process that no longer exists.
 
 ### 9.3 Budgets
 
-Per-skin: ≤ $10 LLM + image spend, ≤ 45 min wall clock, ≤ 3 self-review repairs, ≤ 2 asset regenerations per texture. Exceeding any budget kills the attempt and files the trace for retrospective. (A kill on budget is *evidence about the pipeline*, not about the concept — the retrospective decides which.)
+Per-skin: ≤ $3 external spend (images, plus judges only under the API fallback), ≤ 45 min wall clock, ≤ 3 self-review repairs, ≤ 2 asset regenerations per texture. Local-model tokens are uncapped in dollars but bounded by the wall clock. Exceeding any budget kills the attempt and files the trace for retrospective. (A kill on budget is *evidence about the pipeline*, not about the concept — the retrospective decides which.)
 
 ## 10. Publication and the queue (Snaketron.io)
 
@@ -273,8 +276,8 @@ The queue **is** the first-class-skins admin review surface. The factory runs as
 ### 10.3 Dependency staging
 
 - **Calibration (M0–M1) needs none of PR #84.** Eval skins are built in-repo: document skins as documents, sprite briefs through the existing Rust patterns (`sprite.rs`/`animal.rs` recipes), reviewed via the drafts-as-PRs flow with contact sheets embedded (SHA-pinned URLs, per the established convention). Alex's PR review = the queue, verdict captured by the loop from PR state + comments.
-- **Supervised production (M2) needs the minimum platform slice:** schema v2 (sprite/pattern vocabulary as data — without it every sprite skin is a human-merged Rust PR and autonomy is theater), texture upload, submission API, review queue with feedback (10.2). This is the factory's real dependency on PR #84, and it is a *subset* — no Boost Bux, no Builder, no player creation needed.
-- **Cruise (M3)** additionally wants the decision feed and quick-tags; both are small.
+- **Supervised production (M2) needs the minimum platform slice:** schema v2 (sprite/pattern vocabulary as data — without it every sprite skin is a human-merged Rust PR and autonomy is theater), texture upload, submission API, review queue with feedback, **and the decision feed** (10.2) — the loop cannot learn verdicts without it, and from M2 the loop lives in Hermes. This is the factory's real dependency on PR #84, and it is a *subset* — no Boost Bux, no Builder, no player creation needed.
+- **Cruise (M3)** additionally wants the quick-tags; small.
 
 ### 10.4 What approval means
 
@@ -310,14 +313,26 @@ Routing preferences when several layers could absorb a fix: **most upstream caus
 
 Every retrospective writes at least a **specific** lesson (`lessons.jsonl`: id, trigger, layer, artifact, text, evidence links, status). Generalization is earned, not assumed: when ≥ 3 active lessons share a root-cause signature, a promotion pass synthesizes the general rule, applies it to the target artifact, and marks the specifics `promoted` (kept for audit, dropped from prompts). This is the AWS-DevOps-Agent "learned skill" pattern, and it directly encodes the requested ordering: *generalized lessons are better than specific ones, but specific ones are better than none.*
 
-### 11.5 Validation and safety rails
+### 11.5 Risk tiers, validation, and safety rails
+
+In production the retrospective runs on the local model, and what it may *apply* is tiered by blast radius:
+
+- **Auto-apply (local, immediately): facts, verbatim.** The decision row, the catalog status, and Alex's literal feedback attached to the catalog entry and lesson ledger *as a quote*. These writes do reach the next tick's prompts — the catalog digest carries outcomes and quotes, and that responsiveness is the point of Reflexion — but they add only ground truth the queue produced, never the model's interpretation of it.
+- **Pending (written now, inert until reviewed):** any *inferred* lesson — the local model's reading of *why* — is appended with status `pending` and excluded from every prompt context until a maintenance session activates it. This line is what keeps rail 4 honest: a taste-shaped inference cannot slip into generation behavior dressed as a lesson.
+- **Escalate (queued for the next maintenance session):** anything that edits behavior — slot prompts, `author-skin`, judge rubrics, gates, promotions of specific→general, taste proposals — plus any retrospective the local model marks low-confidence or cannot route cleanly. The escalation queue (`skin-factory/state/escalations.jsonl`) is append-only and carries the full evidence bundle, so the maintenance session starts warm.
+
+This tiering is the simplification that lets the loop run without Claude: the local model does the *routing and recording*, which is structured classification over a fixed taxonomy; the *editing of the stack* — the part that demands judgment — waits for a session that has it. Mechanically, every ledger write goes through `factory append` (which refuses non-append mutations) and every tick ends with `factory commit-tick` committing `state/` — append-only as a git-visible property, not an instruction a small model is trusted to follow.
 
 - Every auto-applied edit runs its artifact's validation gate (6.2) before landing; a failed gate turns the edit into a proposal for Alex.
 - Judge edits: only in calibration passes; validated on the frozen labeled train split with **zero holdout regression tolerated**; the retrospective that *identifies* a judge miss and the calibration pass that *fixes* it are separate runs — the engine never tunes a judge while a specific skin's fate is pending.
 - **Repeat root cause = assimilation failure**, the loop's most important alarm: the same signature recurring after its lesson was applied (twice in any 10 decisions) triggers a meta-retrospective — was the lesson routed to the wrong layer? Written but not surfaced into the prompt context? Too specific? — whose subject is the assimilation engine's own routing, and whose output goes to Alex if it can't resolve itself.
 - Append-only audit log: one entry per retrospective and per applied/proposed diff — trigger, evidence links, layer, artifact, diff SHA, validation result. Halts (`# HALT`), recalibrations, and GEPA runs log at the same level.
 
-### 11.6 Bootstrap from conversation history
+### 11.6 Maintenance sessions
+
+A maintenance session is an **interactive Claude Code session Alex starts** — the same surface as this one, not a scheduled job — when the escalation queue has accumulated (the Hermes driver reports queue depth in its status and notifications; a suggested cadence is weekly or at ≥ 5 items, whichever first). Its **mandatory first act is pausing the loop** (set `paused` in `loop-state.json`, wait out any in-flight tick) and its **mandatory last act is committing and clearing the pause** — the two acts that guarantee production never reads a mid-edit working tree, since maintenance and the cron loop are otherwise two writers on one live workspace. The session: drains the queue (each item gets the full retrospective treatment of 11.3, with edits applied under 6.2's validation gates), runs any judge recalibration or GEPA re-run the alarms have requested, syncs `author-skin` with the slot prompts (9.2), re-runs the export gate if anything behavioral changed, and commits. Everything Claude does to the stack happens here or in calibration — nowhere else.
+
+### 11.7 Bootstrap from conversation history
 
 Before the first calibration round, a one-time mining pass over `~/.claude/projects/-Users-alex-Snaketron*/` transcripts and the distilled memory files extracts: every skin-related correction Alex has given (→ seed lessons, pre-routed by the taxonomy), every verdict-shaped statement (→ seed labeled examples, marked lower-confidence than queue decisions), and prior concepts (→ catalog). This is what the conversation history is *for* — it warms every store the loop reads, without pretending to be a metric.
 
@@ -325,29 +340,44 @@ Before the first calibration round, a one-time mining pass over `~/.claude/proje
 
 ### 12.1 Phases
 
-| Phase | Gate to enter | WIP cap | Review | Exit criteria |
-| --- | --- | --- | --- | --- |
-| **M0 Calibration** | Bootstrap mining done; workspace scaffolded | 13 (the calibration briefs) | Alex reviews every render, every round (Training 1–3) | Eval skins done to Alex's bar; ≥ 40 labeled decisions; first judge GEPA run complete |
-| **M1 Interview + hardening** | M0 exit | — (no new builds) | Interview batches | Disagreement clusters resolved or accepted; judge holdout κ ≥ 0.7; execution GEPA run 2 complete; holdout briefs pass gates first-try |
-| **M2 Supervised production** | M1 exit + platform slice (10.3) live | 5 pending | Every skin; retrospective per decision before the slot refills | Trailing-20 approval ≥ 60% AND zero repeat root causes in last 20 |
-| **M3 Cruise** | M2 exit | 10 pending | Alex on his schedule; batch retros | **approved_count ≥ 100** → done; or a halt |
+| Phase | Home | Gate to enter | WIP cap | Review | Exit criteria |
+| --- | --- | --- | --- | --- | --- |
+| **M0 Calibration** | Claude Code, interactive | Bootstrap mining done; workspace + `factory` driver scaffolded | 13 (the calibration briefs) | Alex reviews every render, every round (Training 1–3) | Eval skins done to Alex's bar; ≥ 40 labeled decisions; first judge GEPA run complete |
+| **M1 Interview + export** | Claude Code, interactive | M0 exit | — (no new concepts) | Interview batches | **The export gate (12.2) passes** |
+| **M2 Supervised production** | **Hermes, local model** | M1 exit + platform slice (10.3) live | 5 pending | Every skin; retrospective per decision before the slot refills | Trailing-20 approval ≥ 60% AND zero repeat root causes in last 20 |
+| **M3 Cruise** | **Hermes, local model** | M2 exit | 10 pending | Alex on his schedule; batch retros | **approved_count ≥ 100** → done; or a halt |
 
-### 12.2 One M3 tick (Hermes cron, e.g. every 2h)
+### 12.2 The export gate (M1 → M2)
 
-1. Poll the decision feed; for each new decision: record → retrospective → assimilate → update catalog and metrics.
-2. Check halts (12.3). If any fire: pause submissions, notify Alex, stop the tick.
-3. If pending < WIP cap and daily budget remains: ideation cycle → build → self-review → submit (or kill → retrospective).
-4. Append the tick summary to the audit log.
+The handoff from Claude to Hermes is a checklist, run in the last M1 session, and every item is a measurement:
 
-### 12.3 Halt rules
+1. Disagreement clusters from calibration resolved or explicitly accepted (interviews done).
+2. A judge configuration clears the **7.4 agreement gate on holdout** — local model preferred; if only an API judge clears it, that fallback is recorded as an explicit decision in the audit log, with the local judge's score kept as the number to beat at the next recalibration. This item deliberately precedes item 3: run 2's μ includes the frozen craft judge, so a judge configuration must be frozen first.
+3. Execution GEPA run 2 complete with the **local model as task LM**, and the 4 holdout briefs build gate-green under the local model, first try.
+4. The Hermes skill dry-runs one full tick against the live workspace (ingest → retro-tiering → build → submit stubbed) with Alex watching — the one sanctioned invocation while `config.yaml` still says `m1`.
+5. `config.yaml` flips `phase: m2`. Nothing is copied anywhere: the category symlink installs the skill, and the skill reads the same repo workspace directly at `~/Snaketron/skin-factory/`.
+
+If item 3 fails after two GEPA attempts, the honest conclusions are limited: either a slot needs a deterministic assist (more rails, less model) or that slot stays on an API model until distillation (section 17) — both are decisions for Alex, presented with the holdout traces.
+
+### 12.3 One production tick (Hermes cron — M2 on Alex's cadence, M3 every 2h)
+
+Everything mechanical below is a `factory` CLI subcommand; the local model sequences the calls, runs the retrospectives, and writes the prose.
+
+1. `factory ingest`: poll the decision feed, advance the cursor, append decision rows, assign the 1-in-5 holdout label **at ingest** (7.3), recompute metrics.
+2. For each new non-holdout decision and each kill: local retrospective → apply/pend/escalate per 11.5, every ledger write through `factory append`. Holdout decisions are record-only.
+3. `factory halt-check`: evaluate 12.4 mechanically. If any fire: pause submissions, notify Alex, stop the tick.
+4. If pending < WIP cap and `factory budget` clears: ideation cycle → build → self-review → submit (or kill → retrospective).
+5. `factory commit-tick`: append the tick summary to the audit log, commit `state/` (every tick is a git diff — tamper-evidence for the append-only ledgers), report escalation-queue depth.
+
+### 12.4 Halt rules
 
 | Condition | Action |
 | --- | --- |
 | 3 consecutive rejections | Pause; if without feedback → request feedback / trigger interview |
-| 5 consecutive kills (gate failures) | Halt: execution regressed; run holdout regression to bisect (recent lesson? platform change?) |
-| Trailing-20 judge–Alex agreement < 60% | Pause submissions; recalibration pass |
-| Repeat root cause (11.5) | Meta-retrospective; escalate to Alex if unresolved |
-| Daily cost > $75 or global > $2,500 | Stop until Alex raises the cap |
+| 5 consecutive kills (gate failures) | Halt: execution regressed; the driver re-runs the deterministic holdout builds to bisect (recent lesson? platform change?) and queues the kill traces for maintenance |
+| Trailing-20 judge–Alex agreement < 60% | Pause submissions; request a maintenance session (recalibration) |
+| Repeat root cause (11.5) | Meta-retrospective queued for maintenance; escalate to Alex if unresolved there |
+| Daily external cost > $25 or global > $1,000 | Stop until Alex raises the cap |
 | Queue stale > 14 days (nothing reviewed) | Idle politely: stop building at WIP cap; never spam the queue |
 | 3 halts in 7 days | Full stop + summary to Alex — something structural is wrong |
 
@@ -361,7 +391,7 @@ All caps and thresholds live in `skin-factory/config.yaml`; the driver enforces 
 ln -sfn ~/Snaketron/hermes/skills ~/.hermes/skills/snaketron
 ```
 
-The skill is the **driver SOP**, deliberately thin: preflight (repo present, `claude` CLI, LM Studio up, budgets file readable, dependencies for the current phase), the state machine of section 12 over `skin-factory/state/`, dispatch commands (`claude -p` invocations per stage, judge API calls), halt enforcement, and notification of Alex. All craft and judgment live in the artifacts the driver dispatches to — the Hermes-local model never makes a quality-bearing decision. Cron entry: every 2 hours in M3; manual invocation in M0–M2 ("run a calibration round", "process the queue").
+The skill is the **production SOP**, and it never touches Claude: preflight (repo present; LM Studio serving the pinned chat and embedding models; budgets readable; phase ≥ m2, with one carve-out — Alex's explicit export-gate dry-run runs in m1 with submissions stubbed; not `paused` or `halted`), the state machine of section 12 over `skin-factory/state/`, local dispatches (ideation cycle, `factory` driver builds with local slot prompts, judge calls per the calibrated config), the 11.5 risk tiering on retrospectives, halt enforcement, escalation-queue reporting, and notification of Alex. All arithmetic, polling, ledger writes, halt evaluation, spend metering, and the per-tick commit are `factory` CLI subcommands — the driver model sequences them; it computes nothing and opens no ledger itself. The craft lives in the GEPA-tuned prompts and the deterministic driver, not in the driver model's judgment. Cron entry: every 2 hours in M3. During M0–M1 the skill is dormant — those phases run in Claude Code, and the skill's only pre-export use is the dry-run tick of the export gate (12.2).
 
 The skill file ships alongside this PRD; it is the second artifact of this branch.
 
@@ -371,7 +401,7 @@ The skill file ships alongside this PRD; it is the second artifact of this branc
 | --- | --- | --- |
 | Approval rate | Approvals / decisions, trailing 20 | The headline; phase gates read it |
 | Repeat-root-cause rate | Recurrences of an already-lessoned signature per 20 decisions | **The self-improvement KPI** — measures whether assimilation works, not whether skins are good |
-| Judge–Alex κ | Cohen's κ, trailing 20 + holdout | Licenses judges as μ; guards against drift |
+| Judge–Alex agreement | Raw agreement + false-approve/false-reject split, trailing 20 + holdout, with a min-n rule (κ logged as diagnostic only — unstable at these sample sizes) | Licenses judges as μ; guards against drift |
 | First-pass gate yield | Builds passing all deterministic gates without repair | Execution quality; GEPA run 2's macro effect |
 | Cost / approved skin | Total spend ÷ approvals | Sustainability; expect $5–15 early, falling |
 | Novelty floor | Min catalog embedding distance among last 10 approved | Uniqueness isn't drifting as the catalog grows |
@@ -379,13 +409,14 @@ The skill file ships alongside this PRD; it is the second artifact of this branc
 
 ## 15. Cost envelope
 
-Per attempt ≈ $3–10 (build-dominant); at a 60% steady-state approval rate, 100 approved ≈ 170 attempts ≈ **$500–1,700** production spend, plus 1–3 execution GEPA runs at $100–400 each and negligible judge-GEPA cost. Calibration (13 briefs × ~3 rounds) ≈ $150–400. Defaults in 12.3 are set so the whole program lands under $2,500 without Alex touching anything; all figures are caps-enforced estimates, not promises.
+With the production loop local, external spend concentrates in calibration. Production: per attempt ≈ $0.30–1.50 (image generation; judges only under the API fallback, at cents), so 100 approved at a 60% approval rate ≈ 170 attempts ≈ **$50–250** — plus local compute, which is bounded by wall clock, not dollars. Calibration: build rounds run inside interactive Claude Code sessions (subscription, not metered API), so their external cost is also mostly images, ≈ $50–150; the GEPA runs are the real API line item — reflection calls at $100–400 for run 2 and ~$20 each for runs 1 and 3. Whole program comfortably under **$1,000**; the caps in 12.4 enforce it mechanically. All figures are caps-enforced estimates, not promises.
 
 ## 16. Risks
 
 | Risk | Mitigation |
 | --- | --- |
-| Judges Goodhart — pipeline optimizes toward rubric, Alex drifts away | κ tracked on *every* decision forever, not just in calibration; < 60% pauses the line; judge model pinned |
+| The local model can't reach the craft bar | The export gate measures it instead of assuming (12.2): holdout briefs, first-try, under the local model. Mitigations in order: more deterministic rails in the driver, a GEPA re-run, a per-slot API fallback recorded as a decision and held until distillation (§17). Never silent degradation — the gates catch what the model fumbles |
+| Judges Goodhart — pipeline optimizes toward rubric, Alex drifts away | Agreement and the error split tracked on *every* decision forever, not just in calibration; < 60% pauses the line; judge config pinned (model + version/quant) |
 | Assimilation thrash — lessons contradicting lessons | Ledger is append-only with supersedence links; promotion requires 3 concordant specifics; meta-retrospective on repeats |
 | Overfitting to the 13 calibration briefs | 4 frozen holdouts + rolling 1-in-5 holdout assignment from production decisions |
 | PR #84 slips | M0–M1 are independent (10.3); M2's platform slice is small and can be carved out ahead of the rest |
@@ -398,17 +429,19 @@ Per attempt ≈ $3–10 (build-dominant); at a 60% steady-state approval rate, 1
 1. **Approve-to-where**: does approval publish immediately, or bank into a release cadence (e.g., weekly drops)? Affects only the queue UI, not the loop.
 2. **Notion write-back**: should accepted direction deltas be pushed to the Notion page (as flagged suggestions via the connector), or does the repo copy become canonical with Notion as Alex's scratchpad? Recommend the latter; decide before M1.
 3. **Fan-out mode**: country/state/team skins are template-instantiable (one optimized brief schema × 200 instances) — a different, cheaper loop mode with its own judge emphasis (accuracy of flags/colors over uniqueness). Spec as v2 once the base loop holds.
-4. **Trace distillation**: once ≥ 100 successful build traces exist, distilling the build stage onto a cheaper model is the standard cost lever. Not before.
+4. **Trace distillation**: once ≥ 100 successful build traces exist (Claude's calibration builds plus approved production builds), SFT-ing the local model on them is the standard lever for retiring any per-slot API fallback and for raising the local craft ceiling generally. Not before.
 
 ---
 
 ## Appendix A — GEPA run configs (summary)
 
-| Run | Genome | Instances | μ | μf | Holdout gate | Budget |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 Judges | rubric texts | labeled decisions (train split) | verdict agreement | Alex's reason vs judge critique | holdout agreement no-regress | ~$20, hours |
-| 2 Execution | stage prompts | 13 calibration briefs | gate pass score + frozen craft judge | gate error text | 4 holdout briefs no-regress | ≤ $400, a weekend |
-| 3 Ideation | ideation prompt + brief rubric | seed list | calibrated concept panel + novelty | judge critiques + collision report | reserved seeds no-regress | ≤ $100 |
+All runs: reflection LM = Claude; task LM = **whatever will run that component in production** — optimizing a prompt for a model it won't run on is wasted rollouts.
+
+| Run | Genome | Task LM | Instances | μ | μf | Holdout gate | Budget |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 Judges | rubric texts | candidate judge configs, local qwen first | labeled decisions (train split) | verdict agreement | Alex's reason vs judge critique | holdout agreement no-regress | ~$20, hours |
+| 2 Execution | build slot prompts | local qwen (production executor) | 13 calibration briefs | gate pass score + frozen craft judge | gate error text | 4 holdout briefs no-regress | ≤ $400, a weekend |
+| 3 Ideation | ideation prompt + brief rubric | local qwen | seed list | calibrated concept judge + novelty | judge critiques + collision report | reserved seeds no-regress | ≤ $100 |
 
 ## Appendix B — Eval-set split (proposed)
 

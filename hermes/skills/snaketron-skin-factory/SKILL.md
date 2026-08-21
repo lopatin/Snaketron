@@ -1,18 +1,24 @@
 ---
 name: snaketron-skin-factory
 category: snaketron
-description: "Drive the Snaketron skin factory loop: ideate skin concepts, build them via Claude Code, submit to Alex's review queue on Snaketron.io, and assimilate every decision back into the AI stack. The driver SOP for specs/skin-factory-prd.md."
-tags: [snaketron, skins, self-improvement, loop, gepa, reflexion]
+description: "Drive the Snaketron skin factory production loop entirely on the local model: ideate skin concepts, build them on deterministic rails with GEPA-tuned prompts, submit to Alex's review queue on Snaketron.io, record and route every decision, and escalate anything judgment-heavy to a Claude Code maintenance session. The production SOP for specs/skin-factory-prd.md."
+tags: [snaketron, skins, self-improvement, loop, gepa, reflexion, local-model]
 platforms: [macos]
 ---
 
-# Snaketron Skin Factory — loop driver
+# Snaketron Skin Factory — production loop
 
-You are the **driver**, not the artist. Every quality-bearing decision — what to
-build, how to build it, whether it's good, why it failed — is made by a
-dispatched Claude session or a pinned-model judge call. Your job is the state
-machine, the caps, the halts, and telling Alex what happened. If you ever find
-yourself judging a skin or editing a prompt yourself, stop: dispatch it.
+Everything here runs locally. No Claude, no API LLM calls — the two external
+calls are image generation (Gemini) and, only if the export gate recorded that
+fallback, the judge model. The craft does not live in you: it lives in the
+GEPA-tuned prompts under `skin-factory/prompts/` and in the deterministic
+`factory` CLI. **Everything mechanical is a `factory` subcommand** — polling,
+cursor management, ledger appends, agreement math, halt evaluation, spend
+metering, the per-tick commit. You sequence those calls, run the risk-tiered
+retrospectives, and write notification prose. You compute nothing, and you
+never open a ledger file yourself. When a task needs judgment about *changing
+the stack*, you never do it — you write it to the escalation queue for the
+next maintenance session.
 
 The full design is `~/Snaketron/specs/skin-factory-prd.md` (the PRD). Section
 references below point there. When this SOP and the PRD disagree, the PRD wins;
@@ -20,122 +26,138 @@ flag the disagreement to Alex.
 
 ## When to use
 
-- Cron tick (M3 cruise: every 2 hours).
-- Alex says: "run a calibration round", "process the skin queue", "make a skin",
-  "skin factory status", "pause/resume the factory".
+- Cron tick (M3 cruise: every 2 hours; M2: on Alex's cadence).
+- Alex says: "process the skin queue", "make a skin", "skin factory status",
+  "pause/resume the factory", "dry-run a tick" (the export-gate rehearsal).
+- Do **not** use for calibration or maintenance — those are interactive Claude
+  Code sessions Alex starts in the repo (PRD §11.6, §12.1). If asked, say so
+  and report the escalation-queue depth.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `~/Snaketron` | The repo. All work happens in a dedicated worktree, never on master. |
-| `~/Snaketron/skin-factory/config.yaml` | Caps, thresholds, phase, WIP limits, model pins. The only file you read for policy. |
-| `~/Snaketron/skin-factory/state/` | `catalog.jsonl`, `lessons.jsonl`, `decisions.jsonl`, `metrics.json`, `audit.md` (append-only), `loop-state.json` |
-| `~/Snaketron/skin-factory/prompts/` | Stage prompts (ideation, build) — dispatched, never inlined by you |
-| `~/Snaketron/skin-factory/judges/` | Judge rubrics + pinned model/version per judge |
-| `~/Snaketron/skin-factory/runs/<id>/` | Per-attempt traces (gitignored): prompts, artifacts, gate reports, judge outputs |
+| `~/Snaketron` | The repo. Builds happen in a dedicated worktree, never on master. |
+| `~/Snaketron/skin-factory/config.yaml` | Phase, caps, WIP limits, pinned model configs (chat, judges, embedder — model + version/quant), thresholds. The only file you read for policy. |
+| `~/Snaketron/skin-factory/state/` | `catalog.jsonl`, `lessons.jsonl`, `decisions.jsonl`, `escalations.jsonl`, `metrics.json`, `audit.md` (append-only), `loop-state.json` |
+| `~/Snaketron/skin-factory/prompts/` | GEPA-tuned slot prompts (ideation, build slots). Read-only to you — edited only in maintenance sessions. |
+| `~/Snaketron/skin-factory/judges/` | Judge rubrics (concept + craft) + the pinned judge config. Read-only to you. |
+| `~/Snaketron/skin-factory/runs/<id>/` | Per-attempt traces (gitignored): slot inputs/outputs, gate reports, judge outputs |
 
 ## Preflight (every invocation)
 
-1. `config.yaml` readable; note `phase`, `wip_cap`, `daily_budget`, `global_budget`.
-2. Repo present and clean enough to worktree from; `claude` CLI on PATH.
-3. Spend ledger in `metrics.json` vs budgets — if daily or global exceeded,
-   record a no-op tick in `audit.md` and stop.
-4. `loop-state.json` not marked `halted`. If halted: report why to Alex and stop
-   — only Alex (or an explicit resume instruction) clears a halt.
-5. Phase dependencies (PRD §10.3): M2+ requires the Snaketron.io submission API
-   and decision feed; M0–M1 run repo-local via draft PRs.
+1. `config.yaml` readable; `phase` is `m2` or `m3` — with exactly one
+   carve-out: an explicit **"dry-run a tick"** request from Alex is allowed in
+   `m1` (submissions stubbed, no state mutation beyond the audit note). Any
+   other invocation outside m2/m3: dormant — report and stop.
+2. LM Studio serving the pinned chat model **and** the pinned embedding model
+   (config names both; a different model/quant than pinned is a halt, not a
+   substitution).
+3. `factory budget` passes — if a cap is exceeded, record a no-op tick in the
+   audit log and stop. (The CLI meters every external call itself and refuses
+   over-budget ones; this check is the outer layer, not the only one.)
+4. `loop-state.json` is neither `halted` nor `paused`. Halted: report why and
+   stop — only Alex clears a halt. Paused: a maintenance session or Alex owns
+   the workspace right now; report and stop.
+5. Platform reachable: submission API + decision feed (PRD §10.2).
 
-## The tick (M2/M3)
+## The tick
 
-Order matters: **assimilate before you build**, so new lessons shape the next
-skin, and Alex's feedback is never left sitting while the factory produces more
-of the same mistake.
+Order matters: **ingest and route decisions before building**, so feedback is
+never left sitting while the factory produces more of the same mistake.
 
-### 1. Ingest decisions
+### 1. Ingest — `factory ingest`
 
-- M2/M3: poll `GET /api/skins/factory/decisions?since=<cursor>` (cursor in
-  `loop-state.json`). M0–M1: read the state of open factory draft PRs — merged
-  = approved, closed = rejected, review comments = feedback.
-- For each new decision: append to `decisions.jsonl`; update `catalog.jsonl`
-  status; recompute trailing agreement in `metrics.json`.
+Polls the decision feed, advances the cursor, appends decision rows, assigns
+the 1-in-5 **holdout label at ingest** (PRD §7.3), and recomputes
+`metrics.json` (trailing agreement, error split, approval rate) — all
+deterministic code. You read its report; you do not redo its math.
 
-### 2. Retrospect and assimilate (one dispatch per decision or kill)
+### 2. Retrospect — locally, risk-tiered (PRD §11.5)
 
-Dispatch to Claude Code, headless, in the repo:
+For each new **non-holdout** decision and each kill, run the retrospective
+procedure with the local model over the run trace + feedback + taxonomy (PRD
+§11.3). Holdout-assigned decisions are **record-only**: `factory ingest`
+already wrote the row; no lesson, no exemplar, no escalation content beyond a
+count. For the rest, split what the retrospective proposes by tier:
 
-```bash
-claude -p "Run a skin-factory retrospective for <run-id>. Read the trace in
-skin-factory/runs/<run-id>/, the decision and feedback in
-skin-factory/state/decisions.jsonl, and follow specs/skin-factory-prd.md §11:
-name the layer, the artifact, and the diff; write the lesson; apply or propose
-per the artifact registry (§6.2); append the audit entry." \
-  --allowedTools "Read,Write,Edit,Bash,Grep,Glob"
-```
+- **Auto-apply — facts, verbatim:** catalog status and Alex's literal feedback
+  attached as a quote. Via `factory append` only.
+- **Pending:** any *inferred* lesson (the model's reading of *why*) is
+  appended with status `pending` — inert, excluded from every prompt context,
+  until a maintenance session activates it.
+- **Escalate:** anything behavioral — proposed edits to slot prompts, skills,
+  judge rubrics, gates; specific→general promotions; taste proposals; any
+  low-confidence or unroutable retrospective. Full evidence bundle to
+  `escalations.jsonl`, via `factory append`.
 
-Verify afterward, mechanically: `audit.md` grew; any applied diff is committed
-on the factory branch; any *proposal* (taste changes, judge edits, gate tasks)
-is in the outbox for Alex. Judge rubric files must NOT have changed in this
-dispatch — if they did, revert and halt (`judge-edit-outside-calibration`).
+`factory append` refuses non-append mutations; after this step run
+`factory write-guard`, which verifies nothing outside `state/`, `runs/`, and
+the build worktree changed. If something did: revert it and halt
+(`behavioral-edit-outside-maintenance`).
 
-### 3. Check halts (PRD §12.3)
+### 3. Check halts — `factory halt-check`
 
-3 consecutive rejections · 5 consecutive kills · trailing-20 agreement < 0.60 ·
-repeat root cause flagged by a retrospective · budgets · stale queue (> 14 days)
-· 3 halts in 7 days → full stop. On any: set `halted` with reason in
-`loop-state.json`, append `# HALT` to `audit.md`, notify Alex with the reason
-and the one action that unblocks (e.g. "needs feedback on the last 3
-rejections", "needs a recalibration pass"). Never auto-resume.
+Evaluates PRD §12.4 mechanically: 3 consecutive rejections · 5 consecutive
+kills (the CLI re-runs the deterministic holdout builds and reports only
+pass/fail per brief + the bisected suspect change — never holdout traces) ·
+trailing-20 agreement < 0.60 · repeat root cause · budgets · stale queue
+(> 14 days) · 3 halts in 7 days → full stop. On any: set `halted` + reason in
+`loop-state.json`, `factory append` a `# HALT` to the audit log, notify Alex
+with the reason and the one action that unblocks (usually "start a maintenance
+session"). Never auto-resume.
 
-### 4. Build (only if pending < `wip_cap` and budget remains)
+### 4. Build (only if pending < `wip_cap` and `factory budget` clears)
 
-1. **Ideate**: dispatch the ideation cycle (PRD §8) — K candidate briefs, judge
-   scoring via the pinned judge configs, top brief wins. A no-winner cycle
-   (all below threshold) is fine; log and skip building this tick.
-2. **Build**: fresh worktree; dispatch the build episode (PRD §9) with the
-   brief, stage prompts, and per-skin budgets from config. The episode runs its
-   own gates; you only enforce wall-clock and cost, and collect the trace into
+1. **Ideate** (PRD §8): run the ideation cycle with the local model — K
+   candidate briefs from the tuned prompt + catalog digest + active lessons;
+   the concept judge scores each on the absolute rubric; ties break
+   deterministically (novelty distance, then least-recently-used tag family,
+   then seed priority). No winner above threshold → log and skip building
+   this tick.
+2. **Build** (PRD §9): fresh worktree; run the `factory` driver on the brief.
+   The driver owns the mechanics (image calls — metered against the caps —
+   sprite tooling, validator, render, capture) and consults the local model
+   only at its defined slots with the tuned prompts. The trace lands in
    `runs/<id>/`.
-3. **Outcome**: gates green → submit (M2+: submission API; M0–M1: open a draft
-   PR with the contact sheet embedded, SHA-pinned image URLs). Gates dead after
-   allowed repairs → mark `killed`, and run step 2's retrospective dispatch on
-   the kill trace this same tick.
+3. **Outcome**: gates green → submit via the API (origin marker `factory`).
+   Dead after allowed repairs → mark `killed` and run step 2's retrospective
+   on the kill trace this same tick.
 
-### 5. Close the tick
+### 5. Close — `factory commit-tick`
 
-Append a tick summary to `audit.md`: decisions ingested, retros run, diffs
-applied/proposed, builds/kills/submissions, spend, metric snapshot. If anything
-needs Alex (proposals, interviews, halts), send one consolidated notification —
-never one ping per item.
+Appends the tick summary to the audit log (decisions ingested, retros run with
+applied/pending/escalated counts, builds/kills/submissions, external spend,
+metric snapshot, escalation-queue depth) and **commits `state/`** — every tick
+is a git diff, which is what makes the append-only ledgers tamper-evident. If
+the queue is ≥ 5 items or a week old, or anything needs Alex, send one
+consolidated notification — never one ping per item.
 
 ## Special invocations
 
-- **"Run a calibration round" (M0)**: build every calibration brief (never the
-  4 holdouts — the split is in `config.yaml`) through the full pipeline; open
-  the draft PRs; stop. After Alex reviews: ingest, retrospect each, and when
-  labeled decisions ≥ 40, dispatch judge GEPA (run 1, PRD Appendix A) as an
-  offline job and report holdout agreement before/after.
-- **"Interview"** (or triggered per PRD §7.5): dispatch generation of a ≤ 10
-  question, instance-grounded batch; deliver to Alex; on answers, dispatch
-  assimilation of each into labels / direction deltas / lessons.
-- **"Status"**: report phase, approved count vs target, pending, trailing
-  approval rate, judge κ, repeat-root-cause count, spend vs caps, active halts,
-  outbox for Alex.
-- **GEPA runs 2/3**: only between phases or on an execution-regression halt,
-  only as explicitly configured offline jobs with their own cost cap, and only
-  with the holdout gates from PRD Appendix A. Log the run config and result in
-  `audit.md`.
+- **"Status"**: phase, approved count vs target, pending, trailing approval
+  rate, judge agreement + error split, repeat-root-cause count, spend vs caps,
+  active halts, escalation-queue depth and age. All numbers from
+  `factory metrics` output, none recomputed by you.
+- **"Dry-run a tick"**: the export-gate rehearsal (PRD §12.2 item 4) — allowed
+  in `m1`, submissions stubbed, Alex watching; report every step's result.
+- **"Pause"/"Resume"**: set/clear `paused` in `loop-state.json` (distinct from
+  `halted`, which only Alex clears after a cause is addressed). Maintenance
+  sessions set `paused` themselves as their first act (PRD §11.6).
 
 ## Hard rules (non-negotiable, from PRD §6.2/§11.5)
 
-1. `audit.md`, `decisions.jsonl`, `lessons.jsonl`, `catalog.jsonl` are
-   append-only. Supersede; never rewrite.
-2. Judge rubrics change only in calibration passes, validated on the frozen
-   labeled split with zero holdout regression. Never in the same dispatch that
-   just failed a skin.
-3. Taste changes (`design-direction.md`) are always proposals to Alex.
-4. The factory never approves, publishes, or merges its own skins.
-5. Caps are enforced by you, mechanically, before dispatching — not by trusting
-   the dispatched agent to stop itself.
+1. `audit.md`, `decisions.jsonl`, `lessons.jsonl`, `catalog.jsonl`,
+   `escalations.jsonl` are append-only, and only `factory append` writes them.
+   Supersede; never rewrite.
+2. You never edit prompts, judges, skills, gates, or the direction doc. Those
+   change only in Claude Code maintenance/calibration sessions, under their
+   validation gates. Outside a build's dedicated worktree, your write surface
+   is `state/` and `runs/` — and `state/` only through the CLI.
+3. The factory never approves, publishes, or merges its own skins.
+4. Pinned means pinned: chat, judge, and embedder configs change only in
+   maintenance sessions, never as runtime substitutions.
+5. Spend is enforced by the `factory` CLI at every external call; you enforce
+   dispatch — never start work a cap check hasn't cleared.
 6. Terminal condition: `approved_count >= target` (default 100) → set phase
    `done`, disable the cron entry, send Alex the final report.
