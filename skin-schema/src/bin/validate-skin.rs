@@ -27,8 +27,13 @@ fn main() -> ExitCode {
             }
         };
 
-        match skin_schema::load(&json) {
-            Ok(doc) => println!("{path}: ok — {} ({})", doc.name, doc.id),
+        match skin_schema::v2::load_any(&json) {
+            Ok(skin_schema::v2::AnySkinDoc::V1(doc)) => {
+                println!("{path}: ok — {} ({}) [v1]", doc.name, doc.id)
+            }
+            Ok(skin_schema::v2::AnySkinDoc::V2(doc)) => {
+                println!("{path}: ok — {} ({}) [v2]", doc.name, doc.id)
+            }
             Err(errors) => {
                 failed = true;
                 eprintln!("{path}: {} problem(s)", errors.len());

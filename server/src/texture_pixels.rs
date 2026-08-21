@@ -128,6 +128,15 @@ fn seam_percentile(image: &RgbaImage, vertical: bool) -> f32 {
     below as f32 / interior.len().max(1) as f32
 }
 
+/// Measure the exact decoded bytes that will be served, without reshaping.
+pub fn seam_report(pixels: &Pixels) -> SeamReport {
+    SeamReport {
+        horizontal_ratio: seam_percentile(&pixels.image, false),
+        vertical_ratio: seam_percentile(&pixels.image, true),
+        repaired: false,
+    }
+}
+
 /// Crop the widest band of the requested aspect from the middle of an image.
 ///
 /// A coat is twelve cells long and one cell tall; a model asked for one returns

@@ -1,0 +1,10 @@
+{
+  "brief": "A crisp two-lane checker snake with a restrained travelling shine.",
+  "palette_intent": "Cool friendly and warm hostile role palettes with lighter same-hue checks.",
+  "motion_intent": "The checker stays fixed while one shine travels head to tail.",
+  "implementation_hint": "layers",
+  "hint_rationale": "The identity is geometric, role-aware, and formula-driven.",
+  "prompt": "One medium horizontal checker-pattern snake, distinct head/body/tail, neutral background.",
+  "model_config": "prototype-gemini-3-pro-image-v1",
+  "image_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

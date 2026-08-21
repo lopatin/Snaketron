@@ -1,0 +1,10 @@
+{
+  "brief": "An iridescent beetle-shell coat with small irregular facets.",
+  "palette_intent": "Material remains recognizable while contour and fallback carry team role.",
+  "motion_intent": "Static coat with no frame animation.",
+  "implementation_hint": "texture",
+  "hint_rationale": "Organic facets would be visibly mechanical as a small set of rectangles.",
+  "prompt": "One medium horizontal beetle-shell snake, distinct head/body/tail, neutral background.",
+  "model_config": "prototype-gemini-3-pro-image-v1",
+  "image_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+}

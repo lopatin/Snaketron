@@ -1,0 +1,4 @@
+{
+  "GEMINI_API_KEY": "replace-with-a-service-scoped-gemini-key",
+  "SNAKETRON_FACTORY_SERVICE_TOKEN": "replace-with-a-private-skin-service-token"
+}

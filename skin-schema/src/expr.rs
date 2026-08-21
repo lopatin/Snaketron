@@ -128,7 +128,26 @@ pub enum Func {
 }
 
 impl Func {
-    fn name(self) -> &'static str {
+    /// Complete callable vocabulary, in the stable order exposed to authors.
+    pub const ALL: [Self; 15] = [
+        Self::Sin,
+        Self::Cos,
+        Self::Saw,
+        Self::Tri,
+        Self::Pulse,
+        Self::Fract,
+        Self::Floor,
+        Self::Abs,
+        Self::Clamp,
+        Self::Mix,
+        Self::Smoothstep,
+        Self::Step,
+        Self::Min,
+        Self::Max,
+        Self::Noise,
+    ];
+
+    pub fn name(self) -> &'static str {
         match self {
             Func::Sin => "sin",
             Func::Cos => "cos",

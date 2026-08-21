@@ -1,0 +1,6 @@
+interface:
+  display_name: "Author Snaketron Skin"
+  short_description: "Build an approved prototype as SkinDoc v2"
+  default_prompt: "Use $author-skin to implement this approved Snaketron prototype as a validated SkinDoc v2 build."
+policy:
+  allow_implicit_invocation: true

@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <% if (!embeddedBuild) { %>
+    <% if (!embeddedBuild && !factoryRendererBuild) { %>
     <!-- Google Tag Manager -->
     <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
               new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
@@ -26,7 +26,7 @@
     <link rel="icon" type="image/x-icon" sizes="32x32" href="images/snaketron-favicon-32x32-white.ico" media="(prefers-color-scheme: dark)">
   </head>
   <body class="<%= crazyGamesBuild ? 'crazygames-build' : '' %>">
-  <% if (!embeddedBuild) { %>
+  <% if (!embeddedBuild && !factoryRendererBuild) { %>
   <!-- Google Tag Manager (noscript) -->
   <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-NVMW583K"
                     height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>

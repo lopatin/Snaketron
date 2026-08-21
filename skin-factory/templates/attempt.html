@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="/">← gallery</a></p><h2>{{ concept.name }}</h2><p>{{ concept.brief }}</p>
+<p><span class="pill">{{ attempt.stage }}</span><span class="pill">{{ attempt.disposition }}</span><span class="pill">{{ attempt.purpose }}</span></p>
+<p class="muted">Attempt {{ attempt.id }} · version {{ attempt.version }}</p>
+
+<section><h3>Artifacts</h3><div class="grid">
+{% for artifact in artifacts %}<article class="card"><h4>{{ artifact.kind }}</h4>
+  {% if artifact.media_type.startswith('image/') %}<a href="/artifacts/{{ artifact.id }}"><img src="/artifacts/{{ artifact.id }}" alt="{{ artifact.kind }} {{ artifact.content_hash }}"></a>
+  {% elif artifact.media_type.startswith('video/') %}<video controls preload="metadata" src="/artifacts/{{ artifact.id }}"></video>
+  {% elif artifact.media_type in ['application/json','text/plain','text/markdown'] %}<p><a href="/artifacts/{{ artifact.id }}">Open retained {{ artifact.media_type }}</a></p>
+  {% else %}<p><a href="/artifacts/{{ artifact.id }}?download=true">Download {{ artifact.media_type }}</a></p>{% endif %}
+  <p class="muted">{{ artifact.id }}<br>{{ artifact.content_hash }}<br>{{ artifact.size_bytes }} bytes</p>
+  <details><summary>Metadata and provenance</summary><pre>{{ artifact.metadata | tojson(indent=2) }}</pre><pre>{{ artifact.provenance | tojson(indent=2) }}</pre></details>
+</article>{% endfor %}</div></section>
+
+<section><h3>Machine evaluations</h3>
+{% if evaluations_blind %}<p class="notice">Hidden until an independent prototype/build label is recorded. Labeling alone never approves or publishes.</p>
+{% elif not evaluations %}<p class="muted">No evaluations retained.</p>{% endif %}
+{% for evaluation in evaluations %}<article><strong>{{ evaluation.gate_name }} · {{ evaluation.verdict }}</strong><pre>{{ evaluation.reasons | tojson(indent=2) }}</pre><pre>{{ evaluation.measurements | tojson(indent=2) }}</pre></article>{% endfor %}</section>
+
+<section><h3>Human audit history</h3>{% if not decisions %}<p class="muted">No human decisions.</p>{% endif %}
+{% for decision in decisions %}<p><strong>{{ decision.action }}</strong> by {{ decision.actor }} at {{ decision.created_at }}<br>{{ decision.feedback }} <span class="muted">{{ decision.content_hash or '' }} {{ decision.revision or '' }}</span></p>{% endfor %}</section>
+
+{% if attempt.purpose == 'production' %}<section><h3>Human actions</h3><div class="actions">
+{% for artifact in artifacts %}
+  {% if attempt.disposition == 'machine_rejected' and ((attempt.stage == 'prototype_review' and artifact.kind == 'prototype') or (attempt.stage == 'final_review' and artifact.kind == 'contact_sheet')) %}<form action="/actions/override-triage" method="post"><h4>Override soft triage</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><input type="hidden" name="artifact_id" value="{{ artifact.id }}"><p class="muted">{{ artifact.content_hash }}</p><label>Human rationale<textarea name="feedback" required></textarea></label><button type="submit">Route exact bytes to human review</button></form>{% endif %}
+  {% if artifact.kind in ['prototype', 'contact_sheet'] %}<form action="/actions/label" method="post"><h4>Blind {{ 'prototype' if artifact.kind == 'prototype' else 'build quality' }} label</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><input type="hidden" name="artifact_id" value="{{ artifact.id }}"><input type="hidden" name="kind" value="{{ 'prototype_label' if artifact.kind == 'prototype' else 'build_quality_label' }}"><label>Independent outcome<select name="outcome" required><option value="accept">accept</option><option value="reject">reject</option></select></label><label>Feedback<textarea name="feedback" required></textarea></label><label>Quick tags<input name="tags" placeholder="readable, seam"></label><button type="submit">Record training label</button></form>{% endif %}
+  {% if artifact.kind == 'prototype' %}<form action="/actions/approve-prototype" method="post"><h4>Approve exact prototype</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><input type="hidden" name="artifact_id" value="{{ artifact.id }}"><input type="hidden" name="content_hash" value="{{ artifact.content_hash }}"><p class="muted">{{ artifact.content_hash }}</p><label>Direction feedback<textarea name="feedback"></textarea></label><button type="submit">Approve exact bytes and start build</button></form>{% endif %}
+  <form action="/actions/re-evaluate" method="post"><h4>Re-evaluate retained bytes</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="idempotency_key" value="{{ action_idempotency_key }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><input type="hidden" name="artifact_id" value="{{ artifact.id }}"><label>Feedback<textarea name="feedback"></textarea></label><button type="submit">Append current evaluation</button></form>
+{% endfor %}
+<form action="/actions/reject" method="post"><h4>Human reject</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><label>Feedback<textarea name="feedback" required></textarea></label><label>Tags<input name="tags"></label><button class="danger" type="submit">Retain as human rejected</button></form>
+<form action="/actions/retry" method="post"><h4>Retry as linked child</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="idempotency_key" value="{{ action_idempotency_key }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><label>From stage<select name="from_stage"><option value="prototype">prototype</option><option value="assets">assets</option><option value="build">build</option></select></label><label>Feedback<textarea name="feedback" required></textarea></label><button type="submit">Create retry</button></form>
+{% if attempt.production_revision and attempt.production_content_hash %}<form action="/actions/publish" method="post"><h4>Publish exact reviewed revision now</h4><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="attempt_id" value="{{ attempt.id }}"><input type="hidden" name="revision" value="{{ attempt.production_revision }}"><input type="hidden" name="content_hash" value="{{ attempt.production_content_hash }}"><p>Revision {{ attempt.production_revision }}<br><span class="muted">{{ attempt.production_content_hash }}</span></p><label>Approval note<textarea name="feedback"></textarea></label><button type="submit">Publish exact revision/hash</button></form>{% endif %}
+</div></section>{% endif %}
+
+<section><h3>Lineage</h3><p>{% for row in lineage %}<a href="/attempts/{{ row.id }}">{{ row.id }}</a>{% if not loop.last %} → {% endif %}{% endfor %}</p>{% if children %}<h4>Children</h4>{% for row in children %}<p><a href="/attempts/{{ row.id }}">{{ row.id }}</a> · retry {{ row.restart_stage }}</p>{% endfor %}{% endif %}</section>
+{% endblock %}

@@ -1,0 +1,106 @@
+{
+  "schema_version": 2,
+  "id": "fixture-hybrid@1",
+  "name": "Fixture Hybrid",
+  "palette": {
+    "friendly": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#3c8dde", "outline": "#286eae" }
+    ],
+    "enemy": [
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#e34e5b", "outline": "#a92f3a" }
+    ],
+    "free_for_all": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#93a3b5", "outline": "#5d6e81" },
+      { "fill": "#f7b731", "outline": "#a87d1f" }
+    ]
+  },
+  "literals": { "starlight": "#ffffff" },
+  "textures": [
+    {
+      "name": "nebula_sheet",
+      "ref": "sha256:d444444444444444444444444444444444444444444444444444444444444444",
+      "kind": "sheet",
+      "descriptor": {
+        "kind": "sheet",
+        "body_columns": 53,
+        "frame_rows": 60,
+        "variants": [
+          {
+            "content_ref": "sha256:d444444444444444444444444444444444444444444444444444444444444444",
+            "url": "/api/textures/variants/sha256:d444444444444444444444444444444444444444444444444444444444444444.png",
+            "width_px": 848,
+            "height_px": 960,
+            "bytes": 780000,
+            "texels_per_cell": 16
+          }
+        ]
+      }
+    }
+  ],
+  "period_ms": 3000,
+  "head_core": { "ratio": 0.38, "color": "#333333" },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": { "slot": "outline" },
+      "extra_px": 2,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Body fallback",
+      "type": "ribbon",
+      "region": "body",
+      "color": { "slot": "fill" },
+      "extra_px": 0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Nebula sheet",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "opacity": 0.65,
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "image",
+        "texture": "nebula_sheet",
+        "fit": { "type": "tile", "cells_per_repeat": 53 },
+        "drift_cells": 0
+      }
+    },
+    {
+      "name": "Star glint",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          { "offset": "tri(time) - 0.1", "color": { "slot": "fill" }, "alpha": 0 },
+          { "offset": "tri(time)", "color": { "literal": "starlight" }, "alpha": 0.12 },
+          { "offset": "tri(time) + 0.1", "color": { "slot": "fill" }, "alpha": 0 }
+        ]
+      }
+    },
+    {
+      "name": "Head glow",
+      "type": "head_ramp",
+      "opacity": "(1 - s / 10) * 0.3",
+      "omit_on_single_cell": true,
+      "color": "#ffffff",
+      "length_cells": 10
+    }
+  ]
+}

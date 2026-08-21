@@ -1312,17 +1312,50 @@ async fn resolve_authored_skin(db: &dyn Database, skin_id: i32, user_id: u32) ->
         }
     };
 
-    let reference = skin.content_ref_for(Some(user_id as i32))?.to_string();
+    // Preserve the moderation kill switch before resolving any revision.
+    // Text gating below chooses *which* otherwise-renderable revision may
+    // enter a match; it must never make a disabled skin renderable again.
+    if !skin.publication.is_renderable() {
+        return None;
+    }
+
+    let creator = skin.creator_user_id == user_id as i32;
+    let desired_revision = if creator {
+        skin.head_revision
+    } else {
+        skin.published_revision?
+    };
+    let desired = match db.get_skin_revision(skin_id, desired_revision).await {
+        Ok(Some(revision)) => revision,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(skin_id, desired_revision, %error, "could not read authored skin revision");
+            return None;
+        }
+    };
+
+    // Text can communicate arbitrary words. A creator may preview it on their
+    // private Builder page, but equipping it would hand the same content hash
+    // to every opponent. Until the exact revision is approved, fall back to a
+    // previously approved published revision or to classic.
+    let (revision, reference) = if desired.contains_text && !desired.review_approved {
+        let published = skin.published_revision?;
+        let fallback = match db.get_skin_revision(skin_id, published).await {
+            Ok(Some(revision)) => revision,
+            _ => return None,
+        };
+        if fallback.contains_text && !fallback.review_approved {
+            return None;
+        }
+        (fallback.revision, fallback.content_ref)
+    } else {
+        (desired.revision, desired.content_ref)
+    };
 
     // Wearing a revision into a match publishes its bytes by necessity —
     // opponents have to fetch it to draw it — so that exposure is recorded
     // rather than inferred. The write is conditional and one-way, so this
     // costs nothing after the first match a revision appears in.
-    let revision = if skin.creator_user_id == user_id as i32 {
-        skin.head_revision
-    } else {
-        skin.published_revision.unwrap_or(skin.head_revision)
-    };
     if let Err(error) = db
         .mark_revision_exposed(skin_id, revision, chrono::Utc::now().timestamp_millis())
         .await

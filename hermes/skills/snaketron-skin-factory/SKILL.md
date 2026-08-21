@@ -15,7 +15,8 @@ reimplement those responsibilities in the agent.
 
 The scheduled Hermes cron runs the same CLI through a non-agent wrapper. This
 skill handles human status and recovery requests; it is not required to reason
-through routine production ticks.
+through routine production ticks. Installation and rollback are documented in
+`skin-factory/docs/hermes-operations.md`.
 
 The factory is model-role based. Its versioned config selects the task worker,
 Gemini 3.7 Flash smart/judge roles, Gemini 3 Pro Image generation, and the image
@@ -25,8 +26,8 @@ editor. Never substitute a model silently.
 
 Run exactly one resumable cycle:
 
-```bash
-factory run-once --json
+```sh
+factory run-once --config config/factory.yaml --env-file .factory.env --json
 ```
 
 Read the structured result and report only:
@@ -37,8 +38,9 @@ Read the structured result and report only:
 - pause/halt reason and the action required;
 - whether an optimization candidate was promoted.
 
-The command runs its own doctor checks, including optimizer readiness, and is
-idempotent at each factory stage. If Hermes is interrupted, invoke it again;
+The installed wrapper and smoke procedure run doctor checks, and `run-once`
+checks optimizer readiness. Each stage is idempotent. If Hermes is interrupted,
+invoke it again;
 the operation journal reconciles external calls and reports an unknown outcome
 instead of blindly repeating spend. Do not repair state files by hand.
 
@@ -60,16 +62,17 @@ secrets, switch providers, clear a halt, or bypass a deterministic gate.
 
 Use the CLI rather than editing the database or repository directly:
 
-```bash
-factory status --json
-factory re-evaluate artifact_01 --json
-factory retry attempt_01 --from build --feedback-file feedback.txt --json
-factory resolve-operation operation_01 --resolution-file resolution.json --json
-factory pause --reason-file pause-reason.txt --json
-factory resume --json
+```sh
+factory status --config config/factory.yaml --json
+factory label attempt_01 artifact_01 --kind prototype_label --outcome accept --actor human:reviewer --feedback-file feedback.txt --env-file operator.json --json
+factory re-evaluate artifact_01 --actor human:reviewer --feedback-file feedback.txt --env-file operator.json --json
+factory retry attempt_01 --from build --actor human:reviewer --feedback-file feedback.txt --env-file operator.json --json
+factory resolve-operation operation_01 --actor human:reviewer --resolution-file resolution.json --env-file operator.json --json
 ```
 
-These operator commands require an authenticated human credential. Prototype
+Load the operator credential through `--env-file`; never place a secret in a
+command argument. These operator commands require an authenticated human
+credential. Prototype
 and final approvals are issued through authenticated review actions that bind
 an exact artifact or revision hash. The cron service identity has no permission
 to approve a prototype, resolve an unknown provider operation, publish,
@@ -77,13 +80,17 @@ override blocking gates, or resume a human halt. Operation resolution requires
 evidence and records one of the PRD's immutable outcomes. Gates marked
 `blocking: true` in the shared manifest are never overrideable.
 
+Blind labels require an explicit `accept` or `reject` outcome. Label each
+artifact independently; machine evaluations for another artifact remain hidden
+until that artifact receives its own label. Labels never imply approval.
+
 ## Optimization
 
 `run-once` automatically enqueues or advances eligible optimization work.
 Optimization is also available on demand to an operator; it is not an
 interactive-agent dependency or a second required schedule:
 
-```bash
+```sh
 factory optimize --if-ready --target authoring-playbook --json
 ```
 
@@ -110,3 +117,5 @@ tests itself.
    config. Notion and agent transcripts are optional import sources only.
 8. Workers never receive external side-effect credentials. Only the factory
    driver may execute their structured requests through the operation journal.
+9. The Hermes service JSON contains no review actor/token or Snaketron operator
+   token. Cron uses only `--script --no-agent --workdir` and one `run-once` job.

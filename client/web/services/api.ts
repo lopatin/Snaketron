@@ -34,6 +34,11 @@ import type {
   SkinSummary,
   Wallet,
 } from '../types/generated';
+import {
+  exactPublicationRequest,
+  exactSkinUpdate,
+  type UpdateSkinRequest,
+} from '../utils/skinApiContracts';
 
 /**
  * An equip request.
@@ -624,18 +629,19 @@ class API {
   /** Append a revision, rename, or re-price. */
   async updateSkin(
     skinId: number,
-    request: { name?: string; document?: unknown; priceBux?: number },
+    request: UpdateSkinRequest,
   ): Promise<SkinSummary> {
     return this.request<SkinSummary>(`/api/skins/${skinId}`, {
       method: 'PUT',
-      body: JSON.stringify(request),
+      body: JSON.stringify(exactSkinUpdate(request)),
     });
   }
 
-  /** Ask an admin to look at the current head revision. */
-  async requestSkinPublication(skinId: number): Promise<void> {
+  /** Ask an admin to look at one exact immutable revision. */
+  async requestSkinPublication(skinId: number, revision: number, contentRef: string): Promise<void> {
     await this.request<unknown>(`/api/skins/${skinId}/publish-request`, {
       method: 'POST',
+      body: JSON.stringify(exactPublicationRequest(revision, contentRef)),
     });
   }
 

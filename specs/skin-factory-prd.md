@@ -40,8 +40,18 @@ Models are selected by capability role in one versioned configuration:
 - **Task worker:** a cheaper, configurable local or API model invoked by the
   factory. This is the student that executes the authoring skill during
   production and GEPA rollouts.
-- **Pixel repair:** local LaMa by default; Gemini image editing is an optional
-  provider for repairs LaMa cannot perform.
+- **Pixel repair:** deterministic local LaMa inside the strict forge. A
+  provider-backed editor is not a selectable production role until it has the
+  same exact-byte, mask, budget, journal, and conformance guarantees.
+
+The LaMa role is a versioned local bundle, not a runtime downloader. Its exact
+transitive Python closure is frozen in a separate `uv.lock`; the Big-LaMa
+TorchScript weight is preloaded over HTTPS, checked against a pinned byte size
+and SHA-256, and stored owner-only. Doctor verifies the lock, hash, model load,
+and a bounded inference without network access. The forge receives a minimal
+environment with the exact `LAMA_MODEL`, offline flags, and a socket-denying
+loader. The dependency lock, loader, and model identity are part of each
+Attempt's behavior digest, so any drift blocks an in-flight attempt.
 
 Every concept is created in the platform before a machine can reject it. Every
 prototype, partial build, valid private skin, browser render, gate report,
@@ -253,6 +263,11 @@ authoring skill, judge rubrics, fixtures, and promoted optimizer outputs.
 Production attempts pin those versions at start, so a promotion between ticks
 cannot change an in-flight build.
 
+The local database, content-addressed object tree, and their parent data
+directory are owner-only on disk. This includes unreleased images, review-gated
+text, provider traces, and human feedback; gallery authentication is not a
+substitute for filesystem isolation on a multi-user Hermes host.
+
 The factory uses a process lease and stage idempotency keys. Before each paid or
 external side effect, it transactionally records an operation intent and cost
 reservation. After the call it records the provider request id, resolved model,
@@ -266,6 +281,7 @@ every operational event.
 An authenticated operator resolves an unknown operation with immutable evidence
 using exactly one outcome: `confirmed_not_executed` releases the reservation
 and permits retry; `executed_result_recovered` attaches the recovered result and
+its exact resolved model, request id when available, and image media type, then
 continues; `executed_output_lost` or `indeterminate` charges the reservation and
 leaves the attempt terminally blocked. The cron service identity cannot create
 an operation resolution.
@@ -550,7 +566,9 @@ For generated texture `T`:
 1. Ask for the required axes to be seamless and record the intended use.
 2. Measure every required join before repair at multiple scales.
 3. For a crop, use the `[T, X, T]` inpainting construction and keep `[T, X]`.
-   Local LaMa is the default editor; Gemini editing may be selected explicitly.
+   The first implementation executes repair with local LaMa inside the strict
+   forge; a failed repair is retained and regenerated through the configured
+   image-generator role.
 4. For an already-nearly-tileable generated image, roll the join to the center,
    repair the narrowest viable band, restore untouched pixels, and roll back.
 5. Resize and filter with wrap-aware operations, then remeasure the exact bytes
@@ -611,8 +629,11 @@ Gate order:
 
 Blocking deterministic gates halt progression but retain the attempt;
 diagnostic gates add evidence for triage. Visual judgment is always soft triage.
-The worker receives at most two targeted repair passes by default; budgets are
-configuration, enforced by code.
+The strict forge performs at most one measured LaMa repair for each required
+join and rechecks every join afterward. Failed repairs are retained rather than
+entering an unbounded editor loop. It never downloads weights at repair time;
+missing, public, symlinked, size-mismatched, or hash-mismatched weights are a
+blocking installation/runtime failure.
 
 Once all pre-revision blocking gates pass, create or append the exact private
 Skin revision before visual triage. A build rejected by the judge therefore
@@ -762,7 +783,7 @@ evaluation. A judge's own decisions are never its labels.
 
 Hard caps live in versioned config and are enforced before spend: concurrent
 attempts, pending prototype reviews, pending final reviews, images per
-prototype, provider retries, repair passes, wall time, per-attempt cost, daily
+prototype, provider retries, wall time, per-attempt cost, daily
 cost, and total program cost.
 
 Pause new generation when any of these occurs:

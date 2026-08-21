@@ -1,0 +1,14 @@
+{
+  "path": "layers",
+  "rationale": "Replace with the measured reason this route is faithful.",
+  "fidelity_features": [
+    "Replace with the highest-priority game-scale feature"
+  ],
+  "layer_plan": [
+    "Role-readable contour and body fallback establish the foundation"
+  ],
+  "asset_plan": [],
+  "animation_plan": [],
+  "required_wrap_axes": [],
+  "risks": []
+}

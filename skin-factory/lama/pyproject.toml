@@ -1,0 +1,31 @@
+[project]
+name = "snaketron-lama-runtime"
+version = "0.1.0"
+description = "Frozen offline image-repair runtime for the Snaketron skin factory"
+requires-python = "==3.11.*"
+dependencies = [
+  "fire==0.5.0",
+  "numpy==1.26.4",
+  "opencv-python==4.11.0.86",
+  "pillow==9.5.0",
+  "simple-lama-inpainting==0.1.2",
+  "torch==2.2.2",
+  "torchvision==0.17.2",
+]
+
+[tool.uv]
+package = false
+exclude-newer = "2026-08-21T00:00:00Z"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]

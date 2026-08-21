@@ -1,0 +1,24 @@
+{
+  "path": "texture",
+  "rationale": "Irregular shell material needs a coat while ordinary layers preserve role reading.",
+  "fidelity_features": ["irregular shell facets", "long repeat", "role contour"],
+  "layer_plan": [
+    "Body fallback remains readable without the atlas",
+    "Shell coat tiles above Body fallback"
+  ],
+  "asset_plan": [
+    {
+      "kind": "coat",
+      "natural_length_cells": 29,
+      "frames": 1,
+      "texels_per_cell": 64,
+      "anchor": "whole",
+      "fit": "tile",
+      "fade": "none",
+      "prompt": "1856x64 opaque x-seamless coat with irregular shell facets and no background."
+    }
+  ],
+  "animation_plan": [],
+  "required_wrap_axes": ["x"],
+  "risks": ["Facet clusters may expose a short repeat"]
+}

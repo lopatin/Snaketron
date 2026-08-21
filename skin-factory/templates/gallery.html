@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>{{ title }}</h2>
+{% if not attempts %}<p class="muted">No attempts in this view.</p>{% endif %}
+<form action="/actions/bulk-retry" method="post">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="idempotency_key" value="{{ action_idempotency_key }}">
+  <div class="grid">
+  {% for item in attempts %}
+    <article class="card">
+      <label><input type="checkbox" name="attempt_ids" value="{{ item.id }}"> Select for retry</label>
+      <h3><a href="/attempts/{{ item.id }}">{{ item.concept_name }}</a></h3>
+      {% if item.preview_artifact_id %}{% if item.preview_media_type.startswith('video/') %}<video muted loop controls preload="metadata" src="/artifacts/{{ item.preview_artifact_id }}"></video>{% else %}<a href="/attempts/{{ item.id }}"><img src="/artifacts/{{ item.preview_artifact_id }}" alt="Preview of {{ item.concept_name }}"></a>{% endif %}{% endif %}
+      <p>{{ item.concept_brief }}</p>
+      <p><span class="pill">{{ item.stage }}</span><span class="pill">{{ item.disposition }}</span><span class="pill">{{ item.purpose }}</span></p>
+      <p class="muted">{{ item.id }} · updated {{ item.updated_at }}</p>
+    </article>
+  {% endfor %}
+  </div>
+  {% if attempts %}
+  <section><h3>Retry selected attempts</h3><label>Restart stage<select name="from_stage"><option value="prototype">prototype (new approval required)</option><option value="assets">assets</option><option value="build">build</option></select></label><label>Literal feedback<textarea name="feedback" required></textarea></label><button type="submit">Create linked retries</button></section>
+  {% endif %}
+</form>
+{% endblock %}
