@@ -55,6 +55,41 @@ EXPECTED_COLORS = {
     "body_mask": "#ffffff",
     "system_head_core": "#1c1c1c",
 }
+EXPECTED_PROJECTION = {
+    "version": "prototype-body-mask-v1",
+    "foreground_detection": {
+        "background_model": "robust_quadratic_border_rgb",
+        "border_fraction": 0.08,
+        "robust_keep_fraction": 0.8,
+        "robust_iterations": 2,
+        "max_border_samples": 8192,
+        "foreground_delta": 18,
+        "foreground_chroma_delta": 10,
+        "neutral_dark_delta": 42,
+        "axis_support_fraction": 0.006,
+        "max_axis_gap_fraction": 0.02,
+        "max_secondary_support_fraction": 0.35,
+        "max_center_offset_fraction": [0.2, 0.2],
+        "min_width_fraction": 0.25,
+        "max_height_fraction": 0.6,
+        "min_aspect_ratio": 2.0,
+        "max_input_pixels": 8_388_608,
+    },
+    "mapping": {
+        "native_body_bbox_px": [15, 15, 255, 30],
+        "native_head_core_bbox_px": [241, 16, 254, 29],
+        "native_head_core_center_px": [247.5, 22.5],
+        "native_head_core_restore_radius_px": 6.75,
+        "source_resample": "center_aligned_bilinear_rgb8",
+    },
+    "output": {
+        "body_clip": "exact_renderer_reference_alpha",
+        "head_core": "exact_renderer_reference_pixels",
+        "background": "exact_guide_canvas_background",
+        "presentation": "contract_nearest_neighbor_integer_upscale",
+        "png": "deterministic_rgb8_filter0_zlib9",
+    },
+}
 
 # External build/capture tools never need provider, factory, reviewer, worker,
 # cloud, or Git credentials. Start from this fixed runtime/build allowlist
@@ -288,6 +323,12 @@ def _validate_contract_facts(
         transform.get("scale"),
         EXPECTED_PRESENTATION_SCALE,
         "presentation_transform.scale",
+    )
+
+    _require_equal(
+        contract.get("prototype_projection"),
+        EXPECTED_PROJECTION,
+        "prototype_projection",
     )
 
     canvas = contract.get("guide_canvas")

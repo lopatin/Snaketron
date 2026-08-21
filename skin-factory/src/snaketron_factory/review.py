@@ -20,6 +20,7 @@ from .domain import (
 )
 from .operations import ExistingOperation, OperationJournal
 from .persistence import ResultPersistence
+from .prototype_projection import PROTOTYPE_PROJECTION_VERSION
 from .recovery import validate_skin_authority_readback
 from .snaketron_api import SnaketronApi
 
@@ -290,7 +291,7 @@ class ReviewService:
         require_approval_decision: bool,
     ) -> None:
         behavior = json.loads(attempt["behavior_json"])
-        if int(behavior.get("snapshot_version", 0)) < 6:
+        if int(behavior.get("snapshot_version", 0)) < 7:
             raise VersionConflict(
                 "legacy prototype cannot authorize a build; retry from prototype under the shared geometry rules"
             )
@@ -332,6 +333,28 @@ class ReviewService:
             raise VersionConflict(
                 "legacy or mismatched prototype cannot authorize a build; retry from prototype under current rules"
             )
+        source_hash = manifest_payload.get("source_image_sha256")
+        if (
+            manifest_payload.get("geometry_projection") != PROTOTYPE_PROJECTION_VERSION
+            or not isinstance(source_hash, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", source_hash) is None
+        ):
+            raise VersionConflict("prototype authority lacks exact renderer-mask projection provenance")
+        retained_source = next(
+            (
+                artifact
+                for candidate in lineage
+                for artifact in self.database.artifacts_for_attempt(
+                    candidate["id"],
+                    stage=Stage.PROTOTYPE,
+                    kind=ArtifactKind.PROVIDER_RESPONSE,
+                )
+                if artifact["content_hash"] == source_hash and str(artifact["media_type"]).startswith("image/")
+            ),
+            None,
+        )
+        if retained_source is None:
+            raise VersionConflict("prototype authority lacks its retained raw provider source")
         if not require_approval_decision:
             return
         decision_id = attempt.get("prototype_decision_id")

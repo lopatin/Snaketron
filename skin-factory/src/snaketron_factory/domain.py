@@ -106,6 +106,8 @@ class PrototypeManifest(StrictModel):
     prompt: str
     provider_config: str = Field(alias="model_config", serialization_alias="model_config")
     image_sha256: str
+    source_image_sha256: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    geometry_projection: Literal["prototype-body-mask-v1"]
     design_guidelines_sha256: str | None = None
     prototype_geometry_sha256: str | None = None
     prototype_guide_sha256: str | None = None

@@ -16,12 +16,17 @@ from .db import Database
 JudgeKind = Literal["prototype", "build"]
 
 PROTOTYPE_JUDGE_RUBRIC = (
-    "The first image is the pinned blank Snaketron geometry guide and the second is the candidate. "
-    "Judge the candidate as a game-scale Snaketron direction. The candidate must preserve one flat, "
-    "orthographic, right-facing, continuous one-cell-wide capsule body, a rounded one-cell head with "
-    "a small centered core, and a rounded tail. Detached or articulated pieces, gaps, perspective, "
-    "an oversized separate head, pointed tail, multiple snakes, or paint outside the round body are "
-    "machine_rejected geometry violations. Return candidate, uncertain, or machine_rejected. Flag "
+    "The first image is the pinned blank Snaketron geometry guide and the second is the candidate "
+    "after deterministic projection through that guide's native 15px-per-cell body mask. Judge the "
+    "candidate as a game-scale Snaketron direction. Its outer silhouette and system head core must "
+    "match the guide: one flat, right-facing, continuous 16-by-1-cell capsule with a rounded one-cell "
+    "head and rounded tail. The surrounding review canvas and empty padding are not snake geometry; "
+    "never reject merely because a provider's source canvas had another aspect ratio. Internal pattern "
+    "dividers or stylistic depth are allowed when they remain clipped inside one continuous silhouette; "
+    "do not call them articulated body pieces unless the outer body actually gaps or separates. Detached "
+    "pieces, an oversized separate head, a pointed tail, multiple snakes, or paint outside the round body "
+    "are machine_rejected geometry violations. Also reject detail, text, or motion cues that collapse in "
+    "the nearest-upscaled native-scale pixels. Return candidate, uncertain, or machine_rejected. Flag "
     "protected marks, public-figure likeness, unsafe content, or an apparently unlicensed reference. "
     "Any safety/IP flag routes to machine_rejected for human review; machine judgment never approves "
     "or waives it."

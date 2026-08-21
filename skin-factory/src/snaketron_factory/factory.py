@@ -55,6 +55,11 @@ from .objects import ObjectStore
 from .operations import ExistingOperation, OperationJournal
 from .outbox import OutboxDispatcher
 from .persistence import SUPPORTED_IMAGE_MEDIA_TYPES, ResultPersistence
+from .prototype_projection import (
+    PROTOTYPE_PROJECTION_VERSION,
+    PrototypeProjectionError,
+    project_prototype_body,
+)
 from .providers import ProviderRegistry
 from .recovery import RecoveredResultError, validate_recovered_result, validate_skin_authority_readback
 from .renderer import (
@@ -152,7 +157,7 @@ class Factory:
         renderer_config = renderer_execution_config(self.config)
         lama_bundle = lama_bundle_manifest(self.config)
         return {
-            "snapshot_version": 6,
+            "snapshot_version": 7,
             "direction_sha": direction_object.sha256,
             "direction_ref": direction_object.uri,
             "design_guidelines_sha": guideline_object.sha256,
@@ -740,7 +745,7 @@ class Factory:
             return None
         behavior = json.loads(attempt["behavior_json"])
         snapshot_version = int(behavior.get("snapshot_version", 0))
-        if snapshot_version < 6 and stage in {
+        if snapshot_version < 7 and stage in {
             Stage.CONCEPT,
             Stage.PROTOTYPE,
             Stage.PROTOTYPE_TRIAGE,
@@ -764,7 +769,7 @@ class Factory:
         approved_hash = attempt.get("approved_prototype_hash")
         if not approved_hash:
             return None
-        if snapshot_version < 6:
+        if snapshot_version < 7:
             return "legacy approved prototype cannot drive a build under the shared geometry contract"
         prototype = self._find_lineage_artifact(
             attempt,
@@ -791,6 +796,20 @@ class Factory:
             return "Attempt behavior lacks exact shared design and geometry authority hashes"
         if any(manifest.get(key) != value for key, value in required.items()):
             return "approved prototype manifest does not bind the pinned design and geometry contract"
+        source_hash = manifest.get("source_image_sha256")
+        if (
+            manifest.get("geometry_projection") != PROTOTYPE_PROJECTION_VERSION
+            or not isinstance(source_hash, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", source_hash) is None
+        ):
+            return "approved prototype manifest lacks the exact renderer-mask projection provenance"
+        source = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.PROVIDER_RESPONSE,
+            content_hash=source_hash,
+        )
+        if source is None or source["stage"] != Stage.PROTOTYPE or not str(source["media_type"]).startswith("image/"):
+            return "approved prototype raw provider source is not retained"
         decision_id = attempt.get("prototype_decision_id")
         approval = next(
             (
@@ -1035,7 +1054,14 @@ class Factory:
                         "object_ref": behavior["prototype_guide_ref"],
                     }
                 ]
-                operation_version = "v2"
+                request["geometry_projection"] = {
+                    "version": PROTOTYPE_PROJECTION_VERSION,
+                    "contract_sha256": behavior["prototype_geometry_sha"],
+                    "guide_content_hash": f"sha256:{behavior['prototype_guide_sha']}",
+                    "raw_provider_image_policy": "retained_audit_only",
+                    "projected_image_policy": "sole_review_and_authoring_authority",
+                }
+                operation_version = "v3"
             operation, result = await self._provider_call(
                 attempt=self.database.get_attempt(attempt["id"]),
                 stage=Stage.PROTOTYPE,
@@ -1051,18 +1077,18 @@ class Factory:
                 ),
             )
             image, media_type = self._image_result(operation, result)
-            stored = self.objects.put(image)
-            image_artifact = self.database.add_artifact(
-                attempt_id=attempt["id"],
-                stage=Stage.PROTOTYPE,
-                kind=ArtifactKind.PROTOTYPE,
-                content_hash=stored.uri,
-                object_ref=stored.uri,
-                media_type=media_type,
-                size_bytes=stored.size,
+            source_artifact = self._store_bytes_artifact(
+                attempt,
+                Stage.PROTOTYPE,
+                ArtifactKind.PROVIDER_RESPONSE,
+                image,
+                media_type,
                 metadata={
                     "prototype_index": index,
                     "prompt": prompt,
+                    "provider_output_role": "prototype_material_source",
+                    "review_authority": False,
+                    "geometry_projection": PROTOTYPE_PROJECTION_VERSION,
                     "prototype_geometry_sha256": request.get("references", [{}])[0].get("contract_sha256"),
                     "prototype_guide_content_hash": request.get("references", [{}])[0].get("content_hash"),
                 },
@@ -1070,13 +1096,91 @@ class Factory:
                     "operation_id": operation["id"],
                     "provider_role": "image_generator",
                     "resolved_model": operation["resolved_model"],
-                    "reference_policy": (
-                        "repository_owned_renderer_geometry_guide"
-                        if references
-                        else "legacy_prompt_only_no_external_reference_assets"
-                    ),
                     "references": request.get("references", []),
                 },
+                occurrence_key=f"prototype-source:{index}",
+            )
+            if geometry is None:
+                return self._block_attempt(
+                    attempt,
+                    "current prototype generation has no pinned renderer geometry authority",
+                )
+            try:
+                projection = project_prototype_body(
+                    image,
+                    contract=contract,
+                    geometry_guide=guide,
+                )
+            except PrototypeProjectionError as error:
+                self.database.add_evaluation(
+                    artifact_id=source_artifact["id"],
+                    attempt_id=attempt["id"],
+                    evaluator="deterministic_prototype_projection",
+                    result=GateResult(
+                        gate="prototype_geometry_projection",
+                        gate_version=PROTOTYPE_PROJECTION_VERSION,
+                        blocking=True,
+                        verdict=GateVerdict.MACHINE_REJECTED,
+                        reasons=[str(error)],
+                        measurements={
+                            "prototype_index": index,
+                            "source_image_sha256": source_artifact["content_hash"],
+                            "projection_version": PROTOTYPE_PROJECTION_VERSION,
+                        },
+                    ),
+                )
+                continue
+            stored = self.objects.put(projection.png_bytes)
+            image_artifact = self.database.add_artifact(
+                attempt_id=attempt["id"],
+                stage=Stage.PROTOTYPE,
+                kind=ArtifactKind.PROTOTYPE,
+                content_hash=stored.uri,
+                object_ref=stored.uri,
+                media_type="image/png",
+                size_bytes=stored.size,
+                metadata={
+                    "prototype_index": index,
+                    "prompt": prompt,
+                    "source_artifact_id": source_artifact["id"],
+                    "source_image_sha256": source_artifact["content_hash"],
+                    "source_media_type": media_type,
+                    "source_bbox": list(projection.source_bbox),
+                    "source_size": list(projection.source_size),
+                    "geometry_projection": projection.version,
+                    "prototype_geometry_sha256": request.get("references", [{}])[0].get("contract_sha256"),
+                    "prototype_guide_content_hash": request.get("references", [{}])[0].get("content_hash"),
+                },
+                provenance={
+                    "operation_id": operation["id"],
+                    "provider_role": "image_generator",
+                    "resolved_model": operation["resolved_model"],
+                    "reference_policy": "repository_owned_renderer_geometry_guide",
+                    "source_artifact_id": source_artifact["id"],
+                    "source_image_sha256": source_artifact["content_hash"],
+                    "geometry_projection": projection.version,
+                    "references": request.get("references", []),
+                },
+            )
+            self.database.add_evaluation(
+                artifact_id=image_artifact["id"],
+                attempt_id=attempt["id"],
+                evaluator="deterministic_prototype_projection",
+                result=GateResult(
+                    gate="prototype_geometry_projection",
+                    gate_version=projection.version,
+                    blocking=True,
+                    verdict=GateVerdict.CANDIDATE,
+                    reasons=["raw provider material was projected through the exact renderer-owned body mask"],
+                    measurements={
+                        "prototype_index": index,
+                        "source_image_sha256": source_artifact["content_hash"],
+                        "projected_image_sha256": image_artifact["content_hash"],
+                        "source_bbox": list(projection.source_bbox),
+                        "source_size": list(projection.source_size),
+                        "projection_version": projection.version,
+                    },
+                ),
             )
             # Content-addressed artifacts intentionally deduplicate identical
             # provider bytes.  A duplicate output is still a completed paid
@@ -1090,11 +1194,21 @@ class Factory:
                 index,
                 prompt=prompt,
                 operation_id=operation["id"],
+                source_image_sha256=source_artifact["content_hash"],
+                geometry_projection=projection.version,
                 duplicate_of_index=(
                     artifact_metadata.get("prototype_index")
                     if artifact_metadata.get("prototype_index") != index
                     else None
                 ),
+            )
+        projected = self.database.artifacts_for_attempt(
+            attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE
+        )
+        if not projected:
+            return self._reject_attempt(
+                attempt,
+                "no provider prototype could be deterministically projected into real snake geometry",
             )
         current = self.database.get_attempt(attempt["id"])
         return self.database.update_attempt(current["id"], current["version"], stage=Stage.PROTOTYPE_TRIAGE)
@@ -1108,6 +1222,8 @@ class Factory:
         *,
         prompt: str | None = None,
         operation_id: str | None = None,
+        source_image_sha256: str | None = None,
+        geometry_projection: str | None = None,
         duplicate_of_index: int | None = None,
     ) -> dict[str, Any]:
         metadata = json.loads(image_artifact["metadata_json"])
@@ -1116,6 +1232,15 @@ class Factory:
             raise RuntimeError(f"retained prototype index {index} lacks its exact generation prompt")
         if not isinstance(retained_prompt, str) or not retained_prompt:
             raise RuntimeError(f"retained prototype index {index} lacks its exact generation prompt")
+        retained_source_sha = source_image_sha256 or metadata.get("source_image_sha256")
+        retained_projection = geometry_projection or metadata.get("geometry_projection")
+        if (
+            not isinstance(retained_source_sha, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", retained_source_sha) is None
+        ):
+            raise RuntimeError(f"retained prototype index {index} lacks its exact provider source hash")
+        if retained_projection != PROTOTYPE_PROJECTION_VERSION:
+            raise RuntimeError(f"retained prototype index {index} lacks the current geometry projection")
         behavior = json.loads(attempt["behavior_json"])
         image_config = behavior.get("models", {}).get("image_generator")
         if not isinstance(image_config, dict):
@@ -1136,6 +1261,8 @@ class Factory:
             prompt=retained_prompt,
             provider_config=canonical_json(image_config),
             image_sha256=image_artifact["content_hash"],
+            source_image_sha256=retained_source_sha,
+            geometry_projection=retained_projection,
             design_guidelines_sha256=behavior.get("design_guidelines_sha"),
             prototype_geometry_sha256=behavior.get("prototype_geometry_sha"),
             prototype_guide_sha256=behavior.get("prototype_guide_sha"),
@@ -3017,7 +3144,12 @@ Pinned renderer geometry contract:
 
 The attached repository-owned guide is a strict geometry reference, not an
 optional style reference. Treat its white capsule as the only paintable snake
-body. Fill that body with the proposed skin while preserving its exact thin
+body. Your response supplies material for a deterministic renderer-mask
+projection: fill the attached white body rather than redesigning its outline.
+The factory will downsample that material to the real 15px-per-cell renderer,
+clip it through the exact native capsule mask, restore the system-owned head
+core, and only then nearest-upscale it for review. Fill that body with the
+proposed skin while preserving its exact thin
 16-cells-by-1-cell, right-facing, flat orthographic silhouette and the small
 centered head core. The body must remain one continuous rounded strip. The
 rounded head may not become larger than one cell; the tail may not become a
@@ -3027,7 +3159,9 @@ segments, perspective, 3D body geometry, or paint outside the round body.
 Depict exactly one snake on a neutral or transparent background. Show how the
 idea reads at actual game scale, including the first 1.5 headward cells and a
 representative repeating/growing body treatment. Do not include UI chrome,
-words, labels, scenery, framing, alternate concepts, or a montage. This is a
+words, letters, digits, ruler labels, scenery, framing, alternate concepts, or
+a montage. Use bold shapes that survive at 15 pixels per cell; do not use ticks,
+lines, or gaps narrower than one fifth of a cell. This is a
 constrained visual implementation reference, not poster art."""
 
     @staticmethod

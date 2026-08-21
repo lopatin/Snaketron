@@ -2,8 +2,11 @@
 
 Validate in this order and retain every report, including failures.
 
-1. **Input binding:** approval hash equals prototype hash; direction, skill,
-   capability, schema, renderer, and gate SHAs are pinned.
+1. **Input binding:** approval hash equals the projected prototype
+   `image_sha256`; `source_image_sha256` remains audit-only, and
+   `geometry_projection` is exactly `prototype-body-mask-v1`. The projected
+   image—not the raw provider source—is the only authoring input. Direction,
+   skill, capability, schema, renderer, and gate SHAs are pinned.
 2. **Plan:** validate `implementation-plan.json`; its exact bounded
    `design_guidelines` object names one artistic direction, primary structure,
    four-cell/early-growth/long-turn behavior, supported head-zone polarity, and

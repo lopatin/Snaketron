@@ -318,7 +318,7 @@ async def test_prototype_retry_sends_literal_human_feedback_in_journaled_prompt(
 ) -> None:
     image = FakeProvider(
         "gemini-3-pro-image",
-        [{"image": b"corrected prototype", "media_type": "image/png", "text": "done"}],
+        [{"image": _prototype_source_png(), "media_type": "image/png", "text": "done"}],
     )
     factory = Factory(
         factory_config,
@@ -353,7 +353,8 @@ async def test_prototype_retry_sends_literal_human_feedback_in_journaled_prompt(
     assert "Keep one continuous thin rounded snake body." in prompt
     assert '"id":"prototype-geometry-test-v1"' in prompt
     assert "Treat its white capsule as the only paintable snake" in prompt
-    assert "body. Fill that body with the proposed skin" in prompt
+    assert "Your response supplies material for a deterministic renderer-mask" in prompt
+    assert "clip it through the exact native capsule mask" in prompt
     assert "Do not create gaps, articulated modules, diamonds, plates" in prompt
     with database.connect() as connection:
         operation = dict(
@@ -641,6 +642,27 @@ async def test_extreme_tall_sheet_is_journaled_in_no_crop_slices_and_resumes_bef
 def _exact_png(color: tuple[int, int, int], *, width: int = 256, height: int = 64) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (width, height), color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _prototype_source_png(*, width: int = 320, height: int = 180) -> bytes:
+    """Return a centered provider-style material source accepted by projection."""
+
+    image = Image.new("RGB", (width, height), (102, 102, 102))
+    pixels = image.load()
+    x0, x1 = width // 8, width - width // 8
+    y0, y1 = height * 2 // 5, height * 3 // 5
+    span = max(1, x1 - x0 - 1)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            phase = (x - x0) / span
+            pixels[x, y] = (
+                round(20 + 80 * phase),
+                round(100 + 120 * phase),
+                round(220 - 80 * phase),
+            )
+    output = io.BytesIO()
+    image.save(output, format="PNG")
     return output.getvalue()
 
 
@@ -1279,9 +1301,10 @@ async def test_reject_annotation_flows_through_lineage_into_a_later_retry(
 async def test_prototype_resume_completes_missing_manifest_without_another_paid_call(
     factory_config, database, objects, monkeypatch
 ) -> None:
+    source = _prototype_source_png()
     image = FakeProvider(
         "gemini-3-pro-image",
-        [{"image": b"one exact prototype", "media_type": "image/png", "text": "done"}],
+        [{"image": source, "media_type": "image/png", "text": "done"}],
     )
     factory = Factory(
         factory_config,
@@ -1304,7 +1327,14 @@ async def test_prototype_resume_completes_missing_manifest_without_another_paid_
     with pytest.raises(RuntimeError, match="injected crash"):
         await factory._prototype(attempt)
     prototypes = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE)
+    sources = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROVIDER_RESPONSE)
     assert len(prototypes) == 1
+    assert len(sources) == 1
+    assert sources[0]["occurrence_key"] == "prototype-source:0"
+    assert sources[0]["content_hash"] == f"sha256:{hashlib.sha256(source).hexdigest()}"
+    assert objects.get(sources[0]["object_ref"]) == source
+    assert objects.get(prototypes[0]["object_ref"]) != source
+    assert prototypes[0]["media_type"] == "image/png"
     assert image.calls and len(image.calls) == 1
     assert not database.artifacts_for_attempt(
         attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST
@@ -1318,7 +1348,10 @@ async def test_prototype_resume_completes_missing_manifest_without_another_paid_
         attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST
     )
     assert len(manifests) == 1
-    assert factory.persistence.load_json(manifests[0]["object_ref"])["image_sha256"] == prototypes[0]["content_hash"]
+    manifest = factory.persistence.load_json(manifests[0]["object_ref"])
+    assert manifest["image_sha256"] == prototypes[0]["content_hash"]
+    assert manifest["source_image_sha256"] == sources[0]["content_hash"]
+    assert manifest["geometry_projection"] == "prototype-body-mask-v1"
     await factory.close()
 
 
@@ -1326,7 +1359,8 @@ async def test_prototype_resume_completes_missing_manifest_without_another_paid_
 async def test_duplicate_prototype_bytes_complete_every_paid_slot_without_duplicate_storage(
     factory_config, database, objects
 ) -> None:
-    duplicate = {"image": b"identical provider output", "media_type": "image/png", "text": "done"}
+    factory_config.budgets.prototypes_per_attempt = 3
+    duplicate = {"image": _prototype_source_png(), "media_type": "image/png", "text": "done"}
     image = FakeProvider(
         "gemini-3-pro-image",
         [duplicate.copy() for _ in range(factory_config.budgets.prototypes_per_attempt)],
@@ -1346,10 +1380,17 @@ async def test_duplicate_prototype_bytes_complete_every_paid_slot_without_duplic
     assert advanced["stage"] == Stage.PROTOTYPE_TRIAGE
     assert len(image.calls) == factory_config.budgets.prototypes_per_attempt
     prototypes = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE)
+    sources = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROVIDER_RESPONSE)
     manifests = database.artifacts_for_attempt(
         attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST
     )
     assert len(prototypes) == 1
+    assert len(sources) == factory_config.budgets.prototypes_per_attempt
+    assert len({item["id"] for item in sources}) == factory_config.budgets.prototypes_per_attempt
+    assert len({item["content_hash"] for item in sources}) == 1
+    assert {item["occurrence_key"] for item in sources} == {
+        f"prototype-source:{index}" for index in range(factory_config.budgets.prototypes_per_attempt)
+    }
     assert len(manifests) == factory_config.budgets.prototypes_per_attempt
     manifest_metadata = [json.loads(item["metadata_json"]) for item in manifests]
     assert {item["prototype_index"] for item in manifest_metadata} == set(
@@ -1359,6 +1400,70 @@ async def test_duplicate_prototype_bytes_complete_every_paid_slot_without_duplic
     assert sum(item["duplicate_of_index"] is not None for item in manifest_metadata) == (
         factory_config.budgets.prototypes_per_attempt - 1
     )
+    for artifact in manifests:
+        manifest = factory.persistence.load_json(artifact["object_ref"])
+        assert manifest["source_image_sha256"] == sources[0]["content_hash"]
+        assert manifest["geometry_projection"] == "prototype-body-mask-v1"
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_projection_failure_is_durable_and_never_repeats_paid_generation(
+    factory_config, database, objects
+) -> None:
+    source = _exact_png((102, 102, 102), width=320, height=180)
+    image = FakeProvider(
+        "gemini-3-pro-image",
+        [{"image": source, "media_type": "image/png", "text": "no foreground"}],
+    )
+    factory = Factory(
+        factory_config,
+        database=database,
+        objects=objects,
+        providers=FakeRegistry({"image_generator": image}),  # type: ignore[arg-type]
+    )
+    configure_skill(factory)
+    attempt = factory._create_seed_attempt()
+    attempt = database.update_attempt(attempt["id"], attempt["version"], stage=Stage.PROTOTYPE)
+
+    rejected = await factory._prototype(attempt)
+
+    assert rejected["stage"] == Stage.PROTOTYPE
+    assert rejected["disposition"] == Disposition.MACHINE_REJECTED
+    assert "could be deterministically projected" in json.loads(rejected["failure_json"])["reason"]
+    assert len(image.calls) == 1
+    assert database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE) == []
+    assert (
+        database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST) == []
+    )
+    sources = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROVIDER_RESPONSE)
+    assert len(sources) == 1
+    assert sources[0]["occurrence_key"] == "prototype-source:0"
+    assert objects.get(sources[0]["object_ref"]) == source
+    evaluations = database.evaluations_for_attempt(attempt["id"], reveal=True)
+    assert len(evaluations) == 1
+    assert evaluations[0]["gate_name"] == "prototype_geometry_projection"
+    assert evaluations[0]["verdict"] == GateVerdict.MACHINE_REJECTED
+    charged_after_first = rejected["cost_charged_micros"]
+
+    replayed = await factory._prototype(database.get_attempt(attempt["id"]))
+
+    assert replayed["disposition"] == Disposition.MACHINE_REJECTED
+    assert replayed["cost_charged_micros"] == charged_after_first
+    assert len(image.calls) == 1
+    assert (
+        len(database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROVIDER_RESPONSE))
+        == 1
+    )
+    assert len(database.evaluations_for_attempt(attempt["id"], reveal=True)) == 1
+    with database.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM operation WHERE attempt_id=? AND side_effect='generate_prototype_image'",
+                (attempt["id"],),
+            ).fetchone()[0]
+            == 1
+        )
     await factory.close()
 
 
@@ -1389,6 +1494,15 @@ async def test_linked_child_prototype_re_evaluation_is_consumed_and_remains_exac
     configure_skill(factory)
     factory.gates = PassingGates()  # type: ignore[assignment]
     parent = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.MACHINE_REJECTED)
+    source = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROVIDER_RESPONSE,
+        value=b"retained raw rejected provider pixels",
+        media_type="image/png",
+    )
     prototype = add_artifact(
         database,
         objects,
@@ -1409,6 +1523,8 @@ async def test_linked_child_prototype_re_evaluation_is_consumed_and_remains_exac
         value=json.dumps(
             {
                 "image_sha256": prototype["content_hash"],
+                "source_image_sha256": source["content_hash"],
+                "geometry_projection": "prototype-body-mask-v1",
                 "design_guidelines_sha256": current_contract["design_guidelines_sha"],
                 "prototype_geometry_sha256": current_contract["prototype_geometry_sha"],
                 "prototype_guide_sha256": current_contract["prototype_guide_sha"],
@@ -1611,6 +1727,15 @@ async def test_build_re_evaluations_record_current_results_but_never_gain_publis
         disposition=Disposition.NEEDS_HUMAN,
         behavior=visual_behavior,
     )
+    prototype_source = add_artifact(
+        database,
+        objects,
+        visual_parent["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROVIDER_RESPONSE,
+        value=b"retained raw approved provider source",
+        media_type="image/png",
+    )
     prototype = add_artifact(
         database,
         objects,
@@ -1629,6 +1754,8 @@ async def test_build_re_evaluations_record_current_results_but_never_gain_publis
         value=canonical_json(
             {
                 "image_sha256": prototype["content_hash"],
+                "source_image_sha256": prototype_source["content_hash"],
+                "geometry_projection": "prototype-body-mask-v1",
                 "design_guidelines_sha256": visual_behavior["design_guidelines_sha"],
                 "prototype_geometry_sha256": visual_behavior["prototype_geometry_sha"],
                 "prototype_guide_sha256": visual_behavior["prototype_guide_sha"],
@@ -1715,7 +1842,7 @@ async def test_legacy_production_attempts_cannot_spend_or_resume_post_approval(
 
     malformed = make_attempt(
         stage=Stage.AUTHOR,
-        behavior={"snapshot_version": 6},
+        behavior={"snapshot_version": 7},
     )
     malformed_prototype = add_artifact(
         database,
@@ -1723,7 +1850,7 @@ async def test_legacy_production_attempts_cannot_spend_or_resume_post_approval(
         malformed["id"],
         stage=Stage.PROTOTYPE,
         kind=ArtifactKind.PROTOTYPE,
-        value=b"malformed v6 prototype",
+        value=b"malformed v7 prototype",
         media_type="image/png",
     )
     add_artifact(
@@ -1795,7 +1922,7 @@ async def test_legacy_production_attempts_cannot_spend_or_resume_post_approval(
         api,  # type: ignore[arg-type]
         factory.persistence,
         lambda: {
-            "snapshot_version": 6,
+            "snapshot_version": 7,
             "direction_sha": "a" * 64,
             "skill_sha": "b" * 64,
             "capability_sha": "c" * 64,
@@ -1814,7 +1941,7 @@ async def test_legacy_production_attempts_cannot_spend_or_resume_post_approval(
             actor="human:alex",
         )
     )["attempt"]
-    assert json.loads(child["behavior_json"])["snapshot_version"] == 6
+    assert json.loads(child["behavior_json"])["snapshot_version"] == 7
     blocked = await factory._advance(child)
     assert blocked["disposition"] == Disposition.BLOCKED
     assert "contract-bound manifest" in blocked["failure_json"]
@@ -1851,7 +1978,7 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     )
     image = FakeProvider(
         "gemini-3-pro-image",
-        [{"image": b"prototype-image-pixels", "media_type": "image/png", "text": "done"}],
+        [{"image": _prototype_source_png(), "media_type": "image/png", "text": "done"}],
     )
     judge = FakeProvider(
         "gemini-3.7-flash",
@@ -1902,27 +2029,49 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     assert attempt["disposition"] == Disposition.NEEDS_HUMAN
     assert attempt["review_kind"] == "prototype"
     kinds = [row["kind"] for row in database.artifacts_for_attempt(attempt["id"])]
-    assert kinds[:3] == [
+    assert kinds == [
         ArtifactKind.CONCEPT_BRIEF,
+        ArtifactKind.PROVIDER_RESPONSE,
         ArtifactKind.PROTOTYPE,
         ArtifactKind.PROTOTYPE_MANIFEST,
+        ArtifactKind.PROVIDER_RESPONSE,
     ]
-    assert kinds[3:] == [ArtifactKind.PROVIDER_RESPONSE]
     assert worker.requests == []
     assert api.create_calls == []
 
+    source = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROVIDER_RESPONSE)[
+        0
+    ]
     prototype = database.artifacts_for_attempt(attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE)[0]
     manifest_artifact = database.artifacts_for_attempt(
         attempt["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROTOTYPE_MANIFEST
     )[0]
     manifest = json.loads(objects.get(manifest_artifact["object_ref"]))
+    source_metadata = json.loads(source["metadata_json"])
+    prototype_metadata = json.loads(prototype["metadata_json"])
+    assert source_metadata["provider_output_role"] == "prototype_material_source"
+    assert source_metadata["review_authority"] is False
+    assert source["content_hash"] == f"sha256:{hashlib.sha256(_prototype_source_png()).hexdigest()}"
+    assert prototype["content_hash"] != source["content_hash"]
+    assert prototype["media_type"] == "image/png"
+    assert prototype_metadata["source_artifact_id"] == source["id"]
+    assert prototype_metadata["source_image_sha256"] == source["content_hash"]
+    assert prototype_metadata["geometry_projection"] == "prototype-body-mask-v1"
+    with (
+        Image.open(io.BytesIO(objects.get(prototype["object_ref"]))) as projected,
+        Image.open(io.BytesIO(objects.get(behavior["prototype_guide_ref"]))) as guide,
+    ):
+        assert projected.size == guide.size
     assert manifest["design_guidelines_sha256"] == behavior["design_guidelines_sha"]
     assert manifest["prototype_geometry_sha256"] == behavior["prototype_geometry_sha"]
     assert manifest["prototype_guide_sha256"] == behavior["prototype_guide_sha"]
+    assert manifest["source_image_sha256"] == source["content_hash"]
+    assert manifest["geometry_projection"] == "prototype-body-mask-v1"
     assert judge.calls[0]["images"] == [
         ("image/png", objects.get(behavior["prototype_guide_ref"])),
         (prototype["media_type"], objects.get(prototype["object_ref"])),
     ]
+    assert all(payload != objects.get(source["object_ref"]) for _, payload in judge.calls[0]["images"])
     assert judge.calls[0]["system"].startswith("The first image is the pinned blank Snaketron geometry guide")
     review = ReviewService(
         database,

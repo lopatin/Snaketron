@@ -4,10 +4,12 @@
   "motion_intent": "Forty-eight-frame seamless loop with a calm resting first frame.",
   "implementation_hint": "sprite_sheet",
   "hint_rationale": "The caustic shapes morph between drawn states rather than sliding as one formula.",
-  "prompt": "Fill the exact pinned blank geometry guide with dark water and painted caustics: one flat right-facing continuous 16-cell-by-1-cell capsule, one-cell rounded head with a small centered dark core, rounded tail, neutral background, and no gaps, detached plates, perspective, or outside paint.",
+  "prompt": "Fill the exact pinned blank geometry guide with dark water and painted caustics: one flat right-facing continuous 16-cell-by-1-cell capsule, one-cell rounded head with a small centered dark core, rounded tail, neutral background, and no gaps, detached plates, perspective, or outside paint. prototype-body-mask-v1 deterministically projects the retained source material through the exact native renderer body mask before review; image_sha256 is the projected authority and source_image_sha256 is audit-only raw provider material.",
   "model_config": "prototype-gemini-3-pro-image-v1",
   "image_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "source_image_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "geometry_projection": "prototype-body-mask-v1",
   "design_guidelines_sha256": "42b83d8ce03f5b9d3e5ce9a547287ddc9868ed22e3682b159179f1d9b94d23d4",
-  "prototype_geometry_sha256": "29a052f780a761b78d8c1e87777e37fbe52acdb2b9749bef18bfeee0f214fa22",
+  "prototype_geometry_sha256": "add1b9dbd48f4229d3e85df834ec1fc2666d3ed62e9075d0ddb5d687aa889300",
   "prototype_guide_sha256": "620c98c34f9d4cf0b7366954d48ab964653639d0b5e2a866110093b3de4d19ae"
 }

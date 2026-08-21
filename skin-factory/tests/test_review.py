@@ -30,7 +30,7 @@ from snaketron_factory.review import ReviewService
 
 def _review_behavior_snapshot() -> dict[str, Any]:
     return {
-        "snapshot_version": 6,
+        "snapshot_version": 7,
         "direction_sha": "a" * 64,
         "skill_sha": "b" * 64,
         "capability_sha": "c" * 64,
@@ -49,6 +49,15 @@ def _bind_prototype_manifest(
     prototype: dict[str, Any],
 ) -> dict[str, Any]:
     behavior = json.loads(attempt["behavior_json"])
+    source = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROVIDER_RESPONSE,
+        value=f"raw prototype source:{prototype['id']}".encode(),
+        media_type="image/png",
+    )
     return add_artifact(
         database,
         objects,
@@ -58,6 +67,8 @@ def _bind_prototype_manifest(
         value=canonical_json(
             {
                 "image_sha256": prototype["content_hash"],
+                "source_image_sha256": source["content_hash"],
+                "geometry_projection": "prototype-body-mask-v1",
                 "design_guidelines_sha256": behavior["design_guidelines_sha"],
                 "prototype_geometry_sha256": behavior["prototype_geometry_sha"],
                 "prototype_guide_sha256": behavior["prototype_guide_sha"],
@@ -630,8 +641,8 @@ async def test_exact_prototype_approval_is_the_only_transition_into_authoring(
 
 @pytest.mark.parametrize(
     "legacy_behavior",
-    [{}, {"snapshot_version": 0}, {"snapshot_version": 5}],
-    ids=["missing-version", "zero-version", "v5"],
+    [{}, {"snapshot_version": 0}, {"snapshot_version": 5}, {"snapshot_version": 6}],
+    ids=["missing-version", "zero-version", "v5", "v6"],
 )
 def test_legacy_or_unversioned_prototype_cannot_authorize_a_new_build(
     database, objects, review: ReviewService, legacy_behavior: dict[str, Any]
@@ -685,7 +696,7 @@ def test_legacy_or_unversioned_prototype_cannot_authorize_a_new_build(
     assert database.decisions_for_attempt(attempt["id"]) == []
 
 
-def test_malformed_v6_authority_hashes_cannot_authorize_a_prototype(
+def test_malformed_v7_authority_hashes_cannot_authorize_a_prototype(
     database, objects, make_attempt, review: ReviewService
 ) -> None:
     malformed = _review_behavior_snapshot()
@@ -702,7 +713,7 @@ def test_malformed_v6_authority_hashes_cannot_authorize_a_prototype(
         attempt["id"],
         stage=Stage.PROTOTYPE,
         kind=ArtifactKind.PROTOTYPE,
-        value=b"malformed-v6-authority",
+        value=b"malformed-v7-authority",
         media_type="image/png",
     )
     add_artifact(
@@ -736,13 +747,13 @@ def test_malformed_v6_authority_hashes_cannot_authorize_a_prototype(
 @pytest.mark.parametrize(
     ("behavior", "message"),
     [
-        ({"snapshot_version": 5}, "legacy prototype cannot authorize"),
+        ({"snapshot_version": 6}, "legacy prototype cannot authorize"),
         (
             {**_review_behavior_snapshot(), "prototype_guide_sha": None},
             "lacks exact shared design and geometry authority hashes",
         ),
     ],
-    ids=["v5", "malformed-v6"],
+    ids=["v6", "malformed-v7"],
 )
 async def test_legacy_final_review_cannot_publish_or_reopen_external_authority(
     database,

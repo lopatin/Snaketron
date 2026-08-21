@@ -8,10 +8,20 @@ transparent background. Detached plates, gaps, perspective, an oversized
 separate head, a pointed tail, UI, labels, scenery, and alternative designs are
 not skin pixels.
 
+prototype-body-mask-v1 deterministically projects the retained source material
+through the exact native renderer body mask before review; image_sha256 is the
+projected authority and source_image_sha256 is audit-only raw provider
+material. The manifest's `geometry_projection` must be exactly
+`prototype-body-mask-v1`, and both `image_sha256` and `source_image_sha256` must
+name their exact retained bytes. The projected image—not the raw source—is the
+only authoring input. Never recover details from, substitute, or approve the
+audit-only source image.
+
 Verify before implementation:
 
-1. The approval names the exact image SHA-256 and the manifest records the same
-   digest. Do not use a visually similar candidate.
+1. The approval names the exact projected `image_sha256` and the manifest
+   records the same digest. It must not name `source_image_sha256`. Do not use a
+   visually similar candidate or raw provider source.
 2. The manifest preserves the brief, palette and motion intent, prompt, stored
    model-configuration reference, implementation hint, and rationale. The
    immutable Artifact/Attempt metadata separately preserves the resolved model,
