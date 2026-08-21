@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -15,6 +16,7 @@ from typing import Any
 PACKAGE = Path(__file__).resolve().parents[1]
 REPO = PACKAGE.parents[1]
 HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
+PLAIN_HASH = re.compile(r"^[a-f0-9]{64}$")
 ROUTES = {"layers", "texture", "sprite-sheet", "hybrid"}
 DRAFT_FIXTURE_DIR = "worker-drafts"
 PLAN_PATHS = {"layers", "texture", "sprite_sheet", "hybrid"}
@@ -36,6 +38,29 @@ DESIGN_GUIDELINE_TEXT_LIMITS = {
     "body_strategy": 320,
     "asset_strategy": 320,
 }
+PROTOTYPE_AUTHORITY_KEYS = {
+    "design_guidelines_sha256",
+    "prototype_geometry_sha256",
+    "prototype_guide_sha256",
+}
+PROTOTYPE_MANIFEST_KEYS = {
+    "brief",
+    "palette_intent",
+    "motion_intent",
+    "implementation_hint",
+    "hint_rationale",
+    "prompt",
+    "model_config",
+    "image_sha256",
+} | PROTOTYPE_AUTHORITY_KEYS
+PROTOTYPE_PROMPT_TERMS = (
+    "exact pinned blank geometry guide",
+    "flat right-facing continuous 16-cell-by-1-cell capsule",
+    "one-cell rounded head",
+    "small centered dark core",
+    "rounded tail",
+    "no gaps, detached plates, perspective, or outside paint",
+)
 
 REQUIRED_FILES = {
     "SKILL.md",
@@ -91,6 +116,25 @@ def is_hash(value: Any) -> bool:
     return isinstance(value, str) and HASH.fullmatch(value) is not None
 
 
+def is_plain_hash(value: Any) -> bool:
+    return isinstance(value, str) and PLAIN_HASH.fullmatch(value) is not None
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_prototype_authorities() -> dict[str, str]:
+    contract = REPO / "skin-schema" / "prototype-geometry-v1.json"
+    geometry = read_json(contract)
+    guide = contract.parent / geometry["guide"]
+    return {
+        "design_guidelines_sha256": sha256_file(PACKAGE / "references/design-guidelines.md"),
+        "prototype_geometry_sha256": sha256_file(contract),
+        "prototype_guide_sha256": sha256_file(guide),
+    }
+
+
 def numeric_constant(value: Any) -> bool:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return True
@@ -131,12 +175,8 @@ def validate_boundaries(errors: list[str]) -> None:
     guidelines_path = "references/design-guidelines.md"
     guidelines = (PACKAGE / guidelines_path).read_text(encoding="utf-8")
     skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
-    prototypes_reference = (PACKAGE / "references/prototypes.md").read_text(
-        encoding="utf-8"
-    )
-    validation_reference = (PACKAGE / "references/validation.md").read_text(
-        encoding="utf-8"
-    )
+    prototypes_reference = (PACKAGE / "references/prototypes.md").read_text(encoding="utf-8")
+    validation_reference = (PACKAGE / "references/validation.md").read_text(encoding="utf-8")
     start = boundary["start_marker"]
     end = boundary["end_marker"]
     add(
@@ -156,8 +196,7 @@ def validate_boundaries(errors: list[str]) -> None:
     )
     add(
         errors,
-        contract.count("<!-- FACTORY_LOCKED:START -->") == 1
-        and contract.count("<!-- FACTORY_LOCKED:END -->") == 1,
+        contract.count("<!-- FACTORY_LOCKED:START -->") == 1 and contract.count("<!-- FACTORY_LOCKED:END -->") == 1,
         "contract must have one locked boundary",
     )
     for required_safety_term in (
@@ -188,17 +227,12 @@ def validate_boundaries(errors: list[str]) -> None:
         guidelines.find(DESIGN_GUIDELINE_START) < guidelines.find(DESIGN_GUIDELINE_END),
         "design-guideline markers are out of order",
     )
-    if (
-        guidelines.count(DESIGN_GUIDELINE_START) == 1
-        and guidelines.count(DESIGN_GUIDELINE_END) == 1
-    ):
-        locked_guidelines = guidelines.split(DESIGN_GUIDELINE_START, 1)[1].split(
-            DESIGN_GUIDELINE_END, 1
-        )[0]
+    if guidelines.count(DESIGN_GUIDELINE_START) == 1 and guidelines.count(DESIGN_GUIDELINE_END) == 1:
+        locked_guidelines = guidelines.split(DESIGN_GUIDELINE_START, 1)[1].split(DESIGN_GUIDELINE_END, 1)[0]
         for required_design_term in (
             "fun, weird, or silly",
             "one-cell-wide path that continuously",
-            "5–15 CSS px",
+            "5\u201315 CSS px",
             "four cells",
             "Six- and seven-cell snakes",
             "compressed head, turn, and tail points",
@@ -224,8 +258,7 @@ def validate_boundaries(errors: list[str]) -> None:
             add(
                 errors,
                 required_design_term in locked_guidelines,
-                "locked design guidelines are missing invariant: "
-                f"{required_design_term}",
+                f"locked design guidelines are missing invariant: {required_design_term}",
             )
     for required_geometry_term in (
         "exact pinned `prototype_geometry` contract and guide",
@@ -241,8 +274,7 @@ def validate_boundaries(errors: list[str]) -> None:
         add(
             errors,
             required_geometry_term in prototypes_reference,
-            "prototype reference is missing pinned geometry handoff: "
-            f"{required_geometry_term}",
+            f"prototype reference is missing pinned geometry handoff: {required_geometry_term}",
         )
     add(
         errors,
@@ -251,8 +283,7 @@ def validate_boundaries(errors: list[str]) -> None:
     )
     add(
         errors,
-        "[Skin Design Guidelines](references/design-guidelines.md)" in skill
-        and "completely and apply" in skill,
+        "[Skin Design Guidelines](references/design-guidelines.md)" in skill and "completely and apply" in skill,
         "SKILL.md must require reading and applying the shared design guidelines",
     )
     add(
@@ -296,18 +327,10 @@ def validate_playbook_candidate(candidate: str) -> list[str]:
 
 
 def validate_manifest(manifest: dict[str, Any], label: str, errors: list[str]) -> None:
-    required = {
-        "brief",
-        "palette_intent",
-        "motion_intent",
-        "implementation_hint",
-        "hint_rationale",
-        "prompt",
-        "model_config",
-        "image_sha256",
-    }
     add(
-        errors, set(manifest) == required, f"{label}: prototype manifest fields drifted"
+        errors,
+        set(manifest) == PROTOTYPE_MANIFEST_KEYS,
+        f"{label}: prototype manifest fields drifted",
     )
     add(
         errors,
@@ -317,10 +340,55 @@ def validate_manifest(manifest: dict[str, Any], label: str, errors: list[str]) -
     add(errors, is_hash(manifest.get("image_sha256")), f"{label}: invalid image hash")
     add(
         errors,
-        isinstance(manifest.get("model_config"), str)
-        and bool(manifest["model_config"]),
+        isinstance(manifest.get("model_config"), str) and bool(manifest["model_config"]),
         f"{label}: model_config must name a stored configuration",
     )
+    for authority in sorted(PROTOTYPE_AUTHORITY_KEYS):
+        add(
+            errors,
+            is_plain_hash(manifest.get(authority)),
+            f"{label}: {authority} is required and must be a SHA-256 digest",
+        )
+    expected_authorities = canonical_prototype_authorities()
+    for authority, expected in expected_authorities.items():
+        add(
+            errors,
+            manifest.get(authority) == expected,
+            f"{label}: {authority} differs from the canonical retained authority",
+        )
+    prompt = manifest.get("prompt")
+    for term in PROTOTYPE_PROMPT_TERMS:
+        add(
+            errors,
+            isinstance(prompt, str) and term in prompt,
+            f"{label}: prototype prompt is missing geometry invariant: {term}",
+        )
+
+
+def validate_prototype_manifest_schema(schema: dict[str, Any], errors: list[str]) -> None:
+    add(
+        errors,
+        schema.get("additionalProperties") is False,
+        "prototype-manifest schema must forbid extra fields",
+    )
+    add(
+        errors,
+        set(schema.get("required", [])) == PROTOTYPE_MANIFEST_KEYS,
+        "prototype-manifest schema must require every field and authority hash",
+    )
+    properties = schema.get("properties", {})
+    add(
+        errors,
+        set(properties) == PROTOTYPE_MANIFEST_KEYS,
+        "prototype-manifest schema fields drifted",
+    )
+    for authority in sorted(PROTOTYPE_AUTHORITY_KEYS):
+        definition = properties.get(authority, {})
+        add(
+            errors,
+            definition.get("type") == "string" and definition.get("pattern") == "^[a-f0-9]{64}$",
+            f"prototype-manifest schema must require a non-null SHA-256: {authority}",
+        )
 
 
 def validate_design_guidelines(evidence: Any, label: str, errors: list[str]) -> None:
@@ -352,15 +420,12 @@ def validate_design_guidelines(evidence: Any, label: str, errors: list[str]) -> 
     )
     add(
         errors,
-        evidence.get("head_zone")
-        in {"light_field_dark_core", "dark_field_light_disc_dark_core"},
+        evidence.get("head_zone") in {"light_field_dark_core", "dark_field_light_disc_dark_core"},
         f"{label}: design_guidelines.head_zone is invalid",
     )
 
 
-def validate_implementation_plan_schema(
-    schema: dict[str, Any], errors: list[str]
-) -> None:
+def validate_implementation_plan_schema(schema: dict[str, Any], errors: list[str]) -> None:
     add(
         errors,
         "design_guidelines" in schema.get("required", []),
@@ -401,9 +466,7 @@ def validate_implementation_plan_schema(
     )
 
 
-def validate_asset_request(
-    request: dict[str, Any], label: str, errors: list[str]
-) -> None:
+def validate_asset_request(request: dict[str, Any], label: str, errors: list[str]) -> None:
     required = {
         "schema_version",
         "request_id",
@@ -469,14 +532,12 @@ def validate_asset_request(
     )
     add(
         errors,
-        request.get("width_px")
-        == grid.get("body_columns", 0) * grid.get("texels_per_cell", 0),
+        request.get("width_px") == grid.get("body_columns", 0) * grid.get("texels_per_cell", 0),
         f"{label}: width must encode independent body columns",
     )
     add(
         errors,
-        request.get("height_px")
-        == grid.get("frame_rows", 0) * grid.get("texels_per_cell", 0),
+        request.get("height_px") == grid.get("frame_rows", 0) * grid.get("texels_per_cell", 0),
         f"{label}: height must encode independent frame rows",
     )
     add(
@@ -491,8 +552,7 @@ def validate_asset_request(
     )
     add(
         errors,
-        isinstance(grid.get("texels_per_cell"), int)
-        and 4 <= grid["texels_per_cell"] <= 128,
+        isinstance(grid.get("texels_per_cell"), int) and 4 <= grid["texels_per_cell"] <= 128,
         f"{label}: invalid texels per cell",
     )
     expected_tpc = 16 if request.get("kind") == "sheet" else 64
@@ -591,8 +651,7 @@ def validate_plan(
         add(errors, kind in ASSET_KINDS, f"{asset_label}: invalid kind")
         add(
             errors,
-            isinstance(asset.get("natural_length_cells"), int)
-            and 1 <= asset["natural_length_cells"] <= 128,
+            isinstance(asset.get("natural_length_cells"), int) and 1 <= asset["natural_length_cells"] <= 128,
             f"{asset_label}: invalid independent X body cells",
         )
         add(
@@ -600,17 +659,13 @@ def validate_plan(
             isinstance(asset.get("frames"), int) and 1 <= asset["frames"] <= 120,
             f"{asset_label}: invalid independent Y frame count",
         )
-        if isinstance(asset.get("natural_length_cells"), int) and isinstance(
-            asset.get("texels_per_cell"), int
-        ):
+        if isinstance(asset.get("natural_length_cells"), int) and isinstance(asset.get("texels_per_cell"), int):
             add(
                 errors,
                 asset["natural_length_cells"] * asset["texels_per_cell"] <= 2048,
                 f"{asset_label}: width exceeds the current capability bound",
             )
-        if isinstance(asset.get("frames"), int) and isinstance(
-            asset.get("texels_per_cell"), int
-        ):
+        if isinstance(asset.get("frames"), int) and isinstance(asset.get("texels_per_cell"), int):
             rows = asset["frames"] if kind == "sheet" else 1
             add(
                 errors,
@@ -619,8 +674,7 @@ def validate_plan(
             )
         add(
             errors,
-            isinstance(asset.get("texels_per_cell"), int)
-            and 4 <= asset["texels_per_cell"] <= 128,
+            isinstance(asset.get("texels_per_cell"), int) and 4 <= asset["texels_per_cell"] <= 128,
             f"{asset_label}: invalid texels per cell",
         )
         expected_tpc = 16 if kind == "sheet" else 64
@@ -703,9 +757,7 @@ def validate_worker_draft(
 ) -> None:
     """Validate the one-pass worker-to-driver unresolved texture handoff."""
     assets = plan.get("asset_plan", [])
-    generated = [
-        request for request in tool_requests if request.get("kind") == "generate_asset"
-    ]
+    generated = [request for request in tool_requests if request.get("kind") == "generate_asset"]
     add(
         errors,
         len(generated) == len(tool_requests),
@@ -747,9 +799,7 @@ def validate_worker_draft(
 
     for index, asset in enumerate(assets):
         arguments = requests_by_index.get(index)
-        add(
-            errors, arguments is not None, f"{label}: missing request for asset {index}"
-        )
+        add(errors, arguments is not None, f"{label}: missing request for asset {index}")
         if arguments is None:
             continue
         expected_rows = asset.get("frames") if asset.get("kind") == "sheet" else 1
@@ -786,9 +836,7 @@ def validate_worker_draft(
         )
 
         texture_name = arguments.get("texture_name")
-        matches = [
-            texture for texture in textures if texture.get("name") == texture_name
-        ]
+        matches = [texture for texture in textures if texture.get("name") == texture_name]
         add(
             errors,
             len(matches) == 1,
@@ -889,8 +937,7 @@ def validate_document(
             if asset.get("kind") == texture.get("kind")
             and isinstance(descriptor, dict)
             and descriptor.get("body_columns") == asset.get("natural_length_cells")
-            and descriptor.get("frame_rows")
-            == (asset.get("frames") if asset.get("kind") == "sheet" else None)
+            and descriptor.get("frame_rows") == (asset.get("frames") if asset.get("kind") == "sheet" else None)
         ]
         add(
             errors,
@@ -944,9 +991,7 @@ def validate_document(
         add(errors, bool(variants), f"{label}: descriptor has no variants")
         add(
             errors,
-            any(
-                variant.get("content_ref") == texture.get("ref") for variant in variants
-            ),
+            any(variant.get("content_ref") == texture.get("ref") for variant in variants),
             f"{label}: canonical ref is not an exact served variant",
         )
         for variant in variants:
@@ -987,13 +1032,9 @@ def validate_package() -> list[str]:
     validate_frontmatter(PACKAGE / "SKILL.md", errors)
     validate_boundaries(errors)
 
-    schemas = {
-        schema.name: read_json(schema)
-        for schema in (PACKAGE / "schemas").glob("*.json")
-    }
-    validate_implementation_plan_schema(
-        schemas.get("implementation-plan.schema.json", {}), errors
-    )
+    schemas = {schema.name: read_json(schema) for schema in (PACKAGE / "schemas").glob("*.json")}
+    validate_implementation_plan_schema(schemas.get("implementation-plan.schema.json", {}), errors)
+    validate_prototype_manifest_schema(schemas.get("prototype-manifest.schema.json", {}), errors)
     asset_template = read_json(PACKAGE / "templates/asset-request.json")
     validate_asset_request(asset_template, "asset template", errors)
     for required_prompt_term in (
@@ -1024,9 +1065,7 @@ def validate_package() -> list[str]:
     )
 
     fixture_root = PACKAGE / "fixtures"
-    fixture_directories = {
-        entry.name for entry in fixture_root.iterdir() if entry.is_dir()
-    }
+    fixture_directories = {entry.name for entry in fixture_root.iterdir() if entry.is_dir()}
     add(
         errors,
         fixture_directories == ROUTES | {DRAFT_FIXTURE_DIR},
@@ -1041,13 +1080,9 @@ def validate_package() -> list[str]:
         validate_manifest(manifest, route, errors)
         validate_plan(plan, manifest, approval, route, errors)
         for asset_index, asset in enumerate(plan.get("asset_plan", [])):
-            if asset.get("kind") != "sheet" or not isinstance(
-                asset.get("desired_fps"), (int, float)
-            ):
+            if asset.get("kind") != "sheet" or not isinstance(asset.get("desired_fps"), (int, float)):
                 continue
-            derived_rows = max(
-                2, math.ceil(document["period_ms"] * asset["desired_fps"] / 1_000)
-            )
+            derived_rows = max(2, math.ceil(document["period_ms"] * asset["desired_fps"] / 1_000))
             add(
                 errors,
                 asset.get("frames") == derived_rows,
@@ -1089,9 +1124,7 @@ def validate_package() -> list[str]:
     add(
         errors,
         any("must use pending:asset:0" in error for error in fabricated_errors)
-        and any(
-            "cannot fabricate a descriptor" in error for error in fabricated_errors
-        ),
+        and any("cannot fabricate a descriptor" in error for error in fabricated_errors),
         "negative draft fixture must prove fabricated refs/descriptors are rejected",
     )
 
@@ -1138,16 +1171,13 @@ def validate_package() -> list[str]:
             validate_frontmatter(wrapper, errors)
             add(
                 errors,
-                "../../../skills/author-skin/SKILL.md"
-                in wrapper.read_text(encoding="utf-8"),
+                "../../../skills/author-skin/SKILL.md" in wrapper.read_text(encoding="utf-8"),
                 f"wrapper does not point at canonical package: {wrapper.relative_to(REPO)}",
             )
 
     add(
         errors,
-        not (
-            REPO / ".claude/skills/author-skin/templates/custom_skin.rs.tmpl"
-        ).exists(),
+        not (REPO / ".claude/skills/author-skin/templates/custom_skin.rs.tmpl").exists(),
         "stale Rust escalation template still exists",
     )
     return errors
@@ -1172,12 +1202,8 @@ def run_cargo_validation() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--cargo", action="store_true", help="also validate fixture SkinDocs"
-    )
-    parser.add_argument(
-        "--json", action="store_true", help="emit a machine-readable result"
-    )
+    parser.add_argument("--cargo", action="store_true", help="also validate fixture SkinDocs")
+    parser.add_argument("--json", action="store_true", help="emit a machine-readable result")
     parser.add_argument(
         "--candidate-playbook",
         type=Path,
@@ -1187,11 +1213,7 @@ def main() -> int:
 
     errors = validate_package()
     if args.candidate_playbook:
-        errors.extend(
-            validate_playbook_candidate(
-                args.candidate_playbook.read_text(encoding="utf-8")
-            )
-        )
+        errors.extend(validate_playbook_candidate(args.candidate_playbook.read_text(encoding="utf-8")))
     if not errors and args.cargo and run_cargo_validation() != 0:
         errors.append("cargo SkinDoc validation failed")
 

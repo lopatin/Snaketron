@@ -1605,7 +1605,12 @@ async def test_build_re_evaluations_record_current_results_but_never_gain_publis
         )
     assert api.publish_calls == []
 
-    visual_parent = make_attempt(stage=Stage.PROTOTYPE_REVIEW, disposition=Disposition.NEEDS_HUMAN)
+    visual_behavior = factory.behavior_snapshot()
+    visual_parent = make_attempt(
+        stage=Stage.PROTOTYPE_REVIEW,
+        disposition=Disposition.NEEDS_HUMAN,
+        behavior=visual_behavior,
+    )
     prototype = add_artifact(
         database,
         objects,
@@ -1614,6 +1619,23 @@ async def test_build_re_evaluations_record_current_results_but_never_gain_publis
         kind=ArtifactKind.PROTOTYPE,
         value=b"approved prototype",
         media_type="image/png",
+    )
+    add_artifact(
+        database,
+        objects,
+        visual_parent["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE_MANIFEST,
+        value=canonical_json(
+            {
+                "image_sha256": prototype["content_hash"],
+                "design_guidelines_sha256": visual_behavior["design_guidelines_sha"],
+                "prototype_geometry_sha256": visual_behavior["prototype_geometry_sha"],
+                "prototype_guide_sha256": visual_behavior["prototype_guide_sha"],
+            }
+        ).encode(),
+        media_type="application/json",
+        metadata={"image_artifact_id": prototype["id"]},
     )
     visual_parent = review.approve_prototype(
         attempt_id=visual_parent["id"],
@@ -1660,6 +1682,148 @@ async def test_build_re_evaluations_record_current_results_but_never_gain_publis
     assert {document_child["id"], visual_child["id"]} <= all_ids
     assert document_child["id"] not in {row["id"] for row in database.list_gallery("published")}
     assert visual_child["id"] not in {row["id"] for row in database.list_gallery("final_review")}
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_production_attempts_cannot_spend_or_resume_post_approval(
+    factory_config, database, objects, make_attempt
+) -> None:
+    image_provider = FakeProvider(
+        "gemini-3-pro-image",
+        [{"image": b"must not be generated", "media_type": "image/png"}],
+    )
+    worker = FakeWorker([author_result()], model="worker-test")
+    api = FakeApi()
+    factory = Factory(
+        factory_config,
+        database=database,
+        objects=objects,
+        providers=FakeRegistry({"image_generator": image_provider}),  # type: ignore[arg-type]
+        worker=worker,
+        api=api,  # type: ignore[arg-type]
+    )
+
+    old_prototype_stage = make_attempt(
+        stage=Stage.PROTOTYPE,
+        behavior={"snapshot_version": 5},
+    )
+    stopped = await factory._advance(old_prototype_stage)
+    assert stopped["disposition"] == Disposition.BLOCKED
+    assert "shared design and geometry contract" in stopped["failure_json"]
+    assert image_provider.calls == []
+
+    malformed = make_attempt(
+        stage=Stage.AUTHOR,
+        behavior={"snapshot_version": 6},
+    )
+    malformed_prototype = add_artifact(
+        database,
+        objects,
+        malformed["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"malformed v6 prototype",
+        media_type="image/png",
+    )
+    add_artifact(
+        database,
+        objects,
+        malformed["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE_MANIFEST,
+        value=canonical_json({"image_sha256": malformed_prototype["content_hash"]}).encode(),
+        media_type="application/json",
+        metadata={"image_artifact_id": malformed_prototype["id"]},
+    )
+    malformed_approval = database.add_human_decision(
+        artifact_id=malformed_prototype["id"],
+        attempt_id=malformed["id"],
+        action="prototype_approval",
+        feedback="malformed snapshot must not compare absent hashes as equal",
+        tags=[],
+        actor="human:test",
+        attempt_version=malformed["version"],
+        content_hash=malformed_prototype["content_hash"],
+    )
+    malformed = database.update_attempt(
+        malformed["id"],
+        malformed["version"],
+        approved_prototype_hash=malformed_prototype["content_hash"],
+        prototype_decision_id=malformed_approval["id"],
+    )
+    malformed_result = await factory._advance(malformed)
+    assert malformed_result["disposition"] == Disposition.BLOCKED
+    assert "lacks exact shared design and geometry authority hashes" in malformed_result["failure_json"]
+    assert worker.requests == []
+
+    parent = make_attempt(
+        stage=Stage.PROTOTYPE_REVIEW,
+        disposition=Disposition.NEEDS_HUMAN,
+        behavior={"snapshot_version": 5},
+    )
+    prototype = add_artifact(
+        database,
+        objects,
+        parent["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE,
+        value=b"legacy articulated prototype",
+        media_type="image/png",
+    )
+    approval = database.add_human_decision(
+        artifact_id=prototype["id"],
+        attempt_id=parent["id"],
+        action="prototype_approval",
+        feedback="historical approval",
+        tags=[],
+        actor="human:historical",
+        attempt_version=parent["version"],
+        content_hash=prototype["content_hash"],
+    )
+    parent = database.update_attempt(
+        parent["id"],
+        parent["version"],
+        stage=Stage.ASSETS,
+        disposition=Disposition.MACHINE_REJECTED,
+        approved_prototype_hash=prototype["content_hash"],
+        prototype_decision_id=approval["id"],
+    )
+    review = ReviewService(
+        database,
+        factory.journal,
+        api,  # type: ignore[arg-type]
+        factory.persistence,
+        lambda: {
+            "snapshot_version": 6,
+            "direction_sha": "a" * 64,
+            "skill_sha": "b" * 64,
+            "capability_sha": "c" * 64,
+            "gate_sha": "d" * 64,
+            "model_config_sha": "e" * 64,
+            "design_guidelines_sha": "f" * 64,
+            "prototype_geometry_sha": "1" * 64,
+            "prototype_guide_sha": "2" * 64,
+        },
+    )
+    child = (
+        await review.retry(
+            attempt_id=parent["id"],
+            from_stage="assets",
+            feedback="try the old approved pixels again",
+            actor="human:alex",
+        )
+    )["attempt"]
+    assert json.loads(child["behavior_json"])["snapshot_version"] == 6
+    blocked = await factory._advance(child)
+    assert blocked["disposition"] == Disposition.BLOCKED
+    assert "contract-bound manifest" in blocked["failure_json"]
+    assert worker.requests == []
+    assert api.create_calls == []
+    with database.connect() as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM operation WHERE attempt_id=?", (child["id"],)).fetchone()[0] == 0
+        )
     await factory.close()
 
 

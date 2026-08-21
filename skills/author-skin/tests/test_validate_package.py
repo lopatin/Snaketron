@@ -21,13 +21,9 @@ class PackageValidationTests(unittest.TestCase):
         self.assertNotEqual(guideline_path, boundary["editable_path"])
 
         skill = (validator.PACKAGE / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "[Skin Design Guidelines](references/design-guidelines.md)", skill
-        )
+        self.assertIn("[Skin Design Guidelines](references/design-guidelines.md)", skill)
         self.assertIn("completely and apply", skill)
-        validation = (validator.PACKAGE / "references/validation.md").read_text(
-            encoding="utf-8"
-        )
+        validation = (validator.PACKAGE / "references/validation.md").read_text(encoding="utf-8")
         self.assertIn("`design_guidelines` object", validation)
 
         guidelines = (validator.PACKAGE / guideline_path).read_text(encoding="utf-8")
@@ -35,17 +31,13 @@ class PackageValidationTests(unittest.TestCase):
         self.assertEqual(guidelines.count(validator.DESIGN_GUIDELINE_END), 1)
 
     def test_locked_guidelines_preserve_renderer_truth(self):
-        guidelines = (validator.PACKAGE / "references/design-guidelines.md").read_text(
-            encoding="utf-8"
-        )
-        locked = guidelines.split(validator.DESIGN_GUIDELINE_START, 1)[1].split(
-            validator.DESIGN_GUIDELINE_END, 1
-        )[0]
+        guidelines = (validator.PACKAGE / "references/design-guidelines.md").read_text(encoding="utf-8")
+        locked = guidelines.split(validator.DESIGN_GUIDELINE_START, 1)[1].split(validator.DESIGN_GUIDELINE_END, 1)[0]
         for term in (
             "DEFAULT_SNAKE_LENGTH",
             "GameArena.tsx",
             "one-cell-wide path that continuously",
-            "5–15 CSS px",
+            "5\u201315 CSS px",
             "canonical texel density of a sprite-sheet cell",
             "coats and overlays use 64 texels per cell",
             "compressed head, turn, and tail points",
@@ -76,6 +68,46 @@ class PackageValidationTests(unittest.TestCase):
                 "invalid_input",
             ):
                 self.assertIn(term, text, f"{path}: missing {term}")
+
+    def test_prototype_manifest_rejects_each_missing_authority_hash(self):
+        manifest = validator.read_json(validator.PACKAGE / "fixtures/layers/prototype-manifest.json")
+        for authority in sorted(validator.PROTOTYPE_AUTHORITY_KEYS):
+            with self.subTest(authority=authority):
+                missing = copy.deepcopy(manifest)
+                missing.pop(authority)
+                errors = []
+                validator.validate_manifest(missing, "probe", errors)
+                self.assertTrue(
+                    any(f"{authority} is required and must be a SHA-256 digest" in error for error in errors),
+                    errors,
+                )
+
+    def test_prototype_manifest_schema_cannot_make_authority_optional_or_nullable(self):
+        schema = validator.read_json(validator.PACKAGE / "schemas/prototype-manifest.schema.json")
+        for authority in sorted(validator.PROTOTYPE_AUTHORITY_KEYS):
+            with self.subTest(authority=authority):
+                relaxed = copy.deepcopy(schema)
+                relaxed["required"].remove(authority)
+                relaxed["properties"][authority]["type"] = ["string", "null"]
+                errors = []
+                validator.validate_prototype_manifest_schema(relaxed, errors)
+                self.assertTrue(
+                    any("must require every field and authority hash" in error for error in errors),
+                    errors,
+                )
+                self.assertTrue(
+                    any(f"must require a non-null SHA-256: {authority}" in error for error in errors),
+                    errors,
+                )
+
+    def test_canonical_prototype_prompts_and_hashes_bind_continuous_geometry(self):
+        expected = validator.canonical_prototype_authorities()
+        for route in sorted(validator.ROUTES):
+            manifest = validator.read_json(validator.PACKAGE / f"fixtures/{route}/prototype-manifest.json")
+            for authority, digest in expected.items():
+                self.assertEqual(manifest[authority], digest, f"{route}: {authority}")
+            for term in validator.PROTOTYPE_PROMPT_TERMS:
+                self.assertIn(term, manifest["prompt"], f"{route}: {term}")
 
     def test_plan_requires_exact_bounded_design_guideline_evidence(self):
         fixture = validator.PACKAGE / "fixtures/layers"
@@ -110,29 +142,17 @@ class PackageValidationTests(unittest.TestCase):
             self.assertTrue(any(expected in error for error in errors), errors)
 
     def test_plan_schema_cannot_relax_the_guideline_boundary(self):
-        schema = copy.deepcopy(
-            validator.read_json(
-                validator.PACKAGE / "schemas/implementation-plan.schema.json"
-            )
-        )
+        schema = copy.deepcopy(validator.read_json(validator.PACKAGE / "schemas/implementation-plan.schema.json"))
         schema["$defs"]["designGuidelines"]["additionalProperties"] = True
-        schema["$defs"]["designGuidelines"]["properties"]["body_strategy"][
-            "maxLength"
-        ] = 321
+        schema["$defs"]["designGuidelines"]["properties"]["body_strategy"]["maxLength"] = 321
         errors = []
         validator.validate_implementation_plan_schema(schema, errors)
         self.assertTrue(any("forbid extra fields" in error for error in errors), errors)
-        self.assertTrue(
-            any("bound drifted: body_strategy" in error for error in errors), errors
-        )
+        self.assertTrue(any("bound drifted: body_strategy" in error for error in errors), errors)
 
     def test_safety_ip_invariants_live_inside_the_locked_contract(self):
-        contract = (validator.PACKAGE / "references/contract.md").read_text(
-            encoding="utf-8"
-        )
-        locked = contract.split("<!-- FACTORY_LOCKED:START -->", 1)[1].split(
-            "<!-- FACTORY_LOCKED:END -->", 1
-        )[0]
+        contract = (validator.PACKAGE / "references/contract.md").read_text(encoding="utf-8")
+        locked = contract.split("<!-- FACTORY_LOCKED:START -->", 1)[1].split("<!-- FACTORY_LOCKED:END -->", 1)[0]
         for term in (
             "protected marks",
             "public-figure likeness",
@@ -162,26 +182,18 @@ class PackageValidationTests(unittest.TestCase):
         plan["required_wrap_axes"] = ["x"]
         errors = []
         validator.validate_plan(plan, manifest, approval, "probe", errors)
-        self.assertTrue(
-            any("derived from kind and fit" in error for error in errors), errors
-        )
+        self.assertTrue(any("derived from kind and fit" in error for error in errors), errors)
 
     def test_nonconstant_image_drift_is_rejected_until_capability_changes(self):
         fixture = validator.PACKAGE / "fixtures/texture"
         plan = validator.read_json(fixture / "implementation-plan.json")
         document = validator.read_json(fixture / "skin.skin.json")
         document = copy.deepcopy(document)
-        image = next(
-            layer
-            for layer in document["layers"]
-            if layer.get("source", {}).get("type") == "image"
-        )
+        image = next(layer for layer in document["layers"] if layer.get("source", {}).get("type") == "image")
         image["source"]["drift_cells"] = "2 * time"
         errors = []
         validator.validate_document(document, plan, "probe", errors)
-        self.assertTrue(
-            any("drift must stay constant" in error for error in errors), errors
-        )
+        self.assertTrue(any("drift must stay constant" in error for error in errors), errors)
 
     def test_sprite_x_and_y_are_independent_metadata(self):
         fixture = validator.PACKAGE / "fixtures/sprite-sheet"
@@ -194,29 +206,21 @@ class PackageValidationTests(unittest.TestCase):
         self.assertNotEqual(descriptor["body_columns"], descriptor["frame_rows"])
 
     def test_asset_requests_cannot_call_an_editor_as_a_generator(self):
-        request = validator.read_json(
-            validator.PACKAGE / "templates/asset-request.json"
-        )
+        request = validator.read_json(validator.PACKAGE / "templates/asset-request.json")
         request["capability_role"] = "image_editor"
         errors = []
         validator.validate_asset_request(request, "probe", errors)
-        self.assertTrue(
-            any("generate needs image_generator" in error for error in errors), errors
-        )
+        self.assertTrue(any("generate needs image_generator" in error for error in errors), errors)
 
     def test_inpaint_repairs_bind_an_exact_mask(self):
-        request = validator.read_json(
-            validator.PACKAGE / "templates/asset-request.json"
-        )
+        request = validator.read_json(validator.PACKAGE / "templates/asset-request.json")
         request["operation"] = "edit"
         request["capability_role"] = "image_editor"
         request["input_artifacts"] = ["sha256:" + "a" * 64]
         request["repair"] = {"method": "tx_t_inpaint", "mask_artifact": None}
         errors = []
         validator.validate_asset_request(request, "probe", errors)
-        self.assertTrue(
-            any("needs a mask artifact" in error for error in errors), errors
-        )
+        self.assertTrue(any("needs a mask artifact" in error for error in errors), errors)
 
         request["repair"]["mask_artifact"] = "sha256:" + "b" * 64
         errors = []
@@ -232,9 +236,7 @@ class PackageValidationTests(unittest.TestCase):
         plan["required_wrap_axes"] = ["y"]
         errors = []
         validator.validate_plan(plan, manifest, approval, "probe", errors)
-        self.assertTrue(
-            any("derived from kind and fit" in error for error in errors), errors
-        )
+        self.assertTrue(any("derived from kind and fit" in error for error in errors), errors)
 
     def test_asset_plan_uses_the_current_forge_texel_density(self):
         fixture = validator.PACKAGE / "fixtures/texture"
@@ -245,9 +247,7 @@ class PackageValidationTests(unittest.TestCase):
         plan["asset_plan"][0]["texels_per_cell"] = 16
         errors = []
         validator.validate_plan(plan, manifest, approval, "probe", errors)
-        self.assertTrue(
-            any("current forge requires 64" in error for error in errors), errors
-        )
+        self.assertTrue(any("current forge requires 64" in error for error in errors), errors)
 
     def test_asset_plan_is_bounded_before_generation(self):
         fixture = validator.PACKAGE / "fixtures/texture"
@@ -258,10 +258,7 @@ class PackageValidationTests(unittest.TestCase):
         errors = []
         validator.validate_plan(plan, manifest, approval, "probe", errors)
         self.assertTrue(
-            any(
-                "width exceeds the current capability bound" in error
-                for error in errors
-            ),
+            any("width exceeds the current capability bound" in error for error in errors),
             errors,
         )
 
@@ -287,12 +284,8 @@ class PackageValidationTests(unittest.TestCase):
             "probe",
             errors,
         )
-        self.assertTrue(
-            any("must use pending:asset:0" in error for error in errors), errors
-        )
-        self.assertTrue(
-            any("cannot fabricate a descriptor" in error for error in errors), errors
-        )
+        self.assertTrue(any("must use pending:asset:0" in error for error in errors), errors)
+        self.assertTrue(any("cannot fabricate a descriptor" in error for error in errors), errors)
 
     def test_pending_sentinel_cannot_reach_final_gates(self):
         fixture = validator.PACKAGE / "fixtures/worker-drafts"
@@ -305,26 +298,18 @@ class PackageValidationTests(unittest.TestCase):
             errors,
             allow_pending=False,
         )
-        self.assertTrue(
-            any("survived exact binding" in error for error in errors), errors
-        )
+        self.assertTrue(any("survived exact binding" in error for error in errors), errors)
 
     def test_optimizer_cannot_edit_outside_marked_playbook_body(self):
-        playbook = (validator.PACKAGE / "references/playbook.md").read_text(
-            encoding="utf-8"
-        )
-        changed_body = playbook.replace(
-            "Choose the cheapest faithful route", "Choose a faithful route"
-        )
+        playbook = (validator.PACKAGE / "references/playbook.md").read_text(encoding="utf-8")
+        changed_body = playbook.replace("Choose the cheapest faithful route", "Choose a faithful route")
         self.assertEqual(validator.validate_playbook_candidate(changed_body), [])
         changed_prefix = playbook.replace(
             "The marked section is the only content",
             "Everything is editable",
         )
         errors = validator.validate_playbook_candidate(changed_prefix)
-        self.assertTrue(
-            any("locked playbook prefix" in error for error in errors), errors
-        )
+        self.assertTrue(any("locked playbook prefix" in error for error in errors), errors)
 
 
 if __name__ == "__main__":

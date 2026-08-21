@@ -12,7 +12,10 @@
     "hint_rationale",
     "prompt",
     "model_config",
-    "image_sha256"
+    "image_sha256",
+    "design_guidelines_sha256",
+    "prototype_geometry_sha256",
+    "prototype_guide_sha256"
   ],
   "properties": {
     "brief": { "type": "string", "minLength": 1 },
@@ -29,15 +32,15 @@
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
     "design_guidelines_sha256": {
-      "type": ["string", "null"],
+      "type": "string",
       "pattern": "^[a-f0-9]{64}$"
     },
     "prototype_geometry_sha256": {
-      "type": ["string", "null"],
+      "type": "string",
       "pattern": "^[a-f0-9]{64}$"
     },
     "prototype_guide_sha256": {
-      "type": ["string", "null"],
+      "type": "string",
       "pattern": "^[a-f0-9]{64}$"
     }
   }

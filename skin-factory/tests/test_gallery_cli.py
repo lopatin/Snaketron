@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from snaketron_factory.cli import app, load_environment
 from snaketron_factory.config import FactoryConfig, load_config
-from snaketron_factory.db import Database
+from snaketron_factory.db import Database, canonical_json
 from snaketron_factory.domain import (
     ArtifactKind,
     Disposition,
@@ -48,6 +48,8 @@ def seeded_factory(tmp_path: Path) -> tuple[Factory, dict, dict, bytes]:
     database = Database(config.paths.database)
     database.migrate()
     objects = ObjectStore(config.paths.objects)
+    factory = Factory(config, database=database, objects=objects)
+    behavior = factory.behavior_snapshot()
     concept = database.create_concept(
         name="Blind test",
         brief="A retained prototype used to prove blind human labeling.",
@@ -60,7 +62,7 @@ def seeded_factory(tmp_path: Path) -> tuple[Factory, dict, dict, bytes]:
         purpose=Purpose.PRODUCTION,
         stage=Stage.PROTOTYPE_REVIEW,
         idempotency_key=f"test:{concept['id']}",
-        behavior={},
+        behavior=behavior,
         direction_sha="direction",
         skill_sha="skill",
         capability_sha="capability",
@@ -84,6 +86,25 @@ def seeded_factory(tmp_path: Path) -> tuple[Factory, dict, dict, bytes]:
         media_type="image/png",
         size_bytes=len(image),
     )
+    manifest = canonical_json(
+        {
+            "image_sha256": artifact["content_hash"],
+            "design_guidelines_sha256": behavior["design_guidelines_sha"],
+            "prototype_geometry_sha256": behavior["prototype_geometry_sha"],
+            "prototype_guide_sha256": behavior["prototype_guide_sha"],
+        }
+    ).encode()
+    manifest_stored = objects.put(manifest)
+    database.add_artifact(
+        attempt_id=attempt["id"],
+        stage=Stage.PROTOTYPE,
+        kind=ArtifactKind.PROTOTYPE_MANIFEST,
+        content_hash=manifest_stored.uri,
+        object_ref=manifest_stored.uri,
+        media_type="application/json",
+        size_bytes=len(manifest),
+        metadata={"image_artifact_id": artifact["id"]},
+    )
     database.add_evaluation(
         artifact_id=artifact["id"],
         attempt_id=attempt["id"],
@@ -98,7 +119,7 @@ def seeded_factory(tmp_path: Path) -> tuple[Factory, dict, dict, bytes]:
         ),
         hidden_until_label=True,
     )
-    return Factory(config, database=database, objects=objects), attempt, artifact, image
+    return factory, attempt, artifact, image
 
 
 def headers() -> dict[str, str]:

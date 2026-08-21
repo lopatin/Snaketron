@@ -130,6 +130,8 @@ def test_server_recreate_waits_for_application_readiness_before_returning(
 
 def test_gallery_start_probes_unauthenticated_health_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     launcher = load_launcher()
+    operator_path = tmp_path / "operator.json"
+    private_json(operator_path, {launcher.OPERATOR_TOKEN: "operator-session"})
     waits: list[tuple[str, float, str]] = []
     starts: list[str] = []
     monkeypatch.setattr(launcher.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -144,13 +146,143 @@ def test_gallery_start_probes_unauthenticated_health_endpoint(tmp_path: Path, mo
         lambda url, *, timeout, description: waits.append((url, timeout, description)),
     )
 
-    launcher.start_renderer_and_gallery(tmp_path / "operator.json")
+    launcher.start_renderer_and_gallery(operator_path)
 
     assert starts == ["renderer", "gallery"]
     assert waits == [
         ("http://127.0.0.1:13000/", 20, "pinned renderer"),
         ("http://127.0.0.1:18765/healthz", 20, "review gallery"),
     ]
+
+
+def test_gallery_fingerprint_changes_when_operator_session_refreshes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+    operator_path = tmp_path / "operator.json"
+    private_json(operator_path, {launcher.OPERATOR_TOKEN: "first-session"})
+    fingerprints: list[tuple[str, str]] = []
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        launcher,
+        "start_owned_process",
+        lambda name, *_args, **kwargs: fingerprints.append((name, kwargs["fingerprint"])),
+    )
+    monkeypatch.setattr(launcher, "wait_http", lambda *_args, **_kwargs: None)
+
+    launcher.start_renderer_and_gallery(operator_path)
+    private_json(operator_path, {launcher.OPERATOR_TOKEN: "refreshed-session"})
+    launcher.start_renderer_and_gallery(operator_path)
+
+    renderer = [value for name, value in fingerprints if name == "renderer"]
+    gallery = [value for name, value in fingerprints if name == "gallery"]
+    assert renderer[0] == renderer[1]
+    assert gallery[0] != gallery[1]
+
+
+def test_stale_owned_process_fingerprint_is_restarted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+    state_dir = tmp_path / "local-runtime"
+    logs = state_dir / "logs"
+    logs.mkdir(parents=True)
+    process_file = state_dir / "processes.json"
+    private_json(
+        process_file,
+        {
+            "gallery": {
+                "pid": 101,
+                "needle": "factory serve",
+                "port": 18765,
+                "log": str(logs / "gallery.log"),
+                "fingerprint": "old-source",
+            }
+        },
+    )
+    monkeypatch.setattr(launcher, "STATE_DIR", state_dir)
+    monkeypatch.setattr(launcher, "PROCESS_FILE", process_file)
+    running = {101: True}
+    signals: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        launcher,
+        "process_command",
+        lambda pid: "factory serve --config local" if running.get(pid, False) else "",
+    )
+    monkeypatch.setattr(launcher, "port_is_open", lambda _port: running.get(101, False))
+
+    def kill(pid: int, sent: int) -> None:
+        signals.append((pid, sent))
+        running[pid] = False
+
+    class Child:
+        pid = 202
+
+    monkeypatch.setattr(launcher.os, "kill", kill)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: Child())
+
+    launcher.start_owned_process(
+        "gallery",
+        ["factory", "serve"],
+        needle="factory serve",
+        port=18765,
+        environment={},
+        fingerprint="new-source",
+    )
+
+    assert signals == [(101, launcher.signal.SIGTERM)]
+    assert launcher.read_processes()["gallery"]["pid"] == 202
+    assert launcher.read_processes()["gallery"]["fingerprint"] == "new-source"
+
+
+def test_matching_owned_process_fingerprint_is_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+    state_dir = tmp_path / "local-runtime"
+    state_dir.mkdir()
+    process_file = state_dir / "processes.json"
+    private_json(
+        process_file,
+        {
+            "gallery": {
+                "pid": 101,
+                "needle": "factory serve",
+                "port": 18765,
+                "log": str(state_dir / "gallery.log"),
+                "fingerprint": "same-source",
+            }
+        },
+    )
+    monkeypatch.setattr(launcher, "STATE_DIR", state_dir)
+    monkeypatch.setattr(launcher, "PROCESS_FILE", process_file)
+    monkeypatch.setattr(launcher, "process_command", lambda _pid: "factory serve --config local")
+    monkeypatch.setattr(launcher, "port_is_open", lambda _port: True)
+    monkeypatch.setattr(
+        launcher.os,
+        "kill",
+        lambda *_args: pytest.fail("matching process must not be stopped"),
+    )
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("matching process must not be restarted"),
+    )
+
+    launcher.start_owned_process(
+        "gallery",
+        ["factory", "serve"],
+        needle="factory serve",
+        port=18765,
+        environment={},
+        fingerprint="same-source",
+    )
+
+    assert launcher.read_processes()["gallery"]["pid"] == 101
 
 
 def test_gemini_import_is_atomic_private_and_preserves_unrelated_keys(

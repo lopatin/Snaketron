@@ -33,6 +33,10 @@ detail, poster-like scenery, and effects that create a competitive advantage.
 
 ## Prototype contract
 
-One medium-length horizontal snake on a neutral or transparent background,
-with a visibly distinct head, representative body, and tail. No UI, labels,
-scenery, or alternate concepts in the same image.
+Prototype geometry is defined only by the behavior-pinned shared design
+guidelines and `skin-schema/prototype-geometry-v1.json`; this direction file
+does not create a second silhouette authority. The canonical review view is
+one continuous, one-cell-wide rounded capsule with a one-cell head and rounded
+tail. Palette, pattern, and compatible effects may vary inside that envelope.
+No UI, labels, scenery, alternate concepts, articulated modules, oversized
+head, or pointed tail may appear in the image.

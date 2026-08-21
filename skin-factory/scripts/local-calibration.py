@@ -686,6 +686,32 @@ def read_private_json_any(path: Path) -> dict[str, Any]:
     return value
 
 
+def process_fingerprint(paths: list[Path]) -> str:
+    """Hash the exact non-secret files whose bytes a local process serves."""
+
+    digest = hashlib.sha256()
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            files.extend(
+                candidate
+                for candidate in path.rglob("*")
+                if candidate.is_file()
+                and "__pycache__" not in candidate.parts
+                and candidate.suffix not in {".pyc", ".pyo"}
+            )
+        elif path.is_file():
+            files.append(path)
+        else:
+            raise RuntimeError(f"process fingerprint input is absent: {path}")
+    for path in sorted(set(files), key=lambda item: str(item.resolve())):
+        digest.update(str(path.resolve()).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def start_owned_process(
     name: str,
     command: list[str],
@@ -693,6 +719,7 @@ def start_owned_process(
     needle: str,
     port: int,
     environment: dict[str, str],
+    fingerprint: str,
 ) -> None:
     processes = read_processes()
     existing = processes.get(name)
@@ -700,8 +727,18 @@ def start_owned_process(
         running = process_command(existing["pid"])
         if running and needle in running:
             if port_is_open(port):
-                return
-            raise RuntimeError(f"owned {name} process exists but port {port} is not ready")
+                if existing.get("fingerprint") == fingerprint:
+                    return
+                os.kill(existing["pid"], signal.SIGTERM)
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and process_command(existing["pid"]):
+                    time.sleep(0.2)
+                if process_command(existing["pid"]):
+                    raise RuntimeError(f"stale owned {name} did not exit after SIGTERM")
+                processes.pop(name, None)
+                running = ""
+            else:
+                raise RuntimeError(f"owned {name} process exists but port {port} is not ready")
         if running:
             raise RuntimeError(f"refusing reused PID recorded for {name}; inspect {PROCESS_FILE}")
         processes.pop(name, None)
@@ -722,7 +759,13 @@ def start_owned_process(
         )
     finally:
         os.close(descriptor)
-    processes[name] = {"pid": child.pid, "needle": needle, "port": port, "log": str(log_path)}
+    processes[name] = {
+        "pid": child.pid,
+        "needle": needle,
+        "port": port,
+        "log": str(log_path),
+        "fingerprint": fingerprint,
+    }
     write_private_json(PROCESS_FILE, processes)
 
 
@@ -731,12 +774,14 @@ def start_renderer_and_gallery(operator_path: Path) -> None:
     if not node:
         raise RuntimeError("Node.js is required to serve the pinned renderer bundle")
     renderer_script = PACKAGE / "scripts" / "serve-renderer-bundle.mjs"
+    renderer_fingerprint = process_fingerprint([renderer_script, REPO / "client" / "web" / "dist"])
     start_owned_process(
         "renderer",
         [node, str(renderer_script), str(REPO / "client" / "web" / "dist"), "127.0.0.1", str(RENDERER_PORT)],
         needle=str(renderer_script),
         port=RENDERER_PORT,
         environment=scrubbed_environment(),
+        fingerprint=renderer_fingerprint,
     )
     wait_http(
         f"http://127.0.0.1:{RENDERER_PORT}/",
@@ -744,6 +789,14 @@ def start_renderer_and_gallery(operator_path: Path) -> None:
         description="pinned renderer",
     )
     factory = PACKAGE / ".venv" / "bin" / "factory"
+    gallery_fingerprint = process_fingerprint(
+        [
+            PACKAGE / "src" / "snaketron_factory",
+            PACKAGE / "templates",
+            RUNTIME_CONFIG,
+            operator_path.resolve(),
+        ]
+    )
     start_owned_process(
         "gallery",
         [
@@ -757,6 +810,7 @@ def start_renderer_and_gallery(operator_path: Path) -> None:
         needle=f"{factory} serve",
         port=GALLERY_PORT,
         environment=scrubbed_environment(include_human=True),
+        fingerprint=gallery_fingerprint,
     )
     wait_http(
         f"http://127.0.0.1:{GALLERY_PORT}/healthz",
