@@ -1,10 +1,11 @@
 # Skin Factory review UI captures
 
-These screenshots use deterministic disposable SQLite/object-store fixtures and
-the real authenticated FastAPI gallery. They do not contain production data or
-credentials. Their snake previews use the same thin, round-capped, continuous
-body geometry as the live renderer rather than the earlier linked-circle
-schematic.
+The deterministic screenshots use disposable SQLite/object-store fixtures and
+the real authenticated FastAPI gallery. The two `local-real-projection-*`
+captures instead show retained output from an authenticated local run against
+real Gemini. None of the captures contains credentials. Their snake previews
+use the same thin, round-capped, continuous body geometry as the live renderer
+rather than the earlier linked-circle schematic.
 
 - `gallery-all.png` shows retained production, rejected, published, and
   experimental attempts together with visual previews and lineage state.
@@ -22,6 +23,14 @@ schematic.
   `gemini-3-pro-image` for pixels, then stopped at blind prototype review.
   Unlike the gallery fixtures, provider output is intentionally not
   byte-reproducible.
+- `local-real-projection-gallery.jpg` is the authenticated live queue after the
+  corrective paid run at commit `9a27c7b1`. It shows the projected **Chroma
+  Register** candidate next to the two earlier wide prototypes that remain
+  retained for calibration and audit.
+- `local-real-projection-review.jpg` is the authenticated live review panel for
+  **Chroma Register**. It compares the exact blank renderer guide with both
+  deterministic `prototype-body-mask-v1` projections and displays their
+  immutable contract, guide, and projected-image hashes.
 
 Regenerate from `skin-factory/` with:
 
@@ -46,4 +55,11 @@ The retained real-run montage is:
 
 ```text
 5621b0153e57e2dfcd0de7a65fd827d46b48384770a609201e55385c02c70fde  local-real-gemini-prototypes.jpg
+```
+
+The latest live projection evidence is:
+
+```text
+dda67c6a02e1913da8aad569ef9cf8520a0385b6a5094e968cd601b142015a3b  local-real-projection-gallery.jpg
+1f830808a703f3b51f5db61f1563f1e523b1fb46cf24a01072fe1a75d54db842  local-real-projection-review.jpg
 ```
