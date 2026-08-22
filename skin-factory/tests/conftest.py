@@ -47,7 +47,13 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
     references = skill / "references"
     references.mkdir()
     (references / "design-guidelines.md").write_text(
-        "# Skin Design Guidelines\nKeep one continuous thin rounded snake body.\n",
+        "# Skin Design Guidelines\n"
+        "<!-- PROTOTYPE_IMAGE_RULES:START -->\n"
+        "Keep one continuous thin rounded snake body.\n"
+        "Keep the rightmost 1.5 cells—the head zone—as one readable tonal field.\n"
+        "Use bold, seamless shapes that survive at native scale.\n"
+        "<!-- PROTOTYPE_IMAGE_RULES:END -->\n"
+        "Downstream-only SkinDoc implementation detail must stay out of the image prompt.\n",
         encoding="utf-8",
     )
     schemas = skill / "schemas"
@@ -133,6 +139,7 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
                     "fixture": "straight_16",
                     "native_cell_px": 3,
                     "body_cells": 16,
+                    "head_direction": "right",
                     "native_canvas": {
                         "width_px": native_width,
                         "height_px": native_height,

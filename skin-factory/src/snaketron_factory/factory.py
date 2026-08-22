@@ -101,6 +101,9 @@ _PROVIDER_IMAGE_ASPECTS = {
 # A direct, no-crop resize corrects at most fifteen percent of aspect drift.
 # Anything taller is divided into independently journaled temporal slices.
 _PROVIDER_SLICE_ASPECT_LOG_TOLERANCE = math.log(1.15)
+_PROTOTYPE_IMAGE_PROMPT_VERSION = "prototype-image-prompt-v2"
+_PROTOTYPE_IMAGE_RULES_START = "<!-- PROTOTYPE_IMAGE_RULES:START -->"
+_PROTOTYPE_IMAGE_RULES_END = "<!-- PROTOTYPE_IMAGE_RULES:END -->"
 
 
 class Factory:
@@ -1039,11 +1042,17 @@ class Factory:
                 return self._block_attempt(attempt, str(error))
             references: list[tuple[str, bytes]] = []
             request: dict[str, Any] = {"prompt": prompt, "aspect_ratio": "16:9", "image_size": "2K"}
-            operation_version = "v1"
             if geometry is not None:
                 contract, guide = geometry
                 behavior = json.loads(attempt["behavior_json"])
+                prompt_contract = {
+                    "id": _PROTOTYPE_IMAGE_PROMPT_VERSION,
+                    "design_guidelines_sha256": behavior["design_guidelines_sha"],
+                    "prototype_geometry_sha256": behavior["prototype_geometry_sha"],
+                    "prototype_guide_sha256": behavior["prototype_guide_sha"],
+                }
                 references = [("image/png", guide)]
+                request["prompt_contract"] = prompt_contract
                 request["references"] = [
                     {
                         "role": "strict_snake_body_geometry_guide",
@@ -1061,11 +1070,10 @@ class Factory:
                     "raw_provider_image_policy": "retained_audit_only",
                     "projected_image_policy": "sole_review_and_authoring_authority",
                 }
-                operation_version = "v3"
             operation, result = await self._provider_call(
                 attempt=self.database.get_attempt(attempt["id"]),
                 stage=Stage.PROTOTYPE,
-                key=f"{attempt['id']}:prototype:{index}:{operation_version}",
+                key=f"{attempt['id']}:prototype:{index}:{_PROTOTYPE_IMAGE_PROMPT_VERSION}",
                 role="image_generator",
                 side_effect="generate_prototype_image",
                 request=request,
@@ -1091,12 +1099,14 @@ class Factory:
                     "geometry_projection": PROTOTYPE_PROJECTION_VERSION,
                     "prototype_geometry_sha256": request.get("references", [{}])[0].get("contract_sha256"),
                     "prototype_guide_content_hash": request.get("references", [{}])[0].get("content_hash"),
+                    "prompt_contract": request.get("prompt_contract"),
                 },
                 provenance={
                     "operation_id": operation["id"],
                     "provider_role": "image_generator",
                     "resolved_model": operation["resolved_model"],
                     "references": request.get("references", []),
+                    "prompt_contract": request.get("prompt_contract"),
                 },
                 occurrence_key=f"prototype-source:{index}",
             )
@@ -1150,6 +1160,7 @@ class Factory:
                     "geometry_projection": projection.version,
                     "prototype_geometry_sha256": request.get("references", [{}])[0].get("contract_sha256"),
                     "prototype_guide_content_hash": request.get("references", [{}])[0].get("content_hash"),
+                    "prompt_contract": request.get("prompt_contract"),
                 },
                 provenance={
                     "operation_id": operation["id"],
@@ -1160,6 +1171,7 @@ class Factory:
                     "source_image_sha256": source_artifact["content_hash"],
                     "geometry_projection": projection.version,
                     "references": request.get("references", []),
+                    "prompt_contract": request.get("prompt_contract"),
                 },
             )
             self.database.add_evaluation(
@@ -3113,56 +3125,138 @@ class Factory:
                 return value[name]
         return fallback
 
+    @staticmethod
+    def _prototype_image_rules(guidelines: str) -> str:
+        if (
+            guidelines.count(_PROTOTYPE_IMAGE_RULES_START) != 1
+            or guidelines.count(_PROTOTYPE_IMAGE_RULES_END) != 1
+        ):
+            raise ValueError("pinned design guidelines must have one prototype-image rules boundary")
+        start = guidelines.index(_PROTOTYPE_IMAGE_RULES_START) + len(_PROTOTYPE_IMAGE_RULES_START)
+        end = guidelines.index(_PROTOTYPE_IMAGE_RULES_END)
+        if start >= end:
+            raise ValueError("pinned prototype-image rules boundary is malformed")
+        rules = guidelines[start:end].strip()
+        if not rules:
+            raise ValueError("pinned prototype-image rules are empty")
+        return rules
+
+    @staticmethod
+    def _prototype_geometry_prompt_values(contract: dict[str, Any]) -> dict[str, int | str]:
+        def mapping(value: Any, name: str) -> dict[str, Any]:
+            if not isinstance(value, dict):
+                raise ValueError(f"pinned prototype geometry has no {name}")
+            return value
+
+        def positive_integer(value: Any, name: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"pinned prototype geometry {name} must be a positive integer")
+            return value
+
+        contract_id = contract.get("id")
+        if not isinstance(contract_id, str) or not contract_id:
+            raise ValueError("pinned prototype geometry has no id")
+        source = mapping(contract.get("renderer_source"), "renderer_source")
+        body_cells = positive_integer(source.get("body_cells"), "renderer_source.body_cells")
+        native_cell_px = positive_integer(source.get("native_cell_px"), "renderer_source.native_cell_px")
+        if source.get("head_direction") != "right":
+            raise ValueError("pinned prototype geometry head_direction must be right")
+        transform = mapping(contract.get("presentation_transform"), "presentation_transform")
+        if transform.get("type") != "nearest_neighbor_integer_upscale":
+            raise ValueError("pinned prototype geometry presentation transform must be nearest-neighbor")
+        presentation_scale = positive_integer(transform.get("scale"), "presentation_transform.scale")
+        projection = mapping(contract.get("prototype_projection"), "prototype_projection")
+        projection_mapping = mapping(projection.get("mapping"), "prototype_projection.mapping")
+        body_bbox = projection_mapping.get("native_body_bbox_px")
+        if (
+            not isinstance(body_bbox, list)
+            or len(body_bbox) != 4
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in body_bbox)
+        ):
+            raise ValueError("pinned prototype geometry native_body_bbox_px must contain four integers")
+        native_body_width = body_bbox[2] - body_bbox[0]
+        native_body_height = body_bbox[3] - body_bbox[1]
+        if (native_body_width, native_body_height) != (body_cells * native_cell_px, native_cell_px):
+            raise ValueError("pinned prototype geometry body box is not exactly body_cells by one square cell")
+        return {
+            "contract_id": contract_id,
+            "body_cells": body_cells,
+            "native_cell_px": native_cell_px,
+            "native_body_width": native_body_width,
+            "native_body_height": native_body_height,
+            "presentation_scale": presentation_scale,
+            "presentation_cell_px": native_cell_px * presentation_scale,
+            "presentation_body_width": native_body_width * presentation_scale,
+            "presentation_body_height": native_body_height * presentation_scale,
+        }
+
     def _prototype_prompt(
         self,
         attempt: dict[str, Any],
         concept: dict[str, Any],
         index: int,
     ) -> str:
-        direction = self.pinned_direction(attempt).decode("utf-8")
         guidelines = self.pinned_design_guidelines(attempt).decode("utf-8")
         geometry = self.pinned_prototype_geometry(attempt)
-        geometry_block = canonical_json(geometry[0]) if geometry is not None else "legacy attempt: no image guide"
+        if geometry is None:
+            raise ValueError("prototype image generation requires pinned renderer geometry and guide bytes")
+        values = self._prototype_geometry_prompt_values(geometry[0])
+        rules = self._prototype_image_rules(guidelines)
+        behavior = json.loads(attempt["behavior_json"])
+        design_sha = behavior.get("design_guidelines_sha")
+        geometry_sha = behavior.get("prototype_geometry_sha")
+        guide_sha = behavior.get("prototype_guide_sha")
+        for name, digest in (
+            ("design guidelines", design_sha),
+            ("prototype geometry", geometry_sha),
+            ("prototype guide", guide_sha),
+        ):
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError(f"pinned {name} authority hash is malformed")
         feedback = self._stage_feedback(attempt, "prototype")
         feedback_block = (
-            "\nLiteral human corrections for this retry (JSON strings; preserve meaning, do not invent more):\n"
-            + canonical_json(feedback)
+            "\nHUMAN RETRY CORRECTIONS\n"
+            "These are literal JSON strings. Apply them only when they do not conflict with GEOMETRY.\n"
+            f"{canonical_json(feedback)}\n"
             if feedback
             else ""
         )
-        return f"""Create prototype variation {index + 1} for this Snaketron skin.
+        return f"""GEOMETRY — HIGHEST PRIORITY
+The attached PNG is the strict repository-owned body guide. Paint the existing
+white capsule; do not redesign its outline. Geometry contract
+`{values['contract_id']}` is pinned as sha256:{geometry_sha}; the attached guide
+is pinned as sha256:{guide_sha}.
 
-Brief: {concept["brief"]}
-Canonical direction:
-{direction}
-Locked Skin Design Guidelines (obey verbatim; shared with the downstream authoring worker):
-{guidelines}
+- The body occupies an invisible grid of exactly {values['body_cells']} columns x 1 row of square occupancy cells.
+- Every logical cell is square: {values['native_cell_px']}x{values['native_cell_px']} px in the native renderer.
+- The complete native body is exactly {values['native_body_width']}x{values['native_body_height']} px.
+- In the attached {values['presentation_scale']}x reference, every cell is
+  {values['presentation_cell_px']}x{values['presentation_cell_px']} px and the body is exactly
+  {values['presentation_body_width']}x{values['presentation_body_height']} px.
+- A cell is a measurement only. Do not draw the grid or turn cells into visible
+  squares, plates, panels, diamonds, joints, or separate segments.
+- Paint one continuous, flat, right-facing capsule. The rightmost one-cell
+  position is the rounded head; the left endpoint is the rounded tail.
+- Keep the small centered head-core disc exactly where the guide puts it. Do not
+  enlarge the head beyond one cell or point the tail.
+- Paint only inside the white body. No gaps, articulated modules, perspective,
+  3D geometry, shadows outside the body, or other silhouettes.
+- This is the fixed prototype review pose. Use exactly this length and
+  silhouette. Do not depict any alternative live length.
 
-Pinned renderer geometry contract:
-{geometry_block}
+CREATIVE BRIEF
+Create prototype variation {index + 1} for this Snaketron skin. Geometry wins
+over every creative instruction if they conflict.
+Concept brief (literal JSON string):
+{canonical_json(concept['brief'])}
+SHARED SKIN DESIGN RULES
+The following is the exact image-relevant excerpt of the shared rules used by
+the downstream skin author. Pinned authority: sha256:{design_sha}.
+{rules}
 {feedback_block}
-
-The attached repository-owned guide is a strict geometry reference, not an
-optional style reference. Treat its white capsule as the only paintable snake
-body. Your response supplies material for a deterministic renderer-mask
-projection: fill the attached white body rather than redesigning its outline.
-The factory will downsample that material to the real 15px-per-cell renderer,
-clip it through the exact native capsule mask, restore the system-owned head
-core, and only then nearest-upscale it for review. Fill that body with the
-proposed skin while preserving its exact thin
-16-cells-by-1-cell, right-facing, flat orthographic silhouette and the small
-centered head core. The body must remain one continuous rounded strip. The
-rounded head may not become larger than one cell; the tail may not become a
-point. Do not create gaps, articulated modules, diamonds, plates, separate
-segments, perspective, 3D body geometry, or paint outside the round body.
-
-Depict exactly one snake on a neutral or transparent background. Show how the
-idea reads at actual game scale, including the first 1.5 headward cells and a
-representative repeating/growing body treatment. Do not include UI chrome,
-words, letters, digits, ruler labels, scenery, framing, alternate concepts, or
-a montage. Use bold shapes that survive at 15 pixels per cell; do not use ticks,
-lines, or gaps narrower than one fifth of a cell. This is a
-constrained visual implementation reference, not poster art."""
+RETURN ONE PROTOTYPE IMAGE
+Apply the brief and shared rules to the exact guide. Return the image only.
+This is a constrained small-scale skin reference, not poster art."""
 
     @staticmethod
     def _nearest_provider_aspect(width: int, height: int) -> tuple[str, float]:

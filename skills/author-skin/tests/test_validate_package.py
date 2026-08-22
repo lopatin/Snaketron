@@ -29,6 +29,16 @@ class PackageValidationTests(unittest.TestCase):
         guidelines = (validator.PACKAGE / guideline_path).read_text(encoding="utf-8")
         self.assertEqual(guidelines.count(validator.DESIGN_GUIDELINE_START), 1)
         self.assertEqual(guidelines.count(validator.DESIGN_GUIDELINE_END), 1)
+        self.assertEqual(guidelines.count(validator.PROTOTYPE_IMAGE_RULES_START), 1)
+        self.assertEqual(guidelines.count(validator.PROTOTYPE_IMAGE_RULES_END), 1)
+        self.assertLess(
+            guidelines.index(validator.DESIGN_GUIDELINE_START),
+            guidelines.index(validator.PROTOTYPE_IMAGE_RULES_START),
+        )
+        self.assertLess(
+            guidelines.index(validator.PROTOTYPE_IMAGE_RULES_END),
+            guidelines.index(validator.DESIGN_GUIDELINE_END),
+        )
 
     def test_locked_guidelines_preserve_renderer_truth(self):
         guidelines = (validator.PACKAGE / "references/design-guidelines.md").read_text(encoding="utf-8")
