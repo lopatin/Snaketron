@@ -37,7 +37,7 @@ gates:
     version: v1
     blocking: true
   - name: renderer_conformance
-    version: v2
+    version: v3
     blocking: true
   - name: browser_pixels_ready
     version: v1

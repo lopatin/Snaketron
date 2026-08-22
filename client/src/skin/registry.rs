@@ -207,14 +207,29 @@ pub fn register_authored_skin(content_ref: &str, document_json: &str) -> Result<
 /// skin that could be freed while a frame still points at it would be a
 /// use-after-free rather than a saving.
 fn compile_document(json: &str) -> Result<&'static dyn SnakeSkin, String> {
+    Ok(Box::leak(compile_document_owned(json)?))
+}
+
+/// The one schema-dispatch boundary shared by runtime registration and the
+/// native pre-register validator.
+fn compile_document_owned(json: &str) -> Result<Box<dyn SnakeSkin>, String> {
     match skin_schema::v2::load_any(json).map_err(readable)? {
         skin_schema::v2::AnySkinDoc::V1(doc) => ParamSkin::compile(&doc)
-            .map(|skin| Box::leak(Box::new(skin)) as &'static dyn SnakeSkin)
+            .map(|skin| Box::new(skin) as Box<dyn SnakeSkin>)
             .map_err(readable),
         skin_schema::v2::AnySkinDoc::V2(doc) => LayerSkin::compile(&doc)
-            .map(|skin| Box::leak(Box::new(skin)) as &'static dyn SnakeSkin)
+            .map(|skin| Box::new(skin) as Box<dyn SnakeSkin>)
             .map_err(readable),
     }
+}
+
+/// Compile without registering or leaking the result.
+///
+/// This is the side-effect-free half of runtime registration, exposed to the
+/// native pre-register gate through the crate root. It deliberately reaches
+/// the same `ParamSkin` / `LayerSkin` compilers as [`compile_document`].
+pub(crate) fn validate_document_for_renderer(json: &str) -> Result<(), String> {
+    compile_document_owned(json).map(drop)
 }
 
 /// Turn validator complaints into something a person can act on.

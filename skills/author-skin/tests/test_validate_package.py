@@ -217,6 +217,32 @@ class PackageValidationTests(unittest.TestCase):
         ):
             self.assertIn(term, locked)
 
+    def test_band_lane_invariant_is_locked_and_schema_visible(self):
+        contract = (validator.PACKAGE / "references/contract.md").read_text(encoding="utf-8")
+        layers = (validator.PACKAGE / "references/layers-effects.md").read_text(encoding="utf-8")
+        validation = (validator.PACKAGE / "references/validation.md").read_text(encoding="utf-8")
+        schema = validator.read_json(validator.PACKAGE / "schemas/implementation-plan.schema.json")
+
+        for text in (contract, layers, validation):
+            self.assertIn(validator.BAND_LANE_INVARIANT, text)
+        self.assertIn(validator.BAND_LANE_SAFE_EXAMPLE, contract)
+        self.assertIn(validator.BAND_LANE_SAFE_EXAMPLE, layers)
+        for field in ("layer_plan", "animation_plan"):
+            self.assertIn(
+                validator.BAND_LANE_INVARIANT,
+                schema["properties"][field]["description"],
+            )
+        self.assertIn(
+            validator.BAND_LANE_SAFE_EXAMPLE,
+            schema["properties"]["animation_plan"]["description"],
+        )
+
+        relaxed = copy.deepcopy(schema)
+        relaxed["properties"]["animation_plan"]["description"] = "Describe motion."
+        errors = []
+        validator.validate_implementation_plan_schema(relaxed, errors)
+        self.assertTrue(any("animation_plan must preserve" in error for error in errors), errors)
+
     def test_approval_must_bind_the_manifest_and_plan_hash(self):
         fixture = validator.PACKAGE / "fixtures/layers"
         manifest = validator.read_json(fixture / "prototype-manifest.json")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -157,9 +158,85 @@ def _result(results, gate: str):
     return next(result for result in results if result.gate == gate)
 
 
+def _layers_plan() -> ImplementationPlan:
+    return ImplementationPlan(
+        path="layers",
+        rationale="Exercise the procedural renderer contract.",
+        fidelity_features=["clean silhouette"],
+        layer_plan=["body", "animated band"],
+        asset_plan=[],
+        animation_plan=["move the band across the body"],
+        required_wrap_axes=[],
+        risks=["band may leave the body"],
+        design_guidelines={
+            "artistic_direction": "One clear deterministic test direction.",
+            "concept_twist": "Original fixture with no popular basis.",
+            "structure": "pattern",
+            "body_strategy": "Reads at four cells, early growth, turns, and overlap.",
+            "head_zone": "light_field_dark_core",
+            "asset_strategy": "Procedural layers require no raster assets.",
+        },
+    )
+
+
 def test_asset_plan_locks_current_forge_texel_density() -> None:
     with pytest.raises(ValidationError, match="sheet requires 16 texels_per_cell"):
         AssetPlan.model_validate(_asset().model_dump() | {"texels_per_cell": 64})
+
+
+def test_renderer_conformance_runs_exact_client_compiler_before_registration(
+    factory_config: FactoryConfig,
+) -> None:
+    factory_config.paths.repo_root = REPO_ROOT
+    document = json.loads(
+        (REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8")
+    )
+    source = document["layers"][2]["source"]
+    source["half_width"] = 0.15
+    source["t_center"] = "tri(time)"
+
+    result = _result(GateRunner(factory_config).validate_document(document, _layers_plan()), "renderer_conformance")
+
+    assert result.verdict == GateVerdict.FAIL
+    assert result.measurements == {
+        "procedural_fallbacks_required": 0,
+        "client_compiler_exit": 1,
+        "client_compiler": "client::skin::registry runtime compiler",
+        "pre_register": True,
+    }
+    assert any("|t_center| + half_width may not exceed 0.5" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    ("error", "kind", "reason"),
+    [
+        (subprocess.TimeoutExpired(["cargo"], 120), "timeout", "timed out after 120 seconds"),
+        (FileNotFoundError(2, "No such file or directory", "cargo"), "missing_executable", "could not run"),
+    ],
+)
+def test_renderer_compiler_unavailability_fails_closed_before_registration(
+    factory_config: FactoryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    kind: str,
+    reason: str,
+) -> None:
+    def fail_to_run(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr("snaketron_factory.gates.subprocess.run", fail_to_run)
+
+    result = GateRunner(factory_config)._client_renderer_compile({"schema_version": 2})
+
+    assert result.blocking is True
+    assert result.verdict == GateVerdict.FAIL
+    assert result.measurements == {
+        "client_compiler_exit": None,
+        "client_compiler": "client::skin::registry runtime compiler",
+        "client_compiler_error": kind,
+        "pre_register": True,
+    }
+    assert reason in result.reasons[0]
 
 
 def test_asset_plan_is_capability_bounded_before_image_allocation() -> None:

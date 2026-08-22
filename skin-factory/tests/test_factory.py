@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -43,6 +44,8 @@ from snaketron_factory.renderer import (
 )
 from snaketron_factory.review import ReviewService
 from snaketron_factory.worker import FakeWorker, SkillBundle
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeRegistry:
@@ -338,6 +341,142 @@ def configure_skill(factory: Factory) -> SkillBundle:
     factory.active_skill_bundle = lambda: (bundle, "refs/tags/test-skill", "test-git-sha")  # type: ignore[method-assign]
     factory.pinned_skill_bundle = lambda _: bundle  # type: ignore[method-assign]
     return bundle
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalid_document_is_machine_rejected_before_register_effect(
+    factory_config, database, objects, make_attempt
+) -> None:
+    factory_config.paths.repo_root = REPO_ROOT
+    api = FakeApi()
+    factory = Factory(factory_config, database=database, objects=objects, api=api)  # type: ignore[arg-type]
+    factory.pinned_gates = lambda _attempt: factory.gates  # type: ignore[method-assign]
+    attempt = make_attempt(stage=Stage.BUILD_GATE, purpose=Purpose.OPTIMIZER)
+    plan = author_result().implementation_plan
+    document = json.loads(
+        (REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8")
+    )
+    source = document["layers"][2]["source"]
+    source["half_width"] = 0.15
+    source["t_center"] = "tri(time)"
+    add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.AUTHOR,
+        kind=ArtifactKind.IMPLEMENTATION_PLAN,
+        value=plan.model_dump_json().encode(),
+        media_type="application/json",
+    )
+    document_artifact = add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.BUILD_GATE,
+        kind=ArtifactKind.SKIN_DOCUMENT,
+        value=json.dumps(document).encode(),
+        media_type="application/json",
+    )
+
+    report = await factory.run_once()
+
+    rejected = database.get_attempt(attempt["id"])
+    assert rejected["stage"] == Stage.BUILD_GATE
+    assert rejected["disposition"] == Disposition.MACHINE_REJECTED, rejected["failure_json"]
+    assert report["advanced"][-1] == {
+        "attempt": attempt["id"],
+        "from": Stage.BUILD_GATE,
+        "to": Stage.BUILD_GATE,
+        "state": Disposition.MACHINE_REJECTED,
+    }
+    renderer_gate = next(
+        result
+        for result in database.evaluations_for_attempt(attempt["id"], reveal=True)
+        if result["gate_name"] == "renderer_conformance"
+    )
+    assert renderer_gate["artifact_id"] == document_artifact["id"]
+    assert renderer_gate["verdict"] == GateVerdict.FAIL
+    assert any(
+        "|t_center| + half_width may not exceed 0.5" in reason
+        for reason in json.loads(renderer_gate["reasons_json"])
+    )
+    assert api.create_calls == []
+    assert api.append_calls == []
+    with database.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM operation WHERE attempt_id=? AND provider_role='snaketron_api'",
+                (attempt["id"],),
+            ).fetchone()[0]
+            == 0
+        )
+    await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_renderer_compile_timeout_machine_rejects_without_register_operation(
+    factory_config, database, objects, make_attempt, monkeypatch
+) -> None:
+    factory_config.paths.repo_root = REPO_ROOT
+    api = FakeApi()
+    factory = Factory(factory_config, database=database, objects=objects, api=api)  # type: ignore[arg-type]
+    factory.pinned_gates = lambda _attempt: factory.gates  # type: ignore[method-assign]
+    attempt = make_attempt(stage=Stage.BUILD_GATE, purpose=Purpose.OPTIMIZER)
+    document = json.loads(
+        (REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8")
+    )
+    add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.AUTHOR,
+        kind=ArtifactKind.IMPLEMENTATION_PLAN,
+        value=author_result().implementation_plan.model_dump_json().encode(),
+        media_type="application/json",
+    )
+    add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.BUILD_GATE,
+        kind=ArtifactKind.SKIN_DOCUMENT,
+        value=json.dumps(document).encode(),
+        media_type="application/json",
+    )
+    real_run = subprocess.run
+
+    def timeout_client(command, *args, **kwargs):
+        if "validate-renderer-skin" in command:
+            raise subprocess.TimeoutExpired(command, 120)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr("snaketron_factory.gates.subprocess.run", timeout_client)
+
+    report = await factory.run_once()
+
+    rejected = database.get_attempt(attempt["id"])
+    assert rejected["stage"] == Stage.BUILD_GATE
+    assert rejected["disposition"] == Disposition.MACHINE_REJECTED
+    assert report["advanced"][-1]["state"] == Disposition.MACHINE_REJECTED
+    renderer_gate = next(
+        result
+        for result in database.evaluations_for_attempt(attempt["id"], reveal=True)
+        if result["gate_name"] == "renderer_conformance"
+    )
+    assert renderer_gate["verdict"] == GateVerdict.FAIL
+    assert json.loads(renderer_gate["measurements_json"])["client_compiler_error"] == "timeout"
+    assert "timed out after 120 seconds" in json.loads(renderer_gate["reasons_json"])[0]
+    assert api.create_calls == []
+    assert api.append_calls == []
+    with database.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM operation WHERE attempt_id=? AND provider_role='snaketron_api'",
+                (attempt["id"],),
+            ).fetchone()[0]
+            == 0
+        )
+    await factory.close()
 
 
 @pytest.mark.asyncio

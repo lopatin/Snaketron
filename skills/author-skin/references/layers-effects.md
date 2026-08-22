@@ -39,7 +39,13 @@ These are patterns, not required designs:
 - travelling shine: gradient stop offsets derived from `saw(time)` while stop
   count and layer placement stay fixed;
 - pulse: layer opacity or `ColorRef.lighten` derived from a slow sine;
-- moving lane: animate band `t_center` or `half_width`, never period/duty/phase;
+- moving lane: animate band `t_center` or `half_width`, never period/duty/phase.
+  Bound both expressions over every baked frame and require
+  `max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5`; neither field's
+  individual range proves the combined lane fits. A safe example is
+  `t_center = 0.3 * tri(time)` with `half_width = 0.15`: the pinned
+  `tri(time)` ranges from zero to one, so the independent maxima sum to
+  `0.3 + 0.15 = 0.45`;
 - head wave: a head-ramp opacity curve combining `s` and `time`;
 - boost response: opacity using `boost` at a snake evaluation site, while the
   layer remains present in the op stream;
@@ -51,5 +57,7 @@ must reject aliasing rather than accepting an animation that plays differently
 from the expression.
 
 Keep every animated value in the property's valid range at every baked step.
-Never animate source kind, number of layers/stops/repeats/slices, fit, span, fade,
-clip, region, order, or a structural flag.
+For a band, this includes proving the combined lane invariant above over the
+entire pinned animation ring. Never animate source kind, number of
+layers/stops/repeats/slices, fit, span, fade, clip, region, order, or a
+structural flag.

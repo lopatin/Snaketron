@@ -26,6 +26,12 @@ I32: TypeAlias = Annotated[StrictInt, Field(ge=-(2**31), le=2**31 - 1)]
 U32: TypeAlias = Annotated[StrictInt, Field(ge=0, le=2**32 - 1)]
 # SkinDoc is also deserialized by the wasm32 client, where Rust usize is u32.
 Usize32: TypeAlias = U32
+BAND_LANE_INVARIANT = (
+    "Across every baked animation frame, prove max_frame(abs(t_center)) + "
+    "max_frame(abs(half_width)) <= 0.5; independent per-field bounds are insufficient. "
+    "Safe example: tri(time) ranges from zero to one, so t_center = 0.3 * tri(time) "
+    "and half_width = 0.15 give 0.3 + 0.15 = 0.45."
+)
 
 
 class SlotColorRef(_SkinModel):
@@ -125,8 +131,8 @@ class BandSource(_SkinModel):
     period_cells: StrictFloat | StrictInt
     duty: StrictFloat | StrictInt = 1
     phase_cells: StrictFloat | StrictInt = 0
-    half_width: PropExpr
-    t_center: PropExpr = 0
+    half_width: PropExpr = Field(description=BAND_LANE_INVARIANT)
+    t_center: PropExpr = Field(default=0, description=BAND_LANE_INVARIANT)
     alpha: PropExpr | None = None
 
 

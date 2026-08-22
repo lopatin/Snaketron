@@ -99,6 +99,16 @@ and structural flags are also static. Unless the capability manifest's
 `drift_cells` must be constant; `constant_cells_per_cycle` does not permit a
 time expression.
 
+For every band, bound both lane expressions independently across every baked animation frame.
+Require the combined lane invariant
+`max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5`. This is stricter
+than checking either property alone, or checking only one convenient frame.
+For example, `t_center = 0.3 * tri(time)` and `half_width = 0.15` are safe:
+the pinned `tri(time)` ranges from zero to one, so
+`max_frame(abs(0.3 * tri(time))) + 0.15 = 0.45 <= 0.5`. A band that cannot
+prove this bound for the pinned animation ring is invalid; reduce its travel
+or width instead of relying on silhouette clipping.
+
 All effects are ordinary layers. A shine can be moving gradient stops; a pulse
 can be opacity or lightness; a wave can use `s` and `time` at a cell-capable
 site. Multiple effects are multiple fixed layers sharing the document's one
