@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "id": "worker-draft@1",
+  "name": "Worker draft",
+  "palette": {
+    "friendly": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#3c8dde", "outline": "#286eae" }
+    ],
+    "enemy": [
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#e34e5b", "outline": "#a92f3a" }
+    ],
+    "free_for_all": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#93a3b5", "outline": "#5d6e81" },
+      { "fill": "#f7b731", "outline": "#a87d1f" }
+    ]
+  },
+  "textures": [
+    { "name": "shell_coat", "ref": "pending:asset:0", "kind": "coat" }
+  ],
+  "period_ms": 2400,
+  "head_core": { "ratio": 0.38, "color": "#333333" },
+  "layers": [
+    {
+      "name": "Body fallback",
+      "type": "ribbon",
+      "region": "body",
+      "color": { "slot": "fill" },
+      "extra_px": 0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Shell coat",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "image",
+        "texture": "shell_coat",
+        "fit": { "type": "tile", "cells_per_repeat": 29 },
+        "drift_cells": 0
+      }
+    }
+  ]
+}

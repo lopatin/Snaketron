@@ -1,0 +1,31 @@
+{
+  "path": "layers",
+  "rationale": "Bands preserve sharp checks and role colours; a gradient stop expresses the shine without raster assets.",
+  "design_guidelines": {
+    "artistic_direction": "A crisp racing checkerboard with one restrained travelling shine.",
+    "concept_twist": "The familiar finish-line checker becomes a role-coloured living race surface.",
+    "structure": "pattern",
+    "body_strategy": "Two-cell checks simplify at the 4-cell spawn, establish rhythm by 6-7 cells, and repeat cleanly through long turns while the head glow stays above tail material.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Procedural layers only; there are no raster seams or sprite-frame rows to produce."
+  },
+  "fidelity_features": [
+    "two-cell checker rhythm",
+    "same-hue role-aware checks",
+    "single restrained travelling shine"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons establish role reading",
+    "Upper check and Lower check bands form the board",
+    "Shine gradient travels without changing topology",
+    "Head glow preserves direction"
+  ],
+  "asset_plan": [],
+  "animation_plan": [
+    "Move three gradient stops with tri(time) over a 2400ms period"
+  ],
+  "required_wrap_axes": [],
+  "risks": [
+    "Check marks may collapse on a one-cell snake, so patterned layers omit there"
+  ]
+}

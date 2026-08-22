@@ -1359,6 +1359,18 @@ pub fn skin_assets_pending() -> bool {
     crate::skin::atlas::any_pending()
 }
 
+/// Browser evidence for requested skin pixels.
+///
+/// Capture tooling uses this after `skinAssetsPending` settles: a failed image
+/// is not "ready", and a decoded image is not evidence until at least one real
+/// canvas draw completed. Returning both states keeps screenshots from quietly
+/// approving the procedural fallback after a 404 or a slow decode.
+#[wasm_bindgen(js_name = skinAssetsStatus)]
+pub fn skin_assets_status() -> Result<String, JsValue> {
+    serde_json::to_string(&crate::skin::atlas::asset_status())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 /// The skins this build can render.
 ///
 /// Exported so the catalogue in the UI is generated from the renderer's own

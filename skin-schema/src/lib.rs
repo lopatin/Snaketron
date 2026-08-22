@@ -10,6 +10,7 @@
 //! and a skin that breaks those readings is a competitive bug, not a bold
 //! choice. Validation is where that line is enforced.
 
+pub mod capabilities;
 pub mod color;
 pub mod content;
 pub mod describe;

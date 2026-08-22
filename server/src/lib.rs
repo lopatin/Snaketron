@@ -7,6 +7,7 @@ pub mod cluster_membership;
 pub mod completion;
 pub mod db;
 pub mod executor_cluster;
+pub mod factory_service;
 pub mod game_bus;
 pub mod game_executor;
 pub mod game_executor_v2;

@@ -798,6 +798,7 @@ impl<'a> PaintCtx<'a> {
             ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
                 &element, source.0, source.1, source.2, source.3, dest.0, dest.1, dest.2, dest.3,
             )?;
+            crate::skin::atlas::record_draw(image);
         }
         self.record(|| PaintOp::DrawImage {
             image,

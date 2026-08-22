@@ -1,0 +1,40 @@
+{
+  "path": "texture",
+  "rationale": "A static coat retains irregular material detail; role-readable layers remain underneath and around it.",
+  "design_guidelines": {
+    "artistic_direction": "A polished shell mosaic with irregular facets and a clean role-coloured contour.",
+    "concept_twist": "A familiar armored shell surface is stretched into a continuously growing snake mosaic.",
+    "structure": "sprite",
+    "body_strategy": "Large facets reduce to a clear material cue at 4 cells, become legible by 6-7 cells, and x-tile across long turns without covering the head glow.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Use one production-quality 64-texel-per-cell coat; its x join must remain visually seamless after every served transformation."
+  },
+  "fidelity_features": [
+    "irregular shell facets",
+    "long non-obvious repeat",
+    "clean role contour"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons remain readable without the atlas",
+    "Shell coat image tiles across the whole body above Body fallback",
+    "Head glow and system core preserve direction"
+  ],
+  "asset_plan": [
+    {
+      "kind": "coat",
+      "natural_length_cells": 29,
+      "frames": 1,
+      "desired_fps": null,
+      "texels_per_cell": 64,
+      "anchor": "whole",
+      "fit": "tile",
+      "fade": "none",
+      "prompt": "1856x64 opaque coat, 29 body cells, x-seamless irregular shell facets several cells wide; no border, vignette, head, tail, text, or background."
+    }
+  ],
+  "animation_plan": [],
+  "required_wrap_axes": ["x"],
+  "risks": [
+    "Facet clusters may expose a short repeat even after the join passes"
+  ]
+}

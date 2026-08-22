@@ -3,11 +3,11 @@
 //!
 //! Two rules shape every route here.
 //!
-//! **Nothing decodes an image in the request handler.** A 4 MB upload can
-//! declare 60,000 × 60,000 pixels, so the handler reads the PNG header, checks
-//! the shape against the kind's conventions, and hands the bytes to a worker.
-//! Doing the pixel work inline would give every free account a multi-second
-//! CPU burn behind a rate limit.
+//! **Interactive uploads do not decode in the request handler.** A 4 MB upload
+//! can declare 60,000 × 60,000 pixels, so that handler checks the PNG header
+//! and hands the bytes to a worker. The authenticated offline-forge endpoint
+//! is deliberately different: its one job is to decode, hash, and gate every
+//! exact ladder object before making an immutable descriptor reachable.
 //!
 //! **Generation is a job, not a request.** It is slow, it costs money per
 //! attempt, and it fails in ways worth reading, so the client gets an id and
@@ -73,6 +73,32 @@ pub struct JobAccepted {
 pub struct TextureListResponse {
     pub textures: Vec<texture::Texture>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateTextureRequest {
+    pub shareable: bool,
+}
+
+/// Strict, authenticated hand-off from the offline forge.
+///
+/// The descriptor is the one embedded in SkinDoc v2. Every listed PNG is sent
+/// as a `variant` multipart part whose filename is
+/// `sha256:<digest>.png`; no resizing or re-encoding occurs after this gate.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeManifest {
+    pub schema_version: u32,
+    pub content_ref: String,
+    pub descriptor: skin_schema::v2::TextureDescriptorV2,
+    /// Use-derived joins the offline forge required. A sheet always includes
+    /// `y`; an image layer with tile fit additionally requires `x`.
+    pub seam_axes: Vec<texture::SeamAxis>,
+    #[serde(default)]
+    pub shareable: bool,
+}
+
+const FORGE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug)]
 pub enum TexturesApiError {
@@ -281,11 +307,469 @@ pub async fn list_mine(
     Ok(response)
 }
 
-/// One texture's manifest: which rungs exist, and what each is called.
+/// Explicitly allow or revoke reuse of one immutable texture by other authors.
+pub async fn update_texture(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(texture_id): Path<i32>,
+    Json(request): Json<UpdateTextureRequest>,
+) -> Result<Response, TexturesApiError> {
+    let texture = state
+        .db
+        .get_texture(texture_id)
+        .await
+        .map_err(TexturesApiError::Internal)?
+        .ok_or(TexturesApiError::NotFound)?;
+    if texture.owner_user_id != auth_user.user_id && !auth_user.is_admin {
+        return Err(TexturesApiError::NotFound);
+    }
+    state
+        .db
+        .set_texture_shareable(texture_id, request.shareable)
+        .await
+        .map_err(TexturesApiError::Internal)?;
+
+    let mut updated = texture;
+    updated.shareable = request.shareable;
+    let mut response = Json(updated).into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// Ingest a complete forge ladder without changing the bytes that were gated.
+pub async fn ingest_forge_manifest(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    mut form: axum::extract::Multipart,
+) -> Result<Response, TexturesApiError> {
+    if auth_user.is_guest {
+        return Err(TexturesApiError::GuestNotAllowed);
+    }
+    let mut manifest_json = None;
+    let mut files = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    while let Some(field) = form.next_field().await.map_err(|error| {
+        TexturesApiError::Invalid(vec![format!("body: could not be read as a form: {error}")])
+    })? {
+        let field_name = field.name().unwrap_or_default().to_string();
+        match field_name.as_str() {
+            "manifest" => {
+                let value = field.text().await.map_err(|error| {
+                    TexturesApiError::Invalid(vec![format!(
+                        "manifest: could not be read as text: {error}"
+                    )])
+                })?;
+                if manifest_json.replace(value).is_some() {
+                    return Err(TexturesApiError::Invalid(vec![
+                        "manifest: supplied twice".to_string(),
+                    ]));
+                }
+            }
+            "variant" => {
+                let filename = field.file_name().unwrap_or_default().to_string();
+                if filename.is_empty() {
+                    return Err(TexturesApiError::Invalid(vec![
+                        "variant: every file needs a sha256:<digest>.png filename".to_string(),
+                    ]));
+                }
+                let reference = filename
+                    .strip_suffix(".png")
+                    .unwrap_or(&filename)
+                    .to_string();
+                let bytes = field.bytes().await.map_err(|error| {
+                    TexturesApiError::Invalid(vec![format!(
+                        "variant {filename}: could not be read: {error}"
+                    )])
+                })?;
+                if files.insert(reference.clone(), bytes.to_vec()).is_some() {
+                    return Err(TexturesApiError::Invalid(vec![format!(
+                        "variant {reference}: supplied twice"
+                    )]));
+                }
+            }
+            _ => {
+                return Err(TexturesApiError::Invalid(vec![format!(
+                    "{field_name}: unknown multipart field"
+                )]));
+            }
+        }
+    }
+    let manifest: ForgeManifest = serde_json::from_str(
+        manifest_json
+            .as_deref()
+            .ok_or_else(|| TexturesApiError::Invalid(vec!["manifest: is required".to_string()]))?,
+    )
+    .map_err(|error| TexturesApiError::Invalid(vec![format!("manifest: {error}")]))?;
+    if manifest.schema_version != FORGE_MANIFEST_SCHEMA_VERSION {
+        return Err(TexturesApiError::Invalid(vec![format!(
+            "manifest.schema_version: expected {FORGE_MANIFEST_SCHEMA_VERSION}"
+        )]));
+    }
+
+    let kind = match manifest.descriptor.kind {
+        skin_schema::v2::TextureKindV2::Coat => TextureKind::Coat,
+        skin_schema::v2::TextureKindV2::Sheet => TextureKind::Sheet,
+        skin_schema::v2::TextureKindV2::Overlay => TextureKind::Overlay,
+    };
+    if manifest.descriptor.body_columns == Some(0) {
+        return Err(TexturesApiError::Invalid(vec![
+            "descriptor.body_columns: must be positive when present".to_string(),
+        ]));
+    }
+    if matches!(kind, TextureKind::Coat | TextureKind::Sheet)
+        && manifest.descriptor.body_columns.is_none()
+    {
+        return Err(TexturesApiError::Invalid(vec![
+            "descriptor.body_columns: coat and sheet art must declare body columns".to_string(),
+        ]));
+    }
+    match (kind, manifest.descriptor.frame_rows) {
+        (TextureKind::Sheet, Some(rows))
+            if (1..=skin_schema::v2::MAX_SPRITE_FRAME_ROWS).contains(&rows) => {}
+        (TextureKind::Sheet, _) => {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "descriptor.frame_rows: sheets require 1 to {} rows",
+                skin_schema::v2::MAX_SPRITE_FRAME_ROWS
+            )]));
+        }
+        (_, Some(_)) => {
+            return Err(TexturesApiError::Invalid(vec![
+                "descriptor.frame_rows: only sheets have animation rows".to_string(),
+            ]));
+        }
+        (_, None) => {}
+    }
+    let mut verified_seam_axes = manifest.seam_axes.clone();
+    verified_seam_axes.sort();
+    verified_seam_axes.dedup();
+    if verified_seam_axes.len() != manifest.seam_axes.len() {
+        return Err(TexturesApiError::Invalid(vec![
+            "seam_axes: each required axis may appear only once".to_string(),
+        ]));
+    }
+    if kind == TextureKind::Sheet && !verified_seam_axes.contains(&texture::SeamAxis::Y) {
+        return Err(TexturesApiError::Invalid(vec![
+            "seam_axes: a looping sheet must gate the y join".to_string(),
+        ]));
+    }
+    let expected_rungs: Vec<u32> = std::iter::once(kind.canonical_texels_per_cell())
+        .chain(kind.ladder().iter().copied())
+        .collect();
+    if manifest.descriptor.variants.len() != expected_rungs.len() {
+        return Err(TexturesApiError::Invalid(vec![format!(
+            "descriptor.variants: expected the complete {:?} ladder",
+            expected_rungs
+        )]));
+    }
+    if manifest
+        .descriptor
+        .variants
+        .iter()
+        .map(|variant| variant.texels_per_cell)
+        .ne(expected_rungs.iter().copied())
+    {
+        return Err(TexturesApiError::Invalid(vec![
+            "descriptor.variants: must be ordered canonical-first with every required rung"
+                .to_string(),
+        ]));
+    }
+    if manifest
+        .descriptor
+        .variants
+        .first()
+        .map(|variant| variant.content_ref.as_str())
+        != Some(manifest.content_ref.as_str())
+    {
+        return Err(TexturesApiError::Invalid(vec![
+            "content_ref: must name the canonical first variant".to_string(),
+        ]));
+    }
+
+    let mut stored_variants = Vec::new();
+    let mut gated_seams = texture::SeamReport {
+        horizontal_ratio: 0.0,
+        vertical_ratio: 0.0,
+        repaired: false,
+    };
+    let mut expected_files = std::collections::BTreeSet::new();
+    let mut variant_refs = std::collections::BTreeSet::new();
+    for (index, variant) in manifest.descriptor.variants.iter().enumerate() {
+        if !skin_schema::content::is_content_ref(&variant.content_ref) {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "descriptor.variants[{index}].content_ref: is not a sha256 reference"
+            )]));
+        }
+        if !variant_refs.insert(variant.content_ref.as_str()) {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "descriptor.variants[{index}].content_ref: each rung must name different exact bytes"
+            )]));
+        }
+        let expected_url = format!("/api/textures/variants/{}.png", variant.content_ref);
+        if variant.url != expected_url {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "descriptor.variants[{index}].url: must be {expected_url}"
+            )]));
+        }
+        if variant.width_px == 0
+            || variant.height_px == 0
+            || variant.width_px > skin_schema::v2::MAX_TEXTURE_DIMENSION_PX
+            || variant.height_px > skin_schema::v2::MAX_TEXTURE_DIMENSION_PX
+        {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: dimensions must be within the renderer's 1..={}px edge limit",
+                variant.content_ref,
+                skin_schema::v2::MAX_TEXTURE_DIMENSION_PX
+            )]));
+        }
+        if variant.bytes == 0 || variant.bytes > skin_schema::v2::MAX_TEXTURE_VARIANT_BYTES {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: compressed size must be within the renderer's 1..={} byte limit",
+                variant.content_ref,
+                skin_schema::v2::MAX_TEXTURE_VARIANT_BYTES
+            )]));
+        }
+        let decoded_bytes = u64::from(variant.width_px)
+            .saturating_mul(u64::from(variant.height_px))
+            .saturating_mul(4);
+        if decoded_bytes > skin_schema::v2::MAX_TEXTURE_DECODED_BYTES {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: decoded RGBA allocation exceeds the renderer limit",
+                variant.content_ref
+            )]));
+        }
+        expected_files.insert(variant.content_ref.clone());
+        let bytes = files.get(&variant.content_ref).ok_or_else(|| {
+            TexturesApiError::Invalid(vec![format!(
+                "variant {}: exact PNG bytes are missing",
+                variant.content_ref
+            )])
+        })?;
+        if bytes.len() != variant.bytes as usize
+            || skin_schema::content::reference_for_bytes(bytes) != variant.content_ref
+        {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: byte count or content hash does not match the manifest",
+                variant.content_ref
+            )]));
+        }
+        let header = texture::read_png_header(bytes).map_err(|error| {
+            TexturesApiError::Invalid(vec![format!(
+                "variant {}: {} {}",
+                variant.content_ref, error.field, error.problem
+            )])
+        })?;
+        if (header.width_px, header.height_px) != (variant.width_px, variant.height_px) {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: PNG dimensions do not match the manifest",
+                variant.content_ref
+            )]));
+        }
+        let expected_width = manifest
+            .descriptor
+            .body_columns
+            .map(|columns| columns.saturating_mul(variant.texels_per_cell));
+        if expected_width.is_some_and(|width| width != variant.width_px) {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: width does not match body_columns × texels_per_cell",
+                variant.content_ref
+            )]));
+        }
+        let expected_height = match kind {
+            TextureKind::Sheet => manifest
+                .descriptor
+                .frame_rows
+                .map(|rows| rows.saturating_mul(variant.texels_per_cell)),
+            TextureKind::Coat => Some(variant.texels_per_cell),
+            TextureKind::Overlay => None,
+        };
+        if expected_height.is_some_and(|height| height != variant.height_px) {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: height does not match its declared rows/kind",
+                variant.content_ref
+            )]));
+        }
+        if kind == TextureKind::Overlay
+            && !variant.height_px.is_multiple_of(variant.texels_per_cell)
+        {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: overlay height is not whole cells",
+                variant.content_ref
+            )]));
+        }
+        let decoded = crate::texture_pixels::decode(bytes).map_err(|error| {
+            TexturesApiError::Invalid(vec![format!(
+                "variant {}: {} {}",
+                variant.content_ref, error.field, error.problem
+            )])
+        })?;
+        let seams = crate::texture_pixels::seam_report(&decoded);
+        if !seams.passes_axes(&verified_seam_axes) {
+            return Err(TexturesApiError::Invalid(vec![format!(
+                "variant {}: failed a required wrap seam axis",
+                variant.content_ref
+            )]));
+        }
+        gated_seams.horizontal_ratio = gated_seams.horizontal_ratio.max(seams.horizontal_ratio);
+        gated_seams.vertical_ratio = gated_seams.vertical_ratio.max(seams.vertical_ratio);
+        if index == 0 {
+            texture::validate_shape(texture::ProposedTexture {
+                kind,
+                width_px: variant.width_px,
+                height_px: variant.height_px,
+                rows: manifest.descriptor.frame_rows,
+                byte_len: bytes.len(),
+            })
+            .map_err(|errors| {
+                TexturesApiError::Invalid(
+                    errors
+                        .into_iter()
+                        .map(|error| format!("canonical {} {}", error.field, error.problem))
+                        .collect(),
+                )
+            })?;
+        }
+        stored_variants.push(texture::TextureVariant {
+            texels_per_cell: variant.texels_per_cell,
+            width_px: variant.width_px,
+            height_px: variant.height_px,
+            bytes: variant.bytes,
+            sha256: variant
+                .content_ref
+                .trim_start_matches("sha256:")
+                .to_string(),
+        });
+    }
+    let actual_files: std::collections::BTreeSet<_> = files.keys().cloned().collect();
+    if actual_files != expected_files {
+        return Err(TexturesApiError::Invalid(vec![
+            "variant: the multipart files must exactly equal the manifest entries".to_string(),
+        ]));
+    }
+
+    if let Some(mut existing) = state
+        .db
+        .get_texture_for_use(
+            &manifest.content_ref,
+            &manifest.descriptor,
+            auth_user.user_id,
+            auth_user.is_admin,
+            &[],
+        )
+        .await
+        .map_err(TexturesApiError::Internal)?
+        .filter(|texture| texture.owner_user_id == auth_user.user_id)
+    {
+        let mut merged_axes = existing.verified_seam_axes.clone();
+        merged_axes.extend(verified_seam_axes.iter().copied());
+        merged_axes.sort();
+        merged_axes.dedup();
+        let merged_seams = texture::SeamReport {
+            horizontal_ratio: existing
+                .seams
+                .horizontal_ratio
+                .max(gated_seams.horizontal_ratio),
+            vertical_ratio: existing
+                .seams
+                .vertical_ratio
+                .max(gated_seams.vertical_ratio),
+            repaired: existing.seams.repaired || gated_seams.repaired,
+        };
+        if existing.shareable != manifest.shareable
+            || existing.verified_seam_axes != merged_axes
+            || existing.seams != merged_seams
+        {
+            state
+                .db
+                .update_texture_verification(
+                    existing.texture_id,
+                    manifest.shareable,
+                    &merged_axes,
+                    merged_seams,
+                )
+                .await
+                .map_err(TexturesApiError::Internal)?;
+            existing.shareable = manifest.shareable;
+            existing.verified_seam_axes = merged_axes;
+            existing.seams = merged_seams;
+        }
+        let mut response = Json(existing).into_response();
+        no_store(&mut response);
+        return Ok(response);
+    }
+
+    let Some(store) = state.texture_store.as_ref() else {
+        return Err(TexturesApiError::Disabled);
+    };
+    // Store and read back every exact object before a database row makes the
+    // descriptor reachable. Content-addressing makes partial attempts harmless.
+    for variant in &manifest.descriptor.variants {
+        let bytes = files.get(&variant.content_ref).expect("checked above");
+        let sha256 = variant.content_ref.trim_start_matches("sha256:");
+        store
+            .put(
+                &crate::texture_store::TextureObject {
+                    sha256: sha256.to_string(),
+                    content_type: "image/png",
+                    byte_len: bytes.len(),
+                },
+                bytes,
+            )
+            .await
+            .map_err(|error| {
+                TexturesApiError::Internal(anyhow::anyhow!(
+                    "could not store strict forge variant: {error}"
+                ))
+            })?;
+        let verified = store
+            .get(sha256)
+            .await
+            .map_err(TexturesApiError::Internal)?
+            .ok_or(TexturesApiError::StorageUnavailable)?;
+        if verified != *bytes {
+            return Err(TexturesApiError::StorageUnavailable);
+        }
+    }
+
+    let texture_id = state
+        .db
+        .next_texture_id()
+        .await
+        .map_err(TexturesApiError::Internal)?;
+    let texture = texture::Texture {
+        texture_id,
+        owner_user_id: auth_user.user_id,
+        shareable: manifest.shareable,
+        content_ref: manifest.content_ref,
+        kind,
+        width_px: manifest.descriptor.variants[0].width_px,
+        height_px: manifest.descriptor.variants[0].height_px,
+        repeat_cells: manifest.descriptor.body_columns.map(|value| value as f32),
+        rows: manifest.descriptor.frame_rows,
+        seams: gated_seams,
+        verified_seam_axes,
+        last_prompt: None,
+        variants: stored_variants,
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    if texture.descriptor() != manifest.descriptor {
+        return Err(TexturesApiError::Invalid(vec![
+            "descriptor: does not round-trip to the server's immutable descriptor".to_string(),
+        ]));
+    }
+    let texture = state
+        .db
+        .create_texture(&texture)
+        .await
+        .map_err(TexturesApiError::Internal)?;
+    let mut response = (StatusCode::CREATED, Json(texture)).into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// One texture's sanitized immutable descriptor.
 ///
-/// Short-cached and revalidating, unlike the bytes: the rungs can change when
-/// an author overrides one with hand-simplified art, and a client holding a
-/// year-old manifest would never see it.
+/// Owner ids and generation prompts belong to the authenticated author
+/// library, never this anonymous render route. Every URL in the descriptor is
+/// addressed by the exact variant bytes' own hash.
 pub async fn get_manifest(
     State(state): State<AuthState>,
     Path(content_ref): Path<String>,
@@ -297,11 +781,21 @@ pub async fn get_manifest(
         .map_err(TexturesApiError::Internal)?
         .ok_or(TexturesApiError::NotFound)?;
 
-    let mut response = Json(texture).into_response();
+    let descriptor = texture.descriptor();
+    let descriptor_bytes = serde_json::to_vec(&descriptor).map_err(|error| {
+        TexturesApiError::Internal(anyhow::anyhow!(
+            "could not serialize texture descriptor: {error}"
+        ))
+    })?;
+    let descriptor_ref = skin_schema::content::reference_for_bytes(&descriptor_bytes);
+    let mut response = Json(descriptor).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=300, must-revalidate"),
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
+    if let Ok(etag) = HeaderValue::from_str(&format!("\"{descriptor_ref}\"")) {
+        response.headers_mut().insert(header::ETAG, etag);
+    }
     Ok(response)
 }
 
@@ -421,6 +915,58 @@ pub async fn get_variant_bytes(
     Ok(response)
 }
 
+/// Serve one PNG by the hash of those exact PNG bytes.
+///
+/// Unlike the legacy logical-texture/rung route, this URL contains no mutable
+/// indirection at all. It is the URL embedded in pinned v2 descriptors.
+pub async fn get_variant_bytes_by_hash(
+    State(state): State<TextureBytesState>,
+    Path(segment): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, TexturesApiError> {
+    let content_ref = segment
+        .strip_suffix(".png")
+        .ok_or(TexturesApiError::NotFound)?;
+    if !skin_schema::content::is_content_ref(content_ref) {
+        return Err(TexturesApiError::NotFound);
+    }
+    let sha256 = content_ref
+        .strip_prefix("sha256:")
+        .ok_or(TexturesApiError::NotFound)?;
+    let etag = format!("\"{content_ref}\"");
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == etag)
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        apply_immutable_headers(&mut response, &etag);
+        return Ok(response);
+    }
+
+    let Some(store) = &state.store else {
+        return Err(TexturesApiError::StorageUnavailable);
+    };
+    let bytes = store
+        .get(sha256)
+        .await
+        .map_err(|error| {
+            error!(%content_ref, ?error, "failed to read content-addressed texture variant");
+            TexturesApiError::StorageUnavailable
+        })?
+        .ok_or(TexturesApiError::NotFound)?;
+    if skin_schema::content::reference_for_bytes(&bytes) != content_ref {
+        error!(%content_ref, "content-addressed texture storage returned different bytes");
+        return Err(TexturesApiError::StorageUnavailable);
+    }
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    apply_immutable_headers(&mut response, &etag);
+    Ok(response)
+}
+
 /// `"32.png"` names the 32-texel rung. Anything else names nothing.
 fn parse_variant_segment(segment: &str) -> Option<u32> {
     let stem = segment.strip_suffix(".png")?;
@@ -454,10 +1000,15 @@ pub fn build_texture_byte_routes(
 }
 
 fn texture_byte_route_template() -> axum::Router<TextureBytesState> {
-    axum::Router::new().route(
-        "/api/textures/by-ref/:content_ref/:variant",
-        axum::routing::get(get_variant_bytes),
-    )
+    axum::Router::new()
+        .route(
+            "/api/textures/by-ref/:content_ref/:variant",
+            axum::routing::get(get_variant_bytes),
+        )
+        .route(
+            "/api/textures/variants/:variant_ref",
+            axum::routing::get(get_variant_bytes_by_hash),
+        )
 }
 
 fn no_store(response: &mut Response) {
@@ -709,6 +1260,7 @@ mod tests {
             catalog: std::sync::Arc::new(OneTexture(Texture {
                 texture_id: 1,
                 owner_user_id: 7,
+                shareable: false,
                 content_ref: content_ref.clone(),
                 kind: TextureKind::Coat,
                 width_px: 768,
@@ -720,6 +1272,7 @@ mod tests {
                     vertical_ratio: 0.8,
                     repaired: false,
                 },
+                verified_seam_axes: vec![crate::texture::SeamAxis::X],
                 last_prompt: None,
                 variants: vec![TextureVariant {
                     texels_per_cell: 32,
@@ -759,6 +1312,21 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("immutable")
+        );
+
+        // The v2 descriptor route is addressed by these exact bytes, with no
+        // logical texture or rung lookup in between.
+        let direct = get_variant_bytes_by_hash(
+            State(state.clone()),
+            Path(format!("sha256:{sha}.png")),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("variant hash is directly fetchable");
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert_eq!(
+            direct.headers()[header::ETAG].to_str().unwrap(),
+            format!("\"sha256:{sha}\"")
         );
 
         // Revalidation settles before object storage is touched.

@@ -1,0 +1,15 @@
+{
+  "brief": "An iridescent beetle-shell coat with small irregular facets.",
+  "palette_intent": "Material remains recognizable while contour and fallback carry team role.",
+  "motion_intent": "Static coat with no frame animation.",
+  "implementation_hint": "texture",
+  "hint_rationale": "Organic facets would be visibly mechanical as a small set of rectangles.",
+  "prompt": "Fill the exact pinned blank geometry guide with an iridescent beetle-shell coat: one flat right-facing continuous 16-cell-by-1-cell capsule, one-cell rounded head with a small centered dark core, rounded tail, neutral background, and no gaps, detached plates, perspective, or outside paint. prototype-body-mask-v1 deterministically projects the retained source material through the exact native renderer body mask before review; image_sha256 is the projected authority and source_image_sha256 is audit-only raw provider material.",
+  "model_config": "prototype-gemini-3-pro-image-v1",
+  "image_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "source_image_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "geometry_projection": "prototype-body-mask-v1",
+  "design_guidelines_sha256": "afb9c6cf0a2fcb14bae4e7ff708f20b8064cf3a1efd6c69ef4441de484e1e1ae",
+  "prototype_geometry_sha256": "add1b9dbd48f4229d3e85df834ec1fc2666d3ed62e9075d0ddb5d687aa889300",
+  "prototype_guide_sha256": "620c98c34f9d4cf0b7366954d48ab964653639d0b5e2a866110093b3de4d19ae"
+}

@@ -21,6 +21,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A wrap join an exact PNG ladder has been measured against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub enum SeamAxis {
+    X,
+    Y,
+}
+
+impl SeamAxis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X => "x",
+            Self::Y => "y",
+        }
+    }
+}
+
 /// What a texture is for, which decides its shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +105,17 @@ impl TextureKind {
     pub fn tiles_in_time(self) -> bool {
         matches!(self, Self::Sheet)
     }
+
+    /// Axes the legacy interactive worker guarantees without knowing the
+    /// eventual document fit. Strict forge manifests carry the use-derived
+    /// set explicitly instead.
+    pub fn worker_seam_axes(self) -> &'static [SeamAxis] {
+        match self {
+            Self::Coat => &[SeamAxis::X],
+            Self::Sheet => &[SeamAxis::Y],
+            Self::Overlay => &[],
+        }
+    }
 }
 
 /// The largest image worth accepting, in either axis.
@@ -94,11 +124,12 @@ pub const MAX_CANONICAL_DIMENSION: u32 = 2048;
 /// The largest single variant, in bytes.
 pub const MAX_VARIANT_BYTES: usize = 2 * 1024 * 1024;
 
-/// The most frames a sheet may carry.
+/// The measured renderer/decoded-memory ceiling for animation frames.
 ///
-/// `DEFAULT_SPRITE_ROWS` is 20 in the sprite tooling; this is the ceiling, not
-/// the default, and exists because rows are the multiplier on a sheet's height.
-pub const MAX_SHEET_ROWS: u32 = 20;
+/// Twenty remains the interactive generator's economical default, not a
+/// capability limit. The v2 capability manifest exposes 120 so deliberately
+/// tall factory sheets can trade bytes for smoother slow-motion playback.
+pub const MAX_SHEET_ROWS: u32 = skin_schema::v2::MAX_SPRITE_FRAME_ROWS;
 
 /// One rung of the ladder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,10 +191,14 @@ impl SeamReport {
     pub const ACCEPTABLE_RATIO: f32 = 0.9;
 
     pub fn passes(&self, kind: TextureKind) -> bool {
-        let horizontal_ok =
-            !kind.tiles_along_body() || self.horizontal_ratio <= Self::ACCEPTABLE_RATIO;
-        let vertical_ok = !kind.tiles_in_time() || self.vertical_ratio <= Self::ACCEPTABLE_RATIO;
-        horizontal_ok && vertical_ok
+        self.passes_axes(kind.worker_seam_axes())
+    }
+
+    pub fn passes_axes(&self, axes: &[SeamAxis]) -> bool {
+        axes.iter().all(|axis| match axis {
+            SeamAxis::X => self.horizontal_ratio <= Self::ACCEPTABLE_RATIO,
+            SeamAxis::Y => self.vertical_ratio <= Self::ACCEPTABLE_RATIO,
+        })
     }
 }
 
@@ -175,6 +210,11 @@ impl SeamReport {
 pub struct Texture {
     pub texture_id: i32,
     pub owner_user_id: i32,
+    /// Whether another author may pin this immutable descriptor in a skin.
+    /// Runtime bytes are public by hash either way; this flag controls reuse
+    /// at save time, not pixel delivery.
+    #[serde(default)]
+    pub shareable: bool,
     /// The hash of the canonical variant, and the name the document uses.
     pub content_ref: String,
     pub kind: TextureKind,
@@ -186,10 +226,58 @@ pub struct Texture {
     /// Frame count, for a sheet.
     pub rows: Option<u32>,
     pub seams: SeamReport,
+    /// Axes measured on every exact ladder rung before this metadata row was
+    /// made reachable. Save-time document validation requires this set to be
+    /// a superset of the axes implied by image fit and animation use.
+    #[serde(default)]
+    pub verified_seam_axes: Vec<SeamAxis>,
     /// Kept so regenerating is one edit rather than a retype.
     pub last_prompt: Option<String>,
     pub variants: Vec<TextureVariant>,
     pub created_at_ms: i64,
+}
+
+/// Public, immutable metadata needed to compile an image source.
+///
+/// This is intentionally not [`Texture`]: ownership and generation prompts
+/// are author-library data, not inputs to rendering, and must never leak from
+/// the anonymous manifest route.
+impl Texture {
+    pub fn descriptor(&self) -> skin_schema::v2::TextureDescriptorV2 {
+        let body_columns = self.repeat_cells.and_then(|value| {
+            let rounded = value.round();
+            (value.is_finite() && value > 0.0 && (value - rounded).abs() < f32::EPSILON)
+                .then_some(rounded as u32)
+        });
+        skin_schema::v2::TextureDescriptorV2 {
+            kind: match self.kind {
+                TextureKind::Coat => skin_schema::v2::TextureKindV2::Coat,
+                TextureKind::Sheet => skin_schema::v2::TextureKindV2::Sheet,
+                TextureKind::Overlay => skin_schema::v2::TextureKindV2::Overlay,
+            },
+            body_columns,
+            frame_rows: self.rows,
+            variants: self
+                .variants
+                .iter()
+                .map(|variant| {
+                    let content_ref = if variant.sha256.starts_with("sha256:") {
+                        variant.sha256.clone()
+                    } else {
+                        format!("sha256:{}", variant.sha256)
+                    };
+                    skin_schema::v2::TextureVariantV2 {
+                        url: format!("/api/textures/variants/{content_ref}.png"),
+                        content_ref,
+                        width_px: variant.width_px,
+                        height_px: variant.height_px,
+                        bytes: variant.bytes,
+                        texels_per_cell: variant.texels_per_cell,
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Why a proposed texture was refused.
@@ -420,6 +508,65 @@ pub fn build_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_descriptor_is_exact_content_addressed_and_sanitized() {
+        let canonical = "a".repeat(64);
+        let smaller = "b".repeat(64);
+        let texture = Texture {
+            texture_id: 7,
+            owner_user_id: 42,
+            shareable: false,
+            content_ref: format!("sha256:{canonical}"),
+            kind: TextureKind::Sheet,
+            width_px: 320,
+            height_px: 640,
+            repeat_cells: Some(20.0),
+            rows: Some(40),
+            seams: SeamReport {
+                horizontal_ratio: 0.2,
+                vertical_ratio: 0.3,
+                repaired: true,
+            },
+            verified_seam_axes: vec![SeamAxis::Y],
+            last_prompt: Some("private generation prompt".to_string()),
+            variants: vec![
+                TextureVariant {
+                    texels_per_cell: 16,
+                    width_px: 320,
+                    height_px: 640,
+                    bytes: 100,
+                    sha256: canonical.clone(),
+                },
+                TextureVariant {
+                    texels_per_cell: 8,
+                    width_px: 160,
+                    height_px: 320,
+                    bytes: 50,
+                    sha256: smaller.clone(),
+                },
+            ],
+            created_at_ms: 1,
+        };
+
+        let descriptor = texture.descriptor();
+        assert_eq!(descriptor.kind, skin_schema::v2::TextureKindV2::Sheet);
+        assert_eq!(descriptor.body_columns, Some(20));
+        assert_eq!(descriptor.frame_rows, Some(40));
+        assert_eq!(
+            descriptor.variants[1].url,
+            format!("/api/textures/variants/sha256:{smaller}.png")
+        );
+        assert_eq!(
+            descriptor.variants[1].content_ref,
+            format!("sha256:{smaller}")
+        );
+
+        let public = serde_json::to_string(&descriptor).expect("serializes");
+        assert!(!public.contains("owner"));
+        assert!(!public.contains("prompt"));
+        assert!(!public.contains("42"));
+    }
 
     fn coat(width: u32, height: u32) -> ProposedTexture {
         ProposedTexture {

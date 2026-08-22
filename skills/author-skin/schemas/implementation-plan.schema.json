@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://snaketron.io/schemas/skin-factory/implementation-plan-v1.json",
+  "title": "Skin implementation plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "path",
+    "rationale",
+    "design_guidelines",
+    "fidelity_features",
+    "layer_plan",
+    "asset_plan",
+    "animation_plan",
+    "required_wrap_axes",
+    "risks"
+  ],
+  "properties": {
+    "path": { "enum": ["layers", "texture", "sprite_sheet", "hybrid"] },
+    "rationale": { "type": "string", "minLength": 1 },
+    "design_guidelines": { "$ref": "#/$defs/designGuidelines" },
+    "fidelity_features": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "layer_plan": {
+      "type": "array",
+      "description": "Ordered executable layer ownership. For every band, record the independent baked-frame maxima proving max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5.",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "asset_plan": {
+      "type": "array",
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "animation_plan": {
+      "type": "array",
+      "description": "Baked-frame behavior and bounds. A band must prove max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5 across the complete pinned animation ring, not merely bound each field separately. Safe example: t_center = 0.3 * tri(time) and half_width = 0.15 give 0.45.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "required_wrap_axes": { "$ref": "#/$defs/wrapAxes" },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "path": { "const": "layers" } } },
+      "then": { "properties": { "asset_plan": { "maxItems": 0 } } }
+    },
+    {
+      "if": { "properties": { "path": { "const": "texture" } } },
+      "then": {
+        "properties": {
+          "asset_plan": {
+            "minItems": 1,
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/asset" },
+                { "properties": { "kind": { "enum": ["coat", "overlay"] } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "path": { "const": "sprite_sheet" } } },
+      "then": {
+        "properties": {
+          "asset_plan": {
+            "minItems": 1,
+            "contains": {
+              "properties": { "kind": { "const": "sheet" } },
+              "required": ["kind"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "path": { "const": "hybrid" } } },
+      "then": { "properties": { "asset_plan": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "designGuidelines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artistic_direction",
+        "concept_twist",
+        "structure",
+        "body_strategy",
+        "head_zone",
+        "asset_strategy"
+      ],
+      "properties": {
+        "artistic_direction": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "concept_twist": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "structure": { "enum": ["pattern", "sprite"] },
+        "body_strategy": { "type": "string", "minLength": 1, "maxLength": 320 },
+        "head_zone": {
+          "enum": [
+            "light_field_dark_core",
+            "dark_field_light_disc_dark_core"
+          ]
+        },
+        "asset_strategy": { "type": "string", "minLength": 1, "maxLength": 320 }
+      }
+    },
+    "wrapAxes": {
+      "type": "array",
+      "maxItems": 2,
+      "items": { "enum": ["x", "y"] },
+      "uniqueItems": true
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "natural_length_cells",
+        "frames",
+        "desired_fps",
+        "texels_per_cell",
+        "anchor",
+        "fit",
+        "fade",
+        "prompt"
+      ],
+      "properties": {
+        "kind": { "enum": ["coat", "sheet", "overlay"] },
+        "natural_length_cells": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "desired_fps": {
+          "type": ["number", "null"],
+          "minimum": 1,
+          "maximum": 120
+        },
+        "texels_per_cell": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 128
+        },
+        "anchor": { "enum": ["whole", "head", "tail"] },
+        "fit": { "enum": ["tile", "clip", "stretch", "cutout"] },
+        "fade": { "enum": ["none", "leading", "trailing", "both"] },
+        "prompt": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "sheet" } } },
+          "then": {
+            "properties": {
+              "frames": { "minimum": 2 },
+              "desired_fps": { "type": "number" },
+              "texels_per_cell": { "const": 16 }
+            }
+          },
+          "else": {
+            "properties": {
+              "frames": { "const": 1 },
+              "desired_fps": { "const": null },
+              "texels_per_cell": { "const": 64 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

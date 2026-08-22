@@ -53,6 +53,22 @@ pub struct Atlas {
     regions: Vec<AtlasRegion>,
 }
 
+/// Observable browser evidence for image-bearing skin captures.
+///
+/// `pending == 0` alone is ambiguous: it also describes a 404. Captures gate
+/// on `failed == 0` and, when images were requested, `drawn_images > 0`, which
+/// proves decoded pixels reached a real canvas rather than only the fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetStatus {
+    pub requested: usize,
+    pub pending: usize,
+    pub ready: usize,
+    pub failed: usize,
+    pub drawn_images: usize,
+    pub draw_calls: u64,
+}
+
 /// One atlas image, and the store handle it resolves to once requested.
 #[derive(Debug)]
 struct Image {
@@ -262,8 +278,16 @@ pub fn any_pending() -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn asset_status() -> AssetStatus {
+    AssetStatus::default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn record_draw(_image: usize) {}
+
 #[cfg(target_arch = "wasm32")]
-pub use browser::{any_pending, image_element, is_ready, request};
+pub use browser::{any_pending, asset_status, image_element, is_ready, record_draw, request};
 
 /// A stub so the non-wasm build can still name the symbol the painter calls.
 #[cfg(not(target_arch = "wasm32"))]
@@ -279,6 +303,7 @@ mod browser {
     struct Entry {
         url: String,
         element: web_sys::HtmlImageElement,
+        draw_calls: u64,
     }
 
     // Single-threaded by construction: wasm has one thread, and the store is
@@ -306,6 +331,7 @@ mod browser {
                 images.push(Entry {
                     url: url.to_string(),
                     element: web_sys::HtmlImageElement::new().expect("image element"),
+                    draw_calls: 0,
                 });
                 return images.len() - 1;
             };
@@ -322,6 +348,7 @@ mod browser {
             images.push(Entry {
                 url: url.to_string(),
                 element,
+                draw_calls: 0,
             });
             images.len() - 1
         })
@@ -347,6 +374,15 @@ mod browser {
         })
     }
 
+    /// Record a successful browser `drawImage`, after the canvas call returns.
+    pub fn record_draw(image: usize) {
+        IMAGES.with(|images| {
+            if let Some(entry) = images.borrow_mut().get_mut(image) {
+                entry.draw_calls = entry.draw_calls.saturating_add(1);
+            }
+        });
+    }
+
     /// Whether any requested image has neither decoded nor given up.
     ///
     /// `complete` covers both outcomes, which is what makes this settle rather
@@ -358,6 +394,30 @@ mod browser {
                 .borrow()
                 .iter()
                 .any(|entry| !entry.element.complete())
+        })
+    }
+
+    pub fn asset_status() -> super::AssetStatus {
+        IMAGES.with(|images| {
+            let images = images.borrow();
+            let mut status = super::AssetStatus {
+                requested: images.len(),
+                ..super::AssetStatus::default()
+            };
+            for entry in images.iter() {
+                if !entry.element.complete() {
+                    status.pending += 1;
+                } else if entry.element.natural_width() > 0 && entry.element.natural_height() > 0 {
+                    status.ready += 1;
+                } else {
+                    status.failed += 1;
+                }
+                if entry.draw_calls > 0 {
+                    status.drawn_images += 1;
+                }
+                status.draw_calls = status.draw_calls.saturating_add(entry.draw_calls);
+            }
+            status
         })
     }
 }
@@ -475,6 +535,7 @@ mod tests {
             "nothing outside a browser ever starts a fetch, so nothing may \
              report as still arriving"
         );
+        assert_eq!(asset_status(), AssetStatus::default());
     }
 
     /// A URL becomes a store handle at most once. Resolving per frame would

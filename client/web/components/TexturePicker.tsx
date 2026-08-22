@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api, isApiError } from '../services/api';
 import type { Texture } from '../types/generated/Texture';
 import type { GenerationJob } from '../types/generated/GenerationJob';
+import type { TextureDescriptor } from '../utils/skinTextures';
 
 /**
  * Choosing the art a texture layer wears.
@@ -30,6 +31,7 @@ interface Choice {
   label: string;
   kind: string;
   contentRef: string;
+  descriptor?: TextureDescriptor;
   /** The image to show in the swatch. */
   preview: string;
   mine: boolean;
@@ -44,16 +46,46 @@ const thumbnailOf = (texture: Texture): string => {
   const smallest = [...texture.variants].sort(
     (a, b) => a.texelsPerCell - b.texelsPerCell,
   )[0];
-  const rung = smallest?.texelsPerCell ?? 64;
-  return `${api.baseUrl}/api/textures/by-ref/${encodeURIComponent(texture.contentRef)}/${rung}.png`;
+  if (!smallest) {
+    return '';
+  }
+  const variantRef = `sha256:${smallest.sha256}`;
+  return `${api.baseUrl}/api/textures/variants/${encodeURIComponent(variantRef)}.png`;
 };
+
+/** Convert the private library row to the sanitized descriptor SkinDoc keeps. */
+const descriptorOf = (texture: Texture): TextureDescriptor => ({
+  kind: texture.kind,
+  ...(texture.repeatCells !== null &&
+  Number.isInteger(texture.repeatCells) &&
+  texture.repeatCells > 0
+    ? { body_columns: texture.repeatCells }
+    : {}),
+  ...(texture.rows === null ? {} : { frame_rows: texture.rows }),
+  variants: texture.variants.map((variant) => {
+    const contentRef = `sha256:${variant.sha256}`;
+    return {
+      content_ref: contentRef,
+      url: `/api/textures/variants/${contentRef}.png`,
+      width_px: variant.widthPx,
+      height_px: variant.heightPx,
+      bytes: variant.bytes,
+      texels_per_cell: variant.texelsPerCell,
+    };
+  }),
+});
 
 interface TexturePickerProps {
   /** The name the layer currently references. */
   value: string;
   builtins: BuiltinTexture[];
   /** Declare and select a texture: name, wire reference, kind. */
-  onChoose: (name: string, contentRef: string, kind: string) => void;
+  onChoose: (
+    name: string,
+    contentRef: string,
+    kind: string,
+    descriptor?: TextureDescriptor,
+  ) => void;
 }
 
 /** How often to ask a running job where it has got to. */
@@ -120,7 +152,12 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
           const textures = await refresh();
           const made = textures.find((each) => each.textureId === next.textureId);
           if (made) {
-            onChoose(`texture-${made.textureId}`, made.contentRef, made.kind);
+            onChoose(
+              `texture-${made.textureId}`,
+              made.contentRef,
+              made.kind,
+              descriptorOf(made),
+            );
           }
         }
         if (next.state === 'failed') {
@@ -173,6 +210,7 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
       kind: texture.kind,
       contentRef: texture.contentRef,
       preview: thumbnailOf(texture),
+      descriptor: descriptorOf(texture),
       mine: true,
     })),
   ];
@@ -257,7 +295,12 @@ const TexturePicker: React.FC<TexturePickerProps> = ({ value, builtins, onChoose
                     // late to be seen — the popover stayed open over the
                     // selection it had just made.
                     setOpen(false);
-                    onChoose(choice.id, choice.contentRef, choice.kind);
+                    onChoose(
+                      choice.id,
+                      choice.contentRef,
+                      choice.kind,
+                      choice.descriptor,
+                    );
                   }}
                 >
                   <img className="texture-swatch" src={choice.preview} alt="" loading="lazy" />

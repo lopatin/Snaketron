@@ -54,6 +54,24 @@ await page.waitForFunction(() => window.wasm?.skinAssetsPending() === false, {
 });
 await page.waitForTimeout(150);
 
+const assetStatus = await page.evaluate(() => {
+  const raw = window.wasm?.skinAssetsStatus?.();
+  return raw ? JSON.parse(raw) : null;
+});
+if (!assetStatus) {
+  throw new Error('renderer does not expose skin asset evidence');
+}
+if (assetStatus.failed > 0) {
+  throw new Error(
+    `${assetStatus.failed} of ${assetStatus.requested} requested skin images failed to decode`,
+  );
+}
+if (assetStatus.requested > 0 && assetStatus.drawnImages === 0) {
+  throw new Error(
+    'skin images decoded but no image pixels reached a canvas; refusing to capture the fallback',
+  );
+}
+
 const slug = skinRef.replace(/[^a-z0-9]+/gi, '-');
 await page.screenshot({
   path: join(outDir, `${slug}-sheet.png`),

@@ -23,7 +23,9 @@ use tracing::error;
 use crate::api::auth::AuthState;
 use crate::api::middleware::AuthUser;
 use crate::skin_catalog::{self, BASE_REF_PREFIX, CatalogEntry, MAX_SKIN_REF_LENGTH, SkinKind};
-use crate::skin_store::{NewRevision, NewSkin, Publication, Skin, skin_id_reference};
+use crate::skin_store::{
+    NewRevision, NewSkin, Publication, Skin, SkinNamespace, SkinWriteError, skin_id_reference,
+};
 
 /// How long a browser may reuse the catalogue. Built-ins change only when the
 /// server is redeployed, so this is generous without being able to strand a
@@ -94,6 +96,8 @@ pub enum SkinsApiError {
     GuestNotAllowed,
     /// The document did not pass the shared validator.
     Invalid(Vec<String>),
+    /// An optimistic write or exact review target lost a race.
+    Conflict(String),
     /// The reference does not name anything this build can draw. Unlike match
     /// preparation, which quietly falls back to classic rather than refusing a
     /// join, an explicit equip is worth an error: the player is looking at the
@@ -123,6 +127,7 @@ impl IntoResponse for SkinsApiError {
                 "Creating a skin needs a registered account".to_string(),
             ),
             Self::Invalid(problems) => (StatusCode::BAD_REQUEST, problems.join("; ")),
+            Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::UnknownSkin(reference) => (
                 StatusCode::BAD_REQUEST,
                 format!("{reference} is not a skin this server knows"),
@@ -314,6 +319,9 @@ fn catalogue_reference(inner: &str, kind: SkinKind) -> Option<String> {
 /// draft, everyone else needs an approved revision, and a disabled skin is
 /// refused to both.
 fn wearable_reference(skin: &Skin, viewer: i32, kind: SkinKind, owned: bool) -> Option<String> {
+    if !skin.namespace.is_publishable() {
+        return None;
+    }
     let wanted = match kind {
         SkinKind::Snake => crate::skin_store::SkinKind::Snake,
         SkinKind::Base => crate::skin_store::SkinKind::Base,
@@ -410,6 +418,7 @@ pub struct SkinSummary {
     pub reference: String,
     pub name: String,
     pub kind: crate::skin_store::SkinKind,
+    pub namespace: SkinNamespace,
     pub publication: Publication,
     pub creator_user_id: i32,
     pub creator_username: Option<String>,
@@ -440,6 +449,7 @@ impl SkinSummary {
             reference: skin_id_reference(skin.skin_id),
             name: skin.name.clone(),
             kind: skin.kind,
+            namespace: skin.namespace,
             publication: skin.publication,
             creator_user_id: skin.creator_user_id,
             creator_username: skin.creator_username.clone(),
@@ -473,6 +483,15 @@ pub struct CreateSkinRequest {
     /// the Builder runs in wasm, so a document the editor accepted is a
     /// document this route accepts.
     pub document: serde_json::Value,
+    /// Factory optimizer and technique candidates use the real storage and
+    /// renderer pipeline, but live in a server-enforced non-publishable
+    /// namespace. This must agree with the reserved idempotency-key prefix.
+    #[serde(default)]
+    pub evaluation_only: bool,
+    /// Stable retry identity for automation. Scoped to the authenticated
+    /// creator and bound to the exact create payload.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -484,6 +503,10 @@ pub struct UpdateSkinRequest {
     pub price_bux: Option<u32>,
     #[serde(default)]
     pub document: Option<serde_json::Value>,
+    /// Revision the editor loaded. Required for document writes so concurrent
+    /// edits cannot silently overwrite each other's immutable head.
+    #[serde(default)]
+    pub expected_head_revision: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,28 +544,100 @@ const MAX_SKIN_NAME_LENGTH: usize = 40;
 /// This read v1 only until the layer schema shipped, which meant a document
 /// from the new Builder was refused at save with a parse error about a field
 /// it does not have.
-fn accept_document(document: &serde_json::Value) -> Result<(String, String, u32), SkinsApiError> {
+#[derive(Debug)]
+struct AcceptedDocument {
+    canonical: String,
+    content_ref: String,
+    schema_version: u32,
+    texture_refs: Vec<skin_schema::v2::TextureRefV2>,
+    required_seam_axes:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<crate::texture::SeamAxis>>,
+    contains_text: bool,
+}
+
+fn collect_tiled_texture_names(
+    layers: &[skin_schema::v2::LayerV2],
+    names: &mut std::collections::BTreeSet<String>,
+) {
+    for layer in layers {
+        match &layer.body {
+            skin_schema::v2::LayerBodyV2::Group { layers } => {
+                collect_tiled_texture_names(layers, names);
+            }
+            skin_schema::v2::LayerBodyV2::Span {
+                source:
+                    skin_schema::v2::SourceV2::Image {
+                        texture,
+                        fit: skin_schema::v2::FitV2::Tile { .. },
+                        ..
+                    },
+                ..
+            } => {
+                names.insert(texture.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn required_texture_seam_axes(
+    textures: &[skin_schema::v2::TextureRefV2],
+    layers: &[skin_schema::v2::LayerV2],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<crate::texture::SeamAxis>> {
+    let mut required = std::collections::BTreeMap::new();
+    for texture in textures {
+        if texture.kind == skin_schema::v2::TextureKindV2::Sheet {
+            required
+                .entry(texture.name.clone())
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(crate::texture::SeamAxis::Y);
+        }
+    }
+    let mut tiled = std::collections::BTreeSet::new();
+    collect_tiled_texture_names(layers, &mut tiled);
+    for name in tiled {
+        required
+            .entry(name)
+            .or_insert_with(std::collections::BTreeSet::new)
+            .insert(crate::texture::SeamAxis::X);
+    }
+    required
+}
+
+fn accept_document(document: &serde_json::Value) -> Result<AcceptedDocument, SkinsApiError> {
     let json = serde_json::to_string(document)
         .map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
 
-    let (bytes, schema_version) = match skin_schema::v2::load_any(&json) {
-        Ok(skin_schema::v2::AnySkinDoc::V1(doc)) => (
-            skin_schema::content::canonical_bytes(&doc),
-            doc.schema_version,
-        ),
-        Ok(skin_schema::v2::AnySkinDoc::V2(doc)) => (
-            skin_schema::content::canonical_bytes(&doc),
-            doc.schema_version,
-        ),
-        Err(errors) => {
-            return Err(SkinsApiError::Invalid(
-                errors
-                    .into_iter()
-                    .map(|error| format!("{}: {}", error.field, error.problem))
-                    .collect(),
-            ));
-        }
-    };
+    let (bytes, schema_version, texture_refs, required_seam_axes, contains_text) =
+        match skin_schema::v2::load_any(&json) {
+            Ok(skin_schema::v2::AnySkinDoc::V1(doc)) => (
+                skin_schema::content::canonical_bytes(&doc),
+                doc.schema_version,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                false,
+            ),
+            Ok(skin_schema::v2::AnySkinDoc::V2(doc)) => {
+                let texture_refs = doc.textures.clone();
+                let required_seam_axes = required_texture_seam_axes(&doc.textures, &doc.layers);
+                let contains_text = crate::skin_store::layers_contain_authored_text(&doc.layers);
+                (
+                    skin_schema::content::canonical_bytes(&doc),
+                    doc.schema_version,
+                    texture_refs,
+                    required_seam_axes,
+                    contains_text,
+                )
+            }
+            Err(errors) => {
+                return Err(SkinsApiError::Invalid(
+                    errors
+                        .into_iter()
+                        .map(|error| format!("{}: {}", error.field, error.problem))
+                        .collect(),
+                ));
+            }
+        };
 
     let bytes =
         bytes.map_err(|error| SkinsApiError::Invalid(vec![format!("document: {error}")]))?;
@@ -556,7 +651,92 @@ fn accept_document(document: &serde_json::Value) -> Result<(String, String, u32)
     let canonical = String::from_utf8(bytes)
         .map_err(|_| SkinsApiError::Invalid(vec!["document: not valid UTF-8".to_string()]))?;
     let reference = skin_schema::content::reference_for_bytes(canonical.as_bytes());
-    Ok((canonical, reference, schema_version))
+    Ok(AcceptedDocument {
+        canonical,
+        content_ref: reference,
+        schema_version,
+        texture_refs,
+        required_seam_axes,
+        contains_text,
+    })
+}
+
+/// Resolve and authorize every generated texture before a revision exists.
+///
+/// The v2 validator proves the descriptor is structurally usable. This check
+/// proves it is the immutable descriptor the texture pipeline actually minted
+/// and that this author may compose it. Built-ins are client-shipped and do
+/// not have database rows.
+async fn authorize_texture_references(
+    state: &AuthState,
+    auth_user: &AuthUser,
+    accepted: &AcceptedDocument,
+) -> Result<Vec<String>, SkinsApiError> {
+    let mut persisted = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
+    for (index, reference) in accepted.texture_refs.iter().enumerate() {
+        if skin_schema::v2::is_builtin_texture(&reference.content_ref) {
+            continue;
+        }
+        let Some(descriptor) = reference.descriptor.as_ref() else {
+            problems.push(format!(
+                "textures[{index}].descriptor: is required for a generated texture"
+            ));
+            continue;
+        };
+        let required_axes: Vec<_> = accepted
+            .required_seam_axes
+            .get(&reference.name)
+            .into_iter()
+            .flat_map(|axes| axes.iter().copied())
+            .collect();
+        let texture = state
+            .db
+            .get_texture_for_use(
+                &reference.content_ref,
+                descriptor,
+                auth_user.user_id,
+                auth_user.is_admin,
+                &required_axes,
+            )
+            .await
+            .map_err(SkinsApiError::Internal)?;
+        let Some(_texture) = texture else {
+            let axes = required_axes
+                .iter()
+                .map(|axis| axis.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            problems.push(format!(
+                "textures[{index}]: no owned or shareable stored texture exactly matches this ref, descriptor, and required seam axes [{axes}]"
+            ));
+            continue;
+        };
+        // The logical canonical ref identifies the texture; the descriptor's
+        // rung refs identify every exact byte object a renderer may receive.
+        // Persist both on the immutable revision for audit/GC without making
+        // either depend on reparsing its JSON envelope later.
+        persisted.insert(reference.content_ref.clone());
+        persisted.extend(
+            descriptor
+                .variants
+                .iter()
+                .map(|variant| variant.content_ref.clone()),
+        );
+    }
+    if problems.is_empty() {
+        Ok(persisted.into_iter().collect())
+    } else {
+        Err(SkinsApiError::Invalid(problems))
+    }
+}
+
+fn skin_write_error(error: anyhow::Error) -> SkinsApiError {
+    if let Some(conflict) = error.downcast_ref::<SkinWriteError>() {
+        SkinsApiError::Conflict(conflict.to_string())
+    } else {
+        SkinsApiError::Internal(error)
+    }
 }
 
 fn accept_name(name: &str) -> Result<String, SkinsApiError> {
@@ -567,6 +747,24 @@ fn accept_name(name: &str) -> Result<String, SkinsApiError> {
         )]));
     }
     Ok(trimmed.to_string())
+}
+
+fn create_namespace(
+    idempotency_key: Option<&str>,
+    evaluation_only: bool,
+) -> Result<SkinNamespace, SkinsApiError> {
+    let trial_key = idempotency_key.is_some_and(|key| key.starts_with("factory-trial:"));
+    if trial_key != evaluation_only {
+        return Err(SkinsApiError::Invalid(vec![
+            "evaluationOnly: must be true exactly for the reserved factory-trial: namespace"
+                .to_string(),
+        ]));
+    }
+    Ok(if evaluation_only {
+        SkinNamespace::Evaluation
+    } else {
+        SkinNamespace::Production
+    })
 }
 
 /// Create a skin.
@@ -591,7 +789,27 @@ pub async fn create_skin(
             )]));
         }
     };
-    let (document, content_ref, schema_version) = accept_document(&request.document)?;
+    let accepted = accept_document(&request.document)?;
+    let texture_refs = authorize_texture_references(&state, &auth_user, &accepted).await?;
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    if idempotency_key.is_some_and(|key| key.len() > 128) {
+        return Err(SkinsApiError::Invalid(vec![
+            "idempotencyKey: must be at most 128 bytes".to_string(),
+        ]));
+    }
+    let namespace = create_namespace(idempotency_key, request.evaluation_only)?;
+    let request_hash = idempotency_key.map(|_| {
+        crate::wallet::request_fingerprint(&[
+            kind.as_str(),
+            namespace.as_str(),
+            &name,
+            &accepted.content_ref,
+        ])
+    });
 
     let skin = state
         .db
@@ -599,16 +817,20 @@ pub async fn create_skin(
             creator_user_id: auth_user.user_id,
             creator_username: Some(&auth_user.username),
             kind,
+            namespace,
             name: &name,
             revision: NewRevision {
-                document: &document,
-                content_ref: &content_ref,
-                texture_refs: &[],
-                validated_schema: schema_version,
+                document: &accepted.canonical,
+                content_ref: &accepted.content_ref,
+                texture_refs: &texture_refs,
+                validated_schema: accepted.schema_version,
+                contains_text: accepted.contains_text,
             },
+            idempotency_key,
+            request_hash: request_hash.as_deref(),
         })
         .await
-        .map_err(SkinsApiError::Internal)?;
+        .map_err(skin_write_error)?;
 
     let mut response = (
         StatusCode::CREATED,
@@ -660,20 +882,28 @@ pub async fn update_skin(
             .map_err(SkinsApiError::Internal)?
             .ok_or(SkinsApiError::NotFound)?,
         Some(document) => {
-            let (document, content_ref, schema_version) = accept_document(document)?;
+            let expected_head = request.expected_head_revision.ok_or_else(|| {
+                SkinsApiError::Invalid(vec![
+                    "expectedHeadRevision: is required when appending a document".to_string(),
+                ])
+            })?;
+            let accepted = accept_document(document)?;
+            let texture_refs = authorize_texture_references(&state, &auth_user, &accepted).await?;
             state
                 .db
                 .put_skin_revision(
                     skin_id,
+                    expected_head,
                     NewRevision {
-                        document: &document,
-                        content_ref: &content_ref,
-                        texture_refs: &[],
-                        validated_schema: schema_version,
+                        document: &accepted.canonical,
+                        content_ref: &accepted.content_ref,
+                        texture_refs: &texture_refs,
+                        validated_schema: accepted.schema_version,
+                        contains_text: accepted.contains_text,
                     },
                 )
                 .await
-                .map_err(SkinsApiError::Internal)?
+                .map_err(skin_write_error)?
         }
     };
 
@@ -727,6 +957,51 @@ pub async fn get_skin(
 ///   reach warm clients and old replays rather than only new matches;
 /// - `404` for everything else, including private drafts nobody has worn —
 ///   uniform, so the route cannot be used to discover what exists.
+enum DocumentVisibility<'a> {
+    Public(&'a crate::skin_store::SkinRevision),
+    Private(&'a crate::skin_store::SkinRevision),
+    Gone,
+    Hidden,
+}
+
+fn resolve_document_visibility<'a>(
+    content_ref: &str,
+    candidates: &'a [(Skin, crate::skin_store::SkinRevision)],
+    viewer: Option<(i32, bool)>,
+) -> DocumentVisibility<'a> {
+    let was_public = |skin: &Skin, revision: &crate::skin_store::SkinRevision| {
+        skin.published_content_ref.as_deref() == Some(content_ref)
+            || revision.exposed_at_ms.is_some()
+            || skin.published_revision == Some(revision.revision)
+    };
+    let text_is_public = |revision: &crate::skin_store::SkinRevision| {
+        !revision.contains_text || revision.review_approved
+    };
+    if let Some((_, revision)) = candidates.iter().find(|(skin, revision)| {
+        skin.publication != Publication::Disabled
+            && was_public(skin, revision)
+            && text_is_public(revision)
+    }) {
+        return DocumentVisibility::Public(revision);
+    }
+    if let Some((user_id, is_admin)) = viewer
+        && let Some((_, revision)) = candidates.iter().find(|(skin, _)| {
+            skin.publication != Publication::Disabled && skin.may_edit(user_id, is_admin)
+        })
+    {
+        return DocumentVisibility::Private(revision);
+    }
+    if candidates.iter().any(|(skin, revision)| {
+        skin.publication == Publication::Disabled
+            && was_public(skin, revision)
+            && text_is_public(revision)
+    }) {
+        DocumentVisibility::Gone
+    } else {
+        DocumentVisibility::Hidden
+    }
+}
+
 pub async fn get_document_by_ref(
     State(state): State<AuthState>,
     auth_user: Option<Extension<AuthUser>>,
@@ -736,44 +1011,35 @@ pub async fn get_document_by_ref(
         return Err(SkinsApiError::NotFound);
     }
 
-    let Some((skin, revision)) = state
+    let candidates = state
         .db
         .resolve_content_ref(&content_ref)
         .await
-        .map_err(SkinsApiError::Internal)?
-    else {
+        .map_err(SkinsApiError::Internal)?;
+    if candidates.is_empty() {
         return Err(SkinsApiError::NotFound);
-    };
-
-    if skin.publication == Publication::Disabled {
-        return Err(SkinsApiError::Gone);
     }
 
-    // Never published and never worn means almost nobody has a legitimate
-    // reason to hold this reference — but its author does. They have to be
-    // able to see their own skin on their own Skins page before anyone has
-    // approved it, and this route is where the picture comes from.
-    // A content reference names bytes, not a revision — and two revisions can
-    // hold the same bytes, which is exactly what saving twice without changing
-    // anything produces. Resolution then returns whichever twin it finds, so a
-    // check that only compared revision numbers would 404 a document that is
-    // demonstrably published: the skin's own published reference is these very
-    // bytes. Asking about the bytes first is both simpler and correct.
-    let was_public = skin.published_content_ref.as_deref() == Some(content_ref.as_str())
-        || revision.exposed_at_ms.is_some()
-        || skin.published_revision == Some(revision.revision);
-    if !was_public {
-        let may_read = auth_user
-            .as_ref()
-            .is_some_and(|Extension(user)| skin.may_edit(user.user_id, user.is_admin));
-        if !may_read {
-            return Err(SkinsApiError::NotFound);
-        }
-    }
+    // Precedence is explicit and independent of GSI row order. Any enabled,
+    // legitimately public copy makes these identical bytes public. Otherwise
+    // an authenticated creator/admin may preview their private copy. A 410 is
+    // returned only when a formerly public copy exists but every eligible copy
+    // is disabled; unrelated private duplicates cannot turn a public document
+    // into an arbitrary 404 or leak unreviewed text.
+    let viewer = auth_user
+        .as_ref()
+        .map(|Extension(user)| (user.user_id, user.is_admin));
+    let (revision, public_cache) =
+        match resolve_document_visibility(&content_ref, &candidates, viewer) {
+            DocumentVisibility::Public(revision) => (revision, true),
+            DocumentVisibility::Private(revision) => (revision, false),
+            DocumentVisibility::Gone => return Err(SkinsApiError::Gone),
+            DocumentVisibility::Hidden => return Err(SkinsApiError::NotFound),
+        };
 
     let mut response = (
         [(header::CONTENT_TYPE, "application/json")],
-        revision.document,
+        revision.document.clone(),
     )
         .into_response();
     // The URL is the hash of the bytes, so a public revision is safe to cache
@@ -783,7 +1049,7 @@ pub async fn get_document_by_ref(
     // answer.
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        if was_public {
+        if public_cache {
             HeaderValue::from_str(&format!(
                 "public, max-age={DOCUMENT_CACHE_SECONDS}, must-revalidate"
             ))
@@ -907,8 +1173,22 @@ pub struct AdminStatusRequest {
     /// Which revision to publish. Required when publishing, ignored otherwise.
     #[serde(default)]
     pub revision: Option<u32>,
+    /// Hash of the exact canonical document the reviewer inspected. Required
+    /// with `revision` when publishing.
+    #[serde(default)]
+    pub content_ref: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicationRequest {
+    /// Exact immutable revision the factory rendered and is asking a human to
+    /// review. A moving "current head" is not review authority.
+    pub revision: u32,
+    /// Hash of the exact canonical document bytes for `revision`.
+    pub content_ref: String,
 }
 
 /// Ask for a skin to be reviewed.
@@ -916,6 +1196,7 @@ pub async fn request_publication(
     State(state): State<AuthState>,
     Extension(auth_user): Extension<AuthUser>,
     Path(skin_id): Path<i32>,
+    Json(request): Json<PublicationRequest>,
 ) -> Result<Response, SkinsApiError> {
     let skin = load_visible_skin(&state, skin_id, &auth_user).await?;
     if !skin.may_edit(auth_user.user_id, auth_user.is_admin) {
@@ -924,14 +1205,77 @@ pub async fn request_publication(
     if skin.publication == Publication::Disabled {
         return Err(SkinsApiError::Gone);
     }
+    if !skin.namespace.is_publishable() {
+        return Err(SkinsApiError::Invalid(vec![
+            "evaluation-only skins cannot request publication".to_string(),
+        ]));
+    }
+
+    let revision = state
+        .db
+        .get_skin_revision(skin_id, request.revision)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or_else(|| {
+            SkinsApiError::Conflict("the requested immutable revision does not exist".to_string())
+        })?;
+    if revision.content_ref != request.content_ref {
+        return Err(SkinsApiError::Conflict(
+            "publication request must bind the exact revision content hash".to_string(),
+        ));
+    }
 
     state
         .db
-        .set_skin_pending_revision(skin_id, Some(skin.head_revision))
+        .set_skin_pending_revision(skin_id, Some(request.revision))
         .await
-        .map_err(SkinsApiError::Internal)?;
+        .map_err(skin_write_error)?;
 
     let mut response = StatusCode::ACCEPTED.into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+/// Withdraw one exact review request.
+///
+/// The expected revision and hash prevent a late rejection of revision N from
+/// clearing a newer request for N+1. This is a creator/service operation; it
+/// removes review authority but cannot publish anything.
+pub async fn cancel_publication_request(
+    State(state): State<AuthState>,
+    Extension(auth_user): Extension<AuthUser>,
+    Path(skin_id): Path<i32>,
+    Json(request): Json<PublicationRequest>,
+) -> Result<Response, SkinsApiError> {
+    let skin = load_visible_skin(&state, skin_id, &auth_user).await?;
+    if !skin.may_edit(auth_user.user_id, auth_user.is_admin) {
+        return Err(SkinsApiError::NotFound);
+    }
+    if !skin.namespace.is_publishable() {
+        return Err(SkinsApiError::Invalid(vec![
+            "evaluation-only skins have no publication request".to_string(),
+        ]));
+    }
+    let revision = state
+        .db
+        .get_skin_revision(skin_id, request.revision)
+        .await
+        .map_err(SkinsApiError::Internal)?
+        .ok_or_else(|| {
+            SkinsApiError::Conflict("the requested immutable revision does not exist".to_string())
+        })?;
+    if revision.content_ref != request.content_ref {
+        return Err(SkinsApiError::Conflict(
+            "publication cancellation must bind the exact revision content hash".to_string(),
+        ));
+    }
+    state
+        .db
+        .clear_skin_pending_revision_exact(skin_id, request.revision)
+        .await
+        .map_err(skin_write_error)?;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
     no_store(&mut response);
     Ok(response)
 }
@@ -1034,58 +1378,45 @@ pub async fn admin_set_status(
         )])
     })?;
 
-    let skin = state
-        .db
-        .get_skin(skin_id)
-        .await
-        .map_err(SkinsApiError::Internal)?
-        .ok_or(SkinsApiError::NotFound)?;
-
-    // Publishing means approving one specific revision, so the approval and the
-    // publication move together. The revision defaults to whatever review was
-    // asked about rather than to the head, because the head may have moved
-    // since — approving something an admin never looked at is the one mistake
-    // this endpoint must not make easy.
-    let published_revision = if publication == Publication::Published {
-        let revision = request
-            .revision
-            .or(skin.pending_revision)
-            .or(skin.published_revision)
-            .ok_or_else(|| {
-                SkinsApiError::Invalid(vec![
-                    "revision: nothing has been submitted for review".to_string(),
-                ])
-            })?;
-        state
+    if publication == Publication::Published {
+        if request.revision.is_none() || request.content_ref.is_none() {
+            return Err(SkinsApiError::Invalid(vec![
+                "revision and contentRef: both exact review targets are required to publish"
+                    .to_string(),
+            ]));
+        }
+        let skin = state
             .db
-            .approve_skin_revision(skin_id, revision)
+            .get_skin(skin_id)
             .await
-            .map_err(SkinsApiError::Internal)?;
-        Some(revision)
-    } else {
-        None
-    };
+            .map_err(SkinsApiError::Internal)?
+            .ok_or(SkinsApiError::NotFound)?;
+        if !skin.namespace.is_publishable() {
+            return Err(SkinsApiError::Invalid(vec![
+                "evaluation-only skins cannot be published".to_string(),
+            ]));
+        }
+    } else if request.revision.is_some() || request.content_ref.is_some() {
+        return Err(SkinsApiError::Invalid(vec![
+            "revision and contentRef: are only accepted when publishing".to_string(),
+        ]));
+    }
 
+    // Approval, exact publication, audit, and queue removal are one database
+    // transaction. There is no interval in which unreviewed text is public or
+    // in which a crash can publish a different revision than the one reviewed.
     state
         .db
-        .set_skin_publication(
+        .decide_skin_review(
             skin_id,
             publication,
-            published_revision,
+            request.revision,
+            request.content_ref.as_deref(),
             auth_user.user_id,
             request.reason.as_deref(),
         )
         .await
-        .map_err(SkinsApiError::Internal)?;
-
-    // Whatever the decision, the review request is answered. Rejecting an edit
-    // clears only this — a published skin keeps its previously approved
-    // revision, so a rejection cannot silently unpublish anything.
-    state
-        .db
-        .set_skin_pending_revision(skin_id, None)
-        .await
-        .map_err(SkinsApiError::Internal)?;
+        .map_err(skin_write_error)?;
 
     let updated = state
         .db
@@ -1139,6 +1470,7 @@ mod tests {
         Skin {
             skin_id,
             kind: crate::skin_store::SkinKind::Snake,
+            namespace: SkinNamespace::Production,
             creator_user_id: creator,
             creator_username: Some("author".to_string()),
             name: "Electric Keys".to_string(),
@@ -1155,6 +1487,216 @@ mod tests {
             owner_count: 1,
             wearer_count: 0,
         }
+    }
+
+    fn stored_revision(
+        skin_id: i32,
+        revision: u32,
+        content_ref: &str,
+        contains_text: bool,
+        review_approved: bool,
+        exposed: bool,
+    ) -> crate::skin_store::SkinRevision {
+        crate::skin_store::SkinRevision {
+            skin_id,
+            revision,
+            content_ref: content_ref.to_string(),
+            document: "{}".to_string(),
+            texture_refs: Vec::new(),
+            validated_schema: 2,
+            exposed_at_ms: exposed.then_some(1),
+            review_approved,
+            contains_text,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn unreviewed_text_is_private_even_if_a_legacy_row_says_exposed() {
+        let content_ref = "sha256:published";
+        let skin = stored_skin(10, 42, Publication::Private, None);
+        let revision = stored_revision(10, skin.head_revision, content_ref, true, false, true);
+        let candidates = vec![(skin, revision)];
+
+        assert!(matches!(
+            resolve_document_visibility(content_ref, &candidates, None),
+            DocumentVisibility::Hidden
+        ));
+        assert!(matches!(
+            resolve_document_visibility(content_ref, &candidates, Some((42, false))),
+            DocumentVisibility::Private(_)
+        ));
+
+        let mut approved = candidates;
+        approved[0].1.review_approved = true;
+        assert!(matches!(
+            resolve_document_visibility(content_ref, &approved, None),
+            DocumentVisibility::Public(_)
+        ));
+    }
+
+    /// Phase 0 regression: equipping is an account-local choice, while the
+    /// resolved game state is shared with every opponent. An author must be
+    /// able to keep working on a text skin without that account reference
+    /// smuggling the unreviewed document hash (and therefore its words) into a
+    /// match snapshot. The authenticated preview path remains available to the
+    /// creator and administrators, but the public/opponent by-ref path stays a
+    /// uniform 404-equivalent `Hidden` result.
+    #[test]
+    fn equipped_unapproved_v2_text_never_enters_an_opponents_snapshot_or_by_ref_view() {
+        use common::{GameState, GameType, QueueMode};
+        use skin_schema::v2::{
+            ClipV2, ColorRef, CornerV2, LayerBodyV2, LayerV2, PropExpr, RegionV2, SlotName,
+            SourceV2, SpanV2, TransformV2,
+        };
+
+        const CREATOR_ID: i32 = 42;
+        const OPPONENT_ID: i32 = 7;
+        const PRIVATE_WORDS: &str = "NOT YET REVIEWED";
+
+        let v1: skin_schema::SkinDoc =
+            serde_json::from_str(include_str!("../../../skin-schema/skins/classic.skin.json"))
+                .expect("the shipped classic skin parses");
+        let mut v2 = skin_schema::v2::upgrade(&v1);
+        v2.id = "private-text-regression".to_string();
+        v2.name = "Private text regression".to_string();
+        // The v2 conformance fixtures make this same small readability repair
+        // when deriving a new id from the exempt classic document.
+        v2.palette.free_for_all[2].fill = "#93a3b5".to_string();
+        v2.palette.free_for_all[2].outline = "#5d6e81".to_string();
+        v2.palette.friendly[0].accent = Some("#0b2033".to_string());
+        v2.palette.friendly[1].accent = Some("#0b2033".to_string());
+        v2.palette.enemy[0].accent = Some("#2a0b0b".to_string());
+        v2.palette.enemy[1].accent = Some("#2a0b0b".to_string());
+        for slot in &mut v2.palette.free_for_all {
+            slot.accent = Some("#141a20".to_string());
+        }
+        v2.layers.push(LayerV2 {
+            name: "unreviewed words".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr::constant(0.9),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Cells,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Text {
+                    content: PRIVATE_WORDS.to_string(),
+                    color: ColorRef::slot(SlotName::Accent),
+                    scale: 0.8,
+                },
+            },
+        });
+        let accepted =
+            accept_document(&serde_json::to_value(v2).expect("the v2 text document serializes"))
+                .expect("the shared v2 validator accepts the text document");
+        assert!(accepted.contains_text, "save-time text detection must run");
+        assert!(accepted.canonical.contains(PRIVATE_WORDS));
+
+        let mut skin = stored_skin(1_000, CREATOR_ID, Publication::Private, None);
+        skin.head_revision = 1;
+        skin.head_content_ref = accepted.content_ref.clone();
+        let revision = crate::skin_store::SkinRevision {
+            skin_id: skin.skin_id,
+            revision: skin.head_revision,
+            content_ref: accepted.content_ref.clone(),
+            document: accepted.canonical.clone(),
+            texture_refs: Vec::new(),
+            validated_schema: accepted.schema_version,
+            exposed_at_ms: None,
+            review_approved: false,
+            contains_text: accepted.contains_text,
+            created_at_ms: 0,
+        };
+
+        let equipped = wearable_reference(&skin, CREATOR_ID, SkinKind::Snake, true)
+            .expect("the creator may store an account-local reference to their draft");
+        assert_eq!(equipped, "skin:1000");
+        let match_revision = crate::matchmaking::match_visible_revision(&revision, None);
+        assert!(
+            match_revision.is_none(),
+            "without a separately hashed approved fallback, the text draft is not match-visible"
+        );
+
+        let mut snapshot = GameState::new(
+            40,
+            40,
+            GameType::FreeForAll { max_players: 2 },
+            QueueMode::Quickmatch,
+            Some(99),
+            123,
+        );
+        snapshot
+            .add_player(CREATOR_ID as u32, Some("creator".to_string()))
+            .expect("creator joins");
+        snapshot
+            .add_player(OPPONENT_ID as u32, Some("opponent".to_string()))
+            .expect("opponent joins");
+        // Exercise the same final resolver `apply_player_skin` uses: an
+        // authored account reference is not a built-in, so the match receives
+        // classic rather than the draft hash.
+        snapshot.set_player_skin(
+            CREATOR_ID as u32,
+            Some(crate::matchmaking::snapshot_skin_reference(
+                Some(&equipped),
+                match_revision.map(|revision| revision.content_ref.as_str()),
+            )),
+        );
+        assert_eq!(
+            snapshot.skins.get(&(CREATOR_ID as u32)).map(String::as_str),
+            Some(skin_catalog::DEFAULT_SKIN_REF)
+        );
+        let wire_snapshot = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(!wire_snapshot.contains(PRIVATE_WORDS));
+        assert!(!wire_snapshot.contains(&accepted.content_ref));
+        assert!(!wire_snapshot.contains(&equipped));
+
+        let candidates = vec![(skin, revision)];
+        for viewer in [None, Some((OPPONENT_ID, false))] {
+            assert!(matches!(
+                resolve_document_visibility(&accepted.content_ref, &candidates, viewer),
+                DocumentVisibility::Hidden
+            ));
+        }
+        for viewer in [(CREATOR_ID, false), (OPPONENT_ID, true)] {
+            let DocumentVisibility::Private(visible) =
+                resolve_document_visibility(&accepted.content_ref, &candidates, Some(viewer))
+            else {
+                panic!("creator/admin should retain the authenticated private preview");
+            };
+            assert_eq!(visible.document, accepted.canonical);
+            assert!(visible.document.contains(PRIVATE_WORDS));
+        }
+    }
+
+    #[test]
+    fn duplicate_hash_visibility_is_order_independent_and_enabled_public_wins() {
+        let content_ref = "sha256:published";
+        let disabled = stored_skin(10, 42, Publication::Disabled, Some(1));
+        let live = stored_skin(11, 43, Publication::Published, Some(1));
+        let disabled_revision = stored_revision(10, 1, content_ref, false, true, true);
+        let live_revision = stored_revision(11, 1, content_ref, false, true, false);
+        for candidates in [
+            vec![
+                (disabled.clone(), disabled_revision.clone()),
+                (live.clone(), live_revision.clone()),
+            ],
+            vec![
+                (live.clone(), live_revision.clone()),
+                (disabled.clone(), disabled_revision.clone()),
+            ],
+        ] {
+            assert!(matches!(
+                resolve_document_visibility(content_ref, &candidates, None),
+                DocumentVisibility::Public(_)
+            ));
+        }
+        assert!(matches!(
+            resolve_document_visibility(content_ref, &[(disabled, disabled_revision)], None,),
+            DocumentVisibility::Gone
+        ));
     }
 
     /// The three-valued encoding is the whole point of the request type: these
@@ -1280,6 +1822,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_evaluation_skin_never_enters_equipment_or_public_visibility() {
+        let mut evaluation = stored_skin(1000, 42, Publication::Published, Some(1));
+        evaluation.namespace = SkinNamespace::Evaluation;
+
+        assert_eq!(
+            wearable_reference(&evaluation, 42, SkinKind::Snake, true),
+            None,
+            "even its creator renders an evaluation only through factory evidence capture"
+        );
+        assert!(evaluation.may_view(Some(42), false));
+        assert!(evaluation.may_view(Some(7), true));
+        assert!(!evaluation.may_view(Some(7), false));
+        assert!(!evaluation.may_view(None, false));
+        assert_eq!(evaluation.content_ref_for(Some(7)), None);
+    }
+
     /// The kill switch has to beat ownership, or moderation would not be
     /// moderation.
     #[test]
@@ -1395,23 +1954,22 @@ mod tests {
             serde_json::from_str(include_str!("../../../skin-schema/skins/aurora.skin.json"))
                 .expect("the shipped document parses");
 
-        let (canonical, reference, schema_version) =
-            accept_document(&document).expect("a shipped document is valid");
+        let accepted = accept_document(&document).expect("a shipped document is valid");
 
-        assert_eq!(schema_version, skin_schema::SCHEMA_VERSION);
-        assert!(skin_schema::content::is_content_ref(&reference));
+        assert_eq!(accepted.schema_version, skin_schema::SCHEMA_VERSION);
+        assert!(skin_schema::content::is_content_ref(&accepted.content_ref));
         assert_eq!(
-            reference,
-            skin_schema::content::reference_for_bytes(canonical.as_bytes()),
+            accepted.content_ref,
+            skin_schema::content::reference_for_bytes(accepted.canonical.as_bytes()),
             "the stored bytes must be the ones the reference names"
         );
 
         // Canonical form is stable: re-accepting what we stored is a no-op.
         let reparsed: serde_json::Value =
-            serde_json::from_str(&canonical).expect("canonical bytes are JSON");
-        let (again, same_reference, _) = accept_document(&reparsed).expect("still valid");
-        assert_eq!(canonical, again);
-        assert_eq!(reference, same_reference);
+            serde_json::from_str(&accepted.canonical).expect("canonical bytes are JSON");
+        let again = accept_document(&reparsed).expect("still valid");
+        assert_eq!(accepted.canonical, again.canonical);
+        assert_eq!(accepted.content_ref, again.content_ref);
     }
 
     /// A layer document saves through the same door.
@@ -1429,13 +1987,12 @@ mod tests {
         let v2 = skin_schema::v2::upgrade(&v1);
         let document = serde_json::to_value(&v2).expect("serializes");
 
-        let (canonical, reference, schema_version) =
-            accept_document(&document).expect("a converted document is valid");
+        let accepted = accept_document(&document).expect("a converted document is valid");
 
-        assert_eq!(schema_version, skin_schema::v2::SCHEMA_VERSION_V2);
+        assert_eq!(accepted.schema_version, skin_schema::v2::SCHEMA_VERSION_V2);
         assert_eq!(
-            reference,
-            skin_schema::content::reference_for_bytes(canonical.as_bytes()),
+            accepted.content_ref,
+            skin_schema::content::reference_for_bytes(accepted.canonical.as_bytes()),
             "a v2 revision is named by its bytes exactly as a v1 one is"
         );
 
@@ -1451,6 +2008,93 @@ mod tests {
         assert!(
             problems.iter().any(|problem| problem.contains("layers")),
             "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn text_detection_reaches_nested_groups_for_the_review_gate() {
+        use skin_schema::v2::{
+            ClipV2, ColorRef, CornerV2, LayerBodyV2, LayerV2, PropExpr, RegionV2, SlotName,
+            SourceV2, SpanV2, TransformV2,
+        };
+        let text = LayerV2 {
+            name: "words".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr::constant(1.0),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Cells,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Text {
+                    content: "HELLO".to_string(),
+                    color: ColorRef::slot(SlotName::Accent),
+                    scale: 0.8,
+                },
+            },
+        };
+        let group = LayerV2 {
+            name: "group".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr::constant(1.0),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Group { layers: vec![text] },
+        };
+        assert!(crate::skin_store::layers_contain_authored_text(&[group]));
+    }
+
+    #[test]
+    fn seam_requirements_follow_nested_image_use_not_texture_kind_guessing() {
+        use skin_schema::v2::{
+            ClipV2, CornerV2, FitV2, LayerBodyV2, LayerV2, PropExpr, RegionV2, SourceV2, SpanV2,
+            TextureKindV2, TextureRefV2, TransformV2,
+        };
+        let tiled_sheet = LayerV2 {
+            name: "tiled motion".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr::constant(1.0),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Cells,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Image {
+                    texture: "motion".to_string(),
+                    fit: FitV2::Tile {
+                        cells_per_repeat: None,
+                    },
+                    fade: None,
+                    drift_cells: PropExpr::constant(0.0),
+                },
+            },
+        };
+        let nested = LayerV2 {
+            name: "group".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr::constant(1.0),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Group {
+                layers: vec![tiled_sheet],
+            },
+        };
+        let textures = vec![TextureRefV2 {
+            name: "motion".to_string(),
+            content_ref: format!("sha256:{}", "a".repeat(64)),
+            kind: TextureKindV2::Sheet,
+            descriptor: None,
+        }];
+        let required = required_texture_seam_axes(&textures, &[nested]);
+        assert_eq!(
+            required["motion"],
+            [crate::texture::SeamAxis::X, crate::texture::SeamAxis::Y]
+                .into_iter()
+                .collect()
         );
     }
 
@@ -1478,6 +2122,39 @@ mod tests {
         assert_eq!(accept_name(" Tidal ").unwrap(), "Tidal");
         assert!(accept_name("   ").is_err());
         assert!(accept_name(&"x".repeat(MAX_SKIN_NAME_LENGTH + 1)).is_err());
+    }
+
+    #[test]
+    fn evaluation_namespace_requires_both_the_marker_and_reserved_key() {
+        assert_eq!(
+            create_namespace(Some("factory-trial:attempt-1"), true).unwrap(),
+            SkinNamespace::Evaluation
+        );
+        assert_eq!(
+            create_namespace(Some("factory-concept:concept-1"), false).unwrap(),
+            SkinNamespace::Production
+        );
+        assert!(create_namespace(Some("factory-trial:attempt-1"), false).is_err());
+        assert!(create_namespace(Some("factory-concept:concept-1"), true).is_err());
+        assert!(create_namespace(None, true).is_err());
+    }
+
+    #[test]
+    fn publication_request_requires_revision_and_exact_content_ref() {
+        let request: PublicationRequest = serde_json::from_str(&format!(
+            r#"{{"revision":7,"contentRef":"sha256:{}"}}"#,
+            "7".repeat(64)
+        ))
+        .unwrap();
+        assert_eq!(request.revision, 7);
+        assert_eq!(request.content_ref, "sha256:".to_string() + &"7".repeat(64));
+        assert!(serde_json::from_str::<PublicationRequest>(r#"{"revision":7}"#).is_err());
+        assert!(
+            serde_json::from_str::<PublicationRequest>(
+                r#"{"revision":7,"contentRef":"sha256:x","head":7}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

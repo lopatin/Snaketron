@@ -89,6 +89,7 @@ skillratings = "0.27"
 indexmap = "2"
 hmac = "0.12"
 sha2 = "0.10"
+subtle = "2"
 hex = "0.4"
 base64 = "0.22"
 ts-rs = { version = "11", optional = true }

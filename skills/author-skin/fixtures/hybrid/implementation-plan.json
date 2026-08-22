@@ -1,0 +1,45 @@
+{
+  "path": "hybrid",
+  "rationale": "The hint changes because cloud material needs drawn frames, while the sharp glint is cheaper and more tunable as a gradient layer.",
+  "design_guidelines": {
+    "artistic_direction": "A painterly deep-space cloud with one precise travelling star glint.",
+    "concept_twist": "The familiar nebula vista becomes a continuous role-aware snake surface rather than a rectangular sky scene.",
+    "structure": "sprite",
+    "body_strategy": "Cloud masses simplify at 4 cells, establish depth by 6-7 cells, and repeat over long turns while the procedural glint and head glow preserve head priority.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Request a production-quality 20 fps translucent sheet with 60 derived rows; x and final-to-zero y joins must be seamless and row zero calm."
+  },
+  "fidelity_features": [
+    "slow painterly cloud morph",
+    "sharp travelling star glint",
+    "visible role-colour foundation"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons preserve team reading",
+    "Nebula sheet is translucent above Body fallback",
+    "Star glint gradient travels independently",
+    "Head glow preserves direction"
+  ],
+  "asset_plan": [
+    {
+      "kind": "sheet",
+      "natural_length_cells": 53,
+      "frames": 60,
+      "desired_fps": 20,
+      "texels_per_cell": 16,
+      "anchor": "whole",
+      "fit": "tile",
+      "fade": "none",
+      "prompt": "848x960 grid: 53 body cells by 60 frame rows, translucent art and no gutters or baked contour; x and final-to-zero y seamless, row zero calm, clouds morph in place."
+    }
+  ],
+  "animation_plan": [
+    "Play all 60 rows over 3000ms",
+    "Move the glint gradient with tri(time) on the same document clock"
+  ],
+  "required_wrap_axes": ["x", "y"],
+  "risks": [
+    "Opaque generated pixels could bury role cues",
+    "Two motions may compete at game scale"
+  ]
+}

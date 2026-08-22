@@ -9,7 +9,7 @@ import GenerateSkinModal from './GenerateSkinModal';
 import TexturePicker from './TexturePicker';
 import type { SkinSummary } from '../types/generated';
 import { reconcileTextures } from '../utils/skinTextures';
-import type { BuiltinTexture } from '../utils/skinTextures';
+import type { BuiltinTexture, TextureDescriptor } from '../utils/skinTextures';
 
 /**
  * The Skin Builder: a layers panel and a preview.
@@ -276,7 +276,13 @@ const SLIDES: Slide[] = [
  */
 const TextureContext = React.createContext<{
   catalogue: BuiltinTexture[];
-  choose: (path: string, name: string, contentRef: string, kind: string) => void;
+  choose: (
+    path: string,
+    name: string,
+    contentRef: string,
+    kind: string,
+    descriptor?: TextureDescriptor,
+  ) => void;
 }>({ catalogue: [], choose: () => {} });
 
 interface ControlProps {
@@ -927,7 +933,13 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
    * picker rather than from a lookup.
    */
   const chooseTexture = useCallback(
-    (path: string, name: string, contentRef: string, kind: string) => {
+    (
+      path: string,
+      name: string,
+      contentRef: string,
+      kind: string,
+      descriptor?: TextureDescriptor,
+    ) => {
       setDocument((current) => {
         if (!current) {
           return current;
@@ -941,7 +953,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
         };
         return reconcileTextures(next, [
           ...(schema?.builtinTextures ?? []),
-          { id: name, label: name, kind, contentRef },
+          { id: name, label: name, kind, contentRef, descriptor },
         ]);
       });
       setStatus(null);
@@ -1049,7 +1061,13 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
     try {
       const name = String(document.name).trim();
       if (skin) {
-        setSkin(await api.updateSkin(skin.skinId, { name, document }));
+        setSkin(
+          await api.updateSkin(skin.skinId, {
+            name,
+            document,
+            expectedHeadRevision: skin.headRevision,
+          }),
+        );
         setStatus('Saved.');
       } else {
         const created = await api.createSkin({ name, document });
@@ -1068,8 +1086,12 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
     if (!skin) {
       return;
     }
+    if (!skin.contentRef) {
+      setProblems(['Save the skin before requesting review.']);
+      return;
+    }
     try {
-      await api.requestSkinPublication(skin.skinId);
+      await api.requestSkinPublication(skin.skinId, skin.headRevision, skin.contentRef);
       setStatus('Sent for review.');
     } catch (cause) {
       setProblems([isApiError(cause) ? cause.message : String(cause)]);

@@ -1,0 +1,42 @@
+{
+  "path": "sprite_sheet",
+  "rationale": "Distinct drawn caustic states need frames; the 41-cell repeat and 48-frame loop are independent decisions.",
+  "design_guidelines": {
+    "artistic_direction": "A calm illustrated water surface whose caustics morph in place.",
+    "concept_twist": "A familiar pool-caustic texture becomes a continuous, role-readable moving snake surface.",
+    "structure": "sprite",
+    "body_strategy": "Caustics stay broad enough to read at 4 cells, develop by 6-7 cells, and tile through long turns while the head glow retains head-over-tail priority.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Request a production-quality 20 fps sheet with 48 derived rows; both x and final-to-zero y joins must be seamless, with a complete calm row zero."
+  },
+  "fidelity_features": [
+    "morphing caustic shapes without whole-image translation",
+    "calm complete resting frame",
+    "long body repeat"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons preserve role readability",
+    "Water sheet tiles across the body above Body fallback",
+    "Head glow preserves direction"
+  ],
+  "asset_plan": [
+    {
+      "kind": "sheet",
+      "natural_length_cells": 41,
+      "frames": 48,
+      "desired_fps": 20,
+      "texels_per_cell": 16,
+      "anchor": "whole",
+      "fit": "tile",
+      "fade": "none",
+      "prompt": "656x768 grid: 41 body cells by 48 frame rows, no gutters; each row is one complete view, x and final-to-zero y seamless, row zero calm, features morph in place instead of translating."
+    }
+  ],
+  "animation_plan": [
+    "Play all 48 rows once over 2400ms; row zero is reduced motion"
+  ],
+  "required_wrap_axes": ["x", "y"],
+  "risks": [
+    "Generated rows may translate the whole field or make the loop seam visible"
+  ]
+}

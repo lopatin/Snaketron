@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "id": "draft@1",
+  "name": "Draft skin",
+  "palette": {
+    "friendly": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#3c8dde", "outline": "#286eae" }
+    ],
+    "enemy": [
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#e34e5b", "outline": "#a92f3a" }
+    ],
+    "free_for_all": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#93a3b5", "outline": "#5d6e81" },
+      { "fill": "#f7b731", "outline": "#a87d1f" }
+    ]
+  },
+  "period_ms": 2400,
+  "head_core": { "ratio": 0.38, "color": "#333333" },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": { "slot": "outline" },
+      "extra_px": 2,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Body fallback",
+      "type": "ribbon",
+      "region": "body",
+      "color": { "slot": "fill" },
+      "extra_px": 0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Head glow",
+      "type": "head_ramp",
+      "opacity": "(1 - s / 10) * 0.3",
+      "omit_on_single_cell": true,
+      "color": "#ffffff",
+      "length_cells": 10
+    }
+  ]
+}

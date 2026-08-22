@@ -30,12 +30,13 @@ use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
     canonical_json_bytes, match_history_summary,
 };
+use crate::factory_service::FactoryServiceCredential;
 use crate::generation::{GenerationJob, JobState};
 use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
 use crate::season::{Season, get_season_at};
 use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
-    SkinRevision,
+    SkinRevision, SkinWriteError,
 };
 use crate::texture::Texture;
 use crate::wallet::{self, LedgerSource, Wallet};
@@ -305,17 +306,107 @@ fn is_conditional_check_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, 
 }
 
 impl DynamoDatabase {
+    /// Strong reads used to reconcile transactional skin writes.
+    ///
+    /// Ordinary catalogue reads may be eventually consistent. A write retry
+    /// cannot: immediately after an ambiguous transaction response it must be
+    /// able to distinguish "the exact write committed" from "another author
+    /// advanced the head" without issuing the write a second time.
+    async fn get_skin_consistent(&self, skin_id: i32) -> Result<Option<Skin>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read skin consistently")?;
+        response
+            .item
+            .map(|item| skins_dynamo::skin_from_item(&item))
+            .transpose()
+    }
+
+    async fn get_skin_revision_consistent(
+        &self,
+        skin_id: i32,
+        revision: u32,
+    ) -> Result<Option<SkinRevision>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read skin revision consistently")?;
+        response
+            .item
+            .map(|item| skins_dynamo::revision_from_item(&item))
+            .transpose()
+    }
+
+    fn revision_matches(stored: &SkinRevision, proposed: &NewRevision<'_>) -> bool {
+        let mut proposed_texture_refs = proposed.texture_refs.to_vec();
+        proposed_texture_refs.sort();
+        proposed_texture_refs.dedup();
+        stored.content_ref == proposed.content_ref
+            && stored.document == proposed.document
+            // DynamoDB stores these as a string set; set iteration order is
+            // not part of its contract. Compare canonicalized values so an
+            // exact response-loss retry cannot become a false conflict merely
+            // because the SDK returned the same set in another order.
+            && stored.texture_refs == proposed_texture_refs
+            && stored.validated_schema == proposed.validated_schema
+            && stored.contains_text == proposed.contains_text
+    }
+
+    async fn get_skin_create_idempotency(
+        &self,
+        user_id: i32,
+        key: &str,
+    ) -> Result<Option<(i32, String)>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(skins_dynamo::create_idempotency_partition(user_id)),
+            )
+            .key(
+                "sk",
+                Self::av_s(skins_dynamo::create_idempotency_sort_key(key)),
+            )
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to reconcile skin creation")?;
+        Ok(response.item.and_then(|item| {
+            Some((
+                Self::extract_number(&item, "skinId")?,
+                Self::extract_string(&item, "requestHash")?,
+            ))
+        }))
+    }
+
     /// Read a texture back out of its item.
     fn texture_from_item(item: &HashMap<String, AttributeValue>) -> Result<Texture> {
+        let kind = Self::extract_string(item, "kind")
+            .and_then(|value| crate::texture::TextureKind::parse(&value))
+            .ok_or_else(|| anyhow!("texture item has no usable kind"))?;
         Ok(Texture {
             texture_id: Self::extract_number(item, "textureId")
                 .ok_or_else(|| anyhow!("texture item has no id"))?,
             owner_user_id: Self::extract_number(item, "ownerUserId").unwrap_or(0),
+            shareable: matches!(item.get("shareable"), Some(AttributeValue::Bool(true))),
             content_ref: Self::extract_string(item, "contentRef")
                 .ok_or_else(|| anyhow!("texture item has no content reference"))?,
-            kind: Self::extract_string(item, "kind")
-                .and_then(|value| crate::texture::TextureKind::parse(&value))
-                .ok_or_else(|| anyhow!("texture item has no usable kind"))?,
+            kind,
             width_px: Self::extract_number(item, "widthPx").unwrap_or(0).max(0) as u32,
             height_px: Self::extract_number(item, "heightPx").unwrap_or(0).max(0) as u32,
             repeat_cells: Self::extract_string(item, "repeatCells")
@@ -328,6 +419,13 @@ impl DynamoDatabase {
                     vertical_ratio: 0.0,
                     repaired: false,
                 }),
+            // Rows created before use-derived seam evidence existed were
+            // gated by the worker's kind defaults. Preserve that proven
+            // guarantee while allowing new strict manifests to record an
+            // explicit empty or multi-axis set.
+            verified_seam_axes: Self::extract_string(item, "verifiedSeamAxes")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(|| kind.worker_seam_axes().to_vec()),
             last_prompt: Self::extract_string(item, "lastPrompt"),
             variants: Self::extract_string(item, "variants")
                 .and_then(|value| serde_json::from_str(&value).ok())
@@ -1173,6 +1271,49 @@ impl DynamoDatabase {
         DateTime::parse_from_rfc3339(&value)
             .map(|datetime| Some(datetime.with_timezone(&Utc)))
             .with_context(|| format!("Invalid datetime for key: {}", key))
+    }
+
+    fn factory_service_credential_from_item(
+        item: &HashMap<String, AttributeValue>,
+    ) -> Result<FactoryServiceCredential> {
+        Ok(FactoryServiceCredential {
+            credential_id: Self::extract_string(item, "credentialId")
+                .context("Factory credential is missing credentialId")?,
+            user_id: Self::extract_number(item, "userId")
+                .context("Factory credential is missing userId")?,
+            token_hash: Self::extract_string(item, "tokenHash")
+                .context("Factory credential is missing tokenHash")?,
+            created_at: Self::extract_optional_datetime(item, "createdAt")?
+                .context("Factory credential is missing createdAt")?,
+            created_by: Self::extract_number(item, "createdBy")
+                .context("Factory credential is missing createdBy")?,
+            revoked_at: Self::extract_optional_datetime(item, "revokedAt")?,
+            revoked_by: Self::extract_number(item, "revokedBy"),
+            replaced_by: Self::extract_string(item, "replacedBy"),
+        })
+    }
+
+    fn factory_service_credential_item(
+        credential: &FactoryServiceCredential,
+    ) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                "pk".to_string(),
+                Self::av_s(format!("FACTORY_CREDENTIAL#{}", credential.credential_id)),
+            ),
+            ("sk".to_string(), Self::av_s("META")),
+            (
+                "credentialId".to_string(),
+                Self::av_s(&credential.credential_id),
+            ),
+            ("userId".to_string(), Self::av_n(credential.user_id)),
+            ("tokenHash".to_string(), Self::av_s(&credential.token_hash)),
+            (
+                "createdAt".to_string(),
+                Self::av_s(credential.created_at.to_rfc3339()),
+            ),
+            ("createdBy".to_string(), Self::av_n(credential.created_by)),
+        ])
     }
 
     fn game_from_item(game_id: i32, item: &HashMap<String, AttributeValue>) -> Result<Game> {
@@ -3299,6 +3440,131 @@ impl Database for DynamoDatabase {
         }
     }
 
+    async fn create_factory_service_credential(
+        &self,
+        credential: &FactoryServiceCredential,
+    ) -> Result<()> {
+        if credential.revoked_at.is_some()
+            || credential.revoked_by.is_some()
+            || credential.replaced_by.is_some()
+        {
+            return Err(anyhow!("A new factory credential must be active"));
+        }
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(Self::factory_service_credential_item(credential)))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .send()
+            .await
+            .context("Failed to create factory service credential")?;
+        Ok(())
+    }
+
+    async fn get_factory_service_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<FactoryServiceCredential>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(format!("FACTORY_CREDENTIAL#{credential_id}")),
+            )
+            .key("sk", Self::av_s("META"))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to load factory service credential")?;
+        response
+            .item
+            .as_ref()
+            .map(Self::factory_service_credential_from_item)
+            .transpose()
+    }
+
+    async fn rotate_factory_service_credential(
+        &self,
+        old_credential_id: &str,
+        replacement: &FactoryServiceCredential,
+        actor_user_id: i32,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        if old_credential_id == replacement.credential_id
+            || replacement.revoked_at.is_some()
+            || replacement.revoked_by.is_some()
+            || replacement.replaced_by.is_some()
+        {
+            return Err(anyhow!("Invalid factory credential rotation"));
+        }
+        let put = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(Self::factory_service_credential_item(replacement)))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build replacement factory credential")?;
+        let revoke = Update::builder()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(format!("FACTORY_CREDENTIAL#{old_credential_id}")),
+            )
+            .key("sk", Self::av_s("META"))
+            .update_expression("SET revokedAt=:at, revokedBy=:actor, replacedBy=:replacement")
+            .condition_expression(concat!(
+                "attribute_exists(pk) AND attribute_exists(sk) AND ",
+                "attribute_not_exists(revokedAt) AND userId=:user_id"
+            ))
+            .expression_attribute_values(":at", Self::av_s(at.to_rfc3339()))
+            .expression_attribute_values(":actor", Self::av_n(actor_user_id))
+            .expression_attribute_values(":replacement", Self::av_s(&replacement.credential_id))
+            .expression_attribute_values(":user_id", Self::av_n(replacement.user_id))
+            .build()
+            .context("Failed to build old factory credential revocation")?;
+        self.client
+            .transact_write_items()
+            .client_request_token(uuid::Uuid::new_v4().to_string())
+            .transact_items(TransactWriteItem::builder().put(put).build())
+            .transact_items(TransactWriteItem::builder().update(revoke).build())
+            .send()
+            .await
+            .context("Failed to atomically rotate factory service credential")?;
+        Ok(())
+    }
+
+    async fn revoke_factory_service_credential(
+        &self,
+        credential_id: &str,
+        actor_user_id: i32,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let current = self
+            .get_factory_service_credential(credential_id)
+            .await?
+            .context("Factory service credential not found")?;
+        if current.revoked_at.is_some() {
+            return Ok(());
+        }
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key(
+                "pk",
+                Self::av_s(format!("FACTORY_CREDENTIAL#{credential_id}")),
+            )
+            .key("sk", Self::av_s("META"))
+            .update_expression("SET revokedAt=:at, revokedBy=:actor")
+            .condition_expression("attribute_exists(pk) AND attribute_not_exists(revokedAt)")
+            .expression_attribute_values(":at", Self::av_s(at.to_rfc3339()))
+            .expression_attribute_values(":actor", Self::av_n(actor_user_id))
+            .send()
+            .await
+            .context("Failed to revoke factory service credential")?;
+        Ok(())
+    }
+
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()> {
         self.mutate_user_progress(user_id, "mmr", UserProgressMutation::Set(mmr))
             .await?;
@@ -3308,11 +3574,35 @@ impl Database for DynamoDatabase {
     // ---- Player-authored skins -------------------------------------------
 
     async fn create_skin(&self, draft: NewSkin<'_>) -> Result<Skin> {
+        let idempotency = match (draft.idempotency_key, draft.request_hash) {
+            (Some(key), Some(request_hash)) => Some((key, request_hash)),
+            (None, None) => None,
+            _ => {
+                return Err(anyhow!(
+                    "Skin create idempotency key and request hash must travel together"
+                ));
+            }
+        };
+        if let Some((key, request_hash)) = idempotency
+            && let Some((skin_id, stored_hash)) = self
+                .get_skin_create_idempotency(draft.creator_user_id, key)
+                .await?
+        {
+            if stored_hash != request_hash {
+                return Err(SkinWriteError::IdempotencyKeyReused.into());
+            }
+            return self
+                .get_skin_consistent(skin_id)
+                .await?
+                .ok_or_else(|| anyhow!("Skin creation marker points to a missing skin"));
+        }
+
         let skin_id = self.generate_id_for_entity("SKIN").await?;
         let now = Utc::now().timestamp_millis();
         let skin = Skin {
             skin_id,
             kind: draft.kind,
+            namespace: draft.namespace,
             creator_user_id: draft.creator_user_id,
             creator_username: draft.creator_username.map(str::to_string),
             name: draft.name.to_string(),
@@ -3363,41 +3653,104 @@ impl Database for DynamoDatabase {
             .build()
             .context("Failed to build creator grant")?;
 
-        self.client
+        let mut transaction = self
+            .client
             .transact_write_items()
             .transact_items(TransactWriteItem::builder().put(put_skin).build())
             .transact_items(TransactWriteItem::builder().put(put_revision).build())
-            .transact_items(TransactWriteItem::builder().put(put_grant).build())
-            .send()
-            .await
-            .context("Failed to create skin")?;
+            .transact_items(TransactWriteItem::builder().put(put_grant).build());
+        if let Some((key, request_hash)) = idempotency {
+            let marker = Put::builder()
+                .table_name(self.main_table())
+                .set_item(Some(skins_dynamo::create_idempotency_item(
+                    draft.creator_user_id,
+                    key,
+                    request_hash,
+                    skin_id,
+                    now,
+                )))
+                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+                .build()
+                .context("Failed to build skin creation idempotency marker")?;
+            transaction =
+                transaction.transact_items(TransactWriteItem::builder().put(marker).build());
+        }
+
+        if let Err(error) = transaction.send().await {
+            if let Some((key, request_hash)) = idempotency
+                && let Some((resolved_id, stored_hash)) = self
+                    .get_skin_create_idempotency(draft.creator_user_id, key)
+                    .await?
+            {
+                if stored_hash != request_hash {
+                    return Err(SkinWriteError::IdempotencyKeyReused.into());
+                }
+                return self
+                    .get_skin_consistent(resolved_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Skin creation marker points to a missing skin"));
+            }
+            return Err(error).context("Failed to atomically create skin");
+        }
 
         Ok(skin)
     }
 
-    async fn put_skin_revision(&self, skin_id: i32, revision: NewRevision<'_>) -> Result<Skin> {
+    async fn put_skin_revision(
+        &self,
+        skin_id: i32,
+        expected_head: u32,
+        revision: NewRevision<'_>,
+    ) -> Result<Skin> {
         let mut skin = self
-            .get_skin(skin_id)
+            .get_skin_consistent(skin_id)
             .await?
             .ok_or_else(|| anyhow!("Skin not found"))?;
-        let next = skin.head_revision + 1;
+
+        // Saving bytes already at the expected head is a no-op. Besides
+        // avoiding a chain of identical revisions, this makes a client retry
+        // after losing the response safe even when it refreshed first.
+        if skin.head_revision == expected_head && skin.head_content_ref == revision.content_ref {
+            let stored = self
+                .get_skin_revision_consistent(skin_id, expected_head)
+                .await?
+                .ok_or_else(|| anyhow!("Skin head revision is missing"))?;
+            if Self::revision_matches(&stored, &revision) {
+                return Ok(skin);
+            }
+        }
+
+        let next = expected_head
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Skin revision counter overflowed"))?;
+
+        // Reconcile a retry whose transaction committed but whose response was
+        // lost. It is idempotent only when every immutable field matches.
+        if skin.head_revision == next
+            && skin.head_content_ref == revision.content_ref
+            && let Some(stored) = self.get_skin_revision_consistent(skin_id, next).await?
+            && Self::revision_matches(&stored, &revision)
+        {
+            return Ok(skin);
+        }
+        if skin.head_revision != expected_head {
+            return Err(SkinWriteError::HeadChanged {
+                expected: expected_head,
+                actual: skin.head_revision,
+            }
+            .into());
+        }
         let now = Utc::now().timestamp_millis();
 
-        // The revision lands first. A revision nothing points at is harmless
-        // clutter; a head pointing at a revision that does not exist would make
-        // the skin unrenderable for its creator.
-        self.client
-            .put_item()
+        let put_revision = Put::builder()
             .table_name(self.main_table())
             .set_item(Some(skins_dynamo::revision_item(
                 skin_id, next, &revision, now,
             )))
-            .send()
-            .await
-            .context("Failed to store skin revision")?;
-
-        self.client
-            .update_item()
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build immutable skin revision append")?;
+        let advance_head = Update::builder()
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
             .key("sk", Self::av_s("META"))
@@ -3409,10 +3762,43 @@ impl Database for DynamoDatabase {
             .expression_attribute_values(":revision", Self::av_n(next))
             .expression_attribute_values(":content_ref", Self::av_s(revision.content_ref))
             .expression_attribute_values(":now", Self::av_n(now))
-            .expression_attribute_values(":expected", Self::av_n(skin.head_revision))
+            .expression_attribute_values(":expected", Self::av_n(expected_head))
+            .build()
+            .context("Failed to build skin head advance")?;
+
+        // The immutable revision and the pointer to it commit together. There
+        // is no orphan-on-race window and no head-without-revision window.
+        let write = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_revision).build())
+            .transact_items(TransactWriteItem::builder().update(advance_head).build())
             .send()
-            .await
-            .context("Failed to advance skin head revision")?;
+            .await;
+
+        if let Err(error) = write {
+            // A transaction response can be ambiguous after a network failure.
+            // Read the exact immutable result before deciding whether to retry.
+            let current = self
+                .get_skin_consistent(skin_id)
+                .await?
+                .ok_or_else(|| anyhow!("Skin disappeared while appending a revision"))?;
+            if current.head_revision == next
+                && current.head_content_ref == revision.content_ref
+                && let Some(stored) = self.get_skin_revision_consistent(skin_id, next).await?
+                && Self::revision_matches(&stored, &revision)
+            {
+                return Ok(current);
+            }
+            if current.head_revision != expected_head {
+                return Err(SkinWriteError::HeadChanged {
+                    expected: expected_head,
+                    actual: current.head_revision,
+                }
+                .into());
+            }
+            return Err(error).context("Failed to atomically append a skin revision");
+        }
 
         skin.head_revision = next;
         skin.head_content_ref = revision.content_ref.to_string();
@@ -3462,6 +3848,7 @@ impl Database for DynamoDatabase {
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
             .key("sk", Self::av_s("META"))
+            .consistent_read(true)
             .send()
             .await
             .context("Failed to read skin")?;
@@ -3478,6 +3865,7 @@ impl Database for DynamoDatabase {
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
             .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .consistent_read(true)
             .send()
             .await
             .context("Failed to read skin revision")?;
@@ -3487,30 +3875,71 @@ impl Database for DynamoDatabase {
             .transpose()
     }
 
-    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Option<(Skin, SkinRevision)>> {
-        let response = self
-            .client
-            .query()
-            .table_name(self.main_table())
-            .index_name("GSI1")
-            .key_condition_expression("gsi1pk = :reference")
-            .expression_attribute_values(
-                ":reference",
-                Self::av_s(skins_dynamo::content_ref_index_partition(content_ref)),
-            )
-            .limit(1)
-            .send()
-            .await
-            .context("Failed to resolve a skin by content reference")?;
+    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Vec<(Skin, SkinRevision)>> {
+        // A hash names document bytes, not a skin. The same bytes may be saved
+        // under several private, disabled, and published skins, so selecting a
+        // single arbitrary GSI row would accidentally select that row's
+        // moderation state too. Read the whole equivalence class and let the
+        // API apply the explicit visibility precedence.
+        let mut revisions = Vec::new();
+        let mut start_key = None;
+        loop {
+            let response = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI1")
+                .key_condition_expression("gsi1pk = :reference")
+                .expression_attribute_values(
+                    ":reference",
+                    Self::av_s(skins_dynamo::content_ref_index_partition(content_ref)),
+                )
+                .set_exclusive_start_key(start_key)
+                .scan_index_forward(true)
+                .send()
+                .await
+                .context("Failed to resolve all skins by content reference")?;
+            for item in response.items.unwrap_or_default() {
+                let revision = skins_dynamo::revision_from_item(&item)?;
+                // A row under the wrong hash is corruption, not another
+                // candidate. Refuse the equivalence class rather than serving
+                // bytes whose name does not match them.
+                if revision.content_ref != content_ref
+                    || skin_schema::content::reference_for_bytes(revision.document.as_bytes())
+                        != content_ref
+                {
+                    return Err(anyhow!(
+                        "skin revision indexed under a content reference that does not name it"
+                    ));
+                }
+                revisions.push(revision);
+            }
+            start_key = response.last_evaluated_key;
+            if start_key.is_none() {
+                break;
+            }
+        }
 
-        let Some(item) = response.items.and_then(|items| items.into_iter().next()) else {
-            return Ok(None);
-        };
-        let revision = skins_dynamo::revision_from_item(&item)?;
-        let Some(skin) = self.get_skin(revision.skin_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some((skin, revision)))
+        revisions.sort_by_key(|revision| (revision.skin_id, revision.revision));
+        let mut resolved = Vec::with_capacity(revisions.len());
+        let mut skins = HashMap::<i32, Skin>::new();
+        for revision in revisions {
+            let skin = match skins.get(&revision.skin_id) {
+                Some(skin) => skin.clone(),
+                None => {
+                    let Some(skin) = self.get_skin(revision.skin_id).await? else {
+                        // A revision without its stable skin is unreachable
+                        // debris. It must not make an otherwise valid hash 404
+                        // or 410, so omit it deterministically.
+                        continue;
+                    };
+                    skins.insert(revision.skin_id, skin.clone());
+                    skin
+                }
+            };
+            resolved.push((skin, revision));
+        }
+        Ok(resolved)
     }
 
     async fn list_published_skins(
@@ -3651,25 +4080,45 @@ impl Database for DynamoDatabase {
     }
 
     async fn set_skin_pending_revision(&self, skin_id: i32, revision: Option<u32>) -> Result<()> {
-        let mut request = self
-            .client
-            .update_item()
+        let current = self
+            .get_skin_consistent(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+        if current.pending_revision == revision {
+            return Ok(());
+        }
+        if let Some(revision) = revision
+            && self
+                .get_skin_revision_consistent(skin_id, revision)
+                .await?
+                .is_none()
+        {
+            return Err(anyhow!("Cannot review a revision that does not exist"));
+        }
+
+        let mut update = Update::builder()
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
-            .key("sk", Self::av_s("META"))
-            .condition_expression("attribute_exists(pk)");
+            .key("sk", Self::av_s("META"));
 
-        request = match revision {
-            Some(revision) => request
+        update = match revision {
+            Some(revision) => update
                 .update_expression("SET pendingRevision = :revision")
+                .condition_expression(
+                    "attribute_exists(pk) AND (attribute_not_exists(pendingRevision) OR pendingRevision = :revision)",
+                )
                 .expression_attribute_values(":revision", Self::av_n(revision)),
-            None => request.update_expression("REMOVE pendingRevision"),
+            None => update
+                .update_expression("REMOVE pendingRevision")
+                .condition_expression("attribute_exists(pk) AND attribute_not_exists(pendingRevision)"),
         };
-
-        request
-            .send()
-            .await
-            .context("Failed to update the pending review revision")?;
+        let update = update
+            .build()
+            .context("Failed to build pending review update")?;
+        let mut transaction = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().update(update).build());
 
         // The queue is a separate marker item rather than an index entry on the
         // skin, because the skin's own index slot is already the browse
@@ -3677,29 +4126,106 @@ impl Database for DynamoDatabase {
         // its single partition holding a queue rather than a history.
         match revision {
             Some(_) => {
-                self.client
-                    .put_item()
+                let marker = Put::builder()
                     .table_name(self.main_table())
                     .set_item(Some(skins_dynamo::review_queue_item(
                         skin_id,
                         Utc::now().timestamp_millis(),
                     )))
-                    .send()
-                    .await
-                    .context("Failed to enqueue a skin for review")?;
+                    .build()
+                    .context("Failed to build review queue marker")?;
+                transaction =
+                    transaction.transact_items(TransactWriteItem::builder().put(marker).build());
             }
             None => {
-                self.client
-                    .delete_item()
+                let marker = Delete::builder()
                     .table_name(self.main_table())
                     .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
                     .key("sk", Self::av_s(skins_dynamo::REVIEW_QUEUE_SORT_KEY))
-                    .send()
-                    .await
-                    .context("Failed to dequeue a reviewed skin")?;
+                    .build()
+                    .context("Failed to build review queue removal")?;
+                transaction =
+                    transaction.transact_items(TransactWriteItem::builder().delete(marker).build());
             }
         }
+        if let Err(error) = transaction.send().await {
+            // A transport response can be ambiguous, so first reconcile the
+            // exact postcondition. A competing revision is a typed 409 and
+            // never loses the older human review authority.
+            let after = self
+                .get_skin_consistent(skin_id)
+                .await?
+                .ok_or_else(|| anyhow!("Skin disappeared while opening review"))?;
+            if after.pending_revision == revision {
+                return Ok(());
+            }
+            if error.code() == Some("TransactionCanceledException")
+                || (revision.is_some() && after.pending_revision.is_some())
+            {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+            return Err(error).context("Failed to atomically update the pending review");
+        }
+        Ok(())
+    }
 
+    async fn clear_skin_pending_revision_exact(
+        &self,
+        skin_id: i32,
+        expected_revision: u32,
+    ) -> Result<()> {
+        let current = self
+            .get_skin_consistent(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+        match current.pending_revision {
+            None => return Ok(()),
+            Some(revision) if revision != expected_revision => {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+            Some(_) => {}
+        }
+
+        let clear = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("REMOVE pendingRevision")
+            .condition_expression("attribute_exists(pk) AND pendingRevision = :expected")
+            .expression_attribute_values(":expected", Self::av_n(expected_revision))
+            .build()
+            .context("Failed to build exact pending review cancellation")?;
+        let dequeue = Delete::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::REVIEW_QUEUE_SORT_KEY))
+            .build()
+            .context("Failed to build review queue cancellation")?;
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().update(clear).build())
+            .transact_items(TransactWriteItem::builder().delete(dequeue).build())
+            .send()
+            .await;
+
+        if let Err(error) = result {
+            // An exact response-loss retry converges. A newer request must be
+            // preserved and surfaced as a conflict rather than cleared.
+            let after = self
+                .get_skin_consistent(skin_id)
+                .await?
+                .ok_or_else(|| anyhow!("Skin disappeared while cancelling review"))?;
+            if after.pending_revision.is_none() {
+                return Ok(());
+            }
+            if after.pending_revision != Some(expected_revision)
+                || error.code() == Some("TransactionCanceledException")
+            {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+            return Err(error).context("Failed to atomically cancel the exact pending review");
+        }
         Ok(())
     }
 
@@ -3748,6 +4274,182 @@ impl Database for DynamoDatabase {
             .send()
             .await
             .context("Failed to approve a skin revision")?;
+        Ok(())
+    }
+
+    async fn decide_skin_review(
+        &self,
+        skin_id: i32,
+        publication: Publication,
+        revision: Option<u32>,
+        content_ref: Option<&str>,
+        actor_user_id: i32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let skin = self
+            .get_skin_consistent(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+
+        let target = if publication == Publication::Published {
+            if !skin.namespace.is_publishable() {
+                return Err(SkinWriteError::EvaluationOnly.into());
+            }
+            let revision = revision.ok_or(SkinWriteError::ReviewTargetChanged)?;
+            let content_ref = content_ref.ok_or(SkinWriteError::ReviewTargetChanged)?;
+            let stored = self
+                .get_skin_revision_consistent(skin_id, revision)
+                .await?
+                .ok_or(SkinWriteError::ReviewTargetChanged)?;
+            if stored.content_ref != content_ref {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+
+            // A response lost after commit is answered by the exact durable
+            // state. Nothing is written again, including the audit row.
+            if skin.publication == Publication::Published
+                && skin.published_revision == Some(revision)
+                && skin.published_content_ref.as_deref() == Some(content_ref)
+                && skin.pending_revision.is_none()
+                && stored.review_approved
+            {
+                return Ok(());
+            }
+            if skin.pending_revision != Some(revision) {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+            Some((revision, content_ref, stored))
+        } else {
+            if revision.is_some() || content_ref.is_some() {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+            None
+        };
+
+        let now = Utc::now().timestamp_millis();
+        let mut assignments = vec![
+            "publication = :publication".to_string(),
+            "updatedAtMs = :now".to_string(),
+        ];
+        let mut removals = vec!["pendingRevision".to_string()];
+        let mut meta = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .expression_attribute_values(":publication", Self::av_s(publication.as_str()))
+            .expression_attribute_values(":now", Self::av_n(now));
+
+        if let Some((revision, content_ref, _)) = &target {
+            assignments.extend([
+                "publishedRevision = :published".to_string(),
+                "publishedContentRef = :published_ref".to_string(),
+                "publishedAtMs = :now".to_string(),
+                "gsi1pk = :index_pk".to_string(),
+                "gsi1sk = :index_sk".to_string(),
+            ]);
+            meta = meta
+                .condition_expression(
+                    "attribute_exists(pk) AND pendingRevision = :reviewed_revision",
+                )
+                .expression_attribute_values(":reviewed_revision", Self::av_n(*revision))
+                .expression_attribute_values(":published", Self::av_n(*revision))
+                .expression_attribute_values(":published_ref", Self::av_s(*content_ref))
+                .expression_attribute_values(
+                    ":index_pk",
+                    Self::av_s(skins_dynamo::published_index_partition(skin.kind)),
+                )
+                .expression_attribute_values(":index_sk", Self::av_s(format!("{now:020}")));
+        } else {
+            meta = meta.condition_expression("attribute_exists(pk)");
+            // The public listing index is sparse. A moderation decision that
+            // is not publication leaves it in no public browse partition.
+            removals.push("gsi1pk".to_string());
+            removals.push("gsi1sk".to_string());
+        }
+
+        let meta = meta
+            .update_expression(format!(
+                "SET {} REMOVE {}",
+                assignments.join(", "),
+                removals.join(", ")
+            ))
+            .build()
+            .context("Failed to build exact skin publication update")?;
+
+        let audit = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::review_decision_item(
+                skin_id,
+                publication,
+                revision,
+                content_ref,
+                actor_user_id,
+                reason,
+                now,
+            )))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build skin review audit write")?;
+        let dequeue = Delete::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::REVIEW_QUEUE_SORT_KEY))
+            .build()
+            .context("Failed to build review queue removal")?;
+
+        let mut transaction = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().update(meta).build())
+            .transact_items(TransactWriteItem::builder().put(audit).build())
+            .transact_items(TransactWriteItem::builder().delete(dequeue).build());
+
+        if let Some((revision, content_ref, _)) = &target {
+            let approve = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+                .key("sk", Self::av_s(skins_dynamo::revision_sort_key(*revision)))
+                .update_expression("SET reviewApproved = :approved")
+                .condition_expression("attribute_exists(pk) AND contentRef = :content_ref")
+                .expression_attribute_values(":approved", Self::av_bool(true))
+                .expression_attribute_values(":content_ref", Self::av_s(*content_ref))
+                .build()
+                .context("Failed to build exact revision approval")?;
+            transaction =
+                transaction.transact_items(TransactWriteItem::builder().update(approve).build());
+        }
+
+        let result = transaction.send().await;
+        if let Err(error) = result {
+            // Transaction responses may be ambiguous. Only the exact final
+            // state is success; everything else remains a conflict/error.
+            let current = self
+                .get_skin_consistent(skin_id)
+                .await?
+                .ok_or_else(|| anyhow!("Skin disappeared while finishing review"))?;
+            let converged = match target {
+                Some((revision, content_ref, _)) => {
+                    current.publication == Publication::Published
+                        && current.published_revision == Some(revision)
+                        && current.published_content_ref.as_deref() == Some(content_ref)
+                        && current.pending_revision.is_none()
+                        && self
+                            .get_skin_revision_consistent(skin_id, revision)
+                            .await?
+                            .is_some_and(|stored| {
+                                stored.review_approved && stored.content_ref == content_ref
+                            })
+                }
+                None => current.publication == publication && current.pending_revision.is_none(),
+            };
+            if converged {
+                return Ok(());
+            }
+            if error.code() == Some("TransactionCanceledException") {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            }
+            return Err(error).context("Failed to atomically finish skin review");
+        }
         Ok(())
     }
 
@@ -4105,6 +4807,7 @@ impl Database for DynamoDatabase {
         item.insert("sk".to_string(), Self::av_s("META"));
         item.insert("textureId".to_string(), Self::av_n(texture.texture_id));
         item.insert("ownerUserId".to_string(), Self::av_n(texture.owner_user_id));
+        item.insert("shareable".to_string(), Self::av_bool(texture.shareable));
         item.insert("contentRef".to_string(), Self::av_s(&texture.content_ref));
         item.insert("kind".to_string(), Self::av_s(texture.kind.as_str()));
         item.insert("widthPx".to_string(), Self::av_n(texture.width_px));
@@ -4123,6 +4826,10 @@ impl Database for DynamoDatabase {
             Self::av_s(serde_json::to_string(&texture.seams)?),
         );
         item.insert(
+            "verifiedSeamAxes".to_string(),
+            Self::av_s(serde_json::to_string(&texture.verified_seam_axes)?),
+        );
+        item.insert(
             "variants".to_string(),
             Self::av_s(serde_json::to_string(&texture.variants)?),
         );
@@ -4132,7 +4839,10 @@ impl Database for DynamoDatabase {
             "gsi1pk".to_string(),
             Self::av_s(format!("TEXREF#{}", texture.content_ref)),
         );
-        item.insert("gsi1sk".to_string(), Self::av_s("-"));
+        item.insert(
+            "gsi1sk".to_string(),
+            Self::av_s(format!("TEXTURE#{:010}", texture.texture_id)),
+        );
         item.insert(
             "gsi2pk".to_string(),
             Self::av_s(format!("TEXTURE_OWNER#{}", texture.owner_user_id)),
@@ -4169,6 +4879,49 @@ impl Database for DynamoDatabase {
             .transpose()
     }
 
+    async fn set_texture_shareable(&self, texture_id: i32, shareable: bool) -> Result<()> {
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("TEXTURE#{texture_id}")))
+            .key("sk", Self::av_s("META"))
+            .update_expression("SET shareable = :shareable")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":shareable", Self::av_bool(shareable))
+            .send()
+            .await
+            .context("Failed to update texture sharing")?;
+        Ok(())
+    }
+
+    async fn update_texture_verification(
+        &self,
+        texture_id: i32,
+        shareable: bool,
+        verified_seam_axes: &[crate::texture::SeamAxis],
+        seams: crate::texture::SeamReport,
+    ) -> Result<()> {
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("TEXTURE#{texture_id}")))
+            .key("sk", Self::av_s("META"))
+            .update_expression(
+                "SET shareable = :shareable, verifiedSeamAxes = :axes, seams = :seams",
+            )
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":shareable", Self::av_bool(shareable))
+            .expression_attribute_values(
+                ":axes",
+                Self::av_s(serde_json::to_string(verified_seam_axes)?),
+            )
+            .expression_attribute_values(":seams", Self::av_s(serde_json::to_string(&seams)?))
+            .send()
+            .await
+            .context("Failed to update exact texture verification")?;
+        Ok(())
+    }
+
     async fn get_texture_by_ref(&self, content_ref: &str) -> Result<Option<Texture>> {
         let response = self
             .client
@@ -4177,6 +4930,7 @@ impl Database for DynamoDatabase {
             .index_name("GSI1")
             .key_condition_expression("gsi1pk = :reference")
             .expression_attribute_values(":reference", Self::av_s(format!("TEXREF#{content_ref}")))
+            .scan_index_forward(true)
             .limit(1)
             .send()
             .await
@@ -4186,6 +4940,53 @@ impl Database for DynamoDatabase {
             .and_then(|items| items.into_iter().next())
             .map(|item| Self::texture_from_item(&item))
             .transpose()
+    }
+
+    async fn get_texture_for_use(
+        &self,
+        content_ref: &str,
+        descriptor: &skin_schema::v2::TextureDescriptorV2,
+        user_id: i32,
+        is_admin: bool,
+        required_seam_axes: &[crate::texture::SeamAxis],
+    ) -> Result<Option<Texture>> {
+        let mut candidates = Vec::new();
+        let mut start_key = None;
+        loop {
+            let response = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI1")
+                .key_condition_expression("gsi1pk = :reference")
+                .expression_attribute_values(
+                    ":reference",
+                    Self::av_s(format!("TEXREF#{content_ref}")),
+                )
+                .set_exclusive_start_key(start_key)
+                .scan_index_forward(true)
+                .send()
+                .await
+                .context("Failed to resolve texture descriptor for author")?;
+            for item in response.items.unwrap_or_default() {
+                let texture = Self::texture_from_item(&item)?;
+                if texture.descriptor() == *descriptor
+                    && (is_admin || texture.owner_user_id == user_id || texture.shareable)
+                    && required_seam_axes
+                        .iter()
+                        .all(|axis| texture.verified_seam_axes.contains(axis))
+                {
+                    candidates.push(texture);
+                }
+            }
+            start_key = response.last_evaluated_key;
+            if start_key.is_none() {
+                break;
+            }
+        }
+        // Prefer ownership over sharing, then the stable numeric identity.
+        candidates.sort_by_key(|texture| (texture.owner_user_id != user_id, texture.texture_id));
+        Ok(candidates.into_iter().next())
     }
 
     async fn list_textures_by_owner(&self, user_id: i32, limit: usize) -> Result<Vec<Texture>> {
@@ -7622,6 +8423,18 @@ mod tests {
         HighlightReason, HighlightScoreBreakdown, HighlightWindow, QueueMode, ReplayAnchor,
         ReplayVisibility,
     };
+
+    #[test]
+    fn factory_service_credential_dynamo_item_round_trips_without_raw_secret() {
+        let issued = crate::factory_service::issue_factory_service_credential(41, 7, Utc::now());
+        let encoded = DynamoDatabase::factory_service_credential_item(&issued.record);
+        let debug = format!("{encoded:?}");
+        assert!(!debug.contains(&issued.token));
+        assert!(debug.contains("sha256:"));
+
+        let decoded = DynamoDatabase::factory_service_credential_from_item(&encoded).unwrap();
+        assert_eq!(decoded, issued.record);
+    }
 
     fn completion_with_recording(game_id: u32) -> CompletionRecordV1 {
         let mut final_state = GameState::new(

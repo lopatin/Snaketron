@@ -1,0 +1,105 @@
+{
+  "schema_version": 2,
+  "id": "fixture-layers@1",
+  "name": "Fixture Layers",
+  "palette": {
+    "friendly": [
+      { "fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa" },
+      { "fill": "#3c8dde", "outline": "#286eae", "accent": "#a8cdf2" }
+    ],
+    "enemy": [
+      { "fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82" },
+      { "fill": "#e34e5b", "outline": "#a92f3a", "accent": "#f2b75f" }
+    ],
+    "free_for_all": [
+      { "fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa" },
+      { "fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82" },
+      { "fill": "#93a3b5", "outline": "#5d6e81", "accent": "#d1dae5" },
+      { "fill": "#f7b731", "outline": "#a87d1f", "accent": "#ffe08a" }
+    ]
+  },
+  "literals": { "gleam": "#ffffff" },
+  "period_ms": 2400,
+  "head_core": { "ratio": 0.38, "color": "#333333" },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": { "slot": "outline" },
+      "extra_px": 2,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Body fallback",
+      "type": "ribbon",
+      "region": "body",
+      "color": { "slot": "fill" },
+      "extra_px": 0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Upper check",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": { "slot": "accent" },
+        "period_cells": 2,
+        "duty": 0.5,
+        "phase_cells": 0,
+        "half_width": 0.25,
+        "t_center": -0.25
+      }
+    },
+    {
+      "name": "Lower check",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": { "slot": "accent" },
+        "period_cells": 2,
+        "duty": 0.5,
+        "phase_cells": 1,
+        "half_width": 0.25,
+        "t_center": 0.25
+      }
+    },
+    {
+      "name": "Shine",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          { "offset": "tri(time) - 0.12", "color": { "slot": "fill" }, "alpha": 0 },
+          { "offset": "tri(time)", "color": { "literal": "gleam" }, "alpha": 0.1 },
+          { "offset": "tri(time) + 0.12", "color": { "slot": "fill" }, "alpha": 0 }
+        ]
+      }
+    },
+    {
+      "name": "Head glow",
+      "type": "head_ramp",
+      "opacity": "(1 - s / 10) * 0.3",
+      "omit_on_single_cell": true,
+      "color": "#ffffff",
+      "length_cells": 10
+    }
+  ]
+}

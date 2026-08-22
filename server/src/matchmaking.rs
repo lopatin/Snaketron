@@ -1276,24 +1276,46 @@ async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_i
     // A first-class skin is named by id and resolved to the hash of the exact
     // bytes this player is wearing, so what travels into everyone's renderer is
     // a specific revision rather than a name whose meaning could change later.
-    if let Some(skin_id) = requested
+    let authored_reference = if let Some(skin_id) = requested
         .as_deref()
         .and_then(crate::skin_store::equipped_skin_id)
-        && let Some(reference) = resolve_authored_skin(db, skin_id, user_id).await
     {
-        game_state.set_player_skin(user_id, Some(reference));
-        return;
-    }
+        resolve_authored_skin(db, skin_id, user_id).await
+    } else {
+        None
+    };
 
-    let resolved = crate::skin_catalog::resolve_skin_ref(requested.as_deref());
-    if requested.is_some() && !crate::skin_catalog::is_known(requested.as_deref().unwrap_or("")) {
+    if authored_reference.is_none()
+        && requested.is_some()
+        && !crate::skin_catalog::is_known(requested.as_deref().unwrap_or(""))
+    {
         tracing::info!(
             user_id,
             requested = requested.as_deref().unwrap_or(""),
             "unknown skin requested; falling back to the default"
         );
     }
-    game_state.set_player_skin(user_id, Some(resolved.to_string()));
+    game_state.set_player_skin(
+        user_id,
+        Some(snapshot_skin_reference(
+            requested.as_deref(),
+            authored_reference.as_deref(),
+        )),
+    );
+}
+
+/// Resolve the final reference placed in the shared match snapshot.
+///
+/// `authored_reference` has already passed revision visibility checks. An
+/// authored account reference with no safe resolved revision is deliberately
+/// treated like any other unknown catalogue value and becomes classic.
+pub(crate) fn snapshot_skin_reference(
+    requested: Option<&str>,
+    authored_reference: Option<&str>,
+) -> String {
+    authored_reference
+        .unwrap_or_else(|| crate::skin_catalog::resolve_skin_ref(requested))
+        .to_string()
 }
 
 /// Resolve one player-authored skin to the content reference they wear.
@@ -1312,17 +1334,49 @@ async fn resolve_authored_skin(db: &dyn Database, skin_id: i32, user_id: u32) ->
         }
     };
 
-    let reference = skin.content_ref_for(Some(user_id as i32))?.to_string();
+    // Preserve the moderation kill switch before resolving any revision.
+    // Text gating below chooses *which* otherwise-renderable revision may
+    // enter a match; it must never make a disabled skin renderable again.
+    if !skin.publication.is_renderable() {
+        return None;
+    }
+
+    let creator = skin.creator_user_id == user_id as i32;
+    let desired_revision = if creator {
+        skin.head_revision
+    } else {
+        skin.published_revision?
+    };
+    let desired = match db.get_skin_revision(skin_id, desired_revision).await {
+        Ok(Some(revision)) => revision,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(skin_id, desired_revision, %error, "could not read authored skin revision");
+            return None;
+        }
+    };
+
+    // Text can communicate arbitrary words. A creator may preview it on their
+    // private Builder page, but equipping it would hand the same content hash
+    // to every opponent. Until the exact revision is approved, fall back to a
+    // previously approved published revision or to classic.
+    let published_fallback = if desired.contains_text && !desired.review_approved {
+        let published = skin.published_revision?;
+        match db.get_skin_revision(skin_id, published).await {
+            Ok(Some(revision)) => Some(revision),
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    let selected = match_visible_revision(&desired, published_fallback.as_ref())?;
+    let revision = selected.revision;
+    let reference = selected.content_ref.clone();
 
     // Wearing a revision into a match publishes its bytes by necessity —
     // opponents have to fetch it to draw it — so that exposure is recorded
     // rather than inferred. The write is conditional and one-way, so this
     // costs nothing after the first match a revision appears in.
-    let revision = if skin.creator_user_id == user_id as i32 {
-        skin.head_revision
-    } else {
-        skin.published_revision.unwrap_or(skin.head_revision)
-    };
     if let Err(error) = db
         .mark_revision_exposed(skin_id, revision, chrono::Utc::now().timestamp_millis())
         .await
@@ -1331,6 +1385,23 @@ async fn resolve_authored_skin(db: &dyn Database, skin_id: i32, user_id: u32) ->
     }
 
     Some(reference)
+}
+
+/// Choose the immutable revision that is safe to put in a match snapshot.
+///
+/// The creator-facing equipment value may point at an unreviewed text draft,
+/// but a match snapshot is shared with opponents and spectators. Such a draft
+/// therefore resolves only to a separately hashed, already-published safe
+/// revision; without one, matchmaking falls back to the built-in classic skin.
+pub(crate) fn match_visible_revision<'a>(
+    desired: &'a crate::skin_store::SkinRevision,
+    published_fallback: Option<&'a crate::skin_store::SkinRevision>,
+) -> Option<&'a crate::skin_store::SkinRevision> {
+    if !desired.contains_text || desired.review_approved {
+        return Some(desired);
+    }
+
+    published_fallback.filter(|revision| !revision.contains_text || revision.review_approved)
 }
 
 async fn prepare_game_from_lobbies(

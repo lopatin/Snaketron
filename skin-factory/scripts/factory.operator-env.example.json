@@ -1,0 +1,5 @@
+{
+  "SKIN_FACTORY_REVIEW_ACTOR": "human:operator-name",
+  "SKIN_FACTORY_REVIEW_TOKEN": "replace-with-a-long-random-review-secret",
+  "SNAKETRON_FACTORY_OPERATOR_TOKEN": "replace-with-a-snaketron-admin-token"
+}

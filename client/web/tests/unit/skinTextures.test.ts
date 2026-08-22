@@ -26,6 +26,37 @@ test('a layer naming a texture gets it declared', () => {
   ]);
 });
 
+test('resolved generated metadata enters the document with the texture', () => {
+  const contentRef = `sha256:${'a'.repeat(64)}`;
+  const descriptor = {
+    kind: 'sheet',
+    body_columns: 48,
+    frame_rows: 64,
+    variants: [
+      {
+        content_ref: contentRef,
+        url: `/api/textures/variants/${contentRef}.png`,
+        width_px: 768,
+        height_px: 1024,
+        bytes: 12000,
+        texels_per_cell: 16,
+      },
+    ],
+  };
+  const doc = reconcileTextures(wearing('generated'), [
+    {
+      id: 'generated',
+      label: 'Generated',
+      kind: 'sheet',
+      contentRef,
+      descriptor,
+    },
+  ]);
+  assert.deepEqual(doc.textures, [
+    { name: 'generated', ref: contentRef, kind: 'sheet', descriptor },
+  ]);
+});
+
 test('nested layers are searched too', () => {
   const doc = {
     layers: [

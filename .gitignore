@@ -21,6 +21,17 @@ loadtest-reports/
 tools/video/clips/*/master.mkv
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# Skin Factory operational truth belongs in its configured data directory,
+# never in Git.  The checked-in fixture state under skin-factory/tests is
+# deliberately outside this path.
+skin-factory/var/
+skin-factory/.factory.env
 
 # Machine-readable staging certification bundles.
 test-results/autoscaling-*/
