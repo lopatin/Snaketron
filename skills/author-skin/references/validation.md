@@ -14,7 +14,10 @@ Validate in this order and retain every report, including failures.
    fidelity feature has an owner, every image layer has a fallback, asset X/Y
    and wrap use agree, and the path matches its requests.
 3. **Document:** parse and validate SkinDoc v2 with the repository binary. Do
-   not use a test-name filter that can match zero tests.
+   not use a test-name filter that can match zero tests. For every band, use
+   the pinned baked frames to prove
+   `max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5`; independently
+   valid lane fields do not establish this combined bound.
 4. **References:** resolve owned/shareable immutable texture descriptors, kinds,
    exact variants and hashes before compilation.
 5. **Assets:** gate exact served variants for dimensions, bytes, grid, required

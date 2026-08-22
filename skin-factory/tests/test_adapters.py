@@ -185,6 +185,16 @@ def test_worker_result_schema_keeps_raw_head_ramp_color_distinct_from_colorref()
     assert WorkerResult.model_validate(payload).skin_document["layers"][0]["color"] == "#ffffff"
 
 
+def test_worker_result_schema_exposes_the_combined_band_lane_invariant() -> None:
+    schema = WorkerResult.model_json_schema()
+    band_properties = schema["$defs"]["BandSource"]["properties"]
+    invariant = "max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5"
+
+    assert invariant in band_properties["half_width"]["description"]
+    assert invariant in band_properties["t_center"]["description"]
+    assert "0.3 * tri(time)" in band_properties["half_width"]["description"]
+
+
 def test_worker_result_anchor_schema_matches_rust_external_tagging() -> None:
     schema = WorkerResult.model_json_schema()
     definitions = schema["$defs"]

@@ -28,6 +28,7 @@
     },
     "layer_plan": {
       "type": "array",
+      "description": "Ordered executable layer ownership. For every band, record the independent baked-frame maxima proving max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5.",
       "minItems": 1,
       "items": { "type": "string", "minLength": 1 }
     },
@@ -38,6 +39,7 @@
     },
     "animation_plan": {
       "type": "array",
+      "description": "Baked-frame behavior and bounds. A band must prove max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5 across the complete pinned animation ring, not merely bound each field separately. Safe example: t_center = 0.3 * tri(time) and half_width = 0.15 give 0.45.",
       "items": { "type": "string", "minLength": 1 }
     },
     "required_wrap_axes": { "$ref": "#/$defs/wrapAxes" },

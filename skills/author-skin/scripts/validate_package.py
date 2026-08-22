@@ -44,6 +44,8 @@ PROTOTYPE_AUTHORITY_KEYS = {
     "prototype_guide_sha256",
 }
 PROTOTYPE_GEOMETRY_PROJECTION = "prototype-body-mask-v1"
+BAND_LANE_INVARIANT = "max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5"
+BAND_LANE_SAFE_EXAMPLE = "t_center = 0.3 * tri(time)"
 PROTOTYPE_PROJECTION_PROMPT = (
     "prototype-body-mask-v1 deterministically projects the retained source material through the exact native "
     "renderer body mask before review; image_sha256 is the projected authority and source_image_sha256 is "
@@ -186,6 +188,7 @@ def validate_boundaries(errors: list[str]) -> None:
     guidelines_path = "references/design-guidelines.md"
     guidelines = (PACKAGE / guidelines_path).read_text(encoding="utf-8")
     skill = (PACKAGE / "SKILL.md").read_text(encoding="utf-8")
+    layers_reference = (PACKAGE / "references/layers-effects.md").read_text(encoding="utf-8")
     prototypes_reference = (PACKAGE / "references/prototypes.md").read_text(encoding="utf-8")
     validation_reference = (PACKAGE / "references/validation.md").read_text(encoding="utf-8")
     start = boundary["start_marker"]
@@ -223,6 +226,30 @@ def validate_boundaries(errors: list[str]) -> None:
             required_safety_term in contract,
             f"locked contract is missing safety invariant: {required_safety_term}",
         )
+    for required_band_term in (
+        BAND_LANE_INVARIANT,
+        BAND_LANE_SAFE_EXAMPLE,
+        "every baked animation frame",
+    ):
+        add(
+            errors,
+            required_band_term in contract,
+            f"locked contract is missing band lane invariant: {required_band_term}",
+        )
+    for label, reference in (
+        ("layer guidance", layers_reference),
+        ("validation guidance", validation_reference),
+    ):
+        add(
+            errors,
+            BAND_LANE_INVARIANT in reference,
+            f"locked {label} is missing the combined band lane invariant",
+        )
+    add(
+        errors,
+        BAND_LANE_SAFE_EXAMPLE in layers_reference,
+        "locked layer guidance is missing the safe animated band example",
+    )
     add(
         errors,
         guidelines.count(DESIGN_GUIDELINE_START) == 1,
@@ -502,6 +529,19 @@ def validate_implementation_plan_schema(schema: dict[str, Any], errors: list[str
         set(properties.get("head_zone", {}).get("enum", []))
         == {"light_field_dark_core", "dark_field_light_disc_dark_core"},
         "design-guideline head-zone enum drifted",
+    )
+    plan_properties = schema.get("properties", {})
+    for field in ("layer_plan", "animation_plan"):
+        description = plan_properties.get(field, {}).get("description", "")
+        add(
+            errors,
+            BAND_LANE_INVARIANT in description,
+            f"implementation-plan schema {field} must preserve the combined band lane invariant",
+        )
+    add(
+        errors,
+        BAND_LANE_SAFE_EXAMPLE in plan_properties.get("animation_plan", {}).get("description", ""),
+        "implementation-plan schema animation_plan must preserve the safe animated band example",
     )
 
 

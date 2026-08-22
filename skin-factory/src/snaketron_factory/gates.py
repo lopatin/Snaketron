@@ -139,7 +139,23 @@ class GateRunner:
 
     def validate_document(self, document: dict[str, Any], plan: ImplementationPlan) -> list[GateResult]:
         results = [self._rust_schema(document)]
-        results.extend(self._image_contract(document, plan))
+        client_compile = self._client_renderer_compile(document)
+        for result in self._image_contract(document, plan):
+            if result.gate != "renderer_conformance":
+                results.append(result)
+                continue
+            reasons = [*client_compile.reasons, *result.reasons]
+            results.append(
+                self.manifest.result(
+                    "renderer_conformance",
+                    client_compile.verdict == GateVerdict.PASS and result.verdict == GateVerdict.PASS,
+                    reasons=reasons,
+                    measurements={
+                        **result.measurements,
+                        **client_compile.measurements,
+                    },
+                )
+            )
         results.append(self._operation_budget(document))
         return results
 
@@ -528,6 +544,72 @@ class GateRunner:
             completed.returncode == 0,
             reasons=[] if completed.returncode == 0 else [output[:4_000]],
             measurements={"validator_exit": completed.returncode, "schema_version": 2},
+        )
+
+    def _client_renderer_compile(self, document: dict[str, Any]) -> GateResult:
+        """Run the exact side-effect-free compiler used by client registration."""
+
+        compiler = "client::skin::registry runtime compiler"
+        timeout_seconds = 120
+
+        def unavailable(kind: str, reason: str) -> GateResult:
+            return self.manifest.result(
+                "renderer_conformance",
+                False,
+                reasons=[reason],
+                measurements={
+                    "client_compiler_exit": None,
+                    "client_compiler": compiler,
+                    "client_compiler_error": kind,
+                    "pre_register": True,
+                },
+            )
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="skin-factory-client-compile-") as directory:
+                path = Path(directory) / "skin.skin.json"
+                path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+                command = [
+                    "cargo",
+                    "run",
+                    "-q",
+                    "-p",
+                    "client",
+                    "--bin",
+                    "validate-renderer-skin",
+                    "--",
+                    str(path),
+                ]
+                completed = subprocess.run(
+                    command,
+                    cwd=self.config.paths.repo_root,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            return unavailable(
+                "timeout",
+                f"client renderer compiler timed out after {timeout_seconds} seconds before registration",
+            )
+        except OSError as error:
+            kind = "missing_executable" if isinstance(error, FileNotFoundError) else "os_error"
+            detail = error.strerror or error.__class__.__name__
+            return unavailable(
+                kind,
+                f"client renderer compiler could not run before registration ({kind}: {detail})",
+            )
+        output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr) if part.strip())
+        return self.manifest.result(
+            "renderer_conformance",
+            completed.returncode == 0,
+            reasons=[] if completed.returncode == 0 else [output[:4_000]],
+            measurements={
+                "client_compiler_exit": completed.returncode,
+                "client_compiler": compiler,
+                "pre_register": True,
+            },
         )
 
     @staticmethod
