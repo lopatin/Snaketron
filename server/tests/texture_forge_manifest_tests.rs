@@ -72,6 +72,7 @@ async fn strict_manifest_stores_the_exact_gated_ladder_and_retries_idempotently(
     let db: Arc<dyn Database> = Arc::new(DynamoDatabase::new().await?);
     let store = Arc::new(InMemoryTextureStore::default());
     let state = AuthState {
+        analytics: None,
         db: db.clone(),
         jwt_manager: Arc::new(JwtManager::new("forge-test")),
         user_cache: None,
