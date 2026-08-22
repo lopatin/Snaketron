@@ -38,15 +38,36 @@ The authored stack supports these actual v2 primitives:
 - transforms: `translate_s`, `translate_t`, `scale_s`, `scale_t`,
   `rotate_turns`.
 
-Groups are authoring structure and flatten before paint. They may carry
-opacity, but their transform must remain the identity. Follow the capability
-manifest for group flag semantics until the pinned implementation proves them.
+Groups exist in the Rust authoring language, but the task-worker result schema
+is intentionally the non-recursive flat-layer subset. Emit no `group` node in
+`skin_document.layers`: put its concrete children directly in document order,
+apply any inherited opacity or structural flags to those children, and use the
+implementation plan for human-readable organization. The real Rust gates
+remain authoritative after this stricter transport boundary.
+
+Anchor serialization follows Rust's externally tagged enum exactly. The unit
+anchors are strings (`"whole"`, `"head"`, or `"tail"`), while numeric variants
+are nested objects: `{"at":{"at":1}}` and
+`{"fraction":{"fraction":0.5}}`. The tempting flattened forms
+`{"at":1}`/`{"fraction":0.5}` do not deserialize and must never be emitted.
+Transport integers also keep Rust's portable widths: `span.priority` is signed
+32-bit; `fade.steps` is non-negative and must fit the wasm32 client's `usize`;
+and texture `body_columns`, `frame_rows`, `width_px`, `height_px`, `bytes`, and
+`texels_per_cell` are unsigned 32-bit. The tighter capability and semantic
+limits still apply inside those representation bounds.
 
 Use palette slots for role-aware colour: `fill`, `outline`, `accent`, and
 `head_core`. Named literals are accents, not a replacement for team signalling.
 Friendly must read cool, hostile warm, the within-team shades must be distinct,
 the head must remain identifiable, and labels/ready state must retain required
 contrast throughout the animation.
+
+Every `ColorRef` is an object: use `{"slot":"fill"}` (or another admitted
+slot), or declare a document literal and use `{"literal":"gleam"}`. Never put
+a bare hex string at a `ColorRef` site, including ribbon colours, solid/band/text
+sources, gradient stops, and head-disc paint. Raw hex strings belong only to
+the raw-colour fields shown by the canonical v2 template and fixtures, such as
+palette swatches, `literals`, `head_core.color`, and `head_ramp.color`.
 
 ## Expressions and animation topology
 

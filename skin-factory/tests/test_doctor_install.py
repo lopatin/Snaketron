@@ -227,6 +227,71 @@ async def test_content_model_preflight_accepts_configurable_openai_image_provide
 async def test_online_doctor_executes_side_effect_free_worker_contract(factory_config, monkeypatch) -> None:
     monkeypatch.setattr("snaketron_factory.doctor.secrets.choice", lambda _alphabet: "8")
     received: list[WorkerRequest] = []
+    document_template = {
+        "schema_version": 2,
+        "id": "draft@1",
+        "name": "Draft skin",
+        "palette": {
+            "friendly": [
+                {"fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa"},
+                {"fill": "#3c8dde", "outline": "#286eae", "accent": "#a8cdf2"},
+            ],
+            "enemy": [
+                {"fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82"},
+                {"fill": "#e34e5b", "outline": "#a92f3a", "accent": "#f2b75f"},
+            ],
+            "free_for_all": [
+                {"fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa"},
+                {"fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82"},
+                {"fill": "#93a3b5", "outline": "#5d6e81", "accent": "#d1dae5"},
+                {"fill": "#f7b731", "outline": "#a87d1f", "accent": "#ffe08a"},
+            ],
+        },
+        "head_core": {"ratio": 0.38, "color": "#333333"},
+        "layers": [
+            {
+                "name": "Outline",
+                "type": "ribbon",
+                "region": "contour",
+                "color": {"slot": "outline"},
+            },
+            {
+                "name": "Body",
+                "type": "ribbon",
+                "region": "body",
+                "color": {"slot": "fill"},
+            },
+        ],
+    }
+    canonical_template = {
+        **document_template,
+        "period_ms": 2400,
+        "layers": [
+            {
+                **document_template["layers"][0],
+                "extra_px": 2,
+                "joints": True,
+                "tail_cap": False,
+            },
+            {
+                **document_template["layers"][1],
+                "extra_px": 0,
+                "joints": True,
+                "tail_cap": True,
+            },
+            {
+                "name": "Head glow",
+                "type": "head_ramp",
+                "opacity": "(1 - s / 10) * 0.3",
+                "omit_on_single_cell": True,
+                "color": "#ffffff",
+                "length_cells": 10,
+            },
+        ],
+    }
+    templates = factory_config.paths.skill_dir / "templates"
+    templates.mkdir()
+    (templates / "skin-v2.template.json").write_text(json.dumps(canonical_template), encoding="utf-8")
 
     class Worker:
         async def execute(self, request: WorkerRequest) -> ProviderResult:
@@ -252,27 +317,9 @@ async def test_online_doctor_executes_side_effect_free_worker_contract(factory_c
                         },
                     ),
                     skin_document={
-                        "schema_version": 2,
+                        **document_template,
+                        "id": "doctor-worker-conformance@1",
                         "name": "Doctor Visual 888888",
-                        "palette": {
-                            "friendly": [{"fill": "#25c776", "outline": "#155c3d", "accent": "#d9fff0"}],
-                            "enemy": [{"fill": "#e45d6a", "outline": "#7c2832", "accent": "#ffd0d5"}],
-                            "free_for_all": [{"fill": "#25c776", "outline": "#155c3d", "accent": "#d9fff0"}],
-                        },
-                        "period_ms": 1000,
-                        "head_core": {"ratio": 0.38, "color": "#155c3d"},
-                        "textures": [],
-                        "layers": [
-                            {
-                                "name": "Swatch body",
-                                "type": "ribbon",
-                                "region": "body",
-                                "color": {"slot": "fill"},
-                                "extra_px": 0,
-                                "joints": True,
-                                "tail_cap": True,
-                            }
-                        ],
                     },
                     tool_requests=[],
                 ),
@@ -319,6 +366,8 @@ async def test_online_doctor_executes_side_effect_free_worker_contract(factory_c
         assert image.format == "PNG"
         assert image.size == (768, 320)
     assert "888888" not in json.dumps(request.authoring_inputs, sort_keys=True)
+    assert request.authoring_inputs["conformance_fixture"]["skin_document_template"] == document_template
+    assert "period_ms" not in request.authoring_inputs["conformance_fixture"]["skin_document_template"]
     assert request.pure_tools == []
 
 

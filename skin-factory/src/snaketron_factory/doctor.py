@@ -552,6 +552,36 @@ class FactoryDoctor:
             bundle = SkillBundle.load(self.config.paths.skill_dir)
             capabilities = json.loads(self.config.paths.capability_manifest.read_text(encoding="utf-8"))
             limits = capabilities["limits"]
+            try:
+                canonical_template = json.loads(bundle.files["templates/skin-v2.template.json"])
+                document_template = {
+                    "schema_version": canonical_template["schema_version"],
+                    "id": canonical_template["id"],
+                    "name": canonical_template["name"],
+                    "palette": canonical_template["palette"],
+                    "head_core": canonical_template["head_core"],
+                    "layers": [
+                        {
+                            "name": "Outline",
+                            "type": "ribbon",
+                            "region": "contour",
+                            "color": {"slot": "outline"},
+                        },
+                        {
+                            "name": "Body",
+                            "type": "ribbon",
+                            "region": "body",
+                            "color": {"slot": "fill"},
+                        },
+                    ],
+                }
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise ValueError("canonical author-skin bundle has no valid SkinDoc v2 template") from error
+            expected_document = {
+                **document_template,
+                "id": "doctor-worker-conformance@1",
+                "name": f"Doctor Visual {visual_challenge}",
+            }
             request = WorkerRequest(
                 request_id="doctor-worker-conformance-v2",
                 attempt_id="doctor-side-effect-free-fixture",
@@ -565,17 +595,15 @@ class FactoryDoctor:
                         "name": "Doctor Visual Identifier",
                         "brief": (
                             "Inspect the attached approved_prototype card. Read the six-digit decimal "
-                            "identifier printed on it and include those exact six digits in the SkinDoc "
-                            "name. The identifier is present only in the image. Return one valid, nonempty "
-                            "SkinDoc v2 procedural layer-only draft with no textures, assets, tool requests, "
-                            "or external actions. To keep this protocol check independent of color "
-                            "interpretation, use exactly the known-valid role palette from the bundled "
-                            "layers fixture: two friendly entries (#70bfe3/#5299bb/#c8ecfa and "
-                            "#3c8dde/#286eae/#a8cdf2), two enemy entries "
-                            "(#ff6b6b/#b84444/#fbcd82 and #e34e5b/#a92f3a/#f2b75f), and four "
-                            "free-for-all entries copied from that fixture."
+                            "identifier printed on it; the identifier is present only in the image. Copy "
+                            "skin_document_template exactly, changing only id to "
+                            "'doctor-worker-conformance@1' and name to 'Doctor Visual ' followed by those "
+                            "exact six digits. Preserve every other value and array exactly, including each "
+                            "ColorRef object such as {'slot': 'outline'}; a raw hex string is invalid at a "
+                            "ColorRef site. Return no textures, assets, tool requests, or external actions."
                         ),
                         "implementation_path": "layers",
+                        "skin_document_template": document_template,
                     }
                 },
                 inline_artifacts={
@@ -609,6 +637,10 @@ class FactoryDoctor:
             ):
                 raise ValueError("worker conformance fixture requested asset or tool side effects")
             document = result.value.skin_document
+            if document != expected_document:
+                raise ValueError(
+                    "worker conformance SkinDoc differs from the exact template outside its required identity"
+                )
             deterministic = self.factory.gates.validate_document(
                 document,
                 result.value.implementation_plan,

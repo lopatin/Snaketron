@@ -14,12 +14,23 @@ inserts its Boost band outside the contour and its head core on top.
 - `head_ramp` evaluates opacity per cell and is the natural place for a glow
   curve using `s` and `time`.
 - `head_disc` adds a bounded authored disc below the system head core.
-- `group` organizes one level of layers and may multiply opacity. Put transforms
-  on children because group transforms cannot flatten exactly.
+- Keep the task-worker `skin_document.layers` flat. Rust understands `group`
+  as an authoring convenience, but the strict worker-response grammar excludes
+  recursive group nodes; place concrete children in document order and apply
+  inherited opacity or flags directly to them.
+
+For a span's `from`, write unit anchors as `"whole"`, `"head"`, or `"tail"`.
+Rust's numeric enum variants are externally tagged and therefore intentionally
+nested: `{"at":{"at":1}}` or `{"fraction":{"fraction":0.5}}`, never the
+flattened shorthand.
 
 Prefer a palette slot when the colour contributes to side reading. A literal
 may supply a controlled gleam or material accent, but the composite still has
 to pass every role and clock sample.
+
+Write those references in their exact object form: `{"slot":"accent"}` or
+`{"literal":"gleam"}`. A bare `"#rrggbb"` is not a `ColorRef`; the canonical
+template's raw hex on `head_ramp.color` is a deliberately different field.
 
 ## Effect recipes
 

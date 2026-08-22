@@ -10,7 +10,8 @@ operator explicitly selects `run` or `--generate`.
 
 - Docker Desktop with `docker compose`;
 - `uv`, Hermes, `wasm-pack`, Node.js/npm, Git, and `curl` on `PATH`;
-- LM Studio serving a loaded task-worker model at `http://127.0.0.1:1234/v1`;
+- LM Studio 0.4 or newer serving at `http://127.0.0.1:1234/v1`, with the
+  task-worker model installed; put its `lms` CLI on `PATH` for automatic loading;
 - a Gemini key already exported in the invoking shell as `GEMINI_API_KEY`, or
   already retained in the owner-private service JSON; and
 - network access for locked dependency/browser installation, the pinned
@@ -43,8 +44,9 @@ On an empty local install, that one command:
    skins and private forge textures but forbids publishing/administering;
 5. installs frozen production dependencies, Chromium, the renderer bundle,
    and pinned LaMa assets without creating a Hermes cron;
-6. pins the exact model ID advertised by LM Studio into the ignored runtime
-   config; and
+6. pins the exact model ID selected from LM Studio's installed/advertised state,
+   verifies its loaded-instance state, and uses `lms load` only when that exact
+   installed model is not loaded; it never issues an unload command; and
 7. starts the exact renderer and authenticated gallery, then runs live
    service, model, browser, SQLite/CAS, and LaMa checks.
 
@@ -55,6 +57,22 @@ identifier explicitly:
 ./skin-factory/scripts/local-calibration.py start \
   --worker-model publisher/exact-model-id
 ```
+
+`--worker-model` selects an exact identifier; it does not permit fallback to a
+different model. If the selected local model is installed but unloaded, the
+launcher idempotently runs:
+
+```sh
+lms load publisher/exact-model-id \
+  --identifier publisher/exact-model-id \
+  --yes
+```
+
+If `lms` is unavailable or loaded-instance state cannot be verified safely, the
+launcher exits before installation and prints that exact recovery command. It
+never issues an unload command or substitutes a different model identifier.
+Automatic loading is bounded to five minutes and the exact loaded instance is
+verified again afterward, including when another launcher wins the load race.
 
 Successful startup prints only the local gallery URL and an `open` command.
 Open it without putting its review secret in a URL or the clipboard:

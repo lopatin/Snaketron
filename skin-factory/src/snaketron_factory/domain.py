@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .skin_document import SkinDocument
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -223,7 +225,7 @@ class InlineArtifact(StrictModel):
 
 class WorkerResult(StrictModel):
     implementation_plan: ImplementationPlan
-    skin_document: dict[str, Any]
+    skin_document: SkinDocument
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     trace: list[dict[str, Any]] = Field(default_factory=list)
     usage: dict[str, bool | int | float] = Field(default_factory=dict)
