@@ -279,6 +279,12 @@ class FactoryConfig(ConfigModel):
             raise ValueError(
                 "optimizer promotion timeout plus cleanup/settlement must fit inside the run wall-time budget"
             )
+        # Factory admission reserves the role's complete HTTP timeout plus one
+        # second to persist terminal state and release the lease. Reject an
+        # impossible worker configuration at load time instead of letting
+        # every AUTHOR attempt halt before its first worker operation.
+        if self.models.task_worker.timeout_seconds + 1 > self.budgets.wall_seconds_per_run:
+            raise ValueError("task_worker timeout plus settlement must fit inside the run wall-time budget")
         if self.worker.max_output_tokens != self.models.task_worker.max_output_tokens:
             raise ValueError("worker max_output_tokens must equal the task_worker model reservation ceiling")
         return self

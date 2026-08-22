@@ -570,6 +570,8 @@ def test_runtime_config_uses_isolated_mutable_state_and_exact_worker_model(
     assert value["browser"]["base_url"] == "http://127.0.0.1:13000"
     assert value["review"]["port"] == 18765
     assert value["models"]["task_worker"]["model"] == "publisher/exact-worker-id"
+    assert value["models"]["task_worker"]["timeout_seconds"] == launcher.TASK_WORKER_TIMEOUT_SECONDS == 900
+    assert value["models"]["task_worker"]["timeout_seconds"] + 1 <= value["budgets"]["wall_seconds_per_run"]
     assert value["paths"]["data_dir"] == "var/local-runtime/factory-data"
     assert value["paths"]["database"] == "var/local-runtime/factory-data/factory.sqlite3"
     assert value["paths"]["objects"] == "var/local-runtime/factory-data/objects"

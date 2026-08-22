@@ -3094,6 +3094,20 @@ async def test_wall_time_cap_is_rechecked_immediately_before_new_provider_spend(
     await factory.close()
 
 
+def test_task_worker_admission_reserves_full_local_timeout_and_settlement(
+    factory_config, database, objects, monkeypatch
+) -> None:
+    factory = Factory(factory_config, database=database, objects=objects)
+    factory.config.models.task_worker.timeout_seconds = 900
+    # Exactly 900 seconds remain, which is enough for the HTTP timeout but not
+    # the additional second required to persist and release the process lease.
+    factory._run_deadline = 910.0
+    monkeypatch.setattr("snaketron_factory.factory.time.monotonic", lambda: 10.0)
+
+    with pytest.raises(BudgetExceeded, match=r"task_worker; requires 901\.000s"):
+        factory._assert_wall_time_before_spend(role="task_worker")
+
+
 @pytest.mark.asyncio
 async def test_late_git_promotion_is_refused_before_operation_or_push(
     factory_config, database, objects, make_attempt, monkeypatch

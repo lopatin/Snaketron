@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -202,9 +203,23 @@ the deterministic factory driver.
             },
         }
         try:
-            response = await self.client.post(
-                f"{self.base_url}/chat/completions", headers=self._headers(), json=payload
-            )
+            # HTTPX's scalar timeout is four independent connect/read/write/pool
+            # inactivity limits, not a total request deadline.  Factory wall
+            # admission reserves this one role timeout as an end-to-end budget,
+            # so enforce it independently around dispatch and full body receipt.
+            async with asyncio.timeout(self.timeout):
+                response = await self.client.post(
+                    f"{self.base_url}/chat/completions", headers=self._headers(), json=payload
+                )
+        except TimeoutError as error:
+            # Cancellation may race a request that LM Studio already accepted.
+            # The worker is side-effect-free, but its operation outcome is not
+            # known until durable response bytes have been received and checked.
+            raise ProviderError(
+                ProviderFailureKind.TIMEOUT,
+                f"task worker total deadline exceeded after dispatch ({self.timeout}s)",
+                outcome_known=False,
+            ) from error
         except httpx.ConnectError as error:
             raise ProviderError(ProviderFailureKind.UNAVAILABLE, f"task worker unavailable: {error}") from error
         except httpx.TimeoutException as error:

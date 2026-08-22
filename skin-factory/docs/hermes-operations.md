@@ -289,6 +289,15 @@ default; enabling fails closed if the real gateway cannot reload it. The
 non-secret timeout may remain after rollback because lowering it could kill an
 unrelated long-running Hermes script.
 
+The pinned local task-worker request timeout is a true 900-second end-to-end
+deadline, enforced independently of the HTTP client's per-phase inactivity
+timers. Before creating its operation intent, `run-once` requires at least 901
+seconds to remain in the tick (the request budget plus durable settlement).
+Configuration loading rejects a task-worker timeout that cannot fit the run
+wall, and the installed 1,920-second Hermes boundary remains outside that
+1,800-second application wall so scheduler termination cannot truncate an
+admitted worker response.
+
 The installed wrapper repeats the behavior-pin check and authenticated
 least-privilege Snaketron probe immediately before **every** `run-once`. It
 emits no readiness success document on stdout, so Hermes still receives one
