@@ -16,9 +16,37 @@ import {
 import type { CheckUsernameResponse } from '../types/generated';
 import { getOrCreateAnonId } from '../utils/anonId';
 import type { PlayerLobbyResponse } from '../types/generated';
+import type { BuxPack, CheckoutToken } from '../types/generated';
 import type { NewsTickerResponse } from '../types/generated';
 import type { HighlightClip } from '../types/generated';
 import type { PublicGameResponse } from '../types/generated';
+import type { Texture } from '../types/generated/Texture';
+import type { JobAccepted } from '../types/generated/JobAccepted';
+import type { GenerationJob } from '../types/generated/GenerationJob';
+import type { TextureListResponse } from '../types/generated/TextureListResponse';
+import type {
+  BrowseResponse,
+  Equipment,
+  PurchaseResult,
+  SkinKind,
+  SkinListResponse,
+  SkinSummary,
+  Wallet,
+} from '../types/generated';
+
+/**
+ * An equip request.
+ *
+ * Three-valued per slot, matching the server: omit a slot to leave it alone,
+ * pass `null` to clear it back to the default look, pass a reference to equip.
+ * Written by hand rather than generated because ts-rs flattens Rust's
+ * `Option<Option<T>>` into a single nullable, losing exactly the distinction
+ * this type exists to carry.
+ */
+export interface EquipRequest {
+  selectedSkin?: string | null;
+  selectedBase?: string | null;
+}
 
 /** Error thrown by `API.request` for a non-2xx response. */
 export interface ApiError {
@@ -100,6 +128,12 @@ class API {
     // Base API host; endpoints below include the /api prefix explicitly
     const envUrl = process.env.REACT_APP_API_URL?.replace(/\/+$/, '');
     this.baseURL = envUrl || 'http://localhost:8080';
+    // The wasm renderer builds texture URLs itself — a skin's atlas is loaded
+    // by the compiled skin, not by anything on this side — and it has no way
+    // to read the build's environment. Publishing what we resolved keeps the
+    // two from disagreeing about where the API is, which origin-relative URLs
+    // get wrong on every deployment that serves the app from a different host.
+    (globalThis as Record<string, unknown>).__snaketronApiOrigin = this.baseURL;
   }
 
   private getToken(): string | null {
@@ -175,10 +209,14 @@ class API {
   // boundary rather than defaulting every call to `any`.
   async request<T>(endpoint: string, options: RequestOptions = {}): Promise<T> {
     const url = `${this.baseURL}${endpoint}`;
+    // A multipart body writes its own content type, boundary and all. Setting
+    // `application/json` over the top of it — which the default here would —
+    // makes the server refuse a body it can otherwise read perfectly well.
+    const sendsForm = options.body instanceof FormData;
     const config: RequestOptions = {
       ...options,
       headers: {
-        'Content-Type': 'application/json',
+        ...(sendsForm ? {} : { 'Content-Type': 'application/json' }),
         ...options.headers,
       },
     };
@@ -449,6 +487,172 @@ class API {
     const params = new URLSearchParams({ limit: limit.toString() });
     if (cursor) params.set('cursor', cursor);
     return this.request<RuntimeConfigAuditPage>(`/api/admin/config/audit?${params.toString()}`);
+  }
+
+  /** The catalogue. Needs no account — browsing is open to anyone. */
+  async browseSkins(kind: SkinKind = 'snake'): Promise<BrowseResponse> {
+    return this.request<BrowseResponse>(`/api/skins?kind=${kind}`);
+  }
+
+  /**
+   * Record what the signed-in player is wearing.
+   *
+   * Slots are addressed independently: omit a slot to leave it alone, pass
+   * `null` to clear it back to the default look. Returns both slots as they
+   * now stand, so a caller that changed one still learns the whole state.
+   */
+  async setEquipment(request: EquipRequest): Promise<Equipment> {
+    return this.request<Equipment>('/api/users/me/equipped', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** What a player can buy Snakebux in. */
+  async buxPacks(): Promise<BuxPack[]> {
+    return this.request<BuxPack[]>('/api/wallet/packs');
+  }
+
+  /** Mint a checkout token for one pack; the provider hosts the rest. */
+  async buxCheckoutToken(sku: string): Promise<CheckoutToken> {
+    return this.request<CheckoutToken>('/api/wallet/xsolla/checkout-token', {
+      method: 'POST',
+      body: JSON.stringify({ sku }),
+    });
+  }
+
+  /** Published player-authored skins, newest first. */
+  async browseAuthoredSkins(
+    kind: SkinKind = 'snake',
+    filter: 'published' | 'mine' = 'published',
+  ): Promise<SkinListResponse> {
+    return this.request<SkinListResponse>(`/api/skins/browse?kind=${kind}&filter=${filter}`);
+  }
+
+  /**
+   * Buy a skin.
+   *
+   * `expectedPriceBux` is what the buyer was shown; the server conditions on
+   * it, so a price that moved between the dialog and this call comes back a
+   * 409 rather than charging a surprise.
+   */
+  async purchaseSkin(
+    skinId: number,
+    expectedPriceBux: number,
+    idempotencyKey: string,
+  ): Promise<PurchaseResult> {
+    return this.request<PurchaseResult>(`/api/skins/${skinId}/purchase`, {
+      method: 'POST',
+      body: JSON.stringify({ idempotencyKey, expectedPriceBux }),
+    });
+  }
+
+  async getWallet(): Promise<Wallet> {
+    return this.request<Wallet>('/api/wallet');
+  }
+
+  /**
+   * One skin's document, by the reference that names it.
+   *
+   * Fetched by content reference rather than by skin id, because that is what
+   * a reference *is*: the bytes are immutable, so this response can be cached
+   * hard, and a revision an author has since replaced still resolves for the
+   * replay that recorded it.
+   */
+  async getSkinDocument(contentRef: string): Promise<unknown> {
+    return this.request<unknown>(`/api/skins/by-ref/${encodeURIComponent(contentRef)}`);
+  }
+
+  /** The textures this account owns, newest first. */
+  /** Where this client talks to, so callers can build asset URLs. */
+  get baseUrl(): string {
+    return this.baseURL;
+  }
+
+  async listTextures(): Promise<TextureListResponse> {
+    return this.request<TextureListResponse>('/api/textures');
+  }
+
+  /**
+   * Hand over art you already have.
+   *
+   * The one route in this API that takes bytes rather than JSON. `request`
+   * spots the `FormData` and stands back from the content type, because the
+   * browser has to write the multipart boundary itself.
+   */
+  async uploadTexture(file: File, kind: string, subject?: string): Promise<JobAccepted> {
+    const form = new FormData();
+    form.append('kind', kind);
+    if (subject) {
+      form.append('subject', subject);
+    }
+    form.append('file', file);
+    return this.request<JobAccepted>('/api/textures', { method: 'POST', body: form });
+  }
+
+  /** Ask a model for one, with optional references. */
+  async generateTexture(request: {
+    kind: string;
+    prompt: string;
+    referenceTextureIds?: number[];
+  }): Promise<JobAccepted> {
+    return this.request<JobAccepted>('/api/textures/generate', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Where a texture job has got to. */
+  async getGenerationJob(jobId: string): Promise<GenerationJob> {
+    return this.request<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(jobId)}`);
+  }
+
+  /** Create a skin from a document the editor has already compiled. */
+  async createSkin(request: { name: string; document: unknown; kind?: 'snake' | 'base' }): Promise<SkinSummary> {
+    return this.request<SkinSummary>('/api/skins', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Append a revision, rename, or re-price. */
+  async updateSkin(
+    skinId: number,
+    request: { name?: string; document?: unknown; priceBux?: number },
+  ): Promise<SkinSummary> {
+    return this.request<SkinSummary>(`/api/skins/${skinId}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Ask an admin to look at the current head revision. */
+  async requestSkinPublication(skinId: number): Promise<void> {
+    await this.request<unknown>(`/api/skins/${skinId}/publish-request`, {
+      method: 'POST',
+    });
+  }
+
+  /** Everything waiting on a reviewer, oldest first. */
+  async getSkinReviewQueue(): Promise<SkinListResponse> {
+    return this.request<SkinListResponse>('/api/admin/skins');
+  }
+
+  /**
+   * Decide a skin.
+   *
+   * Publishing names one revision — by default the one review was asked about,
+   * because the creator's head may have moved since they submitted it.
+   */
+  async setSkinPublication(
+    skinId: number,
+    publication: 'published' | 'unpublished' | 'disabled' | 'private',
+    options: { revision?: number; reason?: string } = {},
+  ): Promise<SkinSummary> {
+    return this.request<SkinSummary>(`/api/admin/skins/${skinId}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ publication, ...options }),
+    });
   }
 }
 

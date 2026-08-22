@@ -3802,6 +3802,70 @@ body {
   height: 18px;
 }
 
+/* The Snakebux chip.
+
+   Borrowed from `.home-fullscreen-toggle` above — the only other bordered
+   element in this cluster — so the account corner reads as one set of
+   controls rather than two visual languages sharing a row. A link rather
+   than a readout, because the useful next thing to do with a balance is
+   spend it. */
+/* The balance, unboxed.
+   A bordered chip made the number look like one more control in a row of
+   controls; the coin says what it is faster than a border and a unit ever did,
+   so the container goes and the icon carries it. */
+.home-bux-chip {
+  display: flex;
+  height: 40px;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+/* Struck gold: gold taken down until it is ink.
+   Bright gold on white is a low-contrast pairing at any weight, and the fix
+   used to be a hard dark edge on all four sides — but at 15px those four
+   copies overlap into a smear rather than an edge, which is what made the
+   number look blurred. Darkening the gold itself does the same job with
+   nothing propping it up, and it is still unmistakably the coin's colour. */
+.home-bux-amount {
+  color: #8a5a06;
+  font-size: 15px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+  transition: color 150ms ease, transform 150ms ease;
+}
+
+/* Warmer on hover rather than brighter: this gold reads because it is dark,
+   so lifting it toward the coin's own yellow would undo the thing that makes
+   it legible. */
+.home-bux-chip:hover .home-bux-amount,
+.home-bux-chip:focus-visible .home-bux-amount {
+  color: #9d6604;
+}
+
+.home-bux-chip:hover .snake-bux-icon {
+  transform: scale(1.07);
+}
+
+.home-bux-chip:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.snake-bux-icon {
+  display: inline-block;
+  flex: none;
+  transition: transform 150ms ease;
+  user-select: none;
+  vertical-align: -2px;
+}
+
 .home-account-action {
   padding: 8px 0;
   border: 0;
@@ -5515,6 +5579,12 @@ a.home-social-icon:hover {
     white-space: nowrap;
   }
 
+  /* Same cluster, same pressure: three rules already exist to stop this row
+     overflowing, and an unbounded chip would undo all of them. */
+  .home-bux-chip {
+    padding: 0 8px;
+  }
+
   .home-fullscreen-toggle {
     width: 36px;
     height: 36px;
@@ -6074,6 +6144,16 @@ a.home-social-icon:hover {
   .home-account-username {
     max-width: 84px;
   }
+
+  /* Below this the header does not fit *before* the chip exists — the nav
+     alone is 258px against a 375px phone, which is why `overflow-x: hidden`
+     is doing quiet work here. Measured: the chip costs 69px on a cluster
+     already 22px over. So it goes, and the balance stays where it is
+     actionable anyway — the Skins page, one tap away, shows it beside the
+     things it buys. */
+  .home-bux-chip {
+    display: none;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -6558,6 +6638,485 @@ a.home-social-icon:hover {
   margin: 0;
   padding: 0;
   list-style: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Skins page and Skin Builder                                         */
+/*                                                                     */
+/* Shares the site's chrome rather than inventing any: cards are the    */
+/* leaderboard's (white, 2px grey rule, rounded), labels are the        */
+/* results card's small letterspaced caps, and every button is a        */
+/* .game-shell-button. Nothing here restyles a control that already     */
+/* exists somewhere else.                                              */
+/* ------------------------------------------------------------------ */
+
+.skins-main,
+.builder-main {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 100svh;
+  padding: 128px clamp(24px, 5vw, 96px) calc(120px + var(--ad-route-bottom-reserve));
+}
+
+.skins-intro,
+.builder-intro {
+  display: flex;
+  width: min(100%, 72rem);
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 auto 28px;
+}
+
+/* Beside the heading rather than in the layers panel: generating is how a skin
+   *starts*, so it belongs with the page's name and not among the controls for
+   editing one that already exists. */
+/* The Generate button.
+   Blue rather than graphite because it is the one control on the page that
+   makes something out of nothing; everything else edits what is already
+   there. */
+.builder-generate {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  border-color: var(--game-blue);
+  color: var(--game-blue);
+}
+
+.builder-generate:hover:not(:disabled) {
+  border-color: var(--game-blue);
+  background: #eff6ff;
+}
+
+.builder-generate-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.builder-generate-label {
+  display: inline-flex;
+}
+
+/* The mount wave.
+   Each letter runs the same colour cycle, staggered by an inline delay, so the
+   colour crosses the word left to right instead of the label blinking as one.
+   It runs once: this is an introduction, not a permanent animation competing
+   with the preview beside it. */
+.builder-generate-label > span {
+  animation: builder-generate-wave 900ms ease-in-out 1 both;
+  white-space: pre;
+}
+
+@keyframes builder-generate-wave {
+  0% {
+    color: var(--game-blue);
+  }
+
+  20% {
+    color: #ec4899;
+  }
+
+  40% {
+    color: #f59e0b;
+  }
+
+  60% {
+    color: #10b981;
+  }
+
+  80% {
+    color: #8b5cf6;
+  }
+
+  100% {
+    color: var(--game-blue);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .builder-generate-label > span {
+    animation: none;
+  }
+}
+
+/* Two checkboxes and six words between them: a column of full-width inputs
+   spaces these as though they were unrelated. */
+.builder-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+}
+
+.builder-toggle-row > .builder-field {
+  flex: 0 1 auto;
+}
+
+/* --- Generate modal ------------------------------------------------------
+   The match-break dialog's look, which is the house style for a modal: a
+   white wash rather than a grey scrim, a hard graphite border, and an offset
+   shadow with no blur. The values are restated rather than borrowed because
+   `ad-break-*` is named for what it interrupts, not for how it looks — but
+   they come from there, and a change to one should be a change to both. */
+.generate-backdrop {
+  position: fixed;
+  z-index: 9998;
+  inset: 0;
+  display: grid;
+  animation: ad-break-backdrop-in 160ms ease-out both;
+  backdrop-filter: blur(9px);
+  background: rgb(248 250 252 / 92%);
+  padding: 20px;
+  place-items: center;
+  -webkit-backdrop-filter: blur(9px);
+}
+
+.generate-dialog {
+  display: flex;
+  position: relative;
+  box-sizing: border-box;
+  width: min(100%, 720px);
+  max-height: calc(100dvh - 40px);
+  flex-direction: column;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  animation: ad-break-dialog-in 180ms ease-out both;
+  background: var(--game-paper);
+  box-shadow: 8px 8px 0 rgb(63 63 65 / 16%);
+  outline: none;
+  padding: 28px 28px 0;
+  text-align: left;
+}
+
+/* One segment per round generated, filling as you go. */
+.generate-rule {
+  display: flex;
+  height: 12px;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 24px;
+}
+
+.generate-rule span {
+  width: 23px;
+  height: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 3px;
+  background: #f1f5f9;
+  transform: skewX(-10deg);
+}
+
+.generate-rule span.is-resolved {
+  border-color: var(--game-blue);
+  background: var(--game-blue);
+}
+
+.generate-kicker {
+  display: block;
+  flex: none;
+  margin-bottom: 8px;
+  color: var(--game-blue);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+}
+
+.generate-dialog h2 {
+  margin: 0;
+  flex: none;
+  color: var(--game-graphite);
+  font-size: clamp(22px, 5vw, 28px);
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.5px;
+  line-height: 1.04;
+  text-transform: uppercase;
+}
+
+.generate-dialog > p {
+  margin: 13px 0 0;
+  flex: none;
+  color: var(--game-muted);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.generate-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 6px;
+  background: var(--game-paper);
+  color: var(--game-graphite);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+}
+
+.generate-close:hover {
+  background: #f1f5f9;
+}
+
+/* The one part that scrolls, so the heading and the actions stay put while a
+   round of six does not have to fit the viewport. */
+.generate-body {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.generate-prompt,
+.generate-guidance {
+  width: 100%;
+  box-sizing: border-box;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 15px;
+  padding: 10px 12px;
+  resize: none;
+}
+
+.generate-prompt:focus,
+.generate-guidance:focus {
+  border-color: var(--game-blue);
+  outline: none;
+}
+
+.generate-reference {
+  display: flex;
+  min-height: 30px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.generate-swatches {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.generate-swatches i {
+  width: 17px;
+  height: 17px;
+  border: 1px solid rgb(63 63 65 / 22%);
+  border-radius: 4px;
+}
+
+.generate-clear {
+  border: 0;
+  background: none;
+  color: var(--game-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 4px;
+  text-decoration: underline;
+}
+
+.generate-error {
+  margin: 0;
+  color: var(--game-red);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Two columns of wide, short snakes; auto-fit so the grid survives the dialog
+   narrowing on a phone. */
+.generate-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.generate-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  padding: 12px 10px 9px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.generate-option:hover {
+  border-color: #9ca3af;
+}
+
+.generate-option.is-kept {
+  border-color: var(--game-blue);
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 18%);
+}
+
+.generate-preview {
+  display: block;
+  overflow: hidden;
+}
+
+.generate-preview canvas {
+  display: block;
+}
+
+.generate-option-name {
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* The match-break dialog's footer rule, carrying the actions. */
+.generate-status {
+  display: flex;
+  min-height: 38px;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--game-rule);
+  margin-top: 20px;
+  color: var(--game-muted);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 1px;
+  padding: 16px 0 20px;
+  text-transform: uppercase;
+}
+
+.generate-actions {
+  display: flex;
+  gap: 9px;
+}
+
+
+.skins-title,
+.builder-title {
+  margin: 0;
+  color: var(--game-graphite);
+  font-size: clamp(26px, 4vw, 38px);
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.035em;
+  text-transform: uppercase;
+}
+
+.skins-subtitle,
+.builder-subtitle {
+  margin: 6px 0 0;
+  max-width: 48ch;
+  color: rgb(63 63 65 / 62%);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.skins-intro-actions {
+  display: flex;
+  gap: 9px;
+  margin-top: 14px;
+}
+
+/* The page's one call to action, sized like one. */
+.skins-make-own {
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 20px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  letter-spacing: 0.085em;
+}
+
+.skins-make-own-icon {
+  display: inline-flex;
+  align-items: center;
+  font-size: 19px;
+  font-style: italic;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.skins-error,
+.builder-problems {
+  width: min(100%, 72rem);
+  margin: 0 auto 20px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  padding: 10px 14px;
+  color: #b91c1c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.builder-problems {
+  margin: 16px 0 0;
+  padding-left: 30px;
+}
+
+/* Snakes take the room a wide horizontal preview needs; bases are a rail. */
+.skins-columns {
+  display: grid;
+  width: min(100%, 72rem);
+  margin: 0 auto;
+  gap: clamp(20px, 3vw, 40px);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 21rem);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .skins-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.skins-column-heading {
+  margin: 0 0 4px;
+  color: var(--game-graphite);
+  font-size: 12px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.skins-column-note {
+  margin: 0 0 14px;
+  color: rgb(63 63 65 / 56%);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* One card holding rows divided by rules, exactly as the leaderboard does. */
+.skins-list {
+  display: flex;
+  flex-direction: column;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  list-style: none;
+  overflow: hidden;
 }
 
 .challenge-row {
@@ -7058,4 +7617,1756 @@ a.home-social-icon:hover {
 .game-shell-button.is-share-icon {
   width: 32px;
   padding: 0;
+}
+
+.skins-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid #e1e3e7;
+  padding: 11px 16px;
+  transition: background-color 140ms ease;
+}
+
+.skins-row:last-child {
+  border-bottom: 0;
+}
+
+.skins-row:hover,
+.skins-row:focus-within {
+  background: #f9fafb;
+}
+
+/* Equipped: tinted, and barred on both sides.
+   The canvas is handed the same tint (see `EQUIPPED_FIELD`), because it paints
+   opaquely — a body crossing itself fills the gap with the field colour — so a
+   row that tinted only around the canvas would frame the art in white.
+   Two rules rather than one: a single left rule is the reflex, and a pair reads
+   as a thing bracketed rather than a thing listed. */
+.skins-row.is-equipped {
+  background: #eff6ff;
+  /* Bars down both sides, hairlines across the top and bottom: the row is
+     closed on all four edges, so it reads as a thing lifted out of the list
+     rather than a thing the list happens to start at. All four are inset
+     shadows so none of them takes part in layout — a real border would move
+     every row below it by a pixel as the equipped one changed. */
+  box-shadow:
+    inset 3px 0 0 var(--game-blue),
+    inset -3px 0 0 var(--game-blue),
+    inset 0 1px 0 var(--game-blue),
+    inset 0 -1px 0 var(--game-blue);
+}
+
+.skins-row.is-equipped:hover,
+.skins-row.is-equipped:focus-within {
+  background: #e6f0ff;
+}
+
+/* The row is a target; the action on it is a different target.
+   Three layers, and the order is the whole trick: the row's contents sit at the
+   bottom, an invisible full-bleed button covers them, and the action column
+   rises back above it. So a click anywhere — art, name, price, the gaps
+   between them — opens the skin, and only the button that does something else
+   is out of reach. Putting the cover *under* the contents instead left just the
+   leftover whitespace clickable, which is a target nobody can find. */
+.skins-row.is-openable {
+  position: relative;
+  cursor: pointer;
+}
+
+.skins-row.is-openable .skins-row-preview,
+.skins-row.is-openable .skins-row-meta {
+  position: relative;
+  z-index: 0;
+}
+
+.skins-row-open {
+  position: absolute;
+  z-index: 1;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  inset: 0;
+  cursor: pointer;
+}
+
+.skins-row-open:focus-visible {
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: -3px;
+}
+
+.skins-row-action {
+  position: relative;
+  z-index: 2;
+  /* Transparent to the pointer except where a control actually is, so the
+     empty half of this column still opens the skin like the rest of the row. */
+  pointer-events: none;
+}
+
+.skins-row-action > * {
+  pointer-events: auto;
+}
+
+/* Every row carrying a button turns the list into a wall of buttons, so the
+   action appears for the row you are actually pointing at. Reserved space
+   rather than none, so rows do not resize as the pointer crosses them. */
+.skins-row-cta {
+  opacity: 0;
+  transition: opacity 120ms ease, border-color 140ms ease, background-color 140ms ease;
+}
+
+.skins-row:hover .skins-row-cta,
+.skins-row:focus-within .skins-row-cta,
+.skins-row-cta:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  /* Nothing hovers on a touch screen, so the action is simply always there. */
+  .skins-row-cta {
+    opacity: 1;
+  }
+}
+
+.skins-row-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.skins-row-lock {
+  margin-right: 4px;
+  opacity: 0.75;
+  vertical-align: -1px;
+}
+
+/* Fixture poses paint at their own arena coordinates, so the canvas is larger
+   than the part worth showing and this window crops back to the snake. */
+.skins-preview-crop {
+  overflow: hidden;
+  flex: none;
+}
+
+.skins-preview-canvas {
+  display: block;
+}
+
+.skins-base-preview {
+  display: flex;
+  gap: 5px;
+}
+
+.skins-base-preview canvas {
+  display: block;
+  border: 1px solid #e1e3e7;
+  border-radius: 3px;
+}
+
+.skins-row-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.skins-row-name {
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.skins-row-byline {
+  color: rgb(63 63 65 / 50%);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* "Yours", and what standing it has. Blue because it is about you, and the
+   page uses blue for the things that are. */
+.skins-row-status {
+  align-self: flex-start;
+  border: 1px solid rgb(59 130 246 / 32%);
+  border-radius: 999px;
+  background: #eff6ff;
+  padding: 2px 8px;
+  color: var(--game-blue);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.skins-row-price {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.skins-row-price.is-priced {
+  color: #d49a00;
+}
+
+/* Equipped is a state, not an action, so it reads as a marker rather than a
+   button you could press. Mirrors the results card's promoted pill. */
+/* A statement of fact, not an offer.
+   Every button on this page is bordered, boxed and italic, so a badge wearing
+   any of those reads as something to press — and pressing the thing that says
+   "equipped" is the one action a row in this state has nothing to do with.
+   Upright blue text with no chrome at all says the same word and asks for
+   nothing, and the blue ties it to the rules bracketing the row. */
+.skins-equipped-badge {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  padding: 0 4px;
+  color: var(--game-blue);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+/* ---- Builder ---- */
+
+/* Not sticky, deliberately: `.home-page` sets `overflow-x: hidden`, which makes
+   it a scroll container, so a sticky child sticks to that rather than to the
+   viewport and simply scrolls away. A strip that claims to stay put and does
+   not is worse than one that plainly scrolls, so this scrolls — and the form
+   below is ordered with the most-changed controls first to compensate. */
+/* The sidebar: preview above layers, riding along with the scroll.
+
+   Both are things you consult *while* editing a field in the pane beside
+   them, so a preview you have to scroll back up to is not a preview of what
+   you are currently doing. It sticks below the header rather than to the very
+   top, and caps its own height so a long layer stack scrolls inside it
+   instead of pushing the preview off screen. */
+/* `.home-page` clips horizontally, and `overflow-x: hidden` silently coerces
+   `overflow-y` to `auto` — which makes that element the scroll container and
+   leaves `position: sticky` sticking to a box that never scrolls. `clip` does
+   the same clipping without creating a scroll container, so the window stays
+   the scroller and the sidebar can actually travel. Scoped to this page rather
+   than changed on `.home-page`, which every other route also uses. */
+.builder-page {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+.builder-sidebar {
+  display: flex;
+  position: sticky;
+  top: 18px;
+  flex-direction: column;
+  gap: 14px;
+  max-height: calc(100vh - 120px);
+  min-height: 0;
+}
+
+.builder-preview-panel {
+  display: flex;
+  position: relative;
+  flex: none;
+  flex-direction: column;
+  gap: 8px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px 16px 12px;
+}
+
+/* Chevron, picture, chevron. The picture takes the slack so the two arrows
+   stay put between slides — arrows that move as the content changes size read
+   as a different control each time. */
+/* The chevrons float over the slide rather than flanking it, so the pictures
+   get the panel's whole width — which is what lets four bodies read as four
+   lengths instead of four similar smudges. They sit in the corners the
+   artwork does not reach: the bodies are flush left and vary on the right, so
+   a disc at each edge, vertically centred, lands on background almost always
+   and on a tail or a head at worst. */
+/* No positioning context of its own: the chevrons sit in the *panel's*
+   corners, and a relative deck would quietly claim them and inset them by the
+   panel's padding as well. */
+.builder-deck {
+  display: flex;
+  min-height: 116px;
+  align-items: center;
+}
+
+.builder-slide {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Four lengths, stacked and left-aligned. Aligned left rather than centred
+   because the whole point of the slide is that the bodies are different
+   lengths, and centring them hides that behind a symmetrical outline. */
+.builder-slide.is-colours {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+/* Two short bodies stacked on the left, the zig-zag beside them on the
+   right — it is the tall one, so it spans both rows. */
+.builder-slide.is-shapes {
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  gap: 4px 10px;
+  grid-template-columns: auto auto;
+}
+
+.builder-slide.is-shapes > :nth-child(3) {
+  grid-area: 1 / 2 / 3 / 3;
+}
+
+.builder-chevron {
+  display: grid;
+  position: absolute;
+  z-index: 2;
+  bottom: 10px;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 50%;
+  /* A flat disc rather than a bare glyph. Over a preview the arrow alone had
+     nothing behind it and read as decoration; a wash gives it an edge without
+     borrowing the page's chrome, and it darkens on hover so the control says
+     it is one. */
+  background: rgb(31 41 55 / 22%);
+  color: #fff;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0;
+  place-items: center;
+  transition: background-color 120ms ease;
+}
+
+/* Tucked into the panel's own bottom corners, the same distance from the floor
+   as from the wall. Measured against the panel rather than the slide, because
+   the slide is inset by the panel's padding and "in the corner" means the
+   corner a reader can see. */
+.builder-chevron.is-prev {
+  left: 10px;
+}
+
+.builder-chevron.is-next {
+  right: 10px;
+}
+
+.builder-chevron:hover {
+  background: rgb(31 41 55 / 62%);
+}
+
+.builder-chevron:focus-visible {
+  background: rgb(31 41 55 / 62%);
+  outline: 2px solid var(--game-blue);
+  outline-offset: 2px;
+}
+
+.builder-dots {
+  display: flex;
+  justify-content: center;
+  gap: 5px;
+}
+
+.builder-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #d1d5db;
+}
+
+.builder-dots span.is-on {
+  background: var(--game-graphite);
+}
+
+.builder-preview-crop {
+  display: block;
+  overflow: hidden;
+}
+
+.builder-preview canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.builder-preview figcaption {
+  margin-top: 5px;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.builder-status {
+  width: min(100%, 72rem);
+  margin: 14px auto 0;
+  color: #16a34a;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+/* The save banner, pinned to the viewport.
+
+   The stack is long and the inspector is longer, so a Save at the end of the
+   document is one you have to go looking for. `Back` sits opposite it because
+   leaving and committing are the two ways out of this page, and they should
+   not be adjacent enough to hit the wrong one. */
+.builder-cta {
+  display: flex;
+  position: fixed;
+  z-index: 20;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 2px solid #d1d5db;
+  background: rgb(255 255 255 / 96%);
+  backdrop-filter: blur(6px);
+  padding: 10px max(16px, calc((100vw - 72rem) / 2));
+}
+
+.builder-cta-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 14px;
+}
+
+.builder-cta-actions {
+  display: flex;
+  gap: 9px;
+}
+
+/* Room for the banner, so the last control is not permanently under it. */
+.builder-page .builder-main {
+  padding-bottom: 76px;
+}
+
+.builder-form {
+  display: flex;
+  width: min(100%, 72rem);
+  flex-direction: column;
+  gap: 14px;
+  margin: 18px auto 0;
+}
+
+/* The layers panel and its inspector.
+
+   Two columns at desk width and one stacked column below it, with the stack
+   first either way: the stack is the map of the skin, and an inspector with
+   nothing selected explains nothing. */
+.builder-workbench {
+  display: grid;
+  width: min(100%, 72rem);
+  grid-template-columns: minmax(260px, 23rem) 1fr;
+  gap: 18px;
+  margin: 18px auto 0;
+  align-items: start;
+}
+
+.builder-stack,
+.builder-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px 16px 16px;
+}
+
+.builder-stack {
+  overflow-y: auto;
+}
+
+.builder-inspector {
+  gap: 14px;
+}
+
+.builder-inspector form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.builder-panel-title {
+  margin: 0 0 2px;
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.builder-layer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px 8px;
+  cursor: grab;
+}
+
+.builder-layer-row.is-selected {
+  border-color: var(--game-graphite);
+  background: #f8fafc;
+}
+
+.builder-layer-row.is-dragging {
+  opacity: 0.45;
+}
+
+/* An engine-owned layer. Shown because the stacking the panel draws has to be
+   the stacking that happens — a locked row is honest where an absent one
+   would quietly misrepresent what sits on top. */
+.builder-layer-row.is-system {
+  border-style: dashed;
+  background: #f9fafb;
+  cursor: default;
+}
+
+.builder-layer-name {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  border: 0;
+  background: none;
+  padding: 0;
+  text-align: left;
+  cursor: inherit;
+  font: inherit;
+}
+
+.builder-layer-name strong {
+  color: var(--game-graphite);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.builder-layer-name span {
+  color: rgb(63 63 65 / 50%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.builder-eye,
+.builder-icon-button {
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  padding: 2px 5px;
+  color: rgb(63 63 65 / 62%);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.builder-eye:hover,
+.builder-icon-button:hover {
+  background: #eef2f7;
+  color: var(--game-graphite);
+}
+
+.builder-eye.is-locked {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.builder-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+}
+
+/* An expression field: one value, two views. */
+.builder-field-expression .builder-field-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.builder-field-expression .builder-field-head > span:first-child {
+  flex: 1;
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+/* Where the value is worked out, shown beside the control that incurs it, so
+   cost is visible at the moment it is chosen rather than at save time. */
+.builder-site {
+  border-radius: 3px;
+  background: #eef2f7;
+  padding: 2px 5px;
+  color: rgb(63 63 65 / 62%);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.builder-fx {
+  border: 1px solid #9ca3af;
+  border-radius: 4px;
+  background: #fff;
+  padding: 2px 7px;
+  color: rgb(63 63 65 / 70%);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.builder-fx.is-on {
+  border-color: var(--game-graphite);
+  background: var(--game-graphite);
+  color: #fff;
+}
+
+.builder-fx:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.builder-expression-input {
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
+  padding: 7px 9px;
+  color: var(--game-graphite);
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.builder-field-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+
+.builder-field-toggle > span {
+  color: var(--game-graphite);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.builder-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px 10px 12px;
+}
+
+.builder-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.builder-list-head strong {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+/* The cost meter. Red at the ceiling is the same red the save produces, so an
+   author never discovers the budget at publish time. */
+.builder-cost {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 0 auto;
+  color: rgb(63 63 65 / 56%);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.builder-cost.is-over {
+  color: #b91c1c;
+}
+
+.builder-templates {
+  display: grid;
+  width: min(100%, 72rem);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin: 0 auto;
+}
+
+.builder-template {
+  display: flex;
+  /* The title sits at the top and the snake fills what is left, centred in it:
+     the card is a name and a specimen, and the specimen is the part being
+     chosen between. */
+  flex-direction: column;
+  min-height: 148px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 16px;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.builder-template:hover,
+.builder-template:focus-visible {
+  border-color: var(--game-graphite);
+}
+
+.builder-template strong {
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-style: italic;
+  font-weight: 950;
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+}
+
+/* The specimen. Full card width, cropped to the snake, and centred in whatever
+   room the title leaves — so three cards of different snake heights still line
+   their bodies up with each other. */
+.builder-template-preview {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: flex-start;
+  overflow: hidden;
+  width: 100%;
+  margin-top: 10px;
+}
+
+.builder-template-preview canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.builder-document {
+  width: min(100%, 72rem);
+  margin: 18px auto 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 12px 16px;
+}
+
+.builder-document summary {
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.builder-document form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.builder-note {
+  margin: 0;
+  color: rgb(63 63 65 / 50%);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 860px) {
+  .builder-workbench {
+    grid-template-columns: 1fr;
+  }
+}
+
+.builder-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  padding: 6px 16px 16px;
+}
+
+.builder-group legend {
+  padding: 0 7px;
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.builder-group-optional legend label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.builder-help {
+  margin: 0;
+  color: rgb(63 63 65 / 56%);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.builder-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.builder-field > span {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.builder-field small {
+  color: rgb(63 63 65 / 50%);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.builder-field input[type='text'],
+.builder-field select {
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
+  padding: 7px 9px;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 13px;
+}
+
+.builder-field input[type='text']:focus-visible,
+.builder-field select:focus-visible {
+  border-color: var(--game-blue);
+  outline: 3px solid rgb(59 130 246 / 34%);
+  outline-offset: 1px;
+}
+
+.builder-field input[type='color'] {
+  width: 52px;
+  height: 28px;
+  border: 1px solid #9ca3af;
+  border-radius: 5px;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.builder-number-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.builder-number-row input[type='range'] {
+  flex: 1;
+  accent-color: var(--game-blue);
+}
+
+.builder-number-row output {
+  min-width: 4ch;
+  color: var(--game-graphite);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.builder-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-left: 2px solid #e1e3e7;
+  padding-left: 12px;
+}
+
+.builder-list-label {
+  color: rgb(63 63 65 / 50%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+/* A colour and its swatch read better side by side than stacked. */
+.builder-group .builder-field-color {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.builder-group .builder-field-color > span {
+  min-width: 7rem;
+}
+
+/* ---- Admin review queue ---- */
+
+/* Sized so a reviewer sees the art first and the metadata second: the art is
+   the part no machine checked. */
+.admin-skin-queue {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  list-style: none;
+  overflow: hidden;
+}
+
+.admin-skin-queue li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid #e1e3e7;
+  padding: 10px 14px;
+}
+
+.admin-skin-queue li:last-child {
+  border-bottom: 0;
+}
+
+.admin-skin-preview canvas {
+  display: block;
+  border-radius: 3px;
+}
+
+.admin-skin-preview-missing {
+  display: inline-block;
+  padding: 24px 12px;
+  color: rgb(63 63 65 / 50%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.admin-skin-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.admin-skin-meta strong {
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.admin-skin-meta span {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.095em;
+  text-transform: uppercase;
+}
+
+.admin-skin-actions {
+  display: flex;
+  gap: 7px;
+}
+
+/* Taking a skin down reaches replays and everyone already wearing it, so it
+   must not look like the button beside it. */
+.admin-skin-actions .game-shell-button.is-destructive {
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+
+.admin-skin-actions .game-shell-button.is-destructive:hover:not(:disabled) {
+  border-color: var(--game-red);
+  background: #fef2f2;
+}
+
+/* A base row is two preview rectangles plus a name plus an action, which does
+   not fit across a 21rem rail. Stack the art over the meta rather than letting
+   the name wrap to one letter per line. */
+.skins-column-bases .skins-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'preview preview'
+    'meta action';
+  row-gap: 10px;
+  padding: 13px 16px;
+}
+
+.skins-column-bases .skins-row-preview {
+  grid-area: preview;
+}
+
+.skins-column-bases .skins-row-meta {
+  grid-area: meta;
+  justify-content: center;
+}
+
+.skins-column-bases .skins-row-action {
+  grid-area: action;
+  justify-self: end;
+}
+
+.skins-column-bases .skins-base-preview canvas {
+  width: 100%;
+  height: auto;
+}
+
+.skins-column-bases .skins-base-preview {
+  width: 100%;
+}
+
+.builder-preview-crop {
+  overflow: hidden;
+}
+
+.builder-preview-crop canvas {
+  display: block;
+}
+
+/* A colour pair is two swatches. Left stacked, eight of them sprawl down the
+   page as mostly-empty full-width rows; side by side they read as the pair
+   they are. */
+.builder-group .builder-group {
+  flex-flow: row wrap;
+  align-items: center;
+  gap: 10px 28px;
+  padding-bottom: 12px;
+}
+
+.builder-group .builder-group > legend {
+  flex-basis: 100%;
+}
+
+.builder-group .builder-field-color > span {
+  min-width: 0;
+}
+
+.admin-skin-crop {
+  overflow: hidden;
+  flex: none;
+}
+
+.admin-skin-crop canvas {
+  display: block;
+}
+
+/* Narrow: a wide snake, a name and an action do not fit across a phone. Stack
+   the art over the meta, the same way the base rail already does — a row that
+   squeezes the name column to nothing wraps it one letter per line. */
+@media (max-width: 700px) {
+  .skins-row,
+  .skins-column-bases .skins-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'preview preview'
+      'meta action';
+    row-gap: 10px;
+  }
+
+  .skins-row-preview {
+    grid-area: preview;
+  }
+
+  .skins-row-meta {
+    grid-area: meta;
+    justify-content: center;
+  }
+
+  .skins-row-action {
+    grid-area: action;
+    justify-self: end;
+  }
+
+  .skins-main,
+  .builder-main {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .builder-preview-strip {
+    gap: 14px 18px;
+  }
+}
+
+/* --- Texture picker --------------------------------------------------------
+   The one field that can create what it selects, and the one that has to show
+   what it is selecting: a texture is a picture, and a list of names is a list
+   of things you have to remember. */
+.texture-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* The trigger and its popover, so the popover hangs off the *button* rather
+   than off the whole control — anchored to the control it opened over the
+   prompt row below it. */
+.texture-picker-anchor {
+  position: relative;
+}
+
+.texture-picker-current {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--game-graphite);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px 6px 6px;
+  text-align: left;
+}
+
+.texture-picker-current:hover {
+  border-color: #9ca3af;
+}
+
+/* A square, and the art cropped to fill it: a coat is twelve times wider than
+   it is tall, so fitting one whole would be a hairline. */
+.texture-swatch {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 1px solid rgb(63 63 65 / 18%);
+  border-radius: 5px;
+  background: #f3f4f6;
+  object-fit: cover;
+}
+
+.texture-swatch.is-empty {
+  display: block;
+}
+
+.texture-picker-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.texture-picker-caret {
+  flex: none;
+  color: var(--game-muted);
+  font-size: 10px;
+}
+
+.texture-popover {
+  display: flex;
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  flex-direction: column;
+  gap: 6px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  background: var(--game-paper);
+  box-shadow: 4px 4px 0 rgb(63 63 65 / 14%);
+  padding: 8px;
+}
+
+.texture-popover-search {
+  width: 100%;
+  box-sizing: border-box;
+  border: 2px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 9px;
+}
+
+.texture-popover-search:focus {
+  border-color: var(--game-blue);
+  outline: none;
+}
+
+/* Capped and scrolling: the shipped art alone is seven rows, and an author
+   with a library would otherwise push the panel off the page. */
+.texture-popover-list {
+  display: flex;
+  max-height: 260px;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.texture-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--game-graphite);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 4px;
+  text-align: left;
+}
+
+.texture-option:hover {
+  background: #f1f5f9;
+}
+
+.texture-option.is-chosen {
+  background: #dbeafe;
+}
+
+.texture-option-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.texture-option-tag {
+  flex: none;
+  color: var(--game-blue);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.texture-popover-empty {
+  margin: 0;
+  color: var(--game-muted);
+  font-size: 12px;
+  padding: 12px 4px;
+  text-align: center;
+}
+
+.texture-picker-make {
+  display: flex;
+  min-height: 30px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.texture-picker-prompt {
+  min-width: 0;
+  flex: 1 1 150px;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--game-graphite);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+}
+
+.texture-picker-prompt:focus {
+  border-color: var(--game-blue);
+  outline: none;
+}
+
+/* A stage, not a spinner: the worker writes one per transition, so this can
+   say which of them the job is actually in. */
+.texture-picker-stage {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--game-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.texture-picker-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #dbeafe;
+  border-radius: 50%;
+  border-top-color: var(--game-blue);
+  animation: spin 850ms linear infinite;
+}
+
+.texture-picker-error {
+  margin: 0;
+  color: var(--game-red);
+  font-size: 12px;
+}
+
+/* The texture field is a div rather than a label (a label would forward its
+   clicks to the popover trigger), so its caption is styled by name. */
+.builder-field-caption {
+  color: var(--game-muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* --- The shop: wallet, skin page, and the spend confirmation ---------------
+   The match-break dialog's look, which is the house style for a modal: a white
+   wash rather than a grey scrim, a hard graphite border, and an offset shadow
+   with no blur. Restated rather than borrowed from `generate-*`, which is named
+   for what it generates — but the values come from there, and a change to one
+   should be a change to both. */
+.shop-backdrop {
+  position: fixed;
+  z-index: 9998;
+  inset: 0;
+  display: grid;
+  animation: ad-break-backdrop-in 160ms ease-out both;
+  backdrop-filter: blur(9px);
+  background: rgb(248 250 252 / 92%);
+  padding: 20px;
+  place-items: center;
+  -webkit-backdrop-filter: blur(9px);
+}
+
+.shop-dialog {
+  display: flex;
+  position: relative;
+  box-sizing: border-box;
+  max-height: calc(100dvh - 40px);
+  flex-direction: column;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  animation: ad-break-dialog-in 180ms ease-out both;
+  background: var(--game-paper);
+  box-shadow: 8px 8px 0 rgb(63 63 65 / 16%);
+  outline: none;
+  padding: 26px 26px 22px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.shop-dialog.is-wallet {
+  width: min(100%, 430px);
+}
+
+.shop-dialog.is-skin {
+  width: min(100%, 640px);
+}
+
+.shop-dialog.is-get {
+  width: min(100%, 380px);
+}
+
+.shop-kicker {
+  color: rgb(63 63 65 / 52%);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.shop-dialog h2 {
+  margin: 2px 0 14px;
+  color: var(--game-graphite);
+  font-size: 26px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.shop-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: rgb(63 63 65 / 55%);
+  font-size: 21px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.shop-close:hover {
+  background: rgb(63 63 65 / 8%);
+  color: var(--game-graphite);
+}
+
+/* --- Wallet --- */
+.shop-balance {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fffdf6;
+  padding: 14px 16px;
+}
+
+.shop-balance strong {
+  color: #b57c05;
+  font-size: 27px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.shop-balance span {
+  color: rgb(63 63 65 / 55%);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.shop-shortfall {
+  margin: 12px 0 0;
+  border-left: 3px solid var(--game-blue);
+  padding-left: 11px;
+  color: rgb(63 63 65 / 78%);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.shop-shortfall strong {
+  color: var(--game-graphite);
+}
+
+.shop-error {
+  margin: 12px 0 0;
+  border-left: 3px solid #dc2626;
+  padding-left: 11px;
+  color: #b91c1c;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.shop-packs {
+  display: grid;
+  margin: 16px 0 0;
+  padding: 0;
+  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  list-style: none;
+}
+
+.shop-pack {
+  display: flex;
+  position: relative;
+  width: 100%;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  border: 2px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 13px 8px 11px;
+  cursor: pointer;
+  transition: border-color 140ms ease, transform 140ms ease;
+}
+
+.shop-pack:hover:not(:disabled) {
+  border-color: #f5b81c;
+  transform: translateY(-1px);
+}
+
+.shop-pack:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.shop-pack.is-enough {
+  border-color: #f5b81c;
+}
+
+.shop-pack-bux {
+  color: #b57c05;
+  font-size: 17px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.shop-pack-price {
+  color: var(--game-graphite);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.shop-pack-flag {
+  position: absolute;
+  top: -8px;
+  right: 8px;
+  border-radius: 999px;
+  background: #f5b81c;
+  padding: 2px 7px;
+  color: #4a3200;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.shop-note {
+  margin: 14px 0 0;
+  color: rgb(63 63 65 / 50%);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* --- A skin's own page --- */
+.skin-shots {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px;
+}
+
+.skin-shot {
+  display: flex;
+  margin: 0;
+  align-items: center;
+  gap: 14px;
+}
+
+.skin-shot-crop {
+  display: block;
+  flex: none;
+  overflow: hidden;
+}
+
+.skin-shot canvas {
+  display: block;
+}
+
+.skin-shot figcaption {
+  color: rgb(63 63 65 / 45%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.skin-stats {
+  display: grid;
+  margin: 14px 0 0;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.skin-stats div {
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.skin-stats dt {
+  color: rgb(63 63 65 / 48%);
+  font-size: 8.5px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.skin-stats dd {
+  display: flex;
+  margin: 3px 0 0;
+  align-items: center;
+  gap: 5px;
+  color: var(--game-graphite);
+  font-size: 13px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.skin-stat-price {
+  color: #b57c05;
+}
+
+.skin-actions {
+  display: flex;
+  margin-top: 16px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.skin-cta {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 18px;
+  font-size: 11px;
+}
+
+/* --- Spending --- */
+.get-preview {
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid #e1e3e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 12px;
+}
+
+.get-sums {
+  margin: 15px 0 0;
+}
+
+.get-sums div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+}
+
+.get-sums dt {
+  color: rgb(63 63 65 / 60%);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.get-sums dd {
+  display: flex;
+  margin: 0;
+  align-items: center;
+  gap: 5px;
+  color: var(--game-graphite);
+  font-size: 14px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.get-sums dd.is-cost {
+  color: #b45309;
+}
+
+.get-sums-total {
+  border-top: 1px solid #e1e3e7;
+  margin-top: 2px;
+}
+
+.get-actions {
+  display: flex;
+  margin-top: 16px;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.get-actions .game-shell-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+}
+
+/* --- The receipt --- */
+.skin-toast {
+  display: flex;
+  position: fixed;
+  z-index: 9999;
+  bottom: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 9px;
+  border: 2px solid var(--game-graphite);
+  border-radius: 8px;
+  animation: skin-toast-in 220ms ease-out both;
+  background: var(--game-paper);
+  box-shadow: 5px 5px 0 rgb(63 63 65 / 16%);
+  padding: 11px 16px;
+  color: var(--game-graphite);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.skin-toast-tick {
+  color: #15803d;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+@keyframes skin-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 14px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skin-toast {
+    animation: none;
+    transform: translateX(-50%);
+  }
+}
+
+@media (max-width: 620px) {
+  .skin-stats {
+    grid-template-columns: 1fr;
+  }
+
+  .shop-packs {
+    grid-template-columns: 1fr;
+  }
 }

@@ -1273,6 +1273,18 @@ async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_i
         }
     };
 
+    // A first-class skin is named by id and resolved to the hash of the exact
+    // bytes this player is wearing, so what travels into everyone's renderer is
+    // a specific revision rather than a name whose meaning could change later.
+    if let Some(skin_id) = requested
+        .as_deref()
+        .and_then(crate::skin_store::equipped_skin_id)
+        && let Some(reference) = resolve_authored_skin(db, skin_id, user_id).await
+    {
+        game_state.set_player_skin(user_id, Some(reference));
+        return;
+    }
+
     let resolved = crate::skin_catalog::resolve_skin_ref(requested.as_deref());
     if requested.is_some() && !crate::skin_catalog::is_known(requested.as_deref().unwrap_or("")) {
         tracing::info!(
@@ -1282,6 +1294,43 @@ async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_i
         );
     }
     game_state.set_player_skin(user_id, Some(resolved.to_string()));
+}
+
+/// Resolve one player-authored skin to the content reference they wear.
+///
+/// Returns `None` for anything that should fall back to classic: a skin that
+/// has been disabled, a draft belonging to someone else, or a lookup that
+/// failed. Every one of those is a cosmetic outcome, never a reason to fail a
+/// match.
+async fn resolve_authored_skin(db: &dyn Database, skin_id: i32, user_id: u32) -> Option<String> {
+    let skin = match db.get_skin(skin_id).await {
+        Ok(Some(skin)) => skin,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(user_id, skin_id, %error, "could not read an authored skin");
+            return None;
+        }
+    };
+
+    let reference = skin.content_ref_for(Some(user_id as i32))?.to_string();
+
+    // Wearing a revision into a match publishes its bytes by necessity —
+    // opponents have to fetch it to draw it — so that exposure is recorded
+    // rather than inferred. The write is conditional and one-way, so this
+    // costs nothing after the first match a revision appears in.
+    let revision = if skin.creator_user_id == user_id as i32 {
+        skin.head_revision
+    } else {
+        skin.published_revision.unwrap_or(skin.head_revision)
+    };
+    if let Err(error) = db
+        .mark_revision_exposed(skin_id, revision, chrono::Utc::now().timestamp_millis())
+        .await
+    {
+        tracing::debug!(skin_id, revision, %error, "could not record skin exposure");
+    }
+
+    Some(reference)
 }
 
 async fn prepare_game_from_lobbies(

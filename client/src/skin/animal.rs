@@ -266,6 +266,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         // and the rim is the only thing here that does.
         swatch: outline.to_string(),
         accent: recipe.coat.to_string(),
+        extra: Vec::new(),
     };
 
     // Nothing about this family varies with the clock: a coat is a coat. One
@@ -288,9 +289,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         ramp_opacity: GRADIENT_MAX_OPACITY,
         wave_phase_turns: 0.0,
         time_turns: 0.0,
-        layer_opacity: Vec::new(),
-        scalars: Vec::new(),
-        literals: Vec::new(),
+        params: Vec::new(),
     }];
 
     let mut layers = document_layers(
@@ -306,7 +305,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
     // patch stamped on the fur, so they go. What remains above the coat is the
     // ramp — which lightens the marks rather than covering them, and is still
     // the direction cue — and the dark core.
-    layers.retain(|layer| !matches!(layer.id, "head-cap" | "head-highlight"));
+    layers.retain(|layer| !matches!(layer.id.as_ref(), "head-cap" | "head-highlight"));
 
     // Rasterise the contour in one pass. `radius` is exactly half `line_width`,
     // so a run's round cap and a joint disc are the *same* circle — and painting
@@ -722,7 +721,7 @@ mod tests {
         for recipe in RECIPES {
             let engine = AnimalSkin(recipe).engine();
             let layers = engine.layers();
-            let ids: Vec<&str> = layers.iter().map(|layer| layer.id).collect();
+            let ids: Vec<&str> = layers.iter().map(|layer| layer.id.as_ref()).collect();
 
             assert_eq!(
                 ids,
@@ -742,7 +741,7 @@ mod tests {
             assert_eq!(coat.region, Region::Body, "{}", recipe.id);
             assert!(coat.omit_on_single_cell, "{}", recipe.id);
             assert!(
-                coat.opacity_track.is_none(),
+                coat.opacity.is_const(1.0),
                 "{}: the coat is opaque; an opacity track would blend it with \
                  the fill it is supposed to replace",
                 recipe.id
@@ -921,6 +920,7 @@ mod tests {
                             .cells,
                         cell_size: 12.0,
                         boost_active: false,
+                        seed: 0.0,
                         detail_scale: 1.0,
                         anim_ms,
                         reduced_motion,

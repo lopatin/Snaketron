@@ -26,6 +26,9 @@ path = "src/bin/trace_rca.rs"
 test = false
 
 [dependencies]
+# One validator for both sides: the server accepts a document only if the same
+# code the Builder runs in wasm accepts it.
+skin-schema = { path = "../skin-schema" }
 common = { path = "../common" }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
@@ -46,7 +49,11 @@ thiserror = "1"
 dotenv = "0.15"
 once_cell = "1"
 url = "2"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+# Pixels. PNG only, and no default codecs: a texture route that will decode
+# anything a filename suggests is a decoder-CVE surface, and the format is
+# already fixed by the schema.
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
@@ -65,7 +72,11 @@ flate2 = "1.0"
 rand = "0.8"
 rustrict = { version = "0.7.38", default-features = false, features = ["censor"] }
 # HTTP API dependencies
-axum = { version = "0.7", features = ["tokio", "ws"] }
+#  is for the texture upload route: a PNG part plus its metadata
+# is the one place the API takes bytes rather than JSON.
+# `multipart` is for the texture upload route: a PNG part beside its metadata
+# is the one place this API takes bytes rather than JSON.
+axum = { version = "0.7", features = ["tokio", "ws", "multipart"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Password hashing

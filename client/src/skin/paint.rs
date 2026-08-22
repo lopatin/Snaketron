@@ -398,6 +398,9 @@ impl OpRecorder {
         // Path bounds accumulate in device space, exactly as canvas bakes the
         // transform into each point as it is added.
         let mut path: Option<(f64, f64, f64, f64)> = None;
+        // The same path without the stroke allowance, for the consumers that
+        // do not stroke it.
+        let mut filled_path: Option<(f64, f64, f64, f64)> = None;
         let mut extent: Option<(f64, f64, f64, f64)> = None;
 
         for op in &self.ops {
@@ -454,11 +457,16 @@ impl OpRecorder {
                         f: *f,
                     }
                 }
-                PaintOp::BeginPath => path = None,
+                PaintOp::BeginPath => {
+                    path = None;
+                    filled_path = None;
+                }
                 PaintOp::Clip => {
                     // A clip with no path clips everything away; canvas treats
                     // an empty path as an empty region, and so do we.
-                    let region = path.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    // A clip is the region the path encloses, not the region a
+                    // pen tracing it would cover.
+                    let region = filled_path.unwrap_or((0.0, 0.0, 0.0, 0.0));
                     state.clip = Some(match state.clip {
                         None => region,
                         Some(existing) => {
@@ -472,15 +480,27 @@ impl OpRecorder {
             let Some(local) = op.painted_bounds(state.line_width * state.ctm.max_stretch()) else {
                 continue;
             };
-            // A stroke's half-width is already in device units above, so the
-            // path point itself is the only thing left to map.
-            let device = match op {
+            // A bare path point is grown by half a line width, because a
+            // *stroke* of it reaches that far. A fill or a clip does not — the
+            // region is the path itself — so the two are tracked apart and the
+            // consumer picks. Growing both was a quiet over-estimate that only
+            // became visible when a `move_to` was added to start a disc's
+            // subpath: the point sits exactly on the circle the arc already
+            // contributes, and the clip appeared to grow by half a pixel
+            // without anything moving.
+            let (device, exact) = match op {
                 PaintOp::MoveTo(x, y) | PaintOp::LineTo(x, y) => {
                     let (dx, dy) = state.ctm.apply(*x, *y);
                     let half = state.line_width * state.ctm.max_stretch() / 2.0;
-                    (dx - half, dy - half, dx + half, dy + half)
+                    (
+                        (dx - half, dy - half, dx + half, dy + half),
+                        (dx, dy, dx, dy),
+                    )
                 }
-                _ => state.ctm.map_bounds(local),
+                _ => {
+                    let mapped = state.ctm.map_bounds(local);
+                    (mapped, mapped)
+                }
             };
 
             // Path-building ops contribute to the path, which only reaches the
@@ -496,6 +516,23 @@ impl OpRecorder {
                     py1.max(device.3),
                 ),
             });
+            filled_path = Some(match filled_path {
+                None => exact,
+                Some((px0, py0, px1, py1)) => (
+                    px0.min(exact.0),
+                    py0.min(exact.1),
+                    px1.max(exact.2),
+                    py1.max(exact.3),
+                ),
+            });
+
+            // `move_to` lays down no ink under any consumer — a stroke is
+            // bounded by the segments and arcs that follow it, a fill and a
+            // clip by the region they enclose. It still moves the path bounds
+            // above, because a later segment starts there.
+            if matches!(op, PaintOp::MoveTo(_, _)) {
+                continue;
+            }
 
             let Some(visible) = (match state.clip {
                 None => Some(device),
@@ -931,6 +968,11 @@ mod tests {
             ctx.scale(3.0, 3.0).unwrap();
             ctx.set_line_width(2.0);
             ctx.move_to(10.0, 0.0);
+            // A segment rather than the bare `move_to` this used to probe
+            // with: a move lays down no ink, so measuring one was measuring
+            // the model rather than the picture. The subject is unchanged —
+            // whether the transform scales the pen as well as the point.
+            ctx.line_to(10.0, 0.0);
         }
         // The point lands at x=30, and the 2px stroke is 6px wide there.
         assert_eq!(recorder.painted_extent(), Some((27.0, -3.0, 33.0, 3.0)));

@@ -26,6 +26,13 @@ pub struct AuthState {
     /// unchanged. Emitting is always non-blocking and drops under pressure, so
     /// an auth handler never waits on it.
     pub analytics: Option<AnalyticsHandle>,
+    /// Where texture pixels live, when a deployment stores any.
+    ///
+    /// The upload route needs it: it puts the bytes away and records a job
+    /// naming their digest, so the worker reads from the store rather than
+    /// being handed megabytes through a queue. `None` is a deployment that
+    /// accepts no textures, and the route says so rather than half-working.
+    pub texture_store: Option<Arc<dyn crate::texture_store::TextureStore>>,
 }
 
 /// Everything an HTTP handler needs to emit an analytics event.
@@ -88,6 +95,16 @@ pub struct UserInfo {
     pub is_guest: bool,
     #[serde(rename = "isAdmin")]
     pub is_admin: bool,
+    /// What this player is wearing.
+    ///
+    /// Carried here rather than behind its own request because the client needs
+    /// it on the very first paint — the Skins page has to know which row is
+    /// already equipped, and the arena has to know what to draw before the
+    /// player touches anything.
+    #[serde(rename = "selectedSkin", skip_serializing_if = "Option::is_none")]
+    pub selected_skin: Option<String>,
+    #[serde(rename = "selectedBase", skip_serializing_if = "Option::is_none")]
+    pub selected_base: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,6 +363,8 @@ pub async fn register(
         mmr: user.mmr,
         is_guest: false,
         is_admin,
+        selected_skin: user.selected_skin,
+        selected_base: user.selected_base,
     };
 
     // Generate JWT token
@@ -400,6 +419,8 @@ pub async fn login(
         mmr: user.mmr,
         is_guest: false,
         is_admin,
+        selected_skin: user.selected_skin,
+        selected_base: user.selected_base,
     };
 
     // Generate JWT token
@@ -460,6 +481,8 @@ pub async fn get_current_user(
         mmr: user.mmr,
         is_guest: user.is_guest,
         is_admin,
+        selected_skin: user.selected_skin,
+        selected_base: user.selected_base,
     };
 
     // Build response with cache-control headers to prevent caching

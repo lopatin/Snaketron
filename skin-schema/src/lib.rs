@@ -11,7 +11,14 @@
 //! choice. Validation is where that line is enforced.
 
 pub mod color;
+pub mod content;
+pub mod describe;
+pub mod describe_v2;
 pub mod expr;
+pub mod generate;
+pub mod ring;
+pub mod sampler;
+pub mod v2;
 
 use color::{ENEMY_HUES, FRIENDLY_HUES, HueWindow, NEUTRAL_CHROMA, Rgb, contrast_ratio};
 use serde::{Deserialize, Serialize};
@@ -49,11 +56,39 @@ pub const READY_CHECK_INK: &str = "#ffffff";
 /// can possibly see instead of sampling and hoping.
 pub const ANIMATION_STEPS: usize = 32;
 
+/// Bounds the editor's controls share with the validator.
+///
+/// These were literals inside `validate` until the Skin Builder needed sliders
+/// over the same ranges. Naming them is what stops a control from offering a
+/// value the server then refuses.
+pub const MIN_HEAD_CORE_RATIO: f64 = 0.05;
+pub const MAX_HEAD_CORE_RATIO: f64 = 0.5;
+pub const MIN_ANIMATION_PERIOD_MS: f64 = 120.0;
+pub const MAX_ANIMATION_PERIOD_MS: f64 = 60_000.0;
+pub const MIN_WAVE_CELLS_PER_CREST: f64 = 1.0;
+pub const MAX_WAVE_CELLS_PER_CREST: f64 = 64.0;
+/// Peak deviation for any animated value. A bigger swing stops reading as a
+/// shimmer and starts changing what the skin *is*.
+pub const MAX_ANIMATION_AMPLITUDE: f64 = 0.35;
+
 /// One body colour and its contour.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColorPair {
     pub fill: String,
     pub outline: String,
+    /// A third colour for whatever this skin's signature element is.
+    ///
+    /// The renderer has always had an accent slot — it is why Ember's head
+    /// glow can be per-role — and no document could set it, so every document
+    /// skin's accent was silently its fill. That is the shape of problem this
+    /// whole schema exists to remove.
+    ///
+    /// It is the answer to "can a literal differ per side": literals are one
+    /// colour for everyone by design, and a colour that must flip with the
+    /// side is not a literal, it is a palette entry. Absent means the fill,
+    /// which is exactly what every existing document already gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
 }
 
 /// Colours for every role the renderer can resolve.
@@ -208,7 +243,7 @@ pub struct CelebrationTheme {
 /// over by loosening the rule for everyone.
 ///
 /// New skins get the strict rule. This list should never grow.
-const LIT_LABEL_EXEMPT: &[&str] = &["classic-doc@1"];
+pub(crate) const LIT_LABEL_EXEMPT: &[&str] = &["classic-doc@1"];
 
 /// Effect ids the client knows how to draw.
 pub const KNOWN_EFFECTS: &[&str] = &["goal-impact-wave"];
@@ -399,7 +434,7 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
         )));
     }
 
-    if !(0.05..=0.5).contains(&doc.head.core_ratio) {
+    if !(MIN_HEAD_CORE_RATIO..=MAX_HEAD_CORE_RATIO).contains(&doc.head.core_ratio) {
         check(Err(SkinDocError::new(
             "head.core_ratio",
             "must be between 0.05 and 0.5 of a cell",
@@ -422,7 +457,7 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
     check(parse("head.gradient.color", &doc.head.gradient.color).map(|_| ()));
 
     if let Some(animation) = &doc.animation {
-        if !(120.0..=60_000.0).contains(&animation.period_ms) {
+        if !(MIN_ANIMATION_PERIOD_MS..=MAX_ANIMATION_PERIOD_MS).contains(&animation.period_ms) {
             check(Err(SkinDocError::new(
                 "animation.period_ms",
                 "must be between 120ms and 60000ms — faster reads as a flicker",
@@ -435,14 +470,16 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
             )));
         }
         if let Some(wave) = &animation.wave {
-            if !(1.0..=64.0).contains(&wave.cells_per_crest) {
+            if !(MIN_WAVE_CELLS_PER_CREST..=MAX_WAVE_CELLS_PER_CREST)
+                .contains(&wave.cells_per_crest)
+            {
                 check(Err(SkinDocError::new(
                     "animation.wave.cells_per_crest",
                     "must be between 1 and 64 cells; below one cell the wave \
                      lands between pixels and reads as noise",
                 )));
             }
-            if !(0.0..=0.35).contains(&wave.amplitude) {
+            if !(0.0..=MAX_ANIMATION_AMPLITUDE).contains(&wave.amplitude) {
                 check(Err(SkinDocError::new(
                     "animation.wave.amplitude",
                     "must be between 0 and 0.35; a bigger swing stops reading \
@@ -459,7 +496,7 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
             }
         }
         for (index, track) in animation.tracks.iter().enumerate() {
-            if !(0.0..=0.35).contains(&track.amplitude) {
+            if !(0.0..=MAX_ANIMATION_AMPLITUDE).contains(&track.amplitude) {
                 check(Err(SkinDocError::new(
                     format!("animation.tracks[{index}].amplitude"),
                     "must be between 0 and 0.35; a bigger swing changes what \
@@ -725,6 +762,75 @@ pub fn validate(doc: &SkinDoc) -> Result<(), Vec<SkinDocError>> {
     } else {
         Err(errors)
     }
+}
+
+/// Hue-window and parse checks for a palette, used by `v2::validate_v2`.
+///
+/// Deliberately *not* refactored out of v1's `validate`, whose interleaved
+/// hue/contrast walk is byte-pinned by its own tests: v1 keeps its closed-world
+/// analytic checks, and v2 keeps only the part that is still analytic in an
+/// open world — the windows. Contrast in v2 is the sampler's job, computed
+/// from the composite rather than from the structure.
+pub(crate) fn validate_palette_hues(palette: &RolePalette, errors: &mut Vec<SkinDocError>) {
+    let mut check_pair = |field: &str, pair: &ColorPair, window: Option<(HueWindow, &str)>| {
+        if let Some((window, side)) = window {
+            for (part, hex) in [("fill", &pair.fill), ("outline", &pair.outline)] {
+                if let Err(error) = require_hue(&format!("{field}.{part}"), hex, window, side) {
+                    errors.push(error);
+                }
+            }
+        }
+        for (part, hex) in [("fill", &pair.fill), ("outline", &pair.outline)] {
+            if let Err(error) = parse(&format!("{field}.{part}"), hex) {
+                errors.push(error);
+            }
+        }
+        // The accent is deliberately not hue-windowed. It is a signature
+        // element — a glow, a stripe, an eye — and pinning it to the side's
+        // hue would make every skin's signature the same colour as its body.
+        // What stops a gold accent from making a friendly snake read as an
+        // enemy is how much of the body it covers, which is the sampler's
+        // question and not a per-colour one.
+        if let Some(accent) = &pair.accent
+            && let Err(error) = parse(&format!("{field}.accent"), accent)
+        {
+            errors.push(error);
+        }
+    };
+
+    check_pair(
+        "palette.friendly[0]",
+        &palette.friendly[0],
+        Some((FRIENDLY_HUES, "friendly")),
+    );
+    check_pair(
+        "palette.friendly[1]",
+        &palette.friendly[1],
+        Some((FRIENDLY_HUES, "friendly")),
+    );
+    check_pair(
+        "palette.enemy[0]",
+        &palette.enemy[0],
+        Some((ENEMY_HUES, "enemy")),
+    );
+    check_pair(
+        "palette.enemy[1]",
+        &palette.enemy[1],
+        Some((ENEMY_HUES, "enemy")),
+    );
+    // Free-for-all slots 0 and 1 double as the spectated blue and red sides.
+    check_pair(
+        "palette.free_for_all[0]",
+        &palette.free_for_all[0],
+        Some((FRIENDLY_HUES, "friendly")),
+    );
+    check_pair(
+        "palette.free_for_all[1]",
+        &palette.free_for_all[1],
+        Some((ENEMY_HUES, "enemy")),
+    );
+    check_pair("palette.free_for_all[2]", &palette.free_for_all[2], None);
+    check_pair("palette.free_for_all[3]", &palette.free_for_all[3], None);
 }
 
 /// The ink a label gets when a document does not name one.

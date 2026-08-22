@@ -49,6 +49,14 @@ pub struct User {
     /// as an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_skin: Option<String>,
+    /// The team base this player has chosen, if any.
+    ///
+    /// Base dressing is viewer-attributed: it themes the arena the owner is
+    /// looking at and never reaches another player's screen, so unlike
+    /// `selected_skin` this one is read by the client and never published into
+    /// game state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_base: Option<String>,
 }
 
 /// The verified, server-side view of a CrazyGames identity.  None of these

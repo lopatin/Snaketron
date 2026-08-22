@@ -325,7 +325,14 @@ jobs:
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          # Pinned, not `latest`. wasm-pack moved from rustwasm/ to
+          # wasm-bindgen/, so the action's lookup of the latest release now
+          # gets a 301 it does not follow, silently falls back to its built-in
+          # default of v0.9.1 — a 2020 release — and that wasm-opt cannot parse
+          # what rustc 1.97 emits. The job then fails with "error in parsing
+          # input" from a toolchain nobody asked for. Release downloads still
+          # redirect, so the old path resolves this version fine.
+          version: 'v0.15.0'
 
       - name: Setup Node
         uses: actions/setup-node@v4

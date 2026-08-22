@@ -17,6 +17,7 @@ import {
   readCrazyGamesPreferences,
 } from '../services/crazyGamesPreferences';
 import { gameStorage, subscribeGameStorage } from '../services/gameStorage';
+import { adoptServerEquipment } from '../utils/skinPreference';
 import { CrazyGamesAccountException } from '../services/crazyGames';
 import { useCrazyGames } from './CrazyGamesContext';
 import {
@@ -488,7 +489,13 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         return;
       }
       try {
-        setUser(await api.getCurrentUser());
+        const currentUser = await api.getCurrentUser();
+        setUser(currentUser);
+        // The account is the authority on what this player is wearing: it is
+        // what match preparation reads and hands to every other player. A stale
+        // local choice would leave the picker disagreeing with what opponents
+        // actually see, so the account wins on load.
+        adoptServerEquipment(currentUser);
       } catch (error) {
         console.error('Failed to fetch current user:', error);
         const status = isApiError(error) ? error.response.status : undefined;

@@ -23,6 +23,7 @@ import IdleWarningBanner from './IdleWarningBanner';
 import LoadingScreen from './LoadingScreen';
 import TutorialModal from './TutorialModal';
 import { readSkinPreference } from '../utils/skinPreference';
+import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import { buildMatchPresentation, simulationStartMs } from '../utils/gamePresentation';
 import { crazyGames } from '../services/crazyGames';
 import {
@@ -536,6 +537,15 @@ export default function GameArena() {
       crazyGames.loadingStop();
     }
   }, [currentGameLoadFailure, isGameObservationActive]);
+
+  // Anyone in this match wearing a player-authored skin is named by the hash of
+  // their document rather than by a catalogue id, so those documents have to be
+  // fetched and compiled before that snake can paint as anything but classic.
+  // Cheap to re-run: everything already registered or already failed is skipped.
+  const wornSkins = (committedState ?? gameState)?.skins;
+  useEffect(() => {
+    ensureAuthoredSkins(wornSkins);
+  }, [wornSkins]);
 
   const platformGameType = useMemo(() => {
     const gameType = (gameState ?? committedState)?.game_type;

@@ -24,6 +24,79 @@
 #![allow(dead_code)]
 
 use crate::skin::space::{ClipShape, CornerPolicy};
+use std::borrow::Cow;
+
+/// A number a layer paints with: fixed at registration, or looked up per
+/// baked frame.
+///
+/// This is the compositor's *single* mechanism for "a value that may vary with
+/// the clock". It replaces three ad-hoc ones that grew up alongside each other
+/// — `opacity_track`, `radius_track`, and the head ramp's own
+/// `ramp_opacity`/`wave` pair — each of which animated exactly the one property
+/// somebody needed at the time.
+///
+/// Unifying them is what makes a *document* able to animate anything
+/// (`specs/skin-layer-documents-prd.md` section 11): the compiler lowers every
+/// expression the same way, and does not need a renderer change per property.
+/// It also keeps the cost model honest, because the two cases are exactly the
+/// two costs — a `Param` is one table slot per step and a lookup per frame, a
+/// `Const` is nothing at all.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Binding {
+    Const(f64),
+    /// Index into the baked frame's parameter table. One slot per step,
+    /// resolved with a lookup.
+    Param(usize),
+    /// Evaluated once per snake per frame.
+    ///
+    /// The third tier exists because `len`, `boost` and `seed` are constant
+    /// for a whole snake-frame but *not* constant at registration, so neither
+    /// of the other two can carry them: folding freezes a boost-reactive layer
+    /// at "not boosting", and baking into the per-step table would give every
+    /// snake in the match one body length and one seed.
+    Snake(std::sync::Arc<skin_schema::expr::Expr>),
+}
+
+impl Binding {
+    pub const ZERO: Self = Self::Const(0.0);
+    pub const ONE: Self = Self::Const(1.0);
+
+    /// The value at one baked frame, for one snake.
+    ///
+    /// A `Param` missing from the table falls back rather than panicking.
+    /// Registration rejects such a stack, so this is unreachable in practice —
+    /// but a cosmetic must never be able to kill a frame, and that rule is
+    /// worth more here than a louder failure.
+    pub fn get(&self, params: &[f64], env: &skin_schema::expr::Env, fallback: f64) -> f64 {
+        match self {
+            Binding::Const(value) => *value,
+            Binding::Param(index) => params.get(*index).copied().unwrap_or(fallback),
+            Binding::Snake(expr) => expr.eval(env),
+        }
+    }
+
+    pub fn as_const(&self) -> Option<f64> {
+        match self {
+            Binding::Const(value) => Some(*value),
+            Binding::Param(_) | Binding::Snake(_) => None,
+        }
+    }
+
+    /// Whether this is exactly the given constant.
+    ///
+    /// Emission asks this before writing an op: a layer whose opacity is the
+    /// constant 1 emits no `globalAlpha` at all, which is precisely why
+    /// classic's op stream is unchanged by this mechanism existing.
+    pub fn is_const(&self, value: f64) -> bool {
+        self.as_const() == Some(value)
+    }
+}
+
+impl From<f64> for Binding {
+    fn from(value: f64) -> Self {
+        Binding::Const(value)
+    }
+}
 
 /// Where a layer is allowed to paint.
 ///
@@ -82,26 +155,47 @@ pub enum ColorSlot {
 /// `overhang_px` reads. Both claims are machine-checked rather than asserted:
 /// the recorder replays the transform stack, so the `TransformLiar` skin in
 /// `skin::conformance` fails the overhang check exactly as a real skin would.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayerTransform {
-    pub translate: (f64, f64),
-    pub scale: (f64, f64),
-    pub rotate_turns: f64,
+    pub translate: (Binding, Binding),
+    pub scale: (Binding, Binding),
+    pub rotate_turns: Binding,
 }
 
 impl Default for LayerTransform {
     fn default() -> Self {
         Self {
-            translate: (0.0, 0.0),
-            scale: (1.0, 1.0),
-            rotate_turns: 0.0,
+            translate: (Binding::ZERO, Binding::ZERO),
+            scale: (Binding::ONE, Binding::ONE),
+            rotate_turns: Binding::ZERO,
         }
     }
 }
 
 impl LayerTransform {
+    /// Whether this transform can be skipped entirely.
+    ///
+    /// A bound field is never identity even if it happens to hold identity
+    /// values at some step: the op has to be emitted at *every* step or the
+    /// op sequence would change with the clock, which is the one thing
+    /// `skin_conformance_animation_only_varies_paint_arguments` forbids.
     pub fn is_identity(&self) -> bool {
-        *self == Self::default()
+        self.translate.0.is_const(0.0)
+            && self.translate.1.is_const(0.0)
+            && self.scale.0.is_const(1.0)
+            && self.scale.1.is_const(1.0)
+            && self.rotate_turns.is_const(0.0)
+    }
+
+    /// Every binding in this transform, for validation and cost accounting.
+    pub fn bindings(&self) -> [&Binding; 5] {
+        [
+            &self.translate.0,
+            &self.translate.1,
+            &self.scale.0,
+            &self.scale.1,
+            &self.rotate_turns,
+        ]
     }
 }
 
@@ -212,11 +306,16 @@ impl Fit {
 }
 
 /// A gradient stop in body space.
+///
+/// Offset and alpha are bindings, which is what makes a travelling shine one
+/// layer rather than a schema feature: the crest is a stop whose offset reads
+/// the clock. The stop *count* stays static, because that is what decides how
+/// many `addColorStop` calls the frame makes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stop {
-    pub offset: f64,
+    pub offset: Binding,
     pub color: ColorSlot,
-    pub alpha: f64,
+    pub alpha: Binding,
 }
 
 /// What fills a span.
@@ -257,7 +356,7 @@ pub enum Source {
         /// How much of each period is painted, `0..1`.
         duty: f64,
         /// Half-width across the body, `0..0.5`.
-        half_width: f64,
+        half_width: Binding,
         /// Where the band sits across the body, `-0.5..0.5`. `0.0` is the
         /// centreline, which is what a single band wants; a checkerboard's two
         /// rows sit either side of it.
@@ -266,7 +365,11 @@ pub enum Source {
         /// reached past the silhouette could paint over the Boost band, and
         /// keeping the bound declarative is what lets `validate_layers` catch
         /// it at registration instead of a pixel validator catching it never.
-        t_center: f64,
+        ///
+        /// Bound rather than fixed, so a band can slide across the body — but
+        /// the bound is then checked against every baked step, not just the
+        /// resting one.
+        t_center: Binding,
         /// Offset of the first repeat along the body, in cells. Tiles are
         /// otherwise pinned to absolute multiples of `period_cells` from the
         /// head, so without this two bands can only ever be in phase.
@@ -293,6 +396,28 @@ pub enum Source {
         /// wrong. Sampling instead costs one extra blit per repeat, always,
         /// which keeps the count a property of the skin and not of the moment.
         drift_cells: f64,
+    },
+    /// Letters along the body, one per cell.
+    ///
+    /// Lowered to the same `drawImage` every other bitmap source uses — the
+    /// glyph strip is an atlas region and a character is a sub-rect of it — so
+    /// text needs no new op, no font machinery and no measuring.
+    ///
+    /// What it does need is for the *count* to stay a property of the pose:
+    /// one blit per covered cell, with the string repeating rather than the
+    /// span stretching to hold it. A layer that emitted one blit per character
+    /// would change its op count when an author typed, which is exactly what
+    /// static topology forbids — and it would do so silently, since typing is
+    /// not an action anybody associates with a frame budget.
+    Text {
+        /// The bundled glyph strip.
+        region: usize,
+        color: ColorSlot,
+        /// One atlas index per character, resolved at registration so the paint
+        /// loop never searches a charset.
+        glyphs: std::sync::Arc<Vec<usize>>,
+        /// How much of a cell a letter fills, `0..1`.
+        scale: f64,
     },
 }
 
@@ -354,7 +479,11 @@ impl Fade {
 /// op stream as the painter it replaces.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
-    pub id: &'static str,
+    /// What this layer is called. `Cow` because first-party skins name their
+    /// layers with literals and documents name theirs at runtime — a borrowed
+    /// id costs an author-written skin nothing, and an owned one is what lets
+    /// a compiled document report errors against the name its author chose.
+    pub id: Cow<'static, str>,
     pub region: Region,
     pub clip: ClipShape,
     pub kind: LayerKind,
@@ -368,9 +497,10 @@ pub struct Layer {
     /// difference between a documented rule and an accident of lowering
     /// (`specs/skin-shading-prd.md` section 15).
     pub omit_on_single_cell: bool,
-    /// Index into the baked frame's per-layer opacity table, when the layer's
-    /// opacity is animated. `None` means fully opaque and never touched.
-    pub opacity_track: Option<usize>,
+    /// The layer's opacity. [`Binding::ONE`] means fully opaque, and emits no
+    /// `globalAlpha` op at all — which is why adding this mechanism left every
+    /// existing skin's op stream untouched.
+    pub opacity: Binding,
 }
 
 /// The geometry a layer covers, and how it is emitted.
@@ -399,16 +529,30 @@ pub enum LayerKind {
         /// built the way it always has been.
         rgb: (u8, u8, u8),
         length_cells: f64,
+        /// The painted opacity of one cell, as a function of `s` (its distance
+        /// from the head, in cells) and `time`.
+        ///
+        /// The ramp is the one place the compositor already walks cells, so it
+        /// is the one place a *per-cell* expression is affordable — which is
+        /// why a travelling wave lives here and nowhere else.
+        ///
+        /// Note this is the **final** opacity, not a peak the renderer then
+        /// applies a falloff to. The legacy path hard-codes a linear falloff
+        /// with the wave added *after* it; making the whole curve the
+        /// expression's business is what turns "the head glow" from a fixed
+        /// shape with two knobs into something an author can actually reshape.
+        /// `None` keeps the legacy pairing of the frame's `ramp_opacity` with
+        /// the skin's configured wave; `Some` supersedes both, and is what a
+        /// compiled document always emits.
+        opacity: Option<std::sync::Arc<skin_schema::expr::Expr>>,
     },
     /// A disc centred on the head cell.
     HeadDisc {
         paint: DiscPaint,
-        /// Radius as a fraction of one cell. `0.5` is the head cap.
-        radius_ratio: f64,
-        /// Index into the baked frame's scalar table, when the radius is
-        /// animated. The topology is still static — the same disc is painted
-        /// every frame, at a different size.
-        radius_track: Option<usize>,
+        /// Radius as a fraction of one cell. `0.5` is the head cap. Bound
+        /// values keep the topology static — the same disc every frame, at a
+        /// different size.
+        radius: Binding,
     },
     /// Rectangles in body space across a span.
     Span {
@@ -465,10 +609,11 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skin_schema::expr::Env;
 
     fn ribbon(region: Region, extra: f64) -> Layer {
         Layer {
-            id: "test",
+            id: "test".into(),
             region,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Ribbon {
@@ -483,7 +628,7 @@ mod tests {
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: false,
-            opacity_track: None,
+            opacity: Binding::ONE,
         }
     }
 
@@ -518,10 +663,39 @@ mod tests {
         assert!(LayerTransform::default().is_identity());
         assert!(
             !LayerTransform {
-                translate: (0.0, 0.1),
+                translate: (Binding::ZERO, Binding::Const(0.1)),
                 ..LayerTransform::default()
             }
             .is_identity()
         );
+    }
+
+    /// A bound field is never the identity, even where it currently holds
+    /// identity values. Emission depends on this: a transform skipped at one
+    /// step and emitted at another would change the op sequence with the
+    /// clock, which is exactly what conformance forbids.
+    #[test]
+    fn a_bound_transform_is_never_skipped_however_it_evaluates() {
+        let bound = LayerTransform {
+            translate: (Binding::Param(0), Binding::ZERO),
+            ..LayerTransform::default()
+        };
+        assert!(!bound.is_identity());
+        assert_eq!(bound.translate.0.get(&[0.0], &Env::default(), 0.0), 0.0);
+    }
+
+    /// The neutral constant is what suppresses an op; a bound value never
+    /// does, and a missing parameter falls back rather than panicking,
+    /// because a cosmetic may not be able to kill a frame.
+    #[test]
+    fn a_binding_reads_its_table_and_survives_a_missing_slot() {
+        assert!(Binding::ONE.is_const(1.0));
+        assert!(!Binding::Param(0).is_const(1.0));
+        assert_eq!(
+            Binding::Param(1).get(&[0.2, 0.7], &Env::default(), 1.0),
+            0.7
+        );
+        assert_eq!(Binding::Param(9).get(&[0.2], &Env::default(), 1.0), 1.0);
+        assert_eq!(Binding::Const(0.4).get(&[], &Env::default(), 1.0), 0.4);
     }
 }
