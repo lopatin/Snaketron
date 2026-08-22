@@ -515,14 +515,39 @@ async def test_prototype_retry_sends_literal_human_feedback_in_journaled_prompt(
     updated = await factory._prototype(child)
     assert updated["stage"] == Stage.PROTOTYPE_TRIAGE
     prompt = image.calls[0]["prompt"]
+    behavior = json.loads(child["behavior_json"])
+    assert prompt.startswith("GEOMETRY — HIGHEST PRIORITY\n")
+    assert len(prompt) < 5_000
+    assert prompt.index("GEOMETRY — HIGHEST PRIORITY") < prompt.index("CREATIVE BRIEF")
+    assert prompt.index("CREATIVE BRIEF") < prompt.index("SHARED SKIN DESIGN RULES")
+    assert prompt.index("SHARED SKIN DESIGN RULES") < prompt.index("HUMAN RETRY CORRECTIONS")
+    assert prompt.index("HUMAN RETRY CORRECTIONS") < prompt.index("RETURN ONE PROTOTYPE IMAGE")
     assert canonical_json([correction]) in prompt
-    assert "Locked Skin Design Guidelines" in prompt
+    assert "exactly 16 columns x 1 row of square occupancy cells" in prompt
+    assert "Every logical cell is square: 3x3 px in the native renderer." in prompt
+    assert "complete native body is exactly 48x3 px" in prompt
+    assert "attached 4x reference" in prompt
+    assert "12x12 px and the body is exactly" in prompt
+    assert "192x12 px" in prompt
+    assert "A cell is a measurement only. Do not draw the grid" in prompt
+    assert "rightmost one-cell\n  position is the rounded head" in prompt
+    assert "left endpoint is the rounded tail" in prompt
+    assert (
+        "This is the fixed prototype review pose. Use exactly this length and\n"
+        "  silhouette. Do not depict any alternative live length."
+    ) in prompt
+    assert "rightmost 1.5 cells—the head zone—as one readable tonal field" in prompt
     assert "Keep one continuous thin rounded snake body." in prompt
-    assert '"id":"prototype-geometry-test-v1"' in prompt
-    assert "Treat its white capsule as the only paintable snake" in prompt
-    assert "Your response supplies material for a deterministic renderer-mask" in prompt
-    assert "clip it through the exact native capsule mask" in prompt
-    assert "Do not create gaps, articulated modules, diamonds, plates" in prompt
+    assert f"Pinned authority: sha256:{behavior['design_guidelines_sha']}" in prompt
+    assert "Downstream-only SkinDoc implementation detail" not in prompt
+    assert "Bright, legible, playful snakes." not in prompt
+    assert '"renderer_source"' not in prompt
+    assert "foreground_detection" not in prompt
+    assert "canonical texel density" not in prompt
+    assert "texel" not in prompt.lower()
+    assert "four-cell spawn" not in prompt
+    assert "spawn" not in prompt.lower()
+    assert "compressed" not in prompt.lower()
     with database.connect() as connection:
         operation = dict(
             connection.execute(
@@ -536,18 +561,76 @@ async def test_prototype_retry_sends_literal_human_feedback_in_journaled_prompt(
     assert retained_request["prompt"] == prompt
     assert retained_request["aspect_ratio"] == "16:9"
     assert retained_request["image_size"] == "2K"
+    assert retained_request["prompt_contract"] == {
+        "id": "prototype-image-prompt-v2",
+        "design_guidelines_sha256": behavior["design_guidelines_sha"],
+        "prototype_geometry_sha256": behavior["prototype_geometry_sha"],
+        "prototype_guide_sha256": behavior["prototype_guide_sha"],
+    }
+    assert operation["idempotency_key"] == f"{child['id']}:prototype:0:prototype-image-prompt-v2"
     assert retained_request["references"] == [
         {
-            "content_hash": f"sha256:{json.loads(child['behavior_json'])['prototype_guide_sha']}",
+            "content_hash": f"sha256:{behavior['prototype_guide_sha']}",
             "contract_id": "prototype-geometry-test-v1",
-            "contract_sha256": json.loads(child["behavior_json"])["prototype_geometry_sha"],
+            "contract_sha256": behavior["prototype_geometry_sha"],
             "media_type": "image/png",
-            "object_ref": json.loads(child["behavior_json"])["prototype_guide_ref"],
+            "object_ref": behavior["prototype_guide_ref"],
             "role": "strict_snake_body_geometry_guide",
         }
     ]
     assert image.calls[0]["references"] == [("image/png", objects.get(retained_request["references"][0]["object_ref"]))]
+    source = database.artifacts_for_attempt(child["id"], stage=Stage.PROTOTYPE, kind=ArtifactKind.PROVIDER_RESPONSE)[0]
+    assert json.loads(source["metadata_json"])["prompt_contract"] == retained_request["prompt_contract"]
+    assert json.loads(source["provenance_json"])["prompt_contract"] == retained_request["prompt_contract"]
     await factory.close()
+
+
+def test_prototype_prompt_dimensions_fail_closed_when_body_cells_are_not_square(factory_config) -> None:
+    contract = json.loads(factory_config.paths.prototype_geometry.read_text(encoding="utf-8"))
+    values = Factory._prototype_geometry_prompt_values(contract)
+
+    assert values == {
+        "contract_id": "prototype-geometry-test-v1",
+        "body_cells": 16,
+        "native_cell_px": 3,
+        "native_body_width": 48,
+        "native_body_height": 3,
+        "presentation_scale": 4,
+        "presentation_cell_px": 12,
+        "presentation_body_width": 192,
+        "presentation_body_height": 12,
+    }
+
+    contract["prototype_projection"]["mapping"]["native_body_bbox_px"][2] -= 1
+    with pytest.raises(ValueError, match="not exactly body_cells by one square cell"):
+        Factory._prototype_geometry_prompt_values(contract)
+
+
+@pytest.mark.parametrize(
+    ("guidelines", "message"),
+    [
+        ("no prompt boundary", "must have one prototype-image rules boundary"),
+        (
+            "<!-- PROTOTYPE_IMAGE_RULES:START -->one"
+            "<!-- PROTOTYPE_IMAGE_RULES:START -->two"
+            "<!-- PROTOTYPE_IMAGE_RULES:END -->",
+            "must have one prototype-image rules boundary",
+        ),
+        (
+            "<!-- PROTOTYPE_IMAGE_RULES:START -->   <!-- PROTOTYPE_IMAGE_RULES:END -->",
+            "prototype-image rules are empty",
+        ),
+        (
+            "<!-- PROTOTYPE_IMAGE_RULES:END -->rules<!-- PROTOTYPE_IMAGE_RULES:START -->",
+            "prototype-image rules boundary is malformed",
+        ),
+    ],
+)
+def test_prototype_image_rules_fail_closed_on_missing_duplicate_empty_or_reversed_markers(
+    guidelines: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Factory._prototype_image_rules(guidelines)
 
 
 def test_asset_retry_prompt_safely_delimits_literal_human_feedback() -> None:

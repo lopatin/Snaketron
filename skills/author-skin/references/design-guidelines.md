@@ -7,6 +7,8 @@ the intent bold; apply it through the actual SkinDoc v2 and renderer contract.
 If a requested look needs geometry the pinned capability manifest does not
 provide, return `platform_gap` rather than pretending the renderer supports it.
 
+<!-- PROTOTYPE_IMAGE_RULES:START -->
+
 ## Creative direction
 
 - Skins may be fun, weird, or silly. Commit confidently to one artistic
@@ -18,6 +20,15 @@ provide, return `platform_gap` rather than pretending the renderer supports it.
 - A hybrid implementation may combine image and procedural layers without
   becoming a mixed visual style. The layers should serve the same artistic
   direction.
+- For the prototype image, apply that one direction only inside the exact
+  attached body guide. Return one flat orthographic snake, without UI, text,
+  scenery, framing, alternate concepts, or a montage.
+- Keep the rightmost 1.5 cells—the head zone—as one readable tonal field that
+  preserves the small system head core instead of competing with it.
+- Use bold, seamless shapes that survive at native scale. Avoid details, lines,
+  or gaps narrower than one fifth of a cell.
+
+<!-- PROTOTYPE_IMAGE_RULES:END -->
 
 ## Thin, growing body at real game scale
 

@@ -24,6 +24,8 @@ ASSET_KINDS = {"coat", "sheet", "overlay"}
 AXES = {"x", "y"}
 DESIGN_GUIDELINE_START = "<!-- SKIN_DESIGN_LOCKED:START -->"
 DESIGN_GUIDELINE_END = "<!-- SKIN_DESIGN_LOCKED:END -->"
+PROTOTYPE_IMAGE_RULES_START = "<!-- PROTOTYPE_IMAGE_RULES:START -->"
+PROTOTYPE_IMAGE_RULES_END = "<!-- PROTOTYPE_IMAGE_RULES:END -->"
 DESIGN_GUIDELINE_KEYS = {
     "artistic_direction",
     "concept_twist",
@@ -212,6 +214,24 @@ def validate_boundaries(errors: list[str]) -> None:
         errors,
         contract.count("<!-- FACTORY_LOCKED:START -->") == 1 and contract.count("<!-- FACTORY_LOCKED:END -->") == 1,
         "contract must have one locked boundary",
+    )
+    add(
+        errors,
+        guidelines.count(PROTOTYPE_IMAGE_RULES_START) == 1
+        and guidelines.count(PROTOTYPE_IMAGE_RULES_END) == 1,
+        "design guidelines must have one prototype-image rules boundary",
+    )
+    rules_start = guidelines.find(PROTOTYPE_IMAGE_RULES_START)
+    rules_end = guidelines.find(PROTOTYPE_IMAGE_RULES_END)
+    add(errors, rules_start < rules_end, "prototype-image rules markers are out of order")
+    rules = guidelines[rules_start + len(PROTOTYPE_IMAGE_RULES_START) : rules_end].strip()
+    add(errors, bool(rules), "prototype-image rules must not be empty")
+    locked_start = guidelines.find(DESIGN_GUIDELINE_START)
+    locked_end = guidelines.find(DESIGN_GUIDELINE_END)
+    add(
+        errors,
+        locked_start < rules_start < rules_end < locked_end,
+        "prototype-image rules must remain inside the locked design guidelines",
     )
     for required_safety_term in (
         "protected marks",
