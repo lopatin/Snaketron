@@ -2620,6 +2620,35 @@ mod exhaustiveness {
 mod tests {
     use super::*;
 
+    #[test]
+    fn numeric_anchors_use_rusts_exact_externally_tagged_shape() {
+        let cases = [
+            (AnchorV2::Whole, serde_json::json!("whole")),
+            (AnchorV2::Head, serde_json::json!("head")),
+            (AnchorV2::Tail, serde_json::json!("tail")),
+            (
+                AnchorV2::At { at: 1.0 },
+                serde_json::json!({ "at": { "at": 1.0 } }),
+            ),
+            (
+                AnchorV2::Fraction { fraction: 0.5 },
+                serde_json::json!({ "fraction": { "fraction": 0.5 } }),
+            ),
+        ];
+
+        for (anchor, expected) in cases {
+            assert_eq!(serde_json::to_value(anchor).expect("serializes"), expected);
+            assert_eq!(
+                serde_json::from_value::<AnchorV2>(expected).expect("deserializes"),
+                anchor
+            );
+        }
+        assert!(serde_json::from_value::<AnchorV2>(serde_json::json!({ "at": 1.0 })).is_err());
+        assert!(
+            serde_json::from_value::<AnchorV2>(serde_json::json!({ "fraction": 0.5 })).is_err()
+        );
+    }
+
     fn classic_v1() -> SkinDoc {
         serde_json::from_str(include_str!("../skins/classic.skin.json"))
             .expect("the shipped classic document parses")

@@ -29,6 +29,49 @@ def private_json(path: Path, value: dict[str, str]) -> None:
     path.chmod(0o600)
 
 
+class JsonResponse:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode()
+
+    def __enter__(self) -> JsonResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def model_opener(
+    launcher: ModuleType,
+    *,
+    loaded: dict[str, bool],
+    loaded_alias: str | None = None,
+    advertised: bool = True,
+):
+    model = launcher.DEFAULT_WORKER_MODEL
+
+    class Opener:
+        def open(self, request: urllib.request.Request, timeout: int) -> JsonResponse:
+            assert timeout == 10
+            if request.full_url == f"{launcher.WORKER_ENDPOINT}/models":
+                entries = [{"id": model}, {"id": "other/downloaded-model"}] if advertised else []
+                return JsonResponse({"data": entries})
+            assert request.full_url == launcher.LMSTUDIO_MODELS_ENDPOINT
+            instances = ([{"id": loaded_alias}] if loaded_alias else []) + ([{"id": model}] if loaded["exact"] else [])
+            return JsonResponse(
+                {
+                    "models": [
+                        {"key": model, "loaded_instances": instances},
+                        {"key": "other/downloaded-model", "loaded_instances": [{"id": "other/loaded-model"}]},
+                    ]
+                }
+            )
+
+    return Opener()
+
+
 def test_runtime_state_is_checkout_isolated_stable_and_private(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     launcher = load_launcher()
     repository = tmp_path / "repo"
@@ -532,6 +575,223 @@ def test_runtime_config_uses_isolated_mutable_state_and_exact_worker_model(
     assert value["paths"]["objects"] == "var/local-runtime/factory-data/objects"
     assert value["paths"]["lama_model"] == "var/lama/big-lama-v0.1.0.pt"
     assert stat.S_IMODE(runtime.stat().st_mode) == 0o600
+
+
+def test_worker_model_preflight_reuses_exact_loaded_instance_without_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    launcher = load_launcher()
+    state = {"exact": True}
+    monkeypatch.setattr(
+        launcher.urllib.request, "build_opener", lambda *_handlers: model_opener(launcher, loaded=state)
+    )
+    monkeypatch.setattr(
+        launcher.shutil,
+        "which",
+        lambda name: pytest.fail(f"loaded model must not resolve or invoke CLI: {name}"),
+    )
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("loaded model must not invoke lms load"),
+    )
+
+    model = launcher.detect_worker_model({}, None)
+    launcher.ensure_worker_model_loaded({}, model)
+
+    assert model == launcher.DEFAULT_WORKER_MODEL
+
+
+def test_worker_model_preflight_loads_only_missing_exact_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+    state = {"exact": False}
+    service = {"LMSTUDIO_API_KEY": "private-local-key"}
+    calls: list[list[str]] = []
+    monkeypatch.setenv("LMSTUDIO_API_KEY", "inherited-key-must-be-scrubbed")
+    monkeypatch.setattr(
+        launcher.urllib.request,
+        "build_opener",
+        lambda *_handlers: model_opener(
+            launcher,
+            loaded=state,
+            loaded_alias="existing-alias",
+            advertised=False,
+        ),
+    )
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/opt/lmstudio/lms" if name == "lms" else None)
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        assert kwargs["check"] is False
+        assert kwargs["capture_output"] is True
+        assert kwargs["timeout"] == launcher.LMSTUDIO_LOAD_TIMEOUT_SECONDS
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert "LMSTUDIO_API_KEY" not in environment
+        assert "unload" not in command
+        state["exact"] = True
+        return subprocess.CompletedProcess(command, 0, "loaded", "")
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+
+    model = launcher.detect_worker_model(service, None)
+    launcher.ensure_worker_model_loaded(service, model)
+
+    assert calls == [
+        [
+            "/opt/lmstudio/lms",
+            "load",
+            launcher.DEFAULT_WORKER_MODEL,
+            "--identifier",
+            launcher.DEFAULT_WORKER_MODEL,
+            "--yes",
+        ]
+    ]
+
+
+def test_worker_model_preflight_accepts_concurrent_load_after_cli_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    launcher = load_launcher()
+    state = {"exact": False}
+    monkeypatch.setattr(
+        launcher.urllib.request, "build_opener", lambda *_handlers: model_opener(launcher, loaded=state)
+    )
+    monkeypatch.setattr(launcher.shutil, "which", lambda _name: "/opt/lmstudio/lms")
+
+    def raced(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        state["exact"] = True
+        return subprocess.CompletedProcess(command, 17, "", "already loaded")
+
+    monkeypatch.setattr(launcher.subprocess, "run", raced)
+
+    launcher.ensure_worker_model_loaded({}, launcher.DEFAULT_WORKER_MODEL)
+
+
+def test_worker_model_preflight_fails_early_with_exact_command_when_cli_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+    state = {"exact": False}
+    monkeypatch.setattr(
+        launcher.urllib.request, "build_opener", lambda *_handlers: model_opener(launcher, loaded=state)
+    )
+    monkeypatch.setattr(launcher.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("missing CLI must not invoke a subprocess"),
+    )
+
+    with pytest.raises(launcher.SetupRequired) as captured:
+        launcher.ensure_worker_model_loaded({}, launcher.DEFAULT_WORKER_MODEL)
+
+    assert launcher.worker_load_instruction(launcher.DEFAULT_WORKER_MODEL) in str(captured.value)
+    assert "installed but not loaded" in str(captured.value)
+
+
+def test_worker_model_preflight_refuses_to_guess_when_loaded_state_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+
+    class UnavailableOpener:
+        def open(self, request: urllib.request.Request, timeout: int) -> JsonResponse:
+            assert request.full_url == launcher.LMSTUDIO_MODELS_ENDPOINT
+            assert timeout == 10
+            raise urllib.error.URLError("injected management API failure")
+
+    monkeypatch.setattr(launcher.urllib.request, "build_opener", lambda *_handlers: UnavailableOpener())
+    monkeypatch.setattr(launcher.shutil, "which", lambda _name: "/opt/lmstudio/lms")
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("unknown loaded state must not invoke lms load"),
+    )
+
+    with pytest.raises(launcher.SetupRequired) as captured:
+        launcher.ensure_worker_model_loaded({}, launcher.DEFAULT_WORKER_MODEL)
+
+    message = str(captured.value)
+    assert "refusing to guess" in message
+    assert launcher.worker_load_instruction(launcher.DEFAULT_WORKER_MODEL) in message
+
+
+def test_worker_model_preflight_refuses_malformed_target_loaded_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    launcher = load_launcher()
+
+    class MalformedOpener:
+        def open(self, request: urllib.request.Request, timeout: int) -> JsonResponse:
+            assert request.full_url == launcher.LMSTUDIO_MODELS_ENDPOINT
+            assert timeout == 10
+            return JsonResponse({"models": [{"key": launcher.DEFAULT_WORKER_MODEL, "loaded_instances": "unknown"}]})
+
+    monkeypatch.setattr(launcher.urllib.request, "build_opener", lambda *_handlers: MalformedOpener())
+    monkeypatch.setattr(launcher.shutil, "which", lambda _name: "/opt/lmstudio/lms")
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("malformed loaded state must not invoke lms load"),
+    )
+
+    with pytest.raises(launcher.SetupRequired) as captured:
+        launcher.ensure_worker_model_loaded({}, launcher.DEFAULT_WORKER_MODEL)
+
+    message = str(captured.value)
+    assert "invalid loaded-instance state" in message
+    assert launcher.worker_load_instruction(launcher.DEFAULT_WORKER_MODEL) in message
+
+
+def test_worker_model_preflight_reports_exact_retry_when_cli_does_not_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = load_launcher()
+    state = {"exact": False}
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        launcher.urllib.request,
+        "build_opener",
+        lambda *_handlers: model_opener(launcher, loaded=state),
+    )
+    monkeypatch.setattr(launcher.shutil, "which", lambda _name: "/opt/lmstudio/lms")
+
+    def refused(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 9, "", "resource guardrail refused load")
+
+    monkeypatch.setattr(launcher.subprocess, "run", refused)
+
+    with pytest.raises(launcher.SetupRequired) as captured:
+        launcher.ensure_worker_model_loaded({}, launcher.DEFAULT_WORKER_MODEL)
+
+    message = str(captured.value)
+    assert len(calls) == 1
+    assert "lms exit 9" in message
+    assert launcher.worker_load_instruction(launcher.DEFAULT_WORKER_MODEL) in message
+    assert "resource guardrail refused load" in message
+
+
+def test_worker_model_preflight_bounds_cli_load_and_reports_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    launcher = load_launcher()
+    state = {"exact": False}
+    monkeypatch.setattr(
+        launcher.urllib.request,
+        "build_opener",
+        lambda *_handlers: model_opener(launcher, loaded=state),
+    )
+    monkeypatch.setattr(launcher.shutil, "which", lambda _name: "/opt/lmstudio/lms")
+
+    def times_out(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs["timeout"]
+        assert timeout == launcher.LMSTUDIO_LOAD_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(launcher.subprocess, "run", times_out)
+
+    with pytest.raises(launcher.SetupRequired) as captured:
+        launcher.ensure_worker_model_loaded({}, launcher.DEFAULT_WORKER_MODEL)
+
+    message = str(captured.value)
+    assert f"timed out after {launcher.LMSTUDIO_LOAD_TIMEOUT_SECONDS}s" in message
+    assert launcher.worker_load_instruction(launcher.DEFAULT_WORKER_MODEL) in message
 
 
 def test_first_paid_cycle_requires_prototype_review_before_recording(

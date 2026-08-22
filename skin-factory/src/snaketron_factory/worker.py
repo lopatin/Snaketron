@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import ValidationError
@@ -96,6 +97,24 @@ class SkillBundle:
 
 class WorkerAdapter(Protocol):
     async def execute(self, request: WorkerRequest) -> ProviderResult: ...
+
+
+def _is_exact_lmstudio_model_unloaded(response: httpx.Response) -> bool:
+    if response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return payload == {"error": "Model unloaded."}
+
+
+def _is_loopback_endpoint(base_url: str) -> bool:
+    try:
+        endpoint = urlsplit(base_url)
+    except ValueError:
+        return False
+    return endpoint.scheme == "http" and endpoint.hostname in {"127.0.0.1", "::1", "localhost"}
 
 
 class OpenAICompatibleWorker:
@@ -189,7 +208,7 @@ the deterministic factory driver.
         except httpx.ConnectError as error:
             raise ProviderError(ProviderFailureKind.UNAVAILABLE, f"task worker unavailable: {error}") from error
         except httpx.TimeoutException as error:
-            known = isinstance(error, (httpx.ConnectTimeout, httpx.PoolTimeout))
+            known = isinstance(error, httpx.ConnectTimeout | httpx.PoolTimeout)
             raise ProviderError(
                 ProviderFailureKind.TIMEOUT,
                 f"task worker timeout: {error}",
@@ -203,7 +222,15 @@ the deterministic factory driver.
             ) from error
         request_id = response.headers.get("x-request-id")
         if not response.is_success:
-            if response.status_code == 429:
+            lmstudio_model_unloaded = _is_loopback_endpoint(self.base_url) and _is_exact_lmstudio_model_unloaded(
+                response
+            )
+            if lmstudio_model_unloaded:
+                # LM Studio rejected the request before inference because the
+                # selected local model instance is absent. This is a known-safe
+                # availability failure, not malformed model output.
+                kind = ProviderFailureKind.UNAVAILABLE
+            elif response.status_code == 429:
                 kind = ProviderFailureKind.QUOTA
             elif response.status_code == 408 or response.status_code >= 500:
                 kind = ProviderFailureKind.UNAVAILABLE
@@ -218,7 +245,8 @@ the deterministic factory driver.
                 # retry-looking response therefore cannot prove the model did
                 # not already perform the generation.
                 outcome_known=(
-                    response.status_code != 429 and response.status_code != 408 and response.status_code < 500
+                    lmstudio_model_unloaded
+                    or (response.status_code != 429 and response.status_code != 408 and response.status_code < 500)
                 ),
                 request_id=request_id,
             )

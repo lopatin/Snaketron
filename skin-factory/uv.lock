@@ -1148,7 +1148,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=11,<13" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.50,<2" },
     { name = "playwright", marker = "extra == 'production'", specifier = ">=1.50,<2" },
-    { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
     { name = "pyyaml", specifier = ">=6.0,<7" },

@@ -89,6 +89,8 @@ REQUIRED_FILES = {
     "templates/asset-request.json",
     "templates/implementation-plan.json",
     "templates/skin-v2.template.json",
+    "fixtures/worker-drafts/skin-anchor.externally-tagged.valid.json",
+    "fixtures/worker-drafts/skin-anchor.flattened.invalid.json",
 }
 
 PLAN_KEYS = {
@@ -1223,6 +1225,7 @@ def validate_package() -> list[str]:
 def run_cargo_validation() -> int:
     paths = [PACKAGE / "templates/skin-v2.template.json"]
     paths.extend(sorted((PACKAGE / "fixtures").glob("*/skin.skin.json")))
+    paths.append(PACKAGE / "fixtures/worker-drafts/skin-anchor.externally-tagged.valid.json")
     command = [
         "cargo",
         "run",
@@ -1234,7 +1237,35 @@ def run_cargo_validation() -> int:
         "--",
         *(str(path) for path in paths),
     ]
-    return subprocess.run(command, cwd=REPO, check=False).returncode
+    accepted = subprocess.run(command, cwd=REPO, check=False)
+    if accepted.returncode != 0:
+        return accepted.returncode
+
+    invalid = PACKAGE / "fixtures/worker-drafts/skin-anchor.flattened.invalid.json"
+    rejected = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "skin-schema",
+            "--bin",
+            "validate-skin",
+            "--",
+            str(invalid),
+        ],
+        cwd=REPO,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if rejected.returncode != 1 or "expected struct variant" not in rejected.stderr:
+        print(
+            "validate-skin did not reject flattened numeric anchors at the Rust enum boundary",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def main() -> int:

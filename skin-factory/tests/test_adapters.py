@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import warnings
 from typing import Any
 
 import httpx
 import pytest
+from jsonschema import Draft202012Validator
+from jsonschema import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
 
 from snaketron_factory.config import FactoryConfig, ModelRole
@@ -82,7 +85,40 @@ def worker_result() -> WorkerResult:
                 "asset_strategy": "Procedural layers require no raster seams.",
             },
         ),
-        skin_document={"schema_version": 2, "name": "test", "layers": []},
+        skin_document={
+            "schema_version": 2,
+            "id": "adapter-test@1",
+            "name": "Adapter test",
+            "palette": {
+                "friendly": [
+                    {"fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa"},
+                    {"fill": "#3c8dde", "outline": "#286eae", "accent": "#a8cdf2"},
+                ],
+                "enemy": [
+                    {"fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82"},
+                    {"fill": "#e34e5b", "outline": "#a92f3a", "accent": "#f2b75f"},
+                ],
+                "free_for_all": [
+                    {"fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa"},
+                    {"fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82"},
+                    {"fill": "#93a3b5", "outline": "#5d6e81", "accent": "#d1dae5"},
+                    {"fill": "#f7b731", "outline": "#a87d1f", "accent": "#ffe08a"},
+                ],
+            },
+            "period_ms": 2400,
+            "head_core": {"ratio": 0.38, "color": "#333333"},
+            "layers": [
+                {
+                    "name": "Body",
+                    "type": "ribbon",
+                    "region": "body",
+                    "color": {"slot": "fill"},
+                    "extra_px": 0,
+                    "joints": True,
+                    "tail_cap": True,
+                }
+            ],
+        },
         tool_requests=[],
         trace=[{"step": "planned"}],
         usage={"reasoning_tokens": 12},
@@ -112,6 +148,215 @@ def worker_request(**overrides: Any) -> WorkerRequest:
     }
     values.update(overrides)
     return WorkerRequest.model_validate(values)
+
+
+def test_worker_result_schema_rejects_raw_colorref_shorthand() -> None:
+    schema = WorkerResult.model_json_schema()
+    payload = json.loads(worker_result().model_dump_json())
+    payload["skin_document"]["layers"][0]["color"] = "#111111"
+
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(schema).validate(payload)
+    with pytest.raises(ValidationError, match="color"):
+        WorkerResult.model_validate(payload)
+
+
+def test_worker_result_schema_keeps_raw_head_ramp_color_distinct_from_colorref() -> None:
+    payload = json.loads(worker_result().model_dump_json())
+    payload["skin_document"]["layers"] = [
+        {
+            "name": "Head glow",
+            "type": "head_ramp",
+            "color": "#ffffff",
+            "length_cells": 10,
+        }
+    ]
+
+    Draft202012Validator(WorkerResult.model_json_schema()).validate(payload)
+    assert WorkerResult.model_validate(payload).skin_document["layers"][0]["color"] == "#ffffff"
+
+
+def test_worker_result_anchor_schema_matches_rust_external_tagging() -> None:
+    schema = WorkerResult.model_json_schema()
+    definitions = schema["$defs"]
+    assert definitions["AtAnchor"]["properties"]["at"] == {"$ref": "#/$defs/AtAnchorValue"}
+    assert definitions["FractionAnchor"]["properties"]["fraction"] == {"$ref": "#/$defs/FractionAnchorValue"}
+
+    payload = json.loads(worker_result().model_dump_json())
+    layer = {
+        "name": "Anchored fill",
+        "type": "span",
+        "region": "body",
+        "span": {"from": "whole"},
+        "source": {"type": "solid", "color": {"slot": "fill"}},
+    }
+    payload["skin_document"]["layers"] = [layer]
+    anchors: tuple[Any, ...] = (
+        "whole",
+        "head",
+        "tail",
+        {"at": {"at": 1}},
+        {"fraction": {"fraction": 0.5}},
+    )
+    for anchor in anchors:
+        payload["skin_document"]["layers"][0]["span"]["from"] = anchor
+        Draft202012Validator(schema).validate(payload)
+        WorkerResult.model_validate(payload)
+
+    for shorthand in ({"at": 1}, {"fraction": 0.5}):
+        payload["skin_document"]["layers"][0]["span"]["from"] = shorthand
+        with pytest.raises(JsonSchemaValidationError):
+            Draft202012Validator(schema).validate(payload)
+        with pytest.raises(ValidationError):
+            WorkerResult.model_validate(payload)
+
+
+def test_worker_result_schema_is_an_acyclic_flat_layer_subset() -> None:
+    schema = WorkerResult.model_json_schema()
+    definitions = schema["$defs"]
+    assert "GroupLayer" not in definitions
+    assert set(definitions["SkinDocumentV2"]["properties"]["layers"]["items"]["discriminator"]["mapping"]) == {
+        "ribbon",
+        "span",
+        "head_disc",
+        "head_ramp",
+    }
+    assert set(definitions["SpanLayer"]["properties"]["source"]["discriminator"]["mapping"]) == {
+        "solid",
+        "gradient",
+        "band",
+        "image",
+        "text",
+    }
+
+    def referenced_definitions(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            found = {
+                reference.removeprefix("#/$defs/")
+                for reference in [value.get("$ref")]
+                if isinstance(reference, str) and reference.startswith("#/$defs/")
+            }
+            return found.union(*(referenced_definitions(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(referenced_definitions(item) for item in value))
+        return set()
+
+    graph = {name: referenced_definitions(definition) for name, definition in definitions.items()}
+
+    def assert_acyclic(name: str, active: frozenset[str] = frozenset()) -> None:
+        assert name not in active, f"recursive worker schema definition: {name}"
+        for referenced in graph[name]:
+            assert_acyclic(referenced, active | {name})
+
+    for name in graph:
+        assert_acyclic(name)
+
+    payload = json.loads(worker_result().model_dump_json())
+    payload["skin_document"]["layers"] = [
+        {
+            "name": "Authoring group",
+            "type": "group",
+            "layers": payload["skin_document"]["layers"],
+        }
+    ]
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(schema).validate(payload)
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        WorkerResult.model_validate(payload)
+
+
+def bounded_skin_document_payload() -> dict[str, Any]:
+    payload = json.loads(worker_result().model_dump_json())
+    payload["skin_document"]["textures"] = [
+        {
+            "name": "bounded_texture",
+            "ref": "sha256:" + "d" * 64,
+            "kind": "sheet",
+            "descriptor": {
+                "kind": "sheet",
+                "body_columns": 1,
+                "frame_rows": 1,
+                "variants": [
+                    {
+                        "content_ref": "sha256:" + "d" * 64,
+                        "url": "/api/textures/variants/sha256:" + "d" * 64 + ".png",
+                        "width_px": 1,
+                        "height_px": 1,
+                        "bytes": 1,
+                        "texels_per_cell": 1,
+                    }
+                ],
+            },
+        }
+    ]
+    payload["skin_document"]["layers"] = [
+        {
+            "name": "Bounded image",
+            "type": "span",
+            "region": "body",
+            "span": {"from": {"at": {"at": 1}}, "priority": 0},
+            "source": {
+                "type": "image",
+                "texture": "bounded_texture",
+                "fit": {"type": "clip"},
+                "fade": {"steps": 1},
+            },
+        }
+    ]
+    return payload
+
+
+NUMERIC_BOUND_PATHS: tuple[tuple[tuple[str | int, ...], int, int], ...] = (
+    (("skin_document", "layers", 0, "span", "priority"), -(2**31), 2**31 - 1),
+    (("skin_document", "layers", 0, "source", "fade", "steps"), 0, 2**32 - 1),
+    (("skin_document", "textures", 0, "descriptor", "body_columns"), 0, 2**32 - 1),
+    (("skin_document", "textures", 0, "descriptor", "frame_rows"), 0, 2**32 - 1),
+    (("skin_document", "textures", 0, "descriptor", "variants", 0, "width_px"), 0, 2**32 - 1),
+    (("skin_document", "textures", 0, "descriptor", "variants", 0, "height_px"), 0, 2**32 - 1),
+    (("skin_document", "textures", 0, "descriptor", "variants", 0, "bytes"), 0, 2**32 - 1),
+    (("skin_document", "textures", 0, "descriptor", "variants", 0, "texels_per_cell"), 0, 2**32 - 1),
+)
+
+
+def set_nested(payload: dict[str, Any], path: tuple[str | int, ...], value: int) -> None:
+    target: Any = payload
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize(("path", "minimum", "maximum"), NUMERIC_BOUND_PATHS)
+@pytest.mark.parametrize("edge", ["minimum", "maximum"])
+def test_worker_result_accepts_exact_rust_integer_boundaries(path, minimum, maximum, edge) -> None:
+    payload = bounded_skin_document_payload()
+    set_nested(payload, path, minimum if edge == "minimum" else maximum)
+
+    Draft202012Validator(WorkerResult.model_json_schema()).validate(payload)
+    WorkerResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(("path", "minimum", "maximum"), NUMERIC_BOUND_PATHS)
+@pytest.mark.parametrize("side", ["below", "above"])
+def test_worker_result_rejects_values_rust_integer_deserialization_cannot_represent(
+    path, minimum, maximum, side
+) -> None:
+    payload = bounded_skin_document_payload()
+    set_nested(payload, path, minimum - 1 if side == "below" else maximum + 1)
+
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(WorkerResult.model_json_schema()).validate(payload)
+    with pytest.raises(ValidationError):
+        WorkerResult.model_validate(payload)
+
+
+def test_worker_result_dump_round_trip_is_warning_free() -> None:
+    original = worker_result()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        encoded = original.model_dump_json()
+
+    assert caught == []
+    assert WorkerResult.model_validate_json(encoded) == original
 
 
 @pytest.mark.parametrize("tool", ["shell", "network", "HTTP", "provider", "storage", "git", "publish", "upload"])
@@ -335,6 +580,64 @@ async def test_openai_worker_http_failures_are_typed(factory_config, status, kin
     await client.aclose()
     assert captured.value.kind == kind
     assert captured.value.outcome_known is outcome_known
+
+
+@pytest.mark.asyncio
+async def test_openai_worker_types_exact_lmstudio_unloaded_as_known_unavailable(factory_config) -> None:
+    factory_config.models.task_worker.base_url = "http://localhost:1234/v1"
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                400,
+                headers={"x-request-id": "lmstudio-unloaded-1"},
+                json={"error": "Model unloaded."},
+            )
+        )
+    )
+    adapter = OpenAICompatibleWorker(factory_config, client=client)
+    with pytest.raises(ProviderError) as captured:
+        await adapter.execute(worker_request())
+    await client.aclose()
+
+    assert captured.value.kind == ProviderFailureKind.UNAVAILABLE
+    assert captured.value.outcome_known is True
+    assert captured.value.request_id == "lmstudio-unloaded-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (400, {"error": "Model unloaded"}),
+        (400, {"error": "model unloaded."}),
+        (400, {"error": "Model unloaded.", "detail": "ambiguous extension"}),
+        (409, {"error": "Model unloaded."}),
+    ],
+)
+async def test_openai_worker_does_not_widen_lmstudio_unloaded_exception(factory_config, status, body) -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(status, json=body)))
+    adapter = OpenAICompatibleWorker(factory_config, client=client)
+    with pytest.raises(ProviderError) as captured:
+        await adapter.execute(worker_request())
+    await client.aclose()
+
+    assert captured.value.kind == ProviderFailureKind.INVALID_OUTPUT
+    assert captured.value.outcome_known is True
+
+
+@pytest.mark.asyncio
+async def test_openai_worker_does_not_trust_remote_unloaded_claim(factory_config) -> None:
+    factory_config.models.task_worker.base_url = "https://worker.example.test/v1"
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(400, json={"error": "Model unloaded."}))
+    )
+    adapter = OpenAICompatibleWorker(factory_config, client=client)
+    with pytest.raises(ProviderError) as captured:
+        await adapter.execute(worker_request())
+    await client.aclose()
+
+    assert captured.value.kind == ProviderFailureKind.INVALID_OUTPUT
+    assert captured.value.outcome_known is True
 
 
 @pytest.mark.asyncio

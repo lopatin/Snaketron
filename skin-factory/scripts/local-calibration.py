@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -64,6 +65,9 @@ REDIS_PORT = 16379
 RENDERER_PORT = 13000
 GALLERY_PORT = 18765
 WORKER_ENDPOINT = "http://127.0.0.1:1234/v1"
+LMSTUDIO_MODELS_ENDPOINT = "http://127.0.0.1:1234/api/v1/models"
+DEFAULT_WORKER_MODEL = "qwen/qwen3.8-27b"
+LMSTUDIO_LOAD_TIMEOUT_SECONDS = 300
 
 
 class SetupRequired(RuntimeError):
@@ -574,27 +578,52 @@ def prepare_factory_environment() -> None:
     )
 
 
-def detect_worker_model(service: dict[str, str], requested: str | None) -> str:
+def lmstudio_headers(service: dict[str, str]) -> dict[str, str]:
     headers = {"Accept": "application/json"}
     if service.get("LMSTUDIO_API_KEY"):
         headers["Authorization"] = f"Bearer {service['LMSTUDIO_API_KEY']}"
+    return headers
+
+
+def worker_load_command(model: str) -> list[str]:
+    return ["lms", "load", model, "--identifier", model, "--yes"]
+
+
+def worker_load_instruction(model: str) -> str:
+    return shlex.join(worker_load_command(model))
+
+
+def detect_worker_model(service: dict[str, str], requested: str | None) -> str:
+    headers = lmstudio_headers(service)
     request = urllib.request.Request(f"{WORKER_ENDPOINT}/models", headers=headers)
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
             payload = json.load(response)
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        candidate = requested or DEFAULT_WORKER_MODEL
         raise SetupRequired(
-            f"LM Studio is not ready at {WORKER_ENDPOINT}. Load the task-worker model and start its local server."
+            f"LM Studio is not ready at {WORKER_ENDPOINT}. Start its local server, then run: "
+            f"{worker_load_instruction(candidate)}"
         ) from error
     entries = payload.get("data") if isinstance(payload, dict) else None
     identifiers = [item.get("id") for item in entries or [] if isinstance(item, dict)]
     identifiers = [item for item in identifiers if isinstance(item, str) and item]
     if requested:
-        if requested not in identifiers:
-            raise SetupRequired(f"--worker-model {requested!r} is not advertised by LM Studio: {identifiers}")
-        return requested
-    preferred = "qwen/qwen3.8-27b"
+        if requested in identifiers:
+            return requested
+        installed, loaded = loaded_worker_models(service, requested)
+        if requested in installed or requested in loaded:
+            return requested
+        raise SetupRequired(
+            f"--worker-model {requested!r} is neither installed nor advertised by LM Studio. "
+            f"Installed model keys: {sorted(installed)}; advertised model ids: {identifiers}. "
+            f"Install it, then run: {worker_load_instruction(requested)}"
+        )
+    preferred = DEFAULT_WORKER_MODEL
     if preferred in identifiers:
+        return preferred
+    installed, loaded = loaded_worker_models(service, preferred)
+    if preferred in installed or preferred in loaded:
         return preferred
     suffix_matches = [item for item in identifiers if item.rsplit("/", 1)[-1] == "qwen3.8-27b"]
     if len(suffix_matches) == 1:
@@ -605,6 +634,105 @@ def detect_worker_model(service: dict[str, str], requested: str | None) -> str:
         "LM Studio must advertise one unambiguous task-worker model; choose one with --worker-model. "
         f"Advertised model ids: {identifiers}"
     )
+
+
+def loaded_worker_models(service: dict[str, str], model: str) -> tuple[set[str], set[str]]:
+    """Return installed model keys and exact loaded instance identifiers."""
+
+    request = urllib.request.Request(LMSTUDIO_MODELS_ENDPOINT, headers=lmstudio_headers(service))
+    instruction = worker_load_instruction(model)
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
+            payload = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        raise SetupRequired(
+            "LM Studio's loaded-model state is unavailable; refusing to guess from /v1/models because it may "
+            f"include downloaded but unloaded models. Verify with `lms ps`, then run if absent: {instruction}"
+        ) from error
+    entries = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise SetupRequired(
+            "LM Studio returned invalid loaded-model state; refusing to load or replace any model. "
+            f"Verify with `lms ps`, then run if absent: {instruction}"
+        )
+    installed: set[str] = set()
+    loaded: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if isinstance(key, str) and key:
+            installed.add(key)
+        instances = entry.get("loaded_instances")
+        if not isinstance(instances, list):
+            if key == model:
+                raise SetupRequired(
+                    f"LM Studio returned invalid loaded-instance state for {model!r}; refusing to guess. "
+                    f"Verify with `lms ps`, then run if absent: {instruction}"
+                )
+            continue
+        for instance in instances:
+            identifier = instance.get("id") if isinstance(instance, dict) else None
+            if not isinstance(identifier, str) or not identifier:
+                if key == model:
+                    raise SetupRequired(
+                        f"LM Studio returned an invalid loaded instance for {model!r}; refusing to guess. "
+                        f"Verify with `lms ps`, then run if absent: {instruction}"
+                    )
+                continue
+            loaded.add(identifier)
+    return installed, loaded
+
+
+def ensure_worker_model_loaded(service: dict[str, str], model: str) -> None:
+    installed, loaded = loaded_worker_models(service, model)
+    if model in loaded:
+        return
+    instruction = worker_load_instruction(model)
+    if model not in installed:
+        raise SetupRequired(
+            f"LM Studio advertises worker model {model!r}, but its local model key was not found. "
+            f"Install it, then run: {instruction}"
+        )
+    executable = shutil.which("lms")
+    if not executable:
+        raise SetupRequired(
+            f"LM Studio model {model!r} is installed but not loaded and `lms` is unavailable on PATH. Run: "
+            f"{instruction}"
+        )
+    say(f"Loading exact local LM Studio task-worker model {model!r}...")
+    command = [executable, *worker_load_command(model)[1:]]
+    result: subprocess.CompletedProcess[str] | None = None
+    invocation_error: OSError | subprocess.TimeoutExpired | None = None
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            cwd=REPO,
+            env=scrubbed_environment(),
+            text=True,
+            capture_output=True,
+            timeout=LMSTUDIO_LOAD_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        invocation_error = error
+    # A concurrent launcher may have won the load race. Always trust the
+    # authoritative loaded-instance state rather than the CLI exit alone.
+    _installed_after, loaded_after = loaded_worker_models(service, model)
+    if model in loaded_after:
+        return
+    detail = str(invocation_error) if invocation_error else ((result.stderr or result.stdout).strip() if result else "")
+    suffix = f" LM Studio said: {detail[:500]}" if detail else ""
+    if isinstance(invocation_error, subprocess.TimeoutExpired):
+        exit_detail = f"timed out after {LMSTUDIO_LOAD_TIMEOUT_SECONDS}s"
+    elif result:
+        exit_detail = f"exit {result.returncode}"
+    else:
+        exit_detail = "could not start"
+    raise SetupRequired(
+        f"LM Studio did not load the exact worker identifier {model!r} (lms {exit_detail}). "
+        f"The launcher issued no unload command. Retry with: {instruction}.{suffix}"
+    ) from invocation_error
 
 
 def write_runtime_config(worker_model: str) -> None:
@@ -880,8 +1008,9 @@ def bootstrap(args: argparse.Namespace) -> tuple[dict[str, str], Path, Path]:
         operator_path=operator_path,
         service_path=service_path,
     )
-    prepare_factory_environment()
     model = detect_worker_model(service, args.worker_model)
+    ensure_worker_model_loaded(service, model)
+    prepare_factory_environment()
     write_runtime_config(model)
     run_installer(service_path)
     start_renderer_and_gallery(operator_path)
@@ -996,7 +1125,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--operator-env", type=Path, default=DEFAULT_OPERATOR_ENV)
     result.add_argument("--accounts-env", type=Path, default=DEFAULT_ACCOUNTS_ENV)
     result.add_argument("--admin-user-id", type=int, help="persist the dedicated local admin id across restarts")
-    result.add_argument("--worker-model", help="exact LM Studio model id when /models is ambiguous")
+    result.add_argument(
+        "--worker-model",
+        help="exact local LM Studio model id; selected model is loaded when installed but not already loaded",
+    )
     return result
 
 

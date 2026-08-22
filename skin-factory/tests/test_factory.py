@@ -294,10 +294,38 @@ def author_result() -> WorkerResult:
         ),
         skin_document={
             "schema_version": 2,
+            "id": "river-glass@1",
             "name": "River Glass",
+            "palette": {
+                "friendly": [
+                    {"fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa"},
+                    {"fill": "#3c8dde", "outline": "#286eae", "accent": "#a8cdf2"},
+                ],
+                "enemy": [
+                    {"fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82"},
+                    {"fill": "#e34e5b", "outline": "#a92f3a", "accent": "#f2b75f"},
+                ],
+                "free_for_all": [
+                    {"fill": "#70bfe3", "outline": "#5299bb", "accent": "#c8ecfa"},
+                    {"fill": "#ff6b6b", "outline": "#b84444", "accent": "#fbcd82"},
+                    {"fill": "#93a3b5", "outline": "#5d6e81", "accent": "#d1dae5"},
+                    {"fill": "#f7b731", "outline": "#a87d1f", "accent": "#ffe08a"},
+                ],
+            },
             "period_ms": 1200,
             "textures": [],
-            "layers": [],
+            "head_core": {"ratio": 0.38, "color": "#333333"},
+            "layers": [
+                {
+                    "name": "Body",
+                    "type": "ribbon",
+                    "region": "body",
+                    "color": {"slot": "fill"},
+                    "extra_px": 0,
+                    "joints": True,
+                    "tail_cap": True,
+                }
+            ],
         },
         tool_requests=[],
         trace=[{"phase": "authored"}],
