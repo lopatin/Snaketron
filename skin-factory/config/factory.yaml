@@ -27,7 +27,12 @@ models:
     model: qwen/qwen3.8-27b
     base_url: http://localhost:1234/v1
     api_key_env: LMSTUDIO_API_KEY
-    timeout_seconds: 300
+    # A real 62k-token authoring request takes several minutes to prefill on
+    # the supported local 27B worker before structured generation begins.
+    # The adapter enforces this as a true end-to-end deadline, independent of
+    # HTTPX's per-phase timers. Keep enough generation headroom while remaining
+    # inside the 1,800-second run wall and Hermes wall-plus-shutdown boundary.
+    timeout_seconds: 900
     max_input_tokens: 131072
     max_output_tokens: 16384
   smart_text:

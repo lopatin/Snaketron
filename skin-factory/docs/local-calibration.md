@@ -73,6 +73,12 @@ launcher exits before installation and prints that exact recovery command. It
 never issues an unload command or substitutes a different model identifier.
 Automatic loading is bounded to five minutes and the exact loaded instance is
 verified again afterward, including when another launcher wins the load race.
+The generated local configuration also pins each task-worker request to a true
+900-second end-to-end deadline, independent of HTTP client's per-phase timers.
+This covers the large canonical skill, retained prototype, and strict SkinDoc
+schema prefill plus structured generation on the supported 27B model. Factory
+admission reserves that entire deadline and a settlement second before starting
+the request, all within the 1,800-second tick wall.
 
 Successful startup prints only the local gallery URL and an `open` command.
 Open it without putting its review secret in a URL or the clipboard:

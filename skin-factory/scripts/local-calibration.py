@@ -68,6 +68,7 @@ WORKER_ENDPOINT = "http://127.0.0.1:1234/v1"
 LMSTUDIO_MODELS_ENDPOINT = "http://127.0.0.1:1234/api/v1/models"
 DEFAULT_WORKER_MODEL = "qwen/qwen3.8-27b"
 LMSTUDIO_LOAD_TIMEOUT_SECONDS = 300
+TASK_WORKER_TIMEOUT_SECONDS = 900
 
 
 class SetupRequired(RuntimeError):
@@ -744,12 +745,16 @@ import os, pathlib, sys, tempfile, yaml
 source = pathlib.Path(sys.argv[1])
 target = pathlib.Path(sys.argv[2])
 model = sys.argv[3]
+worker_timeout = int(sys.argv[4])
 value = yaml.safe_load(source.read_text(encoding="utf-8"))
 value["service"]["base_url"] = "http://127.0.0.1:18080"
 value["browser"]["base_url"] = "http://127.0.0.1:13000"
 value["review"]["bind"] = "127.0.0.1"
 value["review"]["port"] = 18765
 value["models"]["task_worker"]["model"] = model
+# Pin the supported local worker's full request budget independently of any
+# future non-local role tuning in the source configuration.
+value["models"]["task_worker"]["timeout_seconds"] = worker_timeout
 value["paths"]["data_dir"] = "var/local-runtime/factory-data"
 value["paths"]["database"] = "var/local-runtime/factory-data/factory.sqlite3"
 value["paths"]["objects"] = "var/local-runtime/factory-data/objects"
@@ -774,7 +779,15 @@ finally:
 """
     # The helper receives no secret material; only the exact public model id.
     subprocess.run(
-        [str(python), "-c", helper, str(PACKAGE / "config" / "factory.yaml"), str(RUNTIME_CONFIG), worker_model],
+        [
+            str(python),
+            "-c",
+            helper,
+            str(PACKAGE / "config" / "factory.yaml"),
+            str(RUNTIME_CONFIG),
+            worker_model,
+            str(TASK_WORKER_TIMEOUT_SECONDS),
+        ],
         check=True,
         cwd=PACKAGE,
         env=scrubbed_environment(),

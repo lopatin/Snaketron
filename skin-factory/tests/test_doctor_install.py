@@ -40,6 +40,8 @@ def test_repository_config_pins_lm_studio_resolved_worker_identity() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "config/factory.yaml")
 
     assert config.models.task_worker.model == "qwen/qwen3.8-27b"
+    assert config.models.task_worker.timeout_seconds == 900
+    assert config.models.task_worker.timeout_seconds + 1 <= config.budgets.wall_seconds_per_run
     assert config.worker.endpoint == "http://localhost:1234/v1"
 
 

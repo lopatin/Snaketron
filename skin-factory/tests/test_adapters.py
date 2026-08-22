@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import warnings
@@ -48,6 +49,14 @@ def test_task_worker_request_and_reservation_output_ceilings_cannot_drift(factor
     payload["worker"]["max_output_tokens"] += 1
 
     with pytest.raises(ValidationError, match="task_worker model reservation ceiling"):
+        FactoryConfig.model_validate(payload)
+
+
+def test_task_worker_timeout_and_settlement_must_fit_run_wall(factory_config) -> None:
+    payload = factory_config.model_dump(mode="python")
+    payload["models"]["task_worker"]["timeout_seconds"] = payload["budgets"]["wall_seconds_per_run"]
+
+    with pytest.raises(ValidationError, match="task_worker timeout plus settlement"):
         FactoryConfig.model_validate(payload)
 
 
@@ -664,6 +673,37 @@ async def test_openai_worker_transport_preserves_at_most_once_boundary(
     await client.aclose()
     assert captured.value.kind == kind
     assert captured.value.outcome_known is outcome_known
+
+
+@pytest.mark.asyncio
+async def test_openai_worker_total_deadline_cuts_off_progressing_response(factory_config) -> None:
+    chunks_received: list[int] = []
+
+    class ProgressingResponse(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for index in range(100):
+                # Every chunk arrives well inside the client's per-phase read
+                # timeout. Only the adapter's end-to-end deadline can stop it.
+                await asyncio.sleep(0.01)
+                chunks_received.append(index)
+                yield b" "
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=ProgressingResponse())
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        timeout=httpx.Timeout(0.05),
+    )
+    adapter = OpenAICompatibleWorker(factory_config, client=client)
+    adapter.timeout = 0.12
+    with pytest.raises(ProviderError, match="total deadline exceeded") as captured:
+        await adapter.execute(worker_request())
+    await client.aclose()
+
+    assert 2 <= len(chunks_received) < 100
+    assert captured.value.kind == ProviderFailureKind.TIMEOUT
+    assert captured.value.outcome_known is False
 
 
 @pytest.mark.asyncio
