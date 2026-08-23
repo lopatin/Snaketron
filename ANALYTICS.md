@@ -17,7 +17,57 @@ GAME_ANALYTICS_BUILD=web-1.4.0 npm run build:prod
 
 `GAME_ANALYTICS_GAME_KEY` and `GAME_ANALYTICS_SECRET_KEY` are exported from the
 release owner's shell profile, so an interactive build picks them up with no
-further setup. CI and deploy workflows must supply them explicitly.
+further setup.
+
+## Continuous integration and deployment
+
+The keys are stored on the GitHub repository as:
+
+| Name | Kind | Why |
+| --- | --- | --- |
+| `GAME_ANALYTICS_GAME_KEY` | Repository **variable** | It ships inside the client bundle, so it is a public identifier, not a credential |
+| `GAME_ANALYTICS_SECRET_KEY` | Repository **secret** | Also reaches the bundle, but keeping it out of a public repository's files and out of build logs costs nothing |
+
+Neither is a credential in the usual sense: GameAnalytics' HTML5 SDK signs
+payloads in the browser, so anyone can read both out of the served JavaScript.
+Treat them as a rotatable per-game identifier pair. Rotating means updating the
+value in the GameAnalytics dashboard and here — nothing else stores them.
+
+`wasm-build` in `.github/workflows/github-action-test-simple-game.yml` consumes
+both. It builds a production bundle that is never deployed, purely so two
+failures cannot reach a release unnoticed: a broken webpack config, and a key
+that no longer has the exact shape the SDK demands. A malformed key makes the
+SDK decline to initialize with no failed request to notice, so this guard is
+the only thing standing between a bad rotation and a silently dead release. A
+second step asserts that `GAME_ANALYTICS_DISABLE_EMBEDDED=true` really does
+strip the SDK from an embedded package, because that escape hatch is otherwise
+only visible in the shape of a built artifact.
+
+**A deployment workflow needs nothing beyond passing the two values to the
+client build:**
+
+```yaml
+env:
+  GAME_ANALYTICS_GAME_KEY: ${{ vars.GAME_ANALYTICS_GAME_KEY }}
+  GAME_ANALYTICS_SECRET_KEY: ${{ secrets.GAME_ANALYTICS_SECRET_KEY }}
+  GAME_ANALYTICS_BUILD: web-${{ github.ref_name }}
+```
+
+**No AWS or ECS configuration is required for the keys.** They are compile-time
+client configuration baked into the bundle, and the server never talks to
+GameAnalytics — see the section above on why server-side events stay in the
+first-party pipeline. Nothing belongs in Secrets Manager or a task definition.
+
+The one analytics setting that *is* server runtime configuration is the
+operator exclusion list, which the ECS task reads per request:
+
+```text
+SNAKETRON_ANALYTICS_EXCLUDED_IPS=<your public IP or CIDR>
+```
+
+Unset excludes nobody, so production works without it; setting it is what keeps
+the release owner's own play out of the numbers on every device at home,
+including signed-out ones.
 
 The game key is exactly 32 alphanumeric characters and the secret exactly 40.
 The SDK refuses to initialize on any other shape — it logs and returns, with no
