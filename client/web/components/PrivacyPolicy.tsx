@@ -88,13 +88,15 @@ export const PrivacyPolicy: React.FC = () => {
               to understand which modes people play and where the game is too hard or too slow. This
               covers matches played, mode and queue, scores, match length, how a life ended, whether
               you play with a keyboard or touch controls, how much Snakebux an item cost you, and
-              your Snaketron account number. We never send your payment details — those go only to
-              our payment provider and never reach Snaketron or GameAnalytics.
-              GameAnalytics also records the usual technical details of a web request, including
-              your device, browser, and approximate country. We never send your username or email
-              address{isCrazyGamesBuild ? ', and never your CrazyGames profile' : ''}. Your account
-              number is meaningless to GameAnalytics on its own — only Snaketron can connect it to a
-              player.
+              your Snaketron account number. GameAnalytics also records the usual technical details
+              of a web request, including your device, browser, and approximate country.
+            </p>
+            <p className="mt-3 leading-7">
+              We never send your username or email address
+              {isCrazyGamesBuild ? ', and never your CrazyGames profile' : ''}, and never your
+              payment details — those go only to our payment provider and reach neither Snaketron
+              nor GameAnalytics. Your account number is meaningless to GameAnalytics on its own —
+              only Snaketron can connect it to a player.
             </p>
             <p className="mt-3 leading-7">
               To opt out on this device, open{' '}
@@ -123,7 +125,7 @@ export const PrivacyPolicy: React.FC = () => {
         </p>
 
         <p className="mt-8 border-t border-gray-300 pt-5 text-sm text-gray-600">
-          Last updated August 19, 2026.
+          Last updated August 23, 2026.
         </p>
       </article>
     </main>
