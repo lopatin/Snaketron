@@ -21,6 +21,52 @@ if (isItchBuild && isCrazyGamesBuild) {
 
 const isEmbeddedBuild = isItchBuild || isCrazyGamesBuild;
 
+// GameAnalytics ships in every distribution by default, including the itch and
+// CrazyGames packages: both portals permit third-party game analytics, and
+// CrazyGames publishes an analytics partner of its own. Portal traffic is the
+// larger audience, so excluding it would hide most of the players.
+//
+// GAME_ANALYTICS_DISABLE_EMBEDDED=true takes it back out of the reviewed
+// release packages, for a portal whose policy changes or a submission that
+// needs to carry no third-party SDK at all. Defaults to off.
+const disableEmbeddedAnalytics = process.env.GAME_ANALYTICS_DISABLE_EMBEDDED === 'true';
+const analyticsExcludedFromBuild = isEmbeddedBuild && disableEmbeddedAnalytics;
+
+// When excluded, the keys are dropped rather than merely left unused: the
+// artifact must not even contain them.
+const gameAnalyticsGameKey = analyticsExcludedFromBuild
+  ? ''
+  : (process.env.GAME_ANALYTICS_GAME_KEY || '');
+const gameAnalyticsSecretKey = analyticsExcludedFromBuild
+  ? ''
+  : (process.env.GAME_ANALYTICS_SECRET_KEY || '');
+
+if (!analyticsExcludedFromBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gameAnalyticsSecretKey)) {
+  throw new Error(
+    'GAME_ANALYTICS_GAME_KEY and GAME_ANALYTICS_SECRET_KEY must be set together: '
+    + 'GameAnalytics signs every request with the secret, so half a pair would '
+    + 'fail every call at runtime instead of staying inert.',
+  );
+}
+
+// The SDK requires exactly these shapes and silently refuses to initialize
+// otherwise — it logs and returns, with no failed request to notice. Because
+// the keys are compiled in, a mistyped one would otherwise produce a release
+// that looks correct and reports nothing at all. Fail the build instead.
+const gameAnalyticsKeyShapes = [
+  ['GAME_ANALYTICS_GAME_KEY', gameAnalyticsGameKey, /^[A-Za-z0-9]{32}$/, 32],
+  ['GAME_ANALYTICS_SECRET_KEY', gameAnalyticsSecretKey, /^[A-Za-z0-9]{40}$/, 40],
+];
+for (const [name, value, shape, length] of gameAnalyticsKeyShapes) {
+  if (value && !shape.test(value)) {
+    throw new Error(
+      `${name} must be exactly ${length} alphanumeric characters (got ${value.length}). `
+      + 'GameAnalytics rejects any other shape without initializing, so this would '
+      + 'build a release that reports nothing.',
+    );
+  }
+}
+
 module.exports = {
   entry: "./bootstrap.ts",
   output: {
@@ -38,6 +84,15 @@ module.exports = {
     // checkout, which would otherwise let stale WASM silently back the UI.
     alias: {
       'wasm-snaketron': path.resolve(__dirname, '../pkg'),
+      // When analytics is switched off for a release package, stub the SDK out
+      // entirely.
+      //
+      // Dropping the keys is not enough on its own: the dynamic import is
+      // still statically reachable, so webpack emits the ~93 KB vendor chunk
+      // into the ZIP even though nothing will ever request it. `false` here
+      // resolves it to an empty module, so the artifact contains no
+      // third-party SDK code at all.
+      ...(analyticsExcludedFromBuild ? { gameanalytics: false } : {}),
     },
   },
   module: {
@@ -101,6 +156,15 @@ module.exports = {
       'process.env.ITCH_BUILD': JSON.stringify(isItchBuild ? 'true' : ''),
       'process.env.CRAZYGAMES_BUILD': JSON.stringify(isCrazyGamesBuild ? 'true' : ''),
       'process.env.CRAZYGAMES_DATA_ENABLED': JSON.stringify(process.env.CRAZYGAMES_DATA_ENABLED || ''),
+      // GameAnalytics keys are compiled in, not fetched, so a bundle either
+      // reports or provably cannot. A checkout without them — every developer
+      // machine, CI, and any fork — never loads the SDK. See ANALYTICS.md.
+      'process.env.GAME_ANALYTICS_GAME_KEY': JSON.stringify(gameAnalyticsGameKey),
+      'process.env.GAME_ANALYTICS_SECRET_KEY': JSON.stringify(gameAnalyticsSecretKey),
+      'process.env.GAME_ANALYTICS_BUILD': JSON.stringify(process.env.GAME_ANALYTICS_BUILD || ''),
+      'process.env.GAME_ANALYTICS_DISABLE_EMBEDDED': JSON.stringify(
+        disableEmbeddedAnalytics ? 'true' : '',
+      ),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')
     })
   ],

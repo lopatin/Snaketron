@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod analytics_consent;
 pub mod auth;
 pub mod crazygames;
 pub mod games;

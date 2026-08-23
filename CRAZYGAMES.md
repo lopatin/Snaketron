@@ -210,7 +210,13 @@ The script fails unless all of these package checks pass:
 - `index.html` uses a relative base and no root-relative bundled asset URLs;
 - every local asset referenced by `index.html` exists;
 - the CrazyGames HTML5 v3 SDK loads before the local Snaketron bundle;
-- Google Tag Manager/Google Analytics are absent from the embedded package;
+- Google Tag Manager and Google Analytics are absent from the embedded
+  package. This is about a general-purpose tag manager that can inject
+  arbitrary third-party script, not about analytics as such: the GameAnalytics
+  SDK *is* permitted and ships by default, because CrazyGames allows
+  third-party game analytics and publishes an analytics partner of its own.
+  `GAME_ANALYTICS_DISABLE_EMBEDDED=true` removes it from the package if that
+  ever changes. See [ANALYTICS.md](./ANALYTICS.md);
 - the bundle contains at most 1,500 files and no more than exactly 250,000,000
   extracted bytes (the portal's decimal-byte ceiling);
 - because this is currently one eager package, the script conservatively treats
@@ -318,11 +324,18 @@ mappings and progression records should be retained.
 
 ## Privacy and operations
 
-The data inventory, player-facing notice, retention/deletion checklist, and
-incident guidance live in [CRAZYGAMES_PRIVACY.md](./CRAZYGAMES_PRIVACY.md). The
-CrazyGames-only footer links to the packaged `#/privacy` page, which lists the
-monitored contact `alerts@snaketron.io`; neither is shown in ordinary web/itch
-builds or blocks guest play.
+The data inventory, retention/deletion checklist, and incident guidance live in
+[CRAZYGAMES_PRIVACY.md](./CRAZYGAMES_PRIVACY.md).
+
+The packaged `#/privacy` page lists the monitored contact
+`alerts@snaketron.io`. It is reachable in every build — the website and itch
+packages collect the same account and progression data, and all three report
+analytics — and is linked from the footer beside the copyright line. The
+CrazyGames build additionally carries the portal's required new-player notice
+above that line, naming CrazyGames sign-in and linking the same page. Neither
+blocks guest play. The page renders only the sections true of the build it
+ships in, so the portal package never describes a website-only data flow, or
+the reverse.
 
 ## Authoritative CrazyGames references
 

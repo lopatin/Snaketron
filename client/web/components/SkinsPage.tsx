@@ -4,6 +4,7 @@ import { HomeHeader } from './HomeHeader';
 import { SocialFooter } from './SocialFooter';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
+import { analytics } from '../services/analytics';
 import { useWallet } from '../contexts/WalletContext';
 import { BUX_UNIT, coerceBalance, purchaseMessage } from '../utils/walletChip';
 import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
@@ -652,6 +653,12 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
         // Subtracting the price locally would be right most of the time, which
         // is the worst kind of wrong for money.
         applyBalance(coerceBalance(result.balanceBux));
+        if (result.outcome === 'purchased') {
+          // Only this outcome debits. `alreadyOwned` moves no Bux, and
+          // reporting it would put a free acquisition into the economy
+          // dashboards as though it had cost something.
+          analytics.trackCurrencySpent(skin.priceBux, 'skin', skin.reference);
+        }
         if (result.outcome === 'purchased' || result.outcome === 'alreadyOwned') {
           // Re-ask what the viewer owns before equipping: wearing is gated on
           // holding, so the page has to learn about the grant it just earned.

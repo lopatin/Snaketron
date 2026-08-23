@@ -13,6 +13,8 @@ import {
   RuntimeConfigRecord,
   UpdateRuntimeConfigRequest,
 } from '../types';
+import type { AnalyticsConsent } from '../types/generated';
+import { userIdFromSessionToken } from './sessionIdentity.ts';
 import type { CheckUsernameResponse } from '../types/generated';
 import { CLIENT_DISTRIBUTION } from '../constants';
 import { getOrCreateAnonId } from '../utils/anonId';
@@ -211,6 +213,19 @@ class API {
 
   getAuthToken(): string | null {
     return this.getToken();
+  }
+
+  /**
+   * The internal Snaketron user id this browser already holds a session for.
+   *
+   * Analytics has to know who it is reporting as *before* it initializes,
+   * which is earlier than `/auth/me` can answer. The session token already
+   * carries the id, so reading it here avoids both a round trip and a race
+   * against the auth provider.
+   */
+  getAuthenticatedUserId(): string | null {
+    const token = this.getToken();
+    return token === null ? null : userIdFromSessionToken(token, Date.now());
   }
 
   // T must be specified by the caller (typically a generated wire DTO). The
@@ -477,6 +492,15 @@ class API {
 
   async getRuntimeConfig(): Promise<PublicRuntimeConfig> {
     return this.request<PublicRuntimeConfig>('/api/config');
+  }
+
+  /**
+   * Whether this caller's network is on the deployment's analytics exclusion
+   * list. Only the server can answer it — a browser cannot see its own public
+   * address.
+   */
+  async getAnalyticsConsent(): Promise<AnalyticsConsent> {
+    return this.request<AnalyticsConsent>('/api/analytics/consent');
   }
 
   async getAdminRuntimeConfig(): Promise<RuntimeConfigRecord> {

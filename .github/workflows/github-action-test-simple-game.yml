@@ -354,3 +354,42 @@ jobs:
       - name: Type-check the web client
         run: npx tsc --noEmit
         working-directory: client/web
+
+      # The type check never runs webpack, so nothing here previously exercised
+      # the production bundle. Two failures could reach a release unnoticed: a
+      # broken webpack config, and a GameAnalytics key that no longer has the
+      # exact shape the SDK demands (32/40 alphanumeric). The SDK declines to
+      # initialize on a malformed key without a failed request to notice, so
+      # the build guard is the only thing that catches a bad rotation — and it
+      # is worth catching here rather than in a silently dead release.
+      #
+      # This bundle is never deployed and never runs, so it reports nothing.
+      - name: Build the production web bundle
+        run: npm run build:prod
+        working-directory: client/web
+        env:
+          GAME_ANALYTICS_GAME_KEY: ${{ vars.GAME_ANALYTICS_GAME_KEY }}
+          GAME_ANALYTICS_SECRET_KEY: ${{ secrets.GAME_ANALYTICS_SECRET_KEY }}
+          GAME_ANALYTICS_BUILD: ci-${{ github.sha }}
+
+      # The switch that takes analytics back out of a reviewed release package
+      # has no other test: it only shows up in the shape of a built artifact.
+      # Without this, the escape hatch CRAZYGAMES.md promises could rot and
+      # nobody would find out until a portal asked for it.
+      - name: Assert the embedded opt-out removes the analytics SDK
+        working-directory: client/web
+        env:
+          GAME_ANALYTICS_GAME_KEY: ${{ vars.GAME_ANALYTICS_GAME_KEY }}
+          GAME_ANALYTICS_SECRET_KEY: ${{ secrets.GAME_ANALYTICS_SECRET_KEY }}
+          CRAZYGAMES_BUILD: 'true'
+          GAME_ANALYTICS_DISABLE_EMBEDDED: 'true'
+        run: |
+          npm run build:prod
+          if grep -rlq "HmacSHA256" dist/; then
+            echo "::error::GameAnalytics SDK code is present in an opted-out embedded package"
+            exit 1
+          fi
+          if [ -n "$GAME_ANALYTICS_GAME_KEY" ] && grep -rlq "$GAME_ANALYTICS_GAME_KEY" dist/; then
+            echo "::error::GameAnalytics keys are present in an opted-out embedded package"
+            exit 1
+          fi
