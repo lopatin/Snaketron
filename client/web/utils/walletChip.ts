@@ -78,6 +78,8 @@ export const purchaseMessage = (
       return 'You already own this one.';
     case 'insufficientFunds':
       return `Not enough ${BUX_UNIT} for this one.`;
+    case 'notPurchasable':
+      return 'This one is not on sale right now.';
     case 'priceChanged':
       return actualPriceBux === null || actualPriceBux === undefined
         ? 'The price changed. Try again.'

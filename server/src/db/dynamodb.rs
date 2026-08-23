@@ -4090,6 +4090,44 @@ impl Database for DynamoDatabase {
         })
     }
 
+    async fn get_ledger_entry(
+        &self,
+        user_id: i32,
+        source: LedgerSource,
+        idempotency_key: &str,
+    ) -> Result<Option<wallet::LedgerEntry>> {
+        let item = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key(
+                "sk",
+                Self::av_s(wallet::ledger_sort_key(source, idempotency_key)),
+            )
+            // A reversal is decided on what this says, so it must not be
+            // decided on a stale replica.
+            .consistent_read(true)
+            .send()
+            .await
+            .context("Failed to read a ledger entry")?
+            .item;
+
+        let Some(item) = item else {
+            return Ok(None);
+        };
+
+        Ok(Some(wallet::LedgerEntry {
+            source,
+            idempotency_key: Self::extract_string(&item, "idempotencyKey")
+                .unwrap_or_else(|| idempotency_key.to_string()),
+            delta: Self::extract_i64(&item, "delta").unwrap_or(0),
+            request_hash: Self::extract_string(&item, "requestHash").unwrap_or_default(),
+            created_at_ms: Self::extract_i64(&item, "createdAtMs").unwrap_or(0),
+            note: Self::extract_string(&item, "note"),
+        }))
+    }
+
     // ---- Textures and generation jobs -------------------------------------
 
     async fn next_texture_id(&self) -> Result<i32> {
@@ -4426,6 +4464,15 @@ impl Database for DynamoDatabase {
             return Ok(PurchaseOutcome::Purchased);
         }
 
+        // Checked before the balance, because the answer changes what the
+        // buyer should do: someone short of Bux can top up, whereas a skin
+        // that is not on sale will refuse them however much they hold. The
+        // transaction below conditions on this too — this is the early,
+        // truthful answer, not the guard.
+        if skin.publication != Publication::Published {
+            return Ok(PurchaseOutcome::NotPurchasable);
+        }
+
         let wallet = self.get_wallet(user_id, 1).await?;
         if !wallet.may_spend(skin.price_bux) {
             return Ok(PurchaseOutcome::InsufficientFunds);
@@ -4533,6 +4580,12 @@ impl Database for DynamoDatabase {
                         Ok(PurchaseOutcome::PriceChanged {
                             actual_bux: current.price_bux,
                         })
+                    }
+                    // Withdrawn or taken down between the read above and the
+                    // transaction. Falling through to "insufficient funds"
+                    // here told a solvent buyer they were broke.
+                    Some(current) if current.publication != Publication::Published => {
+                        Ok(PurchaseOutcome::NotPurchasable)
                     }
                     _ => Ok(PurchaseOutcome::InsufficientFunds),
                 }

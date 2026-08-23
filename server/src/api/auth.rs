@@ -33,6 +33,12 @@ pub struct AuthState {
     /// being handed megabytes through a queue. `None` is a deployment that
     /// accepts no textures, and the route says so rather than half-working.
     pub texture_store: Option<Arc<dyn crate::texture_store::TextureStore>>,
+    /// The payment provider, when this deployment has a merchant account.
+    ///
+    /// `None` is the ordinary state for development and CI, and every payment
+    /// surface answers "not available here" rather than offering a checkout it
+    /// cannot complete.
+    pub payments: Option<Arc<crate::xsolla::Payments>>,
 }
 
 /// Everything an HTTP handler needs to emit an analytics event.

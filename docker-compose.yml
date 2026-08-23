@@ -78,6 +78,17 @@ services:
       SNAKETRON_REPLAY_CACHE_TIMEOUT_MS: "250"
       # Keep completed games loadable from DynamoDB for 30 days.
       SNAKETRON_COMPLETED_GAME_RETENTION_DAYS: 30
+      # Xsolla. Absent by default: with none of these set the server starts
+      # with payments disabled and the shop simply reports that Snakebux
+      # cannot be bought. Set all four (plus SANDBOX=true) in a local .env to
+      # run a sandbox purchase end to end — see XSOLLA.md.
+      SNAKETRON_XSOLLA_MERCHANT_ID: ${SNAKETRON_XSOLLA_MERCHANT_ID:-}
+      SNAKETRON_XSOLLA_PROJECT_ID: ${SNAKETRON_XSOLLA_PROJECT_ID:-}
+      SNAKETRON_XSOLLA_API_KEY: ${SNAKETRON_XSOLLA_API_KEY:-}
+      SNAKETRON_XSOLLA_WEBHOOK_SECRET: ${SNAKETRON_XSOLLA_WEBHOOK_SECRET:-}
+      SNAKETRON_XSOLLA_SANDBOX: ${SNAKETRON_XSOLLA_SANDBOX:-true}
+      SNAKETRON_XSOLLA_RETURN_URL: ${SNAKETRON_XSOLLA_RETURN_URL:-}
+      SNAKETRON_XSOLLA_WEBHOOK_ALLOWED_IPS: ${SNAKETRON_XSOLLA_WEBHOOK_ALLOWED_IPS:-}
       # Server configuration
       SNAKETRON_HTTP_PORT: 8080
       SNAKETRON_GRPC_PORT: 50051

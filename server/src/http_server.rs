@@ -298,6 +298,10 @@ pub async fn install_http_application(
         user_cache: Some(state.user_cache.clone()),
         crazygames_verifier: crazygames::configured_verifier_from_env()?,
         texture_store: state.texture_store.clone(),
+        // Read once at install time rather than per request: a merchant
+        // account that is half-configured should stop a deployment, not
+        // surprise the first player who clicks buy.
+        payments: crate::xsolla::Payments::from_env()?.map(Arc::new),
     };
     let auth_middleware_state = AuthMiddlewareState {
         jwt_manager: jwt_manager.clone(),

@@ -14,6 +14,7 @@ import {
   UpdateRuntimeConfigRequest,
 } from '../types';
 import type { CheckUsernameResponse } from '../types/generated';
+import { CLIENT_DISTRIBUTION } from '../constants';
 import { getOrCreateAnonId } from '../utils/anonId';
 import type { PlayerLobbyResponse } from '../types/generated';
 import type { BuxPack, CheckoutToken } from '../types/generated';
@@ -231,6 +232,11 @@ class API {
     // before any token exists. The server never uses it for authorization.
     if (config.headers) {
       config.headers['x-snaketron-anon-id'] = getOrCreateAnonId();
+      // Which build this is, so the server can apply distribution policy to
+      // HTTP surfaces the way it already does over the WebSocket. Routing
+      // context, not authorization: it decides whether a portal build is shown
+      // a shop, not whether anyone is allowed to spend.
+      config.headers['x-snaketron-distribution'] = CLIENT_DISTRIBUTION;
     }
 
     const response = await fetch(url, config);

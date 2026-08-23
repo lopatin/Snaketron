@@ -16,7 +16,7 @@ use crate::skin_store::{
     SkinRevision,
 };
 use crate::texture::Texture;
-use crate::wallet::{LedgerSource, Wallet};
+use crate::wallet::{LedgerEntry, LedgerSource, Wallet};
 use common::GameState;
 use models::*;
 
@@ -41,6 +41,14 @@ pub enum PurchaseOutcome {
         actual_bux: u32,
     },
     InsufficientFunds,
+    /// The skin is not on sale: never published, withdrawn, or taken down.
+    ///
+    /// Distinct from [`Self::InsufficientFunds`] because the two ask opposite
+    /// things of the buyer. "You are short" sends someone to top up; a skin
+    /// that is not for sale would take their money and still refuse, so
+    /// telling them they are short is both false and a route to spending Bux
+    /// on nothing.
+    NotPurchasable,
 }
 
 /// The metadata a server registers under; heartbeats re-assert it so a
@@ -227,6 +235,19 @@ pub trait Database: Send + Sync {
     ) -> Result<bool>;
 
     async fn get_wallet(&self, user_id: i32, recent_limit: usize) -> Result<Wallet>;
+
+    /// Read one ledger entry by the key it was written under.
+    ///
+    /// Exists for reversals. A refund must give back exactly what its payment
+    /// credited, and the only durable record of that number is the entry the
+    /// payment wrote — the pack table it was derived from is configuration and
+    /// may have been edited since.
+    async fn get_ledger_entry(
+        &self,
+        user_id: i32,
+        source: LedgerSource,
+        idempotency_key: &str,
+    ) -> Result<Option<LedgerEntry>>;
 
     /// Buy a skin: debit, grant, and ledger row, or none of them.
     ///

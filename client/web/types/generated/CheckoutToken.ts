@@ -4,4 +4,15 @@ export type CheckoutToken = {
 /**
  * Opaque to the client; it hands this to the provider's hosted checkout.
  */
-token: string, sku: string, bux: number, priceUsdCents: number, };
+token: string,
+/**
+ * Where to send the browser. Comes from the provider, so the client never
+ * has to know whether this deployment is pointed at sandbox or production
+ * — getting that wrong client-side is a checkout that silently 404s.
+ */
+paymentUrl: string, sku: string, bux: number, priceUsdCents: number,
+/**
+ * Whether this checkout is a test one. Surfaced so the UI can say so
+ * rather than letting a tester wonder whether they just spent money.
+ */
+sandbox: boolean, };

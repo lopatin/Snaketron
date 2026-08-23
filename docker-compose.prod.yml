@@ -32,6 +32,17 @@ services:
       SNAKETRON_REPLAY_CACHE_MAX_BYTES: ${SNAKETRON_REPLAY_CACHE_MAX_BYTES:-8388608}
       SNAKETRON_REPLAY_CACHE_TIMEOUT_MS: ${SNAKETRON_REPLAY_CACHE_TIMEOUT_MS:-250}
       SNAKETRON_POTG_ENABLED: ${SNAKETRON_POTG_ENABLED:-true}
+      # Xsolla. The API key and the webhook secret are credentials and should
+      # arrive from the secret store, not from a checked-in file. Sandbox is
+      # explicitly off: a production deployment that accepted Xsolla's test
+      # transactions would mint Snakebux for free.
+      SNAKETRON_XSOLLA_MERCHANT_ID: ${SNAKETRON_XSOLLA_MERCHANT_ID:-}
+      SNAKETRON_XSOLLA_PROJECT_ID: ${SNAKETRON_XSOLLA_PROJECT_ID:-}
+      SNAKETRON_XSOLLA_API_KEY: ${SNAKETRON_XSOLLA_API_KEY:-}
+      SNAKETRON_XSOLLA_WEBHOOK_SECRET: ${SNAKETRON_XSOLLA_WEBHOOK_SECRET:-}
+      SNAKETRON_XSOLLA_SANDBOX: "false"
+      SNAKETRON_XSOLLA_RETURN_URL: ${SNAKETRON_XSOLLA_RETURN_URL:-}
+      SNAKETRON_XSOLLA_WEBHOOK_ALLOWED_IPS: ${SNAKETRON_XSOLLA_WEBHOOK_ALLOWED_IPS:-}
       # Production logging
       RUST_LOG: info
       # Disable test mode in production

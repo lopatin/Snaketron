@@ -63,6 +63,8 @@ async fn isolated_auth_state() -> Result<(Arc<dyn Database>, AuthState, Arc<JwtM
         user_cache: None,
         crazygames_verifier: None,
         texture_store: None,
+        // These tests exercise accounts, not the shop.
+        payments: None,
     };
     Ok((db, auth_state, jwt_manager))
 }
