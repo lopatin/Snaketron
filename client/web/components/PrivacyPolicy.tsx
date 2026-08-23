@@ -87,7 +87,9 @@ export const PrivacyPolicy: React.FC = () => {
               </a>{' '}
               to understand which modes people play and where the game is too hard or too slow. This
               covers matches played, mode and queue, scores, match length, how a life ended, whether
-              you play with a keyboard or touch controls, and your Snaketron account number.
+              you play with a keyboard or touch controls, how much Snakebux an item cost you, and
+              your Snaketron account number. We never send your payment details — those go only to
+              our payment provider and never reach Snaketron or GameAnalytics.
               GameAnalytics also records the usual technical details of a web request, including
               your device, browser, and approximate country. We never send your username or email
               address{isCrazyGamesBuild ? ', and never your CrazyGames profile' : ''}. Your account

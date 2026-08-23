@@ -20,6 +20,11 @@ const recorder = () => {
     setExtUserId: (userId) => calls.push(`extUserId(${userId})`),
     configureAvailableCustomDimensions01: (d) => calls.push(`dims01(${d.join('|')})`),
     configureAvailableCustomDimensions02: (d) => calls.push(`dims02(${d.join('|')})`),
+    configureAvailableResourceCurrencies: (c) => calls.push(`currencies(${c.join('|')})`),
+    configureAvailableResourceItemTypes: (t) => calls.push(`itemTypes(${t.join('|')})`),
+    addResourceEvent: (flow, currency, amount, itemType, itemId) => calls.push(
+      `resource(${flow},${currency},${amount},${itemType},${itemId})`,
+    ),
     setEnabledInfoLog: () => {},
     setEnabledEventSubmission: (enabled) => calls.push(`submission(${enabled})`),
     initialize: (key) => calls.push(`initialize(${key})`),
@@ -100,6 +105,8 @@ test('a counted session initializes once and reports', async () => {
     'configureBuild(1.2.3)',
     'dims01(guest|registered)',
     'dims02(keyboard|touch)',
+    'currencies(bux)',
+    'itemTypes(skin|pack)',
     'initialize(GAME)',
   ]);
   assert.equal(store.get(ADDRESS_VERDICT_STORAGE_KEY), 'counted');
@@ -207,6 +214,8 @@ test('events raised before the gate resolves are flushed in order', async () => 
     'configureBuild(1.2.3)',
     'dims01(guest|registered)',
     'dims02(keyboard|touch)',
+    'currencies(bux)',
+    'itemTypes(skin|pack)',
     'initialize(GAME)',
     'dim01(registered)',
     'progression(1,duel,competitive)',
@@ -282,6 +291,8 @@ test('a known player id is configured before the SDK initializes', async () => {
     'configureBuild(1.2.3)',
     'dims01(guest|registered)',
     'dims02(keyboard|touch)',
+    'currencies(bux)',
+    'itemTypes(skin|pack)',
     'configureUserId(4711)',
     'initialize(GAME)',
     // Set even though it duplicates the primary id — see below.
@@ -329,6 +340,8 @@ test('an id learned before the gate resolves is applied to that session', async 
     'configureBuild(1.2.3)',
     'dims01(guest|registered)',
     'dims02(keyboard|touch)',
+    'currencies(bux)',
+    'itemTypes(skin|pack)',
     'initialize(GAME)',
     'extUserId(313)',
     'progression(1,duel,competitive)',
@@ -348,6 +361,8 @@ test('a throwing user-id resolver still starts the session', async () => {
     'configureBuild(1.2.3)',
     'dims01(guest|registered)',
     'dims02(keyboard|touch)',
+    'currencies(bux)',
+    'itemTypes(skin|pack)',
     'initialize(GAME)',
   ]);
 });
@@ -408,6 +423,25 @@ test('errors are deduplicated and capped per session', async () => {
     analytics.trackError('error', `distinct failure ${i}`);
   }
   assert.equal(rec.calls.length, 10, 'and a broken build cannot exceed the session cap');
+});
+
+/**
+ * Only a purchase the server actually debited moves currency. A free skin and
+ * an already-owned one would otherwise enter the economy dashboards as items
+ * that cost nothing, flattening the sink/source comparison the report exists
+ * to make.
+ */
+test('spending Bux reports a sink, and nothing else does', async () => {
+  const { rec, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
+  rec.calls.length = 0;
+
+  analytics.trackCurrencySpent(250, 'skin', 'aurora');
+  analytics.trackCurrencySpent(0, 'skin', 'free-starter');
+  analytics.trackCurrencySpent(-5, 'skin', 'refunded');
+  analytics.trackCurrencySpent(120, 'skin', '');
+
+  assert.deepEqual(rec.calls, ['resource(2,bux,250,skin,aurora)']);
 });
 
 test('an SDK that throws is contained rather than breaking the caller', async () => {

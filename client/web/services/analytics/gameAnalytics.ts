@@ -20,9 +20,12 @@ import {
   ANALYTICS_BUILD_CONFIG,
   ANALYTICS_SUPPORTED_DISTRIBUTION,
   INPUT_DIMENSIONS,
+  RESOURCE_CURRENCIES,
+  RESOURCE_ITEM_TYPES,
   type AccountDimension,
   type AnalyticsBuildConfig,
   type InputDimension,
+  type ResourceItemType,
 } from './config.ts';
 import {
   addressVerdictFromConsent,
@@ -56,6 +59,9 @@ import type { QueueMode } from '../../types/generated/QueueMode';
 const PROGRESSION_START = 1;
 const PROGRESSION_COMPLETE = 2;
 const PROGRESSION_FAIL = 3;
+
+/** Mirrors GameAnalytics' `EGAResourceFlowType`. */
+const RESOURCE_FLOW = { source: 1, sink: 2 } as const;
 
 /** Mirrors GameAnalytics' `EGAAdAction`, `EGAAdType`, and `EGAAdError`. */
 const AD_ACTION = { show: 2, failedShow: 3 } as const;
@@ -104,6 +110,15 @@ export interface GameAnalyticsSdk {
   ): void;
   addDesignEvent(eventId: string, value?: number): void;
   addErrorEvent(severity: number, message: string): void;
+  configureAvailableResourceCurrencies(currencies: string[]): void;
+  configureAvailableResourceItemTypes(itemTypes: string[]): void;
+  addResourceEvent(
+    flowType: number,
+    currency: string,
+    amount: number,
+    itemType: string,
+    itemId: string,
+  ): void;
   addAdEvent(action: number, adType: number, sdkName: string, placement: string): void;
   addAdEventWithNoAdReason(
     action: number,
@@ -310,6 +325,10 @@ class GameAnalyticsService {
       sdk.configureBuild(config.build);
       sdk.configureAvailableCustomDimensions01([...ACCOUNT_DIMENSIONS]);
       sdk.configureAvailableCustomDimensions02([...INPUT_DIMENSIONS]);
+      // Resource vocabularies share the custom dimensions' rule: declared
+      // before `initialize`, and anything outside the declared set is dropped.
+      sdk.configureAvailableResourceCurrencies([...RESOURCE_CURRENCIES]);
+      sdk.configureAvailableResourceItemTypes([...RESOURCE_ITEM_TYPES]);
 
       // Make the Snaketron user id GameAnalytics' *primary* identity, which is
       // what keys retention, funnels, and the user explorer — so one player on
@@ -604,6 +623,29 @@ class GameAnalyticsService {
    * the dashboard in one repeated line. The first occurrence is what carries
    * the diagnostic value.
    */
+  /**
+   * Report Bux leaving the player's wallet.
+   *
+   * Sent only for a purchase the server actually debited: a free skin and an
+   * already-owned one move no currency, and reporting them would put items
+   * into the economy dashboards that never cost anything, flattening exactly
+   * the sink/source comparison the report exists to make.
+   */
+  trackCurrencySpent = (amountBux: number, itemType: ResourceItemType, itemId: string): void => {
+    const amount = Math.round(amountBux);
+    const id = sanitizeEventPart(itemId);
+    if (amount <= 0 || !id) {
+      return;
+    }
+    this.emit((sdk) => sdk.addResourceEvent(
+      RESOURCE_FLOW.sink,
+      RESOURCE_CURRENCIES[0],
+      amount,
+      itemType,
+      id,
+    ));
+  };
+
   trackError = (severity: ErrorSeverity, message: string): void => {
     // GameAnalytics truncates a long message server-side; trimming here keeps
     // the dashboard's grouping stable instead of dependent on stack length.

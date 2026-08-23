@@ -88,3 +88,21 @@ export const INPUT_DIMENSIONS = ['keyboard', 'touch'] as const;
 
 export type AccountDimension = (typeof ACCOUNT_DIMENSIONS)[number];
 export type InputDimension = (typeof INPUT_DIMENSIONS)[number];
+
+/**
+ * Snakebux, the one virtual currency. Like custom dimensions, resource
+ * currencies and item types must be declared before `initialize`, and
+ * GameAnalytics silently drops an event naming anything undeclared — so the
+ * vocabularies live here, where a new value cannot be spent without also being
+ * declared.
+ */
+export const RESOURCE_CURRENCIES = ['bux'] as const;
+
+/**
+ * What Bux flow in and out of. `skin` is the only sink today; `pack` names the
+ * source a settled payment credits, declared now so wiring it later is not a
+ * re-declaration that orphans the events already collected under the old set.
+ */
+export const RESOURCE_ITEM_TYPES = ['skin', 'pack'] as const;
+
+export type ResourceItemType = (typeof RESOURCE_ITEM_TYPES)[number];

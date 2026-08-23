@@ -292,15 +292,51 @@ funnels, currently a failed WASM initialization.
 
 ## What is deliberately not reported
 
-**Business events** are for in-app purchases. Snaketron has none — IAP is
-invite-only on CrazyGames via Xsolla and is not integrated. When it is, a
-business event belongs beside the purchase, paired with a resource event.
+**Resource events** are implemented for the Snakebux **sink**: buying a skin
+sends `Sink / bux / <price> / skin / <reference>`. Only the `purchased`
+outcome reports — a free skin and an already-owned one move no currency, and
+counting them would flatten the sink/source comparison the economy report
+exists to make.
 
-**Resource events** model a virtual economy — currency earned and spent.
-Snaketron's closest analogues are Boost fuel and XP. Both are candidates, but
-neither is a currency the player chooses to spend against alternatives, which
-is what the sink/source metrics are built to compare. Worth adding if a shop or
-a spendable currency ever ships.
+The **source** side is not wired, and neither are **business events**, for one
+shared reason worth understanding before either is added. See below.
+
+## The open gap: reporting a completed payment
+
+Snakebux are bought through Xsolla. Checkout opens Pay Station in a new tab,
+the payment settles by **webhook to our server**, and the client learns about
+it only by refetching its wallet — `WalletModal` says as much: there is no
+moment in the browser that *is* the purchase completing.
+
+That leaves three ways to report the business event, none free:
+
+1. **From the client, on seeing the balance rise.** Fits GameAnalytics' model,
+   attributes revenue to the real session — but the client never sees a
+   purchase the player abandoned the tab on, and the trigger is a balance
+   change, which a refund or an admin grant also produces.
+2. **From the server webhook.** Authoritative, which revenue has to be. But
+   every GameAnalytics event needs a `session_id`, and a server-synthesized one
+   distorts DAU, session counts, and session length — the reasoning in the
+   section above applies here too, just at lower volume.
+3. **Server decides, client reports.** The wallet already returns recent
+   ledger entries carrying `source: "xsolla"`, the provider's transaction id,
+   and the delta. The client reports each once, inside its own real session,
+   using the server's numbers.
+
+Option 3 is the right shape and the recommendation. What it still needs is
+**exactly-once reporting**: two devices opening the game after one purchase
+would both see the same ledger entry and both report it, and doubled revenue
+is worse than late revenue. Local dedupe narrows that window but does not
+close it; a `reportedToAnalytics` marker on the ledger entry does, at the cost
+of a write path and a schema field.
+
+Until that is settled, GameAnalytics' monetization dashboards stay empty while
+the ledger remains the source of truth for actual revenue — which is the safe
+way round.
+
+**Boost fuel and XP** remain unreported. Neither is a currency the player
+chooses to spend against alternatives, which is what the sink/source metrics
+compare; Snakebux is.
 
 **Server-side events do not go to GameAnalytics, by design.** Snaketron already
 has a first-party server analytics pipeline (`server/src/analytics/`) that
