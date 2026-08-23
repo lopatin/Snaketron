@@ -78,6 +78,8 @@ async fn strict_manifest_stores_the_exact_gated_ladder_and_retries_idempotently(
         user_cache: None,
         crazygames_verifier: None,
         texture_store: Some(store.clone()),
+        // This integration test exercises texture persistence, not checkout.
+        payments: None,
     };
     let app = Router::new()
         .route("/", post(ingest_forge_manifest))
