@@ -20,6 +20,7 @@ type QaState =
   | 'pending'
   | 'unavailable'
   | 'incompatible'
+  | 'network'
   | 'malformed-anchor'
   | 'bad-end-hash';
 
@@ -27,8 +28,9 @@ const STATES: readonly { id: QaState; label: string }[] = [
   { id: 'ready', label: 'Ready replay' },
   { id: 'ranked', label: 'Ranked star' },
   { id: 'pending', label: 'Pending cut' },
-  { id: 'unavailable', label: 'Unavailable / ad' },
+  { id: 'unavailable', label: 'Unavailable' },
   { id: 'incompatible', label: 'Version mismatch' },
+  { id: 'network', label: 'Network failure' },
   { id: 'malformed-anchor', label: 'Malformed anchor' },
   { id: 'bad-end-hash', label: 'Bad end hash' },
 ] as const;
@@ -47,6 +49,8 @@ const highlightForState = (state: QaState): MatchHighlightState => {
       return { phase: 'unavailable', reason: 'absent' };
     case 'incompatible':
       return { phase: 'unavailable', reason: 'incompatible' };
+    case 'network':
+      return { phase: 'unavailable', reason: 'network' };
     case 'malformed-anchor': {
       const clip = cloneClip();
       clip.anchor.tick = clip.window.start_tick + 1;

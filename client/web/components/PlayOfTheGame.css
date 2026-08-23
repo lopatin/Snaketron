@@ -1,6 +1,6 @@
 /* The replay band keeps exactly two pieces of broadcast styling — the title
    plate and the lower third — because they read as a sports replay caption.
-   Everything else (controls, sponsor slot, poster) uses the same quiet
+   Everything else (controls and poster) uses the same quiet
    black-on-white chrome as the rest of the results card. */
 .potg-band {
   --potg-ink: #20232a;
@@ -69,9 +69,8 @@
    from a 21:9 canvas, so there is no pixel value to animate to. The resting
    state is the open one, which is what lets reduced motion simply switch the
    animation off.
-   Whichever fills the slot — the replay or the sponsor — opens the same way;
-   appearing without the growth reads as the card mis-laying itself out rather
-   than as something being presented. */
+   The verified replay opens inside this slot; unavailable highlights do not
+   mount a row at all. */
 .potg-slot {
   display: grid;
   grid-template-rows: 1fr;
@@ -81,11 +80,7 @@
   animation: potg-slot-open 560ms cubic-bezier(0.34, 0.68, 0.3, 1) both;
 }
 
-/* Both fills are named rather than using `> *`: the sponsor slot sets its own
-   min-height, and at equal specificity that would win and stop the row
-   collapsing — it would open from 94px instead of from nothing. */
-.potg-slot > .potg-band,
-.potg-slot > .potg-sponsor {
+.potg-slot > .potg-band {
   min-height: 0;
 }
 
@@ -409,68 +404,6 @@
   font-size: 7px;
 }
 
-.potg-sponsor {
-  --potg-ink: #20232a;
-  position: relative;
-  display: grid;
-  min-height: 94px;
-  place-items: center;
-  overflow: hidden;
-  border-bottom: 1px solid #d8dbe0;
-  background: #f7f8fa;
-}
-
-.potg-sponsor__label {
-  position: absolute;
-  top: 8px;
-  left: 10px;
-  z-index: 2;
-  padding: 2px 5px;
-  border: 1px solid rgb(63 63 65 / 24%);
-  background: #fff;
-  color: rgb(63 63 65 / 58%);
-  font-size: 6px;
-  font-weight: 900;
-  letter-spacing: 0.11em;
-  text-transform: uppercase;
-}
-
-.potg-sponsor__sdk {
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  min-height: 90px;
-}
-
-.potg-sponsor__fallback {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  color: var(--potg-ink);
-}
-
-.potg-sponsor__fallback strong {
-  font-size: 12px;
-  font-weight: 800;
-  letter-spacing: 0.01em;
-}
-
-.potg-sponsor__fallback small {
-  color: rgb(63 63 65 / 55%);
-  font-size: 7px;
-  font-weight: 900;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.potg-sponsor.has-live-banner .potg-sponsor__fallback {
-  display: none;
-}
-
 @media (max-width: 420px) {
   .potg-kicker {
     min-height: 18px;
@@ -500,10 +433,6 @@
   .potg-replay {
     width: 24px;
     height: 24px;
-  }
-
-  .potg-sponsor {
-    min-height: 82px;
   }
 }
 
@@ -543,8 +472,7 @@
 }
 
 @media (forced-colors: active) {
-  .potg-band,
-  .potg-sponsor {
+  .potg-band {
     border-color: CanvasText;
     background: Canvas;
     color: CanvasText;

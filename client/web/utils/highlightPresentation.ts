@@ -4,7 +4,10 @@ import type { HighlightClip, HighlightReason } from '../types/generated';
 
 export const HIGHLIGHT_CLIP_FORMAT_VERSION = 1;
 export const HIGHLIGHT_POLL_INTERVAL_MS = 900;
-export const HIGHLIGHT_POLL_MAX_ATTEMPTS = 7;
+// Replay persistence includes an object-store write before the highlight is
+// queryable. Allow roughly 30 seconds so a healthy write is not mistaken for
+// an unavailable highlight after only a few seconds.
+export const HIGHLIGHT_POLL_MAX_ATTEMPTS = 34;
 
 export type MatchHighlightState =
   | { phase: 'idle' }
