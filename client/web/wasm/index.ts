@@ -62,15 +62,22 @@ const SKIN_ASSET_TIMEOUT_MS = 5000;
  * Resolves immediately when nothing is pending, which is the common case: only
  * the first appearance of a textured skin in a session ever waits.
  */
-export function whenSkinAssetsSettle(): Promise<void> {
+export function whenSkinAssetsSettle(contentRef?: string): Promise<void> {
   const wasm = getWasm();
-  if (!wasm?.skinAssetsPending()) {
+  const assetsPending = (): boolean => {
+    const current = getWasm();
+    if (!current) return false;
+    return contentRef
+      ? current.skinAssetPending(contentRef)
+      : current.skinAssetsPending();
+  };
+  if (!wasm || !assetsPending()) {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
     const deadline = Date.now() + SKIN_ASSET_TIMEOUT_MS;
     const poll = () => {
-      if (!getWasm()?.skinAssetsPending() || Date.now() > deadline) {
+      if (!assetsPending() || Date.now() > deadline) {
         resolve();
         return;
       }

@@ -19,6 +19,9 @@ HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
 PLAIN_HASH = re.compile(r"^[a-f0-9]{64}$")
 ROUTES = {"layers", "texture", "sprite-sheet", "hybrid"}
 DRAFT_FIXTURE_DIR = "worker-drafts"
+MODIFIER_FIXTURE_DIR = "modifier-workflow"
+MAX_TEXTURE_REFS = 8
+MAX_SPRITE_FPS = 60
 PLAN_PATHS = {"layers", "texture", "sprite_sheet", "hybrid"}
 ASSET_KINDS = {"coat", "sheet", "overlay"}
 AXES = {"x", "y"}
@@ -74,6 +77,14 @@ PROTOTYPE_PROMPT_TERMS = (
     "no gaps, detached plates, perspective, or outside paint",
     PROTOTYPE_PROJECTION_PROMPT,
 )
+PIXVERSE_TRANSITION_CAPABILITY = "fal-ai/pixverse/v6/transition"
+PIXVERSE_PROMPT_SECTIONS = (
+    "[Cinematography]",
+    "[Subject]",
+    "[Action / Transition]",
+    "[Context]",
+    "[Style & Ambiance]",
+)
 
 REQUIRED_FILES = {
     "SKILL.md",
@@ -83,27 +94,42 @@ REQUIRED_FILES = {
     "references/design-guidelines.md",
     "references/integration.md",
     "references/layers-effects.md",
+    "references/modifiers-video.md",
     "references/playbook.md",
     "references/prototypes.md",
     "references/textures-sprites.md",
     "references/validation.md",
     "schemas/asset-request.schema.json",
     "schemas/implementation-plan.schema.json",
+    "schemas/media-operation-request.schema.json",
+    "schemas/modifier-manifest.schema.json",
     "schemas/prototype-manifest.schema.json",
     "templates/asset-request.json",
     "templates/implementation-plan.json",
+    "templates/media-operation-request.json",
+    "templates/modifier-manifest.json",
     "templates/skin-v2.template.json",
     "fixtures/worker-drafts/skin-anchor.externally-tagged.valid.json",
     "fixtures/worker-drafts/skin-anchor.flattened.invalid.json",
+    "fixtures/modifier-workflow/draft-selection.json",
+    "fixtures/modifier-workflow/implementation-plan.json",
+    "fixtures/modifier-workflow/media-requests.json",
+    "fixtures/modifier-workflow/T1.modifier-manifest.json",
+    "fixtures/modifier-workflow/T2.modifier-manifest.json",
+    "fixtures/modifier-workflow/B1.modifier-manifest.json",
+    "fixtures/modifier-workflow/H.modifier-manifest.json",
 }
 
 PLAN_KEYS = {
+    "input_authority",
     "path",
     "rationale",
     "design_guidelines",
+    "common_period_ms",
     "fidelity_features",
     "layer_plan",
     "asset_plan",
+    "modifier_plan",
     "animation_plan",
     "required_wrap_axes",
     "risks",
@@ -115,10 +141,42 @@ ASSET_KEYS = {
     "frames",
     "desired_fps",
     "texels_per_cell",
+    "raster_overhang_px",
     "anchor",
     "fit",
+    "tile_phase_origin",
     "fade",
+    "transverse_edge_policy",
     "prompt",
+}
+
+INPUT_AUTHORITY_KEYS = {
+    "mode",
+    "artifact_sha256",
+    "authority_record_sha256",
+    "human_approval_decision_id",
+    "selection_rationale",
+    "maximum_driver_action",
+}
+
+MODIFIER_KEYS = {
+    "asset_index",
+    "logical_key",
+    "component_key",
+    "texture_name",
+    "image_layer_name",
+    "fallback_layer_name",
+    "span_limit_mode",
+    "span_limit_value",
+    "source_mode",
+    "source_object_sha256",
+    "modifier_manifest_sha256",
+    "provenance_sha256",
+    "license_id",
+    "authorized_lineage_ids",
+    "required_capabilities",
+    "extraction",
+    "video",
 }
 
 
@@ -165,6 +223,338 @@ def numeric_constant(value: Any) -> bool:
 def add(errors: list[str], condition: bool, message: str) -> None:
     if not condition:
         errors.append(message)
+
+
+def validate_schema_instance(instance: Any, schema: dict[str, Any], label: str, errors: list[str]) -> None:
+    """Dependency-free closed top-level schema check for package fixtures."""
+
+    if not isinstance(instance, dict):
+        errors.append(f"{label}: instance must be an object")
+        return
+    required = set(schema.get("required", []))
+    properties = set(schema.get("properties", {}))
+    add(errors, required <= set(instance), f"{label}: missing required top-level fields")
+    if schema.get("additionalProperties") is False:
+        add(errors, set(instance) <= properties, f"{label}: unexpected top-level fields")
+
+
+def validate_media_request(request: dict[str, Any], label: str, errors: list[str]) -> None:
+    add(
+        errors,
+        request.get("journal")
+        == {
+            "retain_inputs": True,
+            "retain_provider_output": True,
+            "retain_output": True,
+            "retain_reports": True,
+        },
+        f"{label}: media inputs/provider output/result/reports must all be journaled",
+    )
+    extraction = request.get("extraction")
+    if extraction is not None:
+        add(
+            errors,
+            extraction.get("source_arena") == "reserved_empty"
+            and extraction.get("visible_object_count") == 1
+            and extraction.get("alpha_contract") in {"transparent_rgba", "exact_mask_matte"}
+            and extraction.get("background_removal") == "required"
+            and extraction.get("matte_policy") == "fail_closed"
+            and extraction.get("crop_after_verification") is True
+            and extraction.get("fail_on_edge_contact") is True,
+            f"{label}: extraction must fail closed before cropping one verified RGBA/matte object",
+        )
+    video = request.get("video")
+    if isinstance(video, dict):
+        period = video.get("common_period_ms")
+        fps = video.get("desired_fps")
+        if isinstance(period, (int, float)) and isinstance(fps, (int, float)):
+            derived = max(2, math.ceil(period * fps / 1_000))
+            add(errors, video.get("derived_frame_rows") == derived, f"{label}: derived rows must equal ceil(period*fps/1000)")
+        columns = video.get("body_columns")
+        tpc = video.get("texels_per_cell")
+        overhang = video.get("raster_overhang_px")
+        if all(isinstance(value, int) for value in (columns, tpc, overhang)) and (tpc * overhang) % 16 == 0:
+            row_texels = tpc + 2 * (tpc * overhang // 16)
+            cap = min(120, 2048 // row_texels, 16_777_216 // (columns * tpc * row_texels * 4))
+            add(errors, video.get("row_texels") == row_texels, f"{label}: video row_texels is wrong")
+            add(errors, video.get("effective_frame_row_cap") == cap, f"{label}: video effective row cap is wrong")
+            add(errors, video.get("derived_frame_rows", 121) <= cap, f"{label}: video rows exceed effective cap")
+        add(errors, video.get("frame_extraction") == "deterministic_uniform_full_period", f"{label}: video timestamps must be deterministic")
+        add(errors, video.get("loop_closure") == "true_final_to_zero", f"{label}: true final-to-zero loop is required")
+        add(errors, video.get("alpha_matte_verification") == "fail_closed", f"{label}: video alpha/matte must fail closed")
+        add(
+            errors,
+            isinstance(video.get("desired_fps"), (int, float))
+            and not isinstance(video.get("desired_fps"), bool)
+            and video["desired_fps"] <= MAX_SPRITE_FPS,
+            f"{label}: video desired_fps exceeds the pinned renderer ceiling",
+        )
+    if request.get("operation") == "generate_video" and isinstance(video, dict):
+        add(
+            errors,
+            request.get("input_artifacts")
+            == [video.get("start_frame_sha256"), video.get("end_frame_sha256")],
+            f"{label}: transition inputs must bind ordered start/end frame hashes",
+        )
+        add(
+            errors,
+            video.get("source_video_sha256") is None,
+            f"{label}: transition generation cannot claim provider output bytes before generation",
+        )
+        if request.get("capability_id") == PIXVERSE_TRANSITION_CAPABILITY:
+            prompt = request.get("prompt", "")
+            section_positions = [prompt.find(section) for section in PIXVERSE_PROMPT_SECTIONS]
+            add(
+                errors,
+                all(position >= 0 for position in section_positions)
+                and section_positions == sorted(section_positions)
+                and all(prompt.count(section) == 1 for section in PIXVERSE_PROMPT_SECTIONS),
+                f"{label}: PixVerse prompt must contain the five literal sections exactly once and in order",
+            )
+            for term in (
+                "Static orthographic camera",
+                "flat 2D",
+                "exact supplied",
+                "Only the B1 component animates",
+                "reserved matte arena",
+                "background completely static",
+                "true cyclic final-to-zero closure",
+                "exact colors",
+                "alpha/matte boundaries",
+            ):
+                add(errors, term in prompt, f"{label}: PixVerse prompt is missing required constraint: {term}")
+    if request.get("operation") == "extract_video_frames" and isinstance(video, dict):
+        add(
+            errors,
+            request.get("input_artifacts") == [video.get("source_video_sha256")],
+            f"{label}: frame extraction must bind the exact source video hash",
+        )
+    if request.get("operation") == "reuse_modifier":
+        reuse = request.get("reuse", {})
+        add(
+            errors,
+            request.get("input_artifacts") == [reuse.get("modifier_manifest_sha256")],
+            f"{label}: reuse must bind one exact modifier manifest",
+        )
+        add(errors, reuse.get("require_authorized_lineage") is True, f"{label}: reuse must enforce lineage scope")
+        add(errors, bool(reuse.get("target_lineage_id")), f"{label}: reuse target lineage is required")
+
+
+def validate_modifier_manifest(manifest: dict[str, Any], label: str, errors: list[str]) -> None:
+    for field in (
+        "content_sha256",
+        "forge_manifest_sha256",
+        "descriptor_sha256",
+        "provenance_sha256",
+        "created_by_operation_sha256",
+    ):
+        add(errors, is_hash(manifest.get(field)), f"{label}: {field} must be an exact hash")
+    add(
+        errors,
+        isinstance(manifest.get("authorized_lineage_ids"), list)
+        and bool(manifest["authorized_lineage_ids"]),
+        f"{label}: authorized lineage scope is required",
+    )
+    identifier = manifest.get("modifier_id")
+    match = (
+        re.fullmatch(r"modifier:([a-z0-9_-]+):(sha256:[a-f0-9]{64})", identifier)
+        if isinstance(identifier, str)
+        else None
+    )
+    add(errors, match is not None, f"{label}: modifier id is malformed")
+    if match is not None:
+        add(
+            errors,
+            match.group(2) == manifest.get("content_sha256"),
+            f"{label}: modifier id must bind the exact content hash",
+        )
+        add(
+            errors,
+            match.group(1) in manifest.get("authorized_lineage_ids", []),
+            f"{label}: modifier id lineage is not authorized",
+        )
+    add(
+        errors,
+        isinstance(manifest.get("raster_overhang_px"), int)
+        and 0 <= manifest["raster_overhang_px"] <= 4,
+        f"{label}: raster overhang must be 0..4",
+    )
+    verification = manifest.get("verification", {})
+    add(errors, verification.get("background_contamination") == "pass", f"{label}: background contamination failed")
+    add(errors, verification.get("edge_fringes") == "pass", f"{label}: alpha/matte edge fringes failed")
+    add(
+        errors,
+        verification.get("outer_frame_edge") in {"pass_transparent_effect", "not_applicable_opaque_fill"},
+        f"{label}: outer frame edge verification is required",
+    )
+    add(errors, verification.get("frame_gutters") == "pass", f"{label}: frame/repeat gutters are forbidden")
+    add(errors, verification.get("immutable_bytes") is True, f"{label}: modifier bytes must be immutable")
+    alpha_matte = verification.get("alpha_matte")
+    outer_frame_edge = verification.get("outer_frame_edge")
+    if alpha_matte in {"transparent_rgba_verified", "exact_mask_matte_verified"}:
+        add(
+            errors,
+            outer_frame_edge == "pass_transparent_effect",
+            f"{label}: transparent or matte modifier must prove the outer frame edge is clear",
+        )
+    elif alpha_matte == "opaque_not_applicable":
+        add(
+            errors,
+            outer_frame_edge == "not_applicable_opaque_fill",
+            f"{label}: opaque modifier must use the explicit outer-edge exemption",
+        )
+
+
+def validate_modifier_workflow_links(
+    plan: dict[str, Any],
+    requests: list[dict[str, Any]],
+    manifests: dict[str, tuple[str, dict[str, Any]]],
+    label: str,
+    errors: list[str],
+) -> None:
+    """Bind every planned component to one retained manifest and its media path."""
+
+    modifiers = plan.get("modifier_plan", [])
+    assets = plan.get("asset_plan", [])
+    planned_components = [modifier.get("component_key") for modifier in modifiers]
+    add(
+        errors,
+        set(manifests) == set(planned_components) and len(manifests) == len(modifiers),
+        f"{label}: every planned component needs exactly one immutable modifier manifest",
+    )
+    used_request_ids: set[str] = set()
+    for modifier in modifiers:
+        component = modifier.get("component_key")
+        record = manifests.get(component)
+        if record is None:
+            continue
+        manifest_sha256, manifest = record
+        asset_index = modifier.get("asset_index")
+        if not isinstance(asset_index, int) or not 0 <= asset_index < len(assets):
+            continue
+        asset = assets[asset_index]
+        for field in (
+            "logical_key",
+            "component_key",
+            "provenance_sha256",
+            "license_id",
+            "authorized_lineage_ids",
+        ):
+            add(
+                errors,
+                manifest.get(field) == modifier.get(field),
+                f"{label}: {component} manifest {field} differs from its plan",
+            )
+        add(
+            errors,
+            manifest.get("content_sha256") == modifier.get("source_object_sha256"),
+            f"{label}: {component} manifest content differs from the planned immutable object",
+        )
+        add(
+            errors,
+            modifier.get("modifier_manifest_sha256") == f"sha256:{manifest_sha256}",
+            f"{label}: {component} plan does not bind the exact manifest bytes",
+        )
+        add(
+            errors,
+            manifest.get("raster_overhang_px") == asset.get("raster_overhang_px"),
+            f"{label}: {component} manifest overhang differs from its asset",
+        )
+        component_requests = [
+            request
+            for request in requests
+            if request.get("component_key") == component
+            and request.get("logical_key") == modifier.get("logical_key")
+        ]
+        for request in component_requests:
+            if isinstance(request.get("request_id"), str):
+                used_request_ids.add(request["request_id"])
+            add(
+                errors,
+                request.get("capability_id") in modifier.get("required_capabilities", []),
+                f"{label}: {component} request uses an unplanned capability",
+            )
+        mode = modifier.get("source_mode")
+        if mode == "extracted_rgba":
+            add(
+                errors,
+                [request.get("operation") for request in component_requests] == ["extract_object"],
+                f"{label}: {component} extraction path must contain one exact extract_object request",
+            )
+            add(
+                errors,
+                is_hash(manifest.get("extraction_report_sha256"))
+                and manifest.get("video_report_sha256") is None,
+                f"{label}: {component} manifest needs extraction-only verification",
+            )
+        elif mode == "reused_object":
+            add(
+                errors,
+                [request.get("operation") for request in component_requests] == ["reuse_modifier"],
+                f"{label}: {component} reuse path must contain one exact reuse request",
+            )
+            if len(component_requests) == 1:
+                reuse = component_requests[0].get("reuse", {})
+                add(
+                    errors,
+                    reuse.get("modifier_manifest_sha256") == modifier.get("modifier_manifest_sha256"),
+                    f"{label}: {component} reuse request does not bind the planned manifest",
+                )
+                add(
+                    errors,
+                    reuse.get("target_lineage_id") in modifier.get("authorized_lineage_ids", []),
+                    f"{label}: {component} reuse target is outside the authorized lineage",
+                )
+        elif mode == "video_frames":
+            operations = [request.get("operation") for request in component_requests]
+            add(
+                errors,
+                operations == ["generate_video", "extract_video_frames"],
+                f"{label}: {component} video path must retain ordered generation and extraction requests",
+            )
+            add(
+                errors,
+                is_hash(manifest.get("extraction_report_sha256"))
+                and is_hash(manifest.get("video_report_sha256")),
+                f"{label}: {component} manifest needs video and extraction verification",
+            )
+            video = modifier.get("video", {})
+            for request in component_requests:
+                request_video = request.get("video", {})
+                for field in (
+                    "start_frame_sha256",
+                    "end_frame_sha256",
+                    "common_period_ms",
+                    "desired_fps",
+                    "derived_frame_rows",
+                ):
+                    add(
+                        errors,
+                        request_video.get(field) == video.get(field),
+                        f"{label}: {component} media request {field} differs from the plan",
+                    )
+                if request.get("operation") == "extract_video_frames":
+                    add(
+                        errors,
+                        request_video.get("source_video_sha256") == video.get("source_video_sha256"),
+                        f"{label}: {component} extraction request differs from the planned source video",
+                    )
+        if mode != "reused_object":
+            retained_inputs = {
+                artifact
+                for request in component_requests
+                for artifact in request.get("input_artifacts", [])
+            }
+            add(
+                errors,
+                retained_inputs <= set(manifest.get("source_artifacts", [])),
+                f"{label}: {component} manifest does not retain every media input",
+            )
+    add(
+        errors,
+        used_request_ids == {request.get("request_id") for request in requests},
+        f"{label}: media requests must map one-to-one into planned component workflows",
+    )
 
 
 def validate_frontmatter(path: Path, errors: list[str]) -> None:
@@ -296,6 +686,13 @@ def validate_boundaries(errors: list[str]) -> None:
             "compressed head, turn, and tail points",
             "head-ward run",
             "cannot paint arbitrary pixels outside it",
+            "`TextureDescriptorV2.raster_overhang_px`",
+            "0 through 4 authored bleed pixels per transverse side",
+            "unchanged",
+            "16×16 logical body cell",
+            "does not relax the longitudinal head and tail caps",
+            "neighboring snake",
+            "not a freeform canvas",
             "Pattern",
             "Sprite",
             "production quality",
@@ -551,6 +948,12 @@ def validate_implementation_plan_schema(schema: dict[str, Any], errors: list[str
         "design-guideline head-zone enum drifted",
     )
     plan_properties = schema.get("properties", {})
+    add(
+        errors,
+        plan_properties.get("asset_plan", {}).get("maxItems") == MAX_TEXTURE_REFS
+        and plan_properties.get("modifier_plan", {}).get("maxItems") == MAX_TEXTURE_REFS,
+        "implementation-plan schema must admit the current eight reference parser ceiling",
+    )
     for field in ("layer_plan", "animation_plan"):
         description = plan_properties.get(field, {}).get("description", "")
         add(
@@ -562,6 +965,40 @@ def validate_implementation_plan_schema(schema: dict[str, Any], errors: list[str
         errors,
         BAND_LANE_SAFE_EXAMPLE in plan_properties.get("animation_plan", {}).get("description", ""),
         "implementation-plan schema animation_plan must preserve the safe animated band example",
+    )
+    for required in ("input_authority", "common_period_ms", "modifier_plan"):
+        add(errors, required in schema.get("required", []), f"implementation-plan schema must require {required}")
+    authority = schema.get("$defs", {}).get("inputAuthority", {})
+    add(
+        errors,
+        authority.get("additionalProperties") is False
+        and set(authority.get("required", [])) == INPUT_AUTHORITY_KEYS,
+        "input-authority schema must be closed and require every evidence field",
+    )
+    modifier = schema.get("$defs", {}).get("modifier", {})
+    add(
+        errors,
+        modifier.get("additionalProperties") is False
+        and set(modifier.get("required", [])) == MODIFIER_KEYS,
+        "modifier-plan schema must be closed and require every provenance/placement field",
+    )
+    add(
+        errors,
+        modifier.get("properties", {}).get("asset_index", {}).get("maximum")
+        == MAX_TEXTURE_REFS - 1,
+        "modifier asset index must match the current parser ceiling",
+    )
+    asset = schema.get("$defs", {}).get("asset", {})
+    asset_properties = asset.get("properties", {})
+    add(
+        errors,
+        asset_properties.get("raster_overhang_px", {}).get("maximum") == 4,
+        "asset schema must cap raster_overhang_px at 4 around the unchanged 16x16 body cell",
+    )
+    add(
+        errors,
+        set(asset_properties.get("tile_phase_origin", {}).get("enum", [])) == {"head", "tail", None},
+        "asset schema must expose head/tail tile phase plus null for non-tile fits",
     )
 
 
@@ -575,21 +1012,26 @@ def validate_asset_request(request: dict[str, Any], label: str, errors: list[str
         "operation",
         "kind",
         "input_artifacts",
+        "modifier",
         "prompt",
         "width_px",
         "height_px",
         "grid",
         "required_wrap_axes",
+        "tile_phase_origin",
         "transparency",
         "row_zero",
+        "edge_contract",
+        "retention",
         "repair",
     }
     add(errors, set(request) == required, f"{label}: asset-request fields drifted")
-    add(errors, request.get("schema_version") == 1, f"{label}: asset schema must be 1")
+    add(errors, request.get("schema_version") == 2, f"{label}: asset schema must be 2")
     add(
         errors,
-        isinstance(request.get("asset_index"), int) and request["asset_index"] >= 0,
-        f"{label}: invalid asset index",
+        isinstance(request.get("asset_index"), int)
+        and 0 <= request["asset_index"] < MAX_TEXTURE_REFS,
+        f"{label}: asset index exceeds the current parser limit",
     )
     add(
         errors,
@@ -634,10 +1076,21 @@ def validate_asset_request(request: dict[str, Any], label: str, errors: list[str
         request.get("width_px") == grid.get("body_columns", 0) * grid.get("texels_per_cell", 0),
         f"{label}: width must encode independent body columns",
     )
+    tpc = grid.get("texels_per_cell")
+    overhang = grid.get("raster_overhang_px")
+    scaled_side = None
+    if isinstance(tpc, int) and isinstance(overhang, int) and (tpc * overhang) % 16 == 0:
+        scaled_side = tpc * overhang // 16
+    row_texels = tpc + 2 * scaled_side if isinstance(tpc, int) and scaled_side is not None else None
     add(
         errors,
-        request.get("height_px") == grid.get("frame_rows", 0) * grid.get("texels_per_cell", 0),
-        f"{label}: height must encode independent frame rows",
+        row_texels == grid.get("row_texels"),
+        f"{label}: row_texels must scale the bleed aprons around the unchanged 16x16 body",
+    )
+    add(
+        errors,
+        request.get("height_px") == grid.get("frame_rows", 0) * (row_texels or 0),
+        f"{label}: height must encode independent frame rows with scaled overhang",
     )
     add(
         errors,
@@ -686,6 +1139,94 @@ def validate_asset_request(request: dict[str, Any], label: str, errors: list[str
             is_hash(repair.get("mask_artifact")),
             f"{label}: inpaint repair needs a mask artifact",
         )
+    add(
+        errors,
+        isinstance(overhang, int) and 0 <= overhang <= 4,
+        f"{label}: raster_overhang_px must be 0..4",
+    )
+    phase = request.get("tile_phase_origin")
+    if "x" in axes:
+        add(errors, phase in {"head", "tail"}, f"{label}: tiled asset needs head/tail phase origin")
+    else:
+        add(errors, phase is None, f"{label}: non-tiled asset phase origin must be null")
+    modifier = request.get("modifier", {})
+    add(
+        errors,
+        set(modifier)
+        == {"logical_key", "component_key", "provenance_sha256", "license_id", "authorized_lineage_ids"},
+        f"{label}: modifier intent fields drifted",
+    )
+    add(errors, is_hash(modifier.get("provenance_sha256")), f"{label}: modifier provenance must be hashed")
+    add(
+        errors,
+        isinstance(modifier.get("authorized_lineage_ids"), list) and bool(modifier["authorized_lineage_ids"]),
+        f"{label}: modifier needs an authorized lineage scope",
+    )
+    retention = request.get("retention", {})
+    add(
+        errors,
+        retention
+        == {"retain_inputs": True, "retain_provider_output": True, "retain_forged_output": True},
+        f"{label}: asset inputs/provider/forge outputs must all be retained",
+    )
+    edge = request.get("edge_contract", {})
+    add(errors, edge.get("no_frame_or_repeat_gutters") is True, f"{label}: frame/repeat gutters are forbidden")
+    policy = edge.get("transverse_policy")
+    add(
+        errors,
+        policy in {"fail_closed_transparent_effect", "not_applicable_opaque_fill"},
+        f"{label}: invalid transverse edge policy",
+    )
+    if request.get("transparency") == "required":
+        add(errors, policy == "fail_closed_transparent_effect", f"{label}: transparent effect must fail on edge contact")
+    if policy == "not_applicable_opaque_fill":
+        add(errors, request.get("transparency") == "opaque", f"{label}: opaque edge exemption requires opaque bytes")
+
+
+def validate_video_contract(
+    video: Any,
+    asset: dict[str, Any],
+    common_period_ms: Any,
+    label: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(video, dict):
+        errors.append(f"{label}: video contract is required")
+        return
+    for field in (
+        "start_frame_sha256",
+        "end_frame_sha256",
+        "source_video_sha256",
+        "extracted_sheet_sha256",
+    ):
+        add(errors, is_hash(video.get(field)), f"{label}: video {field} must be an exact hash")
+    period = video.get("common_period_ms")
+    fps = video.get("desired_fps")
+    add(errors, period == common_period_ms, f"{label}: video must use the plan common period")
+    add(errors, fps == asset.get("desired_fps"), f"{label}: video desired_fps differs from asset")
+    add(
+        errors,
+        isinstance(fps, (int, float)) and not isinstance(fps, bool) and fps <= MAX_SPRITE_FPS,
+        f"{label}: video desired_fps exceeds the pinned renderer ceiling",
+    )
+    if not isinstance(period, (int, float)) or not isinstance(fps, (int, float)):
+        return
+    derived = max(2, math.ceil(period * fps / 1_000))
+    add(errors, video.get("derived_frame_rows") == derived, f"{label}: video rows must equal ceil(period*fps/1000)")
+    tpc = asset.get("texels_per_cell")
+    overhang = asset.get("raster_overhang_px")
+    columns = asset.get("natural_length_cells")
+    if not all(isinstance(value, int) for value in (tpc, overhang, columns)) or (tpc * overhang) % 16:
+        return
+    row_texels = tpc + 2 * (tpc * overhang // 16)
+    width = columns * tpc
+    cap = min(120, 2048 // row_texels, 16_777_216 // (width * row_texels * 4))
+    add(errors, video.get("effective_frame_row_cap") == cap, f"{label}: video effective row cap is wrong")
+    add(errors, derived <= cap and asset.get("frames") == derived, f"{label}: video cadence exceeds effective row cap")
+    add(errors, video.get("frame_extraction") == "deterministic_uniform_full_period", f"{label}: video extraction is not deterministic")
+    add(errors, video.get("alpha_matte_verification") == "fail_closed", f"{label}: video alpha/matte must fail closed")
+    add(errors, video.get("loop_closure") == "true_final_to_zero", f"{label}: video must verify true final-to-zero")
+    add(errors, video.get("retained_inputs_and_output") is True, f"{label}: video inputs/output must be retained")
 
 
 def validate_plan(
@@ -698,20 +1239,49 @@ def validate_plan(
     add(errors, set(plan) == PLAN_KEYS, f"{label}: implementation-plan fields drifted")
     path = plan.get("path")
     add(errors, path in PLAN_PATHS, f"{label}: invalid plan path")
+    authority = plan.get("input_authority", {})
+    add(errors, set(authority) == INPUT_AUTHORITY_KEYS, f"{label}: input_authority fields drifted")
+    mode = authority.get("mode")
+    add(errors, mode in {"approved_prototype", "draft_submission"}, f"{label}: invalid input authority mode")
+    add(errors, is_hash(authority.get("authority_record_sha256")), f"{label}: authority record must be hashed")
     add(
         errors,
-        approval.get("action") == "prototype_approval",
-        f"{label}: wrong approval action",
+        authority.get("artifact_sha256") == manifest.get("image_sha256"),
+        f"{label}: authority and manifest must bind the same image",
     )
+    if mode == "approved_prototype":
+        add(errors, approval.get("action") == "prototype_approval", f"{label}: wrong approval action")
+        add(
+            errors,
+            manifest.get("image_sha256") == approval.get("artifact_sha256"),
+            f"{label}: approval and manifest must bind the same image",
+        )
+        add(
+            errors,
+            authority.get("human_approval_decision_id") == approval.get("decision_id")
+            and bool(approval.get("decision_id")),
+            f"{label}: exact human approval decision id is required",
+        )
+        add(errors, authority.get("selection_rationale") is None, f"{label}: approval cannot claim selection rationale")
+        add(
+            errors,
+            authority.get("maximum_driver_action") == "register_private_revision",
+            f"{label}: approved mode action ceiling drifted",
+        )
+    elif mode == "draft_submission":
+        add(errors, authority.get("human_approval_decision_id") is None, f"{label}: draft cannot claim human approval")
+        add(errors, bool(authority.get("selection_rationale")), f"{label}: draft needs literal selection rationale")
+        add(
+            errors,
+            authority.get("maximum_driver_action") == "request_admin_review",
+            f"{label}: draft action ceiling must be request_admin_review",
+        )
     add(
         errors,
-        manifest.get("image_sha256") == approval.get("artifact_sha256"),
-        f"{label}: approval and manifest must bind the same image",
-    )
-    add(
-        errors,
-        bool(approval.get("decision_id")),
-        f"{label}: approval decision id is required",
+        isinstance(plan.get("common_period_ms"), (int, float))
+        and not isinstance(plan.get("common_period_ms"), bool)
+        and 120 <= plan["common_period_ms"] <= 60_000,
+        f"{label}: common_period_ms is invalid",
     )
     add(errors, bool(plan.get("rationale")), f"{label}: route rationale is required")
     validate_design_guidelines(plan.get("design_guidelines"), label, errors)
@@ -723,7 +1293,11 @@ def validate_plan(
         f"{label}: invalid wrap axes",
     )
     assets = plan.get("asset_plan", [])
-    add(errors, len(assets) <= 4, f"{label}: asset plan exceeds max texture refs")
+    add(
+        errors,
+        len(assets) <= MAX_TEXTURE_REFS,
+        f"{label}: asset plan exceeds max texture refs",
+    )
     if path == "layers":
         add(errors, not assets, f"{label}: layers path cannot request image assets")
     elif path == "texture":
@@ -743,6 +1317,8 @@ def validate_plan(
         add(errors, bool(assets), f"{label}: hybrid path needs an image asset")
 
     derived_axes: set[str] = set()
+    aggregate_decoded = 0
+    aggregate_png_upper = 0
     for index, asset in enumerate(assets):
         asset_label = f"{label}: asset_plan[{index}]"
         add(errors, set(asset) == ASSET_KEYS, f"{asset_label}: fields drifted")
@@ -758,19 +1334,39 @@ def validate_plan(
             isinstance(asset.get("frames"), int) and 1 <= asset["frames"] <= 120,
             f"{asset_label}: invalid independent Y frame count",
         )
-        if isinstance(asset.get("natural_length_cells"), int) and isinstance(asset.get("texels_per_cell"), int):
+        tpc = asset.get("texels_per_cell")
+        overhang = asset.get("raster_overhang_px")
+        scaled_side = None
+        if isinstance(tpc, int) and isinstance(overhang, int) and (tpc * overhang) % 16 == 0:
+            scaled_side = tpc * overhang // 16
+        row_texels = tpc + 2 * scaled_side if isinstance(tpc, int) and scaled_side is not None else None
+        width = None
+        if isinstance(asset.get("natural_length_cells"), int) and isinstance(tpc, int):
+            width = asset["natural_length_cells"] * tpc
             add(
                 errors,
-                asset["natural_length_cells"] * asset["texels_per_cell"] <= 2048,
+                width <= 2048,
                 f"{asset_label}: width exceeds the current capability bound",
             )
-        if isinstance(asset.get("frames"), int) and isinstance(asset.get("texels_per_cell"), int):
+        height = None
+        if isinstance(asset.get("frames"), int) and row_texels is not None:
             rows = asset["frames"] if kind == "sheet" else 1
+            height = rows * row_texels
             add(
                 errors,
-                rows * asset["texels_per_cell"] <= 2048,
+                height <= 2048,
                 f"{asset_label}: height exceeds the current capability bound",
             )
+        if width is not None and height is not None:
+            decoded = width * height * 4
+            add(
+                errors,
+                decoded <= 16_777_216,
+                f"{asset_label}: decoded bytes exceed the current capability bound",
+            )
+            aggregate_decoded += decoded
+            scanline_bytes = decoded + height
+            aggregate_png_upper += scanline_bytes + ((scanline_bytes + 65_534) // 65_535) * 5 + 1_024
         add(
             errors,
             isinstance(asset.get("texels_per_cell"), int) and 4 <= asset["texels_per_cell"] <= 128,
@@ -796,6 +1392,25 @@ def validate_plan(
             errors,
             asset.get("fade") in {"none", "leading", "trailing", "both"},
             f"{asset_label}: invalid fade",
+        )
+        add(
+            errors,
+            isinstance(overhang, int) and 0 <= overhang <= 4,
+            f"{asset_label}: raster_overhang_px must be 0..4",
+        )
+        if asset.get("fit") == "tile":
+            add(
+                errors,
+                asset.get("tile_phase_origin") in {"head", "tail"},
+                f"{asset_label}: tile fit needs head/tail phase origin",
+            )
+        else:
+            add(errors, asset.get("tile_phase_origin") is None, f"{asset_label}: non-tile phase must be null")
+        add(
+            errors,
+            asset.get("transverse_edge_policy")
+            in {"fail_closed_transparent_effect", "not_applicable_opaque_fill"},
+            f"{asset_label}: invalid transverse edge policy",
         )
         add(
             errors,
@@ -831,9 +1446,106 @@ def validate_plan(
             )
     add(
         errors,
+        aggregate_decoded <= 67_108_864,
+        f"{label}: decoded asset plan exceeds the current per-skin bound",
+    )
+    add(
+        errors,
+        aggregate_png_upper <= 8_388_608,
+        f"{label}: conservative PNG asset plan exceeds the current per-skin compressed bound",
+    )
+    add(
+        errors,
         set(axes) == derived_axes,
         f"{label}: wrap axes must be derived from kind and fit",
     )
+    modifiers = plan.get("modifier_plan", [])
+    add(errors, len(modifiers) == len(assets), f"{label}: modifier plan must map one-to-one to assets")
+    indexes: list[int] = []
+    for index, modifier in enumerate(modifiers):
+        modifier_label = f"{label}: modifier_plan[{index}]"
+        add(errors, set(modifier) == MODIFIER_KEYS, f"{modifier_label}: fields drifted")
+        asset_index = modifier.get("asset_index")
+        indexes.append(asset_index)
+        add(errors, asset_index == index, f"{modifier_label}: asset index must be exact and ordered")
+        if not isinstance(asset_index, int) or not 0 <= asset_index < len(assets):
+            continue
+        asset = assets[asset_index]
+        add(errors, is_hash(modifier.get("provenance_sha256")), f"{modifier_label}: provenance must be hashed")
+        add(
+            errors,
+            isinstance(modifier.get("authorized_lineage_ids"), list)
+            and bool(modifier["authorized_lineage_ids"]),
+            f"{modifier_label}: authorized lineage scope is required",
+        )
+        expected_span = {"whole": "whole", "head": "head_cells", "tail": "tail_fraction"}.get(asset.get("anchor"))
+        add(errors, modifier.get("span_limit_mode") == expected_span, f"{modifier_label}: span limit differs from anchor")
+        value = modifier.get("span_limit_value")
+        if expected_span == "whole":
+            add(errors, value is None, f"{modifier_label}: whole span limit must be null")
+        elif expected_span == "head_cells":
+            add(errors, isinstance(value, (int, float)) and 0 < value <= 6, f"{modifier_label}: head span exceeds cell 6")
+        elif expected_span == "tail_fraction":
+            add(errors, isinstance(value, (int, float)) and 0 < value <= 0.5, f"{modifier_label}: tail span exceeds half")
+        source_mode = modifier.get("source_mode")
+        add(
+            errors,
+            source_mode in {"direct_generate", "extracted_rgba", "reused_object", "video_frames"},
+            f"{modifier_label}: invalid source mode",
+        )
+        source_bound = is_hash(modifier.get("source_object_sha256"))
+        manifest_bound = is_hash(modifier.get("modifier_manifest_sha256"))
+        bound = source_bound and manifest_bound
+        if source_mode == "direct_generate":
+            add(errors, not source_bound and not manifest_bound
+                and modifier.get("extraction") is None and modifier.get("video") is None,
+                f"{modifier_label}: direct generation cannot claim bound media evidence")
+        else:
+            add(errors, bound, f"{modifier_label}: retained object and manifest hashes are required")
+        if source_mode == "reused_object":
+            add(
+                errors,
+                modifier.get("extraction") is None and modifier.get("video") is None,
+                f"{modifier_label}: reused object cannot claim extraction/video evidence",
+            )
+        if source_mode == "extracted_rgba":
+            add(
+                errors,
+                modifier.get("video") is None,
+                f"{modifier_label}: extracted RGBA cannot claim video evidence",
+            )
+        if source_mode in {"extracted_rgba", "video_frames"}:
+            extraction = modifier.get("extraction", {})
+            add(
+                errors,
+                extraction
+                in (
+                    {
+                        "source_arena": "reserved_empty",
+                        "alpha_contract": "transparent_rgba",
+                        "background_removal": "required",
+                        "matte_policy": "fail_closed",
+                        "cropped_object_retained": True,
+                    },
+                    {
+                        "source_arena": "reserved_empty",
+                        "alpha_contract": "exact_mask_matte",
+                        "background_removal": "required",
+                        "matte_policy": "fail_closed",
+                        "cropped_object_retained": True,
+                    },
+                ),
+                f"{modifier_label}: extraction must verify and retain exact alpha/matte bytes",
+            )
+        if source_mode == "video_frames":
+            validate_video_contract(modifier.get("video"), asset, plan.get("common_period_ms"), modifier_label, errors)
+            add(
+                errors,
+                modifier.get("video", {}).get("extracted_sheet_sha256")
+                == modifier.get("source_object_sha256"),
+                f"{modifier_label}: source object must be the exact extracted video sheet bytes",
+            )
+    add(errors, indexes == list(range(len(assets))), f"{label}: modifier indexes must be unique and contiguous")
 
 
 def asset_wrap_axes(asset: dict[str, Any]) -> set[str]:
@@ -994,6 +1706,37 @@ def flatten_layers(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def fallback_covers_image(fallback: dict[str, Any], image: dict[str, Any]) -> bool:
+    if fallback.get("region") != image.get("region"):
+        return False
+    if fallback.get("boost_only", False) or fallback.get("omit_on_single_cell", False):
+        return False
+    if fallback.get("opacity", 1) != 1:
+        return False
+    default_transform = {
+        "translate_s": 0,
+        "translate_t": 0,
+        "scale_s": 1,
+        "scale_t": 1,
+        "rotate_turns": 0,
+    }
+
+    def normalized_transform(layer: dict[str, Any]) -> dict[str, Any]:
+        return {**default_transform, **layer.get("transform", {})}
+
+    if fallback.get("type") == "ribbon":
+        return normalized_transform(fallback) == default_transform
+    if fallback.get("type") != "span" or fallback.get("source", {}).get("type") != "solid":
+        return False
+    span_defaults = {"natural": None, "min": 0, "priority": 0}
+    return (
+        {**span_defaults, **fallback.get("span", {})}
+        == {**span_defaults, **image.get("span", {})}
+        and fallback.get("clip", "silhouette") == image.get("clip", "silhouette")
+        and normalized_transform(fallback) == normalized_transform(image)
+    )
+
+
 def validate_document(
     document: dict[str, Any],
     plan: dict[str, Any],
@@ -1008,6 +1751,8 @@ def validate_document(
     layers = flatten_layers(document.get("layers", []))
     textures = {entry.get("name"): entry for entry in document.get("textures", [])}
     assets = plan.get("asset_plan", [])
+    modifiers = {entry.get("texture_name"): entry for entry in plan.get("modifier_plan", [])}
+    add(errors, document.get("period_ms") == plan.get("common_period_ms"), f"{label}: document period differs from plan")
     image_count = 0
     procedural_count = 0
 
@@ -1023,6 +1768,11 @@ def validate_document(
         add(errors, texture_name in textures, f"{label}: image names an absent texture")
         if texture_name not in textures:
             continue
+        modifier = modifiers.get(texture_name)
+        add(errors, modifier is not None, f"{label}: image texture has no exact modifier record")
+        if modifier is None:
+            continue
+        add(errors, layer.get("name") == modifier.get("image_layer_name"), f"{label}: modifier image layer name differs")
         add(
             errors,
             numeric_constant(source.get("drift_cells", 0)),
@@ -1030,14 +1780,8 @@ def validate_document(
         )
         texture = textures[texture_name]
         descriptor = texture.get("descriptor")
-        matching_assets = [
-            asset
-            for asset in assets
-            if asset.get("kind") == texture.get("kind")
-            and isinstance(descriptor, dict)
-            and descriptor.get("body_columns") == asset.get("natural_length_cells")
-            and descriptor.get("frame_rows") == (asset.get("frames") if asset.get("kind") == "sheet" else None)
-        ]
+        asset_index = modifier.get("asset_index")
+        matching_assets = [assets[asset_index]] if isinstance(asset_index, int) and 0 <= asset_index < len(assets) else []
         add(
             errors,
             len(matching_assets) == 1,
@@ -1049,9 +1793,8 @@ def validate_document(
         fallback_candidates = [
             candidate
             for candidate in layers[:index]
-            if candidate.get("region") == layer.get("region")
-            and candidate.get("type") == "ribbon"
-            and candidate.get("source", {}).get("type") != "image"
+            if candidate.get("name") == modifier.get("fallback_layer_name")
+            and fallback_covers_image(candidate, layer)
         ]
         add(
             errors,
@@ -1080,6 +1823,11 @@ def validate_document(
             descriptor.get("body_columns") == asset["natural_length_cells"],
             f"{label}: descriptor X differs from plan",
         )
+        add(
+            errors,
+            descriptor.get("raster_overhang_px", 0) == asset["raster_overhang_px"],
+            f"{label}: descriptor raster overhang differs from plan",
+        )
         expected_rows = asset["frames"] if asset["kind"] == "sheet" else None
         add(
             errors,
@@ -1100,6 +1848,50 @@ def validate_document(
                 errors,
                 variant.get("url") == f"/api/textures/variants/{content_ref}.png",
                 f"{label}: variant URL is not addressed by its own hash",
+            )
+            tpc = variant.get("texels_per_cell")
+            if isinstance(tpc, int) and (tpc * asset["raster_overhang_px"]) % 16 == 0:
+                row_texels = tpc + 2 * (tpc * asset["raster_overhang_px"] // 16)
+                rows = asset["frames"] if asset["kind"] == "sheet" else 1
+                add(
+                    errors,
+                    variant.get("height_px") == rows * row_texels,
+                    f"{label}: variant height does not include scaled raster overhang",
+                )
+
+        span = layer.get("span", {})
+        mode = modifier.get("span_limit_mode")
+        if mode == "whole":
+            add(errors, span.get("from") == "whole" and span.get("natural") is None, f"{label}: whole modifier span differs")
+        elif mode == "head_cells":
+            natural = span.get("natural")
+            add(
+                errors,
+                span.get("from") == "head"
+                and isinstance(natural, (int, float))
+                and 0 < natural <= min(6, modifier.get("span_limit_value")),
+                f"{label}: head modifier does not stop by cell 6",
+            )
+        elif mode == "tail_fraction":
+            origin = span.get("from")
+            fraction = origin.get("fraction", {}).get("fraction") if isinstance(origin, dict) else None
+            limit = modifier.get("span_limit_value")
+            add(
+                errors,
+                isinstance(fraction, (int, float))
+                and isinstance(limit, (int, float))
+                and 1 - limit <= fraction < 1
+                and span.get("natural") is None,
+                f"{label}: tail modifier exceeds half the current snake",
+            )
+        fit = source.get("fit")
+        if asset.get("fit") == "tile":
+            add(
+                errors,
+                isinstance(fit, dict)
+                and fit.get("type") == "tile"
+                and fit.get("phase_origin", "head") == asset.get("tile_phase_origin"),
+                f"{label}: tile phase origin differs from plan",
             )
 
     path = plan.get("path")
@@ -1134,8 +1926,39 @@ def validate_package() -> list[str]:
     schemas = {schema.name: read_json(schema) for schema in (PACKAGE / "schemas").glob("*.json")}
     validate_implementation_plan_schema(schemas.get("implementation-plan.schema.json", {}), errors)
     validate_prototype_manifest_schema(schemas.get("prototype-manifest.schema.json", {}), errors)
+    add(
+        errors,
+        schemas.get("asset-request.schema.json", {})
+        .get("properties", {})
+        .get("asset_index", {})
+        .get("maximum")
+        == MAX_TEXTURE_REFS - 1,
+        "asset-request schema index must match the current parser ceiling",
+    )
     asset_template = read_json(PACKAGE / "templates/asset-request.json")
+    validate_schema_instance(asset_template, schemas.get("asset-request.schema.json", {}), "asset template schema", errors)
     validate_asset_request(asset_template, "asset template", errors)
+    validate_schema_instance(
+        read_json(PACKAGE / "templates/implementation-plan.json"),
+        schemas.get("implementation-plan.schema.json", {}),
+        "implementation-plan template schema",
+        errors,
+    )
+    media_template = read_json(PACKAGE / "templates/media-operation-request.json")
+    validate_schema_instance(
+        media_template,
+        schemas.get("media-operation-request.schema.json", {}),
+        "media-operation template schema",
+        errors,
+    )
+    validate_media_request(media_template, "media-operation template", errors)
+    validate_schema_instance(
+        read_json(PACKAGE / "templates/modifier-manifest.json"),
+        schemas.get("modifier-manifest.schema.json", {}),
+        "modifier-manifest template schema",
+        errors,
+    )
+    validate_modifier_manifest(read_json(PACKAGE / "templates/modifier-manifest.json"), "modifier-manifest template", errors)
     for required_prompt_term in (
         "Production-quality",
         "one confident style",
@@ -1167,8 +1990,8 @@ def validate_package() -> list[str]:
     fixture_directories = {entry.name for entry in fixture_root.iterdir() if entry.is_dir()}
     add(
         errors,
-        fixture_directories == ROUTES | {DRAFT_FIXTURE_DIR},
-        "fixtures must cover four routes plus the worker draft handoff",
+        fixture_directories == ROUTES | {DRAFT_FIXTURE_DIR, MODIFIER_FIXTURE_DIR},
+        "fixtures must cover four routes, worker handoff, and modifier workflow",
     )
     for route in sorted(ROUTES):
         directory = fixture_root / route
@@ -1178,6 +2001,7 @@ def validate_package() -> list[str]:
         document = read_json(directory / "skin.skin.json")
         validate_manifest(manifest, route, errors)
         validate_plan(plan, manifest, approval, route, errors)
+        validate_schema_instance(plan, schemas.get("implementation-plan.schema.json", {}), f"{route} plan schema", errors)
         for asset_index, asset in enumerate(plan.get("asset_plan", [])):
             if asset.get("kind") != "sheet" or not isinstance(asset.get("desired_fps"), (int, float)):
                 continue
@@ -1211,6 +2035,73 @@ def validate_package() -> list[str]:
         errors,
     )
     validate_worker_draft(draft, draft_plan, draft_requests, "worker draft", errors)
+    validate_schema_instance(draft_plan, schemas.get("implementation-plan.schema.json", {}), "worker draft plan schema", errors)
+    for index, request in enumerate(draft_requests):
+        validate_schema_instance(
+            request.get("arguments", {}),
+            schemas.get("asset-request.schema.json", {}),
+            f"worker draft request {index} schema",
+            errors,
+        )
+
+    modifier_directory = fixture_root / MODIFIER_FIXTURE_DIR
+    selection_path = modifier_directory / "draft-selection.json"
+    modifier_plan = read_json(modifier_directory / "implementation-plan.json")
+    add(
+        errors,
+        modifier_plan.get("input_authority", {}).get("authority_record_sha256")
+        == f"sha256:{sha256_file(selection_path)}",
+        "modifier workflow must bind the exact retained draft-selection record",
+    )
+    validate_plan(
+        modifier_plan,
+        {"image_sha256": "sha256:" + "8" * 64},
+        {},
+        "modifier workflow",
+        errors,
+    )
+    validate_schema_instance(
+        modifier_plan,
+        schemas.get("implementation-plan.schema.json", {}),
+        "modifier workflow plan schema",
+        errors,
+    )
+    component_keys = [item.get("component_key") for item in modifier_plan.get("modifier_plan", [])]
+    add(errors, component_keys == ["T1", "T2", "B1", "H"], "modifier workflow must keep T1/T2/B1/H as four distinct records")
+    add(
+        errors,
+        len({item.get("texture_name") for item in modifier_plan.get("modifier_plan", [])}) == 4
+        and len({item.get("image_layer_name") for item in modifier_plan.get("modifier_plan", [])}) == 4,
+        "modifier workflow must keep one texture and image layer per component",
+    )
+    media_requests = read_json(modifier_directory / "media-requests.json")
+    for index, request in enumerate(media_requests):
+        validate_schema_instance(
+            request,
+            schemas.get("media-operation-request.schema.json", {}),
+            f"modifier media request {index} schema",
+            errors,
+        )
+        validate_media_request(request, f"modifier media request {index}", errors)
+    modifier_manifests: dict[str, tuple[str, dict[str, Any]]] = {}
+    for component in ("T1", "T2", "B1", "H"):
+        manifest_path = modifier_directory / f"{component}.modifier-manifest.json"
+        modifier_manifest = read_json(manifest_path)
+        validate_schema_instance(
+            modifier_manifest,
+            schemas.get("modifier-manifest.schema.json", {}),
+            f"{component} modifier manifest fixture schema",
+            errors,
+        )
+        validate_modifier_manifest(modifier_manifest, f"{component} modifier manifest fixture", errors)
+        modifier_manifests[component] = (sha256_file(manifest_path), modifier_manifest)
+    validate_modifier_workflow_links(
+        modifier_plan,
+        media_requests,
+        modifier_manifests,
+        "modifier workflow",
+        errors,
+    )
 
     fabricated_errors: list[str] = []
     validate_worker_draft(

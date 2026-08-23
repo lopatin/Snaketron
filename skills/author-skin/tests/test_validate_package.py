@@ -53,6 +53,12 @@ class PackageValidationTests(unittest.TestCase):
             "compressed head, turn, and tail points",
             "Manhattan arc",
             "not a visual cell plate",
+            "TextureDescriptorV2.raster_overhang_px",
+            "0 through 4 authored bleed pixels per transverse side",
+            "16×16 logical body cell",
+            "does not relax the longitudinal head and tail caps",
+            "neighboring snake",
+            "not a freeform canvas",
             "light_field_dark_core",
             "dark_field_light_disc_dark_core",
         ):
@@ -389,6 +395,269 @@ class PackageValidationTests(unittest.TestCase):
             allow_pending=False,
         )
         self.assertTrue(any("survived exact binding" in error for error in errors), errors)
+
+    def test_input_authority_modes_are_explicit_and_closed(self):
+        workflow = validator.PACKAGE / "fixtures/modifier-workflow"
+        plan = validator.read_json(workflow / "implementation-plan.json")
+        errors = []
+        validator.validate_plan(
+            plan,
+            {"image_sha256": "sha256:" + "8" * 64},
+            {},
+            "probe",
+            errors,
+        )
+        self.assertEqual(errors, [])
+
+        false_approval = copy.deepcopy(plan)
+        false_approval["input_authority"]["human_approval_decision_id"] = "invented"
+        errors = []
+        validator.validate_plan(
+            false_approval,
+            {"image_sha256": "sha256:" + "8" * 64},
+            {},
+            "probe",
+            errors,
+        )
+        self.assertTrue(any("draft cannot claim human approval" in error for error in errors), errors)
+
+    def test_modifier_components_are_distinct_and_span_bounded(self):
+        plan = validator.read_json(
+            validator.PACKAGE / "fixtures/modifier-workflow/implementation-plan.json"
+        )
+        modifiers = plan["modifier_plan"]
+        self.assertEqual([item["component_key"] for item in modifiers], ["T1", "T2", "B1", "H"])
+        self.assertEqual(len({item["texture_name"] for item in modifiers}), 4)
+        self.assertEqual(len({item["image_layer_name"] for item in modifiers}), 4)
+
+        too_long = copy.deepcopy(plan)
+        too_long["modifier_plan"][3]["span_limit_value"] = 7
+        errors = []
+        validator.validate_plan(
+            too_long,
+            {"image_sha256": "sha256:" + "8" * 64},
+            {},
+            "probe",
+            errors,
+        )
+        self.assertTrue(any("head span exceeds cell 6" in error for error in errors), errors)
+
+        too_much_tail = copy.deepcopy(plan)
+        too_much_tail["modifier_plan"][0]["span_limit_value"] = 0.6
+        errors = []
+        validator.validate_plan(
+            too_much_tail,
+            {"image_sha256": "sha256:" + "8" * 64},
+            {},
+            "probe",
+            errors,
+        )
+        self.assertTrue(any("tail span exceeds half" in error for error in errors), errors)
+
+    def test_plan_can_keep_more_than_four_modest_assets_separate(self):
+        plan_schema = validator.read_json(
+            validator.PACKAGE / "schemas/implementation-plan.schema.json"
+        )
+        asset_schema = validator.read_json(
+            validator.PACKAGE / "schemas/asset-request.schema.json"
+        )
+        self.assertEqual(plan_schema["properties"]["asset_plan"]["maxItems"], 8)
+        self.assertEqual(plan_schema["properties"]["modifier_plan"]["maxItems"], 8)
+        self.assertEqual(plan_schema["$defs"]["modifier"]["properties"]["asset_index"]["maximum"], 7)
+        self.assertEqual(asset_schema["properties"]["asset_index"]["maximum"], 7)
+
+        plan = validator.read_json(
+            validator.PACKAGE / "fixtures/modifier-workflow/implementation-plan.json"
+        )
+        fifth_asset = copy.deepcopy(plan["asset_plan"][3])
+        fifth_asset["prompt"] = "Keep an additional modest cheek accent independently anchored."
+        plan["asset_plan"].append(fifth_asset)
+        fifth_modifier = copy.deepcopy(plan["modifier_plan"][3])
+        fifth_modifier.update(
+            {
+                "asset_index": 4,
+                "logical_key": "cheek_accent",
+                "component_key": "H2",
+                "texture_name": "modifier_h2",
+                "image_layer_name": "H2 Image",
+                "fallback_layer_name": "H2 Fallback",
+            }
+        )
+        plan["modifier_plan"].append(fifth_modifier)
+        errors = []
+        validator.validate_plan(
+            plan,
+            {"image_sha256": "sha256:" + "8" * 64},
+            {},
+            "five-asset-probe",
+            errors,
+        )
+        self.assertEqual(errors, [])
+
+    def test_video_contract_binds_ordered_endpoints_and_exact_cadence(self):
+        requests = validator.read_json(
+            validator.PACKAGE / "fixtures/modifier-workflow/media-requests.json"
+        )
+        request = copy.deepcopy(next(item for item in requests if item["operation"] == "generate_video"))
+        request["input_artifacts"].reverse()
+        request["video"]["derived_frame_rows"] = 47
+        request["video"]["effective_frame_row_cap"] = 84
+        errors = []
+        validator.validate_media_request(request, "probe", errors)
+        for expected in (
+            "ordered start/end frame hashes",
+            "ceil(period*fps/1000)",
+            "effective row cap is wrong",
+        ):
+            self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_pixverse_transition_prompt_preserves_flat_component_contract(self):
+        requests = validator.read_json(
+            validator.PACKAGE / "fixtures/modifier-workflow/media-requests.json"
+        )
+        request = copy.deepcopy(next(item for item in requests if item["operation"] == "generate_video"))
+        errors = []
+        validator.validate_media_request(request, "probe", errors)
+        self.assertEqual(errors, [])
+
+        request["prompt"] = request["prompt"].replace("[Context]", "[Scene]")
+        request["prompt"] = request["prompt"].replace("background completely static", "background")
+        errors = []
+        validator.validate_media_request(request, "probe", errors)
+        self.assertTrue(any("five literal sections" in error for error in errors), errors)
+        self.assertTrue(any("background completely static" in error for error in errors), errors)
+
+    def test_video_extraction_binds_exact_source_video(self):
+        requests = validator.read_json(
+            validator.PACKAGE / "fixtures/modifier-workflow/media-requests.json"
+        )
+        request = copy.deepcopy(next(item for item in requests if item["operation"] == "extract_video_frames"))
+        request["input_artifacts"] = ["sha256:" + "f" * 64]
+        errors = []
+        validator.validate_media_request(request, "probe", errors)
+        self.assertTrue(any("exact source video hash" in error for error in errors), errors)
+
+    def test_video_modifier_binds_exact_extracted_sheet(self):
+        plan = copy.deepcopy(
+            validator.read_json(
+                validator.PACKAGE / "fixtures/modifier-workflow/implementation-plan.json"
+            )
+        )
+        modifier = next(item for item in plan["modifier_plan"] if item["source_mode"] == "video_frames")
+        modifier["video"]["extracted_sheet_sha256"] = "sha256:" + "f" * 64
+        errors = []
+        validator.validate_plan(
+            plan,
+            {"image_sha256": "sha256:" + "8" * 64},
+            {},
+            "probe",
+            errors,
+        )
+        self.assertTrue(any("exact extracted video sheet bytes" in error for error in errors), errors)
+
+    def test_extraction_fails_closed_before_crop(self):
+        request = copy.deepcopy(
+            validator.read_json(validator.PACKAGE / "templates/media-operation-request.json")
+        )
+        request["extraction"]["fail_on_edge_contact"] = False
+        request["extraction"]["matte_policy"] = "best_effort"
+        errors = []
+        validator.validate_media_request(request, "probe", errors)
+        self.assertTrue(any("fail closed before cropping" in error for error in errors), errors)
+
+    def test_raster_overhang_uses_fixed_16_grid_and_no_gutters(self):
+        request = copy.deepcopy(validator.read_json(validator.PACKAGE / "templates/asset-request.json"))
+        request["grid"]["row_texels"] = 23
+        request["height_px"] = request["grid"]["frame_rows"] * 23
+        request["edge_contract"]["no_frame_or_repeat_gutters"] = False
+        errors = []
+        validator.validate_asset_request(request, "probe", errors)
+        self.assertTrue(any("row_texels must scale" in error for error in errors), errors)
+        self.assertTrue(any("gutters are forbidden" in error for error in errors), errors)
+
+    def test_modifier_reuse_binds_manifest_and_lineage(self):
+        requests = validator.read_json(
+            validator.PACKAGE / "fixtures/modifier-workflow/media-requests.json"
+        )
+        request = copy.deepcopy(next(item for item in requests if item["operation"] == "reuse_modifier"))
+        request["input_artifacts"] = ["sha256:" + "f" * 64]
+        request["reuse"]["require_authorized_lineage"] = False
+        errors = []
+        validator.validate_media_request(request, "probe", errors)
+        self.assertTrue(any("one exact modifier manifest" in error for error in errors), errors)
+        self.assertTrue(any("enforce lineage scope" in error for error in errors), errors)
+
+    def test_modifier_identity_binds_exact_bytes_and_authorized_lineage(self):
+        manifest = validator.read_json(
+            validator.PACKAGE / "templates/modifier-manifest.json"
+        )
+        errors = []
+        validator.validate_modifier_manifest(manifest, "probe", errors)
+        self.assertEqual(errors, [])
+
+        mismatched = copy.deepcopy(manifest)
+        mismatched["modifier_id"] = "modifier:not_authorized:sha256:" + "a" * 64
+        errors = []
+        validator.validate_modifier_manifest(mismatched, "probe", errors)
+        self.assertTrue(any("exact content hash" in error for error in errors), errors)
+        self.assertTrue(any("lineage is not authorized" in error for error in errors), errors)
+
+    def test_modifier_alpha_contract_requires_matching_outer_edge_proof(self):
+        manifest = copy.deepcopy(
+            validator.read_json(validator.PACKAGE / "templates/modifier-manifest.json")
+        )
+        manifest["verification"]["outer_frame_edge"] = "not_applicable_opaque_fill"
+        errors = []
+        validator.validate_modifier_manifest(manifest, "probe", errors)
+        self.assertTrue(any("outer frame edge is clear" in error for error in errors), errors)
+
+        manifest["verification"]["alpha_matte"] = "opaque_not_applicable"
+        errors = []
+        validator.validate_modifier_manifest(manifest, "probe", errors)
+        self.assertEqual(errors, [])
+
+    def test_opaque_edge_exemption_requires_opaque_asset_bytes(self):
+        request = copy.deepcopy(validator.read_json(validator.PACKAGE / "templates/asset-request.json"))
+        request["transparency"] = "allowed"
+        request["edge_contract"]["transverse_policy"] = "not_applicable_opaque_fill"
+        errors = []
+        validator.validate_asset_request(request, "probe", errors)
+        self.assertTrue(any("opaque edge exemption requires opaque bytes" in error for error in errors), errors)
+
+    def test_modifier_workflow_binds_every_plan_media_and_manifest_record(self):
+        directory = validator.PACKAGE / "fixtures/modifier-workflow"
+        plan = validator.read_json(directory / "implementation-plan.json")
+        requests = validator.read_json(directory / "media-requests.json")
+        manifests = {
+            component: (
+                validator.sha256_file(directory / f"{component}.modifier-manifest.json"),
+                validator.read_json(directory / f"{component}.modifier-manifest.json"),
+            )
+            for component in ("T1", "T2", "B1", "H")
+        }
+        errors = []
+        validator.validate_modifier_workflow_links(plan, requests, manifests, "probe", errors)
+        self.assertEqual(errors, [])
+
+        plan["modifier_plan"][0]["source_object_sha256"] = "sha256:" + "f" * 64
+        errors = []
+        validator.validate_modifier_workflow_links(plan, requests, manifests, "probe", errors)
+        self.assertTrue(any("manifest content differs" in error for error in errors), errors)
+
+    def test_modifier_reference_is_optimizer_locked(self):
+        boundary = validator.read_json(validator.PACKAGE / "optimization-boundary.json")
+        self.assertIn("references/modifiers-video.md", boundary["locked_paths"])
+        text = (validator.PACKAGE / "references/modifiers-video.md").read_text(encoding="utf-8")
+        for term in (
+            "reserved empty source arena",
+            "transparent RGBA",
+            "exact mask/matte",
+            "actual final-frame-to-row-zero",
+            "authorized_lineage_ids",
+            "raster_overhang_px",
+            "T1/T2/B1/H",
+        ):
+            self.assertIn(term, text)
 
     def test_optimizer_cannot_edit_outside_marked_playbook_body(self):
         playbook = (validator.PACKAGE / "references/playbook.md").read_text(encoding="utf-8")

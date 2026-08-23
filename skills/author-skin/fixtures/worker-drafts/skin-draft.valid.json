@@ -43,7 +43,7 @@
       "source": {
         "type": "image",
         "texture": "shell_coat",
-        "fit": { "type": "tile", "cells_per_repeat": 29 },
+        "fit": { "type": "tile", "cells_per_repeat": 29, "phase_origin": "head" },
         "drift_cells": 0
       }
     }

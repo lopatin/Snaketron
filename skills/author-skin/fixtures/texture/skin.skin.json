@@ -26,6 +26,7 @@
       "descriptor": {
         "kind": "coat",
         "body_columns": 29,
+        "raster_overhang_px": 0,
         "variants": [
           {
             "content_ref": "sha256:d222222222222222222222222222222222222222222222222222222222222222",
@@ -70,7 +71,7 @@
       "source": {
         "type": "image",
         "texture": "shell_coat",
-        "fit": { "type": "tile", "cells_per_repeat": 29 },
+        "fit": { "type": "tile", "cells_per_repeat": 29, "phase_origin": "head" },
         "drift_cells": 0
       }
     },

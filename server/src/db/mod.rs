@@ -14,7 +14,7 @@ use crate::generation::GenerationJob;
 use crate::season::Season;
 use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
-    SkinRevision,
+    SkinReviewDecision, SkinRevision,
 };
 use crate::texture::Texture;
 use crate::wallet::{LedgerEntry, LedgerSource, Wallet};
@@ -254,15 +254,13 @@ pub trait Database: Send + Sync {
 
     /// Finish one review as one durable decision.
     ///
-    /// When publishing, `revision` and `content_ref` are both mandatory and
-    /// are checked against the immutable revision item. Approval, publication,
-    /// audit record, and review-queue removal are one DynamoDB transaction, so
-    /// a crash cannot publish bytes the reviewer did not approve or leave a
-    /// published revision marked unreviewed.
+    /// Publish and reject both bind `revision` and `content_ref` to the
+    /// immutable bytes the reviewer saw. Approval/rejection, publication,
+    /// audit, and queue removal are one DynamoDB transaction.
     async fn decide_skin_review(
         &self,
         skin_id: i32,
-        publication: Publication,
+        decision: SkinReviewDecision,
         revision: Option<u32>,
         content_ref: Option<&str>,
         actor_user_id: i32,

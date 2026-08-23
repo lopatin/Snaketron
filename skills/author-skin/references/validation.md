@@ -2,8 +2,8 @@
 
 Validate in this order and retain every report, including failures.
 
-1. **Input binding:** approval hash equals the projected prototype
-   `image_sha256`; `source_image_sha256` remains audit-only, and
+1. **Input binding:** the explicit `input_authority` mode and artifact hash
+   equal the projected prototype `image_sha256`; `source_image_sha256` remains audit-only, and
    `geometry_projection` is exactly `prototype-body-mask-v1`. The projected
    image—not the raw provider source—is the only authoring input. Direction,
    skill, capability, schema, renderer, and gate SHAs are pinned.
@@ -22,7 +22,11 @@ Validate in this order and retain every report, including failures.
    exact variants and hashes before compilation.
 5. **Assets:** gate exact served variants for dimensions, bytes, grid, required
    seams, multi-scale alignment, detail/chroma, mark scale, temporal continuity,
-   and loop behavior.
+   and loop behavior. For every modifier, prove a one-to-one asset/texture/image
+   layer/fallback mapping plus exact identity, manifest/content hash, license,
+   provenance, and authorized-lineage scope. Extraction must fail closed on a
+   contaminated background, matte fringe, or ambiguous alpha; retain the
+   transparent RGBA object or exact mask/matte and its report.
 6. **Conformance/cost:** run the pinned operation budget and conformance corpus
    without narrowing it to the new skin's name. Animation may vary arguments,
    never operation sequence.
@@ -33,6 +37,11 @@ Validate in this order and retain every report, including failures.
    normal play, reduced motion, and slow motion.
 8. **Fidelity package:** pair prototype and render at comparable scale with the
    plan's ordered fidelity features, all gate reports, and repair lineage.
+9. **Authority ceiling:** an `approved_prototype` build may proceed only as far
+   as the factory's private revision/review flow. A `draft_submission` may only
+   be privately uploaded/registered and sent for admin review by an advertised
+   interactive host. Neither mode publishes; later admin approval binds the
+   exact revision/contentRef.
 
 The canonical document command is:
 

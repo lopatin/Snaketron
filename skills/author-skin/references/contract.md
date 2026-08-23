@@ -8,7 +8,15 @@ reference and the manifest disagree, fail `capability_mismatch`; never guess.
 
 ## Authority and side effects
 
-- Only an exact human `prototype_approval` authorizes a production build.
+- Only an exact human `prototype_approval` authorizes a factory production
+  build. Its observable plan mode is `approved_prototype`.
+- `draft_submission` is not approval. It binds one agent-selected candidate,
+  its literal selection rationale, and the exact retained selection-record
+  hash. Only an interactive host that advertises private upload/registration
+  and admin-review-request capabilities may execute it, and its maximum action
+  is requesting review of a private draft. Otherwise fail `platform_gap`.
+- Neither mode authorizes publication. Publication requires a later Snaketron
+  admin decision bound to the exact private revision and content reference.
 - A task worker is pure. It may read its bundle and inputs, reason, and return
   structured output. Provider, shell, storage, Git, registration, review, and
   publication side effects belong to the factory driver and its journal.
@@ -126,6 +134,11 @@ Every image layer must have an earlier ordinary solid/procedural layer that
 fully preserves a readable snake when atlas loading is pending or fails. The
 fallback is mandatory even when the image is opaque.
 
+The current defensive parser admits at most eight one-to-one raster
+asset/modifier pairs so four base parts plus four separable objects can remain
+independent. The exact pinned `max_texture_refs` capability is authoritative
+at execution time and may impose a lower limit on a retained deployment.
+
 During the isolated worker response, an unresolved planned texture uses exactly
 `pending:asset:<index>` as its `ref`, the matching planned `kind`, and no
 `descriptor`. Its `generate_asset` request uses the same zero-based
@@ -152,6 +165,63 @@ Choose X from repeat length, mark scale, and body fixtures. Choose a
 period using the formula above. Record the derived Y; never freely choose both
 FPS and rows. Never make a sheet square merely to encode one number twice. A
 loop always requires `y`; repeating along the body also requires `x`.
+
+## Reusable modifier objects
+
+A conceptual decomposition such as `T1`, `T2`, `B1`, and `H` describes
+separate visual components, not columns in one bitmap. Each component becomes
+its own immutable object asset, texture, and anchored span image layer. The
+plan binds a logical component key to its exact manifest/content hash when
+available, license, provenance hash, authorized pre-registration lineage ids,
+image-layer name,
+and earlier fallback-layer name. The driver derives the immutable modifier id
+only after exact byte binding. Reuse is authorized within an exact stable
+concept/lineage scope; possession of a hash is not permission. Cross-lineage
+reuse requires explicit shareability or Snaketron admin authority.
+
+Conceptual keys are not renderer slots. Optional head components anchor at
+`head` and extend through at most cell 6. Optional tail components anchor at
+`tail` and cover at most one half of the current snake. The plan records these
+as `head_cells <= 6` and `tail_fraction <= 0.5`; each remains an independent
+span with its own fallback.
+
+Do not pack components into one raster and select columns at render time. That
+is valid only if the pinned renderer manifest and supplied SkinDoc schema expose
+an exact source-region primitive and the plan names it. Without that advertised
+capability, use one object and texture per component or return `platform_gap`.
+
+Extraction happens before composition. Generate or place exactly one object in
+a reserved empty source arena, remove the background, and verify transparent
+RGBA bytes or an exact retained mask/matte. Reject contaminated backgrounds,
+matte-colour fringes, partial-alpha halos, and ambiguous multiple objects.
+After verification, crop and retain the object and its extraction report as
+new immutable first-class artifacts. Only that retained object may be bound to
+an independently anchored layer. The renderer never infers alpha or object
+boundaries from a packed raster.
+
+The reserved transparent source margin used to prevent extraction clipping is
+provenance, not visible paint authority. Visible bounded rendering is governed
+separately by `TextureDescriptorV2.raster_overhang_px`: 0 through 4 authored
+bleed pixels per side around the unchanged 16×16 body cell. At the 16-texel
+rung, a value of 4 is stored as a 24-texel source row (`4 + 16 + 4`) so apron
+art remains distinct; it does not make the cell 24 texels wide. The forge
+scales that apron per rung; it never grants unbounded canvas access.
+When bleed is nonzero, the exact stored transverse row is at most 24 texels at
+the 16-texel rung. For extracted transparent objects/effects, fail closed if visible
+alpha touches or is truncated by its outer frame edge. An opaque generic base
+texture may intentionally fill the strip and records that exemption. This edge
+check is separate from the no-gutter requirement between body repeats or
+sprite frames.
+
+Video is a source pipeline, not an implicit provider trick. Use it only when
+the host advertises journaled video generation and deterministic frame
+extraction. Retain the exact source inputs, provider output video, extracted
+frames/sheet, prompts, resolved provider/model, and verification reports.
+Sample one common `period_ms` at deterministic timestamps; derive rows as
+`ceil(period_ms * desired_fps / 1000)`, clamp to the pinned limit (never more
+than 120), verify transparent RGBA or exact matte handling frame by frame, and
+test the true final-frame-to-row-zero transition. Prefer ordinary procedural
+transforms when they express the motion faithfully.
 
 ## Security and review invariants
 

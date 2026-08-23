@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://snaketron.io/schemas/skin-factory/media-operation-request-v1.json",
+  "title": "Capability-gated interactive media operation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "request_id", "operation", "capability_id",
+    "input_artifacts", "logical_key", "component_key", "prompt",
+    "output_kind", "journal", "extraction", "video", "reuse"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "operation": { "enum": ["extract_object", "generate_video", "extract_video_frames", "reuse_modifier"] },
+    "capability_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "input_artifacts": {
+      "type": "array", "items": { "$ref": "#/$defs/contentHash" }, "uniqueItems": true
+    },
+    "logical_key": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+    "component_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$" },
+    "prompt": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "output_kind": { "enum": ["transparent_rgba_object", "video", "frame_sheet", "modifier_binding"] },
+    "journal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["retain_inputs", "retain_provider_output", "retain_output", "retain_reports"],
+      "properties": {
+        "retain_inputs": { "const": true },
+        "retain_provider_output": { "const": true },
+        "retain_output": { "const": true },
+        "retain_reports": { "const": true }
+      }
+    },
+    "extraction": { "oneOf": [{ "$ref": "#/$defs/extraction" }, { "type": "null" }] },
+    "video": { "oneOf": [{ "$ref": "#/$defs/video" }, { "type": "null" }] },
+    "reuse": { "oneOf": [{ "$ref": "#/$defs/reuse" }, { "type": "null" }] }
+  },
+  "oneOf": [
+    { "properties": {
+      "operation": { "const": "extract_object" },
+      "input_artifacts": { "minItems": 1 },
+      "output_kind": { "const": "transparent_rgba_object" },
+      "extraction": { "$ref": "#/$defs/extraction" },
+      "video": { "type": "null" }, "reuse": { "type": "null" }
+    } },
+    { "properties": {
+      "operation": { "const": "generate_video" },
+      "input_artifacts": { "minItems": 2, "maxItems": 2 },
+      "output_kind": { "const": "video" },
+      "extraction": { "type": "null" },
+      "video": { "allOf": [
+        { "$ref": "#/$defs/video" },
+        { "properties": { "source_video_sha256": { "type": "null" } } }
+      ] },
+      "reuse": { "type": "null" }
+    } },
+    { "properties": {
+      "operation": { "const": "extract_video_frames" },
+      "input_artifacts": { "minItems": 1, "maxItems": 1 },
+      "output_kind": { "const": "frame_sheet" },
+      "extraction": { "$ref": "#/$defs/extraction" },
+      "video": { "allOf": [
+        { "$ref": "#/$defs/video" },
+        { "properties": { "source_video_sha256": { "$ref": "#/$defs/contentHash" } } }
+      ] },
+      "reuse": { "type": "null" }
+    } },
+    { "properties": {
+      "operation": { "const": "reuse_modifier" },
+      "input_artifacts": { "minItems": 1, "maxItems": 1 },
+      "output_kind": { "const": "modifier_binding" },
+      "extraction": { "type": "null" }, "video": { "type": "null" },
+      "reuse": { "$ref": "#/$defs/reuse" }
+    } }
+  ],
+  "$defs": {
+    "contentHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "extraction": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "source_arena", "visible_object_count", "alpha_contract",
+        "background_removal", "matte_policy", "crop_after_verification",
+        "fail_on_edge_contact"
+      ],
+      "properties": {
+        "source_arena": { "const": "reserved_empty" },
+        "visible_object_count": { "const": 1 },
+        "alpha_contract": { "enum": ["transparent_rgba", "exact_mask_matte"] },
+        "background_removal": { "const": "required" },
+        "matte_policy": { "const": "fail_closed" },
+        "crop_after_verification": { "const": true },
+        "fail_on_edge_contact": { "const": true }
+      }
+    },
+    "video": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "start_frame_sha256", "end_frame_sha256", "common_period_ms",
+        "source_video_sha256",
+        "desired_fps", "derived_frame_rows", "body_columns",
+        "texels_per_cell", "raster_overhang_px", "row_texels",
+        "effective_frame_row_cap",
+        "frame_extraction", "row_zero", "alpha_matte_verification",
+        "loop_closure", "max_frame_rows"
+      ],
+      "properties": {
+        "start_frame_sha256": { "$ref": "#/$defs/contentHash" },
+        "end_frame_sha256": { "$ref": "#/$defs/contentHash" },
+        "source_video_sha256": {
+          "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }]
+        },
+        "common_period_ms": { "type": "number", "minimum": 120, "maximum": 60000 },
+        "desired_fps": { "type": "number", "minimum": 1, "maximum": 60 },
+        "derived_frame_rows": { "type": "integer", "minimum": 2, "maximum": 120 },
+        "body_columns": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "texels_per_cell": { "type": "integer", "minimum": 4, "maximum": 128 },
+        "raster_overhang_px": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "row_texels": { "type": "integer", "minimum": 4, "maximum": 192 },
+        "effective_frame_row_cap": { "type": "integer", "minimum": 2, "maximum": 120 },
+        "frame_extraction": { "const": "deterministic_uniform_full_period" },
+        "row_zero": { "const": "resting_and_reduced_motion" },
+        "alpha_matte_verification": { "const": "fail_closed" },
+        "loop_closure": { "const": "true_final_to_zero" },
+        "max_frame_rows": { "const": 120 }
+      }
+    },
+    "reuse": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "modifier_manifest_sha256", "target_lineage_id",
+        "require_authorized_lineage", "cross_lineage_authority_sha256"
+      ],
+      "properties": {
+        "modifier_manifest_sha256": { "$ref": "#/$defs/contentHash" },
+        "target_lineage_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "require_authorized_lineage": { "const": true },
+        "cross_lineage_authority_sha256": {
+          "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }]
+        }
+      }
+    }
+  }
+}

@@ -28,6 +28,7 @@
         "kind": "sheet",
         "body_columns": 53,
         "frame_rows": 60,
+        "raster_overhang_px": 0,
         "variants": [
           {
             "content_ref": "sha256:d444444444444444444444444444444444444444444444444444444444444444",
@@ -73,7 +74,7 @@
       "source": {
         "type": "image",
         "texture": "nebula_sheet",
-        "fit": { "type": "tile", "cells_per_repeat": 53 },
+        "fit": { "type": "tile", "cells_per_repeat": 53, "phase_origin": "head" },
         "drift_cells": 0
       }
     },

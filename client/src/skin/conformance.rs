@@ -180,17 +180,18 @@ fn overhang_overrun(
     ])
 }
 
-/// The renderer sizes the occlusion mask and the roster row from
-/// `metrics().overhang_px`. A skin that paints wider than it admits leaves grid
-/// dots showing through its own outline and overflows the roster.
+/// The renderer sizes fixed-contour occlusion from `overhang_px` and sizes the
+/// roster row from the full visible overhang. A skin that paints wider than it
+/// admits overflows the roster; its raster apron deliberately alpha-composites
+/// without an opaque pre-mask.
 #[test]
 fn skin_conformance_painted_extent_stays_inside_reported_overhang() {
     for skin in skins_under_test() {
         for boost_active in [false, true] {
-            let overhang = skin.metrics(boost_active).overhang_px;
             for identity in identities() {
                 for pose in POSES {
                     for &cell_size in CELL_SIZES {
+                        let overhang = skin.metrics(boost_active).visible_overhang_px(cell_size);
                         let Some(sides) = overhang_overrun(
                             skin.as_ref(),
                             pose.cells,
@@ -649,6 +650,7 @@ fn skin_conformance_catches_a_skin_that_underreports_its_overhang() {
         fn metrics(&self, _boost_active: bool) -> crate::skin::SkinMetrics {
             crate::skin::SkinMetrics {
                 overhang_px: 0.0,
+                raster_overhang_px: 0,
                 head_core_radius_ratio: 0.38,
                 head_core_is_dark: true,
             }
@@ -708,6 +710,7 @@ fn skin_conformance_catches_a_skin_that_paints_honestly_then_moves_it() {
         fn metrics(&self, _boost_active: bool) -> crate::skin::SkinMetrics {
             crate::skin::SkinMetrics {
                 overhang_px: 0.0,
+                raster_overhang_px: 0,
                 head_core_radius_ratio: 0.38,
                 head_core_is_dark: true,
             }

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://snaketron.io/schemas/skin-factory/modifier-manifest-v1.json",
+  "title": "Immutable reusable modifier manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "modifier_id", "logical_key", "component_key",
+    "content_sha256", "forge_manifest_sha256", "descriptor_sha256",
+    "media_type", "provenance_sha256", "license_id",
+    "authorized_lineage_ids", "source_artifacts", "extraction_report_sha256",
+    "video_report_sha256", "created_by_operation_sha256",
+    "raster_overhang_px", "verification"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "modifier_id": {
+      "type": "string",
+      "description": "modifier:<authorized lineage>:<content_sha256>; semantic validation requires the suffix to equal content_sha256",
+      "pattern": "^modifier:[a-z0-9_-]+:sha256:[a-f0-9]{64}$"
+    },
+    "logical_key": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+    "component_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$" },
+    "content_sha256": { "$ref": "#/$defs/contentHash" },
+    "forge_manifest_sha256": { "$ref": "#/$defs/contentHash" },
+    "descriptor_sha256": { "$ref": "#/$defs/contentHash" },
+    "media_type": { "const": "image/png" },
+    "provenance_sha256": { "$ref": "#/$defs/contentHash" },
+    "license_id": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "authorized_lineage_ids": {
+      "type": "array", "minItems": 1,
+      "items": { "type": "string", "minLength": 1, "maxLength": 160 },
+      "uniqueItems": true
+    },
+    "source_artifacts": {
+      "type": "array", "minItems": 1,
+      "items": { "$ref": "#/$defs/contentHash" }, "uniqueItems": true
+    },
+    "extraction_report_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }]
+    },
+    "video_report_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }]
+    },
+    "created_by_operation_sha256": { "$ref": "#/$defs/contentHash" },
+    "raster_overhang_px": { "type": "integer", "minimum": 0, "maximum": 4 },
+    "verification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["alpha_matte", "background_contamination", "edge_fringes", "outer_frame_edge", "frame_gutters", "immutable_bytes"],
+      "properties": {
+        "alpha_matte": { "enum": ["transparent_rgba_verified", "exact_mask_matte_verified", "opaque_not_applicable"] },
+        "background_contamination": { "const": "pass" },
+        "edge_fringes": { "const": "pass" },
+        "outer_frame_edge": { "enum": ["pass_transparent_effect", "not_applicable_opaque_fill"] },
+        "frame_gutters": { "const": "pass" },
+        "immutable_bytes": { "const": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "alpha_matte": {
+            "enum": ["transparent_rgba_verified", "exact_mask_matte_verified"]
+          } } },
+          "then": { "properties": { "outer_frame_edge": { "const": "pass_transparent_effect" } } }
+        },
+        {
+          "if": { "properties": { "alpha_matte": { "const": "opaque_not_applicable" } } },
+          "then": { "properties": { "outer_frame_edge": { "const": "not_applicable_opaque_fill" } } }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "contentHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+  }
+}

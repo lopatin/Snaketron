@@ -35,9 +35,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
-
 import sprite_sheet as sheets
+from PIL import Image
 
 # Texels per cell in the canonical variant, and the rungs below it. These
 # mirror `server/src/texture.rs`; a disagreement would mean the server accepts
@@ -64,9 +63,7 @@ def parse_axes(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError("--axes must be x, y, x,y, or none")
     unknown = [name for name in names if name not in AXIS_IDS]
     if unknown:
-        raise argparse.ArgumentTypeError(
-            f"unknown seam axis {unknown[0]!r}; use x, y, x,y, or none"
-        )
+        raise argparse.ArgumentTypeError(f"unknown seam axis {unknown[0]!r}; use x, y, x,y, or none")
     if len(set(names)) != len(names):
         raise argparse.ArgumentTypeError("each seam axis may be named only once")
     return tuple(AXIS_IDS[name] for name in names)
@@ -75,6 +72,7 @@ def parse_axes(value: str) -> tuple[int, ...]:
 @dataclass
 class Rung:
     texels_per_cell: int
+    row_texels: int
     width_px: int
     height_px: int
     bytes: int
@@ -90,6 +88,9 @@ class Manifest:
     height_px: int
     body_columns: int | None
     frame_rows: int | None
+    texels_per_cell: int
+    raster_overhang_px: int
+    row_texels: int
     seam_axes: list[str]
     horizontal_ratio: float
     vertical_ratio: float
@@ -114,6 +115,20 @@ class Measurement:
     structural: str | None
 
 
+def bleed_apron_texels(texels_per_cell: int, raster_overhang_px: int) -> int | None:
+    """Scale the authored per-side apron from the fixed 16px body grid."""
+
+    if texels_per_cell <= 0 or not 0 <= raster_overhang_px <= 4:
+        return None
+    scaled = texels_per_cell * raster_overhang_px
+    return scaled // 16 if scaled % 16 == 0 else None
+
+
+def stored_row_texels(texels_per_cell: int, raster_overhang_px: int) -> int | None:
+    side = bleed_apron_texels(texels_per_cell, raster_overhang_px)
+    return None if side is None else texels_per_cell + 2 * side
+
+
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -131,12 +146,10 @@ def measure(image: Image.Image, axis: int) -> Measurement:
     if "A" in image.getbands():
         rgba = np.asarray(image.convert("RGBA"), dtype=np.float64)
         alpha = rgba[..., 3:4] / 255.0
-        # Measure what the overlay contributes on screen, plus the alpha edge
-        # itself. Transparent RGB garbage must not dominate, while an opacity
-        # discontinuity must not disappear from the gate.
-        pixels = np.concatenate((rgba[..., :3] * alpha, rgba[..., 3:4]), axis=2).astype(
-            np.uint8
-        )
+        # Measure a deterministic white-background composite. Transparent RGB
+        # garbage cannot dominate, while opacity edges remain visible to the
+        # RGB-only seam implementation.
+        pixels = np.rint(rgba[..., :3] * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
     else:
         pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
 
@@ -190,7 +203,7 @@ def repair_crop_tx_t(
     pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
     working = np.swapaxes(pixels, 0, 1) if axis == 0 else pixels
     height, width, _ = working.shape
-    gap = max(8, int(round(width * gap_fraction)))
+    gap = max(8, round(width * gap_fraction))
     canvas = np.empty((height, width * 2 + gap, 3), dtype=np.uint8)
     canvas[:, :width] = working
     canvas[:, width + gap :] = working
@@ -230,7 +243,52 @@ def repair_crop_tx_t(
     return result
 
 
-def build_ladder(image: Image.Image, kind: str, out_dir: Path) -> list[Rung]:
+def _resize_bounded_rows(
+    image: Image.Image,
+    *,
+    target_width: int,
+    target_row_texels: int,
+    stored_rows: int,
+) -> Image.Image:
+    """Resize each stored row independently, wrapping only the body axis."""
+
+    source_row_texels = image.height // stored_rows
+    result = Image.new("RGBA", (target_width, target_row_texels * stored_rows), (0, 0, 0, 0))
+    for row_index in range(stored_rows):
+        row = image.crop(
+            (
+                0,
+                row_index * source_row_texels,
+                image.width,
+                (row_index + 1) * source_row_texels,
+            )
+        ).convert("RGBA")
+        tiled = Image.new("RGBA", (image.width * 3, source_row_texels), (0, 0, 0, 0))
+        for tile in range(3):
+            tiled.paste(row, (tile * image.width, 0))
+        scaled = tiled.resize(
+            (target_width * 3, target_row_texels),
+            resample=Image.Resampling.LANCZOS,
+        ).crop((target_width, 0, target_width * 2, target_row_texels))
+        # These scanlines were transparent in the canonical input. Clearing
+        # subpixel resampling residue keeps the declared apron a hard maximum.
+        alpha = scaled.getchannel("A")
+        alpha.paste(0, (0, 0, target_width, 1))
+        alpha.paste(0, (0, target_row_texels - 1, target_width, target_row_texels))
+        scaled.putalpha(alpha)
+        result.paste(scaled, (0, row_index * target_row_texels))
+    return result
+
+
+def build_ladder(
+    image: Image.Image,
+    kind: str,
+    out_dir: Path,
+    *,
+    body_columns: int | None = None,
+    frame_rows: int | None = None,
+    raster_overhang_px: int = 0,
+) -> list[Rung]:
     """Write the canonical image and every rung beneath it.
 
     Resizing is wrap-aware — a plain resize samples past the edge and puts a
@@ -240,20 +298,48 @@ def build_ladder(image: Image.Image, kind: str, out_dir: Path) -> list[Rung]:
     canonical, rungs_below = LADDERS[kind]
     out_dir.mkdir(parents=True, exist_ok=True)
     rungs: list[Rung] = []
+    source_side = bleed_apron_texels(canonical, raster_overhang_px)
+    source_row = stored_row_texels(canonical, raster_overhang_px)
+    if source_side is None or source_row is None:
+        raise ValueError("raster overhang cannot be represented by this forge ladder")
+    stored_rows = (
+        frame_rows
+        if kind == "sheet" and frame_rows is not None
+        else image.height // source_row
+        if kind == "sheet"
+        else 1
+    )
+    body_rows = (image.height - 2 * source_side) // canonical if kind == "overlay" else 1
 
     for texels in (canonical, *rungs_below):
+        side_texels = bleed_apron_texels(texels, raster_overhang_px)
+        row_texels = stored_row_texels(texels, raster_overhang_px)
+        if side_texels is None or row_texels is None:
+            raise ValueError(f"{texels}-texel rung cannot represent the declared bleed apron exactly")
+        target_width = body_columns * texels if body_columns is not None else image.width * texels // canonical
+        target_height = stored_rows * row_texels if kind == "sheet" else body_rows * texels + 2 * side_texels
         if texels == canonical:
             scaled = image
+        elif raster_overhang_px > 0:
+            scaled = _resize_bounded_rows(
+                image,
+                target_width=target_width,
+                target_row_texels=target_height // stored_rows,
+                stored_rows=stored_rows,
+            )
         else:
-            scale = texels / canonical
             # `wrapped_resize` takes height then width as scalars, and resizes
             # on a 3x3 tiling so the edges keep the neighbours they will
             # actually have — a plain resize clamps at the border and puts back
             # the very seam the repair removed.
             scaled = sheets.wrapped_resize(
                 image,
-                max(1, round(image.height * scale)),
-                max(1, round(image.width * scale)),
+                target_height,
+                target_width,
+            )
+        if scaled.size != (target_width, target_height):
+            raise ValueError(
+                f"{texels}-texel rung is {scaled.width}x{scaled.height}px, expected {target_width}x{target_height}px"
             )
 
         path = out_dir / f"{texels}.png"
@@ -262,6 +348,7 @@ def build_ladder(image: Image.Image, kind: str, out_dir: Path) -> list[Rung]:
         rungs.append(
             Rung(
                 texels_per_cell=texels,
+                row_texels=row_texels,
                 width_px=scaled.width,
                 height_px=scaled.height,
                 bytes=len(data),
@@ -284,11 +371,15 @@ def rejected_manifest(
     out_dir: Path,
     repair_methods: list[str] | None = None,
     rungs: list[Rung] | None = None,
+    *,
+    raster_overhang_px: int = 0,
 ) -> Manifest:
     out_dir.mkdir(parents=True, exist_ok=True)
     failed_path = out_dir / "rejected.png"
     image.save(failed_path, format="PNG", optimize=True)
     failed_data = failed_path.read_bytes()
+    canonical = LADDERS[kind][0]
+    row_texels = stored_row_texels(canonical, raster_overhang_px) or canonical
     return Manifest(
         kind=kind,
         accepted=False,
@@ -296,6 +387,9 @@ def rejected_manifest(
         height_px=image.height,
         body_columns=body_columns,
         frame_rows=frame_rows,
+        texels_per_cell=canonical,
+        raster_overhang_px=raster_overhang_px,
+        row_texels=row_texels,
         seam_axes=["y" if axis == 0 else "x" for axis in seam_axes],
         horizontal_ratio=ratios[1],
         vertical_ratio=ratios[0],
@@ -303,7 +397,8 @@ def rejected_manifest(
         repair_methods=list(repair_methods or []),
         rungs=list(rungs or []),
         failed_output=Rung(
-            texels_per_cell=LADDERS[kind][0],
+            texels_per_cell=canonical,
+            row_texels=row_texels,
             width_px=image.width,
             height_px=image.height,
             bytes=len(failed_data),
@@ -320,9 +415,19 @@ def shape_problem(
     body_columns: int | None,
     frame_rows: int | None,
     texels_per_cell: int | None = None,
+    raster_overhang_px: int = 0,
 ) -> str | None:
-    """Validate X body cells and Y animation frames independently."""
-    canonical = texels_per_cell or LADDERS[kind][0]
+    """Validate logical body cells separately from stored bleed aprons."""
+    canonical = LADDERS[kind][0] if texels_per_cell is None else texels_per_cell
+    side_texels = bleed_apron_texels(canonical, raster_overhang_px)
+    row_texels = stored_row_texels(canonical, raster_overhang_px)
+    if not 0 <= raster_overhang_px <= 4:
+        return "raster overhang must be from 0 through 4 authored pixels per side"
+    if side_texels is None or row_texels is None:
+        return (
+            f"a {canonical}-texel rung cannot represent {raster_overhang_px}px bleed aprons "
+            "exactly from the unchanged 16px logical body grid"
+        )
     if body_columns is not None and body_columns <= 0:
         return "body columns must be positive"
     if frame_rows is not None and frame_rows <= 0:
@@ -338,15 +443,56 @@ def shape_problem(
             f"{body_columns} body columns at {canonical}px require "
             f"{body_columns * canonical}px width, not {image.width}px"
         )
-    if kind == "sheet" and image.height != frame_rows * canonical:
+    if kind == "sheet" and image.height != frame_rows * row_texels:
         return (
-            f"{frame_rows} frame rows at {canonical}px require "
-            f"{frame_rows * canonical}px height, not {image.height}px"
+            f"{frame_rows} frame rows (stored independently) require {frame_rows * row_texels}px height, "
+            f"not {image.height}px; each row is {side_texels}px top bleed apron + "
+            f"unchanged {canonical}px logical body cell + {side_texels}px bottom bleed apron"
         )
-    if kind == "coat" and image.height != canonical:
-        return f"a coat is one {canonical}px body cell tall, not {image.height}px"
-    if kind == "overlay" and image.height % canonical != 0:
-        return f"an overlay height must contain whole {canonical}px cells"
+    if kind == "coat" and image.height != row_texels:
+        return (
+            f"a coat stored row is {row_texels}px tall ({side_texels}px top bleed apron + "
+            f"unchanged {canonical}px logical body cell + {side_texels}px bottom bleed apron), "
+            f"not {image.height}px"
+        )
+    if kind == "overlay":
+        body_height = image.height - 2 * side_texels
+        if body_height <= 0 or body_height % canonical != 0:
+            return (
+                f"between its {side_texels}px bleed aprons, an overlay height must contain "
+                f"whole unchanged {canonical}px logical body cells"
+            )
+    return None
+
+
+def alpha_problem(
+    image: Image.Image,
+    kind: str,
+    frame_rows: int | None,
+    texels_per_cell: int,
+    raster_overhang_px: int,
+) -> str | None:
+    """Require nonzero bleed to end transparently inside every stored row."""
+
+    if raster_overhang_px == 0:
+        return None
+    if "A" not in image.getbands():
+        return "bounded bleed aprons require an RGBA image with an alpha channel"
+    row_texels = stored_row_texels(texels_per_cell, raster_overhang_px)
+    if row_texels is None:
+        return "the declared bleed apron cannot be represented exactly at this rung"
+    stored_rows = frame_rows if kind == "sheet" and frame_rows is not None else 1
+    if image.height != stored_rows * row_texels and kind != "overlay":
+        return None  # The shape verdict reports the more useful dimensional error.
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)
+    if kind == "sheet":
+        touched = any(
+            np.any(alpha[row * row_texels]) or np.any(alpha[(row + 1) * row_texels - 1]) for row in range(stored_rows)
+        )
+    else:
+        touched = bool(np.any(alpha[0]) or np.any(alpha[-1]))
+    if touched:
+        return "visible alpha touches a transverse stored-row edge; the effect must end inside the bounded bleed apron"
     return None
 
 
@@ -357,6 +503,7 @@ def inspect_existing(
     frame_rows: int | None,
     seam_axes: tuple[int, ...],
     texels_per_cell: int,
+    raster_overhang_px: int = 0,
 ) -> dict[str, object]:
     """Measure exact retained pixels without repair, resize, or generation."""
 
@@ -369,9 +516,25 @@ def inspect_existing(
         reasons.append("seam axes must be a unique subset of x and y")
     if kind == "sheet" and 0 not in seam_axes:
         reasons.append("a sheet must check the y seam between its first and last frame")
-    problem = shape_problem(image, kind, body_columns, frame_rows, texels_per_cell)
+    problem = shape_problem(
+        image,
+        kind,
+        body_columns,
+        frame_rows,
+        texels_per_cell,
+        raster_overhang_px,
+    )
     if problem:
         reasons.append(problem)
+    alpha = alpha_problem(
+        image,
+        kind,
+        frame_rows,
+        texels_per_cell,
+        raster_overhang_px,
+    )
+    if alpha:
+        reasons.append(alpha)
     if not reasons:
         for axis in seam_axes:
             measured = measure(image, axis)
@@ -393,7 +556,7 @@ def inspect_existing(
                     f"({measured.complaint or 'not cleared'})"
                 )
         if kind == "sheet" and frame_rows:
-            temporal = temporal_problem(image, frame_rows)
+            temporal = temporal_problem(image, frame_rows, texels_per_cell)
             if temporal:
                 reasons.append(f"the temporal cells are invalid: {temporal}")
     return {
@@ -406,6 +569,9 @@ def inspect_existing(
         "body_columns": body_columns,
         "frame_rows": frame_rows,
         "texels_per_cell": texels_per_cell,
+        "raster_overhang_px": raster_overhang_px,
+        "row_texels": stored_row_texels(texels_per_cell, raster_overhang_px),
+        "alpha_verified": not bool(alpha),
         "seam_axes": ["y" if axis == 0 else "x" for axis in seam_axes],
         "horizontal_ratio": ratios[1],
         "vertical_ratio": ratios[0],
@@ -414,7 +580,11 @@ def inspect_existing(
     }
 
 
-def temporal_problem(image: Image.Image, frame_rows: int) -> str | None:
+def temporal_problem(
+    image: Image.Image,
+    frame_rows: int,
+    logical_texels_per_cell: int | None = None,
+) -> str | None:
     """Validate the declared 2-D frame cells without inferring their count.
 
     Frame count is a grid fact established by ``shape_problem``.  A vertical
@@ -429,8 +599,7 @@ def temporal_problem(image: Image.Image, frame_rows: int) -> str | None:
     pixels = np.concatenate((rgba[..., :3] * alpha, rgba[..., 3:4]), axis=2)
     frames = pixels.reshape(frame_rows, frame_height, image.width, 4)
     steps = [
-        float(np.mean(np.abs(frames[(index + 1) % frame_rows] - frames[index])) / 255.0)
-        for index in range(frame_rows)
+        float(np.mean(np.abs(frames[(index + 1) % frame_rows] - frames[index])) / 255.0) for index in range(frame_rows)
     ]
     change_floor = 1.0 / 1_024.0
     material = [step for step in steps if step > change_floor]
@@ -441,18 +610,12 @@ def temporal_problem(image: Image.Image, frame_rows: int) -> str | None:
     baseline = float(np.median(internal)) if internal else 0.0
     allowance = max(0.02, baseline * 2.5)
     if steps[-1] > allowance:
-        return (
-            f"last-to-first frame discontinuity {steps[-1]:.4f} exceeds "
-            f"{allowance:.4f}"
-        )
+        return f"last-to-first frame discontinuity {steps[-1]:.4f} exceeds {allowance:.4f}"
 
     drift = sheets.frame_translation(image, frame_rows)
-    drift_limit = max(1, frame_height // 8)
+    drift_limit = max(1, (logical_texels_per_cell or frame_height) // 8)
     if abs(drift) > drift_limit:
-        return (
-            f"frames translate {drift}px around the body cross-section; "
-            f"limit is {drift_limit}px"
-        )
+        return f"frames translate {drift}px around the body cross-section; limit is {drift_limit}px"
     return None
 
 
@@ -463,6 +626,7 @@ def forge(
     frame_rows: int | None,
     seam_axes: tuple[int, ...],
     out_dir: Path,
+    raster_overhang_px: int = 0,
 ) -> Manifest:
     """Measure, repair if needed, measure again, and build the ladder."""
     ratios = {0: 0.0, 1: 0.0}
@@ -470,9 +634,7 @@ def forge(
     repair_methods: list[str] = []
     lama = None
 
-    if len(set(seam_axes)) != len(seam_axes) or any(
-        axis not in AXIS_NAMES for axis in seam_axes
-    ):
+    if len(set(seam_axes)) != len(seam_axes) or any(axis not in AXIS_NAMES for axis in seam_axes):
         return rejected_manifest(
             image,
             kind,
@@ -483,6 +645,7 @@ def forge(
             False,
             "seam axes must be a unique subset of x and y",
             out_dir,
+            raster_overhang_px=raster_overhang_px,
         )
     if kind == "sheet" and 0 not in seam_axes:
         return rejected_manifest(
@@ -495,9 +658,16 @@ def forge(
             False,
             "a sheet must check the y seam between its first and last frame",
             out_dir,
+            raster_overhang_px=raster_overhang_px,
         )
 
-    problem = shape_problem(image, kind, body_columns, frame_rows)
+    problem = shape_problem(
+        image,
+        kind,
+        body_columns,
+        frame_rows,
+        raster_overhang_px=raster_overhang_px,
+    )
     if problem:
         return rejected_manifest(
             image,
@@ -509,6 +679,27 @@ def forge(
             False,
             problem,
             out_dir,
+            raster_overhang_px=raster_overhang_px,
+        )
+    problem = alpha_problem(
+        image,
+        kind,
+        frame_rows,
+        LADDERS[kind][0],
+        raster_overhang_px,
+    )
+    if problem:
+        return rejected_manifest(
+            image,
+            kind,
+            body_columns,
+            frame_rows,
+            seam_axes,
+            ratios,
+            False,
+            problem,
+            out_dir,
+            raster_overhang_px=raster_overhang_px,
         )
 
     for axis in seam_axes:
@@ -546,6 +737,7 @@ def forge(
                 ),
                 out_dir,
                 repair_methods,
+                raster_overhang_px=raster_overhang_px,
             )
 
         if lama is None:
@@ -571,6 +763,7 @@ def forge(
                 ),
                 out_dir,
                 repair_methods,
+                raster_overhang_px=raster_overhang_px,
             )
 
     # Repairing the second axis can disturb the first one near the corners.
@@ -595,13 +788,14 @@ def forge(
                 ),
                 out_dir,
                 repair_methods,
+                raster_overhang_px=raster_overhang_px,
             )
 
     # Validate the actual declared frame cells.  Frame count was already proven
     # by shape_problem; reconstructing frames from a 1-D vertical profile would
     # misclassify legitimate horizontal motion as a one-frame sheet.
     if kind == "sheet" and frame_rows:
-        problem = temporal_problem(image, frame_rows)
+        problem = temporal_problem(image, frame_rows, LADDERS[kind][0])
         if problem:
             return rejected_manifest(
                 image,
@@ -614,15 +808,75 @@ def forge(
                 f"the temporal cells are invalid: {problem}",
                 out_dir,
                 repair_methods,
+                raster_overhang_px=raster_overhang_px,
             )
 
-    rungs = build_ladder(image, kind, out_dir)
+    problem = alpha_problem(
+        image,
+        kind,
+        frame_rows,
+        LADDERS[kind][0],
+        raster_overhang_px,
+    )
+    if problem:
+        return rejected_manifest(
+            image,
+            kind,
+            body_columns,
+            frame_rows,
+            seam_axes,
+            ratios,
+            repaired,
+            problem,
+            out_dir,
+            repair_methods,
+            raster_overhang_px=raster_overhang_px,
+        )
+
+    rungs = build_ladder(
+        image,
+        kind,
+        out_dir,
+        body_columns=body_columns,
+        frame_rows=frame_rows,
+        raster_overhang_px=raster_overhang_px,
+    )
     # The lower rungs are real shipping bytes, not previews. Wrap-aware resize
     # should preserve the join, but the gate verifies that claim on each PNG
     # rather than inferring it from the canonical source.
     for rung in rungs:
         with Image.open(rung.path) as opened:
-            exact = opened.convert("RGBA" if kind == "overlay" else "RGB")
+            has_alpha = "A" in opened.getbands() or "transparency" in opened.info
+            exact = opened.convert("RGBA" if has_alpha else "RGB")
+        rung_problem = shape_problem(
+            exact,
+            kind,
+            body_columns,
+            frame_rows,
+            rung.texels_per_cell,
+            raster_overhang_px,
+        ) or alpha_problem(
+            exact,
+            kind,
+            frame_rows,
+            rung.texels_per_cell,
+            raster_overhang_px,
+        )
+        if rung_problem:
+            return rejected_manifest(
+                image,
+                kind,
+                body_columns,
+                frame_rows,
+                seam_axes,
+                ratios,
+                repaired,
+                f"the shipping {rung.texels_per_cell}-texel rung is invalid: {rung_problem}",
+                out_dir,
+                repair_methods,
+                rungs,
+                raster_overhang_px=raster_overhang_px,
+            )
         for axis in seam_axes:
             measured = measure(exact, axis)
             if not measured.cleared:
@@ -643,6 +897,7 @@ def forge(
                     out_dir,
                     repair_methods,
                     rungs,
+                    raster_overhang_px=raster_overhang_px,
                 )
 
     return Manifest(
@@ -652,6 +907,9 @@ def forge(
         height_px=image.height,
         body_columns=body_columns,
         frame_rows=frame_rows,
+        texels_per_cell=LADDERS[kind][0],
+        raster_overhang_px=raster_overhang_px,
+        row_texels=stored_row_texels(LADDERS[kind][0], raster_overhang_px) or LADDERS[kind][0],
         seam_axes=["y" if axis == 0 else "x" for axis in seam_axes],
         horizontal_ratio=ratios[1],
         vertical_ratio=ratios[0],
@@ -677,6 +935,13 @@ def main() -> int:
         type=int,
         default=None,
         help="number of independent animation frames down a sheet",
+    )
+    parser.add_argument(
+        "--raster-overhang-px",
+        type=int,
+        choices=range(5),
+        default=0,
+        help="authored bleed apron per transverse side on the unchanged 16px body grid",
     )
     parser.add_argument(
         "--axes",
@@ -709,7 +974,10 @@ def main() -> int:
     if args.inspect_existing and args.texels_per_cell is None:
         parser.error("--texels-per-cell is required by --inspect-existing")
 
-    image = Image.open(args.source).convert("RGBA" if args.kind == "overlay" else "RGB")
+    with Image.open(args.source) as opened:
+        has_alpha = "A" in opened.getbands() or "transparency" in opened.info
+        image = opened.convert("RGBA" if args.kind == "overlay" or has_alpha else "RGB")
+        image.load()
     if args.inspect_existing:
         inspected = inspect_existing(
             image,
@@ -718,6 +986,7 @@ def main() -> int:
             args.frame_rows,
             args.axes,
             args.texels_per_cell,
+            args.raster_overhang_px,
         )
         args.out_dir.mkdir(parents=True, exist_ok=True)
         (args.out_dir / "manifest.json").write_text(json.dumps(inspected, indent=2) + "\n")
@@ -731,12 +1000,11 @@ def main() -> int:
         args.frame_rows,
         args.axes,
         args.out_dir,
+        args.raster_overhang_px,
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    (args.out_dir / "manifest.json").write_text(
-        json.dumps(asdict(manifest), indent=2) + "\n"
-    )
+    (args.out_dir / "manifest.json").write_text(json.dumps(asdict(manifest), indent=2) + "\n")
 
     if args.report or not manifest.accepted:
         print(json.dumps(asdict(manifest), indent=2))

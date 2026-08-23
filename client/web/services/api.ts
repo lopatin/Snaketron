@@ -26,6 +26,7 @@ import type { JobAccepted } from '../types/generated/JobAccepted';
 import type { GenerationJob } from '../types/generated/GenerationJob';
 import type { TextureListResponse } from '../types/generated/TextureListResponse';
 import type {
+  AdminSkinReviewQueueResponse,
   BrowseResponse,
   Equipment,
   PurchaseResult,
@@ -35,8 +36,10 @@ import type {
   Wallet,
 } from '../types/generated';
 import {
+  exactAdminSkinDecision,
   exactPublicationRequest,
   exactSkinUpdate,
+  type AdminSkinDecision,
   type UpdateSkinRequest,
 } from '../utils/skinApiContracts';
 
@@ -646,24 +649,23 @@ class API {
   }
 
   /** Everything waiting on a reviewer, oldest first. */
-  async getSkinReviewQueue(): Promise<SkinListResponse> {
-    return this.request<SkinListResponse>('/api/admin/skins');
+  async getSkinReviewQueue(): Promise<AdminSkinReviewQueueResponse> {
+    return this.request<AdminSkinReviewQueueResponse>('/api/admin/skins');
   }
 
   /**
    * Decide a skin.
    *
-   * Publishing names one revision — by default the one review was asked about,
-   * because the creator's head may have moved since they submitted it.
+   * Publish and reject name the exact immutable revision and content hash the
+   * admin reviewed. State-only moderation deliberately accepts neither field.
    */
   async setSkinPublication(
     skinId: number,
-    publication: 'published' | 'unpublished' | 'disabled' | 'private',
-    options: { revision?: number; reason?: string } = {},
+    decision: AdminSkinDecision,
   ): Promise<SkinSummary> {
     return this.request<SkinSummary>(`/api/admin/skins/${skinId}/status`, {
       method: 'PUT',
-      body: JSON.stringify({ publication, ...options }),
+      body: JSON.stringify(exactAdminSkinDecision(decision)),
     });
   }
 }

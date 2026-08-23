@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://snaketron.io/schemas/skin-factory/draft-media-preplan-v1.json",
+  "title": "Hash-free private-draft media preplan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision", "video_intents", "notes", "failure"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "decision": { "enum": ["procedural_only", "video_intents", "platform_gap"] },
+    "video_intents": {
+      "type": "array",
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/videoIntent" }
+    },
+    "notes": {
+      "type": "array",
+      "maxItems": 12,
+      "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+    },
+    "failure": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason", "missing_capabilities"],
+          "properties": {
+            "reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "missing_capabilities": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "maxLength": 200 },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "decision": { "const": "video_intents" } } },
+      "then": {
+        "properties": {
+          "video_intents": { "minItems": 1 },
+          "failure": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "procedural_only" } } },
+      "then": {
+        "properties": {
+          "video_intents": { "maxItems": 0 },
+          "failure": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "platform_gap" } } },
+      "then": {
+        "properties": {
+          "video_intents": { "maxItems": 0 },
+          "failure": { "type": "object" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "videoIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent_id", "logical_key", "component_key", "texture_name",
+        "anchor", "span_limit_mode", "span_limit_value", "body_columns",
+        "desired_fps", "common_period_ms", "raster_overhang_px", "matte_rgb",
+        "start_frame_prompt", "end_frame_prompt", "transition_prompt", "seed",
+        "authorized_lineage_scope"
+      ],
+      "properties": {
+        "intent_id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "logical_key": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "component_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$" },
+        "texture_name": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]*$" },
+        "anchor": { "enum": ["whole", "head", "tail"] },
+        "span_limit_mode": { "enum": ["whole", "head_cells", "tail_fraction"] },
+        "span_limit_value": { "type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 6 },
+        "body_columns": { "type": "integer", "minimum": 1, "maximum": 63 },
+        "desired_fps": { "type": "number", "minimum": 1, "maximum": 60 },
+        "common_period_ms": { "type": "number", "minimum": 120, "maximum": 60000 },
+        "raster_overhang_px": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "matte_rgb": { "const": [127, 127, 127] },
+        "start_frame_prompt": { "type": "string", "minLength": 1, "maxLength": 3000 },
+        "end_frame_prompt": { "type": "string", "minLength": 1, "maxLength": 3000 },
+        "transition_prompt": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "seed": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "authorized_lineage_scope": { "const": "current_concept_only" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "span_limit_mode": { "const": "whole" } } },
+          "then": { "properties": { "span_limit_value": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "span_limit_mode": { "const": "head_cells" } } },
+          "then": { "properties": { "span_limit_value": { "type": "number", "maximum": 6 } } }
+        },
+        {
+          "if": { "properties": { "span_limit_mode": { "const": "tail_fraction" } } },
+          "then": { "properties": { "span_limit_value": { "type": "number", "maximum": 0.5 } } }
+        }
+      ]
+    }
+  }
+}

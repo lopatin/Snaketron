@@ -16,6 +16,7 @@ from snaketron_factory.domain import (
     GateResult,
     GateVerdict,
     ImplementationPlan,
+    InputAuthorityEvidence,
     ProviderResult,
     Purpose,
     Stage,
@@ -326,6 +327,7 @@ async def test_experiment_author_uses_retained_candidate_before_git_and_resumes_
     files = {
         "SKILL.md": "# Candidate authoring contract\n",
         "schemas/asset-request.schema.json": json.dumps({"type": "object"}),
+        "schemas/implementation-plan.schema.json": json.dumps(ImplementationPlan.model_json_schema()),
     }
     candidate_bundle = SkillBundle.from_files(files)
     child = database.create_attempt(
@@ -352,6 +354,22 @@ async def test_experiment_author_uses_retained_candidate_before_git_and_resumes_
             "skill_files": files,
         },
     )
+    approval_input = {
+        "decision_id": approval["id"],
+        "artifact_id": approval["artifact_id"],
+        "artifact_hash": approval["content_hash"],
+        "attempt_version": approval["attempt_version"],
+        "actor": approval["actor"],
+    }
+    worker.results[0].implementation_plan.input_authority = InputAuthorityEvidence(
+        mode="approved_prototype",
+        artifact_sha256=prototype["content_hash"],
+        authority_record_sha256="sha256:" + hashlib.sha256(canonical_json(approval_input).encode()).hexdigest(),
+        human_approval_decision_id=approval["id"],
+        selection_rationale=None,
+        maximum_driver_action="register_private_revision",
+    )
+    worker.results[0].implementation_plan.common_period_ms = worker.results[0].skin_document["period_ms"]
 
     def forbidden_git_lookup(_attempt: dict[str, Any]) -> SkillBundle:
         raise AssertionError("experimental authoring consulted the active Git bundle")

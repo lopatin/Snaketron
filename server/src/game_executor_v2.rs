@@ -5260,7 +5260,7 @@ mod tests {
         unused_database_method!(approve_skin_revision(skin_id: i32, revision: u32) -> ());
         unused_database_method!(decide_skin_review(
             skin_id: i32,
-            publication: crate::skin_store::Publication,
+            decision: crate::skin_store::SkinReviewDecision,
             revision: Option<u32>,
             content_ref: Option<&str>,
             actor_user_id: i32,

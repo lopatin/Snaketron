@@ -22,6 +22,7 @@ from snaketron_factory.domain import (
     GateResult,
     GateVerdict,
     ImplementationPlan,
+    InputAuthorityEvidence,
     OperationStatus,
     ProviderError,
     ProviderFailureKind,
@@ -66,17 +67,21 @@ class FakeApi:
         self.publication_request_calls: list[dict[str, Any]] = []
         self.publish_calls: list[dict[str, Any]] = []
         self.skin_authority: dict[str, Any] | None = None
+        self.documents: dict[str, bytes] = {}
 
     async def close(self) -> None:
         return None
 
     async def create_skin(self, **request: Any) -> ProviderResult:
         self.create_calls.append(request)
+        document = canonical_json(request["document"]).encode()
+        content_ref = "sha256:" + hashlib.sha256(document).hexdigest()
+        self.documents[content_ref] = document
         return ProviderResult(
             value={
                 "skinId": "skin-stable",
                 "headRevision": 1,
-                "contentRef": "sha256:" + "9" * 64,
+                "contentRef": content_ref,
             },
             request_id="create-1",
             resolved_model="snaketron-api",
@@ -84,11 +89,14 @@ class FakeApi:
 
     async def append_revision(self, **request: Any) -> ProviderResult:
         self.append_calls.append(request)
+        document = canonical_json(request["document"]).encode()
+        content_ref = "sha256:" + hashlib.sha256(document).hexdigest()
+        self.documents[content_ref] = document
         return ProviderResult(
             value={
                 "skinId": request["skin_id"],
                 "headRevision": request["expected_head_revision"] + 1,
-                "contentRef": "sha256:" + "8" * 64,
+                "contentRef": content_ref,
             },
             request_id="append-1",
             resolved_model="snaketron-api",
@@ -122,6 +130,10 @@ class FakeApi:
             },
             resolved_model="snaketron-api",
         )
+
+    async def get_skin_document(self, content_ref: str, *, as_operator: bool = False) -> bytes:
+        assert as_operator is False
+        return self.documents[content_ref]
 
 
 def retained_request_metadata(objects: ObjectStore, request: Any) -> dict[str, str]:
@@ -222,6 +234,64 @@ async def test_optimizer_registration_uses_server_enforced_evaluation_namespace(
     assert database.get_concept(attempt["concept_id"])["stable_skin_id"] is None
     assert database.latest_registered_attempt(attempt["concept_id"]) is None
     assert api.publication_request_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["response_content_ref", "private_readback"])
+async def test_registration_fails_closed_before_render_on_inexact_live_server_evidence(
+    factory_config,
+    database,
+    objects,
+    make_attempt,
+    monkeypatch,
+    failure: str,
+) -> None:
+    api = FakeApi()
+    original_create = api.create_skin
+
+    async def create_skin(**request: Any) -> ProviderResult:
+        result = await original_create(**request)
+        if failure == "response_content_ref":
+            return ProviderResult(
+                value={**result.value, "contentRef": "sha256:" + "0" * 64},
+                request_id=result.request_id,
+                resolved_model=result.resolved_model,
+            )
+        return result
+
+    async def get_skin_document(content_ref: str, *, as_operator: bool = False) -> bytes:
+        if failure == "private_readback":
+            return b"{}"
+        return await FakeApi.get_skin_document(api, content_ref, as_operator=as_operator)
+
+    monkeypatch.setattr(api, "create_skin", create_skin)
+    monkeypatch.setattr(api, "get_skin_document", get_skin_document)
+    factory = Factory(factory_config, database=database, objects=objects, api=api)  # type: ignore[arg-type]
+    attempt = make_attempt(stage=Stage.REGISTER, purpose=Purpose.PRODUCTION)
+    add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.BUILD_GATE,
+        kind=ArtifactKind.SKIN_DOCUMENT,
+        value=canonical_json(
+            {
+                "schema_version": 2,
+                "name": "Exact registration",
+                "period_ms": 1_000,
+                "textures": [],
+                "layers": [],
+            }
+        ).encode(),
+        media_type="application/json",
+    )
+
+    registered = await factory._register(attempt)
+
+    assert registered["stage"] == Stage.REGISTER
+    assert registered["disposition"] == Disposition.BLOCKED
+    assert registered["production_skin_id"] is None
+    await factory.close()
     with database.connect() as connection:
         operation = connection.execute(
             "SELECT * FROM operation WHERE attempt_id=? AND side_effect='create_private_skin_revision'",
@@ -353,9 +423,7 @@ async def test_runtime_invalid_document_is_machine_rejected_before_register_effe
     factory.pinned_gates = lambda _attempt: factory.gates  # type: ignore[method-assign]
     attempt = make_attempt(stage=Stage.BUILD_GATE, purpose=Purpose.OPTIMIZER)
     plan = author_result().implementation_plan
-    document = json.loads(
-        (REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8")
-    )
+    document = json.loads((REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8"))
     source = document["layers"][2]["source"]
     source["half_width"] = 0.15
     source["t_center"] = "tri(time)"
@@ -397,8 +465,7 @@ async def test_runtime_invalid_document_is_machine_rejected_before_register_effe
     assert renderer_gate["artifact_id"] == document_artifact["id"]
     assert renderer_gate["verdict"] == GateVerdict.FAIL
     assert any(
-        "|t_center| + half_width may not exceed 0.5" in reason
-        for reason in json.loads(renderer_gate["reasons_json"])
+        "|t_center| + half_width may not exceed 0.5" in reason for reason in json.loads(renderer_gate["reasons_json"])
     )
     assert api.create_calls == []
     assert api.append_calls == []
@@ -422,9 +489,7 @@ async def test_renderer_compile_timeout_machine_rejects_without_register_operati
     factory = Factory(factory_config, database=database, objects=objects, api=api)  # type: ignore[arg-type]
     factory.pinned_gates = lambda _attempt: factory.gates  # type: ignore[method-assign]
     attempt = make_attempt(stage=Stage.BUILD_GATE, purpose=Purpose.OPTIMIZER)
-    document = json.loads(
-        (REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8")
-    )
+    document = json.loads((REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8"))
     add_artifact(
         database,
         objects,
@@ -944,6 +1009,44 @@ def _asset_plan() -> ImplementationPlan:
             "asset_strategy": "The coat tiles seamlessly on x.",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_asset_plan_budget_admission_terminalizes_before_any_image_call(
+    factory_config,
+    database,
+    objects,
+    make_attempt,
+) -> None:
+    factory_config.budgets.max_cost_micros_per_attempt = 1
+    factory = Factory(factory_config, database=database, objects=objects)
+    factory.pinned_gates = lambda _: factory.gates  # type: ignore[method-assign]
+    attempt = make_attempt(stage=Stage.ASSETS)
+    plan = _asset_plan()
+    add_artifact(
+        database,
+        objects,
+        attempt["id"],
+        stage=Stage.AUTHOR,
+        kind=ArtifactKind.IMPLEMENTATION_PLAN,
+        value=plan.model_dump_json().encode(),
+        media_type="application/json",
+    )
+
+    blocked = await factory._build_assets(attempt)
+
+    assert blocked["disposition"] == Disposition.BLOCKED
+    assert blocked["stage"] == Stage.ASSETS
+    assert "worst-case remaining provider reservation" in blocked["failure_json"]
+    with database.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM operation WHERE attempt_id=?",
+                (attempt["id"],),
+            ).fetchone()[0]
+            == 0
+        )
+    await factory.close()
 
 
 def test_rejected_forge_retains_every_identical_rung_occurrence_and_repaired_pixels(
@@ -2341,13 +2444,31 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
         actor="human:alex",
     )
     assert database.get_attempt(attempt["id"])["stage"] == Stage.PROTOTYPE_REVIEW
-    approved = review.approve_prototype(
+    approval_result = review.approve_prototype(
         attempt_id=attempt["id"],
         artifact_id=prototype["id"],
         content_hash=prototype["content_hash"],
         feedback="build this exact direction",
         actor="human:alex",
-    )["attempt"]
+    )
+    approved = approval_result["attempt"]
+    decision = approval_result["decision"]
+    approval_input = {
+        "decision_id": decision["id"],
+        "artifact_id": decision["artifact_id"],
+        "artifact_hash": decision["content_hash"],
+        "attempt_version": decision["attempt_version"],
+        "actor": decision["actor"],
+    }
+    worker.results[0].implementation_plan.input_authority = InputAuthorityEvidence(
+        mode="approved_prototype",
+        artifact_sha256=manifest["image_sha256"],
+        authority_record_sha256="sha256:" + hashlib.sha256(canonical_json(approval_input).encode()).hexdigest(),
+        human_approval_decision_id=decision["id"],
+        selection_rationale=None,
+        maximum_driver_action="register_private_revision",
+    )
+    worker.results[0].implementation_plan.common_period_ms = worker.results[0].skin_document["period_ms"]
     assert approved["stage"] == Stage.AUTHOR
 
     build_report = await factory.run_once()
@@ -2358,7 +2479,12 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     assert built["review_kind"] == "final"
     assert built["production_skin_id"] == "skin-stable"
     assert built["production_revision"] == "1"
-    assert built["production_content_hash"] == "sha256:" + "9" * 64
+    registered_document = factory._find_lineage_artifact(built, ArtifactKind.SKIN_DOCUMENT)
+    assert registered_document is not None
+    registered_payload = json.loads(objects.get(registered_document["object_ref"]))
+    assert built["production_content_hash"] == (
+        "sha256:" + hashlib.sha256(canonical_json(registered_payload).encode()).hexdigest()
+    )
     assert len(worker.requests) == 1
     request = worker.requests[0]
     assert request.inline_artifacts["approved_prototype"].content_hash == prototype["content_hash"]
@@ -2374,6 +2500,16 @@ async def test_full_state_machine_requires_exact_human_gates_and_retains_every_a
     assert request.authoring_inputs["prototype_geometry"]["contract_sha256"] == behavior["prototype_geometry_sha"]
     assert request.authoring_inputs["prototype_geometry"]["guide_sha256"] == behavior["prototype_guide_sha"]
     assert request.authoring_inputs["prototype_approval"]["decision_id"] == approved["prototype_decision_id"]
+    assert request.authoring_inputs["host_capabilities"] == {
+        "authority_modes": ["approved_prototype"],
+        "operations": ["generate_asset"],
+        "raster_overhang_px_max": 0,
+    }
+    current_plan_schema = request.output_schemas["worker_result"]["$defs"]["ImplementationPlan"]
+    assert set(current_plan_schema["required"]) == set(current_plan_schema["properties"])
+    assert request.output_schemas["implementation_plan"] == json.loads(
+        request.skill_files["schemas/implementation-plan.schema.json"]
+    )
     assert api.create_calls[0]["idempotency_key"].startswith("factory-concept:")
     assert api.create_calls[0]["evaluation_only"] is False
     assert api.publication_request_calls == [

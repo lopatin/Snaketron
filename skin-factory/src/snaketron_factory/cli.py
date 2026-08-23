@@ -22,6 +22,8 @@ from .calibration import JudgeCalibrationService
 from .config import FactoryConfig, load_config
 from .db import Database, VersionConflict
 from .doctor import FactoryDoctor
+from .domain import Disposition
+from .draft_automation import DraftInbox, DraftPrompt
 from .environment import apply_environment, load_service_environment, read_private_environment
 from .factory import Factory
 from .gallery import _prevalidate_bulk_retry, build_review_service, create_app
@@ -157,6 +159,77 @@ def run_once(
 
     try:
         _emit(asyncio.run(run()), json_output)
+    except Exception as error:
+        _fail(error, json_output)
+
+
+@app.command("enqueue-draft")
+def enqueue_draft(
+    name: str = typer.Argument(..., help="Admin-facing skin name"),
+    brief: str = typer.Option(..., "--brief", help="Exact concept prompt (20-2000 characters)"),
+    motion: str = typer.Option(..., "--motion", help="Desired motion or explicit static intent"),
+    palette: str = typer.Option(
+        "Preserve the concept's most readable game-scale palette.",
+        "--palette",
+    ),
+    implementation: Literal["layers", "texture", "sprite_sheet", "hybrid"] = typer.Option("hybrid", "--implementation"),
+    tag: list[str] = typer.Option([], "--tag"),
+    queue_id: str | None = typer.Option(None, "--queue-id"),
+    seed: str | None = typer.Option(None, "--seed"),
+    config: Path = CONFIG_OPTION,
+    json_output: bool = JSON_OPTION,
+) -> None:
+    """Atomically enqueue one immutable private draft for the scheduled runner."""
+
+    try:
+        settings = _load(config, None)
+        item = DraftPrompt.from_prompt(
+            name=name,
+            brief=brief,
+            motion_intent=motion,
+            palette_intent=palette,
+            implementation_hint=implementation,
+            tags=tag or None,
+            queue_id=queue_id,
+            seed=seed,
+        )
+        path = DraftInbox(settings.draft_automation.inbox).enqueue(item)
+        _emit(
+            {
+                "ok": True,
+                "queue_id": item.queue_id,
+                "path": str(path),
+                "automation_enabled": settings.draft_automation.enabled,
+                "candidate_budget": settings.draft_candidate_budget_report(),
+                "next_action": "Hermes/factory run-once will create a private draft and request Admin review",
+            },
+            json_output,
+        )
+    except Exception as error:
+        _fail(error, json_output)
+
+
+@app.command("draft-status")
+def draft_status(
+    config: Path = CONFIG_OPTION,
+    json_output: bool = JSON_OPTION,
+) -> None:
+    """Show the immutable inbox and conservative candidate reservation."""
+
+    try:
+        settings = _load(config, None)
+        database = Database(settings.paths.database)
+        database.migrate()
+        _emit(
+            {
+                "ok": True,
+                "enabled": settings.draft_automation.enabled,
+                **DraftInbox(settings.draft_automation.inbox).status(),
+                "awaiting_admin_review": len(database.attempts_by_disposition(Disposition.AWAITING_ADMIN_REVIEW)),
+                "candidate_budget": settings.draft_candidate_budget_report(),
+            },
+            json_output,
+        )
     except Exception as error:
         _fail(error, json_output)
 
@@ -556,6 +629,13 @@ def resolve_operation(
     resolved_model: str | None = typer.Option(None, "--resolved-model"),
     provider_request_id: str | None = typer.Option(None, "--provider-request-id"),
     media_type: str | None = typer.Option(None, "--media-type"),
+    result_metadata_file: Path | None = typer.Option(
+        None,
+        "--result-metadata-file",
+        exists=True,
+        dir_okay=False,
+        help="Bounded provider metadata JSON required to recover an exact Fal video result",
+    ),
     resolution_file: Path | None = typer.Option(None, "--resolution-file", exists=True),
     actor: str | None = typer.Option(None, "--actor"),
     config: Path = CONFIG_OPTION,
@@ -568,7 +648,17 @@ def resolve_operation(
         settings = _load(config, env_file)
         human = _human(settings, actor)
         if resolution_file:
-            if any((resolution, evidence_ref, result_hash, resolved_model, provider_request_id, media_type)):
+            if any(
+                (
+                    resolution,
+                    evidence_ref,
+                    result_hash,
+                    resolved_model,
+                    provider_request_id,
+                    media_type,
+                    result_metadata_file,
+                )
+            ):
                 raise ValueError("--resolution-file cannot be combined with outcome options")
             payload = json.loads(resolution_file.read_text(encoding="utf-8"))
             resolution = payload.get("resolution")
@@ -577,6 +667,13 @@ def resolve_operation(
             resolved_model = payload.get("resolved_model")
             provider_request_id = payload.get("provider_request_id")
             media_type = payload.get("media_type")
+            result_metadata = payload.get("result_metadata")
+        elif result_metadata_file is not None:
+            result_metadata = json.loads(result_metadata_file.read_text(encoding="utf-8"))
+        else:
+            result_metadata = None
+        if result_metadata is not None and not isinstance(result_metadata, dict):
+            raise ValueError("recovered result_metadata must be one JSON object")
         if not resolution or not evidence_ref:
             raise ValueError("resolution and evidence reference are required")
         database = Database(settings.paths.database)
@@ -586,7 +683,7 @@ def resolve_operation(
                 raise ValueError("executed_result_recovered requires a result hash")
             if not resolved_model:
                 raise ValueError("executed_result_recovered requires the exact resolved model")
-            validate_recovered_result(
+            validated = validate_recovered_result(
                 config=settings,
                 operation=database.get_operation(operation_id),
                 database=database,
@@ -594,7 +691,14 @@ def resolve_operation(
                 result_hash=result_hash,
                 resolved_model=resolved_model,
                 media_type=media_type,
+                provider_request_id=provider_request_id,
+                result_metadata=result_metadata,
             )
+            stored_result_metadata = (
+                validated.metadata if validated.metadata.get("result", {}).get("kind") == "video" else None
+            )
+        else:
+            stored_result_metadata = None
         result = database.resolve_operation(
             operation_id=operation_id,
             resolution=resolution,
@@ -603,6 +707,7 @@ def resolve_operation(
             resolved_model=resolved_model,
             provider_request_id=provider_request_id,
             media_type=media_type,
+            result_metadata=stored_result_metadata,
             actor=human,
         )
         _emit(result, json_output)

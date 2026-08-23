@@ -121,7 +121,15 @@ class OperationJournal:
         persist_result: Callable[[ProviderResult], str] | None = None,
         validate_result: Callable[[ProviderResult], None] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        repeatable_read: bool = False,
+        repeatable_local: bool = False,
     ) -> tuple[dict[str, Any], ProviderResult | None]:
+        if repeatable_read and repeatable_local:
+            raise ValueError("an operation cannot be both a repeatable provider read and local computation")
+        repeatable = repeatable_read or repeatable_local
+        if repeatable and reserve_micros != 0:
+            raise ValueError("repeatable reads/local computations must have a zero cost reservation")
+        repeatable_kind = "local_computation" if repeatable_local else "provider_read"
         digest = self.request_hash(request)
         operation, created = self.database.begin_operation(
             attempt_id=attempt_id,
@@ -140,6 +148,23 @@ class OperationJournal:
             if status == OperationStatus.INTENT:
                 # The transaction committed the reservation, but no adapter
                 # call started. Resuming this exact intent is safe.
+                created = True
+            elif status == OperationStatus.RUNNING and repeatable:
+                retained_metadata = json.loads(operation.get("metadata_json") or "{}")
+                operation = self.database.transition_operation(
+                    operation["id"],
+                    OperationStatus.RUNNING,
+                    OperationStatus.INTENT,
+                    retry_class=f"repeatable_{repeatable_kind}_resume",
+                    cost_charged_micros=0,
+                    metadata_json={
+                        **retained_metadata,
+                        "crash_recovery": {
+                            "kind": repeatable_kind,
+                            "request_hash": digest,
+                        },
+                    },
+                )
                 created = True
             elif status == OperationStatus.RUNNING:
                 operation = self.database.transition_operation(
@@ -172,7 +197,17 @@ class OperationJournal:
                 result = await result
             assert isinstance(result, ProviderResult)
         except ProviderError as error:
-            if not error.outcome_known or error.kind == ProviderFailureKind.UNKNOWN_OUTCOME:
+            if repeatable and error.kind in {
+                ProviderFailureKind.AUTHENTICATION,
+                ProviderFailureKind.TIMEOUT,
+                ProviderFailureKind.UNAVAILABLE,
+                ProviderFailureKind.QUOTA,
+                ProviderFailureKind.UNKNOWN_OUTCOME,
+            }:
+                status = OperationStatus.FAILED_RETRYABLE
+                retry_class = "safe_new_key"
+                charged = 0
+            elif not error.outcome_known or error.kind == ProviderFailureKind.UNKNOWN_OUTCOME:
                 status = OperationStatus.RECONCILIATION_REQUIRED
                 retry_class = "unknown"
                 charged = reserve_micros
@@ -201,6 +236,20 @@ class OperationJournal:
             )
             raise
         except BaseException as error:
+            if repeatable:
+                operation = self.database.transition_operation(
+                    operation["id"],
+                    OperationStatus.RUNNING,
+                    OperationStatus.FAILED_RETRYABLE,
+                    retry_class="safe_new_key",
+                    cost_charged_micros=0,
+                    failure_json={"kind": f"repeatable_{repeatable_kind}_exception", "message": str(error)},
+                )
+                raise ProviderError(
+                    ProviderFailureKind.UNAVAILABLE,
+                    f"repeatable {repeatable_kind} failed safely for operation {operation['id']}: {error}",
+                    outcome_known=True,
+                ) from error
             # Once control entered an adapter, an arbitrary transport/process
             # exception cannot prove the provider did not accept the request.
             # This is the expensive boundary the reconciliation workflow owns.

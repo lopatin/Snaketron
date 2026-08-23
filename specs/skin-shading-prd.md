@@ -196,6 +196,18 @@ Delivery is a **versioned relative URL, not `include_bytes!`**. Embedding pixels
 
 A skin whose atlas has not finished decoding paints its fallback layers (a skin must be legible with no atlas at all — this is a schema requirement, not a nicety, because a mid-match join must not show a blank snake).
 
+**Bounded raster rows.** A remote texture may declare up to four authored
+pixels of transparent or painted bleed on each transverse side of the fixed
+16×16 body cell. The logical cell does not change size. At the 16-texel rung,
+the source stores a 24-texel transverse row only because it contains
+`4 bleed + 16 body + 4 bleed`; preserving those additional texels avoids
+discarding real apron artwork. Every ladder rung includes the scaled apron,
+and the compositor maps it through a direction-aware expanded silhouette with
+ordinary longitudinal caps. Bounded bleed may overlap another snake's logical
+cell and follows normal draw order. This descriptor-bound exception supersedes
+the earlier blanket deferral of anisotropic overhang while keeping
+`SkinMetrics` scalar at any actual live cell size.
+
 ### 8.2 Placement
 
 An image layer's `u` maps to its span in `s`, its `v` to `t`. Because runs are axis-aligned, a span crossing a corner splits into per-run slices and each slice is one `drawImage` with a source sub-rectangle:
@@ -234,7 +246,7 @@ What happens to the *art* inside an allocated span is the layer's `fit`:
 | --- | --- |
 | `clip` (default for caps) | Draw the source at its natural scale and clip the far end. Art keeps its proportions. |
 | `stretch` | Compress the source into the span. Available, not default — it distorts in ways an author cannot predict from the PNG. |
-| `tile` | Repeat the source along `s`. The default for middles. |
+| `tile` | Repeat the source along `s`. The default for middles. Its phase may be pinned to the head (default) or tail allocation edge. |
 
 The earlier draft of this section said "art is never compressed" while section 8.2's placement math unconditionally stretched the region across the span. `fit` is the reconciliation: the math in 8.2 is the `stretch` case, and `clip` maps a *prefix* of the source instead.
 

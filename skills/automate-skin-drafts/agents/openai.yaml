@@ -1,0 +1,7 @@
+interface:
+  display_name: "Automate Skin Drafts"
+  short_description: "Plan and advance private Snaketron skin drafts"
+  default_prompt: "Use $automate-skin-drafts to enqueue or advance a private Snaketron skin draft without publishing it."
+
+policy:
+  allow_implicit_invocation: true

@@ -282,6 +282,9 @@ def test_environment_file_is_private_json_not_shell(tmp_path: Path, monkeypatch)
 
 def test_explicit_service_json_wins_and_scrubs_custom_configured_credentials(tmp_path: Path, monkeypatch) -> None:
     config = make_config(tmp_path)
+    config = config.model_copy(
+        update={"draft_automation": config.draft_automation.model_copy(update={"enabled": False})}
+    )
     custom_provider = "CUSTOM_PROVIDER_CREDENTIAL"
     custom_worker = "CUSTOM_WORKER_CREDENTIAL"
     custom_service = "CUSTOM_SNAKETRON_SERVICE_CREDENTIAL"
@@ -350,6 +353,9 @@ def test_service_environment_rejects_inherited_custom_human_authority(tmp_path: 
 
 def test_run_once_uses_authoritative_explicit_service_json(tmp_path: Path, monkeypatch) -> None:
     config = make_config(tmp_path)
+    config = config.model_copy(
+        update={"draft_automation": config.draft_automation.model_copy(update={"enabled": False})}
+    )
     custom_provider = "CUSTOM_RUN_PROVIDER_KEY"
     custom_worker = "CUSTOM_RUN_WORKER_KEY"
     custom_service = "CUSTOM_RUN_SERVICE_TOKEN"

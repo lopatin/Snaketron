@@ -27,6 +27,7 @@
         "kind": "sheet",
         "body_columns": 41,
         "frame_rows": 48,
+        "raster_overhang_px": 0,
         "variants": [
           {
             "content_ref": "sha256:d333333333333333333333333333333333333333333333333333333333333333",
@@ -71,7 +72,7 @@
       "source": {
         "type": "image",
         "texture": "water_sheet",
-        "fit": { "type": "tile", "cells_per_repeat": 41 },
+        "fit": { "type": "tile", "cells_per_repeat": 41, "phase_origin": "head" },
         "drift_cells": 0
       }
     },

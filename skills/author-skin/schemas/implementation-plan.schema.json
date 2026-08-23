@@ -1,58 +1,51 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://snaketron.io/schemas/skin-factory/implementation-plan-v1.json",
+  "$id": "https://snaketron.io/schemas/skin-factory/implementation-plan-v2.json",
   "title": "Skin implementation plan",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "path",
-    "rationale",
-    "design_guidelines",
-    "fidelity_features",
-    "layer_plan",
-    "asset_plan",
-    "animation_plan",
-    "required_wrap_axes",
-    "risks"
+    "input_authority", "path", "rationale", "design_guidelines",
+    "common_period_ms", "fidelity_features", "layer_plan", "asset_plan",
+    "modifier_plan", "animation_plan", "required_wrap_axes", "risks"
   ],
   "properties": {
+    "input_authority": { "$ref": "#/$defs/inputAuthority" },
     "path": { "enum": ["layers", "texture", "sprite_sheet", "hybrid"] },
     "rationale": { "type": "string", "minLength": 1 },
     "design_guidelines": { "$ref": "#/$defs/designGuidelines" },
+    "common_period_ms": { "type": "number", "minimum": 120, "maximum": 60000 },
     "fidelity_features": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 8,
-      "items": { "type": "string", "minLength": 1 },
-      "uniqueItems": true
+      "type": "array", "minItems": 1, "maxItems": 8,
+      "items": { "type": "string", "minLength": 1 }, "uniqueItems": true
     },
     "layer_plan": {
       "type": "array",
-      "description": "Ordered executable layer ownership. For every band, record the independent baked-frame maxima proving max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5.",
-      "minItems": 1,
-      "items": { "type": "string", "minLength": 1 }
+      "description": "Ordered executable layer ownership, including the exact earlier fallback for every image modifier. For every band, record the independent baked-frame maxima proving max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5.",
+      "minItems": 1, "items": { "type": "string", "minLength": 1 }
     },
     "asset_plan": {
+      "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/asset" }
+    },
+    "modifier_plan": {
       "type": "array",
-      "maxItems": 4,
-      "items": { "$ref": "#/$defs/asset" }
+      "description": "One logical modifier record per raster asset. Each record owns one texture and one anchored image layer; conceptual components such as T1/T2/B1/H are not packed columns.",
+      "maxItems": 8, "items": { "$ref": "#/$defs/modifier" }
     },
     "animation_plan": {
       "type": "array",
-      "description": "Baked-frame behavior and bounds. A band must prove max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5 across the complete pinned animation ring, not merely bound each field separately. Safe example: t_center = 0.3 * tri(time) and half_width = 0.15 give 0.45.",
+      "description": "Baked-frame behavior and bounds. A band must prove max_frame(abs(t_center)) + max_frame(abs(half_width)) <= 0.5 across the complete pinned animation ring, not merely bound each field separately. Safe example: t_center = 0.3 * tri(time) and half_width = 0.15 give 0.45. Video-derived rows use the same common_period_ms and include the true final-to-zero transition.",
       "items": { "type": "string", "minLength": 1 }
     },
     "required_wrap_axes": { "$ref": "#/$defs/wrapAxes" },
     "risks": {
-      "type": "array",
-      "items": { "type": "string", "minLength": 1 },
-      "uniqueItems": true
+      "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true
     }
   },
   "allOf": [
     {
       "if": { "properties": { "path": { "const": "layers" } } },
-      "then": { "properties": { "asset_plan": { "maxItems": 0 } } }
+      "then": { "properties": { "asset_plan": { "maxItems": 0 }, "modifier_plan": { "maxItems": 0 } } }
     },
     {
       "if": { "properties": { "path": { "const": "texture" } } },
@@ -60,13 +53,12 @@
         "properties": {
           "asset_plan": {
             "minItems": 1,
-            "items": {
-              "allOf": [
-                { "$ref": "#/$defs/asset" },
-                { "properties": { "kind": { "enum": ["coat", "overlay"] } } }
-              ]
-            }
-          }
+            "items": { "allOf": [
+              { "$ref": "#/$defs/asset" },
+              { "properties": { "kind": { "enum": ["coat", "overlay"] } } }
+            ] }
+          },
+          "modifier_plan": { "minItems": 1 }
         }
       }
     },
@@ -76,111 +68,222 @@
         "properties": {
           "asset_plan": {
             "minItems": 1,
-            "contains": {
-              "properties": { "kind": { "const": "sheet" } },
-              "required": ["kind"]
-            }
-          }
+            "contains": { "properties": { "kind": { "const": "sheet" } }, "required": ["kind"] }
+          },
+          "modifier_plan": { "minItems": 1 }
         }
       }
     },
     {
       "if": { "properties": { "path": { "const": "hybrid" } } },
-      "then": { "properties": { "asset_plan": { "minItems": 1 } } }
+      "then": { "properties": { "asset_plan": { "minItems": 1 }, "modifier_plan": { "minItems": 1 } } }
     }
   ],
   "$defs": {
-    "designGuidelines": {
-      "type": "object",
-      "additionalProperties": false,
+    "contentHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "inputAuthority": {
+      "type": "object", "additionalProperties": false,
       "required": [
-        "artistic_direction",
-        "concept_twist",
-        "structure",
-        "body_strategy",
-        "head_zone",
-        "asset_strategy"
+        "mode", "artifact_sha256", "authority_record_sha256",
+        "human_approval_decision_id", "selection_rationale", "maximum_driver_action"
+      ],
+      "properties": {
+        "mode": { "enum": ["approved_prototype", "draft_submission"] },
+        "artifact_sha256": { "$ref": "#/$defs/contentHash" },
+        "authority_record_sha256": { "$ref": "#/$defs/contentHash" },
+        "human_approval_decision_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 160 },
+        "selection_rationale": { "type": ["string", "null"], "minLength": 1, "maxLength": 500 },
+        "maximum_driver_action": { "enum": ["register_private_revision", "request_admin_review"] }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "mode": { "const": "approved_prototype" },
+            "human_approval_decision_id": { "type": "string", "minLength": 1 },
+            "selection_rationale": { "type": "null" },
+            "maximum_driver_action": { "const": "register_private_revision" }
+          }
+        },
+        {
+          "properties": {
+            "mode": { "const": "draft_submission" },
+            "human_approval_decision_id": { "type": "null" },
+            "selection_rationale": { "type": "string", "minLength": 1 },
+            "maximum_driver_action": { "const": "request_admin_review" }
+          }
+        }
+      ]
+    },
+    "designGuidelines": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "artistic_direction", "concept_twist", "structure", "body_strategy",
+        "head_zone", "asset_strategy"
       ],
       "properties": {
         "artistic_direction": { "type": "string", "minLength": 1, "maxLength": 240 },
         "concept_twist": { "type": "string", "minLength": 1, "maxLength": 240 },
         "structure": { "enum": ["pattern", "sprite"] },
         "body_strategy": { "type": "string", "minLength": 1, "maxLength": 320 },
-        "head_zone": {
-          "enum": [
-            "light_field_dark_core",
-            "dark_field_light_disc_dark_core"
-          ]
-        },
+        "head_zone": { "enum": ["light_field_dark_core", "dark_field_light_disc_dark_core"] },
         "asset_strategy": { "type": "string", "minLength": 1, "maxLength": 320 }
       }
     },
     "wrapAxes": {
-      "type": "array",
-      "maxItems": 2,
-      "items": { "enum": ["x", "y"] },
-      "uniqueItems": true
+      "type": "array", "maxItems": 2,
+      "items": { "enum": ["x", "y"] }, "uniqueItems": true
     },
     "asset": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": [
-        "kind",
-        "natural_length_cells",
-        "frames",
-        "desired_fps",
-        "texels_per_cell",
-        "anchor",
-        "fit",
-        "fade",
-        "prompt"
+        "kind", "natural_length_cells", "frames", "desired_fps",
+        "texels_per_cell", "raster_overhang_px", "anchor", "fit",
+        "tile_phase_origin", "fade", "transverse_edge_policy", "prompt"
       ],
       "properties": {
         "kind": { "enum": ["coat", "sheet", "overlay"] },
-        "natural_length_cells": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 128
-        },
-        "frames": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 120
-        },
-        "desired_fps": {
-          "type": ["number", "null"],
-          "minimum": 1,
-          "maximum": 120
-        },
-        "texels_per_cell": {
-          "type": "integer",
-          "minimum": 4,
-          "maximum": 128
-        },
+        "natural_length_cells": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "frames": { "type": "integer", "minimum": 1, "maximum": 120 },
+        "desired_fps": { "type": ["number", "null"], "minimum": 1, "maximum": 120 },
+        "texels_per_cell": { "type": "integer", "minimum": 4, "maximum": 128 },
+        "raster_overhang_px": { "type": "integer", "minimum": 0, "maximum": 4 },
         "anchor": { "enum": ["whole", "head", "tail"] },
         "fit": { "enum": ["tile", "clip", "stretch", "cutout"] },
+        "tile_phase_origin": { "enum": ["head", "tail", null] },
         "fade": { "enum": ["none", "leading", "trailing", "both"] },
+        "transverse_edge_policy": { "enum": ["fail_closed_transparent_effect", "not_applicable_opaque_fill"] },
         "prompt": { "type": "string", "minLength": 1 }
       },
       "allOf": [
         {
           "if": { "properties": { "kind": { "const": "sheet" } } },
-          "then": {
-            "properties": {
-              "frames": { "minimum": 2 },
-              "desired_fps": { "type": "number" },
-              "texels_per_cell": { "const": 16 }
-            }
-          },
-          "else": {
-            "properties": {
-              "frames": { "const": 1 },
-              "desired_fps": { "const": null },
-              "texels_per_cell": { "const": 64 }
-            }
-          }
+          "then": { "properties": {
+            "frames": { "minimum": 2 }, "desired_fps": { "type": "number" },
+            "texels_per_cell": { "const": 16 }
+          } },
+          "else": { "properties": {
+            "frames": { "const": 1 }, "desired_fps": { "const": null },
+            "texels_per_cell": { "const": 64 }
+          } }
+        },
+        {
+          "if": { "properties": { "fit": { "const": "tile" } } },
+          "then": { "properties": { "tile_phase_origin": { "enum": ["head", "tail"] } } },
+          "else": { "properties": { "tile_phase_origin": { "const": null } } }
         }
       ]
+    },
+    "modifier": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "asset_index", "logical_key", "component_key", "texture_name",
+        "image_layer_name", "fallback_layer_name", "span_limit_mode",
+        "span_limit_value", "source_mode",
+        "source_object_sha256", "modifier_manifest_sha256", "provenance_sha256",
+        "license_id", "authorized_lineage_ids", "required_capabilities",
+        "extraction", "video"
+      ],
+      "properties": {
+        "asset_index": { "type": "integer", "minimum": 0, "maximum": 7 },
+        "logical_key": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "component_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$" },
+        "texture_name": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]*$" },
+        "image_layer_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "fallback_layer_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "span_limit_mode": { "enum": ["whole", "head_cells", "tail_fraction"] },
+        "span_limit_value": { "type": ["number", "null"], "minimum": 0, "maximum": 6 },
+        "source_mode": { "enum": ["direct_generate", "extracted_rgba", "reused_object", "video_frames"] },
+        "source_object_sha256": { "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }] },
+        "modifier_manifest_sha256": { "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }] },
+        "provenance_sha256": { "$ref": "#/$defs/contentHash" },
+        "license_id": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "authorized_lineage_ids": {
+          "type": "array", "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "uniqueItems": true
+        },
+        "required_capabilities": {
+          "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "uniqueItems": true
+        },
+        "extraction": { "oneOf": [{ "$ref": "#/$defs/extraction" }, { "type": "null" }] },
+        "video": { "oneOf": [{ "$ref": "#/$defs/video" }, { "type": "null" }] }
+      },
+      "oneOf": [
+        { "properties": {
+          "source_mode": { "const": "direct_generate" },
+          "source_object_sha256": { "type": "null" },
+          "modifier_manifest_sha256": { "type": "null" },
+          "extraction": { "type": "null" }, "video": { "type": "null" }
+        } },
+        { "properties": {
+          "source_mode": { "const": "extracted_rgba" },
+          "source_object_sha256": { "$ref": "#/$defs/contentHash" },
+          "modifier_manifest_sha256": { "$ref": "#/$defs/contentHash" },
+          "extraction": { "$ref": "#/$defs/extraction" }, "video": { "type": "null" }
+        } },
+        { "properties": {
+          "source_mode": { "const": "reused_object" },
+          "source_object_sha256": { "$ref": "#/$defs/contentHash" },
+          "modifier_manifest_sha256": { "$ref": "#/$defs/contentHash" },
+          "extraction": { "type": "null" }, "video": { "type": "null" }
+        } },
+        { "properties": {
+          "source_mode": { "const": "video_frames" },
+          "source_object_sha256": { "$ref": "#/$defs/contentHash" },
+          "modifier_manifest_sha256": { "$ref": "#/$defs/contentHash" },
+          "extraction": { "$ref": "#/$defs/extraction" }, "video": { "$ref": "#/$defs/video" }
+        } }
+      ]
+      ,
+      "allOf": [
+        {
+          "if": { "properties": { "span_limit_mode": { "const": "whole" } } },
+          "then": { "properties": { "span_limit_value": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "span_limit_mode": { "const": "head_cells" } } },
+          "then": { "properties": { "span_limit_value": { "type": "number", "exclusiveMinimum": 0, "maximum": 6 } } }
+        },
+        {
+          "if": { "properties": { "span_limit_mode": { "const": "tail_fraction" } } },
+          "then": { "properties": { "span_limit_value": { "type": "number", "exclusiveMinimum": 0, "maximum": 0.5 } } }
+        }
+      ]
+    },
+    "extraction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_arena", "alpha_contract", "background_removal", "matte_policy", "cropped_object_retained"],
+      "properties": {
+        "source_arena": { "const": "reserved_empty" },
+        "alpha_contract": { "enum": ["transparent_rgba", "exact_mask_matte"] },
+        "background_removal": { "const": "required" },
+        "matte_policy": { "const": "fail_closed" },
+        "cropped_object_retained": { "const": true }
+      }
+    },
+    "video": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "start_frame_sha256", "end_frame_sha256", "source_video_sha256",
+        "extracted_sheet_sha256", "common_period_ms", "desired_fps",
+        "derived_frame_rows", "effective_frame_row_cap", "frame_extraction",
+        "alpha_matte_verification", "loop_closure", "retained_inputs_and_output"
+      ],
+      "properties": {
+        "start_frame_sha256": { "$ref": "#/$defs/contentHash" },
+        "end_frame_sha256": { "$ref": "#/$defs/contentHash" },
+        "source_video_sha256": { "$ref": "#/$defs/contentHash" },
+        "extracted_sheet_sha256": { "$ref": "#/$defs/contentHash" },
+        "common_period_ms": { "type": "number", "minimum": 120, "maximum": 60000 },
+        "desired_fps": { "type": "number", "minimum": 1, "maximum": 120 },
+        "derived_frame_rows": { "type": "integer", "minimum": 2, "maximum": 120 },
+        "effective_frame_row_cap": { "type": "integer", "minimum": 2, "maximum": 120 },
+        "frame_extraction": { "const": "deterministic_uniform_full_period" },
+        "alpha_matte_verification": { "const": "fail_closed" },
+        "loop_closure": { "const": "true_final_to_zero" },
+        "retained_inputs_and_output": { "const": true }
+      }
     }
   }
 }

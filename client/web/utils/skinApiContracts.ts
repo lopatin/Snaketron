@@ -21,3 +21,23 @@ export function exactSkinUpdate(request: UpdateSkinRequest): UpdateSkinRequest {
 export function exactPublicationRequest(revision: number, contentRef: string) {
   return { revision, contentRef };
 }
+
+export type AdminSkinDecision =
+  | {
+      decision: 'publish' | 'reject';
+      revision: number;
+      contentRef: string;
+      reason?: string;
+    }
+  | {
+      decision: 'setPublication';
+      publication: 'unpublished' | 'disabled' | 'private';
+      revision?: never;
+      contentRef?: never;
+      reason?: string;
+    };
+
+/** Review decisions bind the bytes inspected; state-only moderation does not. */
+export function exactAdminSkinDecision(decision: AdminSkinDecision): AdminSkinDecision {
+  return decision;
+}

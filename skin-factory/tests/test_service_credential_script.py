@@ -7,6 +7,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +57,76 @@ def test_one_time_service_token_is_written_atomically_and_owner_private(tmp_path
         "SNAKETRON_FACTORY_SERVICE_TOKEN": raw_token,
     }
     assert module.current_credential_id(module.private_json(service_path), None) == credential_id
+
+
+def test_fal_key_import_uses_fresh_login_protocol_and_never_emits_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _script()
+    secret = "fal-secret-value:with-safe-punctuation"
+    service_path = tmp_path / "private/service.json"
+    monkeypatch.setattr(module.secrets, "token_hex", lambda _size: "a" * 48)
+
+    def login(command, **kwargs):
+        assert command[:2] == ["/bin/zsh", "-lic"]
+        assert secret not in " ".join(command)
+        assert module.FAL_API_KEY not in kwargs["env"]
+        assert module.FAL_KEY not in kwargs["env"]
+        begin = "__snaketron_fal_begin_" + "a" * 48 + "__"
+        end = "__snaketron_fal_end_" + "a" * 48 + "__"
+        return SimpleNamespace(returncode=0, stdout=f"{begin}\n{secret}\n{end}\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", login)
+    source = module.import_fal_key(service_path, {})
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert secret not in captured.out + captured.err
+    assert source == "fresh-zsh-login"
+    assert stat.S_IMODE(service_path.stat().st_mode) == 0o600
+    assert json.loads(service_path.read_text(encoding="utf-8")) == {module.FAL_API_KEY: secret}
+
+
+def test_fal_key_import_accepts_existing_alias_and_canonicalizes_without_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _script()
+    secret = "existing-fal-key"
+    service_path = tmp_path / "service.json"
+
+    assert module.import_fal_key(service_path, {module.FAL_KEY: secret}) == module.FAL_KEY
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert json.loads(service_path.read_text(encoding="utf-8")) == {module.FAL_API_KEY: secret}
+
+
+def test_fal_login_import_rejects_noisy_or_conflicting_output_without_leaking_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _script()
+    secret = "must-not-leak"
+    monkeypatch.setattr(module.secrets, "token_hex", lambda _size: "b" * 48)
+
+    def noisy(_command, **_kwargs):
+        begin = "__snaketron_fal_begin_" + "b" * 48 + "__"
+        end = "__snaketron_fal_end_" + "b" * 48 + "__"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"startup chatter\n{begin}\n{secret}\n{end}\n",
+            stderr="",
+        )
+
+    with pytest.raises(SystemExit, match="ambiguous startup output"):
+        module.discover_fal_key({}, run_login_shell=noisy)
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
 
 
 def test_service_file_reader_rejects_group_readable_secrets(tmp_path: Path) -> None:

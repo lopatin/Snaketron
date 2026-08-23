@@ -17,6 +17,11 @@ from .config import FactoryConfig
 from .domain import AssetPlan, GateResult, GateVerdict
 from .gates import GateRunner
 from .lama import lama_bundle_manifest, lama_python, lama_subprocess_environment
+from .worker_validation import asset_row_texels
+
+
+def _has_alpha(image: Image.Image) -> bool:
+    return "A" in image.getbands() or "transparency" in image.info
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,7 @@ class AssetProcessor:
                 command[4:4] = ["--body-columns", str(asset.natural_length_cells)]
             if asset.kind == "sheet" and asset.frames is not None:
                 command[4:4] = ["--frame-rows", str(asset.frames)]
+            command.extend(["--raster-overhang-px", str(asset.raster_overhang_px)])
             completed = subprocess.run(
                 command,
                 cwd=self.config.paths.repo_root,
@@ -177,6 +183,7 @@ class AssetProcessor:
                 "kind": asset.kind,
                 "body_columns": asset.natural_length_cells,
                 "frame_rows": asset.frames if asset.kind == "sheet" else None,
+                "raster_overhang_px": asset.raster_overhang_px,
                 "variants": [
                     {
                         "content_ref": item.content_ref,
@@ -292,6 +299,7 @@ class AssetProcessor:
                 command.extend(["--body-columns", str(asset.natural_length_cells)])
                 if asset.kind == "sheet":
                     command.extend(["--frame-rows", str(asset.frames)])
+                command.extend(["--raster-overhang-px", str(asset.raster_overhang_px)])
                 completed = subprocess.run(
                     command,
                     cwd=self.config.paths.repo_root,
@@ -358,16 +366,16 @@ class AssetProcessor:
         """
         canonical_texels = {"coat": 64, "overlay": 64, "sheet": 16}[asset.kind]
         with Image.open(io.BytesIO(source)) as opened:
-            mode = "RGBA" if asset.kind == "overlay" else "RGB"
+            mode = "RGBA" if asset.kind == "overlay" or asset.raster_overhang_px > 0 or _has_alpha(opened) else "RGB"
             image = opened.convert(mode)
             width = image.width if asset.natural_length_cells is None else asset.natural_length_cells * canonical_texels
             if asset.kind == "sheet":
                 assert asset.frames is not None
-                height = asset.frames * canonical_texels
+                height = asset.frames * asset_row_texels(asset)
             elif asset.natural_length_cells is None:
                 height = image.height
             else:
-                height = canonical_texels
+                height = asset_row_texels(asset)
             normalized = ImageOps.fit(
                 image,
                 (width, height),
@@ -385,6 +393,7 @@ class AssetProcessor:
         body_columns: int,
         frame_rows: int,
         texels_per_cell: int = 16,
+        raster_overhang_px: int = 0,
     ) -> bytes:
         """Resize one provider-native time slice without discarding pixels.
 
@@ -395,9 +404,16 @@ class AssetProcessor:
 
         if body_columns < 1 or frame_rows < 1 or texels_per_cell < 1:
             raise ValueError("sheet slice dimensions must be positive")
-        target = (body_columns * texels_per_cell, frame_rows * texels_per_cell)
+        if not 0 <= raster_overhang_px <= 4:
+            raise ValueError("raster_overhang_px must be from 0 through 4")
+        scaled_overhang = texels_per_cell * raster_overhang_px
+        if scaled_overhang % 16:
+            raise ValueError("raster overhang must scale exactly from the fixed 16-texel body grid")
+        row_texels = texels_per_cell + 2 * (scaled_overhang // 16)
+        target = (body_columns * texels_per_cell, frame_rows * row_texels)
         with Image.open(io.BytesIO(source)) as opened:
-            image = opened.convert("RGB")
+            mode = "RGBA" if raster_overhang_px > 0 or _has_alpha(opened) else "RGB"
+            image = opened.convert(mode)
             normalized = image.resize(target, resample=Image.Resampling.LANCZOS)
             output = io.BytesIO()
             normalized.save(output, format="PNG", optimize=True)
@@ -410,13 +426,16 @@ class AssetProcessor:
         if asset.kind != "sheet":
             raise ValueError("only sheet assets can be assembled from time slices")
         expected_width = asset.natural_length_cells * asset.texels_per_cell
-        expected_height = asset.frames * asset.texels_per_cell
+        expected_height = asset.frames * asset_row_texels(asset)
         decoded: list[Image.Image] = []
         total_height = 0
+        use_alpha = asset.raster_overhang_px > 0
         try:
             for source in slices:
                 opened = Image.open(io.BytesIO(source))
-                image = opened.convert("RGB")
+                source_has_alpha = _has_alpha(opened)
+                use_alpha = use_alpha or source_has_alpha
+                image = opened.convert("RGBA" if asset.raster_overhang_px > 0 or source_has_alpha else "RGB")
                 opened.close()
                 if image.width != expected_width:
                     image.close()
@@ -425,7 +444,7 @@ class AssetProcessor:
                 total_height += image.height
             if total_height != expected_height:
                 raise ValueError(f"sheet slice height total {total_height}px differs from expected {expected_height}px")
-            assembled = Image.new("RGB", (expected_width, expected_height))
+            assembled = Image.new("RGBA" if use_alpha else "RGB", (expected_width, expected_height))
             offset = 0
             for image in decoded:
                 assembled.paste(image, (0, offset))

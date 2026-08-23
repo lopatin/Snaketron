@@ -1,4 +1,12 @@
 {
+  "input_authority": {
+    "mode": "approved_prototype",
+    "artifact_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "authority_record_sha256": "sha256:3bf2dc7ef3a2b62fdf8e7060c9278902ff8d1813703a3529e5f9dc64fbe32386",
+    "human_approval_decision_id": "fixture-approval-layers",
+    "selection_rationale": null,
+    "maximum_driver_action": "register_private_revision"
+  },
   "path": "layers",
   "rationale": "Bands preserve sharp checks and role colours; a gradient stop expresses the shine without raster assets.",
   "design_guidelines": {
@@ -9,6 +17,7 @@
     "head_zone": "light_field_dark_core",
     "asset_strategy": "Procedural layers only; there are no raster seams or sprite-frame rows to produce."
   },
+  "common_period_ms": 2400,
   "fidelity_features": [
     "two-cell checker rhythm",
     "same-hue role-aware checks",
@@ -21,6 +30,7 @@
     "Head glow preserves direction"
   ],
   "asset_plan": [],
+  "modifier_plan": [],
   "animation_plan": [
     "Move three gradient stops with tri(time) over a 2400ms period"
   ],

@@ -329,6 +329,7 @@ pub fn revision_from_item(item: &HashMap<String, AttributeValue>) -> Result<Skin
         validated_schema: read_number(item, "validatedSchema").unwrap_or(1),
         exposed_at_ms: read_number::<i64>(item, "exposedAtMs"),
         review_approved: matches!(item.get("reviewApproved"), Some(AttributeValue::Bool(true))),
+        review_rejected: matches!(item.get("reviewRejected"), Some(AttributeValue::Bool(true))),
         contains_text,
         created_at_ms: read_number(item, "createdAtMs").unwrap_or(0),
     })
@@ -464,6 +465,7 @@ mod tests {
         assert_eq!(stored.texture_refs, expected_refs);
         assert!(stored.contains_text);
         assert!(!stored.review_approved);
+        assert!(!stored.review_rejected);
         assert_eq!(
             read_string(&item, "gsi1sk").as_deref(),
             Some("SKIN#0000000017#REV#000003")

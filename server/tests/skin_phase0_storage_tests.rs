@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use server::db::{Database, dynamodb::DynamoDatabase};
 use server::skin_store::{
-    NewRevision, NewSkin, Publication, SkinKind, SkinNamespace, SkinWriteError,
+    NewRevision, NewSkin, Publication, SkinKind, SkinNamespace, SkinReviewDecision, SkinWriteError,
 };
 use uuid::Uuid;
 
@@ -145,7 +145,7 @@ async fn append_and_exact_publish_are_atomic_idempotent_and_conflict_safe() -> R
     let error = db
         .decide_skin_review(
             skin.skin_id,
-            Publication::Published,
+            SkinReviewDecision::Publish,
             Some(2),
             Some(&wrong),
             99,
@@ -160,7 +160,7 @@ async fn append_and_exact_publish_are_atomic_idempotent_and_conflict_safe() -> R
 
     db.decide_skin_review(
         skin.skin_id,
-        Publication::Published,
+        SkinReviewDecision::Publish,
         Some(2),
         Some(&ref_two),
         99,
@@ -170,7 +170,7 @@ async fn append_and_exact_publish_are_atomic_idempotent_and_conflict_safe() -> R
     // Unknown-outcome retry is a no-op success.
     db.decide_skin_review(
         skin.skin_id,
-        Publication::Published,
+        SkinReviewDecision::Publish,
         Some(2),
         Some(&ref_two),
         99,
@@ -191,6 +191,99 @@ async fn append_and_exact_publish_are_atomic_idempotent_and_conflict_safe() -> R
             .await?
             .context("revision exists")?
             .review_approved
+    );
+
+    // Rejecting an edit is an exact decision about the submitted bytes, but
+    // it is not a publication transition: revision 2 remains live throughout.
+    let document_three = r#"{"schema_version":2,"value":"three"}"#;
+    let ref_three = skin_schema::content::reference_for_bytes(document_three.as_bytes());
+    let edited = db
+        .put_skin_revision(skin.skin_id, 2, revision(document_three, &ref_three))
+        .await?;
+    assert_eq!(edited.head_revision, 3);
+    db.set_skin_pending_revision(skin.skin_id, Some(3)).await?;
+    let wrong_reject = db
+        .decide_skin_review(
+            skin.skin_id,
+            SkinReviewDecision::Reject,
+            Some(3),
+            Some(&wrong),
+            99,
+            Some("moving target must survive"),
+        )
+        .await
+        .expect_err("a wrong hash must not clear the pending edit");
+    assert!(wrong_reject.downcast_ref::<SkinWriteError>().is_some());
+    assert_eq!(
+        db.get_skin(skin.skin_id)
+            .await?
+            .context("skin exists")?
+            .pending_revision,
+        Some(3)
+    );
+    db.decide_skin_review(
+        skin.skin_id,
+        SkinReviewDecision::Reject,
+        Some(3),
+        Some(&ref_three),
+        99,
+        Some("not ready"),
+    )
+    .await?;
+    // Unknown-outcome retry is harmless and cannot reach a newer request.
+    db.decide_skin_review(
+        skin.skin_id,
+        SkinReviewDecision::Reject,
+        Some(3),
+        Some(&ref_three),
+        99,
+        Some("not ready"),
+    )
+    .await?;
+    let rejected_edit = db.get_skin(skin.skin_id).await?.context("skin exists")?;
+    assert_eq!(rejected_edit.publication, Publication::Published);
+    assert_eq!(rejected_edit.published_revision, Some(2));
+    assert_eq!(
+        rejected_edit.published_content_ref.as_deref(),
+        Some(ref_two.as_str())
+    );
+    assert_eq!(rejected_edit.pending_revision, None);
+    assert_eq!(rejected_edit.head_revision, 3);
+    let rejected_revision = db
+        .get_skin_revision(skin.skin_id, 3)
+        .await?
+        .context("rejected revision exists")?;
+    assert!(rejected_revision.review_rejected);
+    assert!(!rejected_revision.review_approved);
+
+    // A late response-loss retry proves only the exact revision decision. It
+    // must not restore the publication snapshot captured before a separate
+    // moderator took the already-published skin down.
+    db.decide_skin_review(
+        skin.skin_id,
+        SkinReviewDecision::SetPublication(Publication::Disabled),
+        None,
+        None,
+        100,
+        Some("separate takedown"),
+    )
+    .await?;
+    db.decide_skin_review(
+        skin.skin_id,
+        SkinReviewDecision::Reject,
+        Some(3),
+        Some(&ref_three),
+        99,
+        Some("not ready"),
+    )
+    .await?;
+    assert_eq!(
+        db.get_skin(skin.skin_id)
+            .await?
+            .context("skin exists")?
+            .publication,
+        Publication::Disabled,
+        "a rejection retry cannot resurrect a later moderation state"
     );
 
     // Identical document bytes under another skin return a complete,
@@ -216,6 +309,67 @@ async fn append_and_exact_publish_are_atomic_idempotent_and_conflict_safe() -> R
     assert!(identities.contains(&(twin.skin_id, 1)));
     assert!(identities.windows(2).all(|pair| pair[0] <= pair[1]));
 
+    db.set_skin_pending_revision(twin.skin_id, Some(1)).await?;
+    db.decide_skin_review(
+        twin.skin_id,
+        SkinReviewDecision::Reject,
+        Some(1),
+        Some(&ref_two),
+        99,
+        Some("new draft rejected"),
+    )
+    .await?;
+    let rejected_draft = db.get_skin(twin.skin_id).await?.context("twin exists")?;
+    assert_eq!(rejected_draft.publication, Publication::Private);
+    assert_eq!(rejected_draft.pending_revision, None);
+
+    // A reject arriving after another admin published the same exact target
+    // must report a conflict, not mistake "published + no pending slot" for
+    // its own lost response.
+    let race = db
+        .create_skin(NewSkin {
+            creator_user_id: 81_812,
+            creator_username: Some("factory-race"),
+            kind: SkinKind::Snake,
+            namespace: SkinNamespace::Production,
+            name: "Review race",
+            revision: revision(document_two, &ref_two),
+            idempotency_key: Some("concept-review-race"),
+            request_hash: Some(&ref_two),
+        })
+        .await?;
+    db.set_skin_pending_revision(race.skin_id, Some(1)).await?;
+    db.decide_skin_review(
+        race.skin_id,
+        SkinReviewDecision::Publish,
+        Some(1),
+        Some(&ref_two),
+        99,
+        Some("race winner"),
+    )
+    .await?;
+    let late_reject = db
+        .decide_skin_review(
+            race.skin_id,
+            SkinReviewDecision::Reject,
+            Some(1),
+            Some(&ref_two),
+            100,
+            Some("race loser"),
+        )
+        .await
+        .expect_err("a published target cannot converge as a rejection");
+    assert!(late_reject.downcast_ref::<SkinWriteError>().is_some());
+    let race_winner = db.get_skin(race.skin_id).await?.context("race exists")?;
+    assert_eq!(race_winner.publication, Publication::Published);
+    assert_eq!(race_winner.published_revision, Some(1));
+    let winning_revision = db
+        .get_skin_revision(race.skin_id, 1)
+        .await?
+        .context("winning revision exists")?;
+    assert!(winning_revision.review_approved);
+    assert!(!winning_revision.review_rejected);
+
     let evaluation = db
         .create_skin(NewSkin {
             creator_user_id: 81_810,
@@ -233,7 +387,7 @@ async fn append_and_exact_publish_are_atomic_idempotent_and_conflict_safe() -> R
     let error = db
         .decide_skin_review(
             evaluation.skin_id,
-            Publication::Published,
+            SkinReviewDecision::Publish,
             Some(1),
             Some(&ref_two),
             99,

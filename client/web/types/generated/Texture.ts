@@ -26,7 +26,12 @@ repeatCells: number | null,
 /**
  * Frame count, for a sheet.
  */
-rows: number | null, seams: SeamReport,
+rows: number | null,
+/**
+ * Transverse raster margin per side on the fixed 16-body-texel authoring
+ * grid. Zero is the legacy one-cell row; four is `4 + 16 + 4`.
+ */
+rasterOverhangPx: number, seams: SeamReport,
 /**
  * Axes measured on every exact ladder rung before this metadata row was
  * made reachable. Save-time document validation requires this set to be

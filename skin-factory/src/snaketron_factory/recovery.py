@@ -11,7 +11,12 @@ from pydantic import BaseModel, ValidationError
 
 from .config import FactoryConfig
 from .db import Database, canonical_json
-from .domain import ConceptProposal, ProviderError, VisualJudgment, WorkerResult
+from .domain import ConceptProposal, ProviderError, ProviderResult, VisualJudgment, WorkerResult
+from .fal_media import (
+    PIXVERSE_TRANSITION_CAPABILITY,
+    FalQueueTicket,
+    validate_pixverse_video_result,
+)
 from .objects import ObjectStore
 from .operations import OperationJournal, validate_exact_image_bytes
 
@@ -38,6 +43,8 @@ _EXPECTED_ROLES: dict[str, str] = {
     "visual_judgment": "visual_judge",
     "generate_build_asset": "image_generator",
     "generate_build_asset_slice": "image_generator",
+    "fal_transition_submit": "fal_pixverse_transition",
+    "fal_transition_result": "fal_pixverse_transition",
     "classify_feedback_route": "smart_text",
     "gepa_reflective_proposal": "smart_text",
     "gepa_reflective_mutation": "smart_text",
@@ -74,6 +81,8 @@ def validate_recovered_result(
     result_hash: str,
     resolved_model: str,
     media_type: str | None,
+    provider_request_id: str | None = None,
+    result_metadata: dict[str, Any] | None = None,
 ) -> ValidatedRecoveredResult:
     """Authenticate a recovered CAS object against one immutable operation.
 
@@ -99,6 +108,35 @@ def validate_recovered_result(
     # replayable when its request evidence is missing or has been tampered.
     request = _load_exact_request(operation, objects)
 
+    if side_effect == "fal_transition_result":
+        if media_type != "video/mp4":
+            raise RecoveredResultError("recovered Fal result requires exact media_type video/mp4")
+        if not isinstance(result_metadata, dict):
+            raise RecoveredResultError("recovered Fal result requires bounded provider result metadata")
+        if not isinstance(provider_request_id, str) or not provider_request_id:
+            raise RecoveredResultError("recovered Fal result requires its exact retained request_id")
+        if request.get("request_id") != provider_request_id:
+            raise RecoveredResultError("recovered Fal result request_id differs from its exact poll request")
+        recovered = ProviderResult(
+            value=exact,
+            request_id=provider_request_id,
+            resolved_model=resolved_model,
+            sanitized_metadata=result_metadata,
+            usage={"usage_complete": False},
+        )
+        try:
+            validate_pixverse_video_result(recovered)
+        except ProviderError as error:
+            raise RecoveredResultError(str(error)) from error
+        return ValidatedRecoveredResult(
+            value=exact,
+            metadata={
+                "result": {"kind": "video", "media_type": "video/mp4"},
+                "video": recovered.sanitized_metadata["video"],
+            },
+            size_bytes=len(exact),
+        )
+
     if role in {"image_generator", "image_editor"}:
         if media_type is None:
             raise RecoveredResultError("recovered image result requires its exact media type")
@@ -114,12 +152,26 @@ def validate_recovered_result(
 
     if media_type is not None:
         raise RecoveredResultError(f"recovered structured role {role!r} does not accept a media type")
+    if result_metadata is not None:
+        raise RecoveredResultError(f"recovered structured role {role!r} does not accept result metadata")
     try:
         value = json.loads(exact)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RecoveredResultError(f"recovered structured result is not exact UTF-8 JSON: {error}") from error
     if not isinstance(value, dict):
         raise RecoveredResultError("recovered structured result must be a JSON object")
+    if side_effect == "fal_transition_submit":
+        try:
+            ticket = FalQueueTicket.from_value(value)
+        except ProviderError as error:
+            raise RecoveredResultError(str(error)) from error
+        if provider_request_id is not None and provider_request_id != ticket.request_id:
+            raise RecoveredResultError("recovered Fal submit request_id differs from its queue ticket")
+        return ValidatedRecoveredResult(
+            value=ticket.as_dict(),
+            metadata={"result": {"kind": "structured", "contract": "fal_queue_ticket_v1"}},
+            size_bytes=len(exact),
+        )
     model = _structured_contract(side_effect)
     if model is not None:
         try:
@@ -159,6 +211,10 @@ def _validate_model_identity(
         )
     if role == "git_promotion" and resolved_model != "git-promotion-v1":
         raise RecoveredResultError(f"recovered Git promotion model {resolved_model!r} is not exact 'git-promotion-v1'")
+    if role == "fal_pixverse_transition" and resolved_model != PIXVERSE_TRANSITION_CAPABILITY:
+        raise RecoveredResultError(
+            f"recovered Fal model {resolved_model!r} is not exact {PIXVERSE_TRANSITION_CAPABILITY!r}"
+        )
 
 
 def _structured_contract(side_effect: str) -> type[BaseModel] | None:
@@ -221,6 +277,33 @@ def _content_ref(document: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(document).encode("utf-8")).hexdigest()
 
 
+def validate_registration_result(
+    *,
+    side_effect: str,
+    request: dict[str, Any],
+    response: dict[str, Any],
+) -> None:
+    """Apply the exact registration contract to a live or recovered response."""
+
+    if side_effect not in {"create_private_skin_revision", "append_private_skin_revision"}:
+        raise ValueError("registration validation requires a create or append side effect")
+    skin_id = _value_alias(response, "skinId", "skin_id")
+    revision = _value_alias(response, "headRevision", "head_revision")
+    content_ref = _value_alias(response, "contentRef", "content_ref")
+    if skin_id is None or revision is None or not isinstance(content_ref, str) or not content_ref:
+        raise RecoveredResultError("registration result omitted skinId/headRevision/contentRef")
+    if content_ref != _content_ref(request.get("document")):
+        raise RecoveredResultError("registration contentRef does not name the exact requested document")
+    if side_effect == "create_private_skin_revision" and int(revision) != 1:
+        raise RecoveredResultError("initial skin response did not create revision 1")
+    if side_effect == "append_private_skin_revision":
+        if str(skin_id) != str(request.get("skin_id")):
+            raise RecoveredResultError("append response names a different skin")
+        expected_revision = request.get("expected_head_revision")
+        if not isinstance(expected_revision, int) or int(revision) != expected_revision + 1:
+            raise RecoveredResultError("append response is not the requested next revision")
+
+
 def _validate_external_result_shape(
     side_effect: str,
     value: dict[str, Any],
@@ -232,21 +315,7 @@ def _validate_external_result_shape(
         raise RecoveredResultError(f"recovered {side_effect} result has no exact request authority")
     if side_effect in {"create_private_skin_revision", "append_private_skin_revision"}:
         assert request is not None
-        skin_id = _value_alias(value, "skinId", "skin_id")
-        revision = _value_alias(value, "headRevision", "head_revision")
-        content_ref = _value_alias(value, "contentRef", "content_ref")
-        if skin_id is None or revision is None or not isinstance(content_ref, str) or not content_ref:
-            raise RecoveredResultError("recovered registration result omitted skinId/headRevision/contentRef")
-        if content_ref != _content_ref(request.get("document")):
-            raise RecoveredResultError("recovered registration contentRef does not name the exact requested document")
-        if side_effect == "create_private_skin_revision" and int(revision) != 1:
-            raise RecoveredResultError("recovered initial skin response did not create revision 1")
-        if side_effect == "append_private_skin_revision":
-            if str(skin_id) != str(request.get("skin_id")):
-                raise RecoveredResultError("recovered append response names a different skin")
-            expected_revision = request.get("expected_head_revision")
-            if not isinstance(expected_revision, int) or int(revision) != expected_revision + 1:
-                raise RecoveredResultError("recovered append response is not the requested next revision")
+        validate_registration_result(side_effect=side_effect, request=request, response=value)
     if side_effect == "upload_exact_forge_ladder":
         assert request is not None
         response_ref = _value_alias(value, "contentRef", "content_ref")

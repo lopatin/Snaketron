@@ -73,6 +73,8 @@ pub fn capabilities_v2() -> serde_json::Value {
             "max_ops_per_snake": MAX_OPS_PER_SNAKE,
             "max_texture_refs": MAX_TEXTURE_REFS,
             "max_texture_variants": MAX_TEXTURE_VARIANTS,
+            "max_raster_overhang_px": MAX_RASTER_OVERHANG_PX,
+            "raster_body_texels_per_cell": RASTER_BODY_TEXELS_PER_CELL,
             "max_group_depth": MAX_GROUP_DEPTH,
             "min_gradient_stops": MIN_GRADIENT_STOPS,
             "max_gradient_stops": MAX_GRADIENT_STOPS,
@@ -80,6 +82,8 @@ pub fn capabilities_v2() -> serde_json::Value {
             "max_texture_dimension_px": MAX_TEXTURE_DIMENSION_PX,
             "max_texture_variant_bytes": MAX_TEXTURE_VARIANT_BYTES,
             "max_texture_decoded_bytes": MAX_TEXTURE_DECODED_BYTES,
+            "max_skin_texture_decoded_bytes": MAX_SKIN_TEXTURE_DECODED_BYTES,
+            "max_skin_texture_compressed_bytes": MAX_SKIN_TEXTURE_COMPRESSED_BYTES,
             "max_sprite_frame_rows": MAX_SPRITE_FRAME_ROWS,
             "max_sprite_frame_rate_fps": MAX_SPRITE_FRAME_RATE_FPS,
             "min_animation_period_ms": crate::MIN_ANIMATION_PERIOD_MS,
@@ -103,6 +107,7 @@ pub fn capabilities_v2() -> serde_json::Value {
         "layer_types": ["group", "ribbon", "span", "head_disc", "head_ramp"],
         "source_types": ["solid", "gradient", "band", "image", "text"],
         "image_fits": ["clip", "stretch", "tile", "cutout"],
+        "tile_phase_origins": ["head", "tail"],
         "image_kinds": image_kinds,
         "animation": {
             "expression_clock": "baked_ring",
@@ -114,6 +119,13 @@ pub fn capabilities_v2() -> serde_json::Value {
         "image_contract": {
             "descriptor_required_for_generated": true,
             "fallback_layer_required": true,
+            "raster_overhang": {
+                "units": "authored_bleed_pixels_per_side_around_unchanged_16x16_body_cell",
+                "logical_body_cell": "16x16_texels",
+                "stored_transverse_row": "scaled_bleed_apron + texels_per_cell + scaled_bleed_apron",
+                "visible_clip": "bounded_transverse_expansion_with_unchanged_longitudinal_caps",
+                "cross_snake_compositing": "bounded_bleed_may_overlap_occupied_cells_and_follows_normal_snake_draw_order"
+            },
             "variant_url_template": "/api/textures/variants/{variant_content_ref}.png",
             "repair_backend": "local_simple_lama",
             "repair_methods": ["tx_t_inpaint", "roll_and_repair"],

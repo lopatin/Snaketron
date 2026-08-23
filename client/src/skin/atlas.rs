@@ -69,6 +69,17 @@ pub struct AssetStatus {
     pub draw_calls: u64,
 }
 
+impl AssetStatus {
+    fn merge(&mut self, other: Self) {
+        self.requested = self.requested.saturating_add(other.requested);
+        self.pending = self.pending.saturating_add(other.pending);
+        self.ready = self.ready.saturating_add(other.ready);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.drawn_images = self.drawn_images.saturating_add(other.drawn_images);
+        self.draw_calls = self.draw_calls.saturating_add(other.draw_calls);
+    }
+}
+
 /// One atlas image, and the store handle it resolves to once requested.
 #[derive(Debug)]
 struct Image {
@@ -105,6 +116,21 @@ impl Atlas {
 
     pub fn region(&self, index: usize) -> Option<&AtlasRegion> {
         self.regions.get(index)
+    }
+
+    /// Browser evidence scoped to this atlas rather than every skin process-wide.
+    ///
+    /// Unrequested images contribute nothing: the first exact paint is what
+    /// starts their fetch. Once requested, this reports only the handles this
+    /// atlas owns, so one broken review card cannot poison another one.
+    pub fn asset_status(&self) -> AssetStatus {
+        let mut status = AssetStatus::default();
+        for image in &self.images {
+            if let Some(handle) = image.handle.get() {
+                status.merge(image_asset_status(*handle));
+            }
+        }
+        status
     }
 
     /// The store handle for one image, requesting it if this is the first ask.
@@ -284,10 +310,17 @@ pub fn asset_status() -> AssetStatus {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn image_asset_status(_image: usize) -> AssetStatus {
+    AssetStatus::default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn record_draw(_image: usize) {}
 
 #[cfg(target_arch = "wasm32")]
-pub use browser::{any_pending, asset_status, image_element, is_ready, record_draw, request};
+pub use browser::{
+    any_pending, asset_status, image_asset_status, image_element, is_ready, record_draw, request,
+};
 
 /// A stub so the non-wasm build can still name the symbol the painter calls.
 #[cfg(not(target_arch = "wasm32"))]
@@ -400,25 +433,41 @@ mod browser {
     pub fn asset_status() -> super::AssetStatus {
         IMAGES.with(|images| {
             let images = images.borrow();
-            let mut status = super::AssetStatus {
-                requested: images.len(),
-                ..super::AssetStatus::default()
-            };
+            let mut status = super::AssetStatus::default();
             for entry in images.iter() {
-                if !entry.element.complete() {
-                    status.pending += 1;
-                } else if entry.element.natural_width() > 0 && entry.element.natural_height() > 0 {
-                    status.ready += 1;
-                } else {
-                    status.failed += 1;
-                }
-                if entry.draw_calls > 0 {
-                    status.drawn_images += 1;
-                }
-                status.draw_calls = status.draw_calls.saturating_add(entry.draw_calls);
+                status.merge(entry_asset_status(entry));
             }
             status
         })
+    }
+
+    pub fn image_asset_status(image: usize) -> super::AssetStatus {
+        IMAGES.with(|images| {
+            images
+                .borrow()
+                .get(image)
+                .map(entry_asset_status)
+                .unwrap_or_default()
+        })
+    }
+
+    fn entry_asset_status(entry: &Entry) -> super::AssetStatus {
+        let mut status = super::AssetStatus {
+            requested: 1,
+            draw_calls: entry.draw_calls,
+            ..super::AssetStatus::default()
+        };
+        if !entry.element.complete() {
+            status.pending = 1;
+        } else if entry.element.natural_width() > 0 && entry.element.natural_height() > 0 {
+            status.ready = 1;
+        } else {
+            status.failed = 1;
+        }
+        if entry.draw_calls > 0 {
+            status.drawn_images = 1;
+        }
+        status
     }
 }
 

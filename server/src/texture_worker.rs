@@ -243,6 +243,7 @@ impl Worker {
                 width_px: width,
                 height_px: height,
                 rows: job.rows_hint(),
+                raster_overhang_px: 0,
                 byte_len: source.len(),
             })
             .map_err(|errors| {
@@ -367,6 +368,7 @@ impl Worker {
             height_px: shaped.canonical.height_px,
             repeat_cells: crate::texture::repeat_cells(job.kind, shaped.canonical.width_px),
             rows: shaped.rows,
+            raster_overhang_px: 0,
             seams: verified_seams,
             verified_seam_axes: job.kind.worker_seam_axes().to_vec(),
             // The author's words, not the engineered prompt around them.

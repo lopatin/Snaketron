@@ -415,6 +415,13 @@ pub async fn ingest_forge_manifest(
             "descriptor.body_columns: must be positive when present".to_string(),
         ]));
     }
+    if manifest.descriptor.raster_overhang_px > skin_schema::v2::MAX_RASTER_OVERHANG_PX {
+        return Err(TexturesApiError::Invalid(vec![format!(
+            "descriptor.raster_overhang_px: {} exceeds the bounded {}px-per-side bleed apron around the unchanged 16x16 body cell",
+            manifest.descriptor.raster_overhang_px,
+            skin_schema::v2::MAX_RASTER_OVERHANG_PX
+        )]));
+    }
     if matches!(kind, TextureKind::Coat | TextureKind::Sheet)
         && manifest.descriptor.body_columns.is_none()
     {
@@ -573,12 +580,22 @@ pub async fn ingest_forge_manifest(
                 variant.content_ref
             )]));
         }
+        let row_texels = skin_schema::v2::raster_row_texels(
+            variant.texels_per_cell,
+            manifest.descriptor.raster_overhang_px,
+        )
+        .ok_or_else(|| {
+            TexturesApiError::Invalid(vec![format!(
+                "variant {}: its texel density cannot represent raster_overhang_px exactly",
+                variant.content_ref
+            )])
+        })?;
         let expected_height = match kind {
             TextureKind::Sheet => manifest
                 .descriptor
                 .frame_rows
-                .map(|rows| rows.saturating_mul(variant.texels_per_cell)),
-            TextureKind::Coat => Some(variant.texels_per_cell),
+                .map(|rows| rows.saturating_mul(row_texels)),
+            TextureKind::Coat => Some(row_texels),
             TextureKind::Overlay => None,
         };
         if expected_height.is_some_and(|height| height != variant.height_px) {
@@ -587,13 +604,21 @@ pub async fn ingest_forge_manifest(
                 variant.content_ref
             )]));
         }
-        if kind == TextureKind::Overlay
-            && !variant.height_px.is_multiple_of(variant.texels_per_cell)
-        {
-            return Err(TexturesApiError::Invalid(vec![format!(
-                "variant {}: overlay height is not whole cells",
-                variant.content_ref
-            )]));
+        if kind == TextureKind::Overlay {
+            let side = skin_schema::v2::raster_overhang_texels(
+                variant.texels_per_cell,
+                manifest.descriptor.raster_overhang_px,
+            )
+            .expect("row_texels proved this rung exact");
+            let body_height = variant.height_px.checked_sub(side.saturating_mul(2));
+            if body_height
+                .is_none_or(|height| height == 0 || !height.is_multiple_of(variant.texels_per_cell))
+            {
+                return Err(TexturesApiError::Invalid(vec![format!(
+                    "variant {}: after its bleed aprons, overlay height is not whole body cells",
+                    variant.content_ref
+                )]));
+            }
         }
         let decoded = crate::texture_pixels::decode(bytes).map_err(|error| {
             TexturesApiError::Invalid(vec![format!(
@@ -616,6 +641,7 @@ pub async fn ingest_forge_manifest(
                 width_px: variant.width_px,
                 height_px: variant.height_px,
                 rows: manifest.descriptor.frame_rows,
+                raster_overhang_px: manifest.descriptor.raster_overhang_px,
                 byte_len: bytes.len(),
             })
             .map_err(|errors| {
@@ -744,6 +770,7 @@ pub async fn ingest_forge_manifest(
         height_px: manifest.descriptor.variants[0].height_px,
         repeat_cells: manifest.descriptor.body_columns.map(|value| value as f32),
         rows: manifest.descriptor.frame_rows,
+        raster_overhang_px: manifest.descriptor.raster_overhang_px,
         seams: gated_seams,
         verified_seam_axes,
         last_prompt: None,
@@ -1096,6 +1123,7 @@ pub async fn upload(
         } else {
             None
         },
+        raster_overhang_px: 0,
         byte_len: png.len(),
     })
     .map_err(|errors| {
@@ -1267,6 +1295,7 @@ mod tests {
                 height_px: 64,
                 repeat_cells: Some(12.0),
                 rows: None,
+                raster_overhang_px: 0,
                 seams: SeamReport {
                     horizontal_ratio: 0.8,
                     vertical_ratio: 0.8,
@@ -1377,6 +1406,7 @@ mod tests {
                 width_px: width,
                 height_px: height,
                 rows: (kind == TextureKind::Sheet).then_some(rows),
+                raster_overhang_px: 0,
                 byte_len: 1024,
             };
             texture::validate_shape(proposed)

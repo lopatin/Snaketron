@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import struct
 
 import pytest
 from PIL import Image
 
 from snaketron_factory.db import canonical_json
-from snaketron_factory.domain import OperationStatus, Stage
+from snaketron_factory.domain import OperationStatus, ProviderResult, Stage
+from snaketron_factory.factory import Factory
+from snaketron_factory.fal_media import PIXVERSE_TRANSITION_CAPABILITY
 from snaketron_factory.operations import OperationJournal
 from snaketron_factory.recovery import (
     RecoveredResultError,
@@ -72,6 +75,32 @@ def _corrupt_request_authority(operation: dict) -> dict:
         }
     )
     return {**operation, "metadata_json": canonical_json(metadata)}
+
+
+def _fal_video() -> tuple[bytes, dict]:
+    def box(kind: bytes, payload: bytes = b"") -> bytes:
+        return struct.pack(">I4s", len(payload) + 8, kind) + payload
+
+    value = box(b"ftyp", b"isom\x00\x00\x02\x00isommp42") + box(b"mdat", b"pixels") + box(b"moov")
+    return value, {
+        "video": {
+            "byte_limit": 1_000,
+            "content_sha256": "sha256:" + hashlib.sha256(value).hexdigest(),
+            "bytes": len(value),
+            "reported_file": {
+                "content_type_valid_string": True,
+                "content_type": "video/mp4",
+                "file_size_valid_integer": True,
+                "file_size": len(value),
+                "file_name_valid": True,
+            },
+            "download": {
+                "content_type": "video/mp4",
+                "content_length_valid_integer": True,
+                "content_length": len(value),
+            },
+        }
+    }
 
 
 def test_recovered_structured_result_requires_exact_retained_request(
@@ -147,6 +176,47 @@ def test_recovered_image_requires_exact_retained_request(factory_config, databas
             objects,
             _corrupt_request_authority(operation),
             png,
+        )
+
+
+def test_recovered_fal_submit_requires_exact_queue_ticket_contract(
+    factory_config, database, objects, make_attempt
+) -> None:
+    operation = _operation(
+        database,
+        objects,
+        make_attempt(stage=Stage.AUTHOR),
+        side_effect="fal_transition_submit",
+        role="fal_pixverse_transition",
+        request={"operation": "submit_transition", "request_id": "draft-request-1"},
+    )
+    ticket = {
+        "schema_version": 1,
+        "capability_id": PIXVERSE_TRANSITION_CAPABILITY,
+        "request_id": "fal-ticket-123",
+    }
+    retained = objects.put(canonical_json(ticket).encode())
+    validated = validate_recovered_result(
+        config=factory_config,
+        operation=operation,
+        database=database,
+        objects=objects,
+        result_hash=retained.uri,
+        resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+        media_type=None,
+        provider_request_id="fal-ticket-123",
+    )
+    assert validated.value == ticket
+    with pytest.raises(RecoveredResultError, match="differs from its queue ticket"):
+        validate_recovered_result(
+            config=factory_config,
+            operation=operation,
+            database=database,
+            objects=objects,
+            result_hash=retained.uri,
+            resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+            media_type=None,
+            provider_request_id="different-ticket",
         )
 
 
@@ -331,3 +401,68 @@ def test_authenticated_skin_readback_is_exact_for_pending_cancelled_and_publishe
             request=request,
             authority={"skinId": 17, "pendingRevision": None, "publishedRevision": 4},
         )
+
+
+@pytest.mark.asyncio
+async def test_recovered_fal_video_is_validated_again_on_exact_factory_replay(
+    factory_config,
+    database,
+    objects,
+    make_attempt,
+    monkeypatch,
+) -> None:
+    attempt = make_attempt(stage=Stage.AUTHOR)
+    request = {"operation": "poll_transition", "request_id": "fal-ticket-123"}
+    operation = _operation(
+        database,
+        objects,
+        attempt,
+        side_effect="fal_transition_result",
+        role="fal_pixverse_transition",
+        request=request,
+    )
+    video, metadata = _fal_video()
+    retained = objects.put(video)
+    validated = validate_recovered_result(
+        config=factory_config,
+        operation=operation,
+        database=database,
+        objects=objects,
+        result_hash=retained.uri,
+        resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+        media_type="video/mp4",
+        provider_request_id="fal-ticket-123",
+        result_metadata=metadata,
+    )
+    database.resolve_operation(
+        operation_id=operation["id"],
+        resolution="executed_result_recovered",
+        evidence_ref="fal-dashboard:audit-123",
+        result_hash=retained.uri,
+        resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+        provider_request_id="fal-ticket-123",
+        media_type="video/mp4",
+        result_metadata=validated.metadata,
+        actor="human:test-operator",
+    )
+    assert database.get_operation(operation["id"])["status"] == OperationStatus.SUCCEEDED
+
+    factory = Factory(factory_config, database=database, objects=objects)
+    monkeypatch.setattr(factory, "_behavior_drift_reason", lambda *_args, **_kwargs: None)
+
+    async def must_not_invoke() -> ProviderResult:
+        raise AssertionError("an authenticated recovered result must replay without provider I/O")
+
+    replayed, result = await factory._provider_call(
+        attempt=database.get_attempt(attempt["id"]),
+        stage=Stage.AUTHOR,
+        key="recovery-contract:fal_transition_result",
+        role="fal_pixverse_transition",
+        side_effect="fal_transition_result",
+        request=request,
+        invoke=must_not_invoke,
+    )
+    assert replayed["id"] == operation["id"]
+    assert result is None
+    assert database.get_operation(operation["id"])["status"] == OperationStatus.SUCCEEDED
+    await factory.close()

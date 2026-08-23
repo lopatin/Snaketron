@@ -113,8 +113,10 @@ budgets:
   max_image_slices_per_asset: 16
   max_asset_image_calls_per_attempt: 128
   wall_seconds_per_run: 1800
-  max_cost_micros_per_attempt: 10000000
-  max_cost_micros_per_day: 25000000
+  # Direct-draft automation's checked-in two-candidate + one-video envelope
+  # fits conservatively without trusting provider usage reports.
+  max_cost_micros_per_attempt: 25000000
+  max_cost_micros_per_day: 50000000
   max_cost_micros_program: 500000000
 
 service:
@@ -144,6 +146,37 @@ review:
   port: 8765
   operator_secret_env: SKIN_FACTORY_REVIEW_TOKEN
   sampled_reject_rate: 0.1
+
+# Queue-only direct drafts bypass both local human-review stops. The scheduler
+# selects a retained safe prototype, builds a private revision, and asks the
+# Snaketron Admin queue to review the exact revision/contentRef. It never
+# publishes. The checked-in Hermes mode consumes this queue by default and
+# therefore refuses startup until the owner-private service JSON contains one
+# configured Fal credential alias plus the normal provider/service identity.
+draft_automation:
+  enabled: true
+  inbox: var/draft-inbox
+  skill_dir: ../skills/automate-skin-drafts
+  # Two fits the default conservative attempt cap. Raise both this and the
+  # configured cost caps explicitly for larger batches (maximum 10).
+  candidates_per_prompt: 2
+  max_pending_admin_reviews: 8
+  fal_api_key_env: FAL_API_KEY
+  fal_api_key_fallback_env: FAL_KEY
+  fal_queue_base_url: https://queue.fal.run
+  fal_transition_capability_id: fal-ai/pixverse/v6/transition
+  max_video_intents: 1
+  fal_transition_duration_seconds: 5
+  fal_transition_resolution: 720p
+  fal_transition_aspect_ratio: "3:2"
+  fal_price_table_version: pixverse-v6-no-audio-2026-08
+  fal_720p_cost_micros_per_second: 45000
+  fal_transition_max_cost_micros: 225000
+  fal_transition_timeout_seconds: 60
+  fal_transition_ticket_max_age_seconds: 86400
+  ffmpeg_path: ffmpeg
+  ffprobe_path: ffprobe
+  video_extraction_timeout_seconds: 300
 
 # A judge may suppress candidates only after independent, blind human labels
 # clear all of these Wilson upper-confidence bounds. Until then a deployment

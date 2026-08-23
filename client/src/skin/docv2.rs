@@ -23,7 +23,7 @@ use crate::skin::composite::{
 };
 use crate::skin::layer::{
     Binding, ColorSlot, DiscPaint, Fade, Fit, Layer, LayerKind, LayerTransform, Region, Source,
-    Span, Stop,
+    Span, Stop, TilePhaseOrigin,
 };
 use crate::skin::space::{ClipShape, CornerPolicy};
 use crate::skin::{
@@ -35,7 +35,7 @@ use skin_schema::expr::{Env, Expr, Input};
 use skin_schema::v2::{
     AnchorV2, ClipV2, ColorRef, ColorTarget, CornerV2, DiscPaintName, DiscPaintV2, FitV2,
     GradientAxis, LayerBodyV2, LayerV2, PropExpr, RegionV2, SkinDocV2, SlotName, SourceV2,
-    validate_v2,
+    TilePhaseOriginV2, validate_v2,
 };
 use skin_schema::{ANIMATION_STEPS, ColorPair, SkinDocError, derive_label_ink, shift_lightness};
 use std::sync::Arc;
@@ -232,13 +232,37 @@ fn fit_of(fit: &FitV2) -> Fit {
     match fit {
         FitV2::Clip => Fit::Clip,
         FitV2::Stretch => Fit::Stretch,
-        FitV2::Tile { cells_per_repeat } => Fit::Tile {
+        FitV2::Tile {
+            cells_per_repeat,
+            phase_origin,
+        } => Fit::Tile {
             cells_per_repeat: *cells_per_repeat,
+            phase_origin: match phase_origin {
+                TilePhaseOriginV2::Head => TilePhaseOrigin::Head,
+                TilePhaseOriginV2::Tail => TilePhaseOrigin::Tail,
+            },
         },
         FitV2::Cutout { cells_tall } => Fit::Cutout {
             cells_tall: *cells_tall,
         },
     }
+}
+
+fn raster_overhang_of(doc: &SkinDocV2, texture_name: &str) -> u32 {
+    doc.textures
+        .iter()
+        .find(|texture| texture.name == texture_name)
+        .and_then(|texture| texture.descriptor.as_ref())
+        .map_or(0, |descriptor| descriptor.raster_overhang_px)
+}
+
+fn raster_texels_per_cell_of(doc: &SkinDocV2, texture_name: &str) -> u32 {
+    doc.textures
+        .iter()
+        .find(|texture| texture.name == texture_name)
+        .and_then(|texture| texture.descriptor.as_ref())
+        .and_then(skin_schema::v2::preferred_texture_variant)
+        .map_or(0, |variant| variant.texels_per_cell)
 }
 
 impl LayerSkin {
@@ -270,13 +294,23 @@ impl LayerSkin {
         let mut palette = Palette::default();
         let mut layers = Vec::with_capacity(flat.len() + 2);
 
-        // The Boost band, outermost and painted only while boosting. Pinned
-        // here rather than authored: an opponent has to be able to see that
-        // you are boosting, so neither its colour, its width, nor its place in
-        // the stack is a style choice.
-        layers.push(Layer {
+        let has_raster_overhang = flat.iter().any(|layer| {
+            matches!(
+                layer.body,
+                LayerBodyV2::Span {
+                    source: SourceV2::Image { texture, .. },
+                    ..
+                } if raster_overhang_of(doc, texture) > 0
+            )
+        });
+        // The Boost band is system-owned. Legacy documents keep its original
+        // first-contour position byte-for-byte. A document with bounded raster
+        // overhang paints the same band in the private Signal region after all
+        // authored pixels, so the art neither covers the telegraph nor pops
+        // inward when Boost toggles.
+        let boost_band = |region| Layer {
             id: "boost-band".into(),
-            region: Region::Contour,
+            region,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Ribbon {
                 color: ColorSlot::Boost,
@@ -291,10 +325,17 @@ impl LayerSkin {
             boost_only: true,
             omit_on_single_cell: false,
             opacity: Binding::ONE,
-        });
+        };
+        if !has_raster_overhang {
+            layers.push(boost_band(Region::Contour));
+        }
 
         for layer in &flat {
             layers.push(compile_layer(layer, &mut baker, &mut palette, doc));
+        }
+
+        if has_raster_overhang {
+            layers.push(boost_band(Region::Signal));
         }
 
         // The head core, topmost. Its position is not authorable either, and
@@ -525,6 +566,13 @@ fn compile_layer(
             LayerBodyV2::HeadDisc { .. } | LayerBodyV2::Group { .. } => Region::Head,
         },
         clip: match flat.body {
+            LayerBodyV2::Span {
+                clip,
+                source: SourceV2::Image { texture, .. },
+                ..
+            } if raster_overhang_of(doc, texture) > 0 => {
+                ClipShape::RasterOverhang(raster_overhang_of(doc, texture))
+            }
             LayerBodyV2::Span { clip, .. } => clip_of(*clip),
             // The glow paints whole cell squares, which *is* the cells clip.
             LayerBodyV2::HeadRamp { .. } => ClipShape::Cells,
@@ -610,6 +658,8 @@ fn compile_source(
                 debug_assert!(parsed.inputs().is_empty());
                 parsed.eval(&Env::default())
             },
+            raster_overhang_px: raster_overhang_of(doc, texture),
+            raster_texels_per_cell: raster_texels_per_cell_of(doc, texture),
         },
         SourceV2::Text {
             content,
@@ -832,16 +882,7 @@ fn resolve_texture(texture: &skin_schema::v2::TextureRefV2) -> ResolvedTexture {
     // 32-texel rung (room for high DPI) and otherwise take the closest real
     // rung, favouring the sharper one on a tie. The chosen descriptor supplies
     // every dimension and the immutable URL; no filename or shape is guessed.
-    const PREFERRED_TEXELS_PER_CELL: u32 = 32;
-    let variant = descriptor
-        .variants
-        .iter()
-        .min_by(|left, right| {
-            left.texels_per_cell
-                .abs_diff(PREFERRED_TEXELS_PER_CELL)
-                .cmp(&right.texels_per_cell.abs_diff(PREFERRED_TEXELS_PER_CELL))
-                .then_with(|| right.texels_per_cell.cmp(&left.texels_per_cell))
-        })
+    let variant = skin_schema::v2::preferred_texture_variant(descriptor)
         .expect("generated descriptor has at least one validated variant");
     ResolvedTexture {
         url: descriptor_url(&variant.url),
@@ -1380,6 +1421,7 @@ mod tests {
                 kind: skin_schema::v2::TextureKindV2::Sheet,
                 body_columns: Some(64),
                 frame_rows: Some(64),
+                raster_overhang_px: 0,
                 variants: vec![skin_schema::v2::TextureVariantV2 {
                     url: format!("/api/textures/variants/{content_ref}.png"),
                     content_ref,

@@ -18,13 +18,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::api::auth::AuthState;
 use crate::api::middleware::AuthUser;
 use crate::skin_catalog::{self, BASE_REF_PREFIX, CatalogEntry, MAX_SKIN_REF_LENGTH, SkinKind};
 use crate::skin_store::{
-    NewRevision, NewSkin, Publication, Skin, SkinNamespace, SkinWriteError, skin_id_reference,
+    NewRevision, NewSkin, Publication, Skin, SkinNamespace, SkinReviewDecision, SkinRevision,
+    SkinWriteError, skin_id_reference,
 };
 
 /// How long a browser may reuse the catalogue. Built-ins change only when the
@@ -471,6 +472,91 @@ impl SkinSummary {
 pub struct SkinListResponse {
     pub skins: Vec<SkinSummary>,
     pub cursor: Option<String>,
+}
+
+/// One immutable target in the administrator's review queue.
+///
+/// This is deliberately not a [`SkinSummary`]. A summary answers "what may
+/// this viewer render?", which makes a private draft disappear for an admin
+/// who is not its creator and makes a pending edit resolve to the previously
+/// published bytes. Review authority instead names the exact pending revision
+/// and the exact document hash submitted with it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct AdminSkinReview {
+    pub skin_id: i32,
+    pub name: String,
+    pub namespace: SkinNamespace,
+    pub publication: Publication,
+    pub creator_user_id: i32,
+    pub creator_username: Option<String>,
+    pub head_revision: u32,
+    pub published_revision: Option<u32>,
+    /// The immutable revision the creator or factory submitted.
+    pub pending_revision: u32,
+    /// The content hash stored on that exact immutable revision.
+    pub pending_content_ref: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl AdminSkinReview {
+    fn exact(skin: &Skin, revision: &SkinRevision) -> anyhow::Result<Self> {
+        let pending_revision = skin
+            .pending_revision
+            .ok_or_else(|| anyhow::anyhow!("review queue skin has no pending revision"))?;
+        if revision.skin_id != skin.skin_id || revision.revision != pending_revision {
+            return Err(anyhow::anyhow!(
+                "review queue target does not match skin {} pending revision {}",
+                skin.skin_id,
+                pending_revision
+            ));
+        }
+
+        Ok(Self {
+            skin_id: skin.skin_id,
+            name: skin.name.clone(),
+            namespace: skin.namespace,
+            publication: skin.publication,
+            creator_user_id: skin.creator_user_id,
+            creator_username: skin.creator_username.clone(),
+            head_revision: skin.head_revision,
+            published_revision: skin.published_revision,
+            pending_revision,
+            pending_content_ref: revision.content_ref.clone(),
+            created_at_ms: skin.created_at_ms,
+            updated_at_ms: skin.updated_at_ms,
+        })
+    }
+
+    /// Build a row only while the exact target discovered through the queue
+    /// index is still pending on the authoritative skin record.
+    ///
+    /// DynamoDB secondary indexes are eventually consistent: a removed queue
+    /// marker can outlive the transaction that removed it, and a creator can
+    /// submit a newer target while this route loads the immutable revision.
+    /// Both are normal races, so they omit one stale row rather than poisoning
+    /// the other reviews with a 500 response.
+    fn if_still_pending(
+        skin: &Skin,
+        queued_revision: u32,
+        revision: &SkinRevision,
+    ) -> Option<Self> {
+        if skin.pending_revision != Some(queued_revision) {
+            return None;
+        }
+        Self::exact(skin, revision).ok()
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct AdminSkinReviewQueueResponse {
+    pub skins: Vec<AdminSkinReview>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1168,13 +1254,18 @@ const MAX_REPORT_NOTE_LENGTH: usize = 500;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdminStatusRequest {
-    /// One of `published`, `unpublished`, `disabled`, `private`.
-    pub publication: String,
-    /// Which revision to publish. Required when publishing, ignored otherwise.
+    /// `publish`, `reject`, or `setPublication`. Legacy callers may omit this
+    /// and send only `publication`.
+    #[serde(default)]
+    pub decision: Option<String>,
+    /// Required only with `setPublication`; one of `unpublished`, `disabled`,
+    /// or `private`. Legacy `published` remains an exact publish request.
+    #[serde(default)]
+    pub publication: Option<String>,
+    /// The immutable review target. Required for publish and reject.
     #[serde(default)]
     pub revision: Option<u32>,
-    /// Hash of the exact canonical document the reviewer inspected. Required
-    /// with `revision` when publishing.
+    /// Hash of the exact canonical document the reviewer inspected.
     #[serde(default)]
     pub content_ref: Option<String>,
     #[serde(default)]
@@ -1344,7 +1435,7 @@ pub async fn report_skin(
 /// The review queue: everything waiting on a human, oldest first.
 pub async fn admin_review_queue(
     State(state): State<AuthState>,
-    Extension(auth_user): Extension<AuthUser>,
+    Extension(_auth_user): Extension<AuthUser>,
 ) -> Result<Response, SkinsApiError> {
     let skins = state
         .db
@@ -1352,16 +1443,114 @@ pub async fn admin_review_queue(
         .await
         .map_err(SkinsApiError::Internal)?;
 
-    let mut response = Json(SkinListResponse {
-        skins: skins
-            .iter()
-            .map(|skin| SkinSummary::of(skin, Some(auth_user.user_id), false))
-            .collect(),
-        cursor: None,
-    })
-    .into_response();
+    let mut reviews = Vec::with_capacity(skins.len());
+    for queued_skin in &skins {
+        let Some(pending_revision) = queued_skin.pending_revision else {
+            // The GSI may briefly return a row after its pending marker was
+            // removed. The base item is already authoritative, so omit it.
+            continue;
+        };
+        let Some(revision) = state
+            .db
+            .get_skin_revision(queued_skin.skin_id, pending_revision)
+            .await
+            .map_err(SkinsApiError::Internal)?
+        else {
+            warn!(
+                skin_id = queued_skin.skin_id,
+                pending_revision, "omitting stale review marker for a missing revision"
+            );
+            continue;
+        };
+        let Some(current_skin) = state
+            .db
+            .get_skin(queued_skin.skin_id)
+            .await
+            .map_err(SkinsApiError::Internal)?
+        else {
+            continue;
+        };
+        let Some(review) =
+            AdminSkinReview::if_still_pending(&current_skin, pending_revision, &revision)
+        else {
+            // Queue removal and replacement both race this read safely. A
+            // refresh will show the replacement target once its GSI entry is
+            // visible; the obsolete target must never be sent to an admin.
+            continue;
+        };
+        reviews.push(review);
+    }
+
+    let mut response = Json(AdminSkinReviewQueueResponse { skins: reviews }).into_response();
     no_store(&mut response);
     Ok(response)
+}
+
+fn parse_admin_skin_decision(
+    request: &AdminStatusRequest,
+) -> Result<SkinReviewDecision, SkinsApiError> {
+    match request.decision.as_deref() {
+        Some("publish") if request.publication.is_none() => Ok(SkinReviewDecision::Publish),
+        Some("reject") if request.publication.is_none() => Ok(SkinReviewDecision::Reject),
+        Some("setPublication") => {
+            let publication = request
+                .publication
+                .as_deref()
+                .and_then(Publication::parse)
+                .ok_or_else(|| {
+                    SkinsApiError::Invalid(vec![
+                        "publication: setPublication requires a valid state".to_string(),
+                    ])
+                })?;
+            if publication == Publication::Published {
+                return Err(SkinsApiError::Invalid(vec![
+                    "decision: use publish with an exact review target".to_string(),
+                ]));
+            }
+            Ok(SkinReviewDecision::SetPublication(publication))
+        }
+        None => {
+            let publication = request
+                .publication
+                .as_deref()
+                .and_then(Publication::parse)
+                .ok_or_else(|| {
+                    SkinsApiError::Invalid(vec![
+                        "decision: publish, reject, or setPublication is required".to_string(),
+                    ])
+                })?;
+            Ok(if publication == Publication::Published {
+                SkinReviewDecision::Publish
+            } else {
+                SkinReviewDecision::SetPublication(publication)
+            })
+        }
+        Some(other) => Err(SkinsApiError::Invalid(vec![format!(
+            "decision: {other} is not publish, reject, or setPublication"
+        )])),
+    }
+}
+
+fn validate_admin_skin_target(
+    request: &AdminStatusRequest,
+    decision: SkinReviewDecision,
+) -> Result<(), SkinsApiError> {
+    if matches!(
+        decision,
+        SkinReviewDecision::Publish | SkinReviewDecision::Reject
+    ) {
+        if request.revision.is_none() || request.content_ref.is_none() {
+            return Err(SkinsApiError::Invalid(vec![
+                "revision and contentRef: both exact review targets are required to decide review"
+                    .to_string(),
+            ]));
+        }
+    } else if request.revision.is_some() || request.content_ref.is_some() {
+        return Err(SkinsApiError::Invalid(vec![
+            "revision and contentRef: are only accepted for publish or reject".to_string(),
+        ]));
+    }
+    Ok(())
 }
 
 /// Approve, reject, withdraw, or take down a skin.
@@ -1371,20 +1560,9 @@ pub async fn admin_set_status(
     Path(skin_id): Path<i32>,
     Json(request): Json<AdminStatusRequest>,
 ) -> Result<Response, SkinsApiError> {
-    let publication = Publication::parse(&request.publication).ok_or_else(|| {
-        SkinsApiError::Invalid(vec![format!(
-            "publication: {} is not a publication state",
-            request.publication
-        )])
-    })?;
-
-    if publication == Publication::Published {
-        if request.revision.is_none() || request.content_ref.is_none() {
-            return Err(SkinsApiError::Invalid(vec![
-                "revision and contentRef: both exact review targets are required to publish"
-                    .to_string(),
-            ]));
-        }
+    let decision = parse_admin_skin_decision(&request)?;
+    validate_admin_skin_target(&request, decision)?;
+    if matches!(decision, SkinReviewDecision::Publish) {
         let skin = state
             .db
             .get_skin(skin_id)
@@ -1396,10 +1574,6 @@ pub async fn admin_set_status(
                 "evaluation-only skins cannot be published".to_string(),
             ]));
         }
-    } else if request.revision.is_some() || request.content_ref.is_some() {
-        return Err(SkinsApiError::Invalid(vec![
-            "revision and contentRef: are only accepted when publishing".to_string(),
-        ]));
     }
 
     // Approval, exact publication, audit, and queue removal are one database
@@ -1409,7 +1583,7 @@ pub async fn admin_set_status(
         .db
         .decide_skin_review(
             skin_id,
-            publication,
+            decision,
             request.revision,
             request.content_ref.as_deref(),
             auth_user.user_id,
@@ -1506,9 +1680,93 @@ mod tests {
             validated_schema: 2,
             exposed_at_ms: exposed.then_some(1),
             review_approved,
+            review_rejected: false,
             contains_text,
             created_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn admin_review_exposes_another_creators_private_draft_exactly() {
+        let mut skin = stored_skin(1_001, 42, Publication::Private, None);
+        skin.pending_revision = Some(skin.head_revision);
+        skin.head_content_ref = format!("sha256:{}", "a".repeat(64));
+        let revision = stored_revision(
+            skin.skin_id,
+            skin.head_revision,
+            &skin.head_content_ref,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            SkinSummary::of(&skin, Some(99), false).content_ref,
+            None,
+            "an ordinary viewer summary intentionally hides this draft"
+        );
+        let review = AdminSkinReview::exact(&skin, &revision).expect("exact pending target");
+        assert_eq!(review.pending_revision, skin.head_revision);
+        assert_eq!(review.pending_content_ref, skin.head_content_ref);
+    }
+
+    #[test]
+    fn admin_review_exposes_pending_edit_not_the_old_published_bytes() {
+        let old_ref = format!("sha256:{}", "1".repeat(64));
+        let pending_ref = format!("sha256:{}", "2".repeat(64));
+        let mut skin = stored_skin(1_002, 42, Publication::Published, Some(1));
+        skin.published_content_ref = Some(old_ref.clone());
+        skin.head_content_ref = pending_ref.clone();
+        skin.pending_revision = Some(skin.head_revision);
+        let revision = stored_revision(
+            skin.skin_id,
+            skin.head_revision,
+            &pending_ref,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            SkinSummary::of(&skin, Some(99), false).content_ref,
+            Some(old_ref),
+            "the catalogue summary keeps showing the published revision"
+        );
+        let review = AdminSkinReview::exact(&skin, &revision).expect("exact pending target");
+        assert_eq!(review.pending_revision, 2);
+        assert_eq!(review.pending_content_ref, pending_ref);
+    }
+
+    #[test]
+    fn admin_review_refuses_a_revision_other_than_the_pending_target() {
+        let mut skin = stored_skin(1_003, 42, Publication::Private, None);
+        skin.pending_revision = Some(2);
+        let wrong = stored_revision(
+            skin.skin_id,
+            1,
+            &format!("sha256:{}", "f".repeat(64)),
+            false,
+            false,
+            false,
+        );
+
+        assert!(AdminSkinReview::exact(&skin, &wrong).is_err());
+    }
+
+    #[test]
+    fn admin_review_omits_stale_or_moving_queue_targets() {
+        let content_ref = format!("sha256:{}", "b".repeat(64));
+        let revision = stored_revision(1_004, 2, &content_ref, false, false, false);
+        let mut current = stored_skin(1_004, 42, Publication::Private, None);
+
+        current.pending_revision = None;
+        assert!(AdminSkinReview::if_still_pending(&current, 2, &revision).is_none());
+
+        current.pending_revision = Some(3);
+        assert!(AdminSkinReview::if_still_pending(&current, 2, &revision).is_none());
+
+        current.pending_revision = Some(2);
+        assert!(AdminSkinReview::if_still_pending(&current, 2, &revision).is_some());
     }
 
     #[test]
@@ -1607,6 +1865,7 @@ mod tests {
             validated_schema: accepted.schema_version,
             exposed_at_ms: None,
             review_approved: false,
+            review_rejected: false,
             contains_text: accepted.contains_text,
             created_at_ms: 0,
         };
@@ -2050,7 +2309,7 @@ mod tests {
     fn seam_requirements_follow_nested_image_use_not_texture_kind_guessing() {
         use skin_schema::v2::{
             ClipV2, CornerV2, FitV2, LayerBodyV2, LayerV2, PropExpr, RegionV2, SourceV2, SpanV2,
-            TextureKindV2, TextureRefV2, TransformV2,
+            TextureKindV2, TextureRefV2, TilePhaseOriginV2, TransformV2,
         };
         let tiled_sheet = LayerV2 {
             name: "tiled motion".to_string(),
@@ -2067,6 +2326,7 @@ mod tests {
                     texture: "motion".to_string(),
                     fit: FitV2::Tile {
                         cells_per_repeat: None,
+                        phase_origin: TilePhaseOriginV2::Head,
                     },
                     fade: None,
                     drift_cells: PropExpr::constant(0.0),
@@ -2155,6 +2415,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn admin_publish_and_reject_bind_the_exact_review_target() {
+        let content_ref = "sha256:".to_string() + &"8".repeat(64);
+        for decision in ["publish", "reject"] {
+            let request: AdminStatusRequest = serde_json::from_value(serde_json::json!({
+                "decision": decision,
+                "revision": 8,
+                "contentRef": content_ref.clone(),
+                "reason": "reviewed exact bytes"
+            }))
+            .expect("valid request");
+            let parsed = parse_admin_skin_decision(&request).expect("known decision");
+            assert!(matches!(
+                (decision, parsed),
+                ("publish", SkinReviewDecision::Publish) | ("reject", SkinReviewDecision::Reject)
+            ));
+            validate_admin_skin_target(&request, parsed).expect("exact target is complete");
+        }
+
+        let missing_hash: AdminStatusRequest =
+            serde_json::from_str(r#"{"decision":"reject","revision":8}"#).unwrap();
+        let decision = parse_admin_skin_decision(&missing_hash).unwrap();
+        assert!(validate_admin_skin_target(&missing_hash, decision).is_err());
+
+        let state_with_target: AdminStatusRequest = serde_json::from_value(serde_json::json!({
+            "decision": "setPublication",
+            "publication": "disabled",
+            "revision": 8,
+            "contentRef": content_ref
+        }))
+        .unwrap();
+        let decision = parse_admin_skin_decision(&state_with_target).unwrap();
+        assert!(validate_admin_skin_target(&state_with_target, decision).is_err());
     }
 
     #[test]

@@ -33,6 +33,14 @@ content-addressed object store. Direction, gates, model-role configuration, and
 the authoring skill remain canonical in Git. Every attempt records their exact
 hashes.
 
+The checked-in scheduler mode also consumes an immutable private-draft inbox.
+It selects a safe retained prototype, may materialize a bounded Fal/PixVerse
+animation through journaled endpoint, submit, poll, and local extraction
+phases, runs the pure `author-skin` pass against the resulting exact catalog,
+uploads only a private revision, and asks Snaketron Admin to review that exact
+revision. It has no publication authority and does not use the local Factory
+review gallery.
+
 Production builds open a server review request for the exact rendered
 revision/content hash before entering final review. Final rejection cancels
 only that same request, so it cannot race away a newer revision. Optimizer and
@@ -52,6 +60,18 @@ uv run factory doctor --config config/factory.yaml \
   --identity service
 uv run pytest
 ```
+
+After the owner-private service JSON is provisioned, enqueue a real draft with:
+
+```sh
+uv run factory enqueue-draft "Clockwork Tide" \
+  --brief "A navy snake with crisp brass wave teeth that reads cleanly at game scale." \
+  --motion "The brass wave advances through one calm true cyclic loop."
+```
+
+Hermes advances it automatically. For one production-equivalent terminal tick,
+run `uv run factory run-once --config config/factory.yaml --env-file
+"$HOME/.config/snaketron-skin-factory/service.json"`.
 
 Browser evidence is valid only when the configured web endpoint serves the
 exact cached release bundle built above. For a local operator session, run

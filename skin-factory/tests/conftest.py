@@ -13,7 +13,7 @@ from PIL import Image
 
 from snaketron_factory.config import FactoryConfig
 from snaketron_factory.db import Database
-from snaketron_factory.domain import Purpose, Stage
+from snaketron_factory.domain import ImplementationPlan, Purpose, Stage
 from snaketron_factory.objects import ObjectStore
 
 GATE_NAMES = (
@@ -62,6 +62,10 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
         json.dumps({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"}),
         encoding="utf-8",
     )
+    (schemas / "implementation-plan.schema.json").write_text(
+        json.dumps(ImplementationPlan.model_json_schema()),
+        encoding="utf-8",
+    )
 
     direction = repo / "direction.md"
     direction.write_text("Bright, legible, playful snakes.\n", encoding="utf-8")
@@ -76,6 +80,8 @@ def factory_config(tmp_path: Path) -> FactoryConfig:
                     "max_texture_dimension_px": 2048,
                     "max_texture_variant_bytes": 2_097_152,
                     "max_texture_decoded_bytes": 16_777_216,
+                    "max_skin_texture_decoded_bytes": 67_108_864,
+                    "max_skin_texture_compressed_bytes": 8_388_608,
                     "max_sprite_frame_rows": 120,
                     "max_sprite_frame_rate_fps": 60,
                 },

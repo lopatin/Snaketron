@@ -62,6 +62,7 @@ class _ExactVariant:
     width_px: int
     height_px: int
     texels_per_cell: int
+    has_alpha: bool
     pixels: np.ndarray
 
     def identity(self) -> dict[str, Any]:
@@ -72,6 +73,7 @@ class _ExactVariant:
             "width_px": self.width_px,
             "height_px": self.height_px,
             "texels_per_cell": self.texels_per_cell,
+            "alpha_channel": self.has_alpha,
         }
 
 
@@ -173,6 +175,7 @@ class GateRunner:
             "asset_kind": asset.kind,
             "declared_body_columns": asset.natural_length_cells,
             "declared_frame_rows": asset.frames if asset.kind == "sheet" else None,
+            "raster_overhang_px": asset.raster_overhang_px,
             "byte_scope": "content-addressed-shipping-png",
             "variants": identities,
         }
@@ -181,16 +184,39 @@ class GateRunner:
         grid_measurements: list[dict[str, Any]] = []
         for item in exact:
             expected_width = asset.natural_length_cells * item.texels_per_cell
-            expected_height = (asset.frames if asset.kind == "sheet" else 1) * item.texels_per_cell
+            scaled_overhang = item.texels_per_cell * asset.raster_overhang_px
+            if scaled_overhang % 16:
+                grid_errors.append(
+                    f"{item.content_ref}: {item.texels_per_cell}-texel rung cannot represent "
+                    f"{asset.raster_overhang_px}px bleed aprons exactly from the fixed 16-texel body grid"
+                )
+                continue
+            side_texels = scaled_overhang // 16
+            row_texels = item.texels_per_cell + 2 * side_texels
+            stored_rows = asset.frames if asset.kind == "sheet" else 1
+            expected_height = stored_rows * row_texels
+            edge_alpha_zero = False
+            if item.has_alpha and item.height_px == expected_height:
+                alpha = item.pixels[..., 3]
+                edge_alpha_zero = all(
+                    not np.any(alpha[row * row_texels]) and not np.any(alpha[(row + 1) * row_texels - 1])
+                    for row in range(stored_rows)
+                )
             grid_measurements.append(
                 {
                     "content_ref": item.content_ref,
                     "body_columns": item.width_px / item.texels_per_cell,
-                    "frame_rows": item.height_px / item.texels_per_cell,
+                    "frame_rows": item.height_px / row_texels,
+                    "logical_body_texels": item.texels_per_cell,
+                    "bleed_apron_texels_per_side": side_texels,
+                    "row_texels": row_texels,
                     "expected_width_px": expected_width,
                     "expected_height_px": expected_height,
                     "actual_width_px": item.width_px,
                     "actual_height_px": item.height_px,
+                    "alpha_channel": item.has_alpha,
+                    "transverse_edge_alpha_zero": edge_alpha_zero,
+                    "alpha_verified": asset.raster_overhang_px == 0 or (item.has_alpha and edge_alpha_zero),
                 }
             )
             if item.width_px != expected_width or item.height_px != expected_height:
@@ -198,6 +224,15 @@ class GateRunner:
                     f"{item.content_ref}: exact grid is {item.width_px}x{item.height_px}px; "
                     f"declared grid requires {expected_width}x{expected_height}px"
                 )
+            if asset.raster_overhang_px > 0 and not item.has_alpha:
+                grid_errors.append(f"{item.content_ref}: bounded bleed aprons require an alpha channel")
+            elif asset.raster_overhang_px > 0 and not edge_alpha_zero:
+                grid_errors.append(
+                    f"{item.content_ref}: visible alpha touches a transverse stored-row edge; "
+                    "bleed must end inside the bounded apron"
+                )
+        if asset.raster_overhang_px > 0 and asset.transverse_edge_policy != "fail_closed_transparent_effect":
+            grid_errors.append("bounded bleed requires fail_closed_transparent_effect edge policy")
         if not exact:
             grid_errors.append("no exact shipping PNG variants were available for grid measurement")
         grid = self.manifest.result(
@@ -243,6 +278,7 @@ class GateRunner:
                     opened.load()
                     if opened.format != "PNG":
                         errors.append(f"{label}: exact shipping bytes are {opened.format}, not PNG")
+                    has_alpha = "A" in opened.getbands() or "transparency" in opened.info
                     image = opened.convert("RGBA")
             except Exception as error:  # Pillow exposes several decoder-specific exceptions.
                 errors.append(f"{label}: cannot decode exact shipping PNG: {error}")
@@ -260,6 +296,7 @@ class GateRunner:
                     width_px=image.width,
                     height_px=image.height,
                     texels_per_cell=texels_per_cell,
+                    has_alpha=has_alpha,
                     pixels=np.asarray(image, dtype=np.uint8).copy(),
                 )
             )
@@ -287,18 +324,22 @@ class GateRunner:
         if not exact:
             reasons.append("no exact shipping PNG variants were available for temporal measurement")
         for item in exact:
-            if item.height_px != asset.frames * item.texels_per_cell:
+            scaled_overhang = item.texels_per_cell * asset.raster_overhang_px
+            if scaled_overhang % 16:
+                continue
+            row_texels = item.texels_per_cell + 2 * (scaled_overhang // 16)
+            if item.height_px != asset.frames * row_texels:
                 continue
             luma = _premultiplied_luma(item.pixels)
             raw_frames = item.pixels.reshape(
                 asset.frames,
-                item.texels_per_cell,
+                row_texels,
                 item.width_px,
                 4,
             )
             frame_pixels = _premultiplied_channels(item.pixels).reshape(
                 asset.frames,
-                item.texels_per_cell,
+                row_texels,
                 item.width_px,
                 4,
             )
@@ -332,7 +373,9 @@ class GateRunner:
                 {
                     "content_ref": item.content_ref,
                     "declared_frame_rows": asset.frames,
-                    "measured_frame_rows": item.height_px // item.texels_per_cell,
+                    "measured_frame_rows": item.height_px // row_texels,
+                    "logical_body_texels": item.texels_per_cell,
+                    "row_texels": row_texels,
                     "distinct_frame_cells": distinct_frames,
                     "changed_frame_transitions": len(changed_steps),
                     "minimum_change_mae": _rounded(change_floor),
@@ -653,6 +696,18 @@ class GateRunner:
                 continue
             if descriptor.get("kind") != kind:
                 reference_failures.append(f"texture {texture_name!r} descriptor kind differs")
+            body_columns = descriptor.get("body_columns")
+            frame_rows = descriptor.get("frame_rows")
+            raster_overhang_px = descriptor.get("raster_overhang_px", 0)
+            valid_overhang = (
+                isinstance(raster_overhang_px, int)
+                and not isinstance(raster_overhang_px, bool)
+                and 0 <= raster_overhang_px <= 4
+            )
+            if not valid_overhang:
+                shape_failures.append(
+                    f"texture {texture_name!r} raster_overhang_px must be an integer from 0 through 4"
+                )
             variants = descriptor.get("variants", [])
             if not variants:
                 reference_failures.append(f"texture {texture_name!r} has no immutable variants")
@@ -666,13 +721,45 @@ class GateRunner:
                 width = int(variant.get("width_px", 0))
                 height = int(variant.get("height_px", 0))
                 size = int(variant.get("bytes", 0))
+                texels_per_cell = int(variant.get("texels_per_cell", 0))
                 if width <= 0 or height <= 0 or max(width, height) > limits["max_texture_dimension_px"]:
                     shape_failures.append(f"texture {texture_name!r} variant dimensions exceed limit")
                 if size <= 0 or size > limits["max_texture_variant_bytes"]:
                     shape_failures.append(f"texture {texture_name!r} variant byte size exceeds limit")
-
-            body_columns = descriptor.get("body_columns")
-            frame_rows = descriptor.get("frame_rows")
+                if texels_per_cell <= 0:
+                    shape_failures.append(f"texture {texture_name!r} variant needs texels_per_cell")
+                elif valid_overhang:
+                    scaled_overhang = texels_per_cell * raster_overhang_px
+                    if scaled_overhang % 16:
+                        shape_failures.append(
+                            f"texture {texture_name!r} {texels_per_cell}-texel rung cannot represent "
+                            f"{raster_overhang_px}px bleed aprons exactly"
+                        )
+                    else:
+                        row_texels = texels_per_cell + 2 * (scaled_overhang // 16)
+                        if isinstance(body_columns, int) and width != body_columns * texels_per_cell:
+                            shape_failures.append(
+                                f"texture {texture_name!r} variant width does not match its logical body columns"
+                            )
+                        if kind == "sheet" and isinstance(frame_rows, int):
+                            expected_height = frame_rows * row_texels
+                            if height != expected_height:
+                                shape_failures.append(
+                                    f"texture {texture_name!r} variant height must be {expected_height}px "
+                                    f"for {frame_rows} stored rows of {row_texels}px"
+                                )
+                        elif kind == "coat" and height != row_texels:
+                            shape_failures.append(
+                                f"texture {texture_name!r} coat row must be {row_texels}px: "
+                                f"{texels_per_cell}px body plus scaled bleed aprons"
+                            )
+                        elif kind == "overlay":
+                            body_height = height - 2 * (scaled_overhang // 16)
+                            if body_height <= 0 or body_height % texels_per_cell:
+                                shape_failures.append(
+                                    f"texture {texture_name!r} overlay height must contain whole logical body "
+                                    "cells between its scaled bleed aprons"
+                                )
             if kind in {"coat", "sheet"} and not isinstance(body_columns, int):
                 shape_failures.append(f"{kind} {texture_name!r} needs body_columns")
             if kind == "sheet":
@@ -713,6 +800,10 @@ class GateRunner:
                             )
                             used_sheet_plans.add(candidate_index)
                             processed_sheet_textures.add(str(texture_name))
+                            if raster_overhang_px != asset.raster_overhang_px:
+                                shape_failures.append(
+                                    f"sheet {texture_name!r} raster_overhang_px differs from its implementation plan"
+                                )
                             try:
                                 derived_rows = effective_sheet_frame_rows(
                                     asset,

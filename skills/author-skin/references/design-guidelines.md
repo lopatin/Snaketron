@@ -81,10 +81,18 @@ cornered, U-turn, and long/tiled fixtures rather than validating only one
 illustrated strip.
 
 Authored body spans and image sources are clipped to the round snake
-silhouette. They cannot paint arbitrary pixels outside it. The actual bounded
-exceptions are contour ribbons and authored head discs; the engine still owns
-the outermost Boost band and the topmost head core. Do not imply freeform
-outside-body geometry in a prototype or asset prompt.
+silhouette by default. They cannot paint arbitrary pixels outside it. The
+bounded exceptions are contour ribbons, authored head discs, and transverse
+raster margin declared by `TextureDescriptorV2.raster_overhang_px`:
+0 through 4 authored bleed pixels per transverse side around the unchanged
+16×16 logical body cell, scaled with each served rung. Descriptor-bounded
+transverse raster overhang is
+not a freeform canvas: it does not relax the longitudinal head and tail caps
+or permit unbounded outside-body geometry. The logical cell remains 16×16;
+the bounded apron may overlap a neighboring snake's cell, with ordinary draw
+order deciding which snake is visible on top.
+The engine still owns the outermost Boost band and the topmost head core. Do
+not imply arbitrary outside-body geometry in a prototype or asset prompt.
 
 ## Two visual structures
 

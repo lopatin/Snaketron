@@ -13,11 +13,12 @@ import re
 import socket
 import time
 import uuid
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 from .assets import AssetProcessor, ForgeBundle, ForgeVariant
@@ -38,6 +39,7 @@ from .domain import (
     GateVerdict,
     ImplementationPlan,
     InlineArtifact,
+    ModifierPlan,
     OperationStatus,
     PrototypeManifest,
     ProviderError,
@@ -48,6 +50,23 @@ from .domain import (
     VisualJudgment,
     WorkerRequest,
     WorkerResult,
+    current_worker_result_json_schema,
+)
+from .draft_automation import (
+    DraftInbox,
+    DraftInboxError,
+    DraftMediaPreplan,
+    DraftVideoIntent,
+    draft_attempt_metadata,
+    is_draft_attempt,
+)
+from .fal_media import (
+    PIXVERSE_TRANSITION_CAPABILITY,
+    FalPixVerseTransitionAdapter,
+    FalQueuePending,
+    FalQueueTicket,
+    PixVerseTransitionOptions,
+    validate_pixverse_video_result,
 )
 from .gates import GateRunner
 from .lama import LamaRuntimeError, lama_bundle_manifest, lama_bundle_sha
@@ -61,7 +80,12 @@ from .prototype_projection import (
     project_prototype_body,
 )
 from .providers import ProviderRegistry
-from .recovery import RecoveredResultError, validate_recovered_result, validate_skin_authority_readback
+from .recovery import (
+    RecoveredResultError,
+    validate_recovered_result,
+    validate_registration_result,
+    validate_skin_authority_readback,
+)
 from .renderer import (
     BrowserRenderer,
     RendererDrift,
@@ -70,10 +94,21 @@ from .renderer import (
     renderer_execution_config_sha,
 )
 from .snaketron_api import SnaketronApi
+from .video_frames import (
+    MatteEndpointRequest,
+    VideoFrameExtractionConfig,
+    VideoFrameExtractionError,
+    VideoFrameExtractionRequest,
+    extract_rgba_frame_sheet,
+    validate_matte_endpoint,
+    video_toolchain_identity,
+)
 from .worker import SkillBundle, WorkerAdapter, build_worker
 from .worker_validation import (
     WorkerContractError,
     assert_resolved_document,
+    asset_row_texels,
+    expected_materialized_catalog_record,
     validate_plan_resource_limits,
     validate_worker_handoff,
 )
@@ -117,6 +152,7 @@ class Factory:
         worker: WorkerAdapter | None = None,
         api: SnaketronApi | None = None,
         renderer: BrowserRenderer | None = None,
+        fal_media: FalPixVerseTransitionAdapter | None = None,
     ) -> None:
         self.config = config
         self.database = database or Database(config.paths.database)
@@ -126,6 +162,15 @@ class Factory:
         self.worker = worker or build_worker(config)
         self.api = api or SnaketronApi(config)
         self.renderer = renderer or BrowserRenderer(config)
+        self.fal_media = fal_media or FalPixVerseTransitionAdapter(
+            api_key_env=config.draft_automation.fal_api_key_env,
+            fallback_api_key_envs=(config.draft_automation.fal_api_key_fallback_env,),
+            queue_base_url=config.draft_automation.fal_queue_base_url,
+            timeout_seconds=min(60, config.draft_automation.fal_transition_timeout_seconds),
+            poll_deadline_seconds=config.draft_automation.fal_transition_timeout_seconds,
+            max_status_polls=1,
+            poll_interval_seconds=0,
+        )
         self.assets = AssetProcessor(config)
         self.gates = GateRunner(config)
         self.journal = OperationJournal(self.database)
@@ -135,7 +180,7 @@ class Factory:
         self._run_deadline: float | None = None
 
     async def close(self) -> None:
-        for owner in (self.providers, self.worker, self.api):
+        for owner in (self.providers, self.worker, self.api, self.fal_media):
             close = getattr(owner, "close", None)
             if close:
                 result = close()
@@ -144,6 +189,11 @@ class Factory:
 
     def behavior_snapshot(self) -> dict[str, Any]:
         skill, skill_git_ref, skill_git_sha = self.active_skill_bundle()
+        automation_bundle: SkillBundle | None = None
+        automation_bundle_object = None
+        if self.config.draft_automation.enabled:
+            automation_bundle = SkillBundle.load(self.config.draft_automation.skill_dir)
+            automation_bundle_object = self.objects.put(canonical_json(automation_bundle.files).encode("utf-8"))
         direction = self.config.paths.direction.read_bytes()
         guideline_text = self._skill_guidelines(skill)
         prototype_geometry, prototype_guide, _ = self._current_prototype_geometry()
@@ -159,7 +209,7 @@ class Factory:
         model_config_object = self.objects.put(model_config)
         renderer_config = renderer_execution_config(self.config)
         lama_bundle = lama_bundle_manifest(self.config)
-        return {
+        snapshot = {
             "snapshot_version": 7,
             "direction_sha": direction_object.sha256,
             "direction_ref": direction_object.uri,
@@ -188,6 +238,31 @@ class Factory:
             "lama_bundle": lama_bundle,
             "lama_bundle_sha": lama_bundle_sha(lama_bundle),
         }
+        if automation_bundle is not None and automation_bundle_object is not None:
+            snapshot["draft_automation_skill_sha"] = automation_bundle.sha256
+            snapshot["draft_automation_skill_ref"] = automation_bundle_object.uri
+        return snapshot
+
+    def pinned_draft_automation_bundle(self, attempt: dict[str, Any]) -> SkillBundle:
+        """Load the exact orchestration skill retained in this Attempt snapshot."""
+
+        behavior = json.loads(attempt["behavior_json"])
+        reference = behavior.get("draft_automation_skill_ref")
+        expected = behavior.get("draft_automation_skill_sha")
+        if not isinstance(reference, str) or not isinstance(expected, str):
+            raise FileNotFoundError("draft Attempt has no retained automation skill bundle")
+        try:
+            files = self.persistence.load_json(reference)
+        except (FileNotFoundError, RuntimeError, ValueError) as error:
+            raise FileNotFoundError("retained draft automation skill bundle is unreadable") from error
+        if not isinstance(files, dict) or not all(
+            isinstance(name, str) and isinstance(body, str) for name, body in files.items()
+        ):
+            raise FileNotFoundError("retained draft automation skill bundle is malformed")
+        bundle = SkillBundle.from_files(files)
+        if bundle.sha256 != expected:
+            raise FileNotFoundError("retained draft automation skill bundle hash differs")
+        return bundle
 
     def control_attempt(self, namespace: str = "optimizer") -> dict[str, Any]:
         """Return a terminal current-behavior coordinator for meta-model calls.
@@ -508,6 +583,8 @@ class Factory:
         self._run_deadline = started + self.config.budgets.wall_seconds_per_run
         report: dict[str, Any] = {"owner": owner, "advanced": [], "halt": None}
         try:
+            if self.config.draft_automation.enabled:
+                report["draft_candidate_budget"] = self.config.draft_candidate_budget_report()
             report["calibration"] = self.calibration.refresh_all()
             report["judge_routing"] = {
                 kind: self.calibration.routing_status(kind).as_report() for kind in ("prototype", "build")
@@ -520,20 +597,56 @@ class Factory:
                     "operations": [operation["id"] for operation in unresolved],
                 }
                 return report
+            if self.config.draft_automation.enabled:
+                try:
+                    report["admin_review_reconciliation"] = await self._reconcile_admin_reviews()
+                except ProviderError as error:
+                    report["halt"] = {
+                        "reason": "admin_review_reconciliation_unavailable",
+                        "detail": f"{error.kind}: {error}",
+                    }
+                    return report
             attempt = self.database.next_active_attempt()
             if attempt is None:
-                reason = self._generation_halt()
-                if reason:
-                    report["halt"] = {"reason": reason}
+                if self.config.draft_automation.enabled:
+                    admission_halt = self._draft_generation_halt_detail()
+                    if admission_halt is not None:
+                        report["halt"] = admission_halt
+                    else:
+                        pending_admin = self.database.count_attempts(disposition=Disposition.AWAITING_ADMIN_REVIEW)
+                        if pending_admin >= self.config.draft_automation.max_pending_admin_reviews:
+                            report["halt"] = {
+                                "reason": "admin_review_wip_cap",
+                                "pending": pending_admin,
+                            }
+                        else:
+                            try:
+                                attempt = DraftInbox(self.config.draft_automation.inbox).import_next(self)
+                            except DraftInboxError as error:
+                                report["halt"] = {"reason": "draft_inbox_invalid", "detail": str(error)}
+                            if attempt is None and report["halt"] is None:
+                                report["halt"] = {"reason": "draft_inbox_empty"}
+                            elif attempt is not None:
+                                report["advanced"].append(
+                                    {
+                                        "attempt": attempt["id"],
+                                        "stage": Stage.PROTOTYPE,
+                                        "source": "draft_inbox",
+                                    }
+                                )
                 else:
-                    attempt = self._create_seed_attempt()
-                    report["advanced"].append({"attempt": attempt["id"], "stage": Stage.CONCEPT})
+                    reason = self._generation_halt()
+                    if reason:
+                        report["halt"] = {"reason": reason}
+                    else:
+                        attempt = self._create_seed_attempt()
+                        report["advanced"].append({"attempt": attempt["id"], "stage": Stage.CONCEPT})
 
             while attempt is not None and (
                 attempt["disposition"] == Disposition.ACTIVE
                 and time.monotonic() - started < self.config.budgets.wall_seconds_per_run
             ):
-                if attempt["stage"] in {
+                if not is_draft_attempt(attempt) and attempt["stage"] in {
                     Stage.CONCEPT,
                     Stage.PROTOTYPE,
                     Stage.PROTOTYPE_TRIAGE,
@@ -545,7 +658,7 @@ class Factory:
                     if prototype_pending >= self.config.budgets.max_pending_prototype_reviews:
                         report["halt"] = {"reason": "prototype_review_wip_cap"}
                         break
-                if attempt["stage"] in {
+                if not is_draft_attempt(attempt) and attempt["stage"] in {
                     Stage.AUTHOR,
                     Stage.ASSETS,
                     Stage.BUILD_GATE,
@@ -561,8 +674,23 @@ class Factory:
                         break
                 before = (attempt["stage"], attempt["version"], attempt["disposition"])
                 failure_detail: str | None = None
+                scheduled_pending: FalQueuePending | None = None
                 try:
                     attempt = await self._advance(attempt)
+                except FalQueuePending as pending:
+                    # The paid submit ticket and this repeatable read are both
+                    # durable. Ordinary queue progress is a scheduler yield,
+                    # not a failed skin: retain ACTIVE/AUTHOR and let the next
+                    # Hermes tick allocate one new read key.
+                    scheduled_pending = pending
+                    attempt = self.database.get_attempt(attempt["id"])
+                    report["halt"] = {
+                        "reason": "scheduled_provider_pending",
+                        "provider": "fal.ai",
+                        "request_id": pending.request_id,
+                        "status": pending.status,
+                        "polls_this_tick": pending.polls,
+                    }
                 except ProviderError as error:
                     if not error.outcome_known or error.kind == ProviderFailureKind.UNKNOWN_OUTCOME:
                         unresolved = self.database.unresolved_operations()
@@ -596,7 +724,15 @@ class Factory:
                 }
                 if failure_detail is not None:
                     advancement["failure"] = failure_detail
+                if scheduled_pending is not None:
+                    advancement["pending"] = {
+                        "provider": "fal.ai",
+                        "request_id": scheduled_pending.request_id,
+                        "status": scheduled_pending.status,
+                    }
                 report["advanced"].append(advancement)
+                if scheduled_pending is not None:
+                    break
                 if after == before:
                     break
                 self.database.renew_lease("production", token, self.config.lease_seconds)
@@ -606,7 +742,11 @@ class Factory:
             # Optimizer readiness is part of this same scheduled command. The
             # optimizer module advances at most one resumable job and is loaded
             # lazily so ordinary production does not require DSPy import time.
-            if self.config.optimizer.enabled and not self._wall_time_exhausted():
+            if (
+                self.config.optimizer.enabled
+                and not self.config.draft_automation.enabled
+                and not self._wall_time_exhausted()
+            ):
                 from .optimizer import Optimizer
                 from .techniques import TechniqueMiner
 
@@ -634,9 +774,137 @@ class Factory:
             self._lease_token = None
             self._run_deadline = None
 
+    async def _reconcile_admin_reviews(self) -> dict[str, Any]:
+        """Bound local WIP to live exact Admin requests, not historical rows."""
+
+        result: dict[str, Any] = {"still_pending": [], "published": [], "rejected": [], "superseded": []}
+        for retained in self.database.attempts_by_disposition(Disposition.AWAITING_ADMIN_REVIEW):
+            skin_id = retained.get("production_skin_id")
+            revision = retained.get("production_revision")
+            content_ref = retained.get("production_content_hash")
+            if not skin_id or not revision or not content_ref:
+                current = self.database.get_attempt(retained["id"])
+                self.database.update_attempt(
+                    current["id"],
+                    current["version"],
+                    disposition=Disposition.BLOCKED,
+                    failure_json={
+                        "reason": "awaiting Admin review without exact private revision authority",
+                        "stage": Stage.COMPLETE,
+                    },
+                )
+                result["superseded"].append(retained["id"])
+                continue
+            response = await self._with_lease_heartbeat(self.api.get_skin_authority(skin_id))
+            authority = response.value
+            if not isinstance(authority, dict):
+                raise ProviderError(
+                    ProviderFailureKind.INVALID_OUTPUT,
+                    "Snaketron Admin reconciliation returned a non-object authority",
+                    request_id=response.request_id,
+                    resolved_model=response.resolved_model,
+                )
+            pending = authority.get("pendingRevision", authority.get("pending_revision"))
+            published = authority.get("publishedRevision", authority.get("published_revision"))
+            if str(pending) == str(revision):
+                result["still_pending"].append(retained["id"])
+                continue
+            current = self.database.get_attempt(retained["id"])
+            # ``contentRef`` is viewer-scoped: for the factory creator it is
+            # the current private head, which may advance after Admin publishes
+            # this exact immutable revision. The authenticated revision number
+            # is the publication authority; registration already bound that
+            # revision row to ``content_ref`` and verified exact readback.
+            if str(published) == str(revision):
+                self.database.update_attempt(
+                    current["id"],
+                    current["version"],
+                    disposition=Disposition.PUBLISHED,
+                    review_kind=None,
+                )
+                result["published"].append(retained["id"])
+            elif pending is None:
+                # The exact request disappeared and its immutable revision did
+                # not become public: Admin rejected or explicitly withdrew it.
+                self.database.update_attempt(
+                    current["id"],
+                    current["version"],
+                    disposition=Disposition.HUMAN_REJECTED,
+                    review_kind=None,
+                )
+                result["rejected"].append(retained["id"])
+            else:
+                self.database.update_attempt(
+                    current["id"],
+                    current["version"],
+                    disposition=Disposition.BLOCKED,
+                    review_kind=None,
+                    failure_json={
+                        "reason": "Admin queue now names a different exact revision",
+                        "expected_revision": int(revision),
+                        "observed_pending_revision": pending,
+                        "stage": Stage.COMPLETE,
+                    },
+                )
+                result["superseded"].append(retained["id"])
+        return result
+
     def _generation_halt(self) -> str | None:
         detail = self._generation_halt_detail()
         return str(detail["reason"]) if detail is not None else None
+
+    def _draft_generation_halt_detail(self) -> dict[str, Any] | None:
+        """Safety and spend admission shared with generation, minus local review/target policy."""
+
+        resume = self.database.latest_generation_resume()
+        after = str(resume["created_at"]) if resume is not None else None
+        explicit = self.database.unresolved_program_halt(after=after)
+        if explicit is not None:
+            return {
+                "reason": f"program_halt:{explicit['program_halt']}:{explicit['id']}",
+                "evidence_at": explicit["updated_at"],
+                "attempt_id": explicit["id"],
+                "acknowledgeable": True,
+            }
+        gate_cluster = self.database.repeated_blocking_gate_failure(
+            window=self.config.halts.deterministic_failure_window,
+            threshold=self.config.halts.repeated_blocking_gate_limit,
+            after=after,
+        )
+        if gate_cluster is not None:
+            return {
+                "reason": f"repeated_blocking_gate:{gate_cluster['gate_name']}",
+                "evidence_at": gate_cluster["latest_at"],
+                "acknowledgeable": True,
+            }
+        root_cause = self.database.repeated_root_cause_after_promotion(
+            target="authoring_playbook",
+            min_confidence=self.config.optimizer.feedback_min_confidence,
+            threshold=self.config.halts.repeated_root_cause_after_promotion_limit,
+            after=after,
+        )
+        if root_cause is not None:
+            return {
+                "reason": f"repeated_root_cause_after_promotion:{root_cause['signature']}",
+                "evidence_at": root_cause["latest_at"],
+                "acknowledgeable": True,
+            }
+        report = self.config.draft_candidate_budget_report()
+        # A new durable draft must be able to finish its complete conservative
+        # pipeline under the remaining daily/program envelope. Admitting only
+        # the first candidate creates an unattended half-built Attempt that
+        # can never reach Admin review when prior work consumed the balance.
+        pipeline_reservation = int(report["full_pipeline_reservation_micros"])
+        try:
+            self._check_budget(None, pipeline_reservation)
+        except BudgetExceeded as error:
+            return {
+                "reason": "budget_preflight",
+                "detail": str(error),
+                "required_reservation_micros": pipeline_reservation,
+                "acknowledgeable": False,
+            }
+        return None
 
     def _generation_halt_detail(self) -> dict[str, Any] | None:
         """Return the exact current generation pause and its acknowledgement boundary."""
@@ -813,6 +1081,25 @@ class Factory:
         )
         if source is None or source["stage"] != Stage.PROTOTYPE or not str(source["media_type"]).startswith("image/"):
             return "approved prototype raw provider source is not retained"
+        if is_draft_attempt(attempt):
+            selection_id = attempt.get("prototype_selection_id")
+            if not selection_id or attempt.get("prototype_decision_id"):
+                return "draft submission lacks an exclusive retained selection record"
+            try:
+                selection = self.database.get_artifact(str(selection_id))
+                payload = self.persistence.load_json(selection["object_ref"])
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
+                return f"draft selection record is unreadable: {error}"
+            if (
+                selection["attempt_id"] != attempt["id"]
+                or selection["kind"] != ArtifactKind.PROTOTYPE_SELECTION
+                or payload.get("mode") != "draft_submission"
+                or payload.get("selected_artifact_sha256") != approved_hash
+                or payload.get("human_approval") is not False
+                or payload.get("maximum_driver_action") != "request_admin_review"
+            ):
+                return "draft selection record does not authorize the exact retained prototype"
+            return None
         decision_id = attempt.get("prototype_decision_id")
         approval = next(
             (
@@ -1024,7 +1311,12 @@ class Factory:
             by_index[index] = prototypes_by_id[image_id]
         concept = self.database.get_concept(attempt["concept_id"])
         provider = self.providers.role("image_generator")
-        for index in range(self.config.budgets.prototypes_per_attempt):
+        prototype_count = (
+            self.config.draft_automation.candidates_per_prompt
+            if is_draft_attempt(attempt)
+            else self.config.budgets.prototypes_per_attempt
+        )
+        for index in range(prototype_count):
             if index in completed_indices:
                 continue
             if index in by_index:
@@ -1403,6 +1695,93 @@ class Factory:
                 result=result,
                 hidden_until_label=False,
             )
+        if is_draft_attempt(attempt):
+            ranked: list[tuple[float, str, dict[str, Any], VisualJudgment, GateResult]] = []
+            retained_candidates: list[dict[str, Any]] = []
+            for artifact, judgment, (_, safety) in zip(
+                prototypes,
+                judgments,
+                safety_evaluated,
+                strict=True,
+            ):
+                score = round(
+                    (
+                        judgment.fidelity
+                        + judgment.readability
+                        + judgment.role_clarity
+                        + judgment.animation_quality
+                        + judgment.craft
+                    )
+                    / 5,
+                    6,
+                )
+                metadata = json.loads(artifact["metadata_json"] or "{}")
+                eligible = (
+                    safety.verdict != GateVerdict.FAIL
+                    and judgment.verdict != "machine_rejected"
+                    and not judgment.review_flags
+                )
+                retained_candidates.append(
+                    {
+                        "artifact_id": artifact["id"],
+                        "artifact_sha256": artifact["content_hash"],
+                        "prototype_index": metadata.get("prototype_index"),
+                        "score": score,
+                        "verdict": judgment.verdict,
+                        "eligible": eligible,
+                        "review_flags": judgment.review_flags,
+                    }
+                )
+                if eligible:
+                    # Descending score and then ascending immutable hash makes
+                    # the same retained bytes choose the same authority.
+                    ranked.append((score, artifact["content_hash"], artifact, judgment, safety))
+            if not ranked:
+                return self._reject_attempt(
+                    current,
+                    "draft automation found no safe non-rejected prototype candidate",
+                )
+            ranked.sort(key=lambda value: (-value[0], value[1]))
+            selected_score, _, selected, selected_judgment, _ = ranked[0]
+            queue = draft_attempt_metadata(attempt)
+            rationale = (
+                f"Deterministic safe-candidate rank selected {selected['content_hash']} "
+                f"with mean game-scale score {selected_score:.6f}; "
+                f"verdict={selected_judgment.verdict}."
+            )
+            selection = self._store_json_artifact(
+                attempt,
+                Stage.PROTOTYPE_TRIAGE,
+                ArtifactKind.PROTOTYPE_SELECTION,
+                {
+                    "schema_version": 1,
+                    "mode": "draft_submission",
+                    "queue_id": queue["queue_id"],
+                    "queue_request_sha256": queue["request_sha256"],
+                    "selected_artifact_id": selected["id"],
+                    "selected_artifact_sha256": selected["content_hash"],
+                    "selection_rationale": rationale,
+                    "ranking": "mean-v1:fidelity,readability,role_clarity,animation_quality,craft;hash-tiebreak",
+                    "candidates": retained_candidates,
+                    "human_approval": False,
+                    "maximum_driver_action": "request_admin_review",
+                },
+                metadata={
+                    "selected_artifact_id": selected["id"],
+                    "selected_artifact_sha256": selected["content_hash"],
+                },
+                occurrence_key="draft-selection-v1",
+            )
+            current = self.database.get_attempt(attempt["id"])
+            return self.database.update_attempt(
+                current["id"],
+                current["version"],
+                approved_prototype_hash=selected["content_hash"],
+                prototype_selection_id=selection["id"],
+                stage=Stage.AUTHOR,
+                disposition=Disposition.ACTIVE,
+                review_kind=None,
+            )
         routed = not safety_failed and (not routing.enabled or not all_rejected)
         disposition = Disposition.NEEDS_HUMAN if routed else Disposition.MACHINE_REJECTED
         review_kind = "prototype" if routed else ("prototype_label" if sampled else None)
@@ -1419,7 +1798,27 @@ class Factory:
         return updated
 
     async def _author(self, attempt: dict[str, Any]) -> dict[str, Any]:
-        if not attempt["approved_prototype_hash"] or not attempt["prototype_decision_id"]:
+        draft_submission = is_draft_attempt(attempt)
+        media_catalog_artifact: dict[str, Any] | None = None
+        if draft_submission:
+            preplan_or_attempt = await self._draft_media_preplan(attempt)
+            if isinstance(preplan_or_attempt, dict) and "disposition" in preplan_or_attempt:
+                return preplan_or_attempt
+            preplan = preplan_or_attempt
+            assert isinstance(preplan, DraftMediaPreplan)
+            if preplan.decision == "platform_gap":
+                assert preplan.failure is not None
+                return self._block_attempt(
+                    self.database.get_attempt(attempt["id"]),
+                    "draft media platform_gap: " + preplan.failure.reason,
+                )
+            media_catalog_artifact = await self._materialize_draft_media(attempt, preplan)
+        if not attempt["approved_prototype_hash"]:
+            return self._block_attempt(attempt, "authoring lacks an exact retained prototype selection")
+        if draft_submission:
+            if not attempt.get("prototype_selection_id") or attempt.get("prototype_decision_id"):
+                return self._block_attempt(attempt, "draft authoring lacks an exclusive selection record")
+        elif not attempt["prototype_decision_id"] or attempt.get("prototype_selection_id"):
             return self._block_attempt(attempt, "authoring lacks an exact human prototype approval")
         prototype = self._find_lineage_artifact(
             attempt, ArtifactKind.PROTOTYPE, content_hash=attempt["approved_prototype_hash"]
@@ -1442,17 +1841,35 @@ class Factory:
                     attempt,
                     "approved prototype manifest does not bind the pinned design and geometry contract",
                 )
-        approval = next(
-            (
-                decision
-                for candidate in self._lineage(attempt)
-                for decision in self.database.decisions_for_attempt(candidate["id"])
-                if decision["id"] == attempt["prototype_decision_id"] and decision["action"] == "prototype_approval"
-            ),
-            None,
-        )
-        if approval is None or approval["content_hash"] != prototype["content_hash"]:
-            return self._block_attempt(attempt, "prototype approval decision cannot be verified")
+        approval: dict[str, Any] | None = None
+        selection_payload: dict[str, Any] | None = None
+        selection_artifact: dict[str, Any] | None = None
+        if draft_submission:
+            try:
+                selection_artifact = self.database.get_artifact(str(attempt["prototype_selection_id"]))
+                selection_payload = self.persistence.load_json(selection_artifact["object_ref"])
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
+                return self._block_attempt(attempt, f"draft selection record is unreadable: {error}")
+            if (
+                selection_artifact["attempt_id"] != attempt["id"]
+                or selection_artifact["kind"] != ArtifactKind.PROTOTYPE_SELECTION
+                or selection_payload.get("mode") != "draft_submission"
+                or selection_payload.get("selected_artifact_sha256") != prototype["content_hash"]
+                or selection_payload.get("human_approval") is not False
+            ):
+                return self._block_attempt(attempt, "draft selection record cannot be verified")
+        else:
+            approval = next(
+                (
+                    decision
+                    for candidate in self._lineage(attempt)
+                    for decision in self.database.decisions_for_attempt(candidate["id"])
+                    if decision["id"] == attempt["prototype_decision_id"] and decision["action"] == "prototype_approval"
+                ),
+                None,
+            )
+            if approval is None or approval["content_hash"] != prototype["content_hash"]:
+                return self._block_attempt(attempt, "prototype approval decision cannot be verified")
         try:
             direction_bytes = self.pinned_direction(attempt)
             pinned_gates = self.pinned_gates(attempt)
@@ -1495,6 +1912,14 @@ class Factory:
             )
         if guideline_bytes and self._skill_guidelines(bundle) != guideline_bytes:
             return self._block_attempt(attempt, "pinned shared design guidelines differ from the authoring skill")
+        try:
+            implementation_plan_output_schema = json.loads(bundle.files["schemas/implementation-plan.schema.json"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return self._block_attempt(
+                attempt,
+                "pinned authoring bundle predates the current implementation-plan schema; "
+                "retry under the current package",
+            )
         behavior = json.loads(attempt["behavior_json"])
         feedback = self._lineage_feedback(attempt)
         request_identity = canonical_json(
@@ -1510,13 +1935,18 @@ class Factory:
                 "prototype_guide_sha": behavior.get("prototype_guide_sha"),
             }
         )
+        prototype_input_name = "selected_prototype" if draft_submission else "approved_prototype"
         artifact_refs = {
-            "approved_prototype": prototype["object_ref"],
+            prototype_input_name: prototype["object_ref"],
             "prototype_manifest": prototype_manifest_artifact["object_ref"],
             "canonical_direction": direction_object.uri,
         }
+        materialized_modifier_catalog: dict[str, Any] | None = None
+        if media_catalog_artifact is not None:
+            artifact_refs["materialized_modifier_catalog"] = media_catalog_artifact["object_ref"]
+            materialized_modifier_catalog = self.persistence.load_json(media_catalog_artifact["object_ref"])
         inline_artifacts = {
-            "approved_prototype": InlineArtifact(
+            prototype_input_name: InlineArtifact(
                 content_hash=prototype["content_hash"],
                 media_type=prototype["media_type"],
                 base64_data=base64.b64encode(self.objects.get(prototype["object_ref"])).decode("ascii"),
@@ -1541,6 +1971,42 @@ class Factory:
                 "contract_sha256": behavior["prototype_geometry_sha"],
                 "guide_sha256": behavior["prototype_guide_sha"],
             }
+        if draft_submission:
+            assert selection_payload is not None and selection_artifact is not None
+            prototype_authority_input = {
+                "selection_record_artifact_id": selection_artifact["id"],
+                "selection_record_sha256": selection_artifact["content_hash"],
+                "selected_artifact_id": selection_payload["selected_artifact_id"],
+                "artifact_hash": selection_payload["selected_artifact_sha256"],
+                "selection_rationale": selection_payload["selection_rationale"],
+                "human_approval": False,
+            }
+            trusted_input_authority = {
+                "mode": "draft_submission",
+                "artifact_sha256": prototype_manifest["image_sha256"],
+                "authority_record_sha256": selection_artifact["content_hash"],
+                "human_approval_decision_id": None,
+                "selection_rationale": selection_payload["selection_rationale"],
+                "maximum_driver_action": "request_admin_review",
+            }
+        else:
+            assert approval is not None
+            prototype_authority_input = {
+                "decision_id": approval["id"],
+                "artifact_id": approval["artifact_id"],
+                "artifact_hash": approval["content_hash"],
+                "attempt_version": approval["attempt_version"],
+                "actor": approval["actor"],
+            }
+            trusted_input_authority = {
+                "mode": "approved_prototype",
+                "artifact_sha256": prototype_manifest["image_sha256"],
+                "authority_record_sha256": "sha256:"
+                + hashlib.sha256(canonical_json(prototype_authority_input).encode()).hexdigest(),
+                "human_approval_decision_id": approval["id"],
+                "selection_rationale": None,
+                "maximum_driver_action": "register_private_revision",
+            }
         request = WorkerRequest(
             request_id=f"worker_{hashlib.sha256(request_identity.encode()).hexdigest()}",
             attempt_id=attempt["id"],
@@ -1551,13 +2017,22 @@ class Factory:
             artifact_refs=artifact_refs,
             authoring_inputs={
                 "prototype_manifest": prototype_manifest,
-                "prototype_approval": {
-                    "decision_id": approval["id"],
-                    "artifact_id": approval["artifact_id"],
-                    "artifact_hash": approval["content_hash"],
-                    "attempt_version": approval["attempt_version"],
-                    "actor": approval["actor"],
-                },
+                ("prototype_selection" if draft_submission else "prototype_approval"): prototype_authority_input,
+                "input_authority": trusted_input_authority,
+                "host_capabilities": (
+                    {
+                        "authority_modes": [trusted_input_authority["mode"]],
+                        "operations": ["bind_materialized_modifier", "forge_asset"],
+                        "raster_overhang_px_max": 4,
+                        "max_non_endpoint_generated_assets": 0,
+                    }
+                    if draft_submission
+                    else {
+                        "authority_modes": [trusted_input_authority["mode"]],
+                        "operations": ["generate_asset"],
+                        "raster_overhang_px_max": 0,
+                    }
+                ),
                 "direction": {
                     "sha256": direction_object.uri,
                     "text": direction_bytes.decode("utf-8"),
@@ -1572,6 +2047,7 @@ class Factory:
                     "text": guideline_bytes.decode("utf-8") if guideline_bytes else None,
                 },
                 "prototype_geometry": geometry_input,
+                "materialized_modifier_catalog": materialized_modifier_catalog,
             },
             inline_artifacts=inline_artifacts,
             pure_tools=["color_math", "schema_lookup"],
@@ -1580,8 +2056,8 @@ class Factory:
                 "max_texture_refs": pinned_gates.capabilities["limits"]["max_texture_refs"],
             },
             output_schemas={
-                "implementation_plan": ImplementationPlan.model_json_schema(),
-                "worker_result": WorkerResult.model_json_schema(),
+                "implementation_plan": implementation_plan_output_schema,
+                "worker_result": current_worker_result_json_schema(),
             },
             feedback=feedback,
         )
@@ -1596,7 +2072,14 @@ class Factory:
         )
         worker_result = self._model_result(operation, result, WorkerResult)
         try:
-            validate_worker_handoff(worker_result, bundle.files, pinned_gates.capabilities)
+            validate_worker_handoff(
+                worker_result,
+                bundle.files,
+                pinned_gates.capabilities,
+                trusted_authority=request.authoring_inputs["input_authority"],
+                materialized_modifier_catalog=materialized_modifier_catalog,
+                allow_direct_generation=not draft_submission,
+            )
         except WorkerContractError as error:
             return self._reject_attempt(
                 self.database.get_attempt(attempt["id"]),
@@ -1637,6 +2120,1173 @@ class Factory:
         current = self.database.get_attempt(attempt["id"])
         next_stage = Stage.ASSETS if worker_result.implementation_plan.asset_plan else Stage.BUILD_GATE
         return self.database.update_attempt(current["id"], current["version"], stage=next_stage)
+
+    async def _draft_media_preplan(
+        self,
+        attempt: dict[str, Any],
+    ) -> DraftMediaPreplan | dict[str, Any]:
+        retained = self._find_lineage_artifact(attempt, ArtifactKind.DRAFT_MEDIA_PREPLAN)
+        if retained is not None:
+            try:
+                return DraftMediaPreplan.model_validate(self.persistence.load_json(retained["object_ref"]))
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
+                return self._block_attempt(attempt, f"retained draft media preplan is invalid: {error}")
+        try:
+            bundle = self.pinned_draft_automation_bundle(attempt)
+            schema = json.loads(bundle.files["schemas/draft-media-preplan.schema.json"])
+            guideline_bytes = self.pinned_design_guidelines(attempt)
+            pinned_gates = self.pinned_gates(attempt)
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+            return self._block_attempt(attempt, f"draft media preplanning authority is unavailable: {error}")
+        prototype = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.PROTOTYPE,
+            content_hash=attempt.get("approved_prototype_hash"),
+        )
+        concept_artifact = self._find_lineage_artifact(attempt, ArtifactKind.CONCEPT_BRIEF)
+        if prototype is None or concept_artifact is None:
+            return self._block_attempt(attempt, "draft media preplanning lacks retained prototype/concept bytes")
+        concept = self.persistence.load_json(concept_artifact["object_ref"])
+        behavior = json.loads(attempt["behavior_json"])
+        identity = canonical_json(
+            {
+                "attempt_id": attempt["id"],
+                "automation_skill_sha": bundle.sha256,
+                "prototype": prototype["content_hash"],
+                "concept": concept_artifact["content_hash"],
+                "capability": attempt["capability_sha"],
+            }
+        )
+        request = WorkerRequest(
+            request_id=f"draft_media_{hashlib.sha256(identity.encode()).hexdigest()}",
+            attempt_id=attempt["id"],
+            purpose=Purpose.PRODUCTION,
+            skill_sha256=bundle.sha256,
+            skill_files=bundle.files,
+            capability_manifest=pinned_gates.capabilities,
+            artifact_refs={
+                "selected_prototype": prototype["object_ref"],
+                "concept_brief": concept_artifact["object_ref"],
+            },
+            authoring_inputs={
+                "task": "draft_media_preplan",
+                "concept": concept,
+                "design_guidelines": {
+                    "sha256": behavior.get("design_guidelines_sha"),
+                    "text": guideline_bytes.decode("utf-8"),
+                },
+                "host_capabilities": {
+                    "operations": [
+                        "generate_endpoint_image",
+                        "fal_transition_submit",
+                        "fal_transition_result",
+                        "deterministic_video_frame_extraction",
+                        "forge_asset",
+                    ],
+                    "fal": {
+                        **self.fal_media.capability_manifest(),
+                        "duration_seconds": self.config.draft_automation.fal_transition_duration_seconds,
+                        "resolution": self.config.draft_automation.fal_transition_resolution,
+                        "aspect_ratio": self.config.draft_automation.fal_transition_aspect_ratio,
+                    },
+                    "max_video_intents": self.config.draft_automation.max_video_intents,
+                    "logical_cell_px": 16,
+                    "max_body_columns": 63,
+                    "raster_overhang_px_max": 4,
+                    "endpoint_images_per_video_intent": 2,
+                    "max_non_endpoint_generated_assets": 0,
+                },
+            },
+            inline_artifacts={
+                "selected_prototype": InlineArtifact(
+                    content_hash=prototype["content_hash"],
+                    media_type=prototype["media_type"],
+                    base64_data=base64.b64encode(self.objects.get(prototype["object_ref"])).decode("ascii"),
+                )
+            },
+            pure_tools=["color_math", "schema_lookup"],
+            budget={
+                "max_video_intents": self.config.draft_automation.max_video_intents,
+                "max_frame_rows": int(pinned_gates.capabilities["limits"]["max_sprite_frame_rows"]),
+            },
+            output_schemas={"worker_result": schema, "draft_media_preplan": schema},
+        )
+        execute_typed = getattr(self.worker, "execute_typed", None)
+        if execute_typed is None:
+            return self._block_attempt(attempt, "task worker lacks typed draft media preplanning support")
+        operation, result = await self._provider_call(
+            attempt=attempt,
+            stage=Stage.AUTHOR,
+            key=f"{attempt['id']}:draft-media-preplan:{bundle.sha256}",
+            role="task_worker",
+            side_effect="draft_media_preplan",
+            request=request,
+            invoke=lambda: execute_typed(
+                request,
+                DraftMediaPreplan,
+                system=(
+                    "Plan private Snaketron draft media only. Follow the supplied automate-skin-drafts "
+                    "bundle exactly. You have no tools or side effects and must not invent hashes or "
+                    "claim completed provider work. Return only the requested JSON schema."
+                ),
+            ),
+        )
+        preplan = self._model_result(operation, result, DraftMediaPreplan)
+        if len(preplan.video_intents) > self.config.draft_automation.max_video_intents:
+            return self._block_attempt(
+                self.database.get_attempt(attempt["id"]),
+                "draft media preplan exceeds the advertised video-intent cap",
+            )
+        self._store_json_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.DRAFT_MEDIA_PREPLAN,
+            preplan.model_dump(mode="json"),
+            metadata={"operation_id": operation["id"], "automation_skill_sha": bundle.sha256},
+            occurrence_key="draft-media-preplan-v1",
+        )
+        return preplan
+
+    async def _materialize_draft_media(
+        self,
+        attempt: dict[str, Any],
+        preplan: DraftMediaPreplan,
+    ) -> dict[str, Any]:
+        retained = self._find_lineage_artifact(attempt, ArtifactKind.MEDIA_CATALOG)
+        if retained is not None:
+            return retained
+        if not preplan.video_intents:
+            return self._store_json_artifact(
+                attempt,
+                Stage.AUTHOR,
+                ArtifactKind.MEDIA_CATALOG,
+                {"schema_version": 1, "modifiers": []},
+                occurrence_key="draft-media-catalog-v1",
+            )
+        materialized: list[dict[str, Any]] = []
+        for intent in preplan.video_intents:
+            start = await self._draft_media_endpoint(attempt, intent, endpoint="start")
+            end = await self._draft_media_endpoint(attempt, intent, endpoint="end")
+            video = await self._draft_media_video(attempt, intent, start=start, end=end)
+            materialized.append(
+                await self._draft_media_frame_sheet(
+                    attempt,
+                    intent,
+                    start=start,
+                    end=end,
+                    video=video,
+                )
+            )
+        return self._store_json_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_CATALOG,
+            {"schema_version": 1, "modifiers": materialized},
+            provenance={
+                "preplan_sha256": "sha256:"
+                + hashlib.sha256(canonical_json(preplan.model_dump(mode="json")).encode()).hexdigest()
+            },
+            occurrence_key="draft-media-catalog-v1",
+        )
+
+    async def _draft_media_endpoint(
+        self,
+        attempt: dict[str, Any],
+        intent: DraftVideoIntent,
+        *,
+        endpoint: Literal["start", "end"],
+    ) -> dict[str, Any]:
+        retained = self._find_current_artifact(
+            attempt["id"],
+            ArtifactKind.MEDIA_ENDPOINT,
+            metadata_match={"intent_id": intent.intent_id, "endpoint": endpoint},
+        )
+        if retained is not None:
+            self._verify_draft_media_endpoint_evidence(
+                attempt,
+                intent,
+                endpoint=endpoint,
+                endpoint_artifact=retained,
+            )
+            return retained
+        prototype = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.PROTOTYPE,
+            content_hash=attempt.get("approved_prototype_hash"),
+        )
+        if prototype is None:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "draft media endpoint generation lacks selected prototype bytes",
+                halt_generation=True,
+            )
+        base_prompt = intent.start_frame_prompt if endpoint == "start" else intent.end_frame_prompt
+        extraction_config = VideoFrameExtractionConfig(
+            ffmpeg_path=self.config.draft_automation.ffmpeg_path,
+            ffprobe_path=self.config.draft_automation.ffprobe_path,
+            total_timeout_seconds=self.config.draft_automation.video_extraction_timeout_seconds,
+        )
+        geometry = self._draft_media_endpoint_geometry(
+            intent,
+            source_apron_px=32,
+            output_apron_px=1,
+            max_aspect_scale=extraction_config.max_source_aspect_scale,
+            max_bbox_area_fraction=extraction_config.max_source_bbox_area_fraction,
+            max_upscale=extraction_config.max_source_upscale,
+        )
+        geometry_guide = self._draft_media_endpoint_geometry_guide(intent)
+        geometry_guide_object = self.objects.put(geometry_guide)
+        prompt = f"""Create the exact {endpoint} endpoint for one animated Snaketron modifier.
+Use the first supplied image only as the visual-style reference. Use the second
+supplied blank white snake as the mandatory geometry reference.
+Render exactly one {intent.component_key} component, with a static orthographic
+camera, inside a 3:2 reserved empty arena. The arena background is a single
+flat matte RGB(127,127,127). Keep at least 32 pixels of matte around every
+visible object. No text, labels, shadows, scenery, gradients, extra objects,
+border, or transparency checkerboard.
+Geometry is mandatory:
+- Draw exactly {intent.body_columns} consecutive square 16x16 logical cells in one straight horizontal row.
+- The cell count is structural: make one continuous thin round snake body with no gaps or disconnected square chunks.
+- The logical body core is exactly {geometry["body_core_width_px"]}x16 pixels. The retained native row is
+  exactly {geometry["stored_native_width_px"]}x{geometry["stored_native_row_height_px"]} pixels, including at most
+  {intent.raster_overhang_px} pixels of authored bleed above and below the 16-pixel round body.
+- Target a visible foreground bounding-box aspect of {geometry["visible_bbox_aspect_target"]:.6f}.
+  The deterministic gate rejects aspects below {geometry["visible_bbox_aspect_min"]:.6f} or above
+  {geometry["visible_bbox_aspect_max"]:.6f}, and rejects a foreground bbox above
+  {geometry["max_source_bbox_area_fraction"]:.6f} of the arena area.
+- The source object may require at most {geometry["max_source_upscale"]:.6f}x enlargement to fit
+  the retained native row; do not draw a tiny icon, dot, line, or distant subject.
+- Use no perspective, foreshortening, zoom, or camera padding inside the object. The only empty
+  framing is the external flat matte arena. Do not crop the first or last cell.
+Endpoint direction:
+{base_prompt}
+Return one image only."""
+        provider = self.providers.role("image_generator")
+        request = {
+            "schema_version": 1,
+            "operation": "generate_draft_media_endpoint",
+            "intent_id": intent.intent_id,
+            "endpoint": endpoint,
+            "prompt": prompt,
+            "prototype_sha256": prototype["content_hash"],
+            "geometry_guide_sha256": geometry_guide_object.uri,
+            "references": [
+                {
+                    "role": "visual_style",
+                    "content_ref": prototype["content_hash"],
+                    "media_type": prototype["media_type"],
+                },
+                {
+                    "role": "blank_native_geometry",
+                    "content_ref": geometry_guide_object.uri,
+                    "media_type": "image/png",
+                },
+            ],
+            "geometry": geometry,
+            "arena": {"width_px": 1080, "height_px": 720, "matte_rgb": [127, 127, 127]},
+            "aspect_ratio": "3:2",
+            "image_size": "2K",
+        }
+        operation, result = await self._provider_call(
+            attempt=self.database.get_attempt(attempt["id"]),
+            stage=Stage.AUTHOR,
+            key=f"{attempt['id']}:draft-media:{intent.intent_id}:endpoint:{endpoint}",
+            role="image_generator",
+            side_effect="generate_draft_media_endpoint_image",
+            request=request,
+            invoke=lambda: provider.generate_image(
+                prompt=prompt,
+                references=[
+                    (prototype["media_type"], self.objects.get(prototype["object_ref"])),
+                    ("image/png", geometry_guide),
+                ],
+                aspect_ratio="3:2",
+                image_size="2K",
+            ),
+        )
+        raw, media_type = self._image_result(operation, result)
+        try:
+            with Image.open(io.BytesIO(raw)) as opened:
+                opened.load()
+                source = opened.convert("RGB")
+            decoded = io.BytesIO()
+            # Preserve the provider's complete decoded pixel field. No padding,
+            # resize, crop, or synthetic apron may occur before segmentation.
+            source.save(decoded, format="PNG", optimize=False, compress_level=9)
+            provider_pixels = decoded.getvalue()
+            source.close()
+        except (OSError, ValueError) as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"draft media {endpoint} endpoint cannot be decoded exactly: {error}",
+                request_id=operation.get("provider_request_id"),
+                resolved_model=operation.get("resolved_model"),
+            ) from error
+        provider_artifact = self._store_bytes_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_ENDPOINT_PROVIDER_OUTPUT,
+            provider_pixels,
+            "image/png",
+            metadata={
+                "intent_id": intent.intent_id,
+                "endpoint": endpoint,
+                "operation_id": operation["id"],
+                "provider_media_type": media_type,
+                "normalization": "decoded_pixels_only_no_crop_resize_or_padding",
+            },
+            provenance={"provider_result_hash": operation["result_hash"]},
+            occurrence_key=f"draft-media:{intent.intent_id}:endpoint:{endpoint}:provider-pixels",
+        )
+        request = MatteEndpointRequest(
+            frame_sha256=provider_artifact["content_hash"],
+            body_columns=intent.body_columns,
+            texels_per_cell=16,
+            raster_overhang_px=intent.raster_overhang_px,
+            matte_rgb=tuple(intent.matte_rgb),
+            source_apron_px=32,
+            output_apron_px=1,
+        )
+        try:
+            validated = await asyncio.to_thread(
+                validate_matte_endpoint,
+                provider_pixels,
+                request=request,
+                config=extraction_config,
+                label=f"{intent.intent_id} {endpoint} endpoint",
+            )
+        except VideoFrameExtractionError as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"draft media {endpoint} endpoint failed pre-spend matte validation ({error.code}): {error}",
+            ) from error
+        source = self._store_bytes_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_ENDPOINT_SOURCE_RGBA,
+            validated.source_rgba_png,
+            "image/png",
+            metadata={
+                "intent_id": intent.intent_id,
+                "endpoint": endpoint,
+                "provider_pixels_sha256": provider_artifact["content_hash"],
+            },
+            provenance={"matte_validation_report_sha256": validated.report["report_sha256"]},
+            occurrence_key=f"draft-media:{intent.intent_id}:endpoint:{endpoint}:source-rgba",
+        )
+        native = self._store_bytes_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_ENDPOINT_NATIVE_RGBA,
+            validated.native_rgba_png,
+            "image/png",
+            metadata={
+                "intent_id": intent.intent_id,
+                "endpoint": endpoint,
+                "provider_pixels_sha256": provider_artifact["content_hash"],
+                "body_columns": intent.body_columns,
+                "texels_per_cell": 16,
+                "raster_overhang_px": intent.raster_overhang_px,
+            },
+            provenance={"matte_validation_report_sha256": validated.report["report_sha256"]},
+            occurrence_key=f"draft-media:{intent.intent_id}:endpoint:{endpoint}:native-rgba",
+        )
+        if (
+            validated.report.get("source", {}).get("source_rgba_png_sha256") != source["content_hash"]
+            or validated.report.get("native", {}).get("native_rgba_png_sha256") != native["content_hash"]
+        ):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"draft media {endpoint} endpoint validator returned inconsistent evidence",
+                halt_generation=True,
+            )
+        self._store_json_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_ENDPOINT_VALIDATION_REPORT,
+            validated.report,
+            metadata={
+                "intent_id": intent.intent_id,
+                "endpoint": endpoint,
+                "provider_pixels_sha256": provider_artifact["content_hash"],
+                "source_rgba_sha256": source["content_hash"],
+                "native_rgba_sha256": native["content_hash"],
+            },
+            occurrence_key=f"draft-media:{intent.intent_id}:endpoint:{endpoint}:validation-report",
+        )
+        try:
+            endpoint_bytes = self._compose_draft_media_endpoint(
+                validated.native_rgba_png,
+                tuple(intent.matte_rgb),
+            )
+        except (OSError, ValueError) as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"draft media {endpoint} native object cannot be composed exactly: {error}",
+                halt_generation=True,
+            ) from error
+        retained = self._store_bytes_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_ENDPOINT,
+            endpoint_bytes,
+            "image/png",
+            metadata={
+                "intent_id": intent.intent_id,
+                "endpoint": endpoint,
+                "operation_id": operation["id"],
+                "provider_media_type": media_type,
+                "provider_pixels_sha256": provider_artifact["content_hash"],
+                "source_rgba_sha256": source["content_hash"],
+                "native_rgba_sha256": native["content_hash"],
+                "validation_report_sha256": validated.report["report_sha256"],
+                "width_px": 1080,
+                "height_px": 720,
+                "matte_rgb": list(intent.matte_rgb),
+                "normalization": "validated_native_rgba_centered_without_resampling",
+            },
+            provenance={
+                "provider_result_hash": operation["result_hash"],
+                "provider_pixels_sha256": provider_artifact["content_hash"],
+            },
+            occurrence_key=f"draft-media:{intent.intent_id}:endpoint:{endpoint}",
+        )
+        self._verify_draft_media_endpoint_evidence(
+            attempt,
+            intent,
+            endpoint=endpoint,
+            endpoint_artifact=retained,
+        )
+        return retained
+
+    def _verify_draft_media_endpoint_evidence(
+        self,
+        attempt: dict[str, Any],
+        intent: DraftVideoIntent,
+        *,
+        endpoint: Literal["start", "end"],
+        endpoint_artifact: dict[str, Any],
+    ) -> None:
+        """Verify retained raw segmentation evidence before a paid Fal submit."""
+
+        match = {"intent_id": intent.intent_id, "endpoint": endpoint}
+        report_artifact = self._find_current_artifact(
+            attempt["id"], ArtifactKind.MEDIA_ENDPOINT_VALIDATION_REPORT, metadata_match=match
+        )
+        provider_artifact = self._find_current_artifact(
+            attempt["id"], ArtifactKind.MEDIA_ENDPOINT_PROVIDER_OUTPUT, metadata_match=match
+        )
+        source = self._find_current_artifact(
+            attempt["id"], ArtifactKind.MEDIA_ENDPOINT_SOURCE_RGBA, metadata_match=match
+        )
+        native = self._find_current_artifact(
+            attempt["id"], ArtifactKind.MEDIA_ENDPOINT_NATIVE_RGBA, metadata_match=match
+        )
+        if any(item is None for item in (report_artifact, provider_artifact, source, native)):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"retained {endpoint} endpoint lacks raw pre-spend segmentation evidence",
+                halt_generation=True,
+            )
+        assert report_artifact is not None
+        assert provider_artifact is not None
+        assert source is not None
+        assert native is not None
+        report = self.persistence.load_json(report_artifact["object_ref"])
+        metadata = json.loads(endpoint_artifact["metadata_json"])
+        if (
+            report.get("source", {}).get("input_png_sha256") != provider_artifact["content_hash"]
+            or report.get("source", {}).get("source_rgba_png_sha256") != source["content_hash"]
+            or report.get("native", {}).get("native_rgba_png_sha256") != native["content_hash"]
+            or metadata.get("provider_pixels_sha256") != provider_artifact["content_hash"]
+            or metadata.get("source_rgba_sha256") != source["content_hash"]
+            or metadata.get("native_rgba_sha256") != native["content_hash"]
+            or metadata.get("validation_report_sha256") != report.get("report_sha256")
+        ):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"retained {endpoint} endpoint segmentation evidence is not hash-bound",
+                halt_generation=True,
+            )
+        try:
+            exact_endpoint = self._compose_draft_media_endpoint(
+                self.objects.get(native["object_ref"]),
+                tuple(intent.matte_rgb),
+            )
+        except (OSError, ValueError) as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"retained {endpoint} native endpoint evidence cannot be recomposed: {error}",
+                halt_generation=True,
+            ) from error
+        if (
+            f"sha256:{hashlib.sha256(exact_endpoint).hexdigest()}" != endpoint_artifact["content_hash"]
+            or self.objects.get(endpoint_artifact["object_ref"]) != exact_endpoint
+        ):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"retained {endpoint} Fal arena differs from exact validated native pixels",
+                halt_generation=True,
+            )
+
+    @staticmethod
+    def _draft_media_endpoint_geometry(
+        intent: DraftVideoIntent,
+        *,
+        source_apron_px: int,
+        output_apron_px: int,
+        max_aspect_scale: float,
+        max_bbox_area_fraction: float,
+        max_upscale: float,
+    ) -> dict[str, int | float | bool]:
+        body_width = intent.body_columns * 16
+        row_height = 16 + 2 * intent.raster_overhang_px
+        drawable_width = body_width - 2 * output_apron_px
+        drawable_height = row_height - 2 * output_apron_px
+        aspect = drawable_width / drawable_height
+        return {
+            "logical_body_cells": intent.body_columns,
+            "logical_cell_width_px": 16,
+            "logical_cell_height_px": 16,
+            "body_core_width_px": body_width,
+            "body_core_height_px": 16,
+            "stored_native_width_px": body_width,
+            "stored_native_row_height_px": row_height,
+            "raster_overhang_px_each_transverse_side": intent.raster_overhang_px,
+            "native_output_apron_px": output_apron_px,
+            "native_drawable_width_px": drawable_width,
+            "native_drawable_height_px": drawable_height,
+            "visible_bbox_aspect_target": round(aspect, 6),
+            "visible_bbox_aspect_min": round(aspect / max_aspect_scale, 6),
+            "visible_bbox_aspect_max": round(aspect * max_aspect_scale, 6),
+            "max_source_bbox_area_fraction": max_bbox_area_fraction,
+            "max_source_upscale": max_upscale,
+            "source_matte_apron_px": source_apron_px,
+            "straight_horizontal_row": True,
+            "no_internal_camera_padding": True,
+        }
+
+    @staticmethod
+    def _draft_media_endpoint_geometry_guide(intent: DraftVideoIntent) -> bytes:
+        """Return an exact blank snake silhouette for the endpoint image model."""
+
+        width = intent.body_columns * 16
+        height = 16
+        left = (1080 - width) // 2
+        top = (720 - height) // 2
+        guide = Image.new("RGB", (1080, 720), tuple(intent.matte_rgb))
+        ImageDraw.Draw(guide).rounded_rectangle(
+            (left, top, left + width - 1, top + height - 1),
+            radius=height // 2,
+            fill=(255, 255, 255),
+        )
+        output = io.BytesIO()
+        guide.save(output, format="PNG", optimize=False, compress_level=9)
+        guide.close()
+        return output.getvalue()
+
+    @staticmethod
+    def _compose_draft_media_endpoint(
+        native_rgba_png: bytes,
+        matte_rgb: tuple[int, int, int],
+    ) -> bytes:
+        with Image.open(io.BytesIO(native_rgba_png)) as opened:
+            opened.load()
+            native_image = opened.convert("RGBA")
+        if native_image.width > 1016 or native_image.height > 656:
+            native_image.close()
+            raise ValueError("native endpoint object cannot fit the 32px Fal arena apron")
+        arena = Image.new("RGBA", (1080, 720), (*matte_rgb, 255))
+        arena.alpha_composite(
+            native_image,
+            ((1080 - native_image.width) // 2, (720 - native_image.height) // 2),
+        )
+        output = io.BytesIO()
+        arena.convert("RGB").save(output, format="PNG", optimize=False, compress_level=9)
+        native_image.close()
+        arena.close()
+        return output.getvalue()
+
+    async def _draft_media_video(
+        self,
+        attempt: dict[str, Any],
+        intent: DraftVideoIntent,
+        *,
+        start: dict[str, Any],
+        end: dict[str, Any],
+    ) -> dict[str, Any]:
+        retained = self._find_current_artifact(
+            attempt["id"],
+            ArtifactKind.MEDIA_VIDEO,
+            metadata_match={"intent_id": intent.intent_id},
+        )
+        if retained is not None:
+            return retained
+        # These lookups are a second fail-closed boundary immediately before
+        # the paid submit. Endpoint generation alone never authorizes Fal.
+        for endpoint_name, endpoint_artifact in (("start", start), ("end", end)):
+            self._verify_draft_media_endpoint_evidence(
+                attempt,
+                intent,
+                endpoint=endpoint_name,
+                endpoint_artifact=endpoint_artifact,
+            )
+        period = float(intent.common_period_ms)
+        fps = float(intent.desired_fps)
+        derived_rows = max(2, math.ceil(period * fps / 1_000))
+        row_texels = 16 + 2 * intent.raster_overhang_px
+        effective_cap = min(
+            120,
+            2_048 // row_texels,
+            16_777_216 // (intent.body_columns * 16 * row_texels * 4),
+        )
+        if derived_rows > effective_cap:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"draft media intent {intent.intent_id} needs {derived_rows} rows; exact cap is {effective_cap}",
+                halt_generation=True,
+            )
+        start_bytes = self.objects.get(start["object_ref"])
+        end_bytes = self.objects.get(end["object_ref"])
+        transition_prompt = self._draft_fal_transition_prompt(intent)
+        media_request = {
+            "schema_version": 1,
+            "request_id": f"{attempt['id']}_{intent.intent_id}".replace("-", "_")[:200],
+            "operation": "generate_video",
+            "capability_id": self.config.draft_automation.fal_transition_capability_id,
+            "input_artifacts": [start["content_hash"], end["content_hash"]],
+            "logical_key": intent.logical_key,
+            "component_key": intent.component_key,
+            "prompt": transition_prompt,
+            "model_transition_prompt_sha256": "sha256:"
+            + hashlib.sha256(intent.transition_prompt.encode("utf-8")).hexdigest(),
+            "output_kind": "video",
+            "journal": {
+                "retain_inputs": True,
+                "retain_provider_output": True,
+                "retain_output": True,
+                "retain_reports": True,
+            },
+            "extraction": None,
+            "video": {
+                "start_frame_sha256": start["content_hash"],
+                "end_frame_sha256": end["content_hash"],
+                "source_video_sha256": None,
+                "common_period_ms": period,
+                "desired_fps": fps,
+                "derived_frame_rows": derived_rows,
+                "body_columns": intent.body_columns,
+                "texels_per_cell": 16,
+                "raster_overhang_px": intent.raster_overhang_px,
+                "row_texels": row_texels,
+                "effective_frame_row_cap": effective_cap,
+                "frame_extraction": "deterministic_uniform_full_period",
+                "row_zero": "resting_and_reduced_motion",
+                "alpha_matte_verification": "fail_closed",
+                "loop_closure": "true_final_to_zero",
+                "max_frame_rows": 120,
+            },
+            "reuse": None,
+        }
+        options = PixVerseTransitionOptions(
+            seed=int(intent.seed),
+            reservation_micros=self.config.draft_automation.fal_transition_reservation_micros(),
+            duration_seconds=self.config.draft_automation.fal_transition_duration_seconds,
+            resolution=self.config.draft_automation.fal_transition_resolution,
+            aspect_ratio=self.config.draft_automation.fal_transition_aspect_ratio,
+        )
+        submit_request = self.fal_media.submit_journal_request(
+            media_request,
+            start_frame=start_bytes,
+            start_media_type="image/png",
+            end_frame=end_bytes,
+            end_media_type="image/png",
+            options=options,
+        )
+        submit_operation, submit_result = await self._provider_call(
+            attempt=self.database.get_attempt(attempt["id"]),
+            stage=Stage.AUTHOR,
+            key=f"{attempt['id']}:draft-media:{intent.intent_id}:fal-submit",
+            role="fal_pixverse_transition",
+            side_effect="fal_transition_submit",
+            request=submit_request,
+            invoke=lambda: self.fal_media.submit_transition(
+                media_request,
+                start_frame=start_bytes,
+                start_media_type="image/png",
+                end_frame=end_bytes,
+                end_media_type="image/png",
+                options=options,
+            ),
+        )
+        ticket = FalQueueTicket.from_value(self._json_result(submit_operation, submit_result))
+        poll_operation, poll_result = await self._draft_fal_transition_result(
+            self.database.get_attempt(attempt["id"]),
+            intent_id=intent.intent_id,
+            ticket=ticket,
+            submit_operation=submit_operation,
+        )
+        video_bytes = (
+            poll_result.value if poll_result is not None else self.objects.get(str(poll_operation["result_hash"]))
+        )
+        if not isinstance(video_bytes, bytes):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "Fal result operation did not retain exact MP4 bytes",
+                request_id=ticket.request_id,
+                resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+            )
+        return self._store_bytes_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_VIDEO,
+            video_bytes,
+            "video/mp4",
+            metadata={
+                "intent_id": intent.intent_id,
+                "submit_operation_id": submit_operation["id"],
+                "poll_operation_id": poll_operation["id"],
+                "provider_request_id": ticket.request_id,
+                "media_request": media_request,
+            },
+            provenance={
+                "start_frame_sha256": start["content_hash"],
+                "end_frame_sha256": end["content_hash"],
+            },
+            occurrence_key=f"draft-media:{intent.intent_id}:video",
+        )
+
+    async def _draft_fal_transition_result(
+        self,
+        attempt: dict[str, Any],
+        *,
+        intent_id: str,
+        ticket: FalQueueTicket,
+        submit_operation: dict[str, Any],
+    ) -> tuple[dict[str, Any], ProviderResult | None]:
+        """Perform at most one scheduled GET/read for a retained paid ticket."""
+
+        poll_request = self.fal_media.poll_journal_request(ticket)
+        expected_hash = self.journal.request_hash(poll_request)
+        prefix = f"{attempt['id']}:draft-media:{intent_id}:fal-result:{ticket.request_id}:read:"
+        with self.database.connect() as connection:
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM operation WHERE attempt_id=? AND side_effect=? ORDER BY created_at, id",
+                    (attempt["id"], "fal_transition_result"),
+                ).fetchall()
+                if str(row["idempotency_key"]).startswith(prefix)
+            ]
+        for row in rows:
+            if row["request_hash"] != expected_hash:
+                raise ProviderError(
+                    ProviderFailureKind.INVALID_OUTPUT,
+                    "retained Fal result-read key names a changed ticket request",
+                    request_id=ticket.request_id,
+                    resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+                    halt_generation=True,
+                )
+        succeeded = next(
+            (row for row in reversed(rows) if row["status"] == OperationStatus.SUCCEEDED),
+            None,
+        )
+        if succeeded is not None:
+            return await self._provider_call(
+                attempt=attempt,
+                stage=Stage.AUTHOR,
+                key=succeeded["idempotency_key"],
+                role="fal_pixverse_transition",
+                side_effect="fal_transition_result",
+                request=poll_request,
+                invoke=lambda: self.fal_media.poll_transition(ticket),
+                validate_result_extra=validate_pixverse_video_result,
+                provider_retries_override=0,
+            )
+        failed_terminal = next(
+            (
+                row
+                for row in reversed(rows)
+                if row["status"] in {OperationStatus.FAILED_TERMINAL, OperationStatus.RECONCILIATION_REQUIRED}
+            ),
+            None,
+        )
+        if failed_terminal is not None:
+            raise ExistingOperation(
+                f"Fal result read {failed_terminal['id']} is terminal; inspect its retained evidence"
+            )
+        try:
+            submitted_at = datetime.fromisoformat(str(submit_operation["created_at"]).replace("Z", "+00:00"))
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError) as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "retained Fal submit operation has no valid ticket timestamp",
+                request_id=ticket.request_id,
+                resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+                halt_generation=True,
+            ) from error
+        age_seconds = (datetime.now(UTC) - submitted_at.astimezone(UTC)).total_seconds()
+        maximum_age = self.config.draft_automation.fal_transition_ticket_max_age_seconds
+        if age_seconds > maximum_age:
+            raise ProviderError(
+                ProviderFailureKind.UNAVAILABLE,
+                "Fal queue ticket expired before a validated result was retained; "
+                f"request_id={ticket.request_id}; age={int(age_seconds)}s; max={maximum_age}s; "
+                "operator must reconcile the retained ticket and may not resubmit blindly",
+                request_id=ticket.request_id,
+                resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+                halt_generation=True,
+            )
+        resumable = next(
+            (row for row in reversed(rows) if row["status"] in {OperationStatus.INTENT, OperationStatus.RUNNING}),
+            None,
+        )
+        if resumable is not None:
+            key = str(resumable["idempotency_key"])
+        else:
+            indexes: list[int] = []
+            for row in rows:
+                try:
+                    indexes.append(int(str(row["idempotency_key"]).removeprefix(prefix)))
+                except ValueError:
+                    raise ProviderError(
+                        ProviderFailureKind.INVALID_OUTPUT,
+                        "retained Fal result-read key has an invalid sequence number",
+                        request_id=ticket.request_id,
+                        resolved_model=PIXVERSE_TRANSITION_CAPABILITY,
+                        halt_generation=True,
+                    ) from None
+            key = f"{prefix}{max(indexes, default=-1) + 1}"
+        return await self._provider_call(
+            attempt=attempt,
+            stage=Stage.AUTHOR,
+            key=key,
+            role="fal_pixverse_transition",
+            side_effect="fal_transition_result",
+            request=poll_request,
+            invoke=lambda: self.fal_media.poll_transition(ticket),
+            validate_result_extra=validate_pixverse_video_result,
+            provider_retries_override=0,
+        )
+
+    async def _draft_media_frame_sheet(
+        self,
+        attempt: dict[str, Any],
+        intent: DraftVideoIntent,
+        *,
+        start: dict[str, Any],
+        end: dict[str, Any],
+        video: dict[str, Any],
+    ) -> dict[str, Any]:
+        retained_sheet = self._find_current_artifact(
+            attempt["id"],
+            ArtifactKind.MEDIA_FRAME_SHEET,
+            metadata_match={"intent_id": intent.intent_id},
+        )
+        retained_manifest = self._find_current_artifact(
+            attempt["id"],
+            ArtifactKind.MODIFIER_MANIFEST,
+            metadata_match={"intent_id": intent.intent_id},
+        )
+        if retained_sheet is not None and retained_manifest is not None:
+            payload = self.persistence.load_json(retained_manifest["object_ref"])
+            record = dict(payload["catalog_record"])
+            record["modifier_manifest_sha256"] = retained_manifest["content_hash"]
+            return record
+
+        start_bytes = self.objects.get(start["object_ref"])
+        end_bytes = self.objects.get(end["object_ref"])
+        video_bytes = self.objects.get(video["object_ref"])
+        frame_rows = max(2, math.ceil(intent.common_period_ms * intent.desired_fps / 1_000))
+        extraction_request = VideoFrameExtractionRequest(
+            source_video_sha256=video["content_hash"],
+            start_frame_sha256=start["content_hash"],
+            end_frame_sha256=end["content_hash"],
+            body_columns=intent.body_columns,
+            texels_per_cell=16,
+            raster_overhang_px=intent.raster_overhang_px,
+            frame_rows=frame_rows,
+            desired_fps=float(intent.desired_fps),
+            common_period_ms=float(intent.common_period_ms),
+            matte_rgb=tuple(intent.matte_rgb),
+            source_apron_px=32,
+            output_apron_px=1,
+        )
+        extraction_config = VideoFrameExtractionConfig(
+            ffmpeg_path=self.config.draft_automation.ffmpeg_path,
+            ffprobe_path=self.config.draft_automation.ffprobe_path,
+            total_timeout_seconds=self.config.draft_automation.video_extraction_timeout_seconds,
+        )
+        operation_request = {
+            "schema_version": 1,
+            "operation": "deterministic_video_to_rgba_frame_sheet",
+            "intent_id": intent.intent_id,
+            "tools": video_toolchain_identity(extraction_config),
+            "inputs": {
+                "video": video["content_hash"],
+                "start": start["content_hash"],
+                "end": end["content_hash"],
+            },
+            "request": asdict(extraction_request),
+            "config": asdict(extraction_config),
+        }
+
+        async def invoke_extractor() -> ProviderResult:
+            try:
+                extracted = await asyncio.to_thread(
+                    extract_rgba_frame_sheet,
+                    video_bytes,
+                    start_frame_png=start_bytes,
+                    end_frame_png=end_bytes,
+                    request=extraction_request,
+                    config=extraction_config,
+                )
+            except VideoFrameExtractionError as error:
+                # A paid PixVerse output can deterministically fail matte,
+                # geometry, codec, camera, or loop checks without indicating
+                # that the configured program behavior changed. Those failures
+                # terminalize only this Attempt. Escalate globally only when
+                # exact retained bytes moved or the admitted media toolchain
+                # disappeared between identity capture and execution.
+                invariant_drift = error.code in {"hash_mismatch", "tool_unavailable"}
+                raise ProviderError(
+                    ProviderFailureKind.INVALID_OUTPUT,
+                    f"deterministic video extraction failed closed ({error.code}): {error}",
+                    resolved_model="deterministic-video-frame-extractor-v1",
+                    halt_generation=invariant_drift,
+                ) from error
+            return ProviderResult(
+                value={"image": extracted.sheet_png, "media_type": "image/png"},
+                request_id=f"local-{intent.intent_id}",
+                resolved_model="deterministic-video-frame-extractor-v1",
+                sanitized_metadata={"extraction_report": extracted.report},
+                usage={"cost_micros": 0, "usage_complete": True},
+            )
+
+        self._assert_wall_time_before_spend(
+            required_seconds=extraction_config.total_timeout_seconds,
+            boundary="deterministic video frame extraction",
+        )
+        operation, result = await self._provider_call(
+            attempt=self.database.get_attempt(attempt["id"]),
+            stage=Stage.AUTHOR,
+            key=f"{attempt['id']}:draft-media:{intent.intent_id}:extract-sheet",
+            role="deterministic_video_extractor",
+            side_effect="extract_rgba_frame_sheet",
+            request=operation_request,
+            invoke=invoke_extractor,
+        )
+        sheet_bytes, media_type = self._image_result(operation, result)
+        if media_type != "image/png":
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "deterministic frame extractor did not retain a PNG sheet",
+                resolved_model="deterministic-video-frame-extractor-v1",
+            )
+        operation_metadata = json.loads(operation.get("metadata_json") or "{}")
+        report = operation_metadata.get("extraction_report")
+        if not isinstance(report, dict):
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "deterministic frame extractor operation omitted its exact report",
+                resolved_model="deterministic-video-frame-extractor-v1",
+            )
+        if report.get("tools") != operation_request["tools"]:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "deterministic extractor tool identity changed after journal admission",
+                resolved_model="deterministic-video-frame-extractor-v1",
+                halt_generation=True,
+            )
+        expected_sheet_hash = report.get("output", {}).get("sheet_png_sha256")
+        actual_sheet_hash = f"sha256:{hashlib.sha256(sheet_bytes).hexdigest()}"
+        if expected_sheet_hash != actual_sheet_hash:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "deterministic extractor report differs from retained sheet bytes",
+                resolved_model="deterministic-video-frame-extractor-v1",
+                halt_generation=True,
+            )
+        row_height = 16 + 2 * intent.raster_overhang_px
+        frame_bytes: list[bytes] = []
+        try:
+            with Image.open(io.BytesIO(sheet_bytes)) as opened:
+                opened.load()
+                sheet_image = opened.convert("RGBA")
+            if sheet_image.size != (intent.body_columns * 16, frame_rows * row_height):
+                raise ValueError("sheet dimensions differ from the exact authored grid")
+            for index in range(frame_rows):
+                frame = sheet_image.crop((0, index * row_height, sheet_image.width, (index + 1) * row_height))
+                output = io.BytesIO()
+                frame.save(output, format="PNG", optimize=False, compress_level=9)
+                frame.close()
+                frame_bytes.append(output.getvalue())
+            sheet_image.close()
+        except (OSError, ValueError) as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"retained extracted sheet cannot be split exactly: {error}",
+                resolved_model="deterministic-video-frame-extractor-v1",
+            ) from error
+        expected_frames = report.get("output", {}).get("frame_png_sha256")
+        actual_frames = [f"sha256:{hashlib.sha256(value).hexdigest()}" for value in frame_bytes]
+        if expected_frames != actual_frames:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "retained frame rows differ from extractor report hashes",
+                resolved_model="deterministic-video-frame-extractor-v1",
+                halt_generation=True,
+            )
+        report_artifact = self._store_json_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_EXTRACTION_REPORT,
+            report,
+            metadata={"intent_id": intent.intent_id, "operation_id": operation["id"]},
+            occurrence_key=f"draft-media:{intent.intent_id}:extraction-report",
+        )
+        frame_artifacts = [
+            self._store_bytes_artifact(
+                attempt,
+                Stage.AUTHOR,
+                ArtifactKind.MEDIA_EXTRACTED_FRAME,
+                value,
+                "image/png",
+                metadata={"intent_id": intent.intent_id, "frame_index": index},
+                provenance={"extraction_operation_id": operation["id"]},
+                occurrence_key=f"draft-media:{intent.intent_id}:frame:{index}",
+            )
+            for index, value in enumerate(frame_bytes)
+        ]
+        sheet_artifact = self._store_bytes_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_FRAME_SHEET,
+            sheet_bytes,
+            "image/png",
+            metadata={
+                "intent_id": intent.intent_id,
+                "width_px": intent.body_columns * 16,
+                "height_px": frame_rows * row_height,
+                "frame_rows": frame_rows,
+                "body_columns": intent.body_columns,
+                "texels_per_cell": 16,
+                "raster_overhang_px": intent.raster_overhang_px,
+                "row_texels": row_height,
+                "alpha_verified": True,
+                "operation_id": operation["id"],
+                "report_artifact_id": report_artifact["id"],
+            },
+            provenance={
+                "video_sha256": video["content_hash"],
+                "start_frame_sha256": start["content_hash"],
+                "end_frame_sha256": end["content_hash"],
+                "frame_sha256": [item["content_hash"] for item in frame_artifacts],
+            },
+            occurrence_key=f"draft-media:{intent.intent_id}:frame-sheet",
+        )
+        provenance_payload = {
+            "schema_version": 1,
+            "lineage_id": attempt["concept_id"],
+            "intent_id": intent.intent_id,
+            "endpoint_artifact_ids": [start["id"], end["id"]],
+            "video_artifact_id": video["id"],
+            "sheet_artifact_id": sheet_artifact["id"],
+            "report_artifact_id": report_artifact["id"],
+            "operation_ids": {
+                "extract": operation["id"],
+                "fal_submit": json.loads(video["metadata_json"])["submit_operation_id"],
+                "fal_result": json.loads(video["metadata_json"])["poll_operation_id"],
+            },
+        }
+        provenance_artifact = self._store_json_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MEDIA_PROVENANCE,
+            provenance_payload,
+            metadata={"intent_id": intent.intent_id},
+            occurrence_key=f"draft-media:{intent.intent_id}:provenance",
+        )
+        extraction_evidence = {
+            "source_arena": "reserved_empty",
+            "alpha_contract": "exact_mask_matte",
+            "background_removal": "required",
+            "matte_policy": "fail_closed",
+            "cropped_object_retained": True,
+        }
+        video_evidence = {
+            "start_frame_sha256": start["content_hash"],
+            "end_frame_sha256": end["content_hash"],
+            "source_video_sha256": video["content_hash"],
+            "extracted_sheet_sha256": sheet_artifact["content_hash"],
+            "common_period_ms": float(intent.common_period_ms),
+            "desired_fps": float(intent.desired_fps),
+            "derived_frame_rows": frame_rows,
+            "effective_frame_row_cap": min(
+                120,
+                2_048 // row_height,
+                16_777_216 // (intent.body_columns * 16 * row_height * 4),
+            ),
+            "frame_extraction": "deterministic_uniform_full_period",
+            "alpha_matte_verification": "fail_closed",
+            "loop_closure": "true_final_to_zero",
+            "retained_inputs_and_output": True,
+        }
+        asset = AssetPlan(
+            kind="sheet",
+            natural_length_cells=intent.body_columns,
+            frames=frame_rows,
+            desired_fps=float(intent.desired_fps),
+            texels_per_cell=16,
+            raster_overhang_px=intent.raster_overhang_px,
+            anchor=intent.anchor,
+            fit="tile" if intent.anchor == "whole" else "clip",
+            tile_phase_origin="tail" if intent.anchor == "whole" else None,
+            fade="none" if intent.anchor == "whole" else ("trailing" if intent.anchor == "head" else "leading"),
+            transverse_edge_policy="fail_closed_transparent_effect",
+            prompt=(
+                f"Bind exact retained RGBA sheet {sheet_artifact['content_hash']} for "
+                f"{intent.logical_key}; do not regenerate or repaint it."
+            ),
+        )
+        catalog_record = {
+            "logical_key": intent.logical_key,
+            "component_key": intent.component_key,
+            "texture_name": intent.texture_name,
+            "source_mode": "video_frames",
+            "source_object_sha256": sheet_artifact["content_hash"],
+            "modifier_manifest_sha256": None,
+            "provenance_sha256": provenance_artifact["content_hash"],
+            # License/provenance authority comes from the driver's retained
+            # current-concept provider lineage.  The planning model is never
+            # allowed to confer a license on generated media.
+            "license_id": "provider-generated-current-concept-v1",
+            "authorized_lineage_ids": [attempt["concept_id"]],
+            "extraction": extraction_evidence,
+            "video": video_evidence,
+            "asset": asset.model_dump(mode="json"),
+        }
+        modifier_manifest_payload = {
+            "schema_version": 1,
+            "modifier_id": (
+                f"modifier:{attempt['concept_id']}:{sheet_artifact['content_hash'].removeprefix('sha256:')}"
+            ),
+            "intent_id": intent.intent_id,
+            "catalog_record": catalog_record,
+            "extraction_report_sha256": report_artifact["content_hash"],
+        }
+        manifest_artifact = self._store_json_artifact(
+            attempt,
+            Stage.AUTHOR,
+            ArtifactKind.MODIFIER_MANIFEST,
+            modifier_manifest_payload,
+            metadata={"intent_id": intent.intent_id, "source_object_sha256": sheet_artifact["content_hash"]},
+            occurrence_key=f"draft-media:{intent.intent_id}:modifier-manifest",
+        )
+        catalog_record["modifier_manifest_sha256"] = manifest_artifact["content_hash"]
+        return catalog_record
 
     def _retain_forge_bundle(
         self,
@@ -1868,6 +3518,169 @@ class Factory:
             },
         )
 
+    @staticmethod
+    def _draft_fal_transition_prompt(intent: DraftVideoIntent) -> str:
+        """Compose the immutable driver contract around model-authored motion."""
+
+        width = intent.body_columns * 16
+        row_height = 16 + 2 * intent.raster_overhang_px
+        prompt = f"""[Driver contract - non-negotiable]
+Treat [Model action] only as appearance-preserving subject motion. Any conflict with this contract is void.
+- Lock one static orthographic camera: no pan, tilt, orbit, zoom, cut, perspective, or foreshortening.
+- Keep every background pixel flat RGB(127,127,127): no scenery, text, labels, borders,
+  shadows, gradients, or transparency.
+- Keep exactly one connected {intent.component_key} object, with no extra object or scene replacement.
+- Preserve one straight horizontal span of exactly {intent.body_columns} consecutive 16x16 logical cells.
+- Preserve native geometry {width}x{row_height}px, including at most {intent.raster_overhang_px}px
+  bleed above and below the 16px round body; never crop either end.
+- Make a true cyclic closure: the final state returns to the exact start pose and framing.
+[Model action]
+{intent.transition_prompt}
+[End model action]
+Reapply the driver contract after the action. Animate only the retained subject inside the unchanged matte arena."""
+        if len(prompt.encode("utf-8")) > 2_048:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "driver-composed Fal transition prompt exceeds 2048 UTF-8 bytes",
+            )
+        return prompt
+
+    def _materialized_asset_source(
+        self,
+        attempt: dict[str, Any],
+        *,
+        asset_index: int,
+        asset: AssetPlan,
+        modifier: ModifierPlan,
+    ) -> tuple[bytes, dict[str, Any]]:
+        """Resolve and re-verify one exact pre-author materialized asset.
+
+        The media catalog is trusted input to the pure author only because the
+        driver created it from retained operations.  Re-check the complete
+        binding here, immediately before forge, so no later code path can
+        silently substitute a generated image or a similarly named artifact.
+        """
+
+        if modifier.source_mode != "video_frames":
+            raise WorkerContractError(
+                "platform_gap: direct-draft forge currently materializes only exact video_frames records"
+            )
+        expected = expected_materialized_catalog_record(asset, modifier)
+        catalog_artifact = self._find_lineage_artifact(attempt, ArtifactKind.MEDIA_CATALOG)
+        if catalog_artifact is None:
+            raise WorkerContractError(f"asset {asset_index} has no retained media catalog")
+        catalog = self.persistence.load_json(catalog_artifact["object_ref"])
+        records = catalog.get("modifiers") if isinstance(catalog, dict) else None
+        if not isinstance(records, list):
+            raise WorkerContractError("retained media catalog has no modifiers array")
+        matches = [
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("logical_key") == modifier.logical_key
+        ]
+        if len(matches) != 1 or matches[0] != expected:
+            raise WorkerContractError(f"asset {asset_index} differs from its one exact retained media catalog record")
+
+        source_hash = modifier.source_object_sha256
+        manifest_hash = modifier.modifier_manifest_sha256
+        if source_hash is None or manifest_hash is None or modifier.video is None:
+            raise WorkerContractError(f"asset {asset_index} has incomplete video-frame evidence")
+        source_artifact = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.MEDIA_FRAME_SHEET,
+            content_hash=source_hash,
+        )
+        manifest_artifact = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.MODIFIER_MANIFEST,
+            content_hash=manifest_hash,
+        )
+        provenance_artifact = self._find_lineage_artifact(
+            attempt,
+            ArtifactKind.MEDIA_PROVENANCE,
+            content_hash=modifier.provenance_sha256,
+        )
+        if source_artifact is None or manifest_artifact is None or provenance_artifact is None:
+            raise WorkerContractError(
+                f"asset {asset_index} is missing its exact sheet, modifier manifest, or provenance"
+            )
+        if source_artifact["media_type"] != "image/png":
+            raise WorkerContractError(f"asset {asset_index} materialized sheet is not a retained PNG")
+
+        manifest = self.persistence.load_json(manifest_artifact["object_ref"])
+        manifest_record = dict(expected)
+        # A content-addressed document cannot contain its own hash.  The
+        # outer catalog binds that hash; the immutable manifest retains the
+        # otherwise-complete record with this one field deliberately empty.
+        manifest_record["modifier_manifest_sha256"] = None
+        if not isinstance(manifest, dict) or manifest.get("catalog_record") != manifest_record:
+            raise WorkerContractError(f"asset {asset_index} modifier manifest differs from its catalog")
+        report_hash = manifest.get("extraction_report_sha256")
+        if (
+            not isinstance(report_hash, str)
+            or self._find_lineage_artifact(
+                attempt,
+                ArtifactKind.MEDIA_EXTRACTION_REPORT,
+                content_hash=report_hash,
+            )
+            is None
+        ):
+            raise WorkerContractError(f"asset {asset_index} has no exact extraction report")
+
+        for kind, content_hash, label, media_type in (
+            (
+                ArtifactKind.MEDIA_ENDPOINT,
+                modifier.video.start_frame_sha256,
+                "start endpoint",
+                "image/png",
+            ),
+            (
+                ArtifactKind.MEDIA_ENDPOINT,
+                modifier.video.end_frame_sha256,
+                "end endpoint",
+                "image/png",
+            ),
+            (
+                ArtifactKind.MEDIA_VIDEO,
+                modifier.video.source_video_sha256,
+                "source video",
+                "video/mp4",
+            ),
+        ):
+            evidence = self._find_lineage_artifact(attempt, kind, content_hash=content_hash)
+            if evidence is None or evidence["media_type"] != media_type:
+                raise WorkerContractError(f"asset {asset_index} has no exact retained {label}")
+
+        metadata = json.loads(source_artifact["metadata_json"])
+        expected_geometry = {
+            "width_px": asset.natural_length_cells * asset.texels_per_cell,
+            "height_px": asset.frames * asset_row_texels(asset),
+            "frame_rows": asset.frames,
+            "body_columns": asset.natural_length_cells,
+            "texels_per_cell": asset.texels_per_cell,
+            "raster_overhang_px": asset.raster_overhang_px,
+            "row_texels": asset_row_texels(asset),
+            "alpha_verified": True,
+        }
+        if any(metadata.get(field) != value for field, value in expected_geometry.items()):
+            raise WorkerContractError(f"asset {asset_index} sheet geometry differs from its exact plan")
+        source = self.objects.get(source_artifact["object_ref"])
+        if f"sha256:{hashlib.sha256(source).hexdigest()}" != source_hash:
+            raise WorkerContractError(f"asset {asset_index} sheet bytes differ from their content hash")
+        try:
+            with Image.open(io.BytesIO(source)) as opened:
+                opened.load()
+                if opened.format != "PNG" or opened.mode != "RGBA":
+                    raise ValueError("sheet must remain exact RGBA PNG")
+                if opened.size != (
+                    expected_geometry["width_px"],
+                    expected_geometry["height_px"],
+                ):
+                    raise ValueError("decoded sheet dimensions differ")
+        except (OSError, ValueError) as error:
+            raise WorkerContractError(f"asset {asset_index} materialized sheet failed exact decode: {error}") from error
+        return source, source_artifact
+
     async def _build_assets(self, attempt: dict[str, Any]) -> dict[str, Any]:
         try:
             pinned_gates = self.pinned_gates(attempt)
@@ -1894,6 +3707,21 @@ class Factory:
             )
         if str(attempt.get("restart_stage") or "").startswith("re_evaluate:"):
             return await self._re_evaluate_asset(attempt, plan)
+        remaining_image_reservation = self._planned_asset_image_reservation(
+            plan,
+            attempt=attempt,
+        )
+        try:
+            self._check_budget(attempt, remaining_image_reservation)
+        except BudgetExceeded as error:
+            # An active scheduler must not retry the same unaffordable plan
+            # forever. Retain the exact plan and make the operator action
+            # explicit; no asset-provider operation has started here.
+            return self._block_attempt(
+                self.database.get_attempt(attempt["id"]),
+                "retained asset plan cannot fit its worst-case remaining provider reservation: "
+                f"{remaining_image_reservation} micros ({error})",
+            )
 
         document_artifact = self._find_lineage_artifact(attempt, ArtifactKind.SKIN_DOCUMENT)
         prototype = self._find_lineage_artifact(
@@ -1907,6 +3735,7 @@ class Factory:
         trace = self._find_lineage_artifact(attempt, ArtifactKind.WORKER_TRACE)
         tool_requests = self.persistence.load_json(trace["object_ref"]).get("tool_requests", []) if trace else []
         generated_textures: list[dict[str, Any]] = []
+        modifiers = {item.asset_index: item for item in plan.modifier_plan}
 
         for index, asset in enumerate(plan.asset_plan):
             uploaded = self._find_current_artifact(
@@ -1917,43 +3746,27 @@ class Factory:
             if uploaded:
                 generated_textures.append(self.persistence.load_json(uploaded["object_ref"]))
                 continue
-            request_spec = next(
-                (
-                    request
-                    for request in tool_requests
-                    if request.get("kind") == "generate_asset"
-                    and int(request.get("arguments", {}).get("asset_index", -1)) == index
-                ),
-                None,
-            )
-            base_prompt = (request_spec.get("arguments", {}).get("prompt") if request_spec else None) or asset.prompt
-            if not base_prompt:
-                base_prompt = f"Create the final {asset.kind} art faithful to the approved snake prototype."
-            rejection_feedback = ""
             accepted: ForgeBundle | None = None
             accepted_evidence: dict[str, Any] | None = None
             accepted_normalized: dict[str, Any] | None = None
             accepted_generation: int | None = None
-            for generation in range(self.config.budgets.provider_retries + 1):
-                prompt = self._asset_prompt(asset, base_prompt, rejection_feedback, human_feedback)
+            rejection_feedback = ""
+            modifier = modifiers.get(index)
+            materialized = modifier is not None and modifier.source_mode != "direct_generate"
+            if materialized:
                 try:
-                    raw, raw_artifact = await self._generate_asset_provider_source(
-                        attempt=attempt,
-                        asset=asset,
+                    assert modifier is not None
+                    raw, raw_artifact = self._materialized_asset_source(
+                        attempt,
                         asset_index=index,
-                        generation=generation,
-                        prompt=prompt,
-                        prototype=prototype,
-                        prototype_bytes=prototype_bytes,
+                        asset=asset,
+                        modifier=modifier,
                     )
-                except ProviderError as error:
-                    if error.outcome_known and error.kind == ProviderFailureKind.INVALID_OUTPUT:
-                        # The journal retained/quarantined the exact paid
-                        # response. Continue only at the next bounded
-                        # generation key; never replay the failed operation.
-                        rejection_feedback = f"provider output failed exact validation: {error}"
-                        continue
-                    raise
+                except WorkerContractError as error:
+                    return self._reject_attempt(
+                        self.database.get_attempt(attempt["id"]),
+                        f"asset {index} materialized evidence is invalid: {error}",
+                    )
                 self._assert_wall_time_before_spend(required_seconds=900, boundary="local forge")
                 bundle = await self._with_lease_heartbeat(asyncio.to_thread(self.assets.forge, raw, asset))
                 normalized = self._store_bytes_artifact(
@@ -1964,27 +3777,103 @@ class Factory:
                     "image/png",
                     metadata={
                         "asset_index": index,
-                        "generation": generation,
-                        "phase": "normalized_forge_input",
-                        "provider_artifact_id": raw_artifact["id"],
+                        "generation": 0,
+                        "phase": "normalized_materialized_forge_input",
+                        "materialized_source_artifact_id": raw_artifact["id"],
+                        "materialized_source_sha256": raw_artifact["content_hash"],
+                        "source_mode": modifier.source_mode,
                     },
-                    occurrence_key=f"asset:{index}:generation:{generation}:normalized-input",
+                    provenance={
+                        "materialized_source_artifact_id": raw_artifact["id"],
+                        "modifier_manifest_sha256": modifier.modifier_manifest_sha256,
+                    },
+                    occurrence_key=f"asset:{index}:materialized:normalized-input",
                 )
                 evidence, gate_accepted = self._retain_forge_bundle(
                     attempt=attempt,
                     asset_index=index,
-                    generation=generation,
+                    generation=0,
                     bundle=bundle,
                     normalized=normalized,
-                    provider_artifact_id=raw_artifact["id"],
+                    provider_artifact_id=None,
                 )
-                if gate_accepted:
-                    accepted = bundle
-                    accepted_evidence = evidence
-                    accepted_normalized = normalized
-                    accepted_generation = generation
-                    break
-                rejection_feedback = "; ".join(reason for gate in bundle.gate_results for reason in gate.reasons)
+                if not gate_accepted:
+                    reasons = "; ".join(reason for gate in bundle.gate_results for reason in gate.reasons)
+                    return self._reject_attempt(
+                        self.database.get_attempt(attempt["id"]),
+                        f"asset {index} exact materialized bytes failed strict forge; "
+                        f"regeneration is forbidden: {reasons}",
+                    )
+                accepted = bundle
+                accepted_evidence = evidence
+                accepted_normalized = normalized
+                accepted_generation = 0
+            else:
+                request_spec = next(
+                    (
+                        request
+                        for request in tool_requests
+                        if request.get("kind") == "generate_asset"
+                        and int(request.get("arguments", {}).get("asset_index", -1)) == index
+                    ),
+                    None,
+                )
+                base_prompt = (
+                    request_spec.get("arguments", {}).get("prompt") if request_spec else None
+                ) or asset.prompt
+                if not base_prompt:
+                    base_prompt = f"Create the final {asset.kind} art faithful to the approved snake prototype."
+                for generation in range(self.config.budgets.provider_retries + 1):
+                    prompt = self._asset_prompt(asset, base_prompt, rejection_feedback, human_feedback)
+                    try:
+                        raw, raw_artifact = await self._generate_asset_provider_source(
+                            attempt=attempt,
+                            asset=asset,
+                            asset_index=index,
+                            generation=generation,
+                            prompt=prompt,
+                            prototype=prototype,
+                            prototype_bytes=prototype_bytes,
+                        )
+                    except ProviderError as error:
+                        if error.outcome_known and error.kind == ProviderFailureKind.INVALID_OUTPUT:
+                            # The journal retained/quarantined the exact paid
+                            # response. Continue only at the next bounded
+                            # generation key; never replay the failed operation.
+                            rejection_feedback = f"provider output failed exact validation: {error}"
+                            continue
+                        raise
+                    self._assert_wall_time_before_spend(required_seconds=900, boundary="local forge")
+                    bundle = await self._with_lease_heartbeat(asyncio.to_thread(self.assets.forge, raw, asset))
+                    normalized = self._store_bytes_artifact(
+                        attempt=attempt,
+                        stage=Stage.ASSETS,
+                        kind=ArtifactKind.SOURCE_ASSET,
+                        data=bundle.normalized_source,
+                        media_type="image/png",
+                        metadata={
+                            "asset_index": index,
+                            "generation": generation,
+                            "phase": "normalized_forge_input",
+                            "provider_artifact_id": raw_artifact["id"],
+                        },
+                        occurrence_key=f"asset:{index}:generation:{generation}:normalized-input",
+                    )
+                    evidence, gate_accepted = self._retain_forge_bundle(
+                        attempt=attempt,
+                        asset_index=index,
+                        generation=generation,
+                        bundle=bundle,
+                        normalized=normalized,
+                        provider_artifact_id=raw_artifact["id"],
+                    )
+                    if gate_accepted:
+                        accepted = bundle
+                        accepted_evidence = evidence
+                        accepted_normalized = normalized
+                        accepted_generation = generation
+                        break
+                    rejection_feedback = "; ".join(reason for gate in bundle.gate_results for reason in gate.reasons)
             if accepted is None:
                 return self._reject_attempt(
                     self.database.get_attempt(attempt["id"]),
@@ -2193,12 +4082,13 @@ class Factory:
                 "idempotency_key": idempotency_key,
                 "evaluation_only": evaluation_only,
             }
+            side_effect = "create_private_skin_revision"
             operation, result = await self._provider_call(
                 attempt=attempt,
                 stage=Stage.REGISTER,
                 key=f"{attempt['id']}:create-skin:{document_artifact['content_hash']}",
                 role="snaketron_api",
-                side_effect="create_private_skin_revision",
+                side_effect=side_effect,
                 request=request,
                 invoke=lambda: self.api.create_skin(
                     name=skin_name,
@@ -2213,12 +4103,13 @@ class Factory:
                 "expected_head_revision": int(previous["production_revision"]),
                 "document": document,
             }
+            side_effect = "append_private_skin_revision"
             operation, result = await self._provider_call(
                 attempt=attempt,
                 stage=Stage.REGISTER,
                 key=f"{attempt['id']}:append-skin:{document_artifact['content_hash']}",
                 role="snaketron_api",
-                side_effect="append_private_skin_revision",
+                side_effect=side_effect,
                 request=request,
                 invoke=lambda: self.api.append_revision(
                     skin_id=previous["production_skin_id"],
@@ -2227,6 +4118,17 @@ class Factory:
                 ),
             )
         response = self._json_result(operation, result)
+        try:
+            validate_registration_result(
+                side_effect=side_effect,
+                request=request,
+                response=response,
+            )
+        except (RecoveredResultError, TypeError, ValueError) as error:
+            return self._block_attempt(
+                self.database.get_attempt(attempt["id"]),
+                f"Snaketron registration response violated exact authority: {error}",
+            )
         skin_id = response.get("skinId") or response.get("skin_id")
         revision = response.get("headRevision") or response.get("head_revision")
         content_ref = response.get("contentRef") or response.get("content_ref")
@@ -2234,6 +4136,27 @@ class Factory:
             return self._block_attempt(
                 self.database.get_attempt(attempt["id"]),
                 "Snaketron registration response omitted skinId/headRevision/contentRef",
+            )
+        expected_document_bytes = canonical_json(document).encode("utf-8")
+        try:
+            self._assert_wall_time_before_spend(
+                required_seconds=self.config.service.request_timeout_seconds,
+                boundary="private SkinDoc readback",
+            )
+            stored_document = await self._with_lease_heartbeat(self.api.get_skin_document(str(content_ref)))
+        except AttributeError:
+            return self._block_attempt(
+                self.database.get_attempt(attempt["id"]),
+                "Snaketron API adapter cannot perform authenticated private SkinDoc readback",
+            )
+        if (
+            not isinstance(stored_document, bytes)
+            or stored_document != expected_document_bytes
+            or f"sha256:{hashlib.sha256(stored_document).hexdigest()}" != str(content_ref)
+        ):
+            return self._block_attempt(
+                self.database.get_attempt(attempt["id"]),
+                "Snaketron private SkinDoc readback differs from the exact registered canonical bytes",
             )
         concept = self.database.get_concept(concept["id"])
         if attempt["purpose"] == Purpose.PRODUCTION and concept["stable_skin_id"] is None:
@@ -2425,6 +4348,61 @@ class Factory:
                 disposition=Disposition.EXPERIMENT_COMPLETE,
                 review_kind=None,
             )
+        if is_draft_attempt(attempt):
+            self.database.add_evaluation(
+                artifact_id=render["id"],
+                attempt_id=attempt["id"],
+                evaluator="visual_judge",
+                result=result,
+                hidden_until_label=False,
+            )
+            self.database.add_evaluation(
+                artifact_id=render["id"],
+                attempt_id=attempt["id"],
+                evaluator="visual_judge_safety_ip",
+                result=safety_result,
+                hidden_until_label=False,
+            )
+            if safety_result.verdict == GateVerdict.FAIL or judgment.verdict == "machine_rejected":
+                return self._reject_attempt(
+                    self.database.get_attempt(attempt["id"]),
+                    "direct draft failed completed-build safety or visual triage; private revision retained",
+                )
+            current = self.database.get_attempt(attempt["id"])
+            skin_id = current["production_skin_id"]
+            revision = current["production_revision"]
+            content_ref = current["production_content_hash"]
+            if not skin_id or not revision or not content_ref:
+                return self._block_attempt(
+                    current,
+                    "Admin review cannot open without exact registered private revision authority",
+                )
+            request = {
+                "skin_id": skin_id,
+                "revision": int(revision),
+                "content_ref": content_ref,
+            }
+            await self._provider_call(
+                attempt=current,
+                stage=Stage.BUILD_TRIAGE,
+                key=f"{attempt['id']}:request-admin-review:{skin_id}:{revision}:{content_ref}",
+                role="snaketron_api",
+                side_effect="request_exact_publication_review",
+                request=request,
+                invoke=lambda: self.api.request_publication_exact(
+                    skin_id=skin_id,
+                    revision=int(revision),
+                    content_ref=content_ref,
+                ),
+            )
+            current = self.database.get_attempt(attempt["id"])
+            return self.database.update_attempt(
+                current["id"],
+                current["version"],
+                stage=Stage.COMPLETE,
+                disposition=Disposition.AWAITING_ADMIN_REVIEW,
+                review_kind=None,
+            )
         routing = self.calibration.routing_status("build", evaluator_version=result.gate_version)
         safety_failed = safety_result.verdict == GateVerdict.FAIL
         rejected = judgment.verdict == "machine_rejected"
@@ -2503,6 +4481,8 @@ class Factory:
         side_effect: str,
         request: Any,
         invoke: Any,
+        validate_result_extra: Any | None = None,
+        provider_retries_override: int | None = None,
     ) -> tuple[dict[str, Any], ProviderResult | None]:
         drift = self._behavior_drift_reason(attempt, stage)
         if drift is not None:
@@ -2516,10 +4496,21 @@ class Factory:
         }
         request_hash = self.journal.request_hash(request)
         request_object = self.objects.put(self.journal.request_payload(request))
-        retries = self.config.budgets.provider_retries
+        retries = (
+            self.config.budgets.provider_retries if provider_retries_override is None else provider_retries_override
+        )
+        if retries < 0:
+            raise ValueError("provider_retries_override cannot be negative")
 
         def validate_result(result: ProviderResult) -> None:
             self._validate_resolved_model(attempt, role, result)
+            if validate_result_extra is not None:
+                validate_result_extra(result)
+
+        repeatable_provider_read = role == "fal_pixverse_transition" and side_effect == "fal_transition_result"
+        repeatable_local_computation = (
+            role == "deterministic_video_extractor" and side_effect == "extract_rgba_frame_sheet"
+        )
 
         async def run_journal(operation_key: str, retry: int):
             operation, result = await self._with_lease_heartbeat(
@@ -2540,6 +4531,8 @@ class Factory:
                         "request_ref": request_object.uri,
                         "request_sha256": request_object.sha256,
                     },
+                    repeatable_read=repeatable_provider_read,
+                    repeatable_local=repeatable_local_computation,
                 )
             )
             operation_metadata = json.loads(operation.get("metadata_json") or "{}")
@@ -2634,7 +4627,10 @@ class Factory:
                 # fails closed for RUNNING/reconciliation/terminal states.
                 if existing["status"] == OperationStatus.SUCCEEDED:
                     self._validate_replayed_operation_model(attempt, role, existing)
-                if existing["status"] == OperationStatus.INTENT:
+                if existing["status"] == OperationStatus.INTENT or (
+                    existing["status"] == OperationStatus.RUNNING
+                    and (repeatable_provider_read or repeatable_local_computation)
+                ):
                     self._assert_wall_time_before_spend(role=role)
                 return await run_journal(operation_key, retry)
 
@@ -2684,6 +4680,11 @@ class Factory:
                     required_seconds,
                     float(self.config.optimizer.promotion_timeout_seconds + 30),
                 )
+            elif role == "fal_pixverse_transition":
+                required_seconds = max(
+                    required_seconds,
+                    float(self.config.draft_automation.fal_transition_timeout_seconds),
+                )
             boundary = role
         if self._run_deadline is None:
             return
@@ -2710,6 +4711,28 @@ class Factory:
         subsequent calls cannot move even within the allowed family.
         """
 
+        if role == "deterministic_video_extractor":
+            if result.resolved_model != "deterministic-video-frame-extractor-v1":
+                raise ProviderError(
+                    ProviderFailureKind.INVALID_OUTPUT,
+                    "video extractor resolved identity differs from the pinned deterministic implementation",
+                    request_id=result.request_id,
+                    resolved_model=result.resolved_model,
+                    halt_generation=True,
+                )
+            return
+        if role == "fal_pixverse_transition":
+            resolved = result.resolved_model
+            expected = self.config.draft_automation.fal_transition_capability_id
+            if resolved != expected or resolved != PIXVERSE_TRANSITION_CAPABILITY:
+                raise ProviderError(
+                    ProviderFailureKind.INVALID_OUTPUT,
+                    f"Fal resolved capability {resolved!r} differs from pinned {expected!r}",
+                    request_id=result.request_id,
+                    resolved_model=resolved,
+                    halt_generation=True,
+                )
+            return
         config_role_name = "task_worker" if role == "task_worker" else role
         role_config = getattr(self.config.models, config_role_name, None)
         if role_config is None:
@@ -2763,7 +4786,10 @@ class Factory:
             metadata = parsed_metadata
             resolved = operation.get("resolved_model")
             config_role_name = "task_worker" if role == "task_worker" else role
-            if hasattr(self.config.models, config_role_name):
+            if hasattr(self.config.models, config_role_name) or role in {
+                "fal_pixverse_transition",
+                "deterministic_video_extractor",
+            }:
                 if not isinstance(resolved, str) or not resolved:
                     raise RecoveredResultError(f"replayed {role} operation omitted its resolved model identity")
                 self._validate_resolved_model(
@@ -2785,6 +4811,13 @@ class Factory:
                 raise RecoveredResultError("authenticated recovery omitted its retained result hash")
             if not isinstance(resolved, str) or not resolved:
                 raise RecoveredResultError("authenticated recovery omitted its resolved model identity")
+            recovered_result_metadata = recovery.get("result_metadata")
+            video_metadata = (
+                {"video": recovered_result_metadata.get("video")}
+                if isinstance(recovered_result_metadata, dict)
+                and recovered_result_metadata.get("result") == {"kind": "video", "media_type": "video/mp4"}
+                else None
+            )
             validate_recovered_result(
                 config=self.config,
                 operation=operation,
@@ -2793,6 +4826,8 @@ class Factory:
                 result_hash=result_hash,
                 resolved_model=resolved,
                 media_type=recovery.get("media_type"),
+                provider_request_id=operation.get("provider_request_id"),
+                result_metadata=video_metadata,
             )
         except (ProviderError, RecoveredResultError, TypeError, ValueError) as error:
             evidence_ref = None
@@ -2858,6 +4893,12 @@ class Factory:
         return operation_task.result()
 
     def _reservation(self, role: str, side_effect: str) -> int:
+        if role == "fal_pixverse_transition":
+            if side_effect == "fal_transition_submit":
+                return self.config.draft_automation.fal_transition_reservation_micros()
+            if side_effect == "fal_transition_result":
+                return 0
+            raise ValueError(f"unsupported Fal journal side effect {side_effect!r}")
         if not hasattr(self.config.models, role):
             return 0
         model = getattr(self.config.models, role)
@@ -3127,10 +5168,7 @@ class Factory:
 
     @staticmethod
     def _prototype_image_rules(guidelines: str) -> str:
-        if (
-            guidelines.count(_PROTOTYPE_IMAGE_RULES_START) != 1
-            or guidelines.count(_PROTOTYPE_IMAGE_RULES_END) != 1
-        ):
+        if guidelines.count(_PROTOTYPE_IMAGE_RULES_START) != 1 or guidelines.count(_PROTOTYPE_IMAGE_RULES_END) != 1:
             raise ValueError("pinned design guidelines must have one prototype-image rules boundary")
         start = guidelines.index(_PROTOTYPE_IMAGE_RULES_START) + len(_PROTOTYPE_IMAGE_RULES_START)
         end = guidelines.index(_PROTOTYPE_IMAGE_RULES_END)
@@ -3224,15 +5262,15 @@ class Factory:
         return f"""GEOMETRY — HIGHEST PRIORITY
 The attached PNG is the strict repository-owned body guide. Paint the existing
 white capsule; do not redesign its outline. Geometry contract
-`{values['contract_id']}` is pinned as sha256:{geometry_sha}; the attached guide
+`{values["contract_id"]}` is pinned as sha256:{geometry_sha}; the attached guide
 is pinned as sha256:{guide_sha}.
 
-- The body occupies an invisible grid of exactly {values['body_cells']} columns x 1 row of square occupancy cells.
-- Every logical cell is square: {values['native_cell_px']}x{values['native_cell_px']} px in the native renderer.
-- The complete native body is exactly {values['native_body_width']}x{values['native_body_height']} px.
-- In the attached {values['presentation_scale']}x reference, every cell is
-  {values['presentation_cell_px']}x{values['presentation_cell_px']} px and the body is exactly
-  {values['presentation_body_width']}x{values['presentation_body_height']} px.
+- The body occupies an invisible grid of exactly {values["body_cells"]} columns x 1 row of square occupancy cells.
+- Every logical cell is square: {values["native_cell_px"]}x{values["native_cell_px"]} px in the native renderer.
+- The complete native body is exactly {values["native_body_width"]}x{values["native_body_height"]} px.
+- In the attached {values["presentation_scale"]}x reference, every cell is
+  {values["presentation_cell_px"]}x{values["presentation_cell_px"]} px and the body is exactly
+  {values["presentation_body_width"]}x{values["presentation_body_height"]} px.
 - A cell is a measurement only. Do not draw the grid or turn cells into visible
   squares, plates, panels, diamonds, joints, or separate segments.
 - Paint one continuous, flat, right-facing capsule. The rightmost one-cell
@@ -3248,7 +5286,7 @@ CREATIVE BRIEF
 Create prototype variation {index + 1} for this Snaketron skin. Geometry wins
 over every creative instruction if they conflict.
 Concept brief (literal JSON string):
-{canonical_json(concept['brief'])}
+{canonical_json(concept["brief"])}
 SHARED SKIN DESIGN RULES
 The following is the exact image-relevant excerpt of the shared rules used by
 the downstream skin author. Pinned authority: sha256:{design_sha}.
@@ -3333,18 +5371,61 @@ This is a constrained small-scale skin reference, not poster art."""
         return slices
 
     def _validate_asset_image_call_budget(self, plan: ImplementationPlan) -> None:
-        slice_counts = [len(self._asset_image_slices(asset)) for asset in plan.asset_plan]
+        direct_indexes = (
+            {item.asset_index for item in plan.modifier_plan if item.source_mode == "direct_generate"}
+            if plan.modifier_plan
+            else set(range(len(plan.asset_plan)))
+        )
+        slice_counts = [
+            (index, len(self._asset_image_slices(asset)))
+            for index, asset in enumerate(plan.asset_plan)
+            if index in direct_indexes
+        ]
         per_asset = self.config.budgets.max_image_slices_per_asset
-        for index, count in enumerate(slice_counts):
+        for index, count in slice_counts:
             if count > per_asset:
                 raise ValueError(f"asset {index} needs {count} slices; configured maximum is {per_asset}")
         # The same configured retry count bounds both known-safe transport
         # retries and image regeneration after a strict deterministic reject.
         rounds = self.config.budgets.provider_retries + 1
-        worst_case_calls = sum(slice_counts) * rounds * rounds
+        worst_case_calls = sum(count for _index, count in slice_counts) * rounds * rounds
         maximum = self.config.budgets.max_asset_image_calls_per_attempt
         if worst_case_calls > maximum:
             raise ValueError(f"worst-case image calls {worst_case_calls} exceed configured attempt maximum {maximum}")
+
+    def _planned_asset_image_reservation(
+        self,
+        plan: ImplementationPlan,
+        *,
+        attempt: dict[str, Any] | None = None,
+    ) -> int:
+        """Conservatively price every still-possible direct image call."""
+
+        direct_indexes = (
+            {item.asset_index for item in plan.modifier_plan if item.source_mode == "direct_generate"}
+            if plan.modifier_plan
+            else set(range(len(plan.asset_plan)))
+        )
+        if attempt is not None:
+            direct_indexes = {
+                index
+                for index in direct_indexes
+                if self._find_current_artifact(
+                    attempt["id"],
+                    ArtifactKind.FORGE_MANIFEST,
+                    metadata_match={"asset_index": index, "uploaded": True},
+                )
+                is None
+            }
+        slice_count = sum(
+            len(self._asset_image_slices(asset))
+            for index, asset in enumerate(plan.asset_plan)
+            if index in direct_indexes
+        )
+        rounds = self.config.budgets.provider_retries + 1
+        worst_case_calls = slice_count * rounds * rounds
+        per_call = self._reservation("image_generator", "generate_build_asset")
+        return worst_case_calls * per_call
 
     async def _generate_asset_provider_source(
         self,
@@ -3500,6 +5581,7 @@ This is a constrained small-scale skin reference, not poster art."""
                 body_columns=asset.natural_length_cells,
                 frame_rows=frame_rows,
                 texels_per_cell=asset.texels_per_cell,
+                raster_overhang_px=asset.raster_overhang_px,
             )
             normalized_artifact = self._store_bytes_artifact(
                 attempt,
@@ -3514,7 +5596,7 @@ This is a constrained small-scale skin reference, not poster art."""
                     "slice": request["slice"],
                     "provider_artifact_id": raw_artifact["id"],
                     "target_width_px": asset.natural_length_cells * asset.texels_per_cell,
-                    "target_height_px": frame_rows * asset.texels_per_cell,
+                    "target_height_px": frame_rows * asset_row_texels(asset),
                     "normalization": "no_crop_direct_resize",
                 },
                 provenance={"operation_id": operation["id"], "provider_artifact_id": raw_artifact["id"]},
@@ -3545,7 +5627,7 @@ This is a constrained small-scale skin reference, not poster art."""
                 "provider_artifact_ids": [artifact["id"] for artifact in raw_artifacts],
                 "normalized_slice_artifact_ids": [artifact["id"] for artifact in normalized_artifacts],
                 "width_px": asset.natural_length_cells * asset.texels_per_cell,
-                "height_px": asset.frames * asset.texels_per_cell,
+                "height_px": asset.frames * asset_row_texels(asset),
                 "assembly": "vertical_exact_no_crop",
             },
             provenance={
@@ -3638,6 +5720,7 @@ grid and then measure the bytes.{corrections}{retry}"""
         if len(manifests) != len(plan.asset_plan):
             raise ValueError("generated manifest count differs from asset plan")
         claimed: set[int] = set()
+        modifiers = {item.asset_index: item for item in plan.modifier_plan}
         for index, (asset, manifest) in enumerate(zip(plan.asset_plan, manifests, strict=True)):
             request = next(
                 (
@@ -3648,7 +5731,10 @@ grid and then measure the bytes.{corrections}{retry}"""
                 ),
                 None,
             )
+            modifier = modifiers.get(index)
             texture_name = request.get("arguments", {}).get("texture_name") if request else None
+            if texture_name is None and modifier is not None:
+                texture_name = modifier.texture_name
             if texture_name:
                 matches = [i for i, item in enumerate(textures) if item.get("name") == texture_name]
             else:

@@ -19,9 +19,13 @@ audit-only source image.
 
 Verify before implementation:
 
-1. The approval names the exact projected `image_sha256` and the manifest
-   records the same digest. It must not name `source_image_sha256`. Do not use a
-   visually similar candidate or raw provider source.
+1. `input_authority.artifact_sha256` names the exact projected
+   `image_sha256`, and the manifest records the same digest. It must not name
+   `source_image_sha256`. In `approved_prototype` mode, retain the exact human
+   `prototype_approval` decision and record hash. In `draft_submission` mode,
+   retain the agent selection rationale and selection-record hash, set the
+   maximum action to `request_admin_review`, and never call it approval. Do not
+   use a visually similar candidate or raw provider source.
 2. The manifest preserves the brief, palette and motion intent, prompt, stored
    model-configuration reference, implementation hint, and rationale. The
    immutable Artifact/Attempt metadata separately preserves the resolved model,

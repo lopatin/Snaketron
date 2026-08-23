@@ -35,6 +35,12 @@ from .lama import (
 from .objects import ObjectStore
 from .renderer import renderer_bundle_manifest, renderer_bundle_manifest_sha
 from .snaketron_api import validate_service_capabilities
+from .video_frames import (
+    VideoFrameExtractionConfig,
+    VideoFrameExtractionRequest,
+    extract_rgba_frame_sheet,
+    media_tool_environment,
+)
 from .worker import SkillBundle
 from .worker_validation import validate_worker_handoff
 
@@ -89,6 +95,7 @@ class FactoryDoctor:
         checks.append(self._capture_command_check())
         checks.append(self._renderer_bundle_check())
         checks.append(self._lama_check())
+        checks.append(self._draft_automation_media_check())
         checks.append(self._git_signing_check())
         checks.append(await self._git_remote_check(offline=offline))
         checks.append(await self._browser_check(offline=offline))
@@ -153,6 +160,15 @@ class FactoryDoctor:
             "gate_manifest": self.config.paths.gate_manifest,
             "prototype_geometry_contract": self.config.paths.prototype_geometry,
         }
+        if self.config.draft_automation.enabled:
+            paths.update(
+                {
+                    "draft_automation_skill": self.config.draft_automation.skill_dir / "SKILL.md",
+                    "draft_automation_preplan_schema": (
+                        self.config.draft_automation.skill_dir / "schemas" / "draft-media-preplan.schema.json"
+                    ),
+                }
+            )
         return [
             DoctorCheck(
                 name=name,
@@ -193,7 +209,7 @@ class FactoryDoctor:
         if identity in {"operator", "all"}:
             required.add(self.config.review.operator_secret_env)
             required.add(self.config.service.operator_token_env)
-        return [
+        checks = [
             DoctorCheck(
                 name=f"credential:{name}",
                 ok=bool(os.environ.get(name)),
@@ -201,6 +217,27 @@ class FactoryDoctor:
             )
             for name in sorted(required)
         ]
+        if identity in {"service", "all"} and self.config.draft_automation.enabled:
+            primary = self.config.draft_automation.fal_api_key_env
+            fallback = self.config.draft_automation.fal_api_key_fallback_env
+            present = [name for name in (primary, fallback) if os.environ.get(name)]
+            consistent = not (len(present) == 2 and os.environ.get(primary) != os.environ.get(fallback))
+            checks.append(
+                DoctorCheck(
+                    name=f"credential:{primary}|{fallback}",
+                    ok=bool(present) and consistent,
+                    detail=(
+                        f"set via {present[0]}"
+                        if len(present) == 1
+                        else "set consistently via both aliases"
+                        if present and consistent
+                        else "missing"
+                        if not present
+                        else "conflicting aliases"
+                    ),
+                )
+            )
+        return checks
 
     def _database_check(self) -> DoctorCheck:
         try:
@@ -373,6 +410,111 @@ class FactoryDoctor:
                 f"bundle sha256:{lama_bundle_sha(bundle)}"
             ),
         )
+
+    def _draft_automation_media_check(self) -> DoctorCheck:
+        """Prove the exact local video toolchain before any paid Fal submit."""
+
+        if not self.config.draft_automation.enabled:
+            return DoctorCheck(
+                name="draft_automation_media",
+                ok=True,
+                required=False,
+                detail="draft automation is disabled",
+            )
+        try:
+            bundle = SkillBundle.load(self.config.draft_automation.skill_dir)
+            schema = json.loads(bundle.files["schemas/draft-media-preplan.schema.json"])
+            if schema.get("type") != "object" or not isinstance(schema.get("properties"), dict):
+                raise ValueError("draft media preplan schema is not a strict object schema")
+
+            frame = Image.new("RGB", (108, 72), (127, 127, 127))
+            draw = ImageDraw.Draw(frame)
+            draw.rounded_rectangle((20, 27, 87, 44), radius=8, fill=(24, 202, 220))
+            endpoint = io.BytesIO()
+            frame.save(endpoint, format="PNG", optimize=False, compress_level=9)
+            endpoint_png = endpoint.getvalue()
+            endpoint_sha = f"sha256:{hashlib.sha256(endpoint_png).hexdigest()}"
+
+            with tempfile.TemporaryDirectory(prefix="skin-factory-media-doctor-") as directory:
+                root = Path(directory)
+                endpoint_path = root / "endpoint.png"
+                video_path = root / "loop.mp4"
+                endpoint_path.write_bytes(endpoint_png)
+                completed = subprocess.run(
+                    [
+                        self.config.draft_automation.ffmpeg_path,
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-loop",
+                        "1",
+                        "-i",
+                        str(endpoint_path),
+                        "-t",
+                        "1",
+                        "-r",
+                        "2",
+                        "-an",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:v",
+                        "libx264",
+                        "-y",
+                        str(video_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=media_tool_environment(),
+                    timeout=30,
+                    check=False,
+                )
+                if completed.returncode != 0 or not video_path.is_file():
+                    raise RuntimeError(
+                        "ffmpeg synthetic loop failed: " + (completed.stderr or completed.stdout).strip()[-500:]
+                    )
+                video = video_path.read_bytes()
+
+            request = VideoFrameExtractionRequest(
+                source_video_sha256=f"sha256:{hashlib.sha256(video).hexdigest()}",
+                start_frame_sha256=endpoint_sha,
+                end_frame_sha256=endpoint_sha,
+                body_columns=4,
+                texels_per_cell=16,
+                raster_overhang_px=4,
+                frame_rows=2,
+                desired_fps=2,
+                common_period_ms=1_000,
+                matte_rgb=(127, 127, 127),
+                source_apron_px=8,
+                output_apron_px=1,
+            )
+            extraction = extract_rgba_frame_sheet(
+                video,
+                start_frame_png=endpoint_png,
+                end_frame_png=endpoint_png,
+                request=request,
+                config=VideoFrameExtractionConfig(
+                    ffmpeg_path=self.config.draft_automation.ffmpeg_path,
+                    ffprobe_path=self.config.draft_automation.ffprobe_path,
+                    total_timeout_seconds=min(
+                        120,
+                        self.config.draft_automation.video_extraction_timeout_seconds,
+                    ),
+                ),
+            )
+            tools = extraction.report["tools"]
+            return DoctorCheck(
+                name="draft_automation_media",
+                ok=True,
+                detail=(
+                    f"skill sha256:{bundle.sha256}; synthetic RGBA extraction passed; "
+                    f"ffmpeg={tools['ffmpeg']['binary_sha256']}; "
+                    f"ffprobe={tools['ffprobe']['binary_sha256']}"
+                ),
+            )
+        except Exception as error:
+            return DoctorCheck(name="draft_automation_media", ok=False, detail=_safe_error(error))
 
     def _git_signing_check(self) -> DoctorCheck:
         repo = self.config.paths.repo_root
@@ -629,7 +771,7 @@ class FactoryDoctor:
                 )
             if not isinstance(result.value, WorkerResult):
                 raise ValueError("worker execution did not return a validated WorkerResult")
-            validate_worker_handoff(result.value, bundle.files, capabilities)
+            validate_worker_handoff(result.value, bundle.files, capabilities, allow_legacy=True)
             if (
                 result.value.implementation_plan.path != "layers"
                 or result.value.implementation_plan.asset_plan

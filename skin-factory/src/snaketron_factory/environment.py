@@ -60,6 +60,15 @@ def load_service_environment(config: FactoryConfig, path: Path | None) -> None:
     if unknown:
         raise PermissionError("service environment contains undeclared names: " + ", ".join(unknown))
     missing = sorted(name for name in config.required_service_environment_names() if not payload.get(name))
+    if config.draft_automation.enabled:
+        primary_name = config.draft_automation.fal_api_key_env
+        fallback_name = config.draft_automation.fal_api_key_fallback_env
+        primary = payload.get(primary_name, "")
+        fallback = payload.get(fallback_name, "")
+        if not primary and not fallback:
+            missing.append(f"{primary_name}|{fallback_name}")
+        if primary and fallback and primary != fallback:
+            raise PermissionError("service environment contains conflicting Fal credential aliases")
     if missing:
         raise PermissionError("service environment is missing required credentials: " + ", ".join(missing))
     for name in config.credential_environment_names():

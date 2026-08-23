@@ -11,9 +11,10 @@ Use two different JSON files with mode `0600`:
 
 - The **service** file contains `GEMINI_API_KEY` for the default roles (or the
   exact environment variable named by a configured OpenAI-compatible role) and
-  `SNAKETRON_FACTORY_SERVICE_TOKEN`, plus `LMSTUDIO_API_KEY` only when the
-  configured task-worker endpoint requires one. It must not contain the review
-  token, review actor, or Snaketron operator token.
+  `SNAKETRON_FACTORY_SERVICE_TOKEN`, one of `FAL_API_KEY`/`FAL_KEY` for the
+  enabled draft-animation path, plus `LMSTUDIO_API_KEY` only when the configured
+  task-worker endpoint requires one. It must not contain the review token,
+  review actor, or Snaketron operator token.
 - The **operator** file contains `SKIN_FACTORY_REVIEW_TOKEN`,
   `SKIN_FACTORY_REVIEW_ACTOR`, and `SNAKETRON_FACTORY_OPERATOR_TOKEN`. It is
   used only for the gallery and explicit human commands.
@@ -32,6 +33,18 @@ install -m 600 scripts/factory.operator-env.example.json \
 vi "$HOME/.config/snaketron-skin-factory/service.json"
 vi "$HOME/.config/snaketron-skin-factory/operator.json"
 ```
+
+If Fal is already exported from `.zshrc`, import it once without printing it:
+
+```sh
+python3 scripts/manage-service-credential.py import-fal \
+  --service-env "$HOME/.config/snaketron-skin-factory/service.json"
+```
+
+The importer uses an explicit fresh zsh login probe only during this one-time
+operator action, rejects ambiguous startup output, writes canonical
+`FAL_API_KEY` atomically, and leaves the JSON at mode `0600`. Hermes never
+sources `.zshrc`.
 
 Create a dedicated, durable Snaketron account through `/api/auth/register`.
 Do not add its numeric user id to `SNAKETRON_ADMIN_USER_IDS`; do not reuse an
@@ -236,8 +249,10 @@ checks the Snaketron health endpoint and authenticated least-privilege
 capability envelope, verifies the frozen LaMa environment and model hash,
 loads the model and performs one bounded 32x32 inference with network access
 disabled, verifies all retained object hashes, and performs SQLite
-integrity/migration checks. It does not create a Snaketron canary or call a
-paid image provider.
+integrity/migration checks. It also validates the automation skill/schema and
+runs a small synthetic matte-to-RGBA extraction through the exact installed
+ffmpeg/ffprobe binaries, reporting their hashes. It does not create a
+Snaketron canary or call a paid image/video provider.
 
 After reviewing those results, opt in to one explicit paid/resumability smoke
 cycle. This is the only command in the install flow that authorizes generation
@@ -313,6 +328,18 @@ Scheduler plus durable factory status:
 ```sh
 ./scripts/hermes-status.sh
 ```
+
+Queue a skin for unattended private-draft creation with:
+
+```sh
+uv run factory enqueue-draft "Clockwork Tide" \
+  --brief "A navy snake with crisp brass wave teeth that reads cleanly at game scale." \
+  --motion "The brass wave advances through one calm true cyclic loop."
+```
+
+The checked-in Hermes mode consumes this inbox automatically and stops after
+requesting Snaketron Admin review for the exact private revision. It never
+publishes and does not require the local review gallery.
 
 Launch the human surface in a separate process carrying the operator identity:
 

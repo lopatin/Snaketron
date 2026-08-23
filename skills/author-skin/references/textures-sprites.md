@@ -6,6 +6,13 @@ default is Gemini 3 Pro Image, but requests describe pixels and geometry rather
 than naming a vendor. The response must record the resolved provider/model,
 request id, prompt, source references, and exact byte hashes.
 
+When the prototype decomposes into separable modifiers, do not ask for a
+packed atlas of conceptual components. Read
+[modifiers-video.md](modifiers-video.md), extract each component into verified
+transparent bytes first, and bind each immutable object to its own texture and
+anchored image layer unless the pinned renderer advertises an exact
+source-region primitive.
+
 ## Ask for usable source art
 
 State the asset kind, exact grid/dimensions accepted by the capability manifest,
@@ -109,3 +116,9 @@ frame order, no unintended whole-picture translation, temporal continuity,
 final-to-zero loop, short/median/long placement, bytes/dimensions/palette, and
 reduced motion on row zero. A sprite that ends inside the body needs a declared
 leading/trailing fade so its bitmap edge does not read as a cut.
+
+Provider video is permitted only through the separately advertised journaled
+media pipeline. It does not relax any sheet rule: deterministic frame
+timestamps, derived rows, common period, alpha/matte checks, retained bytes,
+and the true final-to-zero loop remain mandatory. Use procedural layer
+transforms instead when distinct drawn frames are unnecessary.

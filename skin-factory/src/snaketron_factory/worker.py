@@ -8,11 +8,11 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .config import FactoryConfig
 from .domain import (
@@ -96,8 +96,19 @@ class SkillBundle:
         return cls(files=dict(files), sha256=hasher.hexdigest())
 
 
+WorkerModel = TypeVar("WorkerModel", bound=BaseModel)
+
+
 class WorkerAdapter(Protocol):
     async def execute(self, request: WorkerRequest) -> ProviderResult: ...
+
+    async def execute_typed(
+        self,
+        request: WorkerRequest,
+        result_model: type[WorkerModel],
+        *,
+        system: str,
+    ) -> ProviderResult: ...
 
 
 def _is_exact_lmstudio_model_unloaded(response: httpx.Response) -> bool:
@@ -168,6 +179,15 @@ the deterministic factory driver.
         return headers
 
     async def execute(self, request: WorkerRequest) -> ProviderResult:
+        return await self.execute_typed(request, WorkerResult, system=self.SYSTEM)
+
+    async def execute_typed(
+        self,
+        request: WorkerRequest,
+        result_model: type[WorkerModel],
+        *,
+        system: str,
+    ) -> ProviderResult:
         skill_text = "\n\n".join(f"--- {name} ---\n{body}" for name, body in request.skill_files.items())
         user = {
             "request": request.model_dump(mode="json", exclude={"skill_files", "inline_artifacts"}),
@@ -184,10 +204,17 @@ the deterministic factory driver.
                     },
                 }
             )
+        try:
+            response_schema = request.output_schemas["worker_result"]
+        except KeyError as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                "WorkerRequest omitted its exact worker_result output schema",
+            ) from error
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self.SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": content},
             ],
             "temperature": 0.2,
@@ -198,7 +225,7 @@ the deterministic factory driver.
                 "json_schema": {
                     "name": "snaketron_worker_result",
                     "strict": True,
-                    "schema": WorkerResult.model_json_schema(),
+                    "schema": response_schema,
                 },
             },
         }
@@ -313,7 +340,7 @@ the deterministic factory driver.
                 request_id=request_id,
             )
         try:
-            result = WorkerResult.model_validate_json(content)
+            result = result_model.model_validate_json(content)
         except (ValidationError, ValueError) as error:
             raise ProviderError(
                 ProviderFailureKind.INVALID_OUTPUT,
@@ -362,7 +389,7 @@ def _valid_usage_count(value: Any) -> bool:
 
 
 class FakeWorker:
-    def __init__(self, results: list[WorkerResult] | None = None, *, model: str = "fake-worker-v1") -> None:
+    def __init__(self, results: list[BaseModel] | None = None, *, model: str = "fake-worker-v1") -> None:
         self.results = list(results or [])
         self.requests: list[WorkerRequest] = []
         self.model = model
@@ -371,11 +398,29 @@ class FakeWorker:
         return {"id": "fake-worker", "owned_by": "test"}
 
     async def execute(self, request: WorkerRequest) -> ProviderResult:
+        return await self.execute_typed(request, WorkerResult, system=OpenAICompatibleWorker.SYSTEM)
+
+    async def execute_typed(
+        self,
+        request: WorkerRequest,
+        result_model: type[WorkerModel],
+        *,
+        system: str,
+    ) -> ProviderResult:
+        _ = system
         self.requests.append(request)
         if not self.results:
             raise ProviderError(ProviderFailureKind.INVALID_OUTPUT, "fake worker has no queued result")
+        value = self.results.pop(0)
+        try:
+            parsed = value if isinstance(value, result_model) else result_model.model_validate(value)
+        except (ValidationError, ValueError) as error:
+            raise ProviderError(
+                ProviderFailureKind.INVALID_OUTPUT,
+                f"fake worker result violated {result_model.__name__}: {error}",
+            ) from error
         return ProviderResult(
-            value=self.results.pop(0),
+            value=parsed,
             request_id=f"fake-worker-{len(self.requests)}",
             resolved_model=self.model,
             sanitized_metadata={"fake": True},

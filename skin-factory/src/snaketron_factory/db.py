@@ -74,6 +74,7 @@ ATTEMPT_MUTABLE_FIELDS = frozenset(
         "restart_stage",
         "approved_prototype_hash",
         "prototype_decision_id",
+        "prototype_selection_id",
         "cost_reserved_micros",
         "cost_charged_micros",
         "production_skin_id",
@@ -483,6 +484,11 @@ MIGRATIONS: tuple[str, ...] = (
       SELECT RAISE(ABORT, 'human label already exists for exact artifact');
     END;
     """,
+    """
+    ALTER TABLE attempt ADD COLUMN prototype_selection_id TEXT REFERENCES artifact(id);
+    CREATE UNIQUE INDEX attempt_prototype_selection
+        ON attempt(prototype_selection_id) WHERE prototype_selection_id IS NOT NULL;
+    """,
 )
 
 
@@ -703,6 +709,7 @@ class Database:
         restart_stage: str | None = None,
         approved_prototype_hash: str | None = None,
         prototype_decision_id: str | None = None,
+        prototype_selection_id: str | None = None,
         experiment_run_id: str | None = None,
         experiment_candidate: str | None = None,
         experiment_split: str | None = None,
@@ -720,36 +727,65 @@ class Database:
             ).fetchone()
             if existing:
                 return dict(existing)
+            columns = [
+                "id",
+                "concept_id",
+                "purpose",
+                "parent_attempt_id",
+                "restart_stage",
+                "stage",
+                "disposition",
+                "idempotency_key",
+                "approved_prototype_hash",
+                "prototype_decision_id",
+                "direction_sha",
+                "skill_sha",
+                "capability_sha",
+                "gate_sha",
+                "model_config_sha",
+                "behavior_json",
+                "experiment_run_id",
+                "experiment_candidate",
+                "experiment_split",
+                "created_at",
+                "updated_at",
+            ]
+            values: list[Any] = [
+                attempt_id,
+                concept_id,
+                purpose,
+                parent_attempt_id,
+                restart_stage,
+                stage,
+                disposition,
+                idempotency_key,
+                approved_prototype_hash,
+                prototype_decision_id,
+                direction_sha,
+                skill_sha,
+                capability_sha,
+                gate_sha,
+                model_config_sha,
+                canonical_json(dict(behavior)),
+                experiment_run_id,
+                experiment_candidate,
+                experiment_split,
+                timestamp,
+                timestamp,
+            ]
+            attempt_columns = {row["name"] for row in connection.execute("PRAGMA table_info(attempt)")}
+            if "prototype_selection_id" in attempt_columns:
+                columns.append("prototype_selection_id")
+                values.append(prototype_selection_id)
+            elif prototype_selection_id is not None:
+                raise RuntimeError(
+                    "attempt schema predates prototype selection authority; "
+                    "run migrations before creating a selected draft"
+                )
+            placeholders = ",".join("?" for _ in columns)
             connection.execute(
-                """INSERT INTO attempt(
-                    id,concept_id,purpose,parent_attempt_id,restart_stage,stage,disposition,
-                    idempotency_key,approved_prototype_hash,prototype_decision_id,direction_sha,
-                    skill_sha,capability_sha,gate_sha,model_config_sha,behavior_json,
-                    experiment_run_id,experiment_candidate,experiment_split,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    attempt_id,
-                    concept_id,
-                    purpose,
-                    parent_attempt_id,
-                    restart_stage,
-                    stage,
-                    disposition,
-                    idempotency_key,
-                    approved_prototype_hash,
-                    prototype_decision_id,
-                    direction_sha,
-                    skill_sha,
-                    capability_sha,
-                    gate_sha,
-                    model_config_sha,
-                    canonical_json(dict(behavior)),
-                    experiment_run_id,
-                    experiment_candidate,
-                    experiment_split,
-                    timestamp,
-                    timestamp,
-                ),
+                f"INSERT INTO attempt({','.join(columns)}) VALUES({placeholders})",
+                values,
             )
             if purpose == Purpose.PRODUCTION:
                 connection.execute(
@@ -772,6 +808,14 @@ class Database:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM attempt WHERE idempotency_key=?", (key,)).fetchone()
         return self._dict(row)
+
+    def attempts_by_disposition(self, disposition: Disposition | str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM attempt WHERE disposition=? ORDER BY created_at",
+                (disposition,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_attempt(
         self,
@@ -1384,6 +1428,7 @@ class Database:
         resolved_model: str | None = None,
         provider_request_id: str | None = None,
         media_type: str | None = None,
+        result_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not actor.startswith("human:") or not actor.removeprefix("human:").strip():
             raise PermissionError("unknown operations require an authenticated human actor")
@@ -1405,7 +1450,10 @@ class Database:
                 raise ValueError("executed_result_recovered requires a valid sha256 result hash")
             if not isinstance(resolved_model, str) or not resolved_model.strip():
                 raise ValueError("executed_result_recovered requires the exact resolved model")
-        elif any(value is not None for value in (result_hash, resolved_model, provider_request_id, media_type)):
+        elif any(
+            value is not None
+            for value in (result_hash, resolved_model, provider_request_id, media_type, result_metadata)
+        ):
             raise ValueError(f"{resolution} does not accept recovered result metadata")
         resolution_id = new_id("resolution")
         timestamp = now()
@@ -1419,16 +1467,31 @@ class Database:
             resolution_metadata: dict[str, Any] = {}
             if resolution == "executed_result_recovered":
                 image_result = operation["provider_role"] in {"image_generator", "image_editor"}
+                video_result = (
+                    operation["provider_role"] == "fal_pixverse_transition"
+                    and operation["side_effect"] == "fal_transition_result"
+                )
                 if image_result and media_type not in {"image/png", "image/jpeg", "image/webp"}:
                     raise ValueError(
                         "recovered image operations require media_type image/png, image/jpeg, or image/webp"
                     )
-                if not image_result and media_type is not None:
-                    raise ValueError("media_type is only valid for a recovered image operation")
+                if video_result and media_type != "video/mp4":
+                    raise ValueError("recovered Fal result operations require media_type video/mp4")
+                if not image_result and not video_result and media_type is not None:
+                    raise ValueError("media_type is only valid for a recovered image or Fal video operation")
+                if video_result:
+                    if not isinstance(result_metadata, dict) or result_metadata.get("result") != {
+                        "kind": "video",
+                        "media_type": "video/mp4",
+                    }:
+                        raise ValueError("recovered Fal result requires validated bounded result metadata")
+                elif result_metadata is not None:
+                    raise ValueError("result_metadata is only valid for a recovered Fal video operation")
                 resolution_metadata = {
                     "resolved_model": resolved_model,
                     "provider_request_id": provider_request_id,
                     "media_type": media_type,
+                    "result_metadata": result_metadata,
                 }
                 operation_metadata["recovery"] = {
                     "evidence_ref": evidence_ref,
@@ -1436,6 +1499,10 @@ class Database:
                 }
                 if image_result:
                     operation_metadata["result"] = {"kind": "image", "media_type": media_type}
+                elif video_result:
+                    assert result_metadata is not None
+                    operation_metadata["result"] = result_metadata["result"]
+                    operation_metadata["recovered_video"] = result_metadata["video"]
             connection.execute(
                 "INSERT INTO operation_resolution(id,operation_id,resolution,evidence_ref,"
                 "result_hash,actor,created_at,metadata_json) VALUES(?,?,?,?,?,?,?,?)",

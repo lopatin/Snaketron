@@ -37,6 +37,24 @@ def moving_band(*, columns: int = 2, rows: int = 4, cell: int = 16) -> Image.Ima
     return Image.fromarray(pixels)
 
 
+def bounded_band(*, columns: int = 2, rows: int = 4, cell: int = 16, overhang: int = 4) -> Image.Image:
+    side = cell * overhang // 16
+    row_texels = cell + 2 * side
+    width = columns * cell
+    pixels = np.zeros((rows * row_texels, width, 4), dtype=np.uint8)
+    x = np.arange(width)
+    for frame in range(rows):
+        top = frame * row_texels
+        body_top = top + side
+        pixels[body_top : body_top + cell, :, :] = (12, 24, 36, 255)
+        selected = ((x - frame * width // rows) % width) < width // rows
+        pixels[body_top : body_top + cell, selected, :] = (245, 210, 32, 255)
+        # A real semi-transparent apron sentinel proves that RGBA data is not
+        # flattened while the first/last scanlines remain hard transparent.
+        pixels[top + 1, selected, :] = (255, 40, 90, 128)
+    return Image.fromarray(pixels, mode="RGBA")
+
+
 class ParseAxesTests(unittest.TestCase):
     def test_axes_are_explicit_and_independent(self):
         self.assertEqual(forge.parse_axes("none"), ())
@@ -46,9 +64,8 @@ class ParseAxesTests(unittest.TestCase):
 
     def test_invalid_or_duplicate_axes_are_rejected(self):
         for value in ("", "z", "x,x", "x,none"):
-            with self.subTest(value=value):
-                with self.assertRaises(argparse.ArgumentTypeError):
-                    forge.parse_axes(value)
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                forge.parse_axes(value)
 
 
 class ShapeContractTests(unittest.TestCase):
@@ -70,14 +87,31 @@ class ShapeContractTests(unittest.TestCase):
 
     def test_sheet_requires_y_seam_but_not_x_seam(self):
         image = Image.new("RGB", (2 * 16, 3 * 16))
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(forge, "measure") as measure:
-                manifest = forge.forge(
-                    image, "sheet", 2, 3, (1,), Path(temporary)
-                )
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(forge, "measure") as measure:
+            manifest = forge.forge(image, "sheet", 2, 3, (1,), Path(temporary))
         self.assertFalse(manifest.accepted)
         self.assertIn("must check the y seam", manifest.rejection)
         measure.assert_not_called()
+
+    def test_four_pixel_bleed_is_a_24px_stored_row_not_a_larger_body_cell(self):
+        valid = bounded_band(columns=3, rows=5)
+        self.assertIsNone(forge.shape_problem(valid, "sheet", 3, 5, raster_overhang_px=4))
+
+        square_rows = Image.new("RGBA", (3 * 16, 5 * 16), (0, 0, 0, 0))
+        problem = forge.shape_problem(square_rows, "sheet", 3, 5, raster_overhang_px=4)
+        self.assertIn("4px top bleed apron", problem)
+        self.assertIn("unchanged 16px logical body cell", problem)
+
+    def test_nonzero_bleed_requires_rgba_and_transverse_clearance(self):
+        rgb = Image.new("RGB", (2 * 16, 3 * 24), (20, 40, 60))
+        self.assertIn("alpha channel", forge.alpha_problem(rgb, "sheet", 3, 16, 4))
+
+        touched = bounded_band(columns=2, rows=3)
+        touched.putpixel((0, 0), (255, 255, 255, 255))
+        self.assertIn(
+            "touches a transverse stored-row edge",
+            forge.alpha_problem(touched, "sheet", 3, 16, 4),
+        )
 
 
 class ForgeTests(unittest.TestCase):
@@ -90,14 +124,14 @@ class ForgeTests(unittest.TestCase):
             complaint="coarse join",
             structural="halves disagree at scale 8",
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            with (
-                mock.patch.object(forge, "measure", side_effect=[structural, seam(), seam()]),
-                mock.patch.object(forge.sheets, "load_lama", return_value=object()),
-                mock.patch.object(forge, "repair_crop_tx_t", return_value=image) as repair,
-                mock.patch.object(forge, "build_ladder", return_value=[]),
-            ):
-                manifest = forge.forge(image, "coat", 2, None, (1,), Path(temporary))
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(forge, "measure", side_effect=[structural, seam(), seam()]),
+            mock.patch.object(forge.sheets, "load_lama", return_value=object()),
+            mock.patch.object(forge, "repair_crop_tx_t", return_value=image) as repair,
+            mock.patch.object(forge, "build_ladder", return_value=[]),
+        ):
+            manifest = forge.forge(image, "coat", 2, None, (1,), Path(temporary))
 
         self.assertTrue(manifest.accepted)
         self.assertTrue(manifest.repaired)
@@ -122,14 +156,12 @@ class ForgeTests(unittest.TestCase):
 
     def test_manifest_records_shape_and_only_checks_requested_axes(self):
         image = moving_band(rows=3)
-        with tempfile.TemporaryDirectory() as temporary:
-            with (
-                mock.patch.object(forge, "measure", return_value=seam()) as measure,
-                mock.patch.object(forge, "build_ladder", return_value=[]),
-            ):
-                manifest = forge.forge(
-                    image, "sheet", 2, 3, (0,), Path(temporary)
-                )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(forge, "measure", return_value=seam()) as measure,
+            mock.patch.object(forge, "build_ladder", return_value=[]),
+        ):
+            manifest = forge.forge(image, "sheet", 2, 3, (0,), Path(temporary))
 
         self.assertTrue(manifest.accepted)
         self.assertEqual(manifest.body_columns, 2)
@@ -144,9 +176,7 @@ class ForgeTests(unittest.TestCase):
             mock.patch.object(forge, "measure", return_value=seam()),
             mock.patch.object(forge, "build_ladder") as ladder,
         ):
-            manifest = forge.forge(
-                image, "sheet", 2, 64, (0,), Path(temporary)
-            )
+            manifest = forge.forge(image, "sheet", 2, 64, (0,), Path(temporary))
 
         self.assertFalse(manifest.accepted)
         self.assertIn("no measurable frame-to-frame animation", manifest.rejection)
@@ -173,16 +203,60 @@ class ForgeTests(unittest.TestCase):
         self.assertTrue(all(r.bytes > 0 for r in rungs))
         self.assertTrue(all(len(r.sha256) == 64 for r in rungs))
 
+    def test_bounded_rgba_ladder_scales_body_and_aprons_independently(self):
+        image = bounded_band(columns=2, rows=4)
+        with tempfile.TemporaryDirectory() as temporary:
+            rungs = forge.build_ladder(
+                image,
+                "sheet",
+                Path(temporary),
+                body_columns=2,
+                frame_rows=4,
+                raster_overhang_px=4,
+            )
+
+            self.assertEqual(
+                [(r.texels_per_cell, r.row_texels, r.width_px, r.height_px) for r in rungs],
+                [(16, 24, 32, 96), (8, 12, 16, 48)],
+            )
+            for rung in rungs:
+                with Image.open(rung.path) as opened:
+                    self.assertEqual(opened.mode, "RGBA")
+                    alpha = np.asarray(opened.getchannel("A"))
+                for row in range(4):
+                    self.assertFalse(alpha[row * rung.row_texels].any())
+                    self.assertFalse(alpha[(row + 1) * rung.row_texels - 1].any())
+                self.assertGreater(int(alpha.max()), 0)
+
+    def test_real_forge_accepts_a_bounded_rgba_clip_sheet(self):
+        image = bounded_band(columns=7, rows=4)
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = forge.forge(
+                image,
+                "sheet",
+                7,
+                4,
+                (0,),
+                Path(temporary),
+                raster_overhang_px=4,
+            )
+
+        self.assertTrue(manifest.accepted, manifest.rejection)
+        self.assertEqual(manifest.texels_per_cell, 16)
+        self.assertEqual(manifest.raster_overhang_px, 4)
+        self.assertEqual(manifest.row_texels, 24)
+        self.assertEqual([rung.row_texels for rung in manifest.rungs], [24, 12])
+
     def test_every_shipping_rung_is_remeasured(self):
         image = Image.new("RGB", (2 * 64, 64), (20, 40, 60))
         # Initial source, final canonical, then the 64 and 32 rungs clear. The
         # 16-texel PNG regresses and must make the whole forge refuse.
         readings = [seam(), seam(), seam(), seam(), seam(cleared=False)]
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(forge, "measure", side_effect=readings) as measure:
-                manifest = forge.forge(
-                    image, "coat", 2, None, (1,), Path(temporary)
-                )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(forge, "measure", side_effect=readings) as measure,
+        ):
+            manifest = forge.forge(image, "coat", 2, None, (1,), Path(temporary))
 
         self.assertFalse(manifest.accepted)
         self.assertIn("shipping 16-texel rung", manifest.rejection)

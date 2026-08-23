@@ -36,7 +36,7 @@ use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, 
 use crate::season::{Season, get_season_at};
 use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
-    SkinRevision, SkinWriteError,
+    SkinReviewDecision, SkinRevision, SkinWriteError,
 };
 use crate::texture::Texture;
 use crate::wallet::{self, LedgerSource, Wallet};
@@ -412,6 +412,9 @@ impl DynamoDatabase {
             repeat_cells: Self::extract_string(item, "repeatCells")
                 .and_then(|value| value.parse().ok()),
             rows: Self::extract_number(item, "rows").map(|rows| rows.max(0) as u32),
+            raster_overhang_px: Self::extract_number(item, "rasterOverhangPx")
+                .unwrap_or(0)
+                .max(0) as u32,
             seams: Self::extract_string(item, "seams")
                 .and_then(|value| serde_json::from_str(&value).ok())
                 .unwrap_or(crate::texture::SeamReport {
@@ -4268,7 +4271,7 @@ impl Database for DynamoDatabase {
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
             .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
-            .update_expression("SET reviewApproved = :approved")
+            .update_expression("SET reviewApproved = :approved REMOVE reviewRejected")
             .condition_expression("attribute_exists(pk)")
             .expression_attribute_values(":approved", Self::av_bool(true))
             .send()
@@ -4280,7 +4283,7 @@ impl Database for DynamoDatabase {
     async fn decide_skin_review(
         &self,
         skin_id: i32,
-        publication: Publication,
+        decision: SkinReviewDecision,
         revision: Option<u32>,
         content_ref: Option<&str>,
         actor_user_id: i32,
@@ -4291,8 +4294,19 @@ impl Database for DynamoDatabase {
             .await?
             .ok_or_else(|| anyhow!("Skin not found"))?;
 
-        let target = if publication == Publication::Published {
-            if !skin.namespace.is_publishable() {
+        if matches!(
+            decision,
+            SkinReviewDecision::SetPublication(Publication::Published)
+        ) {
+            return Err(SkinWriteError::ReviewTargetChanged.into());
+        }
+
+        let exact_decision = matches!(
+            decision,
+            SkinReviewDecision::Publish | SkinReviewDecision::Reject
+        );
+        let target = if exact_decision {
+            if matches!(decision, SkinReviewDecision::Publish) && !skin.namespace.is_publishable() {
                 return Err(SkinWriteError::EvaluationOnly.into());
             }
             let revision = revision.ok_or(SkinWriteError::ReviewTargetChanged)?;
@@ -4307,11 +4321,19 @@ impl Database for DynamoDatabase {
 
             // A response lost after commit is answered by the exact durable
             // state. Nothing is written again, including the audit row.
-            if skin.publication == Publication::Published
+            if matches!(decision, SkinReviewDecision::Publish)
+                && skin.publication == Publication::Published
                 && skin.published_revision == Some(revision)
                 && skin.published_content_ref.as_deref() == Some(content_ref)
                 && skin.pending_revision.is_none()
                 && stored.review_approved
+            {
+                return Ok(());
+            }
+            if matches!(decision, SkinReviewDecision::Reject)
+                && skin.pending_revision.is_none()
+                && stored.review_rejected
+                && !stored.review_approved
             {
                 return Ok(());
             }
@@ -4326,20 +4348,39 @@ impl Database for DynamoDatabase {
             None
         };
 
+        let resulting_publication = match decision {
+            SkinReviewDecision::Publish => Publication::Published,
+            SkinReviewDecision::Reject => skin.publication,
+            SkinReviewDecision::SetPublication(publication) => publication,
+        };
+        let audit_publication = match decision {
+            // REVIEW rows historically encode rejection as `private`; the
+            // metadata update below deliberately preserves the actual state.
+            SkinReviewDecision::Reject => Publication::Private,
+            _ => resulting_publication,
+        };
+
         let now = Utc::now().timestamp_millis();
-        let mut assignments = vec![
-            "publication = :publication".to_string(),
-            "updatedAtMs = :now".to_string(),
-        ];
+        let mut assignments = vec!["updatedAtMs = :now".to_string()];
         let mut removals = vec!["pendingRevision".to_string()];
         let mut meta = Update::builder()
             .table_name(self.main_table())
             .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
             .key("sk", Self::av_s("META"))
-            .expression_attribute_values(":publication", Self::av_s(publication.as_str()))
             .expression_attribute_values(":now", Self::av_n(now));
 
-        if let Some((revision, content_ref, _)) = &target {
+        if !matches!(decision, SkinReviewDecision::Reject) {
+            assignments.push("publication = :publication".to_string());
+            meta = meta.expression_attribute_values(
+                ":publication",
+                Self::av_s(resulting_publication.as_str()),
+            );
+        }
+
+        if matches!(decision, SkinReviewDecision::Publish) {
+            let Some((revision, content_ref, _)) = &target else {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            };
             assignments.extend([
                 "publishedRevision = :published".to_string(),
                 "publishedContentRef = :published_ref".to_string(),
@@ -4359,6 +4400,17 @@ impl Database for DynamoDatabase {
                     Self::av_s(skins_dynamo::published_index_partition(skin.kind)),
                 )
                 .expression_attribute_values(":index_sk", Self::av_s(format!("{now:020}")));
+        } else if matches!(decision, SkinReviewDecision::Reject) {
+            let Some((revision, _, _)) = &target else {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            };
+            // Rejection changes no publication or browse-index field. The
+            // condition binds queue removal to the exact bytes reviewed.
+            meta = meta
+                .condition_expression(
+                    "attribute_exists(pk) AND pendingRevision = :reviewed_revision",
+                )
+                .expression_attribute_values(":reviewed_revision", Self::av_n(*revision));
         } else {
             meta = meta.condition_expression("attribute_exists(pk)");
             // The public listing index is sparse. A moderation decision that
@@ -4380,7 +4432,7 @@ impl Database for DynamoDatabase {
             .table_name(self.main_table())
             .set_item(Some(skins_dynamo::review_decision_item(
                 skin_id,
-                publication,
+                audit_publication,
                 revision,
                 content_ref,
                 actor_user_id,
@@ -4404,12 +4456,15 @@ impl Database for DynamoDatabase {
             .transact_items(TransactWriteItem::builder().put(audit).build())
             .transact_items(TransactWriteItem::builder().delete(dequeue).build());
 
-        if let Some((revision, content_ref, _)) = &target {
+        if matches!(decision, SkinReviewDecision::Publish) {
+            let Some((revision, content_ref, _)) = &target else {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            };
             let approve = Update::builder()
                 .table_name(self.main_table())
                 .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
                 .key("sk", Self::av_s(skins_dynamo::revision_sort_key(*revision)))
-                .update_expression("SET reviewApproved = :approved")
+                .update_expression("SET reviewApproved = :approved REMOVE reviewRejected")
                 .condition_expression("attribute_exists(pk) AND contentRef = :content_ref")
                 .expression_attribute_values(":approved", Self::av_bool(true))
                 .expression_attribute_values(":content_ref", Self::av_s(*content_ref))
@@ -4417,6 +4472,25 @@ impl Database for DynamoDatabase {
                 .context("Failed to build exact revision approval")?;
             transaction =
                 transaction.transact_items(TransactWriteItem::builder().update(approve).build());
+        } else if matches!(decision, SkinReviewDecision::Reject) {
+            let Some((revision, content_ref, _)) = &target else {
+                return Err(SkinWriteError::ReviewTargetChanged.into());
+            };
+            let reject = Update::builder()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+                .key("sk", Self::av_s(skins_dynamo::revision_sort_key(*revision)))
+                .update_expression("SET reviewRejected = :rejected")
+                .condition_expression(
+                    "attribute_exists(pk) AND contentRef = :content_ref AND (attribute_not_exists(reviewApproved) OR reviewApproved = :not_approved)",
+                )
+                .expression_attribute_values(":rejected", Self::av_bool(true))
+                .expression_attribute_values(":not_approved", Self::av_bool(false))
+                .expression_attribute_values(":content_ref", Self::av_s(*content_ref))
+                .build()
+                .context("Failed to build exact revision rejection")?;
+            transaction =
+                transaction.transact_items(TransactWriteItem::builder().update(reject).build());
         }
 
         let result = transaction.send().await;
@@ -4427,8 +4501,11 @@ impl Database for DynamoDatabase {
                 .get_skin_consistent(skin_id)
                 .await?
                 .ok_or_else(|| anyhow!("Skin disappeared while finishing review"))?;
-            let converged = match target {
-                Some((revision, content_ref, _)) => {
+            let converged = match decision {
+                SkinReviewDecision::Publish => {
+                    let Some((revision, content_ref, _)) = target else {
+                        return Err(SkinWriteError::ReviewTargetChanged.into());
+                    };
                     current.publication == Publication::Published
                         && current.published_revision == Some(revision)
                         && current.published_content_ref.as_deref() == Some(content_ref)
@@ -4440,7 +4517,24 @@ impl Database for DynamoDatabase {
                                 stored.review_approved && stored.content_ref == content_ref
                             })
                 }
-                None => current.publication == publication && current.pending_revision.is_none(),
+                SkinReviewDecision::Reject => {
+                    let Some((revision, content_ref, _)) = target else {
+                        return Err(SkinWriteError::ReviewTargetChanged.into());
+                    };
+                    current.pending_revision.is_none()
+                        && self
+                            .get_skin_revision_consistent(skin_id, revision)
+                            .await?
+                            .is_some_and(|stored| {
+                                stored.content_ref == content_ref
+                                    && stored.review_rejected
+                                    && !stored.review_approved
+                            })
+                }
+                SkinReviewDecision::SetPublication(_) => {
+                    current.publication == resulting_publication
+                        && current.pending_revision.is_none()
+                }
             };
             if converged {
                 return Ok(());
@@ -4855,6 +4949,12 @@ impl Database for DynamoDatabase {
         }
         if let Some(rows) = texture.rows {
             item.insert("rows".to_string(), Self::av_n(rows));
+        }
+        if texture.raster_overhang_px > 0 {
+            item.insert(
+                "rasterOverhangPx".to_string(),
+                Self::av_n(texture.raster_overhang_px),
+            );
         }
         if let Some(prompt) = &texture.last_prompt {
             item.insert("lastPrompt".to_string(), Self::av_s(prompt));

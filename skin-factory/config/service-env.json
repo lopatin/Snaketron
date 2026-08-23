@@ -14,6 +14,16 @@
   ],
   "optional": [
     {
+      "name": "FAL_API_KEY",
+      "consumer": ["draft_animation_transition"],
+      "secret": true
+    },
+    {
+      "name": "FAL_KEY",
+      "consumer": ["draft_animation_transition_alias_import_only"],
+      "secret": true
+    },
+    {
       "name": "LMSTUDIO_API_KEY",
       "consumer": ["task_worker"],
       "secret": true

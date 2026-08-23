@@ -387,6 +387,32 @@ or published). Validation of *pixels* happened at forge time (M3); the
 document trusts the digest, and the digest is verified end-to-end by the
 store.
 
+Generated descriptors may opt into `raster_overhang_px: 1..=4`. The logical
+game and authoring cell remains exactly 16×16 body texels. The field measures
+an extra authored bleed apron **per transverse side**, not a larger cell and
+not a CSS pixel: `4` stores a source row as `4 bleed + 16 body + 4 bleed = 24`
+texels. Keeping those distinct source texels is necessary for real artwork in
+the apron; squeezing the row back to 16 would discard or resample that art.
+Every ladder rung scales the body and apron exactly (stored rows 24, 48, 96);
+fractional aprons and mismatched coat/sheet rows are rejected. The longitudinal
+source remains 16 texels per cell, so the clip uses direction-aware elliptical
+caps and never lengthens the head or tail. At live 5/10/15px cells the visible
+bleed is 1.25/2.5/3.75px per side, capped at four pixels on larger static
+surfaces.
+
+This is the one bounded exception to silhouette-only body paint. The apron may
+visually overlap a neighboring snake's logical cell, as ordinary contours
+already can; normal snake draw order decides which paint is on top. Safety
+comes from the descriptor's strict four-authored-pixel cap and the renderer's
+direction-aware clip, not from treating occupied cells as hard visual boxes.
+The Boost band is painted in an engine-private signal region above the image,
+and the head core remains topmost, so enabling Boost does not contract or pop
+the raster art.
+
+Tiled image fit also carries `phase_origin: "head" | "tail"`. `head` is the
+backward-compatible default. `tail` makes the allocation's tail edge an exact
+repeat boundary, avoiding a variable partial tile as the snake grows.
+
 ## 6. Animation worked through
 
 The v1 vocabulary, expressed in v2 — this table is also the conversion the
@@ -451,9 +477,12 @@ error, not a silent freeze).
 per-layer closed formula (runs × slices × repeats at the worst-case pose
 family: maximum body length and maximum corner density the arena permits)
 summed over the stack and required ≤ the existing 200 ceiling, plus: ≤ 24
-layers after flattening, ≤ 8 stops per gradient, ≤ 4 texture refs, ≤ 2
+layers after flattening, ≤ 8 stops per gradient, ≤ 8 texture refs, ≤ 2
 `PerTexel` expressions (each bakes a tile per role per step in the worst
-case — the budget is memory), bake ≤ 256KB. The formula is property-tested
+case — the budget is memory), bake ≤ 256KB. The larger reference count supports
+a four-part skin plus independently extracted modifiers without raising the old
+four-maximum-image resource envelope: selected rungs are capped in aggregate at
+64 MiB decoded and 8 MiB compressed per skin. The formula is property-tested
 against the recorder: for a corpus of generated documents, predicted ==
 recorded, so the meter in the Builder and the gate in the validator cannot
 drift from the truth.

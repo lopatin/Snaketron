@@ -1,4 +1,12 @@
 {
+  "input_authority": {
+    "mode": "approved_prototype",
+    "artifact_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "authority_record_sha256": "sha256:283eea173088509358cfa5d843e2d3b112461a927da48c9068ea11abe35e7365",
+    "human_approval_decision_id": "fixture-approval-sprite-sheet",
+    "selection_rationale": null,
+    "maximum_driver_action": "register_private_revision"
+  },
   "path": "sprite_sheet",
   "rationale": "Distinct drawn caustic states need frames; the 41-cell repeat and 48-frame loop are independent decisions.",
   "design_guidelines": {
@@ -9,6 +17,7 @@
     "head_zone": "light_field_dark_core",
     "asset_strategy": "Request a production-quality 20 fps sheet with 48 derived rows; both x and final-to-zero y joins must be seamless, with a complete calm row zero."
   },
+  "common_period_ms": 2400,
   "fidelity_features": [
     "morphing caustic shapes without whole-image translation",
     "calm complete resting frame",
@@ -26,10 +35,34 @@
       "frames": 48,
       "desired_fps": 20,
       "texels_per_cell": 16,
+      "raster_overhang_px": 0,
       "anchor": "whole",
       "fit": "tile",
+      "tile_phase_origin": "head",
       "fade": "none",
+      "transverse_edge_policy": "not_applicable_opaque_fill",
       "prompt": "656x768 grid: 41 body cells by 48 frame rows, no gutters; each row is one complete view, x and final-to-zero y seamless, row zero calm, features morph in place instead of translating."
+    }
+  ],
+  "modifier_plan": [
+    {
+      "asset_index": 0,
+      "logical_key": "water_motion",
+      "component_key": "B1",
+      "texture_name": "water_sheet",
+      "image_layer_name": "Water sheet",
+      "fallback_layer_name": "Body fallback",
+      "span_limit_mode": "whole",
+      "span_limit_value": null,
+      "source_mode": "direct_generate",
+      "source_object_sha256": null,
+      "modifier_manifest_sha256": null,
+      "provenance_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "license_id": "owned-original",
+      "authorized_lineage_ids": ["fixture-sprite-sheet"],
+      "required_capabilities": ["image_generator"],
+      "extraction": null,
+      "video": null
     }
   ],
   "animation_plan": [

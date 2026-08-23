@@ -160,6 +160,7 @@ mod exhaustiveness {
             kind: _,
             body_columns: _,
             frame_rows: _,
+            raster_overhang_px: _,
             variants: _,
         } = descriptor;
         let crate::v2::TextureVariantV2 {
@@ -196,6 +197,7 @@ mod exhaustiveness {
             FitV2::Clip | FitV2::Stretch => {}
             FitV2::Tile {
                 cells_per_repeat: _,
+                phase_origin: _,
             } => {}
             FitV2::Cutout { cells_tall: _ } => {}
         }

@@ -137,6 +137,19 @@ impl Publication {
     }
 }
 
+/// What an administrator is doing with one open review.
+///
+/// Rejection is not a publication state: it clears the review slot while the
+/// previously published revision (if any) stays live. Keeping that distinction
+/// in the storage API prevents a rejected edit from silently withdrawing the
+/// skin it was editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkinReviewDecision {
+    Publish,
+    Reject,
+    SetPublication(Publication),
+}
+
 /// A skin, without its documents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,6 +293,11 @@ pub struct SkinRevision {
     /// Set when an admin approves this revision. Gates whether text layers
     /// render for anyone but the creator.
     pub review_approved: bool,
+    /// Durable exact-target marker for a rejected review. This is separate
+    /// from publication because rejecting an edit leaves the prior approved
+    /// revision live. A later approval removes the marker transactionally.
+    #[serde(default)]
+    pub review_rejected: bool,
     /// Whether this document contains an authored text source.
     ///
     /// Text is the one source whose pixels can communicate arbitrary words.

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  exactAdminSkinDecision,
   exactPublicationRequest,
   exactSkinUpdate,
 } from '../../utils/skinApiContracts.ts';
@@ -23,4 +24,34 @@ test('skin writes and review requests bind exact immutable revision authority', 
     revision: 8,
     contentRef: `sha256:${'a'.repeat(64)}`,
   });
+  assert.deepEqual(
+    exactAdminSkinDecision({
+      decision: 'publish',
+      revision: 8,
+      contentRef: `sha256:${'a'.repeat(64)}`,
+    }),
+    {
+      decision: 'publish',
+      revision: 8,
+      contentRef: `sha256:${'a'.repeat(64)}`,
+    },
+  );
+  assert.deepEqual(
+    exactAdminSkinDecision({
+      decision: 'reject',
+      revision: 8,
+      contentRef: `sha256:${'a'.repeat(64)}`,
+      reason: 'Rejected in review',
+    }),
+    {
+      decision: 'reject',
+      revision: 8,
+      contentRef: `sha256:${'a'.repeat(64)}`,
+      reason: 'Rejected in review',
+    },
+  );
+  assert.deepEqual(
+    exactAdminSkinDecision({ decision: 'setPublication', publication: 'disabled' }),
+    { decision: 'setPublication', publication: 'disabled' },
+  );
 });

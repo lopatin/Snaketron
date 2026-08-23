@@ -111,6 +111,7 @@ async fn strict_manifest_stores_the_exact_gated_ladder_and_retries_idempotently(
         height_px: 64,
         repeat_cells: Some(12.0),
         rows: None,
+        raster_overhang_px: 0,
         seams: SeamReport {
             horizontal_ratio: 0.0,
             vertical_ratio: 0.0,

@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import tempfile
 import urllib.error
 import urllib.parse
@@ -32,6 +33,8 @@ from typing import Any
 
 OPERATOR_TOKEN = "SNAKETRON_FACTORY_OPERATOR_TOKEN"
 SERVICE_TOKEN = "SNAKETRON_FACTORY_SERVICE_TOKEN"
+FAL_API_KEY = "FAL_API_KEY"
+FAL_KEY = "FAL_KEY"
 LOCAL_ADMIN_USERNAME = "SNAKETRON_LOCAL_ADMIN_USERNAME"
 LOCAL_ADMIN_PASSWORD = "SNAKETRON_LOCAL_ADMIN_PASSWORD"
 LOCAL_ADMIN_USER_ID = "SNAKETRON_LOCAL_ADMIN_USER_ID"
@@ -325,14 +328,91 @@ def install_issued_token(service_path: Path, service: dict[str, str], response: 
     return credential_id
 
 
+def _validated_fal_key(value: str) -> str:
+    if not value or len(value) > 4_096 or any(character.isspace() or ord(character) < 32 for character in value):
+        raise SystemExit("Fal credential is missing or malformed")
+    return value
+
+
+def discover_fal_key(
+    environment: dict[str, str] | None = None,
+    *,
+    run_login_shell: Any | None = None,
+) -> tuple[str, str]:
+    """Read Fal authority without ever writing the secret to user output.
+
+    The fresh login-shell protocol accepts output only when stdout is exactly
+    one nonce-delimited value and stderr is empty. Shell startup chatter is an
+    error, and its captured bytes are intentionally omitted from diagnostics.
+    """
+
+    inherited = os.environ if environment is None else environment
+    run_login_shell = run_login_shell or subprocess.run
+    primary = inherited.get(FAL_API_KEY, "")
+    fallback = inherited.get(FAL_KEY, "")
+    if primary or fallback:
+        if primary and fallback and primary != fallback:
+            raise SystemExit("FAL_API_KEY and FAL_KEY disagree")
+        return _validated_fal_key(primary or fallback), (FAL_API_KEY if primary else FAL_KEY)
+
+    nonce = secrets.token_hex(24)
+    begin = f"__snaketron_fal_begin_{nonce}__"
+    end = f"__snaketron_fal_end_{nonce}__"
+    conflict = f"__snaketron_fal_conflict_{nonce}__"
+    missing = f"__snaketron_fal_missing_{nonce}__"
+    command = (
+        "emulate -L zsh; "
+        "primary=${FAL_API_KEY-}; fallback=${FAL_KEY-}; "
+        f"if [[ -n $primary && -n $fallback && $primary != $fallback ]]; then command printf '%s\\n' '{conflict}'; "
+        f"elif [[ -n $primary ]]; then command printf '%s\\n%s\\n%s\\n' '{begin}' \"$primary\" '{end}'; "
+        f"elif [[ -n $fallback ]]; then command printf '%s\\n%s\\n%s\\n' '{begin}' \"$fallback\" '{end}'; "
+        f"else command printf '%s\\n' '{missing}'; fi"
+    )
+    child_environment = os.environ.copy()
+    child_environment.pop(FAL_API_KEY, None)
+    child_environment.pop(FAL_KEY, None)
+    try:
+        completed = run_login_shell(
+            ["/bin/zsh", "-lic", command],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            env=child_environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit("fresh zsh login could not be inspected for a Fal credential") from error
+    if completed.returncode != 0 or completed.stderr != "":
+        raise SystemExit("fresh zsh login produced ambiguous startup output while reading Fal authority")
+    lines = completed.stdout.splitlines()
+    if lines == [conflict]:
+        raise SystemExit("fresh zsh login defines conflicting FAL_API_KEY and FAL_KEY values")
+    if lines == [missing]:
+        raise SystemExit("fresh zsh login does not define FAL_API_KEY or FAL_KEY")
+    if len(lines) != 3 or lines[0] != begin or lines[2] != end:
+        raise SystemExit("fresh zsh login produced ambiguous startup output while reading Fal authority")
+    return _validated_fal_key(lines[1]), "fresh-zsh-login"
+
+
+def import_fal_key(service_path: Path, environment: dict[str, str] | None = None) -> str:
+    service = private_json(service_path, may_not_exist=True)
+    value, source = discover_fal_key(environment)
+    service[FAL_API_KEY] = value
+    # The scheduler consumes one canonical name. Keeping a second alias would
+    # make later rotation ambiguous.
+    service.pop(FAL_KEY, None)
+    write_private_json(service_path, service)
+    return source
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
-        choices=("bootstrap-local-accounts", "provision", "rotate", "revoke"),
+        choices=("bootstrap-local-accounts", "import-fal", "provision", "rotate", "revoke"),
     )
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--operator-env", type=Path, required=True)
+    parser.add_argument("--base-url")
+    parser.add_argument("--operator-env", type=Path)
     parser.add_argument("--service-env", type=Path)
     parser.add_argument("--accounts-env", type=Path)
     parser.add_argument(
@@ -344,9 +424,20 @@ def main() -> None:
     parser.add_argument("--credential-id")
     args = parser.parse_args()
 
+    if args.action == "import-fal":
+        if args.service_env is None:
+            raise SystemExit("import-fal requires --service-env")
+        if any((args.base_url, args.operator_env, args.accounts_env, args.user_id, args.credential_id)):
+            raise SystemExit("import-fal accepts only --service-env")
+        if args.require_admin:
+            raise SystemExit("--require-admin is valid only with bootstrap-local-accounts")
+        source = import_fal_key(args.service_env)
+        print(f"imported Fal service authority from {source} into {args.service_env}")
+        return
+
     if args.action == "bootstrap-local-accounts":
-        if args.accounts_env is None:
-            raise SystemExit("bootstrap-local-accounts requires --accounts-env")
+        if args.accounts_env is None or args.operator_env is None or args.base_url is None:
+            raise SystemExit("bootstrap-local-accounts requires --base-url, --operator-env, and --accounts-env")
         admin_user_id, factory_user_id, is_admin = bootstrap_local_accounts(
             args.base_url,
             args.accounts_env,
@@ -370,6 +461,8 @@ def main() -> None:
         raise SystemExit("--accounts-env is valid only with bootstrap-local-accounts")
     if args.service_env is None:
         raise SystemExit(f"{args.action} requires --service-env")
+    if args.operator_env is None or args.base_url is None:
+        raise SystemExit(f"{args.action} requires --base-url and --operator-env")
 
     operator = private_json(args.operator_env)
     operator_token = operator.get(OPERATOR_TOKEN)

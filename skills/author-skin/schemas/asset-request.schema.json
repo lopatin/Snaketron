@@ -1,81 +1,76 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://snaketron.io/schemas/skin-factory/asset-request-v1.json",
-  "title": "Pure task-worker asset request",
+  "$id": "https://snaketron.io/schemas/skin-factory/asset-request-v2.json",
+  "title": "Pure task-worker ordinary asset request",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version",
-    "request_id",
-    "asset_index",
-    "texture_name",
-    "capability_role",
-    "operation",
-    "kind",
-    "input_artifacts",
-    "prompt",
-    "width_px",
-    "height_px",
-    "grid",
-    "required_wrap_axes",
-    "transparency",
-    "row_zero",
-    "repair"
+    "schema_version", "request_id", "asset_index", "texture_name",
+    "capability_role", "operation", "kind", "input_artifacts", "modifier",
+    "prompt", "width_px", "height_px", "grid", "required_wrap_axes",
+    "tile_phase_origin", "transparency", "row_zero", "edge_contract",
+    "retention", "repair"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "request_id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-    "asset_index": { "type": "integer", "minimum": 0 },
-    "texture_name": {
-      "type": "string",
-      "pattern": "^[a-zA-Z][a-zA-Z0-9_-]*$"
-    },
+    "asset_index": { "type": "integer", "minimum": 0, "maximum": 7 },
+    "texture_name": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_-]*$" },
     "capability_role": { "enum": ["image_generator", "image_editor"] },
     "operation": { "enum": ["generate", "edit"] },
     "kind": { "enum": ["coat", "sheet", "overlay"] },
     "input_artifacts": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/contentHash" },
-      "uniqueItems": true
+      "type": "array", "items": { "$ref": "#/$defs/contentHash" }, "uniqueItems": true
     },
+    "modifier": { "$ref": "#/$defs/modifierIntent" },
     "prompt": { "type": "string", "minLength": 1 },
     "width_px": { "type": "integer", "minimum": 1, "maximum": 2048 },
     "height_px": { "type": "integer", "minimum": 1, "maximum": 2048 },
     "grid": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["body_columns", "frame_rows", "texels_per_cell"],
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "body_columns", "frame_rows", "texels_per_cell",
+        "raster_overhang_px", "row_texels"
+      ],
       "properties": {
         "body_columns": { "type": "integer", "minimum": 1, "maximum": 128 },
         "frame_rows": { "type": "integer", "minimum": 1, "maximum": 120 },
-        "texels_per_cell": {
-          "type": "integer",
-          "minimum": 4,
-          "maximum": 128
-        }
+        "texels_per_cell": { "type": "integer", "minimum": 4, "maximum": 128 },
+        "raster_overhang_px": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "row_texels": { "type": "integer", "minimum": 4, "maximum": 192 }
       }
     },
     "required_wrap_axes": {
-      "type": "array",
-      "maxItems": 2,
-      "items": { "enum": ["x", "y"] },
-      "uniqueItems": true
+      "type": "array", "maxItems": 2,
+      "items": { "enum": ["x", "y"] }, "uniqueItems": true
     },
+    "tile_phase_origin": { "enum": ["head", "tail", null] },
     "transparency": { "enum": ["opaque", "allowed", "required"] },
-    "row_zero": {
-      "enum": ["not_applicable", "resting_and_reduced_motion"]
+    "row_zero": { "enum": ["not_applicable", "resting_and_reduced_motion"] },
+    "edge_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transverse_policy", "no_frame_or_repeat_gutters"],
+      "properties": {
+        "transverse_policy": { "enum": ["fail_closed_transparent_effect", "not_applicable_opaque_fill"] },
+        "no_frame_or_repeat_gutters": { "const": true }
+      }
+    },
+    "retention": {
+      "type": "object", "additionalProperties": false,
+      "required": ["retain_inputs", "retain_provider_output", "retain_forged_output"],
+      "properties": {
+        "retain_inputs": { "const": true },
+        "retain_provider_output": { "const": true },
+        "retain_forged_output": { "const": true }
+      }
     },
     "repair": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["method", "mask_artifact"],
       "properties": {
         "method": { "enum": ["none", "tx_t_inpaint", "roll_and_repair"] },
         "mask_artifact": {
-          "oneOf": [
-            { "$ref": "#/$defs/contentHash" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/contentHash" }, { "type": "null" }]
         }
       }
     }
@@ -83,80 +78,82 @@
   "allOf": [
     {
       "if": { "properties": { "operation": { "const": "generate" } } },
-      "then": {
-        "properties": {
-          "capability_role": { "const": "image_generator" },
-          "input_artifacts": { "maxItems": 0 },
-          "repair": {
-            "properties": {
-              "method": { "const": "none" },
-              "mask_artifact": { "type": "null" }
-            }
-          }
-        }
-      }
+      "then": { "properties": {
+        "capability_role": { "const": "image_generator" },
+        "input_artifacts": { "maxItems": 0 },
+        "repair": { "properties": {
+          "method": { "const": "none" }, "mask_artifact": { "type": "null" }
+        } }
+      } }
     },
     {
       "if": { "properties": { "operation": { "const": "edit" } } },
-      "then": {
-        "properties": {
-          "capability_role": { "const": "image_editor" },
-          "input_artifacts": { "minItems": 1 }
-        }
-      }
+      "then": { "properties": {
+        "capability_role": { "const": "image_editor" },
+        "input_artifacts": { "minItems": 1 }
+      } }
     },
     {
       "if": { "properties": { "kind": { "const": "sheet" } } },
-      "then": {
-        "properties": {
-          "grid": {
-            "properties": {
-              "frame_rows": { "minimum": 2 },
-              "texels_per_cell": { "const": 16 }
-            }
-          },
-          "required_wrap_axes": { "contains": { "const": "y" } },
-          "row_zero": { "const": "resting_and_reduced_motion" }
-        }
-      },
-      "else": {
-        "properties": {
-          "grid": {
-            "properties": {
-              "frame_rows": { "const": 1 },
-              "texels_per_cell": { "const": 64 }
-            }
-          },
-          "row_zero": { "const": "not_applicable" }
-        }
-      }
+      "then": { "properties": {
+        "grid": { "properties": {
+          "frame_rows": { "minimum": 2 }, "texels_per_cell": { "const": 16 }
+        } },
+        "required_wrap_axes": { "contains": { "const": "y" } },
+        "row_zero": { "const": "resting_and_reduced_motion" }
+      } },
+      "else": { "properties": {
+        "grid": { "properties": {
+          "frame_rows": { "const": 1 }, "texels_per_cell": { "const": 64 }
+        } },
+        "row_zero": { "const": "not_applicable" }
+      } }
     },
     {
-      "if": {
-        "properties": {
-          "repair": {
-            "properties": {
-              "method": { "enum": ["tx_t_inpaint", "roll_and_repair"] }
-            },
-            "required": ["method"]
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "repair": {
-            "properties": {
-              "mask_artifact": { "$ref": "#/$defs/contentHash" }
-            }
-          }
-        }
-      }
+      "if": { "properties": { "required_wrap_axes": { "contains": { "const": "x" } } } },
+      "then": { "properties": { "tile_phase_origin": { "enum": ["head", "tail"] } } },
+      "else": { "properties": { "tile_phase_origin": { "const": null } } }
+    },
+    {
+      "if": { "properties": { "transparency": { "const": "required" } } },
+      "then": { "properties": { "edge_contract": { "properties": {
+        "transverse_policy": { "const": "fail_closed_transparent_effect" }
+      } } } }
+    },
+    {
+      "if": { "properties": { "edge_contract": { "properties": {
+        "transverse_policy": { "const": "not_applicable_opaque_fill" }
+      }, "required": ["transverse_policy"] } } },
+      "then": { "properties": { "transparency": { "const": "opaque" } } }
+    },
+    {
+      "if": { "properties": { "repair": { "properties": {
+        "method": { "enum": ["tx_t_inpaint", "roll_and_repair"] }
+      }, "required": ["method"] } } },
+      "then": { "properties": { "repair": { "properties": {
+        "mask_artifact": { "$ref": "#/$defs/contentHash" }
+      } } } }
     }
   ],
   "$defs": {
-    "contentHash": {
-      "type": "string",
-      "pattern": "^sha256:[a-f0-9]{64}$"
+    "contentHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "modifierIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "logical_key", "component_key", "provenance_sha256",
+        "license_id", "authorized_lineage_ids"
+      ],
+      "properties": {
+        "logical_key": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "component_key": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$" },
+        "provenance_sha256": { "$ref": "#/$defs/contentHash" },
+        "license_id": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "authorized_lineage_ids": {
+          "type": "array", "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "uniqueItems": true
+        }
+      }
     }
   }
 }

@@ -98,6 +98,7 @@ class StretchFit(_SkinModel):
 class TileFit(_SkinModel):
     type: Literal["tile"]
     cells_per_repeat: StrictFloat | StrictInt | None = None
+    phase_origin: Literal["head", "tail"] = "head"
 
 
 class CutoutFit(_SkinModel):
@@ -253,6 +254,7 @@ class TextureDescriptorV2(_SkinModel):
     kind: TextureKind
     body_columns: U32 | None = None
     frame_rows: U32 | None = None
+    raster_overhang_px: Annotated[StrictInt, Field(ge=0, le=4)] = 0
     variants: list[TextureVariantV2]
 
 

@@ -86,6 +86,7 @@ def _factory_capabilities(
 async def test_service_doctor_does_not_require_operator_authority(tmp_path: Path, monkeypatch) -> None:
     factory, _, _, _ = seeded_factory(tmp_path)
     monkeypatch.setenv("GEMINI_API_KEY", "service-gemini-value")
+    monkeypatch.setenv("FAL_API_KEY", "service-fal-value")
     monkeypatch.setenv("SNAKETRON_FACTORY_SERVICE_TOKEN", "private-skin-token")
     monkeypatch.delenv("SKIN_FACTORY_REVIEW_TOKEN", raising=False)
     monkeypatch.delenv("SNAKETRON_FACTORY_OPERATOR_TOKEN", raising=False)
@@ -106,6 +107,33 @@ async def test_service_doctor_does_not_require_operator_authority(tmp_path: Path
     assert "credential:SKIN_FACTORY_REVIEW_TOKEN" not in names
     assert "credential:SNAKETRON_FACTORY_OPERATOR_TOKEN" not in names
     assert "credential:SNAKETRON_FACTORY_SERVICE_TOKEN" in names
+
+
+def test_draft_media_doctor_never_passes_service_or_provider_secrets_to_ffmpeg(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    factory, _, _, _ = seeded_factory(tmp_path)
+    secrets = {
+        "FAL_API_KEY": "fal-never-child",
+        "GEMINI_API_KEY": "gemini-never-child",
+        "SNAKETRON_FACTORY_SERVICE_TOKEN": "service-never-child",
+        "SKIN_FACTORY_REVIEW_TOKEN": "review-never-child",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    captured: dict[str, str] = {}
+
+    def fail_after_capture(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess([], 1, "", "synthetic stop")
+
+    monkeypatch.setattr("snaketron_factory.doctor.subprocess.run", fail_after_capture)
+    check = FactoryDoctor(factory.config, factory=factory)._draft_automation_media_check()
+
+    assert check.ok is False
+    assert not set(secrets).intersection(captured)
+    assert all(value not in captured.values() for value in secrets.values())
 
 
 @pytest.mark.asyncio
@@ -629,7 +657,7 @@ def test_hermes_scripts_enforce_locked_no_agent_service_only_install() -> None:
 def test_service_example_contains_no_human_credentials() -> None:
     root = Path(__file__).resolve().parents[1]
     value = json.loads((root / "scripts/factory.service-env.example.json").read_text(encoding="utf-8"))
-    assert set(value) == {"GEMINI_API_KEY", "SNAKETRON_FACTORY_SERVICE_TOKEN"}
+    assert set(value) == {"FAL_API_KEY", "GEMINI_API_KEY", "SNAKETRON_FACTORY_SERVICE_TOKEN"}
     assert "SKIN_FACTORY_REVIEW_TOKEN" not in value
     assert "SNAKETRON_FACTORY_OPERATOR_TOKEN" not in value
 

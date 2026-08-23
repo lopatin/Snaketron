@@ -8,6 +8,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -169,6 +170,58 @@ class ReviewConfig(ConfigModel):
     sampled_reject_rate: float = Field(default=0.1, ge=0, le=1)
 
 
+class DraftAutomationConfig(ConfigModel):
+    """Queue-only private-draft automation; Admin remains the human boundary."""
+
+    enabled: bool = False
+    inbox: Path = Path("var/draft-inbox")
+    skill_dir: Path = Path("../skills/automate-skin-drafts")
+    # Two fits the canonical conservative per-attempt cap together with
+    # incomplete provider usage. Larger batches require an explicit budget
+    # increase and are rejected at config load if they cannot fit.
+    candidates_per_prompt: int = Field(default=2, ge=1, le=10)
+    max_pending_admin_reviews: int = Field(default=8, ge=1, le=100)
+    fal_api_key_env: str = Field(default="FAL_API_KEY", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    fal_api_key_fallback_env: str = Field(default="FAL_KEY", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    fal_queue_base_url: str = "https://queue.fal.run"
+    fal_transition_capability_id: str = "fal-ai/pixverse/v6/transition"
+    max_video_intents: int = Field(default=1, ge=0, le=2)
+    fal_transition_duration_seconds: Literal[5] = 5
+    fal_transition_resolution: Literal["720p"] = "720p"
+    fal_transition_aspect_ratio: Literal["3:2"] = "3:2"
+    # Versioned admission price for the constrained no-audio 720p recipe.
+    # The paid submit reserves duration * this rate; configuration cannot
+    # silently opt into the adapter's costlier 1080p/15-second envelope.
+    fal_price_table_version: Literal["pixverse-v6-no-audio-2026-08"] = "pixverse-v6-no-audio-2026-08"
+    fal_720p_cost_micros_per_second: Literal[45_000] = 45_000
+    fal_transition_max_cost_micros: int = Field(default=225_000, ge=1)
+    # One scheduler tick performs one repeatable queue read. The retained
+    # ticket may be revisited until its separate absolute age deadline.
+    fal_transition_timeout_seconds: int = Field(default=60, ge=5, le=300)
+    fal_transition_ticket_max_age_seconds: int = Field(default=86_400, ge=300, le=604_800)
+    ffmpeg_path: str = Field(default="ffmpeg", min_length=1, max_length=1_024)
+    ffprobe_path: str = Field(default="ffprobe", min_length=1, max_length=1_024)
+    video_extraction_timeout_seconds: int = Field(default=300, ge=30, le=900)
+
+    @model_validator(mode="after")
+    def validate_fal_boundary(self) -> DraftAutomationConfig:
+        if self.fal_api_key_env == self.fal_api_key_fallback_env:
+            raise ValueError("Fal primary and fallback environment names must differ")
+        parsed = urlsplit(self.fal_queue_base_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("fal_queue_base_url must be one HTTPS origin without userinfo")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("fal_queue_base_url must not contain a path, query, or fragment")
+        if self.fal_transition_max_cost_micros < self.fal_transition_reservation_micros():
+            raise ValueError("Fal transition maximum cost under-reserves the pinned duration/resolution recipe")
+        if self.fal_transition_ticket_max_age_seconds <= self.fal_transition_timeout_seconds:
+            raise ValueError("Fal ticket max age must exceed one scheduled result-read timeout")
+        return self
+
+    def fal_transition_reservation_micros(self) -> int:
+        return self.fal_transition_duration_seconds * self.fal_720p_cost_micros_per_second
+
+
 class JudgeCalibrationConfig(ConfigModel):
     """Fail-closed requirements for allowing a visual judge to route rejects."""
 
@@ -251,6 +304,7 @@ class FactoryConfig(ConfigModel):
     browser: BrowserConfig = BrowserConfig()
     worker: WorkerConfig = WorkerConfig()
     review: ReviewConfig = ReviewConfig()
+    draft_automation: DraftAutomationConfig = DraftAutomationConfig()
     judge_calibration: JudgeCalibrationConfig = JudgeCalibrationConfig()
     outbox: OutboxConfig = OutboxConfig()
     optimizer: OptimizerConfig = OptimizerConfig()
@@ -287,6 +341,29 @@ class FactoryConfig(ConfigModel):
             raise ValueError("task_worker timeout plus settlement must fit inside the run wall-time budget")
         if self.worker.max_output_tokens != self.models.task_worker.max_output_tokens:
             raise ValueError("worker max_output_tokens must equal the task_worker model reservation ceiling")
+        if self.draft_automation.enabled and (
+            self.draft_automation.fal_transition_timeout_seconds + 1 > self.budgets.wall_seconds_per_run
+        ):
+            raise ValueError("Fal transition timeout plus settlement must fit inside the run wall-time budget")
+        if self.draft_automation.enabled:
+            candidate_budget = self.draft_candidate_budget_report()
+            pipeline_reservation = int(candidate_budget["full_pipeline_reservation_micros"])
+            if pipeline_reservation > self.budgets.max_cost_micros_per_attempt:
+                raise ValueError(
+                    "draft automation pipeline conservatively reserves "
+                    f"{pipeline_reservation} micros, which exceeds budgets.max_cost_micros_per_attempt; "
+                    "reduce draft_automation.candidates_per_prompt or explicitly raise the attempt cap"
+                )
+            if pipeline_reservation > self.budgets.max_cost_micros_per_day:
+                raise ValueError(
+                    "draft automation pipeline exceeds budgets.max_cost_micros_per_day; "
+                    "reduce candidates_per_prompt or explicitly raise the daily cap"
+                )
+            if pipeline_reservation > self.budgets.max_cost_micros_program:
+                raise ValueError(
+                    "draft automation pipeline exceeds budgets.max_cost_micros_program; "
+                    "reduce candidates_per_prompt or explicitly raise the program cap"
+                )
         return self
 
     def resolve_paths(self, config_file: Path) -> FactoryConfig:
@@ -306,6 +383,9 @@ class FactoryConfig(ConfigModel):
                 paths[key] = str(candidate.parent.resolve() / candidate.name)
             else:
                 paths[key] = str(candidate.resolve())
+        for key in ("inbox", "skill_dir"):
+            nested = Path(raw["draft_automation"][key])
+            raw["draft_automation"][key] = str(nested if nested.is_absolute() else (base / nested).resolve())
         updated = FactoryConfig.model_validate(raw)
         updated.source_path = config_file.resolve()
         updated.version_sha256 = self.version_sha256
@@ -321,6 +401,8 @@ class FactoryConfig(ConfigModel):
         value["worker"].pop("api_key_env", None)
         value["outbox"].pop("webhook_url_env", None)
         value["outbox"].pop("webhook_token_env", None)
+        value["draft_automation"].pop("fal_api_key_env", None)
+        value["draft_automation"].pop("fal_api_key_fallback_env", None)
         return value
 
     def human_authority_environment_names(self) -> frozenset[str]:
@@ -346,6 +428,12 @@ class FactoryConfig(ConfigModel):
                 self.outbox.webhook_token_env,
             }
         )
+        names.update(
+            {
+                self.draft_automation.fal_api_key_env,
+                self.draft_automation.fal_api_key_fallback_env,
+            }
+        )
         return frozenset(str(name) for name in names if name)
 
     def required_service_environment_names(self) -> frozenset[str]:
@@ -362,6 +450,46 @@ class FactoryConfig(ConfigModel):
         """Complete config-derived scrub set for untrusted subprocesses."""
 
         return self.service_environment_names() | self.human_authority_environment_names()
+
+    def draft_candidate_budget_report(self) -> dict[str, int | bool]:
+        image = self.models.image_generator
+        judge = self.models.visual_judge
+        per_candidate = (
+            image.cost_per_image_micros
+            + (
+                image.max_input_tokens * image.cost_per_million_input_micros
+                + image.max_output_tokens * image.cost_per_million_output_micros
+            )
+            // 1_000_000
+        )
+        per_judgment = (
+            judge.max_input_tokens * judge.cost_per_million_input_micros
+            + judge.max_output_tokens * judge.cost_per_million_output_micros
+        ) // 1_000_000
+        worst_case = per_candidate * self.draft_automation.candidates_per_prompt
+        pipeline = (
+            worst_case
+            + per_judgment * self.draft_automation.candidates_per_prompt
+            + 2 * per_candidate * self.draft_automation.max_video_intents
+            + self.draft_automation.fal_transition_reservation_micros() * self.draft_automation.max_video_intents
+            + per_judgment
+        )
+        return {
+            "candidates_per_prompt": self.draft_automation.candidates_per_prompt,
+            "reservation_micros_per_candidate": per_candidate,
+            "reservation_micros_per_judgment": per_judgment,
+            "full_batch_reservation_micros": worst_case,
+            "full_pipeline_reservation_micros": pipeline,
+            # The queue-only pass-2 host advertises and validates zero direct
+            # generated assets. Exact video modifiers are already paid and
+            # materialized before author-skin; procedural-only plans have no
+            # asset provider work. Factory still performs plan-aware admission
+            # at ASSETS so this invariant cannot silently drift.
+            "final_author_asset_image_reservation_micros": 0,
+            "attempt_cap_micros": self.budgets.max_cost_micros_per_attempt,
+            "full_batch_fits_without_reported_usage": worst_case <= self.budgets.max_cost_micros_per_attempt,
+            "full_pipeline_fits_without_reported_usage": pipeline <= self.budgets.max_cost_micros_per_attempt,
+        }
 
 
 def load_config(path: Path | str | None = None) -> FactoryConfig:

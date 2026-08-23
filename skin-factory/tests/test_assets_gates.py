@@ -61,6 +61,34 @@ def _moving_band_sheet(columns: int, rows: int, texels_per_cell: int) -> Image.I
     return Image.fromarray(pixels, mode="RGB")
 
 
+def _bounded_moving_band_sheet(
+    columns: int,
+    rows: int,
+    texels_per_cell: int,
+    raster_overhang_px: int = 4,
+) -> Image.Image:
+    side = texels_per_cell * raster_overhang_px // 16
+    row_texels = texels_per_cell + 2 * side
+    width = columns * texels_per_cell
+    pixels = np.zeros((rows * row_texels, width, 4), dtype=np.uint8)
+    band_width = max(2, width // rows)
+    x = np.arange(width)
+    for frame in range(rows):
+        selected = ((x - frame * width // rows) % width) < band_width
+        top = frame * row_texels
+        body_top = top + side
+        pixels[body_top : body_top + texels_per_cell, :, :] = (12, 24, 36, 255)
+        pixels[body_top : body_top + texels_per_cell, selected, :] = (245, 210, 32, 255)
+        pixels[top + 1, selected, :] = (255, 40, 90, 128)
+    return Image.fromarray(pixels, mode="RGBA")
+
+
+def _image_bytes(image: Image.Image) -> bytes:
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
 def _checkerboard(columns: int, texels_per_cell: int) -> Image.Image:
     height = texels_per_cell
     width = columns * texels_per_cell
@@ -72,14 +100,24 @@ def _checkerboard(columns: int, texels_per_cell: int) -> Image.Image:
     return Image.fromarray(pixels, mode="RGB")
 
 
-def _asset(*, kind: str = "sheet", fit: str = "tile", frames: int = 60) -> AssetPlan:
+def _asset(
+    *,
+    kind: str = "sheet",
+    fit: str = "tile",
+    frames: int = 60,
+    raster_overhang_px: int = 0,
+) -> AssetPlan:
     return AssetPlan(
         kind=kind,
         natural_length_cells=7,
         frames=frames if kind == "sheet" else 1,
         desired_fps=float(frames) if kind == "sheet" else None,
         texels_per_cell=16 if kind == "sheet" else 64,
+        raster_overhang_px=raster_overhang_px,
         fit=fit,
+        transverse_edge_policy=(
+            "fail_closed_transparent_effect" if raster_overhang_px > 0 else "not_applicable_opaque_fill"
+        ),
         prompt="A deterministic test texture",
     )
 
@@ -105,7 +143,13 @@ def _plan(asset: AssetPlan, *, axes: list[str] | None = None) -> ImplementationP
     )
 
 
-def _document(*, frames: int = 60, fit: object | None = None, drift: object = "2") -> dict:
+def _document(
+    *,
+    frames: int = 60,
+    fit: object | None = None,
+    drift: object = "2",
+    raster_overhang_px: int = 0,
+) -> dict:
     digest = "a" * 64
     return {
         "schema_version": 2,
@@ -119,12 +163,13 @@ def _document(*, frames: int = 60, fit: object | None = None, drift: object = "2
                     "kind": "sheet",
                     "body_columns": 7,
                     "frame_rows": frames,
+                    "raster_overhang_px": raster_overhang_px,
                     "variants": [
                         {
                             "content_ref": f"sha256:{digest}",
                             "url": f"/api/textures/variants/sha256:{digest}.png",
                             "width_px": 112,
-                            "height_px": frames * 16,
+                            "height_px": frames * (16 + 2 * raster_overhang_px),
                             "bytes": 1_024,
                             "texels_per_cell": 16,
                         }
@@ -188,9 +233,7 @@ def test_renderer_conformance_runs_exact_client_compiler_before_registration(
     factory_config: FactoryConfig,
 ) -> None:
     factory_config.paths.repo_root = REPO_ROOT
-    document = json.loads(
-        (REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8")
-    )
+    document = json.loads((REPO_ROOT / "skills/author-skin/fixtures/layers/skin.skin.json").read_text(encoding="utf-8"))
     source = document["layers"][2]["source"]
     source["half_width"] = 0.15
     source["t_center"] = "tri(time)"
@@ -268,6 +311,47 @@ def test_normalize_keeps_body_columns_and_frame_rows_independent() -> None:
     normalized = AssetProcessor.normalize(_png(), _asset(frames=45))
     with Image.open(io.BytesIO(normalized)) as image:
         assert image.size == (7 * 16, 45 * 16)
+
+
+def test_normalize_preserves_rgba_and_adds_only_the_bounded_apron_rows() -> None:
+    asset = _asset(frames=4, raster_overhang_px=4)
+    source = _image_bytes(_bounded_moving_band_sheet(7, 4, 16))
+
+    normalized = AssetProcessor.normalize(source, asset)
+
+    with Image.open(io.BytesIO(normalized)) as image:
+        assert image.mode == "RGBA"
+        assert image.size == (7 * 16, 4 * (4 + 16 + 4))
+        alpha = np.asarray(image.getchannel("A"))
+    assert alpha[1].max() == 128
+    assert not alpha[0].any()
+
+
+def test_sheet_slice_assembly_retains_distinct_rgba_apron_pixels() -> None:
+    asset = _asset(frames=4, raster_overhang_px=4)
+    source = _image_bytes(_bounded_moving_band_sheet(7, 2, 16))
+    first = AssetProcessor.normalize_sheet_slice(
+        source,
+        body_columns=7,
+        frame_rows=2,
+        raster_overhang_px=4,
+    )
+    second = AssetProcessor.normalize_sheet_slice(
+        source,
+        body_columns=7,
+        frame_rows=2,
+        raster_overhang_px=4,
+    )
+
+    assembled = AssetProcessor.assemble_sheet_slices([first, second], asset)
+
+    with Image.open(io.BytesIO(assembled)) as image:
+        assert image.mode == "RGBA"
+        assert image.size == (7 * 16, 4 * 24)
+        alpha = np.asarray(image.getchannel("A"))
+    for row in range(4):
+        assert not alpha[row * 24].any()
+        assert not alpha[(row + 1) * 24 - 1].any()
 
 
 @pytest.mark.parametrize(
@@ -427,6 +511,48 @@ def test_exact_asset_byte_gates_measure_every_shipping_rung(factory_config: Fact
     assert all(item["changed_frame_transitions"] == 4 for item in loops)
 
 
+def test_exact_byte_gates_keep_a_16px_body_inside_scaled_rgba_aprons(
+    factory_config: FactoryConfig,
+) -> None:
+    runner = GateRunner(factory_config)
+    asset = _asset(frames=4, raster_overhang_px=4)
+    variants = [
+        _variant(_bounded_moving_band_sheet(7, 4, 16), 16),
+        _variant(_bounded_moving_band_sheet(7, 4, 8), 8),
+    ]
+
+    results = runner.validate_asset_bytes(asset, variants)
+
+    grid = _result(results, "sprite_grid")
+    assert grid.verdict == GateVerdict.PASS
+    assert [item["row_texels"] for item in grid.measurements["grid"]] == [24, 12]
+    assert [item["logical_body_texels"] for item in grid.measurements["grid"]] == [16, 8]
+    assert all(item["alpha_verified"] for item in grid.measurements["grid"])
+    temporal = _result(results, "temporal_loop")
+    assert temporal.verdict == GateVerdict.PASS
+    assert [item["row_texels"] for item in temporal.measurements["loops"]] == [24, 12]
+
+
+def test_exact_grid_gate_rejects_unaproned_or_edge_touching_bleed(
+    factory_config: FactoryConfig,
+) -> None:
+    runner = GateRunner(factory_config)
+    asset = _asset(frames=4, raster_overhang_px=4)
+    square = _variant(_moving_band_sheet(7, 4, 16), 16)
+    touched_image = _bounded_moving_band_sheet(7, 4, 16)
+    touched_image.putpixel((0, 0), (255, 255, 255, 255))
+    touched = _variant(touched_image, 16)
+
+    square_grid = _result(runner.validate_asset_bytes(asset, [square]), "sprite_grid")
+    touched_grid = _result(runner.validate_asset_bytes(asset, [touched]), "sprite_grid")
+
+    assert square_grid.verdict == GateVerdict.FAIL
+    assert any("declared grid requires 112x96px" in reason for reason in square_grid.reasons)
+    assert any("require an alpha channel" in reason for reason in square_grid.reasons)
+    assert touched_grid.verdict == GateVerdict.FAIL
+    assert any("touches a transverse stored-row edge" in reason for reason in touched_grid.reasons)
+
+
 def test_temporal_gate_accepts_horizontal_motion_with_constant_row_means(
     factory_config: FactoryConfig,
 ) -> None:
@@ -533,6 +659,23 @@ def test_image_contract_accepts_object_fit_and_numeric_constant(
 
     assert all(result.verdict == GateVerdict.PASS for result in results)
     assert _result(results, "asset_dimensions").measurements["required_wrap_axes"] == ["x", "y"]
+
+
+def test_image_contract_matches_bounded_apron_descriptor_to_plan(
+    factory_config: FactoryConfig,
+) -> None:
+    runner = GateRunner(factory_config)
+    document = _document(frames=30, raster_overhang_px=4)
+    plan = _plan(_asset(frames=30, raster_overhang_px=4))
+
+    result = _result(runner._image_contract(document, plan), "asset_dimensions")
+
+    assert result.verdict == GateVerdict.PASS
+
+    document["textures"][0]["descriptor"]["variants"][0]["height_px"] = 30 * 16
+    malformed = _result(runner._image_contract(document, plan), "asset_dimensions")
+    assert malformed.verdict == GateVerdict.FAIL
+    assert any("stored rows of 24px" in reason for reason in malformed.reasons)
 
 
 def test_sheet_rows_are_derived_from_desired_fps_and_period(
