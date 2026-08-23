@@ -11,40 +11,86 @@
 //! the shared `skin-schema` crate when they arrive; until then, an unknown id
 //! is simply not a skin.
 
+use serde::Serialize;
+
 /// The look every client can render, and the answer to any question this
 /// module cannot resolve.
 pub const DEFAULT_SKIN_REF: &str = "classic@1";
+
+/// What a skin dresses. Snake skins paint one player's body and travel to
+/// every other player; base skins theme the arena the wearer is looking at and
+/// never leave that client (`specs/skins-prd.md` section 5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub enum SkinKind {
+    Snake,
+    Base,
+}
+
+/// One catalogue entry, as the browse API presents it.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub struct CatalogEntry {
+    /// The reference that travels in game state and persists on the user item.
+    pub reference: &'static str,
+    /// What a player sees in the picker.
+    pub name: &'static str,
+    pub kind: SkinKind,
+    /// Built-ins cost nothing and everyone already has them. The field exists
+    /// so the browse shape does not change when priced skins arrive.
+    pub price_bux: u32,
+}
 
 /// Every selectable skin, in catalogue order.
 ///
 /// Kept in step with the client's registry by
 /// `client/src/skin/registry.rs`. The two lists are checked against each other
-/// by `skin_catalog_matches_the_client_registry` in the client crate's tests.
-pub const CATALOG: &[&str] = &[
-    "classic@1",
-    "aurora@1",
-    "ember@1",
-    "tidewave@1",
-    "voltage@1",
-    "lantern@1",
-    "gambit@1",
-    "harlequin@1",
-    "pitlane@1",
-    "zebra@1",
-    "zebra-print@1",
-    "tiger@1",
-    "tiger-print@1",
-    "jaguar@1",
-    "jaguar-print@1",
-    "zebra-live@1",
-    "tiger-live@1",
-    "stars-and-stripes@1",
-    "race-livery@1",
+/// by `the_client_catalogue_matches_the_servers` in the client crate's tests.
+pub const CATALOG: &[CatalogEntry] = &[
+    entry("classic@1", "Classic"),
+    entry("aurora@1", "Aurora"),
+    entry("ember@1", "Ember"),
+    entry("tidewave@1", "Tidewave"),
+    entry("voltage@1", "Voltage"),
+    entry("lantern@1", "Lantern"),
+    entry("gambit@1", "Gambit"),
+    entry("harlequin@1", "Harlequin"),
+    entry("pitlane@1", "Pitlane"),
+    entry("zebra@1", "Zebra"),
+    entry("zebra-print@1", "Zebra Print"),
+    entry("tiger@1", "Tiger"),
+    entry("tiger-print@1", "Tiger Print"),
+    entry("jaguar@1", "Jaguar"),
+    entry("jaguar-print@1", "Jaguar Print"),
+    entry("zebra-live@1", "Living Zebra"),
+    entry("tiger-live@1", "Living Tiger"),
+    entry("stars-and-stripes@1", "Stars and Stripes"),
+    entry("race-livery@1", "Race Livery"),
 ];
+
+/// Every snake skin also supplies base dressing, so the base picker offers the
+/// same looks addressed at the other slot. These are not separate registry
+/// entries — `base:<snake ref>` names "the base theme belonging to that skin",
+/// which is exactly what the renderer already resolves from a skin's
+/// `base_theme()`.
+pub const BASE_REF_PREFIX: &str = "base:";
+
+const fn entry(reference: &'static str, name: &'static str) -> CatalogEntry {
+    CatalogEntry {
+        reference,
+        name,
+        kind: SkinKind::Snake,
+        price_bux: 0,
+    }
+}
 
 /// Longest id worth considering. Sized for a future `sha256:<64 hex>` ref so
 /// this limit does not have to move when player-authored skins land.
-const MAX_SKIN_REF_LENGTH: usize = 96;
+pub const MAX_SKIN_REF_LENGTH: usize = 96;
 
 /// Resolve a client's requested skin to something safe to publish.
 ///
@@ -60,14 +106,35 @@ pub fn resolve_skin_ref(requested: Option<&str>) -> &'static str {
     }
     CATALOG
         .iter()
-        .find(|known| **known == trimmed)
-        .copied()
+        .find(|known| known.reference == trimmed)
+        .map(|known| known.reference)
         .unwrap_or(DEFAULT_SKIN_REF)
 }
 
 /// Whether an id names a skin this build knows.
 pub fn is_known(skin_ref: &str) -> bool {
-    CATALOG.contains(&skin_ref)
+    CATALOG.iter().any(|entry| entry.reference == skin_ref)
+}
+
+/// Whether an id names a base a player may equip.
+///
+/// A base reference is a snake reference wearing the `base:` prefix, so the
+/// base slot inherits the catalogue without a second list to keep in step.
+pub fn is_known_base(base_ref: &str) -> bool {
+    base_ref.strip_prefix(BASE_REF_PREFIX).is_some_and(is_known)
+}
+
+/// The catalogue as base entries, for the base picker.
+pub fn base_catalog() -> Vec<CatalogEntry> {
+    CATALOG
+        .iter()
+        .map(|entry| CatalogEntry {
+            reference: entry.reference,
+            name: entry.name,
+            kind: SkinKind::Base,
+            price_bux: entry.price_bux,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -77,8 +144,8 @@ mod tests {
     #[test]
     fn every_catalogue_entry_resolves_to_itself() {
         for entry in CATALOG {
-            assert_eq!(resolve_skin_ref(Some(entry)), *entry);
-            assert!(is_known(entry));
+            assert_eq!(resolve_skin_ref(Some(entry.reference)), entry.reference);
+            assert!(is_known(entry.reference));
         }
     }
 
@@ -121,12 +188,42 @@ mod tests {
     fn the_catalogue_has_no_duplicates_and_starts_with_the_default() {
         let mut seen = std::collections::HashSet::new();
         for entry in CATALOG {
-            assert!(seen.insert(*entry), "{entry} appears twice");
+            assert!(
+                seen.insert(entry.reference),
+                "{} appears twice",
+                entry.reference
+            );
         }
         assert_eq!(
-            CATALOG.first().copied(),
+            CATALOG.first().map(|entry| entry.reference),
             Some(DEFAULT_SKIN_REF),
             "the fallback has to be in the catalogue, and first is the tidiest place"
         );
+    }
+
+    /// A base reference is only ever a prefixed snake reference, so the two
+    /// slots can never drift into naming different sets of looks.
+    #[test]
+    fn base_references_are_prefixed_catalogue_entries() {
+        assert!(is_known_base("base:aurora@1"));
+        assert!(is_known_base("base:classic@1"));
+        assert!(!is_known_base("aurora@1"), "a bare snake ref is not a base");
+        assert!(!is_known_base("base:nonesuch@9"));
+        assert!(!is_known_base("base:"));
+        assert_eq!(base_catalog().len(), CATALOG.len());
+        assert!(
+            base_catalog()
+                .iter()
+                .all(|entry| entry.kind == SkinKind::Base)
+        );
+    }
+
+    #[test]
+    fn every_entry_has_a_display_name() {
+        for entry in CATALOG {
+            assert!(!entry.name.is_empty(), "{} has no name", entry.reference);
+            assert_eq!(entry.kind, SkinKind::Snake);
+            assert_eq!(entry.price_bux, 0, "built-ins are free");
+        }
     }
 }

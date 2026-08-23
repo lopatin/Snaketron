@@ -88,7 +88,64 @@ pub const POSES: &[Pose] = &[
         name: "self_crossing",
         cells: &[(2.0, 2.0), (6.0, 2.0), (6.0, 5.0), (4.0, 5.0), (4.0, 1.0)],
     },
+    Pose {
+        // A wide U-turn: out along one arm, four cells across, and back. It
+        // spans the same 21 cells as `longer_than_head_gradient` so the two
+        // sit at one width in the Builder's preview row, and it is the pose
+        // that shows what `single_corner` cannot — a pattern crossing *two*
+        // turns, and the head running back alongside the tail where any
+        // mismatch between the two arms is side by side and obvious.
+        name: "wide_u_turn",
+        cells: &[(0.0, 2.0), (20.0, 2.0), (20.0, 6.0), (0.0, 6.0)],
+    },
+    Pose {
+        // Four cells: the length every snake is dealt at spawn
+        // (`DEFAULT_SNAKE_LENGTH` in `common::game_state`). Shorter than the
+        // head glow and shorter than most patterns' repeat, so it is the pose
+        // that answers "what does this look like in the second before anyone
+        // has eaten anything" — which is every player's first sight of it.
+        name: "starting_length",
+        cells: &[(5.0, 3.0), (2.0, 3.0)],
+    },
 ];
+
+/// Bodies the Builder's preview draws, kept out of the corpus above.
+///
+/// [`POSES`] is a correctness instrument: every entry is there because the
+/// painter has a branch only it reaches, and every entry costs a block of
+/// recorded trace plus a pass of the conformance suite at three cell sizes and
+/// four clock samples. Four straight bodies at four lengths reach exactly the
+/// branches one straight body reaches, so putting them there would buy no
+/// coverage and charge for it — and would mean re-recording the goldens every
+/// time someone nudged a preview.
+///
+/// They all start at x = 0, so a column of them lines up on its left edge and
+/// the difference between them reads as length rather than as position.
+pub const PREVIEW_ONLY_POSES: &[Pose] = &[
+    Pose {
+        name: "straight_16",
+        cells: &[(15.0, 3.0), (0.0, 3.0)],
+    },
+    Pose {
+        name: "straight_18",
+        cells: &[(17.0, 3.0), (0.0, 3.0)],
+    },
+    Pose {
+        name: "straight_19",
+        cells: &[(18.0, 3.0), (0.0, 3.0)],
+    },
+];
+
+/// Resolve a pose by name, preview-only bodies included.
+///
+/// The corpus is what the goldens and the conformance suite iterate; this is
+/// what a *renderer caller* asks, and it may have either kind.
+pub fn pose_by_name(name: &str) -> Option<&'static Pose> {
+    POSES
+        .iter()
+        .chain(PREVIEW_ONLY_POSES)
+        .find(|pose| pose.name == name)
+}
 
 /// Arena bodies for the corpse painter, which still consumes untransformed
 /// grid positions plus a rotation.
@@ -227,6 +284,30 @@ mod tests {
         );
     }
 
+    /// The Builder names these in its own source, across a crate boundary and
+    /// a wasm one, so nothing type-checks the pair. Deleting one shows up as a
+    /// blank canvas in a modal rather than as a build error — which is exactly
+    /// how `mid_horizontal` went missing once already.
+    #[test]
+    fn the_bodies_the_builder_asks_for_all_resolve() {
+        for name in [
+            // The preview deck's slides.
+            "straight_16",
+            "straight_18",
+            "straight_19",
+            "longer_than_head_gradient",
+            "starting_length",
+            "self_crossing",
+            "zigzag",
+            "wide_u_turn",
+        ] {
+            assert!(
+                pose_by_name(name).is_some(),
+                "the Builder asks for `{name}` and nothing answers"
+            );
+        }
+    }
+
     /// The shading engine needs a body whose runs are one cell long, and one
     /// long enough for a tile to wrap. Losing either silently would take the
     /// coverage with it.
@@ -264,5 +345,21 @@ mod tests {
             assert!(identity_by_name(name).is_some(), "{name} did not resolve");
         }
         assert!(identity_by_name("nonesuch").is_none());
+    }
+
+    /// A template names the role its picker card should paint, and that name
+    /// crosses a crate boundary as a string — skin-schema cannot see this list.
+    /// A typo there would silently fall back to whatever the caller does with
+    /// an unresolvable role, so the two ends are tied together here.
+    #[test]
+    fn every_template_names_a_role_that_resolves() {
+        for template in skin_schema::v2::templates() {
+            assert!(
+                identity_by_name(&template.preview_role).is_some(),
+                "template `{}` previews as `{}`, which is not a role",
+                template.id,
+                template.preview_role
+            );
+        }
     }
 }

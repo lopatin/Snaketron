@@ -24,13 +24,21 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use super::models::*;
-use super::{Database, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
+use super::skins_dynamo;
+use super::{Database, PurchaseOutcome, SERVER_HEARTBEAT_FRESHNESS_SECONDS, ServerRegistration};
 use crate::completion::{
     CompletionEffect, CompletionRecordV1, EffectApplyResult, MATCH_HISTORY_SCHEMA_VERSION,
     canonical_json_bytes, match_history_summary,
 };
+use crate::generation::{GenerationJob, JobState};
 use crate::replay_store::{ReplayObjectMetadata, ReplayStore, ReplayStoreConfig, S3ReplayStore};
 use crate::season::{Season, get_season_at};
+use crate::skin_store::{
+    GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
+    SkinRevision,
+};
+use crate::texture::Texture;
+use crate::wallet::{self, LedgerSource, Wallet};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -289,7 +297,224 @@ pub async fn dynamodb_client() -> Client {
     Client::new(&config)
 }
 
+/// Whether an SDK error is DynamoDB refusing a write because its condition did
+/// not hold. That is an ordinary outcome for the idempotent writes here — the
+/// grant already exists, the exposure was already recorded — not a failure.
+fn is_conditional_check_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, R>) -> bool {
+    error.code() == Some("ConditionalCheckFailedException")
+}
+
 impl DynamoDatabase {
+    /// Read a texture back out of its item.
+    fn texture_from_item(item: &HashMap<String, AttributeValue>) -> Result<Texture> {
+        Ok(Texture {
+            texture_id: Self::extract_number(item, "textureId")
+                .ok_or_else(|| anyhow!("texture item has no id"))?,
+            owner_user_id: Self::extract_number(item, "ownerUserId").unwrap_or(0),
+            content_ref: Self::extract_string(item, "contentRef")
+                .ok_or_else(|| anyhow!("texture item has no content reference"))?,
+            kind: Self::extract_string(item, "kind")
+                .and_then(|value| crate::texture::TextureKind::parse(&value))
+                .ok_or_else(|| anyhow!("texture item has no usable kind"))?,
+            width_px: Self::extract_number(item, "widthPx").unwrap_or(0).max(0) as u32,
+            height_px: Self::extract_number(item, "heightPx").unwrap_or(0).max(0) as u32,
+            repeat_cells: Self::extract_string(item, "repeatCells")
+                .and_then(|value| value.parse().ok()),
+            rows: Self::extract_number(item, "rows").map(|rows| rows.max(0) as u32),
+            seams: Self::extract_string(item, "seams")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or(crate::texture::SeamReport {
+                    horizontal_ratio: 0.0,
+                    vertical_ratio: 0.0,
+                    repaired: false,
+                }),
+            last_prompt: Self::extract_string(item, "lastPrompt"),
+            variants: Self::extract_string(item, "variants")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
+            created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
+        })
+    }
+
+    /// The attribute map for one generation job.
+    ///
+    /// A queued job carries an index entry so a worker can find it; every
+    /// later state drops that entry, which is what keeps the queue partition
+    /// holding a queue rather than every job ever run.
+    fn generation_job_item(job: &GenerationJob) -> Result<HashMap<String, AttributeValue>> {
+        let mut item = HashMap::new();
+        item.insert(
+            "pk".to_string(),
+            Self::av_s(format!("GENJOB#{}", job.job_id)),
+        );
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("jobId".to_string(), Self::av_s(&job.job_id));
+        item.insert("ownerUserId".to_string(), Self::av_n(job.owner_user_id));
+        item.insert("kind".to_string(), Self::av_s(job.kind.as_str()));
+        item.insert("prompt".to_string(), Self::av_s(&job.prompt));
+        item.insert("state".to_string(), Self::av_s(job.state.as_str()));
+        item.insert(
+            "providerCalls".to_string(),
+            Self::av_n(job.spend.provider_calls),
+        );
+        item.insert(
+            "spendUsdMicros".to_string(),
+            Self::av_n(job.spend.usd_micros),
+        );
+        if let Some(texture_id) = job.texture_id {
+            item.insert("textureId".to_string(), Self::av_n(texture_id));
+        }
+        if let Some(failure) = job.failure {
+            item.insert("failure".to_string(), Self::av_s(failure.as_str()));
+        }
+        if let Some(detail) = &job.detail {
+            item.insert("detail".to_string(), Self::av_s(detail));
+        }
+        item.insert("createdAtMs".to_string(), Self::av_n(job.created_at_ms));
+        item.insert("updatedAtMs".to_string(), Self::av_n(job.updated_at_ms));
+        if let Some(lease) = job.lease_until_ms {
+            item.insert("leaseUntilMs".to_string(), Self::av_n(lease));
+        }
+        if let Some(subject) = &job.subject {
+            item.insert("subject".to_string(), Self::av_s(subject));
+        }
+        if let Some(source) = &job.source_ref {
+            item.insert("sourceRef".to_string(), Self::av_s(source));
+        }
+        if !job.reference_refs.is_empty() {
+            item.insert(
+                "referenceRefs".to_string(),
+                AttributeValue::Ss(job.reference_refs.clone()),
+            );
+        }
+        // Jobs are working state, not a record: a week is long enough to read
+        // a failure and short enough that the table does not accumulate them.
+        //
+        // Written here rather than only at creation, because updating a job
+        // replaces the whole item — so a lifetime added once at creation is
+        // stripped by the first progress write, and the job becomes permanent.
+        // Anything this function omits is deleted the moment a job moves.
+        item.insert(
+            "ttl".to_string(),
+            Self::av_n(job.created_at_ms / 1_000 + 7 * 24 * 60 * 60),
+        );
+
+        // Every unfinished job carries a queue entry, not only untouched ones.
+        // A claim used to remove it, which meant a worker that died took the
+        // job out of the only index that could find it again — the state said
+        // `generating` and no query would ever return it. Keeping the entry
+        // until the job is genuinely finished is what makes a lapsed lease
+        // recoverable; the claim condition, not the index, is what stops two
+        // workers running the same job.
+        if !job.state.is_terminal() {
+            item.insert("gsi1pk".to_string(), Self::av_s("GENJOB_QUEUE"));
+            item.insert(
+                "gsi1sk".to_string(),
+                Self::av_s(format!("{:020}", job.created_at_ms)),
+            );
+        }
+        // Spend is totalled across a window, so every job carries a
+        // time-ordered entry regardless of state.
+        item.insert("gsi2pk".to_string(), Self::av_s("GENJOB_SPEND"));
+        item.insert(
+            "gsi2sk".to_string(),
+            Self::av_s(format!("{:020}", job.created_at_ms)),
+        );
+        Ok(item)
+    }
+
+    fn generation_job_from_item(item: &HashMap<String, AttributeValue>) -> Result<GenerationJob> {
+        Ok(GenerationJob {
+            job_id: Self::extract_string(item, "jobId")
+                .ok_or_else(|| anyhow!("job item has no id"))?,
+            owner_user_id: Self::extract_number(item, "ownerUserId").unwrap_or(0),
+            kind: Self::extract_string(item, "kind")
+                .and_then(|value| crate::texture::TextureKind::parse(&value))
+                .ok_or_else(|| anyhow!("job item has no usable kind"))?,
+            prompt: Self::extract_string(item, "prompt").unwrap_or_default(),
+            // An unreadable state is treated as failed rather than as queued:
+            // re-running a job whose state we cannot read is how one prompt
+            // becomes an unbounded bill.
+            state: Self::extract_string(item, "state")
+                .and_then(|value| JobState::parse(&value))
+                .unwrap_or(JobState::Failed),
+            spend: crate::generation::Spend {
+                provider_calls: Self::extract_number(item, "providerCalls").unwrap_or(0) as u32,
+                usd_micros: Self::extract_i64(item, "spendUsdMicros")
+                    .unwrap_or(0)
+                    .max(0) as u64,
+            },
+            texture_id: Self::extract_number(item, "textureId"),
+            failure: Self::extract_string(item, "failure").and_then(|value| {
+                use crate::generation::FailureKind::*;
+                match value.as_str() {
+                    "providerRefused" => Some(ProviderRefused),
+                    "providerUnavailable" => Some(ProviderUnavailable),
+                    "shapeRejected" => Some(ShapeRejected),
+                    "seamsRejected" => Some(SeamsRejected),
+                    "budgetExhausted" => Some(BudgetExhausted),
+                    "pipelineHalted" => Some(PipelineHalted),
+                    _ => None,
+                }
+            }),
+            detail: Self::extract_string(item, "detail"),
+            created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
+            updated_at_ms: Self::extract_i64(item, "updatedAtMs").unwrap_or(0),
+            lease_until_ms: Self::extract_i64(item, "leaseUntilMs"),
+            subject: Self::extract_string(item, "subject"),
+            source_ref: Self::extract_string(item, "sourceRef"),
+            reference_refs: item
+                .get("referenceRefs")
+                .and_then(|value| value.as_ss().ok())
+                .map(|list| list.to_vec())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Query one of the skin indexes and page the result.
+    ///
+    /// Both listings are the same shape — a partition, newest first, resumable
+    /// — so they share one implementation rather than two that drift.
+    async fn query_skin_index(
+        &self,
+        index: &str,
+        partition_attribute: &str,
+        partition: String,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage> {
+        let limit = limit.clamp(1, 100) as i32;
+        let mut request = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name(index)
+            .key_condition_expression(format!("{partition_attribute} = :partition"))
+            .expression_attribute_values(":partition", Self::av_s(partition))
+            // Newest first: a catalogue nobody has scrolled should open on what
+            // was made most recently.
+            .scan_index_forward(false)
+            .limit(limit);
+        if let Some(key) = cursor.and_then(skins_dynamo::decode_cursor) {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let response = request.send().await.context("Failed to list skins")?;
+        let skins = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| skins_dynamo::skin_from_item(item).ok())
+            .collect();
+        Ok(SkinPage {
+            skins,
+            cursor: response
+                .last_evaluated_key
+                .as_ref()
+                .and_then(skins_dynamo::encode_cursor),
+        })
+    }
+
     pub async fn new() -> Result<Self> {
         let client = dynamodb_client().await;
 
@@ -2786,6 +3011,7 @@ impl Database for DynamoDatabase {
             profile_picture_url: None,
             profile_iat: None,
             selected_skin: None,
+            selected_base: None,
         })
     }
 
@@ -2851,6 +3077,7 @@ impl Database for DynamoDatabase {
             profile_picture_url: None,
             profile_iat: None,
             selected_skin: None,
+            selected_base: None,
         })
     }
 
@@ -3033,6 +3260,7 @@ impl Database for DynamoDatabase {
                     profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
                     profile_iat: Self::extract_i64(&item, "profileIat"),
                     selected_skin: Self::extract_string(&item, "selectedSkin"),
+                    selected_base: Self::extract_string(&item, "selectedBase"),
                 };
                 Ok(Some(user))
             }
@@ -3075,6 +3303,1242 @@ impl Database for DynamoDatabase {
         self.mutate_user_progress(user_id, "mmr", UserProgressMutation::Set(mmr))
             .await?;
         Ok(())
+    }
+
+    // ---- Player-authored skins -------------------------------------------
+
+    async fn create_skin(&self, draft: NewSkin<'_>) -> Result<Skin> {
+        let skin_id = self.generate_id_for_entity("SKIN").await?;
+        let now = Utc::now().timestamp_millis();
+        let skin = Skin {
+            skin_id,
+            kind: draft.kind,
+            creator_user_id: draft.creator_user_id,
+            creator_username: draft.creator_username.map(str::to_string),
+            name: draft.name.to_string(),
+            publication: Publication::Private,
+            pending_revision: None,
+            price_bux: 0,
+            head_revision: 1,
+            published_revision: None,
+            head_content_ref: draft.revision.content_ref.to_string(),
+            published_content_ref: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            published_at_ms: None,
+            // Its creator's own grant is written beside it, so it is born with
+            // exactly one owner and nobody wearing it yet.
+            owner_count: 1,
+            wearer_count: 0,
+        };
+
+        // The skin, its first revision, and the creator's own grant land
+        // together: a skin its author does not own would be unequippable by the
+        // only person allowed to wear it.
+        let put_skin = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::skin_item(&skin)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .context("Failed to build skin creation")?;
+        let put_revision = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::revision_item(
+                skin_id,
+                1,
+                &draft.revision,
+                now,
+            )))
+            .build()
+            .context("Failed to build first revision")?;
+        let put_grant = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::grant_item(
+                draft.creator_user_id,
+                skin_id,
+                GrantSource::OwnCreation,
+                0,
+                now,
+            )))
+            .build()
+            .context("Failed to build creator grant")?;
+
+        self.client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_skin).build())
+            .transact_items(TransactWriteItem::builder().put(put_revision).build())
+            .transact_items(TransactWriteItem::builder().put(put_grant).build())
+            .send()
+            .await
+            .context("Failed to create skin")?;
+
+        Ok(skin)
+    }
+
+    async fn put_skin_revision(&self, skin_id: i32, revision: NewRevision<'_>) -> Result<Skin> {
+        let mut skin = self
+            .get_skin(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+        let next = skin.head_revision + 1;
+        let now = Utc::now().timestamp_millis();
+
+        // The revision lands first. A revision nothing points at is harmless
+        // clutter; a head pointing at a revision that does not exist would make
+        // the skin unrenderable for its creator.
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::revision_item(
+                skin_id, next, &revision, now,
+            )))
+            .send()
+            .await
+            .context("Failed to store skin revision")?;
+
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression(
+                "SET headRevision = :revision, headContentRef = :content_ref, \
+                 updatedAtMs = :now",
+            )
+            .condition_expression("headRevision = :expected")
+            .expression_attribute_values(":revision", Self::av_n(next))
+            .expression_attribute_values(":content_ref", Self::av_s(revision.content_ref))
+            .expression_attribute_values(":now", Self::av_n(now))
+            .expression_attribute_values(":expected", Self::av_n(skin.head_revision))
+            .send()
+            .await
+            .context("Failed to advance skin head revision")?;
+
+        skin.head_revision = next;
+        skin.head_content_ref = revision.content_ref.to_string();
+        skin.updated_at_ms = now;
+        Ok(skin)
+    }
+
+    async fn update_skin_metadata(
+        &self,
+        skin_id: i32,
+        name: Option<&str>,
+        price_bux: Option<u32>,
+    ) -> Result<()> {
+        let mut assignments = vec!["updatedAtMs = :now".to_string()];
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":now", Self::av_n(Utc::now().timestamp_millis()));
+
+        if let Some(name) = name {
+            assignments.push("#name = :name".to_string());
+            request = request
+                .expression_attribute_names("#name", "name")
+                .expression_attribute_values(":name", Self::av_s(name));
+        }
+        if let Some(price) = price_bux {
+            assignments.push("priceBux = :price".to_string());
+            request = request.expression_attribute_values(":price", Self::av_n(price));
+        }
+
+        request
+            .update_expression(format!("SET {}", assignments.join(", ")))
+            .send()
+            .await
+            .context("Failed to update skin metadata")?;
+        Ok(())
+    }
+
+    async fn get_skin(&self, skin_id: i32) -> Result<Option<Skin>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read skin")?;
+        response
+            .item
+            .map(|item| skins_dynamo::skin_from_item(&item))
+            .transpose()
+    }
+
+    async fn get_skin_revision(&self, skin_id: i32, revision: u32) -> Result<Option<SkinRevision>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .send()
+            .await
+            .context("Failed to read skin revision")?;
+        response
+            .item
+            .map(|item| skins_dynamo::revision_from_item(&item))
+            .transpose()
+    }
+
+    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Option<(Skin, SkinRevision)>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :reference")
+            .expression_attribute_values(
+                ":reference",
+                Self::av_s(skins_dynamo::content_ref_index_partition(content_ref)),
+            )
+            .limit(1)
+            .send()
+            .await
+            .context("Failed to resolve a skin by content reference")?;
+
+        let Some(item) = response.items.and_then(|items| items.into_iter().next()) else {
+            return Ok(None);
+        };
+        let revision = skins_dynamo::revision_from_item(&item)?;
+        let Some(skin) = self.get_skin(revision.skin_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some((skin, revision)))
+    }
+
+    async fn list_published_skins(
+        &self,
+        kind: SkinKind,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage> {
+        self.query_skin_index(
+            "GSI1",
+            "gsi1pk",
+            skins_dynamo::published_index_partition(kind),
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_skins_by_creator(
+        &self,
+        user_id: i32,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SkinPage> {
+        self.query_skin_index(
+            "GSI2",
+            "gsi2pk",
+            skins_dynamo::owner_index_partition(user_id),
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    async fn set_skin_publication(
+        &self,
+        skin_id: i32,
+        publication: Publication,
+        published_revision: Option<u32>,
+        actor_user_id: i32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let skin = self
+            .get_skin(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+
+        let mut assignments = vec![
+            "publication = :publication".to_string(),
+            "updatedAtMs = :now".to_string(),
+        ];
+        let mut removals: Vec<String> = Vec::new();
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":publication", Self::av_s(publication.as_str()))
+            .expression_attribute_values(":now", Self::av_n(now));
+
+        if let Some(revision) = published_revision {
+            let content_ref = self
+                .get_skin_revision(skin_id, revision)
+                .await?
+                .map(|revision| revision.content_ref)
+                .ok_or_else(|| anyhow!("Cannot publish a revision that does not exist"))?;
+            assignments.push("publishedRevision = :published".to_string());
+            assignments.push("publishedContentRef = :published_ref".to_string());
+            assignments.push("publishedAtMs = :now".to_string());
+            request = request
+                .expression_attribute_values(":published", Self::av_n(revision))
+                .expression_attribute_values(":published_ref", Self::av_s(content_ref));
+        }
+
+        // The browse index is sparse: an entry exists only while the skin is
+        // published, so withdrawing one removes it from the listing rather than
+        // leaving something to filter out on every read.
+        if publication.is_browsable() {
+            assignments.push("gsi1pk = :index_pk".to_string());
+            assignments.push("gsi1sk = :index_sk".to_string());
+            request = request
+                .expression_attribute_values(
+                    ":index_pk",
+                    Self::av_s(skins_dynamo::published_index_partition(skin.kind)),
+                )
+                .expression_attribute_values(":index_sk", Self::av_s(format!("{now:020}")));
+        } else {
+            removals.push("gsi1pk".to_string());
+            removals.push("gsi1sk".to_string());
+        }
+
+        let mut expression = format!("SET {}", assignments.join(", "));
+        if !removals.is_empty() {
+            expression.push_str(&format!(" REMOVE {}", removals.join(", ")));
+        }
+
+        request
+            .update_expression(expression)
+            .send()
+            .await
+            .context("Failed to change skin publication")?;
+
+        // Every decision is recorded, with its actor, the way runtime-config
+        // changes are: moderation that leaves no trail is not reviewable.
+        let mut audit = HashMap::new();
+        audit.insert(
+            "pk".to_string(),
+            AttributeValue::S(skins_dynamo::skin_partition(skin_id)),
+        );
+        audit.insert(
+            "sk".to_string(),
+            AttributeValue::S(format!("REVIEW#{now:020}")),
+        );
+        audit.insert(
+            "publication".to_string(),
+            AttributeValue::S(publication.as_str().to_string()),
+        );
+        audit.insert(
+            "actorUserId".to_string(),
+            AttributeValue::N(actor_user_id.to_string()),
+        );
+        audit.insert("atMs".to_string(), AttributeValue::N(now.to_string()));
+        if let Some(reason) = reason {
+            audit.insert("reason".to_string(), AttributeValue::S(reason.to_string()));
+        }
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(audit))
+            .send()
+            .await
+            .context("Failed to record a skin publication decision")?;
+
+        Ok(())
+    }
+
+    async fn set_skin_pending_revision(&self, skin_id: i32, revision: Option<u32>) -> Result<()> {
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk)");
+
+        request = match revision {
+            Some(revision) => request
+                .update_expression("SET pendingRevision = :revision")
+                .expression_attribute_values(":revision", Self::av_n(revision)),
+            None => request.update_expression("REMOVE pendingRevision"),
+        };
+
+        request
+            .send()
+            .await
+            .context("Failed to update the pending review revision")?;
+
+        // The queue is a separate marker item rather than an index entry on the
+        // skin, because the skin's own index slot is already the browse
+        // listing. It exists only while a request is open, which is what keeps
+        // its single partition holding a queue rather than a history.
+        match revision {
+            Some(_) => {
+                self.client
+                    .put_item()
+                    .table_name(self.main_table())
+                    .set_item(Some(skins_dynamo::review_queue_item(
+                        skin_id,
+                        Utc::now().timestamp_millis(),
+                    )))
+                    .send()
+                    .await
+                    .context("Failed to enqueue a skin for review")?;
+            }
+            None => {
+                self.client
+                    .delete_item()
+                    .table_name(self.main_table())
+                    .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+                    .key("sk", Self::av_s(skins_dynamo::REVIEW_QUEUE_SORT_KEY))
+                    .send()
+                    .await
+                    .context("Failed to dequeue a reviewed skin")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn list_skins_awaiting_review(&self, limit: usize) -> Result<Vec<Skin>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :queue")
+            .expression_attribute_values(":queue", Self::av_s(skins_dynamo::REVIEW_QUEUE_PARTITION))
+            // Oldest first: the point of a review queue is that waiting longest
+            // gets looked at first.
+            .scan_index_forward(true)
+            .limit(limit.clamp(1, 100) as i32)
+            .send()
+            .await
+            .context("Failed to read the review queue")?;
+
+        let mut skins = Vec::new();
+        for item in response.items.unwrap_or_default() {
+            let Some(AttributeValue::N(skin_id)) = item.get("skinId") else {
+                continue;
+            };
+            let Ok(skin_id) = skin_id.parse::<i32>() else {
+                continue;
+            };
+            // A marker whose skin has since been deleted is skipped rather than
+            // failing the whole queue.
+            if let Some(skin) = self.get_skin(skin_id).await? {
+                skins.push(skin);
+            }
+        }
+        Ok(skins)
+    }
+
+    async fn approve_skin_revision(&self, skin_id: i32, revision: u32) -> Result<()> {
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .update_expression("SET reviewApproved = :approved")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":approved", Self::av_bool(true))
+            .send()
+            .await
+            .context("Failed to approve a skin revision")?;
+        Ok(())
+    }
+
+    async fn mark_revision_exposed(&self, skin_id: i32, revision: u32, at_ms: i64) -> Result<()> {
+        // Conditional on the attribute's absence, so this is a no-op write
+        // after the first match and never moves the recorded moment.
+        let result = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s(skins_dynamo::revision_sort_key(revision)))
+            .update_expression("SET exposedAtMs = :at")
+            .condition_expression("attribute_exists(pk) AND attribute_not_exists(exposedAtMs)")
+            .expression_attribute_values(":at", Self::av_n(at_ms))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_conditional_check_failure(&error) => Ok(()),
+            Err(error) => Err(error).context("Failed to record skin exposure"),
+        }
+    }
+
+    async fn grant_skin(
+        &self,
+        user_id: i32,
+        skin_id: i32,
+        source: GrantSource,
+        price_paid_bux: u32,
+    ) -> Result<()> {
+        // The grant and the skin's owner count move together. Separately, a
+        // retried grant that lost its race would count an owner twice; the
+        // conditional put is what makes the pair idempotent, and the
+        // transaction is what makes the counter share that property.
+        let put_grant = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::grant_item(
+                user_id,
+                skin_id,
+                source,
+                price_paid_bux,
+                Utc::now().timestamp_millis(),
+            )))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .context("Failed to build a skin grant")?;
+        let count_owner = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD ownerCount :one")
+            .expression_attribute_values(":one", Self::av_n(1))
+            .build()
+            .context("Failed to build an owner count")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_grant).build())
+            .transact_items(TransactWriteItem::builder().update(count_owner).build())
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            // Already owned. Ownership is permanent and its terms are
+            // historical, so a repeat grant leaves the original alone — and
+            // leaves the count alone with it.
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error).context("Failed to grant a skin"),
+        }
+    }
+
+    async fn adjust_skin_wearers(&self, skin_id: i32, delta: i32) -> Result<()> {
+        self.client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD wearerCount :delta")
+            // Only for a skin that still exists: a deleted one should not be
+            // conjured back into being by somebody taking it off.
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":delta", Self::av_n(delta))
+            .send()
+            .await
+            .map(|_| ())
+            .or_else(|error| {
+                if is_conditional_check_failure(&error) {
+                    Ok(())
+                } else {
+                    Err(error).context("Failed to adjust a skin wearer count")
+                }
+            })
+    }
+
+    async fn list_skin_grants(&self, user_id: i32) -> Result<Vec<SkinGrant>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .key_condition_expression("pk = :user AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":user", Self::av_s(format!("USER#{user_id}")))
+            .expression_attribute_values(":prefix", Self::av_s("SKINOWN#"))
+            .send()
+            .await
+            .context("Failed to list skin grants")?;
+
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(skins_dynamo::grant_from_item)
+            .collect())
+    }
+
+    async fn has_skin_grant(&self, user_id: i32, skin_id: i32) -> Result<bool> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s(skins_dynamo::grant_sort_key(skin_id)))
+            .send()
+            .await
+            .context("Failed to check a skin grant")?;
+        Ok(response.item.is_some())
+    }
+
+    async fn set_user_equipment(
+        &self,
+        user_id: i32,
+        selected_skin: Option<Option<&str>>,
+        selected_base: Option<Option<&str>>,
+    ) -> Result<()> {
+        // Build one update expression covering only the slots the caller named,
+        // so equipping a skin cannot silently clear a base the request never
+        // mentioned. Nothing to say means nothing to write.
+        let mut sets: Vec<String> = Vec::new();
+        let mut removes: Vec<String> = Vec::new();
+        let mut request = self
+            .client
+            .update_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .condition_expression("attribute_exists(pk) AND attribute_exists(sk)");
+
+        for (slot, attribute, placeholder) in [
+            (selected_skin, "selectedSkin", ":skin"),
+            (selected_base, "selectedBase", ":base"),
+        ] {
+            match slot {
+                None => {}
+                Some(None) => removes.push(attribute.to_string()),
+                Some(Some(reference)) => {
+                    sets.push(format!("{attribute} = {placeholder}"));
+                    request =
+                        request.expression_attribute_values(placeholder, Self::av_s(reference));
+                }
+            }
+        }
+
+        if sets.is_empty() && removes.is_empty() {
+            return Ok(());
+        }
+
+        let mut expression = String::new();
+        if !sets.is_empty() {
+            expression.push_str(&format!("SET {}", sets.join(", ")));
+        }
+        if !removes.is_empty() {
+            if !expression.is_empty() {
+                expression.push(' ');
+            }
+            expression.push_str(&format!("REMOVE {}", removes.join(", ")));
+        }
+
+        request
+            .update_expression(expression)
+            .send()
+            .await
+            .context("Failed to update user equipment")?;
+
+        Ok(())
+    }
+
+    // ---- Snakebux --------------------------------------------------------
+
+    async fn apply_ledger_entry(
+        &self,
+        user_id: i32,
+        source: LedgerSource,
+        idempotency_key: &str,
+        delta: i64,
+        request_hash: &str,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now().timestamp_millis();
+        let sort_key = wallet::ledger_sort_key(source, idempotency_key);
+
+        let mut entry = HashMap::new();
+        entry.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        entry.insert("sk".to_string(), Self::av_s(&sort_key));
+        entry.insert("source".to_string(), Self::av_s(source.as_str()));
+        entry.insert("idempotencyKey".to_string(), Self::av_s(idempotency_key));
+        entry.insert("delta".to_string(), Self::av_n(delta));
+        entry.insert("requestHash".to_string(), Self::av_s(request_hash));
+        entry.insert("createdAtMs".to_string(), Self::av_n(now));
+        if let Some(note) = note {
+            entry.insert("note".to_string(), Self::av_s(note));
+        }
+        // The ledger is a financial record and outlives the session that made
+        // it, so unlike the job items it carries no TTL.
+        entry.insert(
+            "gsi2pk".to_string(),
+            Self::av_s(format!("WALLET#{user_id}")),
+        );
+        entry.insert("gsi2sk".to_string(), Self::av_s(format!("{now:020}")));
+
+        let put_entry = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(entry))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build a ledger entry")?;
+        let move_balance = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD boostBux :delta")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":delta", Self::av_n(delta))
+            .build()
+            .context("Failed to build a balance change")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_entry).build())
+            .transact_items(TransactWriteItem::builder().update(move_balance).build())
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                // The key is taken. Whether that is a duplicate or a collision
+                // depends on whether the request matches what it was taken for.
+                let existing = self
+                    .client
+                    .get_item()
+                    .table_name(self.main_table())
+                    .key("pk", Self::av_s(format!("USER#{user_id}")))
+                    .key("sk", Self::av_s(&sort_key))
+                    .send()
+                    .await
+                    .context("Failed to read an existing ledger entry")?
+                    .item;
+
+                match existing.as_ref().and_then(|item| {
+                    item.get("requestHash").and_then(|value| match value {
+                        AttributeValue::S(hash) => Some(hash.clone()),
+                        _ => None,
+                    })
+                }) {
+                    Some(stored) if stored == request_hash => Ok(false),
+                    Some(_) => Err(anyhow!(
+                        "idempotency key already used for a different request"
+                    )),
+                    // The condition failed but no entry exists, so it was the
+                    // balance update's condition: there is no such user.
+                    None => Err(anyhow!("User not found")),
+                }
+            }
+            Err(error) => Err(error).context("Failed to apply a ledger entry"),
+        }
+    }
+
+    async fn get_wallet(&self, user_id: i32, recent_limit: usize) -> Result<Wallet> {
+        let balance_bux = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read a wallet balance")?
+            .item
+            .and_then(|item| Self::extract_i64(&item, "boostBux"))
+            .unwrap_or(0);
+
+        // Newest first, off the time-ordered index: the ledger's own sort key
+        // orders by idempotency key, which is a UUID and therefore not a time.
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI2")
+            .key_condition_expression("gsi2pk = :wallet")
+            .expression_attribute_values(":wallet", Self::av_s(format!("WALLET#{user_id}")))
+            .scan_index_forward(false)
+            .limit(recent_limit.clamp(1, 100) as i32)
+            .send()
+            .await
+            .context("Failed to read a wallet ledger")?;
+
+        let recent = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| {
+                Some(wallet::LedgerEntry {
+                    source: LedgerSource::parse(&Self::extract_string(item, "source")?)?,
+                    idempotency_key: Self::extract_string(item, "idempotencyKey")?,
+                    delta: Self::extract_i64(item, "delta").unwrap_or(0),
+                    request_hash: Self::extract_string(item, "requestHash").unwrap_or_default(),
+                    created_at_ms: Self::extract_i64(item, "createdAtMs").unwrap_or(0),
+                    note: Self::extract_string(item, "note"),
+                })
+            })
+            .collect();
+
+        Ok(Wallet {
+            balance_bux,
+            recent,
+        })
+    }
+
+    // ---- Textures and generation jobs -------------------------------------
+
+    async fn next_texture_id(&self) -> Result<i32> {
+        self.generate_id_for_entity("TEXTURE").await
+    }
+
+    async fn create_texture(&self, texture: &Texture) -> Result<Texture> {
+        let mut item = HashMap::new();
+        item.insert(
+            "pk".to_string(),
+            Self::av_s(format!("TEXTURE#{}", texture.texture_id)),
+        );
+        item.insert("sk".to_string(), Self::av_s("META"));
+        item.insert("textureId".to_string(), Self::av_n(texture.texture_id));
+        item.insert("ownerUserId".to_string(), Self::av_n(texture.owner_user_id));
+        item.insert("contentRef".to_string(), Self::av_s(&texture.content_ref));
+        item.insert("kind".to_string(), Self::av_s(texture.kind.as_str()));
+        item.insert("widthPx".to_string(), Self::av_n(texture.width_px));
+        item.insert("heightPx".to_string(), Self::av_n(texture.height_px));
+        if let Some(repeat) = texture.repeat_cells {
+            item.insert("repeatCells".to_string(), Self::av_s(repeat.to_string()));
+        }
+        if let Some(rows) = texture.rows {
+            item.insert("rows".to_string(), Self::av_n(rows));
+        }
+        if let Some(prompt) = &texture.last_prompt {
+            item.insert("lastPrompt".to_string(), Self::av_s(prompt));
+        }
+        item.insert(
+            "seams".to_string(),
+            Self::av_s(serde_json::to_string(&texture.seams)?),
+        );
+        item.insert(
+            "variants".to_string(),
+            Self::av_s(serde_json::to_string(&texture.variants)?),
+        );
+        item.insert("createdAtMs".to_string(), Self::av_n(texture.created_at_ms));
+        // Hash lookup for the render path, sharded by the hash itself.
+        item.insert(
+            "gsi1pk".to_string(),
+            Self::av_s(format!("TEXREF#{}", texture.content_ref)),
+        );
+        item.insert("gsi1sk".to_string(), Self::av_s("-"));
+        item.insert(
+            "gsi2pk".to_string(),
+            Self::av_s(format!("TEXTURE_OWNER#{}", texture.owner_user_id)),
+        );
+        item.insert(
+            "gsi2sk".to_string(),
+            Self::av_s(format!("{:020}", texture.created_at_ms)),
+        );
+
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .send()
+            .await
+            .context("Failed to store a texture record")?;
+        Ok(texture.clone())
+    }
+
+    async fn get_texture(&self, texture_id: i32) -> Result<Option<Texture>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("TEXTURE#{texture_id}")))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read a texture")?;
+        response
+            .item
+            .as_ref()
+            .map(Self::texture_from_item)
+            .transpose()
+    }
+
+    async fn get_texture_by_ref(&self, content_ref: &str) -> Result<Option<Texture>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :reference")
+            .expression_attribute_values(":reference", Self::av_s(format!("TEXREF#{content_ref}")))
+            .limit(1)
+            .send()
+            .await
+            .context("Failed to resolve a texture reference")?;
+        response
+            .items
+            .and_then(|items| items.into_iter().next())
+            .map(|item| Self::texture_from_item(&item))
+            .transpose()
+    }
+
+    async fn list_textures_by_owner(&self, user_id: i32, limit: usize) -> Result<Vec<Texture>> {
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI2")
+            .key_condition_expression("gsi2pk = :owner")
+            .expression_attribute_values(":owner", Self::av_s(format!("TEXTURE_OWNER#{user_id}")))
+            .scan_index_forward(false)
+            .limit(limit.clamp(1, 100) as i32)
+            .send()
+            .await
+            .context("Failed to list textures")?;
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| Self::texture_from_item(item).ok())
+            .collect())
+    }
+
+    /// Enqueue a job, or notice it is already enqueued.
+    ///
+    /// Idempotent, because the job id is derived from who asked, for what, and
+    /// when — so a double-submitted form produces the same id twice on purpose.
+    /// The caller reads first and writes only if it found nothing, but those
+    /// two steps are not atomic: both copies of one submit can read `None` and
+    /// both try to create. The conditional write is what makes that safe, and
+    /// the loser's refusal is the idempotency mechanism *working*. Surfacing it
+    /// would tell a player their double-click broke something.
+    async fn create_generation_job(&self, job: &GenerationJob) -> Result<()> {
+        let item = Self::generation_job_item(job)?;
+        match self
+            .client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_conditional_check_failure(&error) => Ok(()),
+            Err(error) => Err(error).context("Failed to create a generation job"),
+        }
+    }
+
+    async fn get_generation_job(&self, job_id: &str) -> Result<Option<GenerationJob>> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("GENJOB#{job_id}")))
+            .key("sk", Self::av_s("META"))
+            .send()
+            .await
+            .context("Failed to read a generation job")?;
+        response
+            .item
+            .as_ref()
+            .map(Self::generation_job_from_item)
+            .transpose()
+    }
+
+    async fn update_generation_job(&self, job: &GenerationJob) -> Result<()> {
+        let item = Self::generation_job_item(job)?;
+        self.client
+            .put_item()
+            .table_name(self.main_table())
+            .set_item(Some(item))
+            .condition_expression("attribute_exists(pk)")
+            .send()
+            .await
+            .context("Failed to update a generation job")?;
+        Ok(())
+    }
+
+    async fn claim_generation_job(
+        &self,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<Option<GenerationJob>> {
+        // Unfinished jobs sit in one small index partition. It holds work in
+        // progress as well as work not started, so a job whose worker died is
+        // still reachable — finding it again is the whole reason the entry
+        // outlives the claim.
+        let response = self
+            .client
+            .query()
+            .table_name(self.main_table())
+            .index_name("GSI1")
+            .key_condition_expression("gsi1pk = :queue")
+            .expression_attribute_values(":queue", Self::av_s("GENJOB_QUEUE"))
+            .scan_index_forward(true)
+            .limit(10)
+            .send()
+            .await
+            .context("Failed to read the generation queue")?;
+
+        for item in response.items.unwrap_or_default() {
+            let Ok(job) = Self::generation_job_from_item(&item) else {
+                continue;
+            };
+            // A job someone else is actively working is skipped here; the
+            // condition below is what actually decides, but reading the lease
+            // first saves a pointless conditional write per busy job.
+            if !job.claim_is_stale(now_ms) {
+                continue;
+            }
+            // The claim is the conditional write, not the read above: two
+            // workers reading the same job is expected, and exactly one of
+            // them wins the update. The condition repeats the staleness test
+            // because between the read and the write another worker may have
+            // taken it.
+            let claimed = self
+                .client
+                .update_item()
+                .table_name(self.main_table())
+                .key("pk", Self::av_s(format!("GENJOB#{}", job.job_id)))
+                .key("sk", Self::av_s("META"))
+                .update_expression(
+                    "SET #state = :generating, claimedBy = :worker, updatedAtMs = :now, \
+                     leaseUntilMs = :lease",
+                )
+                // Queued, or claimed by a worker that stopped saying so.
+                .condition_expression(
+                    "#state = :queued \
+                     OR (#state <> :done AND #state <> :failed \
+                         AND (attribute_not_exists(leaseUntilMs) OR leaseUntilMs <= :now))",
+                )
+                .expression_attribute_names("#state", "state")
+                .expression_attribute_values(
+                    ":generating",
+                    Self::av_s(JobState::Generating.as_str()),
+                )
+                .expression_attribute_values(":queued", Self::av_s(JobState::Queued.as_str()))
+                .expression_attribute_values(":done", Self::av_s(JobState::Done.as_str()))
+                .expression_attribute_values(":failed", Self::av_s(JobState::Failed.as_str()))
+                .expression_attribute_values(
+                    ":lease",
+                    Self::av_n(now_ms + crate::generation::LEASE_MS),
+                )
+                .expression_attribute_values(":worker", Self::av_s(worker))
+                .expression_attribute_values(":now", Self::av_n(now_ms))
+                .send()
+                .await;
+
+            match claimed {
+                Ok(_) => {
+                    let mut claimed = job;
+                    claimed.state = JobState::Generating;
+                    claimed.updated_at_ms = now_ms;
+                    // The caller writes progress from this value, and a write
+                    // rebuilds the whole item — so it has to carry the lease
+                    // it was just granted or the first update drops it.
+                    claimed.lease_until_ms = Some(now_ms + crate::generation::LEASE_MS);
+                    return Ok(Some(claimed));
+                }
+                // Someone else took it. Try the next one rather than failing.
+                Err(error) if is_conditional_check_failure(&error) => continue,
+                Err(error) => return Err(error).context("Failed to claim a generation job"),
+            }
+        }
+        Ok(None)
+    }
+
+    /// What generation has cost since a moment, across every page of it.
+    ///
+    /// Paginated, and that is the whole point: DynamoDB caps a query page at
+    /// 1 MB, so a single call silently returns a *prefix* once a day's jobs
+    /// exceed it. This total is the circuit breaker on a bill — reading a
+    /// prefix means the ceiling stops halting exactly when the spend is
+    /// highest, which is the failure the breaker was written to prevent.
+    async fn generation_spend_since(&self, since_ms: i64) -> Result<u64> {
+        let mut total: u64 = 0;
+        let mut start_key = None;
+        loop {
+            let response = self
+                .client
+                .query()
+                .table_name(self.main_table())
+                .index_name("GSI2")
+                .key_condition_expression("gsi2pk = :spend AND gsi2sk >= :since")
+                .expression_attribute_values(":spend", Self::av_s("GENJOB_SPEND"))
+                .expression_attribute_values(":since", Self::av_s(format!("{since_ms:020}")))
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .context("Failed to total generation spend")?;
+
+            total = total.saturating_add(
+                response
+                    .items
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|item| Self::extract_i64(item, "spendUsdMicros"))
+                    .map(|value| value.max(0) as u64)
+                    .sum(),
+            );
+
+            start_key = response.last_evaluated_key;
+            if start_key.is_none() {
+                return Ok(total);
+            }
+        }
+    }
+
+    async fn purchase_skin(
+        &self,
+        user_id: i32,
+        skin_id: i32,
+        expected_price_bux: u32,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<PurchaseOutcome> {
+        if self.has_skin_grant(user_id, skin_id).await? {
+            return Ok(PurchaseOutcome::AlreadyOwned);
+        }
+
+        let skin = self
+            .get_skin(skin_id)
+            .await?
+            .ok_or_else(|| anyhow!("Skin not found"))?;
+        if skin.price_bux != expected_price_bux {
+            return Ok(PurchaseOutcome::PriceChanged {
+                actual_bux: skin.price_bux,
+            });
+        }
+
+        // A free skin needs no ledger row at all: nothing moves, so there is
+        // nothing to make idempotent beyond the grant, which already is.
+        if skin.price_bux == 0 {
+            self.grant_skin(user_id, skin_id, GrantSource::Grant, 0)
+                .await?;
+            return Ok(PurchaseOutcome::Purchased);
+        }
+
+        let wallet = self.get_wallet(user_id, 1).await?;
+        if !wallet.may_spend(skin.price_bux) {
+            return Ok(PurchaseOutcome::InsufficientFunds);
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let price = i64::from(skin.price_bux);
+
+        let mut entry = HashMap::new();
+        entry.insert("pk".to_string(), Self::av_s(format!("USER#{user_id}")));
+        entry.insert(
+            "sk".to_string(),
+            Self::av_s(wallet::ledger_sort_key(
+                LedgerSource::Purchase,
+                idempotency_key,
+            )),
+        );
+        entry.insert(
+            "source".to_string(),
+            Self::av_s(LedgerSource::Purchase.as_str()),
+        );
+        entry.insert("idempotencyKey".to_string(), Self::av_s(idempotency_key));
+        entry.insert("delta".to_string(), Self::av_n(-price));
+        entry.insert("requestHash".to_string(), Self::av_s(request_hash));
+        entry.insert("createdAtMs".to_string(), Self::av_n(now));
+        entry.insert("skinId".to_string(), Self::av_n(skin_id));
+        entry.insert(
+            "gsi2pk".to_string(),
+            Self::av_s(format!("WALLET#{user_id}")),
+        );
+        entry.insert("gsi2sk".to_string(), Self::av_s(format!("{now:020}")));
+
+        // Three conditions, one transaction: the key is unused, the wallet can
+        // cover it, and the skin still costs what the buyer was shown. Any one
+        // of them failing takes the whole thing with it, so there is no state
+        // where a player is charged without receiving the skin.
+        let put_entry = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(entry))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build a purchase ledger entry")?;
+        let debit = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(format!("USER#{user_id}")))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD boostBux :delta")
+            .condition_expression("attribute_exists(pk) AND boostBux >= :price")
+            .expression_attribute_values(":delta", Self::av_n(-price))
+            .expression_attribute_values(":price", Self::av_n(price))
+            .build()
+            .context("Failed to build a purchase debit")?;
+        // Both the price guard and the owner count, as one operation: a
+        // transaction may not touch an item twice, and these are the same item.
+        let price_unchanged = Update::builder()
+            .table_name(self.main_table())
+            .key("pk", Self::av_s(skins_dynamo::skin_partition(skin_id)))
+            .key("sk", Self::av_s("META"))
+            .update_expression("ADD ownerCount :one")
+            .condition_expression("priceBux = :price AND publication = :published")
+            .expression_attribute_values(":one", Self::av_n(1))
+            .expression_attribute_values(":price", Self::av_n(skin.price_bux))
+            .expression_attribute_values(":published", Self::av_s(Publication::Published.as_str()))
+            .build()
+            .context("Failed to build a price check")?;
+        let grant = Put::builder()
+            .table_name(self.main_table())
+            .set_item(Some(skins_dynamo::grant_item(
+                user_id,
+                skin_id,
+                GrantSource::Purchase,
+                skin.price_bux,
+                now,
+            )))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .context("Failed to build a purchase grant")?;
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put_entry).build())
+            .transact_items(TransactWriteItem::builder().update(debit).build())
+            .transact_items(TransactWriteItem::builder().update(price_unchanged).build())
+            .transact_items(TransactWriteItem::builder().put(grant).build())
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(PurchaseOutcome::Purchased),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(Self::transaction_cancellation_is_conditional) =>
+            {
+                // Something moved under us between the reads above and the
+                // transaction. Re-read to say which, so the client can show the
+                // right thing rather than a generic failure.
+                if self.has_skin_grant(user_id, skin_id).await? {
+                    return Ok(PurchaseOutcome::AlreadyOwned);
+                }
+                let current = self.get_skin(skin_id).await?;
+                match current {
+                    Some(current) if current.price_bux != expected_price_bux => {
+                        Ok(PurchaseOutcome::PriceChanged {
+                            actual_bux: current.price_bux,
+                        })
+                    }
+                    _ => Ok(PurchaseOutcome::InsufficientFunds),
+                }
+            }
+            Err(error) => Err(error).context("Failed to purchase a skin"),
+        }
     }
 
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()> {

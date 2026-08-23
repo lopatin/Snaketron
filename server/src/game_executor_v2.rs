@@ -5205,6 +5205,113 @@ mod tests {
         unused_database_method!(update_user_mmr(user_id: i32, mmr: i32) -> ());
         unused_database_method!(update_guest_username(user_id: i32, username: &str) -> ());
         unused_database_method!(add_user_xp(user_id: i32, xp_to_add: i32) -> i32);
+        unused_database_method!(set_user_equipment(
+            user_id: i32,
+            selected_skin: Option<Option<&str>>,
+            selected_base: Option<Option<&str>>
+        ) -> ());
+        unused_database_method!(create_skin(draft: crate::skin_store::NewSkin<'_>) -> crate::skin_store::Skin);
+        unused_database_method!(put_skin_revision(
+            skin_id: i32,
+            revision: crate::skin_store::NewRevision<'_>
+        ) -> crate::skin_store::Skin);
+        unused_database_method!(update_skin_metadata(
+            skin_id: i32,
+            name: Option<&str>,
+            price_bux: Option<u32>
+        ) -> ());
+        unused_database_method!(get_skin(skin_id: i32) -> Option<crate::skin_store::Skin>);
+        unused_database_method!(get_skin_revision(
+            skin_id: i32,
+            revision: u32
+        ) -> Option<crate::skin_store::SkinRevision>);
+        unused_database_method!(resolve_content_ref(
+            content_ref: &str
+        ) -> Option<(crate::skin_store::Skin, crate::skin_store::SkinRevision)>);
+        unused_database_method!(list_published_skins(
+            kind: crate::skin_store::SkinKind,
+            cursor: Option<&str>,
+            limit: usize
+        ) -> crate::skin_store::SkinPage);
+        unused_database_method!(list_skins_by_creator(
+            user_id: i32,
+            cursor: Option<&str>,
+            limit: usize
+        ) -> crate::skin_store::SkinPage);
+        unused_database_method!(set_skin_publication(
+            skin_id: i32,
+            publication: crate::skin_store::Publication,
+            published_revision: Option<u32>,
+            actor_user_id: i32,
+            reason: Option<&str>
+        ) -> ());
+        unused_database_method!(set_skin_pending_revision(
+            skin_id: i32,
+            revision: Option<u32>
+        ) -> ());
+        unused_database_method!(list_skins_awaiting_review(
+            limit: usize
+        ) -> Vec<crate::skin_store::Skin>);
+        unused_database_method!(approve_skin_revision(skin_id: i32, revision: u32) -> ());
+        unused_database_method!(mark_revision_exposed(
+            skin_id: i32,
+            revision: u32,
+            at_ms: i64
+        ) -> ());
+        unused_database_method!(grant_skin(
+            user_id: i32,
+            skin_id: i32,
+            source: crate::skin_store::GrantSource,
+            price_paid_bux: u32
+        ) -> ());
+        unused_database_method!(list_skin_grants(user_id: i32) -> Vec<crate::skin_store::SkinGrant>);
+        unused_database_method!(has_skin_grant(user_id: i32, skin_id: i32) -> bool);
+        unused_database_method!(adjust_skin_wearers(skin_id: i32, delta: i32) -> ());
+        unused_database_method!(apply_ledger_entry(
+            user_id: i32,
+            source: crate::wallet::LedgerSource,
+            idempotency_key: &str,
+            delta: i64,
+            request_hash: &str,
+            note: Option<&str>
+        ) -> bool);
+        unused_database_method!(get_wallet(
+            user_id: i32,
+            recent_limit: usize
+        ) -> crate::wallet::Wallet);
+        unused_database_method!(next_texture_id() -> i32);
+        unused_database_method!(create_texture(
+            texture: &crate::texture::Texture
+        ) -> crate::texture::Texture);
+        unused_database_method!(get_texture(texture_id: i32) -> Option<crate::texture::Texture>);
+        unused_database_method!(get_texture_by_ref(
+            content_ref: &str
+        ) -> Option<crate::texture::Texture>);
+        unused_database_method!(list_textures_by_owner(
+            user_id: i32,
+            limit: usize
+        ) -> Vec<crate::texture::Texture>);
+        unused_database_method!(create_generation_job(
+            job: &crate::generation::GenerationJob
+        ) -> ());
+        unused_database_method!(get_generation_job(
+            job_id: &str
+        ) -> Option<crate::generation::GenerationJob>);
+        unused_database_method!(update_generation_job(
+            job: &crate::generation::GenerationJob
+        ) -> ());
+        unused_database_method!(claim_generation_job(
+            worker: &str,
+            now_ms: i64
+        ) -> Option<crate::generation::GenerationJob>);
+        unused_database_method!(generation_spend_since(since_ms: i64) -> u64);
+        unused_database_method!(purchase_skin(
+            user_id: i32,
+            skin_id: i32,
+            expected_price_bux: u32,
+            idempotency_key: &str,
+            request_hash: &str
+        ) -> crate::db::PurchaseOutcome);
         unused_database_method!(resolve_crazygames_account(
             profile: &CrazyGamesProfile,
             guest_candidate_user_id: Option<i32>,

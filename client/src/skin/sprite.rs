@@ -576,6 +576,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
         label: recipe.label.to_string(),
         swatch: recipe.tone.to_string(),
         accent: recipe.tone.to_string(),
+        extra: Vec::new(),
     };
 
     // One baked frame per row, so `frame_index` walking the frames *is* the
@@ -600,9 +601,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
             ramp_opacity: GRADIENT_MAX_OPACITY,
             wave_phase_turns: 0.0,
             time_turns: row as f64 / recipe.sheet.rows as f64,
-            layer_opacity: Vec::new(),
-            scalars: Vec::new(),
-            literals: Vec::new(),
+            params: Vec::new(),
         })
         .collect();
 
@@ -617,7 +616,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
     // a patch stamped on the art. The ramp and the dark core stay, because they
     // modulate the art rather than replace it, and the head is the one part of
     // a snake that has to stay unambiguous.
-    layers.retain(|layer| !matches!(layer.id, "head-cap" | "head-highlight"));
+    layers.retain(|layer| !matches!(layer.id.as_ref(), "head-cap" | "head-highlight"));
 
     // Rasterise the contour in one pass. `radius` is exactly half `line_width`,
     // so a run's round cap and a joint disc are the *same* circle — and painting
@@ -781,6 +780,7 @@ mod tests {
                 cells,
                 cell_size: 12.0,
                 boost_active: false,
+                seed: 0.0,
                 anim_ms,
                 reduced_motion: false,
                 detail_scale: 1.0,
@@ -993,6 +993,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#3c8dde".into(),
                         accent: "#3c8dde".into(),
+                        extra: Vec::new(),
                     },
                     Swatch {
                         fill: "#3c8dde".into(),
@@ -1000,6 +1001,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#3c8dde".into(),
                         accent: "#3c8dde".into(),
+                        extra: Vec::new(),
                     },
                 ],
                 enemy: [
@@ -1009,6 +1011,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#de3c3c".into(),
                         accent: "#de3c3c".into(),
+                        extra: Vec::new(),
                     },
                     Swatch {
                         fill: "#de3c3c".into(),
@@ -1016,6 +1019,7 @@ mod tests {
                         label: "#ffffff".into(),
                         swatch: "#de3c3c".into(),
                         accent: "#de3c3c".into(),
+                        extra: Vec::new(),
                     },
                 ],
                 free_for_all: std::array::from_fn(|_| Swatch {
@@ -1024,13 +1028,12 @@ mod tests {
                     label: "#ffffff".into(),
                     swatch: "#888888".into(),
                     accent: "#888888".into(),
+                    extra: Vec::new(),
                 }),
                 ramp_opacity: 0.2,
                 wave_phase_turns: 0.0,
                 time_turns: 0.0,
-                layer_opacity: Vec::new(),
-                scalars: Vec::new(),
-                literals: Vec::new(),
+                params: Vec::new(),
             }],
             1_000.0,
             CompositeConfig {

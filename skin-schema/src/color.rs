@@ -34,6 +34,36 @@ impl Rgb {
         })
     }
 
+    /// Build a colour from sRGB HSL.
+    ///
+    /// Deliberately *not* the space this module judges hue in — OKLCH is, for
+    /// the reasons at the top of the file. HSL is here because it is a
+    /// convenient dial to *turn*: a generator wants "the same colour, lighter"
+    /// and "a neighbouring hue" without solving an inverse transform. What
+    /// comes out is then measured in OKLCH like anything else, so a generated
+    /// colour is held to exactly the rule an authored one is.
+    pub fn from_hsl(hue_degrees: f64, saturation: f64, lightness: f64) -> Self {
+        let hue = hue_degrees.rem_euclid(360.0) / 60.0;
+        let saturation = saturation.clamp(0.0, 1.0);
+        let lightness = lightness.clamp(0.0, 1.0);
+        let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+        let second = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+        let (r, g, b) = match hue as u32 {
+            0 => (chroma, second, 0.0),
+            1 => (second, chroma, 0.0),
+            2 => (0.0, chroma, second),
+            3 => (0.0, second, chroma),
+            4 => (second, 0.0, chroma),
+            _ => (chroma, 0.0, second),
+        };
+        let base = lightness - chroma / 2.0;
+        Self {
+            r: (r + base).clamp(0.0, 1.0),
+            g: (g + base).clamp(0.0, 1.0),
+            b: (b + base).clamp(0.0, 1.0),
+        }
+    }
+
     pub fn to_hex(self) -> String {
         let byte = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
         format!(

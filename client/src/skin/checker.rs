@@ -41,7 +41,7 @@ use crate::skin::composite::{
     BaseThemeOwned, CelebrationThemeOwned, CompositeConfig, CompositeSkin, Frame, Swatch,
     span_layer,
 };
-use crate::skin::layer::{ColorSlot, Region, Source, Span};
+use crate::skin::layer::{Binding, ColorSlot, Region, Source, Span};
 use crate::skin::{
     BaseTheme, CelebrationTheme, PaintCtx, SkinColors, SkinIdentity, SkinMetrics, SnakePose,
     SnakeSkin,
@@ -340,6 +340,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         label: crate::render::roster_label_ink(tones.fill).to_string(),
         swatch: tones.fill.to_string(),
         accent: check_tone(recipe.motion, tones.check, turns),
+        extra: Vec::new(),
     };
 
     let frames: Vec<Frame> = (0..skin_schema::ANIMATION_STEPS)
@@ -363,9 +364,7 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
                 ramp_opacity: GRADIENT_MAX_OPACITY,
                 wave_phase_turns: 0.0,
                 time_turns: turns,
-                layer_opacity: lane_opacities(recipe.motion, turns),
-                scalars: Vec::new(),
-                literals: Vec::new(),
+                params: lane_opacities(recipe.motion, turns),
             }
         })
         .collect();
@@ -414,8 +413,8 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
                 color: ColorSlot::Accent,
                 period_cells: recipe.board.period_cells,
                 duty: 0.5,
-                half_width: 0.25,
-                t_center,
+                half_width: Binding::Const(0.25),
+                t_center: Binding::Const(t_center),
                 phase_cells: phase * recipe.board.period_cells,
                 alpha: alpha.clone(),
             },
@@ -424,7 +423,10 @@ fn compile(recipe: &'static Recipe) -> CompositeSkin {
         // board on a body that small reads as a smudge, and the head cap and
         // core cover most of it anyway.
         layer.omit_on_single_cell = true;
-        layer.opacity_track = matches!(recipe.motion, Motion::Tilt { .. }).then_some(index);
+        layer.opacity = match recipe.motion {
+            Motion::Tilt { .. } => Binding::Param(index),
+            _ => Binding::ONE,
+        };
         layers.insert(insert_at + index, layer);
     }
 
@@ -808,7 +810,13 @@ mod tests {
                             ..
                         },
                     ..
-                } => (*period_cells, *duty, *half_width, *t_center, *phase_cells),
+                } => (
+                    *period_cells,
+                    *duty,
+                    half_width.clone(),
+                    t_center.clone(),
+                    *phase_cells,
+                ),
                 other => panic!("{}: a lane is not a tiled span: {other:?}", recipe.id),
             };
             let near = read(lanes[0]);
@@ -816,10 +824,14 @@ mod tests {
 
             assert_eq!(near.0, far.0, "{}: lanes disagree on period", recipe.id);
             assert_eq!((near.1, far.1), (0.5, 0.5), "squares are half the period");
-            assert_eq!((near.2, far.2), (0.25, 0.25), "lanes are half a cell wide");
+            assert_eq!(
+                (near.2, far.2),
+                (Binding::Const(0.25), Binding::Const(0.25)),
+                "lanes are half a cell wide"
+            );
             assert_eq!(
                 (near.3, far.3),
-                (-0.25, 0.25),
+                (Binding::Const(-0.25), Binding::Const(0.25)),
                 "{}: the lanes are not either side of the centreline",
                 recipe.id
             );
@@ -864,6 +876,7 @@ mod tests {
                         cell_size: 12.0,
                         detail_scale: 1.0,
                         boost_active: false,
+                        seed: 0.0,
                         anim_ms,
                         reduced_motion,
                     },

@@ -338,10 +338,26 @@ fn build_silhouette(
             (x0, y0, 0.0, 0.0)
         };
         ctx.rect(rx, ry, rw, rh);
+        // `move_to` before each disc, and it is load-bearing rather than
+        // tidiness. Canvas2D's `arc` appends *a straight line from the current
+        // point to the arc's start* when the path already has one, and `rect`
+        // leaves a current point behind — so each cap was joined to the corner
+        // of the run's rectangle by a chord. Chord, arc and the implicit close
+        // bound a sliver, and under a nonzero fill a sliver wound against the
+        // shape it overlaps subtracts instead of adding.
+        //
+        // On one run the slivers land inside the rectangle and nothing shows.
+        // On a body that doubles back they reach across a whole arm, which is
+        // the tapering wedge of bare body a checkerboard shows on a U-turn:
+        // not a rasteriser bug, a path that says something we did not mean.
+        // Starting each disc at its own angle-zero point makes the connecting
+        // line zero-length, which is the same as no line at all.
+        ctx.move_to(ax + radius, ay);
         if let Err(cause) = ctx.arc(ax, ay, radius, 0.0, FULL_CIRCLE) {
             error = Some(cause);
             return;
         }
+        ctx.move_to(bx + radius, by);
         if let Err(cause) = ctx.arc(bx, by, radius, 0.0, FULL_CIRCLE) {
             error = Some(cause);
         }
@@ -544,6 +560,63 @@ pub fn emit_ribbon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every disc in the silhouette starts its own subpath.
+    ///
+    /// Canvas2D's `arc` appends *a straight line from the current point to the
+    /// arc's start* when the path already has one, and `rect` leaves a current
+    /// point behind. Without a `move_to` in between, every cap was joined to
+    /// the corner of a run's rectangle by a chord, and chord-plus-arc bounds a
+    /// sliver that a nonzero fill subtracts wherever it winds against the
+    /// shape. On a body that doubles back the slivers reach across a whole
+    /// arm: a checkerboard on a U-turn lost a tapering wedge to bare body.
+    ///
+    /// The rule is cheap to state and cheap to check, so it is checked: no arc
+    /// in this path may follow anything but a move to its own start point.
+    #[test]
+    fn every_disc_in_the_silhouette_begins_its_own_subpath() {
+        use crate::skin::paint::{OpRecorder, PaintOp};
+
+        for cells in [
+            vec![(3.0, 3.0)],
+            vec![(8.0, 3.0), (3.0, 3.0)],
+            vec![(8.0, 3.0), (3.0, 3.0), (3.0, 8.0)],
+            vec![(0.0, 2.0), (20.0, 2.0), (20.0, 6.0), (0.0, 6.0)],
+        ] {
+            let mut recorder = OpRecorder::new();
+            {
+                let mut ctx = PaintCtx::recording(&mut recorder);
+                clip_to_body(&mut ctx, &cells, 10.0, ClipShape::Silhouette).expect("clips");
+            }
+            let ops = recorder.ops();
+            for (index, op) in ops.iter().enumerate() {
+                let PaintOp::Arc(cx, cy, radius, _, _) = op else {
+                    continue;
+                };
+                // The first subpath of a path needs no move; every later one
+                // does, and it has to land on the arc's own angle-zero point
+                // or the connecting line has length.
+                let Some(previous) = index.checked_sub(1).map(|at| &ops[at]) else {
+                    continue;
+                };
+                if matches!(previous, PaintOp::BeginPath) {
+                    continue;
+                }
+                match previous {
+                    PaintOp::MoveTo(mx, my) => assert!(
+                        (mx - (cx + radius)).abs() < 1e-9 && (my - cy).abs() < 1e-9,
+                        "a disc at ({cx}, {cy}) r{radius} is entered from \
+                         ({mx}, {my}), so canvas draws a chord to reach it"
+                    ),
+                    other => panic!(
+                        "a disc at ({cx}, {cy}) follows {other:?} with no move; \
+                         canvas will join them with a chord and the nonzero \
+                         fill will carve the sliver out of the body"
+                    ),
+                }
+            }
+        }
+    }
     use crate::skin::fixtures::POSES;
     use crate::skin::paint::OpRecorder;
 

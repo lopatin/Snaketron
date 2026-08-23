@@ -16,10 +16,13 @@ import ChallengesPanel from './components/ChallengesPanel';
 import PlayRoute from './components/PlayRoute';
 import { NewHome } from './components/NewHome';
 import { ArenaBackdrop, SHOW_BACKDROP_DURING_GAMEPLAY } from './components/ArenaBackdrop';
+import SkinsPage from './components/SkinsPage';
+import SkinBuilder from './components/SkinBuilder';
 import { Leaderboard } from './components/Leaderboard';
 import { MatchmakingBanner } from './components/MatchmakingBanner';
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { WalletProvider } from './contexts/WalletContext';
 import { UIProvider } from './contexts/UIContext';
 import { LatencyProvider } from './contexts/LatencyContext';
 import { CrazyGamesProvider, useCrazyGames } from './contexts/CrazyGamesContext';
@@ -197,6 +200,27 @@ function AppContent() {
             />
           }
         />
+        <Route
+          path="/skins"
+          element={
+            <SkinsPage
+              onOpenAuth={handleOpenAuth}
+              onOpenAccount={setAccountModalView}
+            />
+          }
+        />
+        <Route
+          path="/skins/builder"
+          element={
+            <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+          }
+        />
+        <Route
+          path="/skins/builder/:skinId"
+          element={
+            <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+          }
+        />
         <Route path="/profile" element={<Navigate to="/" replace />} />
         <Route path="/history" element={<Navigate to="/" replace />} />
         <Route
@@ -333,7 +357,8 @@ function App() {
         <CrazyGamesProvider>
           <RuntimeConfigProvider>
             <AuthProvider>
-              <UIProvider>
+              <WalletProvider>
+                <UIProvider>
                 <LatencyProvider>
                   <WebSocketProvider>
                     <AdsProvider>
@@ -343,7 +368,8 @@ function App() {
                     </AdsProvider>
                   </WebSocketProvider>
                 </LatencyProvider>
-              </UIProvider>
+                </UIProvider>
+              </WalletProvider>
             </AuthProvider>
           </RuntimeConfigProvider>
         </CrazyGamesProvider>

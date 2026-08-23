@@ -20,6 +20,14 @@ import type { SessionCommandRejectionFence } from "./SessionCommandRejectionFenc
 
 export type WSMessage = { "Token": string } | { "Authenticate": { token: string, protocol_version: number,
 /**
+ * Advisory pseudonymous browser identifier for product analytics.
+ * Never used for authentication or authorization, and never trusted:
+ * `sanitize_anon_id` validates it before anything downstream sees it.
+ * Optional and defaulted so a client that predates the field — an
+ * itch.io bundle cannot update itself — still authenticates.
+ */
+anon_id?: string,
+/**
  * Session build channel. A missing value resolves to a disabled ad
  * policy because the client's available SDK is unknown.
  */

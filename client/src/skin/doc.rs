@@ -84,6 +84,7 @@ impl ParamSkin {
                 // A document skin has no signature element beyond its body, so
                 // its accent is its fill.
                 accent: fill.to_hex(),
+                extra: Vec::new(),
                 swatch,
             }
         };
@@ -115,9 +116,7 @@ impl ParamSkin {
                     .map(|wave| wave.crests_per_cycle * step as f64 / steps.max(1) as f64)
                     .unwrap_or(0.0),
                 time_turns: step as f64 / steps.max(1) as f64,
-                layer_opacity: Vec::new(),
-                scalars: Vec::new(),
-                literals: Vec::new(),
+                params: Vec::new(),
             })
             .collect();
 
@@ -234,7 +233,12 @@ mod tests {
     #[test]
     fn a_document_compiles_to_the_classic_layer_shape() {
         let skin = classic_doc();
-        let ids: Vec<&str> = skin.engine.layers().iter().map(|layer| layer.id).collect();
+        let ids: Vec<&str> = skin
+            .engine
+            .layers()
+            .iter()
+            .map(|layer| layer.id.as_ref())
+            .collect();
         assert_eq!(
             ids,
             vec![
@@ -267,6 +271,7 @@ mod tests {
                     cells: &[(3.0, 3.0), (0.0, 3.0)],
                     cell_size: 10.0,
                     boost_active: false,
+                    seed: 0.0,
                     anim_ms,
                     reduced_motion,
                     detail_scale: 1.0,

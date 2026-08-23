@@ -55,6 +55,39 @@ pub enum Input {
 }
 
 impl Input {
+    /// Every input, for exhaustive reasoning about what an expression may read.
+    pub const ALL: [Input; 6] = [
+        Input::S,
+        Input::T,
+        Input::Len,
+        Input::Time,
+        Input::Boost,
+        Input::Seed,
+    ];
+
+    /// The name an author writes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Input::S => "s",
+            Input::T => "t",
+            Input::Len => "len",
+            Input::Time => "time",
+            Input::Boost => "boost",
+            Input::Seed => "seed",
+        }
+    }
+
+    fn bit(self) -> u8 {
+        match self {
+            Input::S => 1,
+            Input::T => 1 << 1,
+            Input::Len => 1 << 2,
+            Input::Time => 1 << 3,
+            Input::Boost => 1 << 4,
+            Input::Seed => 1 << 5,
+        }
+    }
+
     fn tier(self) -> Tier {
         match self {
             Input::S => Tier::PerCell,
@@ -153,6 +186,34 @@ impl Func {
     }
 }
 
+/// A set of [`Input`]s, as a bitset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Inputs(u8);
+
+impl Inputs {
+    pub fn contains(self, input: Input) -> bool {
+        self.0 & input.bit() != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The first input in this set that is not in `allowed`.
+    ///
+    /// Returns the offender rather than a bool so an error can name it: "reads
+    /// `boost`" is actionable where "reads something it may not" is not.
+    pub fn first_outside(self, allowed: &[Input]) -> Option<Input> {
+        Input::ALL
+            .into_iter()
+            .find(|input| self.contains(*input) && !allowed.contains(input))
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Input> {
+        Input::ALL.into_iter().filter(move |i| self.contains(*i))
+    }
+}
+
 /// A parsed expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -213,6 +274,25 @@ impl Expr {
             });
         }
         Ok(expr)
+    }
+
+    /// Every input this expression reads.
+    ///
+    /// The tier answers "how often does this have to be evaluated"; this
+    /// answers "what does it depend on", and the two are different questions.
+    /// `boost` and `seed` are constant-tier — they never change within one
+    /// snake-frame — yet an expression reading them cannot be folded at
+    /// registration, because it is not constant across *snakes*. A compiler
+    /// that only consulted the tier would freeze a boost-reactive layer at
+    /// "not boosting" and nothing would report it.
+    pub fn inputs(&self) -> Inputs {
+        match self {
+            Expr::Const(_) => Inputs::default(),
+            Expr::Input(input) => Inputs(input.bit()),
+            Expr::Neg(inner) => inner.inputs(),
+            Expr::Bin(_, left, right) => Inputs(left.inputs().0 | right.inputs().0),
+            Expr::Call(_, args) => Inputs(args.iter().fold(0, |bits, arg| bits | arg.inputs().0)),
+        }
     }
 
     /// How often this expression has to be evaluated.
@@ -702,6 +782,32 @@ mod tests {
             tier("noise(1, 2)"),
             Tier::PerTexel,
             "noise varies faster than its arguments suggest"
+        );
+    }
+
+    /// The tier and the input set answer different questions, and a compiler
+    /// that conflated them would fold a boost-reactive expression into a
+    /// constant. `boost` and `seed` are constant-*tier* and still per-snake.
+    #[test]
+    fn inputs_are_reported_separately_from_the_tier() {
+        let inputs = |source: &str| Expr::parse(source).expect("grammatical").inputs();
+
+        assert!(inputs("0.3 + 0.2").is_empty(), "a literal reads nothing");
+        assert!(inputs("mix(0.7, 1.0, boost)").contains(Input::Boost));
+        assert_eq!(
+            Expr::parse("mix(0.7, 1.0, boost)").unwrap().tier(),
+            Tier::Constant,
+            "constant-tier, but emphatically not a constant"
+        );
+
+        let both = inputs("sin(tau * time) * len");
+        assert!(both.contains(Input::Time) && both.contains(Input::Len));
+        assert_eq!(both.first_outside(&[Input::Time]), Some(Input::Len));
+        assert_eq!(both.first_outside(&[Input::Time, Input::Len]), None);
+        assert_eq!(
+            inputs("s / len").iter().collect::<Vec<_>>(),
+            vec![Input::S, Input::Len],
+            "reported in a stable order, so error messages are stable too"
         );
     }
 

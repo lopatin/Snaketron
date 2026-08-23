@@ -12916,6 +12916,1866 @@ begin_path
 arc(37.5, 37.5, 5.7, 0.0, 6.283185307179586)
 fill
 
+# alive pose=wide_u_turn cell=5.0 boost=false mask=none
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+set_fill #286eae
+begin_path
+arc(102.5, 12.5, 3.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 3.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+begin_path
+arc(102.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(2.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(5.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(10.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(15.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(20.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(25.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(30.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(35.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(40.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(45.0, 10.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(2.5, 12.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=5.0 boost=false mask=#ffffff
+set_fill #ffffff
+fill_rect(-1.0, 9.0, 107.0, 7.0)
+fill_rect(99.0, 9.0, 7.0, 27.0)
+fill_rect(-1.0, 29.0, 107.0, 7.0)
+fill_rect(-1.0, 9.0, 7.0, 7.0)
+fill_rect(99.0, 9.0, 7.0, 7.0)
+fill_rect(99.0, 29.0, 7.0, 7.0)
+fill_rect(-1.0, 29.0, 7.0, 7.0)
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+set_fill #286eae
+begin_path
+arc(102.5, 12.5, 3.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 3.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+begin_path
+arc(102.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(2.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(5.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(10.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(15.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(20.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(25.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(30.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(35.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(40.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(45.0, 10.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(2.5, 12.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=5.0 boost=true mask=none
+set_stroke #fff200
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+set_fill #fff200
+begin_path
+arc(102.5, 12.5, 5.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 5.5, 0.0, 6.283185307179586)
+fill
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+set_fill #286eae
+begin_path
+arc(102.5, 12.5, 3.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 3.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+begin_path
+arc(102.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(2.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(5.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(10.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(15.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(20.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(25.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(30.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(35.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(40.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(45.0, 10.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(2.5, 12.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=5.0 boost=true mask=#ffffff
+set_fill #ffffff
+fill_rect(-3.0, 7.0, 111.0, 11.0)
+fill_rect(97.0, 7.0, 11.0, 31.0)
+fill_rect(-3.0, 27.0, 111.0, 11.0)
+fill_rect(-3.0, 7.0, 11.0, 11.0)
+fill_rect(97.0, 7.0, 11.0, 11.0)
+fill_rect(97.0, 27.0, 11.0, 11.0)
+fill_rect(-3.0, 27.0, 11.0, 11.0)
+set_stroke #fff200
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+set_fill #fff200
+begin_path
+arc(102.5, 12.5, 5.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 5.5, 0.0, 6.283185307179586)
+fill
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+set_fill #286eae
+begin_path
+arc(102.5, 12.5, 3.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 3.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 12.5)
+line_to(102.5, 12.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(102.5, 12.5)
+line_to(102.5, 32.5)
+stroke
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(2.5, 32.5)
+line_to(102.5, 32.5)
+stroke
+begin_path
+arc(102.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(102.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(2.5, 32.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(5.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(10.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(15.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(20.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(25.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(30.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(35.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(40.0, 10.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(45.0, 10.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(2.5, 12.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(2.5, 12.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=10.0 boost=false mask=none
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+set_fill #286eae
+begin_path
+arc(205.0, 25.0, 6.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 6.0, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+begin_path
+arc(205.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(5.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(10.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(20.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(40.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(50.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(60.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(70.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(80.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(90.0, 20.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(5.0, 25.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=10.0 boost=false mask=#ffffff
+set_fill #ffffff
+fill_rect(-1.0, 19.0, 212.0, 12.0)
+fill_rect(199.0, 19.0, 12.0, 52.0)
+fill_rect(-1.0, 59.0, 212.0, 12.0)
+fill_rect(-1.0, 19.0, 12.0, 12.0)
+fill_rect(199.0, 19.0, 12.0, 12.0)
+fill_rect(199.0, 59.0, 12.0, 12.0)
+fill_rect(-1.0, 59.0, 12.0, 12.0)
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+set_fill #286eae
+begin_path
+arc(205.0, 25.0, 6.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 6.0, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+begin_path
+arc(205.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(5.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(10.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(20.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(40.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(50.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(60.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(70.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(80.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(90.0, 20.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(5.0, 25.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=10.0 boost=true mask=none
+set_stroke #fff200
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+set_fill #fff200
+begin_path
+arc(205.0, 25.0, 8.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 8.0, 0.0, 6.283185307179586)
+fill
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+set_fill #286eae
+begin_path
+arc(205.0, 25.0, 6.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 6.0, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+begin_path
+arc(205.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(5.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(10.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(20.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(40.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(50.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(60.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(70.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(80.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(90.0, 20.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(5.0, 25.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=10.0 boost=true mask=#ffffff
+set_fill #ffffff
+fill_rect(-3.0, 17.0, 216.0, 16.0)
+fill_rect(197.0, 17.0, 16.0, 56.0)
+fill_rect(-3.0, 57.0, 216.0, 16.0)
+fill_rect(-3.0, 17.0, 16.0, 16.0)
+fill_rect(197.0, 17.0, 16.0, 16.0)
+fill_rect(197.0, 57.0, 16.0, 16.0)
+fill_rect(-3.0, 57.0, 16.0, 16.0)
+set_stroke #fff200
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+set_fill #fff200
+begin_path
+arc(205.0, 25.0, 8.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 8.0, 0.0, 6.283185307179586)
+fill
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+set_fill #286eae
+begin_path
+arc(205.0, 25.0, 6.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 6.0, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 25.0)
+line_to(205.0, 25.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(205.0, 25.0)
+line_to(205.0, 65.0)
+stroke
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(5.0, 65.0)
+line_to(205.0, 65.0)
+stroke
+begin_path
+arc(205.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(205.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(5.0, 65.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(10.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(20.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(40.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(50.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(60.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(70.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(80.0, 20.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(90.0, 20.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(5.0, 25.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(5.0, 25.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=15.0 boost=false mask=none
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+set_fill #286eae
+begin_path
+arc(307.5, 37.5, 8.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 8.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+begin_path
+arc(307.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(7.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(15.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(45.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(60.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(75.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(90.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(105.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(120.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(135.0, 30.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(7.5, 37.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=15.0 boost=false mask=#ffffff
+set_fill #ffffff
+fill_rect(-1.0, 29.0, 317.0, 17.0)
+fill_rect(299.0, 29.0, 17.0, 77.0)
+fill_rect(-1.0, 89.0, 317.0, 17.0)
+fill_rect(-1.0, 29.0, 17.0, 17.0)
+fill_rect(299.0, 29.0, 17.0, 17.0)
+fill_rect(299.0, 89.0, 17.0, 17.0)
+fill_rect(-1.0, 89.0, 17.0, 17.0)
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+set_fill #286eae
+begin_path
+arc(307.5, 37.5, 8.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 8.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+begin_path
+arc(307.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(7.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(15.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(45.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(60.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(75.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(90.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(105.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(120.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(135.0, 30.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(7.5, 37.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=15.0 boost=true mask=none
+set_stroke #fff200
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+set_fill #fff200
+begin_path
+arc(307.5, 37.5, 10.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 10.5, 0.0, 6.283185307179586)
+fill
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+set_fill #286eae
+begin_path
+arc(307.5, 37.5, 8.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 8.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+begin_path
+arc(307.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(7.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(15.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(45.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(60.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(75.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(90.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(105.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(120.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(135.0, 30.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(7.5, 37.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=wide_u_turn cell=15.0 boost=true mask=#ffffff
+set_fill #ffffff
+fill_rect(-3.0, 27.0, 321.0, 21.0)
+fill_rect(297.0, 27.0, 21.0, 81.0)
+fill_rect(-3.0, 87.0, 321.0, 21.0)
+fill_rect(-3.0, 27.0, 21.0, 21.0)
+fill_rect(297.0, 27.0, 21.0, 21.0)
+fill_rect(297.0, 87.0, 21.0, 21.0)
+fill_rect(-3.0, 87.0, 21.0, 21.0)
+set_stroke #fff200
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+set_fill #fff200
+begin_path
+arc(307.5, 37.5, 10.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 10.5, 0.0, 6.283185307179586)
+fill
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+set_fill #286eae
+begin_path
+arc(307.5, 37.5, 8.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 8.5, 0.0, 6.283185307179586)
+fill
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 37.5)
+line_to(307.5, 37.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(307.5, 37.5)
+line_to(307.5, 97.5)
+stroke
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(7.5, 97.5)
+line_to(307.5, 97.5)
+stroke
+begin_path
+arc(307.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+begin_path
+arc(307.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #3c8dde
+begin_path
+arc(7.5, 97.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(0.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(15.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(45.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.18)
+fill_rect(60.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.15)
+fill_rect(75.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.12)
+fill_rect(90.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.09000000000000001)
+fill_rect(105.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.059999999999999984)
+fill_rect(120.0, 30.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.029999999999999992)
+fill_rect(135.0, 30.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(7.5, 37.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(7.5, 37.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=5.0 boost=false mask=none
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(12.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(25.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(20.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(15.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(10.0, 15.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(27.5, 17.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=5.0 boost=false mask=#ffffff
+set_fill #ffffff
+fill_rect(9.0, 14.0, 22.0, 7.0)
+fill_rect(24.0, 14.0, 7.0, 7.0)
+fill_rect(9.0, 14.0, 7.0, 7.0)
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(12.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(25.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(20.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(15.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(10.0, 15.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(27.5, 17.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=5.0 boost=true mask=none
+set_stroke #fff200
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #fff200
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(12.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(25.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(20.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(15.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(10.0, 15.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(27.5, 17.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=5.0 boost=true mask=#ffffff
+set_fill #ffffff
+fill_rect(7.0, 12.0, 26.0, 11.0)
+fill_rect(22.0, 12.0, 11.0, 11.0)
+fill_rect(7.0, 12.0, 11.0, 11.0)
+set_stroke #fff200
+set_line_width(11.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #fff200
+set_stroke #286eae
+set_line_width(7.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(5.0)
+set_line_cap round
+begin_path
+move_to(12.5, 17.5)
+line_to(27.5, 17.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(12.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(25.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(20.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(15.0, 15.0, 5.0, 5.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(10.0, 15.0, 5.0, 5.0)
+set_fill #3c8dde
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(27.5, 17.5, 2.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(27.5, 17.5, 1.9, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=10.0 boost=false mask=none
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #3c8dde
+begin_path
+arc(25.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(50.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(40.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(20.0, 30.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(55.0, 35.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=10.0 boost=false mask=#ffffff
+set_fill #ffffff
+fill_rect(19.0, 29.0, 42.0, 12.0)
+fill_rect(49.0, 29.0, 12.0, 12.0)
+fill_rect(19.0, 29.0, 12.0, 12.0)
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #3c8dde
+begin_path
+arc(25.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(50.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(40.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(20.0, 30.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(55.0, 35.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=10.0 boost=true mask=none
+set_stroke #fff200
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #fff200
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #3c8dde
+begin_path
+arc(25.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(50.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(40.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(20.0, 30.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(55.0, 35.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=10.0 boost=true mask=#ffffff
+set_fill #ffffff
+fill_rect(17.0, 27.0, 46.0, 16.0)
+fill_rect(47.0, 27.0, 16.0, 16.0)
+fill_rect(17.0, 27.0, 16.0, 16.0)
+set_stroke #fff200
+set_line_width(16.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #fff200
+set_stroke #286eae
+set_line_width(12.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(10.0)
+set_line_cap round
+begin_path
+move_to(25.0, 35.0)
+line_to(55.0, 35.0)
+stroke
+set_fill #3c8dde
+begin_path
+arc(25.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(50.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(40.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(30.0, 30.0, 10.0, 10.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(20.0, 30.0, 10.0, 10.0)
+set_fill #3c8dde
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(55.0, 35.0, 5.0, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(55.0, 35.0, 3.8, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=15.0 boost=false mask=none
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(37.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(75.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(60.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(45.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 45.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(82.5, 52.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=15.0 boost=false mask=#ffffff
+set_fill #ffffff
+fill_rect(29.0, 44.0, 62.0, 17.0)
+fill_rect(74.0, 44.0, 17.0, 17.0)
+fill_rect(29.0, 44.0, 17.0, 17.0)
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(37.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(75.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(60.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(45.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 45.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(82.5, 52.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=15.0 boost=true mask=none
+set_stroke #fff200
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #fff200
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(37.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(75.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(60.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(45.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 45.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(82.5, 52.5, 5.7, 0.0, 6.283185307179586)
+fill
+
+# alive pose=starting_length cell=15.0 boost=true mask=#ffffff
+set_fill #ffffff
+fill_rect(27.0, 42.0, 66.0, 21.0)
+fill_rect(72.0, 42.0, 21.0, 21.0)
+fill_rect(27.0, 42.0, 21.0, 21.0)
+set_stroke #fff200
+set_line_width(21.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #fff200
+set_stroke #286eae
+set_line_width(17.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #286eae
+set_stroke #3c8dde
+set_fill #3c8dde
+set_line_width(15.0)
+set_line_cap round
+begin_path
+move_to(37.5, 52.5)
+line_to(82.5, 52.5)
+stroke
+set_fill #3c8dde
+begin_path
+arc(37.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+fill_rect(75.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.27)
+fill_rect(60.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.24)
+fill_rect(45.0, 45.0, 15.0, 15.0)
+set_fill rgba(255, 255, 255, 0.21)
+fill_rect(30.0, 45.0, 15.0, 15.0)
+set_fill #3c8dde
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill rgba(255, 255, 255, 0.3)
+begin_path
+arc(82.5, 52.5, 7.5, 0.0, 6.283185307179586)
+fill
+set_fill #333
+begin_path
+arc(82.5, 52.5, 5.7, 0.0, 6.283185307179586)
+fill
+
 ## dead
 
 # dead body=single_cell rotation=0 cell=5.0

@@ -34,6 +34,9 @@ use crate::api::rate_limit::{
     global_rate_limit_middleware, rate_limit_layer, rate_limit_middleware,
 };
 use crate::api::regions;
+use crate::api::skins;
+use crate::api::textures;
+use crate::api::wallet as wallet_api;
 use crate::cluster_membership::ClusterNamespace;
 use crate::db::Database;
 use crate::db::models::Game;
@@ -183,6 +186,10 @@ pub struct HttpServerState {
     /// Verified cache-aside access to durable completed-game recordings.
     /// Absent only when replay object storage is intentionally not configured.
     pub replay_repository: Option<Arc<ReplayRepository>>,
+    /// Where generated texture pixels live. Absent when this deployment
+    /// stores no textures, which serves 503 rather than 404 — the row exists
+    /// and its bytes are unreachable, which is a deployment state.
+    pub texture_store: Option<Arc<dyn crate::texture_store::TextureStore>>,
     /// Process lifecycle used for truthful readiness and planned drain.
     pub lifecycle: TaskLifecycle,
     /// Region-scoped authoritative recovery namespace.
@@ -219,6 +226,13 @@ pub async fn install_http_application(
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let user_cache = UserCache::new(redis.clone(), db.clone());
+    // First caller of `texture_store::from_env`, which has existed since the
+    // generation pipeline landed and had nothing to construct it: the bytes
+    // were stored and served by nothing.
+    let texture_store: Option<Arc<dyn crate::texture_store::TextureStore>> =
+        crate::texture_store::from_env()
+            .await?
+            .map(|store| Arc::new(store) as Arc<dyn crate::texture_store::TextureStore>);
     let replay_repository = match ReplayStoreConfig::from_env()? {
         Some(config) => {
             let store = Arc::new(S3ReplayStore::new(config).await?);
@@ -250,6 +264,7 @@ pub async fn install_http_application(
         lobby_manager,
         user_cache,
         replay_repository,
+        texture_store,
         lifecycle: lifecycle.clone(),
         cluster_namespace,
         ads_config,
@@ -266,6 +281,11 @@ pub async fn install_http_application(
 
     // Start background task to broadcast user counts to WebSocket clients every 5 seconds
     spawn_user_count_broadcaster(redis.clone(), cancellation_token.clone());
+    spawn_texture_worker(
+        db.clone(),
+        state.texture_store.clone(),
+        cancellation_token.clone(),
+    );
 
     // Start background task to broadcast the region's online-player roster.
     spawn_region_roster_broadcaster(redis.clone(), region.clone(), cancellation_token.clone());
@@ -277,6 +297,7 @@ pub async fn install_http_application(
         jwt_manager: jwt_manager.clone(),
         user_cache: Some(state.user_cache.clone()),
         crazygames_verifier: crazygames::configured_verifier_from_env()?,
+        texture_store: state.texture_store.clone(),
     };
     let auth_middleware_state = AuthMiddlewareState {
         jwt_manager: jwt_manager.clone(),
@@ -305,6 +326,13 @@ pub async fn install_http_application(
     // "does this account exist" to anyone. Per-IP, and tight enough that it is
     // a poor way to enumerate usernames.
     let player_lobby_limiter = rate_limit_layer(120, 60);
+    // Generation is the one route where a request turns into money, so it is
+    // throttled as well as quota'd and circuit-broken inside the handler.
+    let generation_limiter = rate_limit_layer(20, 60);
+    // Uploads are cheaper than generations — no model, no bill — but they are
+    // still four megabytes of pixels each, so they get their own allowance
+    // rather than sharing one with the route that spends money.
+    let upload_limiter = rate_limit_layer(30, 60);
 
     // Build protected API routes
     let protected_routes = Router::new()
@@ -315,6 +343,67 @@ pub async fn install_http_application(
             put(crazygames::save_preferences)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
+        // Two skin references and nothing else; a body larger than this is not
+        // an equip request that got long, it is something else entirely.
+        .route(
+            "/api/users/me/equipped",
+            put(skins::set_equipment).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
+        // A document is capped at 32 KB; the request limit leaves room for the
+        // envelope around it and nothing like enough for anything else.
+        .route(
+            "/api/skins",
+            post(skins::create_skin).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/skins/:skin_id",
+            put(skins::update_skin).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/skins/:skin_id/publish-request",
+            post(skins::request_publication),
+        )
+        .route(
+            "/api/skins/:skin_id/report",
+            post(skins::report_skin).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route("/api/wallet", get(wallet_api::get_wallet))
+        .route("/api/wallet/packs", get(wallet_api::list_packs))
+        .route("/api/textures", get(textures::list_mine))
+        // Generation is slow and costs money per attempt, so the route that
+        // starts one is rate limited as well as quota'd inside the handler.
+        .route(
+            "/api/textures/generate",
+            post(textures::generate)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    generation_limiter,
+                    rate_limit_middleware,
+                )),
+        )
+        // A PNG plus its metadata. The 4 MB cap is the PRD's, and it is the
+        // largest body this API takes: the handler checks the magic bytes and
+        // the declared dimensions, and everything that costs CPU happens in
+        // the worker.
+        .route(
+            "/api/textures",
+            post(textures::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    upload_limiter,
+                    rate_limit_middleware,
+                )),
+        )
+        .route("/api/generation-jobs/:job_id", get(textures::get_job))
+        .route(
+            "/api/wallet/xsolla/checkout-token",
+            post(wallet_api::xsolla_checkout_token)
+                .layer(axum::extract::DefaultBodyLimit::max(2 * 1024)),
+        )
+        .route(
+            "/api/skins/:skin_id/purchase",
+            post(wallet_api::purchase_skin).layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             auth_middleware_state.clone(),
             auth_middleware,
@@ -323,6 +412,11 @@ pub async fn install_http_application(
 
     let admin_routes = Router::new()
         .route("/api/admin/history", get(admin::get_admin_history))
+        .route("/api/admin/skins", get(skins::admin_review_queue))
+        .route(
+            "/api/admin/skins/:skin_id/status",
+            put(skins::admin_set_status).layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/admin/config",
             get(admin::get_admin_config)
@@ -387,6 +481,43 @@ pub async fn install_http_application(
         .route("/api/news", get(news::get_news))
         .with_state(NewsState::new(db.clone()));
 
+    // Browsing the catalogue needs no account: the Skins page is a shop window
+    // as much as a picker, and a logged-out visitor should see what is on offer.
+    let skin_catalog_routes = Router::new()
+        .route("/api/skins", get(skins::browse))
+        .route("/api/skins/catalog", get(skins::browse));
+
+    // Reading a skin document needs no account: a spectator or a replay viewer
+    // holding a reference out of a snapshot has to be able to draw it.
+    let payment_routes = Router::new()
+        .route(
+            "/api/wallet/xsolla/webhook",
+            post(wallet_api::xsolla_webhook).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
+        )
+        .with_state(auth_state.clone());
+
+    // Optional auth, not none: every route here serves an anonymous caller,
+    // and three of them serve a signed-in one *more* — your own skins, your own
+    // skin, and the document behind a draft only you can see. Without this the
+    // extension is never installed, `filter=mine` can only answer 401, and a
+    // skin you have made but not published is invisible on your own Skins page.
+    let skin_document_routes = Router::new()
+        .route(
+            "/api/skins/by-ref/:content_ref",
+            get(skins::get_document_by_ref),
+        )
+        .route("/api/skins/browse", get(skins::list_skins))
+        .route(
+            "/api/textures/by-ref/:content_ref/manifest",
+            get(textures::get_manifest),
+        )
+        .route("/api/skins/:skin_id", get(skins::get_skin))
+        .layer(middleware::from_fn_with_state(
+            auth_middleware_state.clone(),
+            crate::api::middleware::optional_auth_middleware,
+        ))
+        .with_state(auth_state.clone());
+
     // Replay and highlight reads are intentionally anonymous. At launch all
     // runtime games, including custom games, are public; no username or lobby
     // membership ACL is applied here.
@@ -400,6 +531,19 @@ pub async fn install_http_application(
     let public_game_routes = public_games::build_public_game_routes(db.clone()).layer(
         middleware::from_fn_with_state(public_game_read_limiter, global_rate_limit_middleware),
     );
+    // Texture pixels, anonymous for the same reason replays are: these are the
+    // bytes a client needs to render somebody *else's* snake, so gating them
+    // behind a session would stop a match drawing its own players.
+    //
+    // The budget is far above the replay limiter's because the traffic shape is
+    // different: eight players, up to four textures each, all cold at the same
+    // instant when a match starts. A per-minute allowance sized for replays
+    // would black out arenas rather than shed load.
+    let texture_read_limiter = rate_limit_layer(6_000, 60);
+    let texture_byte_routes =
+        textures::build_texture_byte_routes(db.clone(), state.texture_store.clone()).layer(
+            middleware::from_fn_with_state(texture_read_limiter, global_rate_limit_middleware),
+        );
 
     // Build protected leaderboard routes (requires authentication)
     let protected_leaderboard_routes = Router::new()
@@ -441,8 +585,12 @@ pub async fn install_http_application(
         .merge(player_routes)
         .merge(leaderboard_routes)
         .merge(news_routes)
+        .merge(skin_catalog_routes)
+        .merge(skin_document_routes)
+        .merge(payment_routes)
         .merge(replay_routes)
         .merge(public_game_routes)
+        .merge(texture_byte_routes)
         .merge(protected_leaderboard_routes)
         .merge(debug_routes)
         .with_state(auth_state);
@@ -1109,6 +1257,49 @@ fn spawn_region_roster_broadcaster(
 }
 
 /// Background task to broadcast user count updates every 5 seconds
+/// Start the loop that drains the texture queue, when there is anything for it
+/// to do.
+///
+/// It needs somewhere to put pixels and something to ask for them; without
+/// either, a worker would claim jobs only to fail them, which is worse than
+/// leaving them queued for a deployment that can finish them. So the absence
+/// of a store or of every provider key means no worker rather than a broken
+/// one, and the log says which.
+fn spawn_texture_worker(
+    db: Arc<dyn crate::db::Database>,
+    store: Option<Arc<dyn crate::texture_store::TextureStore>>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    let Some(store) = store else {
+        tracing::info!("no texture store configured; the texture worker will not run");
+        return;
+    };
+    let providers = crate::generation_providers::configured_providers();
+    if providers.is_empty() {
+        // Uploads need no provider, so this is worth running anyway — it just
+        // cannot generate.
+        tracing::info!("no image provider configured; the texture worker will handle uploads only");
+    }
+
+    let worker = crate::texture_worker::Worker {
+        db,
+        store,
+        providers,
+        budget: crate::generation::Budget::default(),
+        name: format!(
+            "{}-{}",
+            gethostname::gethostname().to_string_lossy(),
+            std::process::id()
+        ),
+    };
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        cancellation_token.cancelled().await;
+        let _ = tx.send(true);
+    });
+    tokio::spawn(worker.run_forever(rx));
+}
+
 fn spawn_user_count_broadcaster(
     redis: RedisConnection,
     cancellation_token: tokio_util::sync::CancellationToken,

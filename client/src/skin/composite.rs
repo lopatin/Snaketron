@@ -31,7 +31,8 @@
 
 use crate::skin::geometry::walk_cells_from_head;
 use crate::skin::layer::{
-    Anchor, ColorSlot, DiscPaint, Fade, Layer, LayerKind, LayerTransform, Region, Source, Span,
+    Anchor, Binding, ColorSlot, DiscPaint, Fade, Layer, LayerKind, LayerTransform, Region, Source,
+    Span,
 };
 use crate::skin::space::{
     ClipShape, RibbonPlan, arc_length, clip_to_body, emit_ribbon, for_each_run,
@@ -54,6 +55,15 @@ pub struct Swatch {
     /// A third colour for a skin's signature element. Defaults to the fill for
     /// skins that have no such element.
     pub accent: String,
+    /// Colours the document computed, resolved for *this* role at this step,
+    /// named by [`ColorSlot::Literal`].
+    ///
+    /// Per role rather than per frame, and that placement is the whole point.
+    /// A plain literal is one colour for everyone, so it lands here identical
+    /// across roles and costs nothing. A *derived* colour — a lightened fill,
+    /// which is how v1's brightness tracks convert — is a different colour on
+    /// each side of the match, and a frame-level table could not hold both.
+    pub extra: Vec<String>,
 }
 
 /// Everything one animation step resolves to.
@@ -74,12 +84,12 @@ pub struct Frame {
     /// frame strips. Distinct from `wave_phase_turns`, which is the head
     /// ramp's own wave and may run at a different rate.
     pub time_turns: f64,
-    /// Per-track layer opacities, indexed by `Layer::opacity_track`.
-    pub layer_opacity: Vec<f64>,
-    /// Per-track scalars, indexed by `LayerKind::HeadDisc::radius_track`.
-    pub scalars: Vec<f64>,
-    /// Colours a layer can name with [`ColorSlot::Literal`].
-    pub literals: Vec<String>,
+    /// Every bound value at this step, indexed by [`Binding::Param`].
+    ///
+    /// One table, not one per property: `layer_opacity` and `scalars` were
+    /// separate because each was added for the one property that needed it,
+    /// and a document compiler would have had to grow a third. See [`Binding`].
+    pub params: Vec<f64>,
 }
 
 /// The parts of a skin that never vary with role or time.
@@ -181,18 +191,25 @@ impl CompositeSkin {
     ) -> Result<Self, Vec<LayerStackError>> {
         let mut problems = validate_layers(&layers, &frames);
         for layer in &layers {
-            let LayerKind::Span {
-                source:
-                    Source::Image {
-                        region,
-                        fade,
-                        drift_cells,
-                        ..
-                    },
-                ..
-            } = &layer.kind
-            else {
-                continue;
+            // Both bitmap sources name an atlas region, and both are refused
+            // at registration for naming one that does not exist — a blank
+            // snake discovered mid-match is the alternative.
+            let (region, fade, drift_cells) = match &layer.kind {
+                LayerKind::Span {
+                    source:
+                        Source::Image {
+                            region,
+                            fade,
+                            drift_cells,
+                            ..
+                        },
+                    ..
+                } => (region, *fade, *drift_cells),
+                LayerKind::Span {
+                    source: Source::Text { region, .. },
+                    ..
+                } => (region, None, 0.0),
+                _ => continue,
             };
             // A fade is a fixed number of extra blits per run, so an absurd
             // step count is a frame-rate bug rather than an ugly one — and it
@@ -288,6 +305,16 @@ impl CompositeSkin {
         &self.layers
     }
 
+    #[cfg(test)]
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_at(&self, step: usize) -> &Frame {
+        &self.frames[step]
+    }
+
     /// Which precomputed frame a clock reading lands on.
     ///
     /// Reduced motion always gets frame zero, which is the resting pose.
@@ -326,6 +353,56 @@ impl CompositeSkin {
 /// would not produce a wrong picture so much as a wrong *claim* — an
 /// `overhang_px` that no longer bounds anything, or a Boost band a body layer
 /// can paint over.
+/// Whether a binding resolves at every step a viewer could land on.
+///
+/// A parameter missing from one frame is a registration error rather than a
+/// paint-time fallback, because the fallback would look like a skin that
+/// flickers once per cycle — the hardest possible thing to attribute.
+fn bound_everywhere(binding: &Binding, frames: &[Frame]) -> bool {
+    match binding {
+        // Nothing to look up: one is folded, the other is evaluated fresh.
+        Binding::Const(_) | Binding::Snake(_) => true,
+        Binding::Param(index) => frames.iter().all(|frame| *index < frame.params.len()),
+    }
+}
+
+/// Whether a binding's range is knowable at registration.
+///
+/// A per-snake binding's is not: it reads the body's length, whether the snake
+/// is boosting, and its seed — none of which exist until paint time. That is
+/// perfectly fine for an opacity or a transform, and not fine for anything
+/// whose *bound* is what keeps a layer inside the silhouette. Those properties
+/// refuse it with a reason, rather than trusting a paint-time clamp to be
+/// remembered by whoever adds the next source.
+fn is_statically_bounded(binding: &Binding) -> bool {
+    !matches!(binding, Binding::Snake(_))
+}
+
+/// The extreme value a binding reaches across every baked step.
+///
+/// Bounds that keep a layer inside the body have to hold at *every* step, so
+/// they are checked against this rather than against the resting value.
+/// `pick` is applied to each value on its own as well as pairwise, so a
+/// caller asking for "the largest magnitude" gets it from a single-valued
+/// binding too. An absent parameter yields zero; `bound_everywhere` is what
+/// rejects that, so this never has to double as the error path.
+fn extent_of(binding: &Binding, frames: &[Frame], pick: impl Fn(f64, f64) -> f64) -> f64 {
+    match binding {
+        // Fails closed. `is_statically_bounded` is what actually rejects this
+        // case with a legible message; returning infinity here means that if
+        // the guard is ever dropped, the bound still refuses rather than
+        // silently passing an unbounded layer.
+        Binding::Snake(_) => f64::INFINITY,
+        Binding::Const(value) => pick(*value, *value),
+        Binding::Param(index) => frames
+            .iter()
+            .filter_map(|frame| frame.params.get(*index).copied())
+            .map(|value| pick(value, value))
+            .reduce(&pick)
+            .unwrap_or(0.0),
+    }
+}
+
 fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
     let mut problems: Vec<LayerStackError> = Vec::new();
     for layer in layers {
@@ -389,28 +466,29 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                     );
                 }
             }
-            LayerKind::HeadDisc {
-                radius_ratio,
-                radius_track,
-                ..
-            } => {
-                if let Some(track) = radius_track
-                    && frames.iter().any(|frame| *track >= frame.scalars.len())
-                {
+            LayerKind::HeadDisc { radius, .. } => {
+                if !bound_everywhere(radius, frames) {
                     reject(
                         &mut problems,
                         layer,
-                        "radius track is not present in every baked frame",
+                        "radius reads a parameter that is not present in every \
+                         baked frame",
                     );
                 }
-                let widest = radius_track
-                    .map(|track| {
-                        frames
-                            .iter()
-                            .filter_map(|frame| frame.scalars.get(track).copied())
-                            .fold(*radius_ratio, f64::max)
-                    })
-                    .unwrap_or(*radius_ratio);
+                if !is_statically_bounded(radius) {
+                    reject(
+                        &mut problems,
+                        layer,
+                        "a head disc radius may not depend on the snake (`len`, \
+                         `boost`, `seed`): its bound is what keeps the disc \
+                         inside the silhouette, and that bound has to be \
+                         checkable before the skin paints",
+                    );
+                }
+                // The widest the disc ever gets, across every step a viewer
+                // could land on — not the resting radius. A disc that only
+                // escapes the silhouette mid-cycle escapes it.
+                let widest = extent_of(radius, frames, f64::max);
                 if widest > 0.5 {
                     reject(
                         &mut problems,
@@ -421,7 +499,9 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                 }
             }
             LayerKind::Span { source, corner, .. } => {
-                let blit = matches!(source, Source::Image { .. });
+                // Text is a blit too: it draws glyph sub-rects from the bundled
+                // strip, so it inherits every rule a bitmap source has.
+                let blit = matches!(source, Source::Image { .. } | Source::Text { .. });
                 if blit && !corner.allows_blits() {
                     reject(
                         &mut problems,
@@ -462,29 +542,65 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                     t_center,
                     ..
                 } = source
-                    && t_center.abs() + half_width.abs() > 0.5 + 1e-9
                 {
-                    reject(
-                        &mut problems,
-                        layer,
-                        "a tiled band must stay inside the body: \
-                         |t_center| + half_width may not exceed 0.5",
-                    );
+                    if !bound_everywhere(half_width, frames) || !bound_everywhere(t_center, frames)
+                    {
+                        reject(
+                            &mut problems,
+                            layer,
+                            "a band reads a parameter that is not present in \
+                             every baked frame",
+                        );
+                    }
+                    if !is_statically_bounded(half_width) || !is_statically_bounded(t_center) {
+                        reject(
+                            &mut problems,
+                            layer,
+                            "a band's lane may not depend on the snake (`len`, \
+                             `boost`, `seed`): the lane's bound is what keeps a \
+                             body layer off the Boost band, and that has to be \
+                             checkable before the skin paints",
+                        );
+                    }
+                    // Checked at the step where the lane is widest and the step
+                    // where it sits furthest off-centre. Those can be different
+                    // steps, so taking each extreme independently is the
+                    // conservative reading — and conservative is the only safe
+                    // direction for a bound that keeps a body layer off the
+                    // Boost band.
+                    let reach = extent_of(t_center, frames, |a, b| a.abs().max(b.abs()))
+                        + extent_of(half_width, frames, |a, b| a.abs().max(b.abs()));
+                    if reach > 0.5 + 1e-9 {
+                        reject(
+                            &mut problems,
+                            layer,
+                            "a tiled band must stay inside the body: \
+                             |t_center| + half_width may not exceed 0.5",
+                        );
+                    }
                 }
             }
             LayerKind::HeadRamp { .. } => {}
         }
 
-        if let Some(track) = layer.opacity_track
-            && frames
-                .iter()
-                .any(|frame| track >= frame.layer_opacity.len())
-        {
+        if !bound_everywhere(&layer.opacity, frames) {
             reject(
                 &mut problems,
                 layer,
-                "opacity track is not present in every baked frame",
+                "opacity reads a parameter that is not present in every baked \
+                 frame",
             );
+        }
+        for binding in layer.transform.bindings() {
+            if !bound_everywhere(binding, frames) {
+                reject(
+                    &mut problems,
+                    layer,
+                    "a transform reads a parameter that is not present in \
+                     every baked frame",
+                );
+                break;
+            }
         }
     }
 
@@ -688,20 +804,15 @@ fn allocate_spans(layers: &[Layer], body_len: f64, into: &mut Vec<Option<Allocat
 }
 
 /// Resolve a colour slot against a frame.
-fn color<'a>(
-    slot: ColorSlot,
-    swatch: &'a Swatch,
-    frame: &'a Frame,
-    config: &'a CompositeConfig,
-) -> &'a str {
+fn color<'a>(slot: ColorSlot, swatch: &'a Swatch, config: &'a CompositeConfig) -> &'a str {
     match slot {
         ColorSlot::Fill => &swatch.fill,
         ColorSlot::Outline => &swatch.outline,
         ColorSlot::Boost => &config.boost_color,
         ColorSlot::HeadCore => &config.head_core_color,
         ColorSlot::Accent => &swatch.accent,
-        ColorSlot::Literal(index) => frame
-            .literals
+        ColorSlot::Literal(index) => swatch
+            .extra
             .get(index)
             .map(String::as_str)
             // A literal index that survived validation cannot be missing; if
@@ -760,6 +871,7 @@ impl SnakeSkin for CompositeSkin {
         let frame = &self.frames[self.frame_index(pose.anim_ms, pose.reduced_motion)];
         let swatch = self.swatch(frame, identity);
         let body_len = arc_length(pose.cells);
+        let env = binding_env(pose, frame, body_len);
 
         let mut allocations = Vec::new();
         allocate_spans(&self.layers, body_len, &mut allocations);
@@ -786,9 +898,10 @@ impl SnakeSkin for CompositeSkin {
                 open_clip = wants_clip;
             }
 
-            let opacity = layer
-                .opacity_track
-                .and_then(|track| frame.layer_opacity.get(track).copied());
+            // A fully-opaque constant emits nothing, which is what keeps every
+            // pre-binding skin's op stream byte-identical.
+            let opacity =
+                (!layer.opacity.is_const(1.0)).then(|| layer.opacity.get(&frame.params, &env, 1.0));
             if let Some(alpha) = opacity {
                 ctx.set_global_alpha(alpha);
             }
@@ -796,7 +909,7 @@ impl SnakeSkin for CompositeSkin {
             let transformed = !layer.transform.is_identity();
             if transformed {
                 ctx.save();
-                apply_transform(ctx, &layer.transform, pose.cell_size)?;
+                apply_transform(ctx, &layer.transform, frame, &env, pose.cell_size)?;
             }
 
             self.paint_layer(
@@ -804,6 +917,7 @@ impl SnakeSkin for CompositeSkin {
                 pose,
                 layer,
                 frame,
+                &env,
                 swatch,
                 allocations[index],
                 body_len,
@@ -847,6 +961,24 @@ impl SnakeSkin for CompositeSkin {
     }
 }
 
+/// The environment a per-snake binding resolves in.
+///
+/// `s` and `t` are zero, and that is a statement rather than a placeholder: a
+/// binding at this tier is one value for the whole snake. Validation rejects
+/// any expression that reads them, because reading them puts the expression in
+/// the per-cell or per-texel tier, which belongs to the head ramp and the band
+/// — the two places the renderer already walks that finely.
+fn binding_env(pose: &SnakePose, frame: &Frame, body_len: f64) -> skin_schema::expr::Env {
+    skin_schema::expr::Env {
+        s: 0.0,
+        t: 0.0,
+        len: body_len,
+        time: frame.time_turns,
+        boost: if pose.boost_active { 1.0 } else { 0.0 },
+        seed: pose.seed,
+    }
+}
+
 /// Whether a layer could paint outside its region without a clip.
 ///
 /// A ribbon is the silhouette; a head disc is bounded by validation; a head
@@ -857,22 +989,30 @@ fn layer_needs_clip(layer: &Layer) -> bool {
 }
 
 /// Apply a layer transform, in the layer's own space.
+/// Each of the three ops is emitted when its own fields are not the neutral
+/// *constant* — so a bound field always emits, at every step, even where it
+/// happens to evaluate to the neutral value. Deciding per step would make the
+/// op sequence a function of the clock.
 fn apply_transform(
     ctx: &mut PaintCtx,
     transform: &LayerTransform,
+    frame: &Frame,
+    env: &skin_schema::expr::Env,
     cell_size: f64,
 ) -> Result<(), JsValue> {
-    if transform.translate != (0.0, 0.0) {
+    let params = &frame.params;
+    let get = |binding: &Binding, fallback: f64| binding.get(params, env, fallback);
+    if !(transform.translate.0.is_const(0.0) && transform.translate.1.is_const(0.0)) {
         ctx.translate(
-            transform.translate.0 * cell_size,
-            transform.translate.1 * cell_size,
+            get(&transform.translate.0, 0.0) * cell_size,
+            get(&transform.translate.1, 0.0) * cell_size,
         )?;
     }
-    if transform.rotate_turns != 0.0 {
-        ctx.rotate(transform.rotate_turns * FULL_CIRCLE)?;
+    if !transform.rotate_turns.is_const(0.0) {
+        ctx.rotate(get(&transform.rotate_turns, 0.0) * FULL_CIRCLE)?;
     }
-    if transform.scale != (1.0, 1.0) {
-        ctx.scale(transform.scale.0, transform.scale.1)?;
+    if !(transform.scale.0.is_const(1.0) && transform.scale.1.is_const(1.0)) {
+        ctx.scale(get(&transform.scale.0, 1.0), get(&transform.scale.1, 1.0))?;
     }
     Ok(())
 }
@@ -885,6 +1025,7 @@ impl CompositeSkin {
         pose: &SnakePose,
         layer: &Layer,
         frame: &Frame,
+        env: &skin_schema::expr::Env,
         swatch: &Swatch,
         allocation: Option<Allocation>,
         body_len: f64,
@@ -903,7 +1044,7 @@ impl CompositeSkin {
                 pose.cells,
                 pose.cell_size,
                 &RibbonPlan {
-                    color: color(*slot, swatch, frame, &self.config),
+                    color: color(*slot, swatch, &self.config),
                     // A skin quotes its contour in 1x pixels; the arena scales
                     // it with the cell so the rim keeps its weight at any zoom.
                     extra: *extra * pose.detail_scale,
@@ -914,7 +1055,11 @@ impl CompositeSkin {
                     single_pass: *single_pass,
                 },
             ),
-            LayerKind::HeadRamp { rgb, length_cells } => {
+            LayerKind::HeadRamp {
+                rgb,
+                length_cells,
+                opacity: curve,
+            } => {
                 let wave = self
                     .config
                     .wave
@@ -924,10 +1069,27 @@ impl CompositeSkin {
                         phase_turns: frame.wave_phase_turns,
                     });
                 for (x, y, distance) in walk_cells_from_head(pose.cells, *length_cells) {
-                    let base = (1.0 - distance / length_cells) * frame.ramp_opacity;
-                    let opacity = match wave {
-                        Some(wave) => (base + wave_offset(wave, distance)).clamp(0.0, 1.0),
-                        None => base,
+                    let opacity = match curve {
+                        // The expression *is* the curve — falloff included —
+                        // so an author can reshape the glow rather than only
+                        // scale the one shape the renderer knows.
+                        Some(curve) => curve
+                            .eval(&skin_schema::expr::Env {
+                                s: distance,
+                                t: 0.0,
+                                len: body_len,
+                                time: frame.time_turns,
+                                boost: if pose.boost_active { 1.0 } else { 0.0 },
+                                seed: 0.0,
+                            })
+                            .clamp(0.0, 1.0),
+                        None => {
+                            let base = (1.0 - distance / length_cells) * frame.ramp_opacity;
+                            match wave {
+                                Some(wave) => (base + wave_offset(wave, distance)).clamp(0.0, 1.0),
+                                None => base,
+                            }
+                        }
                     };
                     let (r, g, b) = *rgb;
                     ctx.set_fill(&format!("rgba({r}, {g}, {b}, {opacity})"));
@@ -940,31 +1102,22 @@ impl CompositeSkin {
                 }
                 Ok(())
             }
-            LayerKind::HeadDisc {
-                paint,
-                radius_ratio,
-                radius_track,
-            } => {
+            LayerKind::HeadDisc { paint, radius } => {
                 let (head_x, head_y) = pose.cells[0];
                 let centre = (
                     head_x * pose.cell_size + pose.cell_size / 2.0,
                     head_y * pose.cell_size + pose.cell_size / 2.0,
                 );
-                let radius = pose.cell_size
-                    * radius_track
-                        .and_then(|track| frame.scalars.get(track).copied())
-                        .unwrap_or(*radius_ratio);
+                let radius = pose.cell_size * radius.get(&frame.params, env, 0.0);
                 match paint {
-                    DiscPaint::Slot(slot) => {
-                        ctx.set_fill(color(*slot, swatch, frame, &self.config))
-                    }
+                    DiscPaint::Slot(slot) => ctx.set_fill(color(*slot, swatch, &self.config)),
                     DiscPaint::RampPeak => {
                         let (r, g, b) = ramp_rgb(&self.layers);
-                        let opacity = frame.ramp_opacity;
+                        let opacity = ramp_peak(&self.layers, frame, env);
                         ctx.set_fill(&format!("rgba({r}, {g}, {b}, {opacity})"));
                     }
                     DiscPaint::RadialGlow { slot, stops } => {
-                        let base = color(*slot, swatch, frame, &self.config);
+                        let base = color(*slot, swatch, &self.config);
                         ctx.set_fill_gradient(&crate::skin::paint::Gradient::Radial {
                             x0: centre.0,
                             y0: centre.1,
@@ -996,12 +1149,10 @@ impl CompositeSkin {
                 // Whatever `paint` already put on the context for this layer.
                 // Read here rather than passed down from there so the two can
                 // never disagree about which track is in force.
-                let base_alpha = layer
-                    .opacity_track
-                    .and_then(|track| frame.layer_opacity.get(track).copied())
-                    .unwrap_or(1.0);
+                let base_alpha = layer.opacity.get(&frame.params, env, 1.0);
                 self.paint_span(
-                    ctx, pose, source, *corner, allocation, swatch, frame, body_len, base_alpha,
+                    ctx, pose, env, source, *corner, allocation, swatch, frame, body_len,
+                    base_alpha,
                 )
             }
         }
@@ -1013,6 +1164,7 @@ impl CompositeSkin {
         &self,
         ctx: &mut PaintCtx,
         pose: &SnakePose,
+        env: &skin_schema::expr::Env,
         source: &Source,
         corner: crate::skin::space::CornerPolicy,
         allocation: Allocation,
@@ -1030,7 +1182,7 @@ impl CompositeSkin {
         // per run after the fill is set. Sources that need the run's own
         // coordinate frame are the ones that pay for a transform.
         if let Source::Solid(slot) = source {
-            ctx.set_fill(color(*slot, swatch, frame, &self.config));
+            ctx.set_fill(color(*slot, swatch, &self.config));
             let cell = pose.cell_size;
             for_each_run(pose.cells, |run| {
                 let (ribbon_start, ribbon_end) = run.ribbon_range(corner);
@@ -1068,15 +1220,17 @@ impl CompositeSkin {
             if painted <= 0.0 {
                 return Ok(());
             }
-            ctx.set_fill(color(*slot, swatch, frame, &self.config));
+            ctx.set_fill(color(*slot, swatch, &self.config));
 
             let cell = pose.cell_size;
-            let half = half_width.clamp(0.0, 0.5);
+            let half = half_width.get(&frame.params, env, 0.0).clamp(0.0, 0.5);
             // The band's own lane across the body. Validation has already
-            // established that the lane fits inside the silhouette, so the
-            // clamp here is defence against a hand-built layer rather than the
-            // rule itself.
-            let centre = t_center.clamp(-0.5 + half, 0.5 - half);
+            // established that the lane fits inside the silhouette at every
+            // baked step, so the clamp here is defence against a hand-built
+            // layer rather than the rule itself.
+            let centre = t_center
+                .get(&frame.params, env, 0.0)
+                .clamp(-0.5 + half, 0.5 - half);
             // Tiles are laid out from the head along the body, not per run, so
             // a repeat that straddles a corner stays one tile in body space and
             // the pattern does not restart at every turn.
@@ -1164,7 +1318,7 @@ impl CompositeSkin {
                 Source::Solid(_) => unreachable!("handled above"),
                 Source::LinearAlongBody(stops) | Source::RadialFromStart(stops) => {
                     let gradient =
-                        build_gradient(source, stops, u0, u1, swatch, frame, &self.config);
+                        build_gradient(source, stops, u0, u1, swatch, frame, env, &self.config);
                     if let Err(cause) = ctx.set_fill_gradient(&gradient) {
                         ctx.restore();
                         error = Some(cause);
@@ -1390,6 +1544,88 @@ impl CompositeSkin {
                         break;
                     }
                 }
+                Source::Text {
+                    region,
+                    color: slot,
+                    glyphs,
+                    scale,
+                } => {
+                    let Some(strip) = self.atlas.region(*region) else {
+                        ctx.restore();
+                        continue;
+                    };
+                    let Some(image) = self.atlas.handle(strip.image) else {
+                        ctx.restore();
+                        continue;
+                    };
+                    if glyphs.is_empty() {
+                        ctx.restore();
+                        continue;
+                    }
+
+                    // The strip is square cells, two rows of inks, so a cell is
+                    // half the region's height and the glyph count follows from
+                    // the width. Derived rather than declared: a strip
+                    // regenerated with more punctuation should not need a
+                    // constant edited to match it.
+                    let glyph_px = (strip.height / GLYPH_INK_ROWS as f64).max(1e-6);
+                    let count = (strip.width / glyph_px).round().max(1.0);
+
+                    // Which ink, chosen from the document's colour reference
+                    // resolved for *this* role.
+                    //
+                    // Canvas cannot tint a blit — `fillStyle` does not touch
+                    // `drawImage`, and the ways around that need either a
+                    // per-snake isolation buffer or an offscreen canvas, and
+                    // this engine has neither. So the strip carries its inks
+                    // and the reference picks between them by luminance. It is
+                    // a smaller promise than arbitrary colour and it keeps the
+                    // one that matters: legible on a light snake and on a dark
+                    // one. Picking the row is a source-rect *argument*, so it
+                    // varies per role without changing a single op.
+                    let ink_row =
+                        match skin_schema::color::Rgb::parse(color(*slot, swatch, &self.config)) {
+                            Some(chosen) if chosen.relative_luminance() >= 0.5 => 0.0,
+                            Some(_) => 1.0,
+                            None => 0.0,
+                        };
+
+                    // One blit per covered cell, indexed by the cell's place
+                    // along the body rather than by the character's place in
+                    // the string. That is what makes the count a function of
+                    // the pose: a longer word does not cost more, it wraps.
+                    let mut cell = start.floor().max(allocation.start.floor());
+                    let mut failed = None;
+                    while cell < end && failed.is_none() {
+                        let centre = cell + 0.5;
+                        cell += 1.0;
+                        if centre < start || centre >= end {
+                            continue;
+                        }
+                        let index =
+                            ((centre - allocation.start).floor().max(0.0) as usize) % glyphs.len();
+                        let glyph = glyphs[index].min(count as usize - 1);
+                        let half = scale.clamp(0.0, 1.0) / 2.0;
+                        failed = ctx
+                            .draw_image(
+                                image,
+                                (
+                                    strip.x + glyph as f64 * glyph_px,
+                                    strip.y + ink_row * glyph_px,
+                                    glyph_px,
+                                    glyph_px,
+                                ),
+                                (centre - run.s0 - half, -half, half * 2.0, half * 2.0),
+                            )
+                            .err();
+                    }
+
+                    if let Some(cause) = failed {
+                        ctx.restore();
+                        error = Some(cause);
+                        break;
+                    }
+                }
             }
             ctx.restore();
         }
@@ -1400,6 +1636,10 @@ impl CompositeSkin {
         }
     }
 }
+
+/// How many inks the bundled glyph strip carries, light row first. Mirrors
+/// `INKS` in `client/design/tools/build_glyph_atlas.py`.
+pub(crate) const GLYPH_INK_ROWS: usize = 2;
 
 /// A travelling wave, resolved to one moment in its cycle.
 ///
@@ -1426,11 +1666,39 @@ fn ramp_rgb(layers: &[Layer]) -> (u8, u8, u8) {
         .unwrap_or((255, 255, 255))
 }
 
+/// The head ramp's opacity at the head itself — what [`DiscPaint::RampPeak`]
+/// paints with.
+///
+/// Read off the ramp layer rather than taken from the frame, because a skin
+/// whose glow is an expression has no single "peak" stored anywhere: the peak
+/// is that curve at `s = 0`. For the legacy pairing the two agree by
+/// construction — a linear falloff at zero distance is the frame's
+/// `ramp_opacity` — which is what keeps classic's highlight disc byte-identical
+/// through this generalisation.
+fn ramp_peak(layers: &[Layer], frame: &Frame, env: &skin_schema::expr::Env) -> f64 {
+    layers
+        .iter()
+        .find_map(|layer| match &layer.kind {
+            LayerKind::HeadRamp {
+                opacity: Some(curve),
+                ..
+            } => Some(
+                curve
+                    .eval(&skin_schema::expr::Env { s: 0.0, ..*env })
+                    .clamp(0.0, 1.0),
+            ),
+            LayerKind::HeadRamp { opacity: None, .. } => Some(frame.ramp_opacity),
+            _ => None,
+        })
+        .unwrap_or(frame.ramp_opacity)
+}
+
 fn wave_offset(wave: GradientWave, distance: f64) -> f64 {
     let turns = distance / wave.cells_per_crest - wave.phase_turns;
     wave.amplitude * (turns * std::f64::consts::TAU).sin()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_gradient(
     source: &Source,
     stops: &[crate::skin::layer::Stop],
@@ -1438,14 +1706,27 @@ fn build_gradient(
     u1: f64,
     swatch: &Swatch,
     frame: &Frame,
+    binding_env: &skin_schema::expr::Env,
     config: &CompositeConfig,
 ) -> crate::skin::paint::Gradient {
     use crate::skin::paint::{Gradient, GradientStop};
     let resolved: Vec<GradientStop> = stops
         .iter()
         .map(|stop| GradientStop {
-            offset: stop.offset,
-            color: rgba_of(color(stop.color, swatch, frame, config), stop.alpha),
+            // Clamped because `addColorStop` throws outside 0..1 rather than
+            // clipping, and a bound offset is an author's arithmetic — the
+            // travelling shine in `specs/skin-layer-documents-prd.md` runs its
+            // crest off both ends of the span by design.
+            offset: stop
+                .offset
+                .get(&frame.params, binding_env, 0.0)
+                .clamp(0.0, 1.0),
+            color: rgba_of(
+                color(stop.color, swatch, config),
+                stop.alpha
+                    .get(&frame.params, binding_env, 1.0)
+                    .clamp(0.0, 1.0),
+            ),
         })
         .collect();
     match source {
@@ -1489,7 +1770,7 @@ fn rgba_of(hex: &str, alpha: f64) -> String {
 /// Convenience for building a span layer without spelling out every field.
 pub fn span_layer(id: &'static str, region: Region, span: Span, source: Source) -> Layer {
     Layer {
-        id,
+        id: std::borrow::Cow::Borrowed(id),
         region,
         clip: ClipShape::Silhouette,
         kind: LayerKind::Span {
@@ -1500,7 +1781,7 @@ pub fn span_layer(id: &'static str, region: Region, span: Span, source: Source) 
         transform: LayerTransform::default(),
         boost_only: false,
         omit_on_single_cell: false,
-        opacity_track: None,
+        opacity: Binding::ONE,
     }
 }
 
@@ -1517,6 +1798,8 @@ mod tests {
             label: "#ffffff".to_string(),
             swatch: "#3c8dde".to_string(),
             accent: "#3c8dde".to_string(),
+            // One entry so a fixture may name `ColorSlot::Literal(0)`.
+            extra: vec!["#ffffff".to_string()],
         };
         Frame {
             friendly: [swatch(), swatch()],
@@ -1525,15 +1808,13 @@ mod tests {
             ramp_opacity: 0.3,
             wave_phase_turns: 0.0,
             time_turns: 0.0,
-            layer_opacity: vec![1.0],
-            scalars: Vec::new(),
-            literals: vec!["#ffffff".to_string()],
+            params: vec![1.0],
         }
     }
 
     fn ribbon(id: &'static str, region: Region, extra: f64) -> Layer {
         Layer {
-            id,
+            id: std::borrow::Cow::Borrowed(id),
             region,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Ribbon {
@@ -1548,7 +1829,7 @@ mod tests {
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: false,
-            opacity_track: None,
+            opacity: Binding::ONE,
         }
     }
 
@@ -1584,8 +1865,7 @@ mod tests {
         let mut layer = ribbon("core", Region::Head, 0.0);
         layer.kind = LayerKind::HeadDisc {
             paint: DiscPaint::Slot(ColorSlot::HeadCore),
-            radius_ratio: 0.9,
-            radius_track: None,
+            radius: Binding::Const(0.9),
         };
         let problems = validate_layers(&[layer], &[frame()]);
         assert_eq!(problems.len(), 1, "{problems:?}");
@@ -1630,8 +1910,8 @@ mod tests {
                 color: ColorSlot::Fill,
                 period_cells: 3.0,
                 duty: 0.5,
-                half_width: 0.5,
-                t_center: 0.0,
+                half_width: Binding::Const(0.5),
+                t_center: Binding::ZERO,
                 phase_cells: 0.0,
                 alpha: alpha.map(|src| {
                     std::sync::Arc::new(skin_schema::expr::Expr::parse(src).expect("grammatical"))
@@ -1672,6 +1952,7 @@ mod tests {
                 cells,
                 cell_size: 10.0,
                 boost_active: false,
+                seed: 0.0,
                 anim_ms,
                 reduced_motion: false,
                 detail_scale: 1.0,
@@ -1743,6 +2024,7 @@ mod tests {
                     cells: &cells,
                     cell_size: 10.0,
                     boost_active: false,
+                    seed: 0.0,
                     anim_ms,
                     reduced_motion: false,
                     detail_scale: 1.0,
@@ -1768,8 +2050,8 @@ mod tests {
                 color: ColorSlot::Fill,
                 period_cells: 1.0,
                 duty: 0.5,
-                half_width,
-                t_center,
+                half_width: Binding::Const(half_width),
+                t_center: Binding::Const(t_center),
                 phase_cells,
                 alpha: None,
             },
@@ -1802,6 +2084,7 @@ mod tests {
                 cells,
                 cell_size: 10.0,
                 boost_active: false,
+                seed: 0.0,
                 anim_ms: 0.0,
                 reduced_motion: true,
                 detail_scale: 1.0,
@@ -1918,7 +2201,7 @@ mod tests {
             frames: None,
         };
         let image_layer = |id, from, natural, min, priority, fit| Layer {
-            id,
+            id: std::borrow::Cow::Borrowed(id),
             region: Region::Body,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Span {
@@ -1939,7 +2222,7 @@ mod tests {
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: false,
-            opacity_track: None,
+            opacity: Binding::ONE,
         };
 
         let layers = vec![
@@ -2451,6 +2734,7 @@ mod tests {
                 cells,
                 cell_size: 10.0,
                 boost_active: false,
+                seed: 0.0,
                 anim_ms,
                 reduced_motion: false,
                 detail_scale: 1.0,
@@ -2586,6 +2870,7 @@ mod tests {
                         cells: &body,
                         cell_size: 10.0,
                         boost_active: false,
+                        seed: 0.0,
                         anim_ms: ms,
                         reduced_motion: false,
                         detail_scale: 1.0,
@@ -2665,9 +2950,9 @@ mod tests {
         };
         let mut skin = sheet_skin(rows, Fit::Clip, Some(Fade::trailing(6.0, 4)), span, 0.0);
         // Half-opacity layer: `frame()` already carries one opacity track.
-        skin.layers[1].opacity_track = Some(0);
+        skin.layers[1].opacity = Binding::Param(0);
         for frame in &mut skin.frames {
-            frame.layer_opacity = vec![0.5];
+            frame.params = vec![0.5];
         }
 
         let (blits, _) = blits_with_alpha(&skin, &[(0.0, 0.0), (34.0, 0.0)], 0.0);
@@ -2863,17 +3148,18 @@ mod tests {
         // The head ramp keeps its full-cell reach: it is not a span, and
         // classic has painted it that way since before any of this existed.
         let ramp = Layer {
-            id: "head-ramp",
+            id: "head-ramp".into(),
             region: Region::Body,
             clip: ClipShape::Cells,
             kind: LayerKind::HeadRamp {
                 rgb: (255, 255, 255),
                 length_cells: 5.0,
+                opacity: None,
             },
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: true,
-            opacity_track: None,
+            opacity: Binding::ONE,
         };
         assert!(validate_layers(&[ramp], &[frame()]).is_empty());
     }
@@ -2883,7 +3169,7 @@ mod tests {
     #[test]
     fn spans_degrade_by_priority_then_disappear() {
         let head_art = |natural, min, priority| Layer {
-            id: "head-art",
+            id: "head-art".into(),
             region: Region::Body,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Span {
@@ -2899,15 +3185,15 @@ mod tests {
             transform: LayerTransform::default(),
             boost_only: false,
             omit_on_single_cell: false,
-            opacity_track: None,
+            opacity: Binding::ONE,
         };
         let mut tail_art = head_art(3.0, 1.0, 10);
-        tail_art.id = "tail-art";
+        tail_art.id = "tail-art".into();
         if let LayerKind::Span { span, .. } = &mut tail_art.kind {
             span.from = Anchor::Tail;
         }
         let mut middle = head_art(0.0, 1.0, 0);
-        middle.id = "middle";
+        middle.id = "middle".into();
         if let LayerKind::Span { span, .. } = &mut middle.kind {
             span.natural = None;
         }
