@@ -12,23 +12,22 @@ SnakeTron is a competitive online multiplayer Snake game — real-time matches, 
 
 ## Features
 
-- **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, Free-for-All, and private Custom games with configurable arena size, tick rate, food spawn rate, and player limits
-- **Matchmaking**: casual Quickmatch and ranked Competitive queues, plus lobbies with server-moderated chat and invite links
-- **Combos**: every food pickup restarts a one-second timer; keep the chain alive and successive pickups are worth +1, +1, +2, and then +3 each, in both points and snake length
-- **Boost**: hold-to-boost speed bursts fueled by Boost pads scattered around the arena (Solo gives you an unlimited tank to practice with)
-- **Accounts**: register/login with JWT auth, or play instantly as a guest
-- **Progression**: seasonal MMR with leaderboards (`/api/leaderboard`, `/api/seasons`), plus lifetime XP
-- **Server-controlled ads**: provider-neutral banner placements and a lobby-wide pre-match video barrier, disabled by default
-- **Netcode**: the game engine is shared between server and client, enabling client-side prediction with server authority
+- **Game modes**: Solo practice, Duel (1v1), 2v2 team matches, and Free-for-All.
+- **Matchmaking**: Quickmatch and competitive queues, plus lobbies with server-moderated chat and invite links.
+- **Combos**: Every food pickup restarts a one-second timer; keep the chain alive and successive pickups are worth +1, +1, +2, and then +3 each.
+- **Boost**: Hold space to boost. Use it to chain combos and get kills.
+- **Accounts**: Instant play as guest. Signup to rank up and equip skins.
+- **Progression**: Seasonal MMR with leaderboards, plus lifetime XP.
+- **Latency compensation**: The game engine is shared between server and client, enabling client-side prediction with server authority.
 
 ## Architecture
 
-- **Backend**: Rust server (Tokio + axum) serving the REST API and WebSocket connections on a single HTTP port
-- **Cluster coordination**: Redis (Valkey) — server membership and heartbeats, partition assignment with fenced leases, and Redis Streams as the game event/command bus. The server running a game's loop is not necessarily the WebSocket server its players are connected to.
-- **Persistence**: AWS DynamoDB — a single-table-style main table with GSIs, plus small auxiliary tables for username uniqueness and game codes; LocalStack stands in for it in local development
-- **Frontend**: React + TypeScript consuming a Rust game engine compiled to WebAssembly (wasm-pack), bundled with webpack
-- **Shared game logic**: the `common/` crate compiles to both native (server) and WASM (client)
-- **Infrastructure**: Docker containers, designed for AWS Fargate deployment
+- **Backend**: Rust server (Tokio + axum) serving the REST API and WebSocket connections.
+- **Cluster coordination**: Redis (Valkey) — server membership and heartbeats, partition assignment with fenced leases, and Redis Streams as the game event/command bus.
+- **Persistence**: AWS DynamoDB — a single-table-style main table with GSIs, plus small auxiliary tables for username uniqueness and game code.
+- **Frontend**: React + TypeScript consuming a Rust game engine compiled to WebAssembly.
+- **Shared game logic**: the `common/` crate compiles to both native (server) and WASM (client).
+- **Infrastructure**: Docker containers, designed for AWS Fargate deployment.
 
 ## Quick Start
 
@@ -113,7 +112,7 @@ npm run type-check  # TypeScript type check
 
 ### Code Quality
 
-PRs are welcome. CI requires clean formatting and a warning-free clippy pass on every PR (mirrored as a deploy gate):
+PRs are welcome. CI requires clean formatting and a warning-free clippy pass on every PR:
 
 ```bash
 cargo fmt --all -- --check
@@ -128,90 +127,9 @@ TypeScript types for everything crossing the WebSocket are generated from the Ru
 ./scripts/gen-types.sh
 ```
 
-### Advertisement Configuration
-
-See [the advertising design](docs/advertising-design.md) for the authority and
-lobby-state diagrams plus desktop, mobile, fallback, and admin screenshots.
-
-Advertisement capability is resolved by the server at startup and sent to each
-browser session. The browser reports which distribution build it is running
-(`web`, `crazygames`, or `itch`); the server maps that distribution to its
-configured provider and placements. Client build flags only make an SDK adapter
-available. Live pre-match authorization, distribution targeting, game-count
-eligibility, and frequency are stored in the versioned DynamoDB runtime config
-managed at `/admin`. Invalid deployment values fail server startup.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `SNAKETRON_ADS_ENABLED` | `false` | Deployment capability kill switch. When false, every placement is disabled regardless of runtime policy. |
-| `SNAKETRON_ADS_<DISTRIBUTION>_PROVIDER` | `none` | Adapter key for `WEB`, `CRAZYGAMES`, or `ITCH`. A `none` distribution stays ad-free even when the global switch is on. |
-| `SNAKETRON_ADS_<DISTRIBUTION>_BOTTOM_BANNER_ENABLED` | distribution enabled | Show the horizontal bottom placement for that distribution. |
-| `SNAKETRON_ADS_<DISTRIBUTION>_SIDE_BANNERS_ENABLED` | distribution enabled | Show desktop side placements for that distribution; mobile clients omit them. |
-| `SNAKETRON_ADS_<DISTRIBUTION>_PRE_MATCH_VIDEO_ENABLED` | distribution enabled | Let that distribution receive video during a lobby-wide break. |
-| `SNAKETRON_AD_BREAK_TIMEOUT_SECONDS` | `120` | Server safety deadline for the lobby barrier; valid range is 5–300 seconds. Providers skip submission unless enough lifecycle budget remains. |
-| `SNAKETRON_MATCHMAKING_QUEUE_LEASE_ENFORCEMENT` | `true` | Reject and reap queued generations after five minutes without a member heartbeat. Set this to `false` only during the first phase of an upgrade from a pre-v8 fleet. |
-
-For one server that serves the website, CrazyGames, and itch.io simultaneously:
-
-```bash
-SNAKETRON_ADS_ENABLED=true \
-SNAKETRON_ADS_WEB_PROVIDER=none \
-SNAKETRON_ADS_CRAZYGAMES_PROVIDER=crazygames \
-SNAKETRON_ADS_ITCH_PROVIDER=none \
-cargo run --bin server
-```
-
-Once a website H5 adapter is registered, set
-`SNAKETRON_ADS_WEB_PROVIDER` to its adapter key. itch.io can remain `none`
-without disabling ads for the other distributions. Placement switches may be
-set independently for each distribution after the global switch is on. The
-old scalar `SNAKETRON_ADS_PROVIDER` is intentionally unsupported because a
-shared server cannot route one provider correctly to every build.
-
-Pre-match video remains disabled until an administrator enables the runtime
-advertising master switch and the intended `web`, `crazygames`, or `itch`
-distribution toggles. That same record owns the 0–10,000 minimum-games
-threshold and the 1–1,440 minute per-user interval. Every lobby member must
-meet the game threshold; every targeted member must clear the durable interval
-or the whole lobby skips the break. Provider IDs and the break timeout remain
-deployment capabilities and cannot be enabled from the admin page.
-
-Distribution reporting is part of gameplay protocol v9. Older authentication
-payloads remain accepted, but receive a disabled ad configuration because the
-server cannot safely infer a build from an account or token. Keep the global
-switch off during a v9 client rollout; enable it only after the intended web
-and portal builds are reporting their distribution.
-
-Roll this protocol out in two phases. For an upgrade from a pre-v8 fleet, first
-deploy the protocol v9 binary to every gateway, matcher, and completion executor with
-`SNAKETRON_ADS_ENABLED=false` and
-`SNAKETRON_MATCHMAKING_QUEUE_LEASE_ENFORCEMENT=false`. New tasks still write
-and refresh queue leases, while mixed-fleet matchers continue accepting legacy
-queue records. Pause new matchmaking admissions for the cutover, let the queue
-drain to zero, and drain every old task and connection; a pre-v8 admission
-retry cannot observe the v8 cancellation fence. Then set queue-lease
-enforcement to `true` and optionally enable ads in the second configuration
-rollout. Fresh deployments should retain the `true` default.
-Older binaries cannot participate in the v8 lobby fence or completion counter;
-the disabled-by-default first phase makes any rollout-window undercount
-conservative (players skip ads longer) rather than exposing a newcomer.
-`gamesPlayed` has an explicit v8 baseline: existing rows without the attribute
-are treated as zero, and completions whose legacy idempotency effect already
-won during the mixed-fleet phase are not replayed. After every completion
-executor is on the new binary, each new completion advances the durable counter exactly
-once. This intentionally requires historical players to complete the configured
-number of post-rollout games before becoming eligible; no historical totals are
-guessed or backfilled.
-
 ### Game Replays
 
-The terminal viewer can still play the sample `.replay` captures in `replays/`:
-
-```bash
-cargo run --bin snaketron -- replays/
-```
-
-Production matches now also create a versioned deterministic `GameRecordingV1`.
+Replays of production matches now also create a versioned deterministic `GameRecordingV1`.
 The completion outbox uploads its canonical gzip to private S3, stores verified
 replay metadata plus the server-selected Play of the Game in DynamoDB, and
 serves public reads through a bounded Valkey/ElastiCache cache-aside layer.
@@ -221,6 +139,13 @@ server-attested and deliberately excluded; `SNAKETRON_TEST_MODE` also disables
 recording for the entire test process.
 See `server/README.md` for storage variables, public endpoints, and the
 LocalStack integration test.
+
+#### CLI
+The terminal viewer can play the sample captures in `replays/`:
+
+```bash
+cargo run --bin snaketron -- replays/
+```
 
 The bot CLI must present the server's configured stress key so test users do
 not contaminate production replay storage:
