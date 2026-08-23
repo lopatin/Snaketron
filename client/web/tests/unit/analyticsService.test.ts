@@ -32,6 +32,10 @@ const recorder = () => {
       `design(${id}${value === undefined ? '' : `,${value}`})`,
     ),
     addErrorEvent: (severity, message) => calls.push(`error(${severity},${message})`),
+    addAdEvent: (a, t, sdkName, placement) => calls.push(`ad(${a},${t},${sdkName},${placement})`),
+    addAdEventWithNoAdReason: (a, t, sdkName, placement, reason) => calls.push(
+      `ad(${a},${t},${sdkName},${placement},reason=${reason})`,
+    ),
   };
   return { sdk, calls, loads: 0 };
 };
@@ -367,6 +371,43 @@ test('an operator signing in stops submission and is remembered', async () => {
   analytics.trackMatchStart(duel, 'Competitive');
   analytics.trackDeath('Wall', duel);
   assert.deepEqual(rec.calls, ['submission(false)'], 'nothing reports after exclusion');
+});
+
+test('ad breaks report a show or a typed failure', async () => {
+  const { rec, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
+  rec.calls.length = 0;
+
+  analytics.trackAdBreak('completed', 'crazygames', 'pre_match');
+  analytics.trackAdBreak('unavailable', 'crazygames', 'pre_match');
+  analytics.trackAdBreak('blocked', 'crazygames', 'pre_match');
+
+  assert.deepEqual(rec.calls, [
+    'ad(2,4,crazygames,pre_match)',
+    'ad(3,4,crazygames,pre_match,reason=3)',
+    'ad(3,4,crazygames,pre_match,reason=1)',
+  ]);
+});
+
+/**
+ * A render or reconnect loop raises the same error every frame. The SDK does
+ * not rate-limit error events, so an unbounded handler would spend the
+ * player's bandwidth and bury the dashboard under one repeated line.
+ */
+test('errors are deduplicated and capped per session', async () => {
+  const { rec, resolveUserId } = harness();
+  await analytics.start({ consent: async () => counts, resolveUserId });
+  rec.calls.length = 0;
+
+  for (let i = 0; i < 50; i += 1) {
+    analytics.trackError('error', 'the same failing frame');
+  }
+  assert.deepEqual(rec.calls, ['error(4,the same failing frame)'], 'a loop costs one event');
+
+  for (let i = 0; i < 50; i += 1) {
+    analytics.trackError('error', `distinct failure ${i}`);
+  }
+  assert.equal(rec.calls.length, 10, 'and a broken build cannot exceed the session cap');
 });
 
 test('an SDK that throws is contained rather than breaking the caller', async () => {

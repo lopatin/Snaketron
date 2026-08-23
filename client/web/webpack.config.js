@@ -26,24 +26,24 @@ const isEmbeddedBuild = isItchBuild || isCrazyGamesBuild;
 // CrazyGames publishes an analytics partner of its own. Portal traffic is the
 // larger audience, so excluding it would hide most of the players.
 //
-// GAMEANALYTICS_DISABLE_EMBEDDED=true takes it back out of the reviewed
+// GAME_ANALYTICS_DISABLE_EMBEDDED=true takes it back out of the reviewed
 // release packages, for a portal whose policy changes or a submission that
 // needs to carry no third-party SDK at all. Defaults to off.
-const disableEmbeddedAnalytics = process.env.GAMEANALYTICS_DISABLE_EMBEDDED === 'true';
+const disableEmbeddedAnalytics = process.env.GAME_ANALYTICS_DISABLE_EMBEDDED === 'true';
 const analyticsExcludedFromBuild = isEmbeddedBuild && disableEmbeddedAnalytics;
 
 // When excluded, the keys are dropped rather than merely left unused: the
 // artifact must not even contain them.
 const gameAnalyticsGameKey = analyticsExcludedFromBuild
   ? ''
-  : (process.env.GAMEANALYTICS_GAME_KEY || '');
+  : (process.env.GAME_ANALYTICS_GAME_KEY || '');
 const gameAnalyticsSecretKey = analyticsExcludedFromBuild
   ? ''
-  : (process.env.GAMEANALYTICS_SECRET_KEY || '');
+  : (process.env.GAME_ANALYTICS_SECRET_KEY || '');
 
 if (!analyticsExcludedFromBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gameAnalyticsSecretKey)) {
   throw new Error(
-    'GAMEANALYTICS_GAME_KEY and GAMEANALYTICS_SECRET_KEY must be set together: '
+    'GAME_ANALYTICS_GAME_KEY and GAME_ANALYTICS_SECRET_KEY must be set together: '
     + 'GameAnalytics signs every request with the secret, so half a pair would '
     + 'fail every call at runtime instead of staying inert.',
   );
@@ -54,8 +54,8 @@ if (!analyticsExcludedFromBuild && Boolean(gameAnalyticsGameKey) !== Boolean(gam
 // the keys are compiled in, a mistyped one would otherwise produce a release
 // that looks correct and reports nothing at all. Fail the build instead.
 const gameAnalyticsKeyShapes = [
-  ['GAMEANALYTICS_GAME_KEY', gameAnalyticsGameKey, /^[A-Za-z0-9]{32}$/, 32],
-  ['GAMEANALYTICS_SECRET_KEY', gameAnalyticsSecretKey, /^[A-Za-z0-9]{40}$/, 40],
+  ['GAME_ANALYTICS_GAME_KEY', gameAnalyticsGameKey, /^[A-Za-z0-9]{32}$/, 32],
+  ['GAME_ANALYTICS_SECRET_KEY', gameAnalyticsSecretKey, /^[A-Za-z0-9]{40}$/, 40],
 ];
 for (const [name, value, shape, length] of gameAnalyticsKeyShapes) {
   if (value && !shape.test(value)) {
@@ -159,10 +159,10 @@ module.exports = {
       // GameAnalytics keys are compiled in, not fetched, so a bundle either
       // reports or provably cannot. A checkout without them — every developer
       // machine, CI, and any fork — never loads the SDK. See ANALYTICS.md.
-      'process.env.GAMEANALYTICS_GAME_KEY': JSON.stringify(gameAnalyticsGameKey),
-      'process.env.GAMEANALYTICS_SECRET_KEY': JSON.stringify(gameAnalyticsSecretKey),
-      'process.env.GAMEANALYTICS_BUILD': JSON.stringify(process.env.GAMEANALYTICS_BUILD || ''),
-      'process.env.GAMEANALYTICS_DISABLE_EMBEDDED': JSON.stringify(
+      'process.env.GAME_ANALYTICS_GAME_KEY': JSON.stringify(gameAnalyticsGameKey),
+      'process.env.GAME_ANALYTICS_SECRET_KEY': JSON.stringify(gameAnalyticsSecretKey),
+      'process.env.GAME_ANALYTICS_BUILD': JSON.stringify(process.env.GAME_ANALYTICS_BUILD || ''),
+      'process.env.GAME_ANALYTICS_DISABLE_EMBEDDED': JSON.stringify(
         disableEmbeddedAnalytics ? 'true' : '',
       ),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development')

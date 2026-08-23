@@ -29,6 +29,25 @@ if (!isScenarioCaptureMode()) {
   });
 }
 
+// A crash the player sees is invisible in every gameplay funnel: the session
+// simply stops producing events. These two handlers are the only place the
+// client can say *why*. Reporting is deduplicated and capped per session, so a
+// render loop raising the same error every frame costs one event.
+window.addEventListener('error', (event) => {
+  const detail = event.error instanceof Error
+    ? `${event.error.name}: ${event.error.message}`
+    : event.message;
+  analytics.trackError('error', `uncaught: ${detail}`);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const reason: unknown = event.reason;
+  const detail = reason instanceof Error
+    ? `${reason.name}: ${reason.message}`
+    : String(reason);
+  analytics.trackError('error', `unhandled-rejection: ${detail}`);
+});
+
 // Kick off WASM initialization; consumers await initWasm()/read getWasm().
 initWasm()
   .catch(error => {

@@ -7,6 +7,7 @@
  * so it lives apart from the transport that sends it.
  */
 
+import type { AdBreakResolution } from '../../types/generated/AdBreakResolution';
 import type { DeathCause } from '../../types/generated/DeathCause';
 import type { GameState } from '../../types/generated/GameState';
 import type { GameType } from '../../types/generated/GameType';
@@ -174,6 +175,48 @@ export const queueIntentEvents = (message: unknown): QueueIntentEvent[] => {
   }
 
   return [];
+};
+
+/**
+ * A finished advertisement break, in GameAnalytics' vocabulary.
+ *
+ * `action` and `noAdReason` mirror the SDK's `EGAAdAction` and `EGAAdError`
+ * enums. The numbers live in the transport; this stays a pure mapping so the
+ * translation from Snaketron's own outcomes is pinned by tests.
+ */
+export type AdAction = 'show' | 'failedShow';
+export type NoAdReason = 'noFill' | 'internalError' | 'offline' | 'unknown';
+
+export interface AdBreakEvent {
+  action: AdAction;
+  /** Only meaningful for a failed show; `null` when the ad played. */
+  noAdReason: NoAdReason | null;
+}
+
+/**
+ * Translate a Snaketron ad-break resolution into a GameAnalytics ad event.
+ *
+ * Every outcome is reported, not just the successful one: fill rate and the
+ * reasons behind a miss are the whole point of the ad funnel, and a break that
+ * silently failed looks identical to one that never happened.
+ */
+export const adBreakEvent = (resolution: AdBreakResolution): AdBreakEvent => {
+  switch (resolution) {
+    case 'completed':
+      return { action: 'show', noAdReason: null };
+    case 'unavailable':
+      // The provider had nothing to show, which is GameAnalytics' "no fill".
+      return { action: 'failedShow', noAdReason: 'noFill' };
+    case 'error':
+      return { action: 'failedShow', noAdReason: 'internalError' };
+    case 'blocked':
+    case 'timed_out':
+    default:
+      // An ad blocker and a missed deadline are both "we could not show it and
+      // the network never told us why". GameAnalytics has no closer reason,
+      // and inventing one would misreport fill rate.
+      return { action: 'failedShow', noAdReason: 'unknown' };
+  }
 };
 
 /** Whether the local player won the match they just finished. */

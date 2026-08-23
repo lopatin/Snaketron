@@ -38,11 +38,14 @@ import {
 import {
   buildEventId,
   buildMatchResultEvent,
+  sanitizeEventPart,
   deathCauseSlug,
   gameTypeSlug,
   matchProgression,
+  adBreakEvent,
   type LocalMatchSummary,
 } from './events.ts';
+import type { AdBreakResolution } from '../../types/generated/AdBreakResolution';
 import type { AnalyticsConsent } from '../../types/generated/AnalyticsConsent';
 import type { DeathCause } from '../../types/generated/DeathCause';
 import type { GameState } from '../../types/generated/GameState';
@@ -53,6 +56,16 @@ import type { QueueMode } from '../../types/generated/QueueMode';
 const PROGRESSION_START = 1;
 const PROGRESSION_COMPLETE = 2;
 const PROGRESSION_FAIL = 3;
+
+/** Mirrors GameAnalytics' `EGAAdAction`, `EGAAdType`, and `EGAAdError`. */
+const AD_ACTION = { show: 2, failedShow: 3 } as const;
+const AD_TYPE_INTERSTITIAL = 4;
+const NO_AD_REASON = {
+  unknown: 1,
+  offline: 2,
+  noFill: 3,
+  internalError: 4,
+} as const;
 
 /** Mirrors GameAnalytics' `EGAErrorSeverity`. */
 export const ERROR_SEVERITY = {
@@ -91,6 +104,14 @@ export interface GameAnalyticsSdk {
   ): void;
   addDesignEvent(eventId: string, value?: number): void;
   addErrorEvent(severity: number, message: string): void;
+  addAdEvent(action: number, adType: number, sdkName: string, placement: string): void;
+  addAdEventWithNoAdReason(
+    action: number,
+    adType: number,
+    sdkName: string,
+    placement: string,
+    noAdReason: number,
+  ): void;
 }
 
 export type SdkLoader = () => Promise<GameAnalyticsSdk>;
@@ -132,6 +153,13 @@ const errorMessage = (error: unknown): string => (
  */
 const MAX_QUEUED_EVENTS = 32;
 
+/**
+ * Distinct error messages reported per page session. A loop repeats one
+ * message; a genuinely broken build produces a handful. Ten is generous for
+ * the second and cheap for the first.
+ */
+const MAX_ERRORS_PER_SESSION = 10;
+
 type QueuedEvent = (sdk: GameAnalyticsSdk) => void;
 
 class GameAnalyticsService {
@@ -149,6 +177,9 @@ class GameAnalyticsService {
    * queue, must not report a result either.
    */
   private openProgression: string | null = null;
+
+  /** Error messages already reported, so a loop cannot flood the session. */
+  private reportedErrors = new Set<string>();
 
   /**
    * The Snaketron user id, once known. Kept so that an identity learned before
@@ -527,10 +558,60 @@ class GameAnalyticsService {
     }
   };
 
+  /**
+   * Report the outcome of one advertisement break.
+   *
+   * Every outcome is sent, not only the ad that played: fill rate and the
+   * reasons behind a miss are what the ad funnel is for, and a break that
+   * silently failed is indistinguishable from one that never ran.
+   */
+  trackAdBreak = (
+    resolution: AdBreakResolution,
+    providerId: string,
+    placement: string,
+  ): void => {
+    const sdkName = sanitizeEventPart(providerId);
+    const adPlacement = sanitizeEventPart(placement);
+    if (!sdkName || !adPlacement) {
+      return;
+    }
+
+    const { action, noAdReason } = adBreakEvent(resolution);
+    if (noAdReason === null) {
+      this.emit((sdk) => sdk.addAdEvent(
+        AD_ACTION[action],
+        AD_TYPE_INTERSTITIAL,
+        sdkName,
+        adPlacement,
+      ));
+      return;
+    }
+    this.emit((sdk) => sdk.addAdEventWithNoAdReason(
+      AD_ACTION[action],
+      AD_TYPE_INTERSTITIAL,
+      sdkName,
+      adPlacement,
+      NO_AD_REASON[noAdReason],
+    ));
+  };
+
+  /**
+   * Report a client failure.
+   *
+   * Deduplicated and capped per page session. A render or reconnect loop can
+   * raise the same error every frame, and the SDK does not rate-limit error
+   * events — an unbounded handler would spend the player's bandwidth and bury
+   * the dashboard in one repeated line. The first occurrence is what carries
+   * the diagnostic value.
+   */
   trackError = (severity: ErrorSeverity, message: string): void => {
     // GameAnalytics truncates a long message server-side; trimming here keeps
     // the dashboard's grouping stable instead of dependent on stack length.
     const trimmed = message.slice(0, 8_192);
+    if (this.reportedErrors.has(trimmed) || this.reportedErrors.size >= MAX_ERRORS_PER_SESSION) {
+      return;
+    }
+    this.reportedErrors.add(trimmed);
     this.emit((sdk) => sdk.addErrorEvent(ERROR_SEVERITY[severity], trimmed));
   };
 
@@ -551,6 +632,7 @@ class GameAnalyticsService {
     this.inputDimension = null;
     this.openProgression = null;
     this.playerId = null;
+    this.reportedErrors.clear();
     this.consentLoader = null;
     this.userIdResolver = null;
     this.sdkLoader = overrides.sdkLoader ?? loadRealSdk;

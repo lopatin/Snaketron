@@ -12,11 +12,12 @@ The game key and secret come from the GameAnalytics dashboard
 `DefinePlugin`:
 
 ```bash
-GAMEANALYTICS_GAME_KEY=<game key> \
-GAMEANALYTICS_SECRET_KEY=<secret key> \
-GAMEANALYTICS_BUILD=web-1.4.0 \
-npm run build:prod
+GAME_ANALYTICS_BUILD=web-1.4.0 npm run build:prod
 ```
+
+`GAME_ANALYTICS_GAME_KEY` and `GAME_ANALYTICS_SECRET_KEY` are exported from the
+release owner's shell profile, so an interactive build picks them up with no
+further setup. CI and deploy workflows must supply them explicitly.
 
 The game key is exactly 32 alphanumeric characters and the secret exactly 40.
 The SDK refuses to initialize on any other shape — it logs and returns, with no
@@ -28,7 +29,7 @@ payloads with it in the browser, so it is readable by anyone who opens the
 bundle. Treat it as a public per-game identifier, not a secret to protect, and
 rotate it in the dashboard if it is ever abused.
 
-`GAMEANALYTICS_BUILD` is the version label attached to every event, so a
+`GAME_ANALYTICS_BUILD` is the version label attached to every event, so a
 regression can be traced to the release that introduced it. It defaults to
 `0.0.0`.
 
@@ -55,7 +56,7 @@ To take analytics back out of the reviewed release packages, for a portal whose
 policy changes or a submission that must carry no third-party SDK:
 
 ```bash
-GAMEANALYTICS_DISABLE_EMBEDDED=true CRAZYGAMES_BUILD=true npm run build:prod
+GAME_ANALYTICS_DISABLE_EMBEDDED=true CRAZYGAMES_BUILD=true npm run build:prod
 ```
 
 That blanks the keys *and* aliases `gameanalytics` to an empty module, because
@@ -209,11 +210,65 @@ match:death:<cause>:<mode>      cause ∈ wall, out-of-bounds, enemy-base,
 match:duration:<mode>           value = match length in seconds
 ```
 
+**Ad events** — one per pre-match break, for every outcome. Fill rate is only
+meaningful when the misses are counted, and a break that silently failed is
+otherwise indistinguishable from one that never ran.
+
+| Snaketron resolution | GameAnalytics |
+| --- | --- |
+| `completed` | Show |
+| `unavailable` | FailedShow, `no_fill` |
+| `error` | FailedShow, `internal_error` |
+| `blocked` (ad blocker), `timed_out` | FailedShow, `unknown` |
+
+Reported as an interstitial at placement `pre_match`, with the provider id as
+the ad SDK name.
+
+**Error events** — genuine client failures: a failed WASM initialization,
+uncaught exceptions, and unhandled promise rejections. A crash is invisible in
+every gameplay funnel, because the session simply stops producing events;
+these are the only place the client can say why.
+
+Deduplicated and capped at 10 distinct messages per page session. The SDK does
+not rate-limit error events, so a render or reconnect loop raising the same
+error every frame would otherwise spend the player's bandwidth and bury the
+dashboard under one repeated line.
+
 Death causes drop the killer's snake id: it is per-match and would make the
 dimension unbounded without answering "how do players die".
 
 **Error events** — only genuine client failures that are invisible in gameplay
 funnels, currently a failed WASM initialization.
+
+## What is deliberately not reported
+
+**Business events** are for in-app purchases. Snaketron has none — IAP is
+invite-only on CrazyGames via Xsolla and is not integrated. When it is, a
+business event belongs beside the purchase, paired with a resource event.
+
+**Resource events** model a virtual economy — currency earned and spent.
+Snaketron's closest analogues are Boost fuel and XP. Both are candidates, but
+neither is a currency the player chooses to spend against alternatives, which
+is what the sink/source metrics are built to compare. Worth adding if a shop or
+a spendable currency ever ships.
+
+**Server-side events do not go to GameAnalytics, by design.** Snaketron already
+has a first-party server analytics pipeline (`server/src/analytics/`) that
+records session, connection, lobby, queue, game, and per-player result events
+into Iceberg tables — strictly more detail than GameAnalytics would hold, and
+queryable with SQL.
+
+Bridging those into GameAnalytics would actively damage the metrics
+GameAnalytics is good at. Its model is client-session-centric: every event
+needs a `session_id`, and server-synthesized sessions would inflate session
+counts, depress average session length, and distort DAU and retention — the
+exact figures the integration exists to provide. The two systems are kept to
+what each does best: GameAnalytics for player-behaviour dashboards, the
+first-party lake for authoritative gameplay records.
+
+If a server-side GameAnalytics stream is ever wanted anyway, point it at a
+*separate* GameAnalytics game key so it cannot contaminate the player-facing
+one, and expect to synthesize session annotations for every event.
 
 ## Code map
 

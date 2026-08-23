@@ -14,6 +14,7 @@ import type {
 } from '../types';
 import { AdBreakResolutionOutbox } from '../services/ads/adBreakOutbox';
 import { resolveAdAttemptBeforeDeadline } from '../services/ads/adBreakCoordinator';
+import { analytics } from '../services/analytics';
 import { createAdProvider } from '../services/ads/providerFactory';
 import type { AdProvider, AdProviderCapabilities } from '../services/ads/types';
 import { getServerClockOffsetMs } from '../utils/clockSync';
@@ -206,6 +207,12 @@ export const AdsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     void resolveBreak().then((resolution) => {
+      // Reported for every outcome, before any of the lobby bookkeeping below
+      // can return early: fill rate is only meaningful if the misses are
+      // counted too, and a break resolved for a player who already answered
+      // still consumed an ad opportunity.
+      analytics.trackAdBreak(resolution, provider.id, 'pre_match');
+
       const latestBreak = activeBreakRef.current;
       if (!latestBreak || latestBreak.id !== breakId) {
         return;

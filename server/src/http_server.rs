@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::ads::AdsConfig;
 use crate::api::admin;
-use crate::api::analytics;
+use crate::api::analytics_consent;
 use crate::api::auth::{self, AuthState};
 use crate::api::crazygames;
 use crate::api::games as public_games;
@@ -598,7 +598,7 @@ pub async fn install_http_application(
         // network, so it deliberately does not live on /api/config.
         .route(
             "/api/analytics/consent",
-            get(analytics::get_analytics_consent),
+            get(analytics_consent::get_analytics_consent),
         )
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))

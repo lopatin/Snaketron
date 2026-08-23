@@ -30,7 +30,7 @@ export interface AnalyticsBuildConfig {
  * publishes an analytics partner of its own. Portal traffic is the larger
  * audience, so excluding it would hide most of the players.
  *
- * `GAMEANALYTICS_DISABLE_EMBEDDED=true` takes it back out of the reviewed
+ * `GAME_ANALYTICS_DISABLE_EMBEDDED=true` takes it back out of the reviewed
  * release packages without touching the ordinary website build — for a portal
  * whose policy changes, or a submission that must carry no third-party SDK.
  * The website build is never affected by that switch.
@@ -42,7 +42,7 @@ export const resolveEmbeddedAnalyticsSupport = (input: {
 
 export const ANALYTICS_SUPPORTED_DISTRIBUTION = resolveEmbeddedAnalyticsSupport({
   distribution: CLIENT_DISTRIBUTION,
-  disableEmbedded: process.env.GAMEANALYTICS_DISABLE_EMBEDDED === 'true',
+  disableEmbedded: process.env.GAME_ANALYTICS_DISABLE_EMBEDDED === 'true',
 });
 
 const readKey = (value: string | undefined): string => (value ?? '').trim();
@@ -73,9 +73,9 @@ export const resolveAnalyticsBuildConfig = (
 };
 
 export const ANALYTICS_BUILD_CONFIG = resolveAnalyticsBuildConfig(
-  process.env.GAMEANALYTICS_GAME_KEY,
-  process.env.GAMEANALYTICS_SECRET_KEY,
-  process.env.GAMEANALYTICS_BUILD,
+  process.env.GAME_ANALYTICS_GAME_KEY,
+  process.env.GAME_ANALYTICS_SECRET_KEY,
+  process.env.GAME_ANALYTICS_BUILD,
 );
 
 /**

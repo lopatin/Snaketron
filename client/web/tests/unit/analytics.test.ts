@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  adBreakEvent,
   buildEventId,
   buildMatchResultEvent,
   deathCauseSlug,
@@ -169,6 +170,27 @@ test('both GameAnalytics keys are required for a bundle to be configured', () =>
     { gameKey: 'key', secretKey: 'secret', build: '0.0.0' },
     'an unlabelled build still reports, under a placeholder version',
   );
+});
+
+/**
+ * Fill rate is only meaningful if the misses are counted, so every resolution
+ * maps to an event — a break that silently failed must not look identical to
+ * one that never ran.
+ */
+test('every ad break outcome maps to a GameAnalytics ad event', () => {
+  assert.deepEqual(adBreakEvent('completed'), { action: 'show', noAdReason: null });
+  assert.deepEqual(adBreakEvent('unavailable'), {
+    action: 'failedShow',
+    noAdReason: 'noFill',
+  });
+  assert.deepEqual(adBreakEvent('error'), {
+    action: 'failedShow',
+    noAdReason: 'internalError',
+  });
+  // An ad blocker and a missed deadline are both "could not show, no reason
+  // given". Inventing a closer reason would misreport fill rate.
+  assert.deepEqual(adBreakEvent('blocked'), { action: 'failedShow', noAdReason: 'unknown' });
+  assert.deepEqual(adBreakEvent('timed_out'), { action: 'failedShow', noAdReason: 'unknown' });
 });
 
 // --- event taxonomy -------------------------------------------------------

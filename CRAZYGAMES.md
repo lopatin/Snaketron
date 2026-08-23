@@ -215,7 +215,7 @@ The script fails unless all of these package checks pass:
   arbitrary third-party script, not about analytics as such: the GameAnalytics
   SDK *is* permitted and ships by default, because CrazyGames allows
   third-party game analytics and publishes an analytics partner of its own.
-  `GAMEANALYTICS_DISABLE_EMBEDDED=true` removes it from the package if that
+  `GAME_ANALYTICS_DISABLE_EMBEDDED=true` removes it from the package if that
   ever changes. See [ANALYTICS.md](./ANALYTICS.md);
 - the bundle contains at most 1,500 files and no more than exactly 250,000,000
   extracted bytes (the portal's decimal-byte ceiling);
