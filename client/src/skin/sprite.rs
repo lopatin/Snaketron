@@ -667,6 +667,7 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
             fit: if recipe.wear.repeat {
                 Fit::Tile {
                     cells_per_repeat: Some(cells),
+                    phase_origin: crate::skin::layer::TilePhaseOrigin::Head,
                 }
             } else {
                 Fit::Cutout {
@@ -675,6 +676,8 @@ fn compile_with(recipe: &'static Recipe, tuning: Tuning) -> CompositeSkin {
             },
             fade: recipe.wear.fade,
             drift_cells: tuning.drift_cells,
+            raster_overhang_px: 0,
+            raster_texels_per_cell: 0,
         },
     );
     // A one-cell snake is a disc with a head core on it; a fragment of sheet on
@@ -966,9 +969,12 @@ mod tests {
                     region: 0,
                     fit: Fit::Tile {
                         cells_per_repeat: Some(20.0),
+                        phase_origin: crate::skin::layer::TilePhaseOrigin::Head,
                     },
                     fade: None,
                     drift_cells: 0.0,
+                    raster_overhang_px: 0,
+                    raster_texels_per_cell: 0,
                 },
             )
         };

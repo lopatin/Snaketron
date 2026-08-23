@@ -634,11 +634,24 @@ pub(crate) fn roster_snake_layout_for(
     height: f64,
     boost_active: bool,
 ) -> RosterSnakeLayout {
-    let outline_extra = skin.metrics(boost_active).overhang_px * 2.0;
-    let max_cell = (height - outline_extra).max(1.0);
-    let available = (width - outline_extra).max(max_cell);
+    let metrics = skin.metrics(boost_active);
+    // Legacy/vector skins have an absolute-pixel contour and keep their exact
+    // arithmetic. A raster margin is proportional to the live cell, so solve
+    // the two layout constraints against the actual cell instead of reserving
+    // its authored 4px cap around a 5px arena-scale body.
+    let max_cell = if metrics.raster_overhang_px == 0 {
+        (height - metrics.overhang_px * 2.0).max(1.0)
+    } else {
+        largest_cell_that_fits(height, 1, metrics)
+    };
+    let max_overhang = metrics.visible_overhang_px(max_cell);
+    let available = (width - max_overhang * 2.0).max(max_cell);
     let cells = ((available / max_cell).round().max(2.0) as usize).max(2);
-    let cell_size = max_cell.min(available / cells as f64);
+    let cell_size = if metrics.raster_overhang_px == 0 {
+        max_cell.min(available / cells as f64)
+    } else {
+        max_cell.min(largest_cell_that_fits(width, cells, metrics))
+    };
     let span = cell_size * cells as f64;
 
     RosterSnakeLayout {
@@ -647,6 +660,21 @@ pub(crate) fn roster_snake_layout_for(
         offset_x: (width - span) / 2.0,
         offset_y: (height - cell_size) / 2.0,
     }
+}
+
+fn largest_cell_that_fits(extent: f64, cells: usize, metrics: crate::skin::SkinMetrics) -> f64 {
+    let mut low = 0.0;
+    let mut high = extent.max(1.0);
+    for _ in 0..64 {
+        let mid = (low + high) / 2.0;
+        let used = mid * cells as f64 + metrics.visible_overhang_px(mid) * 2.0;
+        if used <= extent {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low.max(f64::EPSILON)
 }
 
 /// Anchor the name to the head. It begins (or ends) just clear of the dark head
@@ -1242,7 +1270,7 @@ pub fn skin_fixture_bounds(
     let overhang = skin_registry()
         .resolve(Some(skin_ref))
         .metrics(boost_active)
-        .overhang_px;
+        .visible_overhang_px(cell_size);
     let min_x = fixture.cells.iter().map(|c| c.0).fold(f64::MAX, f64::min) * cell_size;
     let min_y = fixture.cells.iter().map(|c| c.1).fold(f64::MAX, f64::min) * cell_size;
     let max_x = fixture.cells.iter().map(|c| c.0).fold(f64::MIN, f64::max) * cell_size + cell_size;
@@ -1357,6 +1385,40 @@ pub fn skin_perf_smoke(
 #[wasm_bindgen(js_name = skinAssetsPending)]
 pub fn skin_assets_pending() -> bool {
     crate::skin::atlas::any_pending()
+}
+
+/// Browser evidence for requested skin pixels.
+///
+/// Capture tooling uses this after `skinAssetsPending` settles: a failed image
+/// is not "ready", and a decoded image is not evidence until at least one real
+/// canvas draw completed. Returning both states keeps screenshots from quietly
+/// approving the procedural fallback after a 404 or a slow decode.
+#[wasm_bindgen(js_name = skinAssetsStatus)]
+pub fn skin_assets_status() -> Result<String, JsValue> {
+    serde_json::to_string(&crate::skin::atlas::asset_status())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Browser evidence for one resolved skin's requested pixels only.
+///
+/// The process-wide status above remains useful to contact-sheet captures.
+/// Review needs a narrower authority: one failed texture on another card must
+/// not disable publishing this exact document, and a successful paint must
+/// advance this skin's own draw counter.
+#[wasm_bindgen(js_name = skinAssetStatus)]
+pub fn skin_asset_status(skin_ref: &str) -> Result<String, JsValue> {
+    serde_json::to_string(&skin_registry().resolve(Some(skin_ref)).asset_status())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Whether one resolved skin still has a requested texture in flight.
+#[wasm_bindgen(js_name = skinAssetPending)]
+pub fn skin_asset_pending(skin_ref: &str) -> bool {
+    skin_registry()
+        .resolve(Some(skin_ref))
+        .asset_status()
+        .pending
+        > 0
 }
 
 /// The skins this build can render.
@@ -2373,6 +2435,10 @@ pub fn render_game_state(
                 reduced_motion,
                 detail_scale: crate::skin::arena_detail_scale(cell_size),
             };
+            // Bounded skin bleed is ordinary visual paint: it may cross a
+            // neighboring logical cell, and later snakes naturally paint on
+            // top. Its extent is constrained by the skin clip, not by a
+            // foreign-cell ownership mask.
             paint_alive_with_occlusion(
                 &mut PaintCtx::web(&ctx),
                 skin,
@@ -2405,7 +2471,10 @@ pub fn render_game_state(
                         anchor.run_is_horizontal,
                         rotation_int,
                     ),
-                    across_body_bleed_px: skin.metrics(snake.boost().active).overhang_px * 2.0,
+                    across_body_bleed_px: skin
+                        .metrics(snake.boost().active)
+                        .visible_overhang_px(cell_size)
+                        * 2.0,
                     ink: colors.label,
                 });
             }

@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "request_id": "request_replace_me",
+  "asset_index": 0,
+  "texture_name": "texture_replace_me",
+  "capability_role": "image_generator",
+  "operation": "generate",
+  "kind": "sheet",
+  "input_artifacts": [],
+  "modifier": {
+    "logical_key": "body_motion",
+    "component_key": "B1",
+    "provenance_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "license_id": "owned-original",
+    "authorized_lineage_ids": ["concept_replace_me"]
+  },
+  "prompt": "Production-quality art in one confident style; describe exact snake-space grid, mark scale, transparency, required seamless axes, and exclusions. For a sheet, each row is one full frame with no gutters and row zero is a complete resting pose.",
+  "width_px": 640,
+  "height_px": 1152,
+  "grid": {
+    "body_columns": 40,
+    "frame_rows": 48,
+    "texels_per_cell": 16,
+    "raster_overhang_px": 4,
+    "row_texels": 24
+  },
+  "required_wrap_axes": ["x", "y"],
+  "tile_phase_origin": "head",
+  "transparency": "allowed",
+  "row_zero": "resting_and_reduced_motion",
+  "edge_contract": {
+    "transverse_policy": "fail_closed_transparent_effect",
+    "no_frame_or_repeat_gutters": true
+  },
+  "retention": {
+    "retain_inputs": true,
+    "retain_provider_output": true,
+    "retain_forged_output": true
+  },
+  "repair": {
+    "method": "none",
+    "mask_artifact": null
+  }
+}

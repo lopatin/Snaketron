@@ -42,6 +42,43 @@ impl SkinKind {
     }
 }
 
+/// Which lifecycle a stored skin belongs to.
+///
+/// Evaluation entries exist so the real renderer can exercise optimizer and
+/// technique candidates through the same immutable-revision path as a
+/// production skin. They are nevertheless a separate namespace: no review or
+/// administrator action may turn one into a public catalogue skin.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub enum SkinNamespace {
+    #[default]
+    Production,
+    Evaluation,
+}
+
+impl SkinNamespace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Evaluation => "evaluation",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "production" => Some(Self::Production),
+            "evaluation" => Some(Self::Evaluation),
+            _ => None,
+        }
+    }
+
+    pub fn is_publishable(self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
 /// What the world can see of a skin.
 ///
 /// Orthogonal to review: `pending_revision` on the skin says what an admin has
@@ -100,6 +137,19 @@ impl Publication {
     }
 }
 
+/// What an administrator is doing with one open review.
+///
+/// Rejection is not a publication state: it clears the review slot while the
+/// previously published revision (if any) stays live. Keeping that distinction
+/// in the storage API prevents a rejected edit from silently withdrawing the
+/// skin it was editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkinReviewDecision {
+    Publish,
+    Reject,
+    SetPublication(Publication),
+}
+
 /// A skin, without its documents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +158,10 @@ impl Publication {
 pub struct Skin {
     pub skin_id: i32,
     pub kind: SkinKind,
+    /// Production catalogue entry or isolated, permanently non-publishable
+    /// factory evaluation fixture.
+    #[serde(default)]
+    pub namespace: SkinNamespace,
     /// Who made it. Distinct from who owns it: ownership is a grant many
     /// players can hold, and only the creator (or an admin) may edit.
     pub creator_user_id: i32,
@@ -153,6 +207,9 @@ impl Skin {
         if viewer_user_id == Some(self.creator_user_id) {
             return Some(&self.head_content_ref);
         }
+        if !self.namespace.is_publishable() {
+            return None;
+        }
         self.published_content_ref.as_deref()
     }
 
@@ -168,7 +225,13 @@ impl Skin {
     /// gets: ids are sequential, so a distinguishable "exists but forbidden"
     /// would let anyone enumerate how many private drafts exist and when.
     pub fn may_view(&self, user_id: Option<i32>, is_admin: bool) -> bool {
-        if is_admin || self.publication.is_browsable() {
+        if is_admin {
+            return true;
+        }
+        if !self.namespace.is_publishable() {
+            return user_id == Some(self.creator_user_id);
+        }
+        if self.publication.is_browsable() {
             return true;
         }
         match self.publication {
@@ -179,6 +242,29 @@ impl Skin {
             }
             Publication::Published => true,
         }
+    }
+}
+
+/// Whether a validated v2 layer tree can paint author-controlled words.
+pub fn layers_contain_authored_text(layers: &[skin_schema::v2::LayerV2]) -> bool {
+    layers.iter().any(|layer| match &layer.body {
+        skin_schema::v2::LayerBodyV2::Group { layers } => layers_contain_authored_text(layers),
+        skin_schema::v2::LayerBodyV2::Span {
+            source: skin_schema::v2::SourceV2::Text { .. },
+            ..
+        } => true,
+        _ => false,
+    })
+}
+
+/// Recover the text gate for rows written before `containsText` was persisted.
+/// Malformed legacy bytes fail closed: they need exact human approval before
+/// any by-reference or matchmaking path may expose them.
+pub fn document_contains_authored_text(document: &str) -> bool {
+    match skin_schema::v2::load_any(document) {
+        Ok(skin_schema::v2::AnySkinDoc::V1(_)) => false,
+        Ok(skin_schema::v2::AnySkinDoc::V2(doc)) => layers_contain_authored_text(&doc.layers),
+        Err(_) => true,
     }
 }
 
@@ -207,6 +293,20 @@ pub struct SkinRevision {
     /// Set when an admin approves this revision. Gates whether text layers
     /// render for anyone but the creator.
     pub review_approved: bool,
+    /// Durable exact-target marker for a rejected review. This is separate
+    /// from publication because rejecting an edit leaves the prior approved
+    /// revision live. A later approval removes the marker transactionally.
+    #[serde(default)]
+    pub review_rejected: bool,
+    /// Whether this document contains an authored text source.
+    ///
+    /// Text is the one source whose pixels can communicate arbitrary words.
+    /// Keeping the bit beside the revision lets match preparation fail closed
+    /// without reparsing JSON on every game start: an unreviewed text revision
+    /// may be previewed privately by its author, but may not enter a match or
+    /// be fetched by an opponent.
+    #[serde(default)]
+    pub contains_text: bool,
     pub created_at_ms: i64,
 }
 
@@ -263,8 +363,15 @@ pub struct NewSkin<'a> {
     pub creator_user_id: i32,
     pub creator_username: Option<&'a str>,
     pub kind: SkinKind,
+    pub namespace: SkinNamespace,
     pub name: &'a str,
     pub revision: NewRevision<'a>,
+    /// Stable per-creator request identity. Factory callers always provide it;
+    /// interactive legacy callers may omit it until their client is upgraded.
+    pub idempotency_key: Option<&'a str>,
+    /// Hash of the create payload, used to refuse reuse of a key for different
+    /// content rather than silently returning the first skin.
+    pub request_hash: Option<&'a str>,
 }
 
 /// Everything needed to append a revision.
@@ -275,6 +382,24 @@ pub struct NewRevision<'a> {
     pub content_ref: &'a str,
     pub texture_refs: &'a [String],
     pub validated_schema: u32,
+    pub contains_text: bool,
+}
+
+/// A storage conflict with a safe, caller-actionable meaning.
+///
+/// Database methods still return `anyhow::Error` because that is the service's
+/// shared persistence interface. These values are downcast by the HTTP layer
+/// so an optimistic-write loss is a 409 rather than a misleading 500.
+#[derive(Debug, thiserror::Error)]
+pub enum SkinWriteError {
+    #[error("skin head changed: expected revision {expected}, current revision is {actual}")]
+    HeadChanged { expected: u32, actual: u32 },
+    #[error("the reviewed revision or content hash no longer matches the request")]
+    ReviewTargetChanged,
+    #[error("the skin-create idempotency key was already used for different content")]
+    IdempotencyKeyReused,
+    #[error("evaluation-only skins cannot enter the production catalogue")]
+    EvaluationOnly,
 }
 
 /// A page of skins, and where to resume.
@@ -309,6 +434,7 @@ mod tests {
         Skin {
             skin_id: 7,
             kind: SkinKind::Snake,
+            namespace: SkinNamespace::Production,
             creator_user_id: 42,
             creator_username: Some("author".to_string()),
             name: "Test".to_string(),
@@ -420,6 +546,9 @@ mod tests {
 
         for kind in [SkinKind::Snake, SkinKind::Base] {
             assert_eq!(SkinKind::parse(kind.as_str()), Some(kind));
+        }
+        for namespace in [SkinNamespace::Production, SkinNamespace::Evaluation] {
+            assert_eq!(SkinNamespace::parse(namespace.as_str()), Some(namespace));
         }
         for source in [
             GrantSource::Purchase,

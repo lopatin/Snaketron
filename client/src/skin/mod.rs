@@ -268,16 +268,29 @@ pub enum SideCue {
 /// What the renderer needs to know about a skin's shape to lay out around it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SkinMetrics {
-    /// The furthest the skin paints beyond its body cells, per side, in
-    /// pixels. Drives the renderer's occlusion mask and the roster's row
-    /// sizing. Reporting less than you paint is a conformance failure.
+    /// Fixed contour/signal paint beyond the body cells, per side, in live
+    /// pixels. Raster bleed aprons are reported separately because they scale with
+    /// the live cell size; consumers use [`Self::visible_overhang_px`] to
+    /// combine both components.
     pub overhang_px: f64,
+    /// Transverse image bleed per side around the unchanged 16×16 logical
+    /// body cell. Unlike `overhang_px`, this scales with a live cell until the
+    /// declared authored-pixel cap is reached.
+    pub raster_overhang_px: u32,
     /// Where the head's core ends, as a fraction of one cell. Label anchoring
     /// uses it to stay clear of the head.
     pub head_core_radius_ratio: f64,
     /// Whether the head core is dark enough for the roster's white ready-check
     /// to read against it.
     pub head_core_is_dark: bool,
+}
+
+impl SkinMetrics {
+    /// Furthest live paint distance beyond the body, per side.
+    pub fn visible_overhang_px(self, cell_size: f64) -> f64 {
+        self.overhang_px
+            .max(space::raster_overhang_cells(cell_size, self.raster_overhang_px) * cell_size)
+    }
 }
 
 /// Viewer-attributed dressing for the team bases.
@@ -373,6 +386,15 @@ pub trait SnakeSkin: Send + Sync {
 
     fn metrics(&self, boost_active: bool) -> SkinMetrics;
 
+    /// Lazy image readiness scoped to this skin.
+    ///
+    /// Procedural skins keep the empty default. Composite skins override this
+    /// with their own atlas so review/capture surfaces can prove one exact
+    /// paint drew decoded pixels without observing unrelated skins.
+    fn asset_status(&self) -> atlas::AssetStatus {
+        atlas::AssetStatus::default()
+    }
+
     /// Where this skin's friend/foe reading lives. See [`SideCue`] — including
     /// why only the conformance suite calls it.
     #[allow(dead_code)]
@@ -383,9 +405,11 @@ pub trait SnakeSkin: Send + Sync {
     /// Paint one living snake.
     ///
     /// There is no mask parameter: erasing whatever sits behind the snake is
-    /// the renderer's job, sized from [`SkinMetrics::overhang_px`], so a skin
-    /// cannot paint the arena's background colour and a future non-white arena
-    /// does not have to touch every skin.
+    /// the renderer's job for the logical body and its fixed contour, so a
+    /// skin cannot paint the arena's background colour and a future non-white
+    /// arena does not have to touch every skin. A raster bleed apron is not
+    /// erased first: its RGBA pixels composite over the arena and earlier
+    /// snakes in normal draw order.
     fn paint_alive(
         &self,
         ctx: &mut PaintCtx,
@@ -482,6 +506,52 @@ pub fn paint_alive_with_occlusion(
 mod tests {
     use super::*;
 
+    struct RasterTestSkin;
+
+    impl SnakeSkin for RasterTestSkin {
+        fn id(&self) -> &str {
+            "raster-test@1"
+        }
+
+        fn name(&self) -> &str {
+            "Raster test"
+        }
+
+        fn colors(&self, _identity: &SkinIdentity) -> SkinColors<'_> {
+            SkinColors {
+                fill: "#f00",
+                outline: "#f00",
+                label: "#fff",
+                swatch: "#f00",
+            }
+        }
+
+        fn metrics(&self, _boost_active: bool) -> SkinMetrics {
+            SkinMetrics {
+                overhang_px: 1.0,
+                raster_overhang_px: 4,
+                head_core_radius_ratio: 0.38,
+                head_core_is_dark: true,
+            }
+        }
+
+        fn paint_alive(
+            &self,
+            _ctx: &mut PaintCtx,
+            _pose: &SnakePose,
+            _identity: &SkinIdentity,
+        ) -> Result<(), JsValue> {
+            Ok(())
+        }
+    }
+
+    fn test_identity() -> SkinIdentity {
+        SkinIdentity {
+            role: SnakeRole::Own,
+            shade_slot: 0,
+        }
+    }
+
     /// The one rule that keeps team games readable: a skin can restyle a role
     /// but never choose one.
     #[test]
@@ -495,6 +565,51 @@ mod tests {
 
         let spectated = SkinIdentity::resolve(0, Some(1), 0, 4, true, None, None);
         assert_eq!(spectated.role, SnakeRole::SpectatedTeam(1));
+    }
+
+    #[test]
+    fn raster_apron_does_not_expand_the_opaque_occlusion_mask() {
+        use crate::skin::paint::{OpRecorder, PaintOp};
+
+        let cells = [(0.0, 0.0), (4.0, 0.0)];
+        let mut recorder = OpRecorder::new();
+        paint_alive_with_occlusion(
+            &mut PaintCtx::recording(&mut recorder),
+            &RasterTestSkin,
+            &SnakePose::still(&cells, 5.0, false),
+            &test_identity(),
+            Some("#fff"),
+        )
+        .unwrap();
+
+        let rectangles = recorder
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                PaintOp::FillRect(x, y, width, height) => Some((*x, *y, *width, *height)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rectangles,
+            vec![
+                (-1.0, -1.0, 27.0, 7.0),
+                (-1.0, -1.0, 7.0, 7.0),
+                (19.0, -1.0, 7.0, 7.0),
+            ],
+            "the logical body and fixed one-pixel contour remain masked"
+        );
+        assert!(
+            !recorder.ops().iter().any(|op| matches!(
+                op,
+                PaintOp::BeginPath
+                    | PaintOp::Arc(..)
+                    | PaintOp::Ellipse(..)
+                    | PaintOp::Rect(..)
+                    | PaintOp::Fill
+            )),
+            "the RGBA raster apron must not receive an opaque shape fill before image paint"
+        );
     }
 
     /// A playing viewer's free-for-all opponents must never land on the blue

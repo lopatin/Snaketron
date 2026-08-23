@@ -259,7 +259,9 @@ pub fn arc_length(cells: &[(f64, f64)]) -> f64 {
 /// parity target for a reason that has nothing to do with the compositor being
 /// wrong.
 ///
-/// Neither shape exceeds the body's cells, so neither contributes overhang.
+/// The authored raster variant is the one bounded exception: it dilates the
+/// silhouette only far enough to admit the immutable texture descriptor's
+/// transverse margin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClipShape {
     /// The capsule union: run strips with round caps, filled nonzero. What the
@@ -269,6 +271,23 @@ pub enum ClipShape {
     /// The union of the body's cell squares. Larger than the silhouette at
     /// every cap and every outer corner.
     Cells,
+    /// The silhouette widened for a source row with bounded transverse bleed.
+    /// The value is authored apron pixels per side around an unchanged 16×16
+    /// body cell, never a caller-selected live-canvas distance.
+    RasterOverhang(u32),
+}
+
+/// Visible raster bleed in body-space cells.
+///
+/// Up to the 16px nominal sprite cell it preserves the source's exact ratio;
+/// larger static surfaces cap at the declared authored-pixel bound so roster
+/// rows and occlusion metrics remain honest.
+pub fn raster_overhang_cells(cell_size: f64, authored_px: u32) -> f64 {
+    if !cell_size.is_finite() || cell_size <= 0.0 || authored_px == 0 {
+        return 0.0;
+    }
+    let authored = f64::from(authored_px);
+    (authored / f64::from(skin_schema::v2::RASTER_BODY_TEXELS_PER_CELL)).min(authored / cell_size)
 }
 
 /// Build a clip path for the body and apply it.
@@ -284,8 +303,14 @@ pub fn clip_to_body(
 ) -> Result<(), JsValue> {
     ctx.begin_path();
     match shape {
-        ClipShape::Silhouette => build_silhouette(ctx, cells, cell_size)?,
+        ClipShape::Silhouette => build_silhouette(ctx, cells, cell_size, 0.0)?,
         ClipShape::Cells => build_cells(ctx, cells, cell_size),
+        ClipShape::RasterOverhang(authored_px) => build_silhouette(
+            ctx,
+            cells,
+            cell_size,
+            raster_overhang_cells(cell_size, authored_px) * cell_size,
+        )?,
     }
     ctx.clip();
     Ok(())
@@ -299,13 +324,27 @@ fn build_silhouette(
     ctx: &mut PaintCtx,
     cells: &[(f64, f64)],
     cell_size: f64,
+    transverse_overhang: f64,
 ) -> Result<(), JsValue> {
-    let radius = cell_size / 2.0;
-    let centre = |cell: (f64, f64)| (cell.0 * cell_size + radius, cell.1 * cell_size + radius);
+    let body_radius = cell_size / 2.0;
+    let transverse_radius = body_radius + transverse_overhang;
+    let centre = |cell: (f64, f64)| {
+        (
+            cell.0 * cell_size + body_radius,
+            cell.1 * cell_size + body_radius,
+        )
+    };
 
     if cells.len() == 1 {
         let (x, y) = centre(cells[0]);
-        ctx.arc(x, y, radius, 0.0, FULL_CIRCLE)?;
+        if transverse_overhang == 0.0 {
+            ctx.arc(x, y, body_radius, 0.0, FULL_CIRCLE)?;
+        } else {
+            // A one-cell body has no observed heading, so use the same
+            // canonical rightward frame as `Run::direction`: 16 authored
+            // pixels along the snake and up to 24 only across it.
+            ctx.ellipse(x, y, body_radius, transverse_radius, 0.0, 0.0, FULL_CIRCLE)?;
+        }
         return Ok(());
     }
 
@@ -329,10 +368,11 @@ fn build_silhouette(
         // silhouette, so it emits no clip at all. A patterned body layer is
         // the first thing that can paint into the corner the cap rounds away,
         // and it duly did, right where the contour should have been.
-        let (rx, ry, rw, rh) = if x1 > x0 {
-            (x0, y0 - radius, x1 - x0, cell_size)
+        let horizontal = x1 > x0;
+        let (rx, ry, rw, rh) = if horizontal {
+            (x0, y0 - transverse_radius, x1 - x0, transverse_radius * 2.0)
         } else if y1 > y0 {
-            (x0 - radius, y0, cell_size, y1 - y0)
+            (x0 - transverse_radius, y0, transverse_radius * 2.0, y1 - y0)
         } else {
             // No extent in either axis: the discs are the whole shape.
             (x0, y0, 0.0, 0.0)
@@ -352,13 +392,28 @@ fn build_silhouette(
         // not a rasteriser bug, a path that says something we did not mean.
         // Starting each disc at its own angle-zero point makes the connecting
         // line zero-length, which is the same as no line at all.
-        ctx.move_to(ax + radius, ay);
-        if let Err(cause) = ctx.arc(ax, ay, radius, 0.0, FULL_CIRCLE) {
+        let (radius_x, radius_y, start_x) = if horizontal {
+            (body_radius, transverse_radius, body_radius)
+        } else {
+            (transverse_radius, body_radius, transverse_radius)
+        };
+        ctx.move_to(ax + start_x, ay);
+        let first_cap = if transverse_overhang == 0.0 {
+            ctx.arc(ax, ay, body_radius, 0.0, FULL_CIRCLE)
+        } else {
+            ctx.ellipse(ax, ay, radius_x, radius_y, 0.0, 0.0, FULL_CIRCLE)
+        };
+        if let Err(cause) = first_cap {
             error = Some(cause);
             return;
         }
-        ctx.move_to(bx + radius, by);
-        if let Err(cause) = ctx.arc(bx, by, radius, 0.0, FULL_CIRCLE) {
+        ctx.move_to(bx + start_x, by);
+        let second_cap = if transverse_overhang == 0.0 {
+            ctx.arc(bx, by, body_radius, 0.0, FULL_CIRCLE)
+        } else {
+            ctx.ellipse(bx, by, radius_x, radius_y, 0.0, 0.0, FULL_CIRCLE)
+        };
+        if let Err(cause) = second_cap {
             error = Some(cause);
         }
     });
@@ -887,6 +942,48 @@ mod tests {
             rects(&[(1.0, 1.0), (1.0, 2.0), (2.0, 2.0)]),
             vec![(10.0, 15.0, 10.0, 10.0), (15.0, 20.0, 10.0, 10.0)],
             "each one-cell run spans its own centres and no further"
+        );
+    }
+
+    /// The logical cell stays 16×16 while a stored source row may add a
+    /// transverse bleed apron. Its rounded caps remain on the ordinary 16px
+    /// longitudinal cell boundary, so bleed cannot grow a head or tail four
+    /// pixels longer than its body contract.
+    #[test]
+    fn raster_bleed_crosses_adjacent_cells_but_stays_strictly_transverse_and_bounded() {
+        let measure = |cells: &[(f64, f64)], cell_size: f64| {
+            let mut recorder = OpRecorder::new();
+            {
+                let mut ctx = PaintCtx::recording(&mut recorder);
+                ctx.save();
+                clip_to_body(&mut ctx, cells, cell_size, ClipShape::RasterOverhang(4)).unwrap();
+                ctx.fill_rect(-1000.0, -1000.0, 4000.0, 4000.0);
+                ctx.restore();
+            }
+            recorder.painted_extent().expect("the clip admits paint")
+        };
+
+        let horizontal = measure(&[(1.0, 1.0), (4.0, 1.0)], 16.0);
+        assert_eq!(
+            horizontal,
+            (16.0, 12.0, 80.0, 36.0),
+            "horizontal caps stay exactly on the head/tail cell edges"
+        );
+        assert!(
+            horizontal.1 < 16.0 && horizontal.3 > 32.0,
+            "the four-pixel apron intentionally enters the logical cells above and below"
+        );
+        assert_eq!(16.0 - horizontal.1, 4.0);
+        assert_eq!(horizontal.3 - 32.0, 4.0);
+        assert_eq!(
+            measure(&[(1.0, 1.0), (1.0, 4.0)], 16.0),
+            (12.0, 16.0, 36.0, 80.0),
+            "the same contract rotates with a vertical body"
+        );
+        assert_eq!(
+            measure(&[(0.0, 0.0)], 5.0),
+            (0.0, -1.25, 5.0, 6.25),
+            "a short one-cell body uses the canonical rightward frame and a 1.25px live margin"
         );
     }
 

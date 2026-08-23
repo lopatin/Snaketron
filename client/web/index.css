@@ -8558,11 +8558,11 @@ a.home-social-icon:hover {
 
 .admin-skin-queue li {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(340px, 1.25fr) minmax(190px, 0.7fr) minmax(190px, 0.7fr);
   align-items: center;
-  gap: 16px;
+  gap: 20px;
   border-bottom: 1px solid #e1e3e7;
-  padding: 10px 14px;
+  padding: 16px;
 }
 
 .admin-skin-queue li:last-child {
@@ -8572,6 +8572,79 @@ a.home-social-icon:hover {
 .admin-skin-preview canvas {
   display: block;
   border-radius: 3px;
+}
+
+.admin-skin-specimen {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.admin-skin-motion {
+  display: grid;
+  width: min(100%, 360px);
+  grid-template-columns: auto minmax(100px, 1fr) 4.2ch;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-skin-play {
+  border: 1px solid #9ca3af;
+  border-radius: 4px;
+  background: #fff;
+  padding: 4px 8px;
+  color: var(--game-graphite);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.admin-skin-play[aria-pressed='true'] {
+  border-color: var(--game-blue);
+  color: #1d4ed8;
+}
+
+.admin-skin-play:disabled,
+.admin-skin-motion input:disabled {
+  cursor: wait;
+  opacity: 0.48;
+}
+
+.admin-skin-play:focus-visible,
+.admin-skin-motion input:focus-visible,
+.admin-skin-actions button:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.admin-skin-motion input {
+  min-width: 0;
+  accent-color: var(--game-blue);
+}
+
+.admin-skin-motion output,
+.admin-skin-motion-note {
+  color: rgb(63 63 65 / 56%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.admin-skin-motion-note.is-reduced {
+  color: #6b7280;
+}
+
+.admin-skin-motion-note.is-error {
+  max-width: min(100%, 360px);
+  color: #b91c1c;
+  line-height: 1.45;
 }
 
 .admin-skin-preview-missing {
@@ -8606,9 +8679,55 @@ a.home-social-icon:hover {
   text-transform: uppercase;
 }
 
+.admin-skin-meta .admin-skin-target {
+  align-self: flex-start;
+  margin-top: 7px;
+  border: 1px solid #93c5fd;
+  border-radius: 4px;
+  background: #eff6ff;
+  padding: 5px 7px;
+  color: #1d4ed8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 8px;
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+}
+
 .admin-skin-actions {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
   gap: 7px;
+}
+
+.admin-skin-review-note {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 2px;
+}
+
+.admin-skin-review-note span {
+  color: rgb(63 63 65 / 56%);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.admin-skin-review-note input {
+  min-width: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 6px 7px;
+  color: var(--game-graphite);
+  font: 10px/1.3 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.admin-skin-review-note input:focus-visible {
+  border-color: var(--game-blue);
+  outline: 2px solid rgb(59 130 246 / 34%);
+  outline-offset: 1px;
 }
 
 /* Taking a skin down reaches replays and everyone already wearing it, so it
@@ -8685,6 +8804,7 @@ a.home-social-icon:hover {
 }
 
 .admin-skin-crop {
+  position: relative;
   overflow: hidden;
   flex: none;
 }
@@ -8693,10 +8813,55 @@ a.home-social-icon:hover {
   display: block;
 }
 
+.admin-skin-preview-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border: 1px dashed #cbd5e1;
+  background: rgb(255 255 255 / 88%);
+  color: #64748b;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.admin-skin-preview-state.is-error {
+  border-color: #fca5a5;
+  background: rgb(254 242 242 / 94%);
+  color: #b91c1c;
+}
+
+@media (max-width: 960px) {
+  .admin-skin-queue li {
+    grid-template-columns: minmax(320px, 1fr) minmax(190px, 0.7fr);
+  }
+
+  .admin-skin-actions {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+
 /* Narrow: a wide snake, a name and an action do not fit across a phone. Stack
    the art over the meta, the same way the base rail already does — a row that
    squeezes the name column to nothing wraps it one letter per line. */
 @media (max-width: 700px) {
+  .admin-skin-queue li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-skin-actions {
+    grid-column: auto;
+  }
+
+  .admin-skin-crop {
+    max-width: 100%;
+  }
+
   .skins-row,
   .skins-column-bases .skins-row {
     grid-template-columns: minmax(0, 1fr) auto;

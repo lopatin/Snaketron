@@ -21,6 +21,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A wrap join an exact PNG ladder has been measured against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "ts-gen", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-gen", ts(export))]
+pub enum SeamAxis {
+    X,
+    Y,
+}
+
+impl SeamAxis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X => "x",
+            Self::Y => "y",
+        }
+    }
+}
+
 /// What a texture is for, which decides its shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +105,17 @@ impl TextureKind {
     pub fn tiles_in_time(self) -> bool {
         matches!(self, Self::Sheet)
     }
+
+    /// Axes the legacy interactive worker guarantees without knowing the
+    /// eventual document fit. Strict forge manifests carry the use-derived
+    /// set explicitly instead.
+    pub fn worker_seam_axes(self) -> &'static [SeamAxis] {
+        match self {
+            Self::Coat => &[SeamAxis::X],
+            Self::Sheet => &[SeamAxis::Y],
+            Self::Overlay => &[],
+        }
+    }
 }
 
 /// The largest image worth accepting, in either axis.
@@ -94,11 +124,12 @@ pub const MAX_CANONICAL_DIMENSION: u32 = 2048;
 /// The largest single variant, in bytes.
 pub const MAX_VARIANT_BYTES: usize = 2 * 1024 * 1024;
 
-/// The most frames a sheet may carry.
+/// The measured renderer/decoded-memory ceiling for animation frames.
 ///
-/// `DEFAULT_SPRITE_ROWS` is 20 in the sprite tooling; this is the ceiling, not
-/// the default, and exists because rows are the multiplier on a sheet's height.
-pub const MAX_SHEET_ROWS: u32 = 20;
+/// Twenty remains the interactive generator's economical default, not a
+/// capability limit. The v2 capability manifest exposes 120 so deliberately
+/// tall factory sheets can trade bytes for smoother slow-motion playback.
+pub const MAX_SHEET_ROWS: u32 = skin_schema::v2::MAX_SPRITE_FRAME_ROWS;
 
 /// One rung of the ladder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,10 +191,14 @@ impl SeamReport {
     pub const ACCEPTABLE_RATIO: f32 = 0.9;
 
     pub fn passes(&self, kind: TextureKind) -> bool {
-        let horizontal_ok =
-            !kind.tiles_along_body() || self.horizontal_ratio <= Self::ACCEPTABLE_RATIO;
-        let vertical_ok = !kind.tiles_in_time() || self.vertical_ratio <= Self::ACCEPTABLE_RATIO;
-        horizontal_ok && vertical_ok
+        self.passes_axes(kind.worker_seam_axes())
+    }
+
+    pub fn passes_axes(&self, axes: &[SeamAxis]) -> bool {
+        axes.iter().all(|axis| match axis {
+            SeamAxis::X => self.horizontal_ratio <= Self::ACCEPTABLE_RATIO,
+            SeamAxis::Y => self.vertical_ratio <= Self::ACCEPTABLE_RATIO,
+        })
     }
 }
 
@@ -175,6 +210,11 @@ impl SeamReport {
 pub struct Texture {
     pub texture_id: i32,
     pub owner_user_id: i32,
+    /// Whether another author may pin this immutable descriptor in a skin.
+    /// Runtime bytes are public by hash either way; this flag controls reuse
+    /// at save time, not pixel delivery.
+    #[serde(default)]
+    pub shareable: bool,
     /// The hash of the canonical variant, and the name the document uses.
     pub content_ref: String,
     pub kind: TextureKind,
@@ -185,11 +225,64 @@ pub struct Texture {
     pub repeat_cells: Option<f32>,
     /// Frame count, for a sheet.
     pub rows: Option<u32>,
+    /// Transverse bleed apron per side around the unchanged 16×16 logical
+    /// body cell. At the 16-texel rung, four is stored as `4 + 16 + 4`.
+    #[serde(default)]
+    pub raster_overhang_px: u32,
     pub seams: SeamReport,
+    /// Axes measured on every exact ladder rung before this metadata row was
+    /// made reachable. Save-time document validation requires this set to be
+    /// a superset of the axes implied by image fit and animation use.
+    #[serde(default)]
+    pub verified_seam_axes: Vec<SeamAxis>,
     /// Kept so regenerating is one edit rather than a retype.
     pub last_prompt: Option<String>,
     pub variants: Vec<TextureVariant>,
     pub created_at_ms: i64,
+}
+
+/// Public, immutable metadata needed to compile an image source.
+///
+/// This is intentionally not [`Texture`]: ownership and generation prompts
+/// are author-library data, not inputs to rendering, and must never leak from
+/// the anonymous manifest route.
+impl Texture {
+    pub fn descriptor(&self) -> skin_schema::v2::TextureDescriptorV2 {
+        let body_columns = self.repeat_cells.and_then(|value| {
+            let rounded = value.round();
+            (value.is_finite() && value > 0.0 && (value - rounded).abs() < f32::EPSILON)
+                .then_some(rounded as u32)
+        });
+        skin_schema::v2::TextureDescriptorV2 {
+            kind: match self.kind {
+                TextureKind::Coat => skin_schema::v2::TextureKindV2::Coat,
+                TextureKind::Sheet => skin_schema::v2::TextureKindV2::Sheet,
+                TextureKind::Overlay => skin_schema::v2::TextureKindV2::Overlay,
+            },
+            body_columns,
+            frame_rows: self.rows,
+            raster_overhang_px: self.raster_overhang_px,
+            variants: self
+                .variants
+                .iter()
+                .map(|variant| {
+                    let content_ref = if variant.sha256.starts_with("sha256:") {
+                        variant.sha256.clone()
+                    } else {
+                        format!("sha256:{}", variant.sha256)
+                    };
+                    skin_schema::v2::TextureVariantV2 {
+                        url: format!("/api/textures/variants/{content_ref}.png"),
+                        content_ref,
+                        width_px: variant.width_px,
+                        height_px: variant.height_px,
+                        bytes: variant.bytes,
+                        texels_per_cell: variant.texels_per_cell,
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Why a proposed texture was refused.
@@ -215,6 +308,7 @@ pub struct ProposedTexture {
     pub width_px: u32,
     pub height_px: u32,
     pub rows: Option<u32>,
+    pub raster_overhang_px: u32,
     pub byte_len: usize,
 }
 
@@ -249,6 +343,25 @@ pub fn validate_shape(proposed: ProposedTexture) -> Result<(), Vec<TextureError>
     }
 
     let cell = proposed.kind.canonical_texels_per_cell();
+    if proposed.raster_overhang_px > skin_schema::v2::MAX_RASTER_OVERHANG_PX {
+        errors.push(TextureError::new(
+            "rasterOverhangPx",
+            format!(
+                "{} authored pixels per side exceeds the {}px bound",
+                proposed.raster_overhang_px,
+                skin_schema::v2::MAX_RASTER_OVERHANG_PX
+            ),
+        ));
+    }
+    let raster_side = skin_schema::v2::raster_overhang_texels(cell, proposed.raster_overhang_px)
+        .unwrap_or(u32::MAX);
+    if raster_side == u32::MAX {
+        errors.push(TextureError::new(
+            "rasterOverhangPx",
+            "cannot be represented exactly at this texture density",
+        ));
+    }
+    let raster_row = cell.saturating_add(raster_side.saturating_mul(2));
 
     match proposed.kind {
         TextureKind::Coat | TextureKind::Overlay => {
@@ -264,14 +377,25 @@ pub fn validate_shape(proposed: ProposedTexture) -> Result<(), Vec<TextureError>
                     ),
                 ));
             }
-            if proposed.kind == TextureKind::Coat && proposed.height_px != cell {
+            if proposed.kind == TextureKind::Coat && proposed.height_px != raster_row {
                 errors.push(TextureError::new(
                     "height",
                     format!(
-                        "a coat is exactly one cell tall; {}px is not {cell}px",
-                        proposed.height_px
+                        "a coat keeps a {cell}px body cell plus {raster_side}px stored bleed apron per side; {}px is not the required {raster_row}px row",
+                        proposed.height_px,
                     ),
                 ));
+            }
+            if proposed.kind == TextureKind::Overlay && proposed.raster_overhang_px > 0 {
+                let body_height = proposed
+                    .height_px
+                    .checked_sub(raster_side.saturating_mul(2));
+                if body_height.is_none_or(|height| height == 0 || !height.is_multiple_of(cell)) {
+                    errors.push(TextureError::new(
+                        "height",
+                        "after its bounded bleed aprons, an overlay must contain whole body cells",
+                    ));
+                }
             }
             if proposed.rows.is_some() {
                 errors.push(TextureError::new("rows", "only a sheet has frames"));
@@ -299,6 +423,17 @@ pub fn validate_shape(proposed: ProposedTexture) -> Result<(), Vec<TextureError>
                     format!(
                         "{}px does not divide by {rows} frames, so every frame would \
                          sample across a boundary",
+                        proposed.height_px
+                    ),
+                ));
+            } else if proposed.raster_overhang_px > 0
+                && proposed.height_px != rows.saturating_mul(raster_row)
+            {
+                errors.push(TextureError::new(
+                    "height",
+                    format!(
+                        "{rows} stored frames with {cell} body texels plus {raster_side}px bleed apron per side require {}px, not {}px",
+                        rows.saturating_mul(raster_row),
                         proposed.height_px
                     ),
                 ));
@@ -421,12 +556,74 @@ pub fn build_prompt(
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_descriptor_is_exact_content_addressed_and_sanitized() {
+        let canonical = "a".repeat(64);
+        let smaller = "b".repeat(64);
+        let texture = Texture {
+            texture_id: 7,
+            owner_user_id: 42,
+            shareable: false,
+            content_ref: format!("sha256:{canonical}"),
+            kind: TextureKind::Sheet,
+            width_px: 320,
+            height_px: 640,
+            repeat_cells: Some(20.0),
+            rows: Some(40),
+            raster_overhang_px: 0,
+            seams: SeamReport {
+                horizontal_ratio: 0.2,
+                vertical_ratio: 0.3,
+                repaired: true,
+            },
+            verified_seam_axes: vec![SeamAxis::Y],
+            last_prompt: Some("private generation prompt".to_string()),
+            variants: vec![
+                TextureVariant {
+                    texels_per_cell: 16,
+                    width_px: 320,
+                    height_px: 640,
+                    bytes: 100,
+                    sha256: canonical.clone(),
+                },
+                TextureVariant {
+                    texels_per_cell: 8,
+                    width_px: 160,
+                    height_px: 320,
+                    bytes: 50,
+                    sha256: smaller.clone(),
+                },
+            ],
+            created_at_ms: 1,
+        };
+
+        let descriptor = texture.descriptor();
+        assert_eq!(descriptor.kind, skin_schema::v2::TextureKindV2::Sheet);
+        assert_eq!(descriptor.body_columns, Some(20));
+        assert_eq!(descriptor.frame_rows, Some(40));
+        assert_eq!(descriptor.raster_overhang_px, 0);
+        assert_eq!(
+            descriptor.variants[1].url,
+            format!("/api/textures/variants/sha256:{smaller}.png")
+        );
+        assert_eq!(
+            descriptor.variants[1].content_ref,
+            format!("sha256:{smaller}")
+        );
+
+        let public = serde_json::to_string(&descriptor).expect("serializes");
+        assert!(!public.contains("owner"));
+        assert!(!public.contains("prompt"));
+        assert!(!public.contains("42"));
+    }
+
     fn coat(width: u32, height: u32) -> ProposedTexture {
         ProposedTexture {
             kind: TextureKind::Coat,
             width_px: width,
             height_px: height,
             rows: None,
+            raster_overhang_px: 0,
             byte_len: 1024,
         }
     }
@@ -437,6 +634,7 @@ mod tests {
             width_px: width,
             height_px: height,
             rows: Some(rows),
+            raster_overhang_px: 0,
             byte_len: 1024,
         }
     }
@@ -487,12 +685,61 @@ mod tests {
     }
 
     #[test]
+    fn a_16x16_body_cell_with_bleed_aprons_scales_to_canonical_density() {
+        let wide_coat = ProposedTexture {
+            raster_overhang_px: 4,
+            ..coat(768, 96)
+        };
+        assert!(validate_shape(wide_coat).is_ok());
+
+        let clipped = ProposedTexture {
+            raster_overhang_px: 4,
+            ..coat(768, 64)
+        };
+        let errors = validate_shape(clipped).expect_err("64px omits the scaled margins");
+        assert!(errors.iter().any(|error| {
+            error.field == "height" && error.problem.contains("16px stored bleed apron per side")
+        }));
+
+        let unbounded = ProposedTexture {
+            raster_overhang_px: 5,
+            ..coat(768, 104)
+        };
+        let errors = validate_shape(unbounded).expect_err("more than 4 authored pixels is unsafe");
+        assert!(errors.iter().any(|error| error.field == "rasterOverhangPx"));
+
+        let wide_sheet = ProposedTexture {
+            raster_overhang_px: 4,
+            ..sheet(320, 24 * 8, 8)
+        };
+        assert!(validate_shape(wide_sheet).is_ok());
+
+        // A 16px body row plus two 4px stored aprons is 24px, so the generic
+        // 2048px edge limit makes 85 the effective row ceiling even though a
+        // no-bleed sheet may use the schema's general 120-row ceiling.
+        let tallest_wide_sheet = ProposedTexture {
+            raster_overhang_px: 4,
+            ..sheet(320, 24 * 85, 85)
+        };
+        assert!(validate_shape(tallest_wide_sheet).is_ok());
+        let too_tall_wide_sheet = ProposedTexture {
+            raster_overhang_px: 4,
+            ..sheet(320, 24 * 86, 86)
+        };
+        assert!(
+            validate_shape(too_tall_wide_sheet).is_err(),
+            "86 stored body-plus-apron rows exceed the immutable 2048px decoded-edge bound"
+        );
+    }
+
+    #[test]
     fn an_oversized_or_heavy_image_is_refused_from_its_header_alone() {
         let huge = ProposedTexture {
             kind: TextureKind::Coat,
             width_px: 20_000,
             height_px: 64,
             rows: None,
+            raster_overhang_px: 0,
             byte_len: 1024,
         };
         assert!(validate_shape(huge).is_err());
@@ -628,6 +875,7 @@ mod tests {
             width_px: header.width_px,
             height_px: header.height_px,
             rows: None,
+            raster_overhang_px: 0,
             byte_len: bytes.len(),
         })
         .expect_err("14 gigabytes decoded");

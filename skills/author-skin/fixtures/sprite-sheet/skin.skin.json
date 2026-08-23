@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "id": "fixture-sprite-sheet@1",
+  "name": "Fixture Sprite Sheet",
+  "palette": {
+    "friendly": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#3c8dde", "outline": "#286eae" }
+    ],
+    "enemy": [
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#e34e5b", "outline": "#a92f3a" }
+    ],
+    "free_for_all": [
+      { "fill": "#70bfe3", "outline": "#5299bb" },
+      { "fill": "#ff6b6b", "outline": "#b84444" },
+      { "fill": "#93a3b5", "outline": "#5d6e81" },
+      { "fill": "#f7b731", "outline": "#a87d1f" }
+    ]
+  },
+  "textures": [
+    {
+      "name": "water_sheet",
+      "ref": "sha256:d333333333333333333333333333333333333333333333333333333333333333",
+      "kind": "sheet",
+      "descriptor": {
+        "kind": "sheet",
+        "body_columns": 41,
+        "frame_rows": 48,
+        "raster_overhang_px": 0,
+        "variants": [
+          {
+            "content_ref": "sha256:d333333333333333333333333333333333333333333333333333333333333333",
+            "url": "/api/textures/variants/sha256:d333333333333333333333333333333333333333333333333333333333333333.png",
+            "width_px": 656,
+            "height_px": 768,
+            "bytes": 620000,
+            "texels_per_cell": 16
+          }
+        ]
+      }
+    }
+  ],
+  "period_ms": 2400,
+  "head_core": { "ratio": 0.38, "color": "#333333" },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": { "slot": "outline" },
+      "extra_px": 2,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Body fallback",
+      "type": "ribbon",
+      "region": "body",
+      "color": { "slot": "fill" },
+      "extra_px": 0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Water sheet",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": { "from": "whole", "min": 0, "priority": 0 },
+      "corner": "fan",
+      "source": {
+        "type": "image",
+        "texture": "water_sheet",
+        "fit": { "type": "tile", "cells_per_repeat": 41, "phase_origin": "head" },
+        "drift_cells": 0
+      }
+    },
+    {
+      "name": "Head glow",
+      "type": "head_ramp",
+      "opacity": "(1 - s / 10) * 0.3",
+      "omit_on_single_cell": true,
+      "color": "#ffffff",
+      "length_cells": 10
+    }
+  ]
+}

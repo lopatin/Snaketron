@@ -114,6 +114,7 @@ mod exhaustiveness {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parts(
         transform: TransformV2,
         span: SpanV2,
@@ -121,6 +122,8 @@ mod exhaustiveness {
         fade: FadeV2,
         core: HeadCoreV2,
         texture: TextureRefV2,
+        descriptor: crate::v2::TextureDescriptorV2,
+        variant: crate::v2::TextureVariantV2,
         reference: ColorRef,
     ) {
         let TransformV2 {
@@ -151,7 +154,23 @@ mod exhaustiveness {
             name: _,
             content_ref: _,
             kind: _,
+            descriptor: _,
         } = texture;
+        let crate::v2::TextureDescriptorV2 {
+            kind: _,
+            body_columns: _,
+            frame_rows: _,
+            raster_overhang_px: _,
+            variants: _,
+        } = descriptor;
+        let crate::v2::TextureVariantV2 {
+            content_ref: _,
+            url: _,
+            width_px: _,
+            height_px: _,
+            bytes: _,
+            texels_per_cell: _,
+        } = variant;
         let ColorRef { target, lighten: _ } = reference;
         match target {
             ColorTarget::Slot { slot: _ } => {}
@@ -178,6 +197,7 @@ mod exhaustiveness {
             FitV2::Clip | FitV2::Stretch => {}
             FitV2::Tile {
                 cells_per_repeat: _,
+                phase_origin: _,
             } => {}
             FitV2::Cutout { cells_tall: _ } => {}
         }
@@ -1273,6 +1293,7 @@ mod tests {
             name: art.id.to_string(),
             content_ref: format!("{}{}", crate::v2::BUILTIN_TEXTURE_PREFIX, art.id),
             kind: art.kind,
+            descriptor: None,
         });
     }
     use crate::v2::{LayerV2, SkinDocV2, SourceV2, validate_v2};

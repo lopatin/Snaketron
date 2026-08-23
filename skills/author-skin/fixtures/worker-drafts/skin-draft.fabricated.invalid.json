@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "id": "worker-draft-fabricated@1",
+  "name": "Invalid fabricated worker draft",
+  "textures": [
+    {
+      "name": "shell_coat",
+      "ref": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "kind": "coat",
+      "descriptor": { "kind": "coat", "body_columns": 29, "variants": [] }
+    }
+  ],
+  "layers": [
+    { "name": "Body fallback", "type": "ribbon", "region": "body" },
+    {
+      "name": "Shell coat",
+      "type": "span",
+      "region": "body",
+      "source": { "type": "image", "texture": "shell_coat" }
+    }
+  ]
+}

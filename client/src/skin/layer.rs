@@ -117,6 +117,12 @@ pub enum Region {
     Contour,
     /// Inside one clip per snake.
     Body,
+    /// Engine-owned competitive signal painted above authored body pixels.
+    ///
+    /// Documents cannot name this region. It exists so a bounded raster
+    /// overhang may remain stable while the pinned Boost band stays visible on
+    /// top of it; moving the art at the Boost toggle would create a pop.
+    Signal,
     /// A bounded slot at `s ≈ 0`, inside the body clip.
     Head,
 }
@@ -275,6 +281,8 @@ pub enum Fit {
         /// the two, which is what lets one texture be authored at whatever
         /// resolution suits it and then worn at whatever scale reads best.
         cells_per_repeat: Option<f64>,
+        /// Which allocation edge owns an exact repeat boundary.
+        phase_origin: TilePhaseOrigin,
     },
     /// Draw at the art's **authored scale** and let the body clip the rest.
     ///
@@ -302,7 +310,15 @@ impl Fit {
     /// A tile at the source's own proportions.
     pub const TILE: Self = Self::Tile {
         cells_per_repeat: None,
+        phase_origin: TilePhaseOrigin::Head,
     };
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TilePhaseOrigin {
+    #[default]
+    Head,
+    Tail,
 }
 
 /// A gradient stop in body space.
@@ -396,6 +412,14 @@ pub enum Source {
         /// wrong. Sampling instead costs one extra blit per repeat, always,
         /// which keeps the count a property of the skin and not of the moment.
         drift_cells: f64,
+        /// Bounded transverse bleed apron, in authored pixels per side around
+        /// the unchanged 16×16 body cell. Zero is the legacy source row; at
+        /// the 16-texel rung, four is stored as `4 + 16 + 4` texels.
+        raster_overhang_px: u32,
+        /// Density of the exact ladder rung selected into the atlas. Together
+        /// with the fixed 16×16 body cell it identifies the source rows that
+        /// are bleed apron rather than body, even for a multi-cell-tall overlay.
+        raster_texels_per_cell: u32,
     },
     /// Letters along the body, one per cell.
     ///
@@ -580,13 +604,14 @@ pub enum DiscPaint {
 }
 
 impl Layer {
-    /// How far past the body this layer paints, per side.
+    /// Fixed live-pixel paint beyond the body, per side.
     ///
-    /// Only contour layers can be non-zero, which is what keeps `overhang_px`
-    /// computable as a maximum over contour layers rather than a measurement.
-    pub fn overhang_px(&self) -> f64 {
+    /// Only contour and private renderer-signal layers can be non-zero. Raster
+    /// spans declare authored-grid pixels instead and are scaled separately by
+    /// [`crate::skin::SkinMetrics::visible_overhang_px`].
+    pub fn fixed_overhang_px(&self) -> f64 {
         match (&self.region, &self.kind) {
-            (Region::Contour, LayerKind::Ribbon { extra, .. }) => extra / 2.0,
+            (Region::Contour | Region::Signal, LayerKind::Ribbon { extra, .. }) => extra / 2.0,
             _ => 0.0,
         }
     }
@@ -632,13 +657,14 @@ mod tests {
         }
     }
 
-    /// The rule that keeps `overhang_px` honest without a pixel validator: a
-    /// body layer cannot contribute overhang no matter what it declares.
+    /// The rule that keeps the fixed component honest without a pixel
+    /// validator: authored body layers never contribute live CSS pixels.
     #[test]
-    fn only_contour_layers_contribute_overhang() {
-        assert_eq!(ribbon(Region::Contour, 6.0).overhang_px(), 3.0);
-        assert_eq!(ribbon(Region::Body, 6.0).overhang_px(), 0.0);
-        assert_eq!(ribbon(Region::Head, 6.0).overhang_px(), 0.0);
+    fn only_contour_and_signal_layers_contribute_fixed_overhang() {
+        assert_eq!(ribbon(Region::Contour, 6.0).fixed_overhang_px(), 3.0);
+        assert_eq!(ribbon(Region::Signal, 6.0).fixed_overhang_px(), 3.0);
+        assert_eq!(ribbon(Region::Body, 6.0).fixed_overhang_px(), 0.0);
+        assert_eq!(ribbon(Region::Head, 6.0).fixed_overhang_px(), 0.0);
     }
 
     /// Layer presence may depend on the pose and never on the clock, because

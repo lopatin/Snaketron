@@ -92,6 +92,7 @@ sha2 = "0.10"
 # Xsolla signs its webhooks with SHA-1. Not a choice; a compatibility
 # requirement (server/src/xsolla.rs).
 sha1 = "0.10"
+subtle = "2"
 hex = "0.4"
 base64 = "0.22"
 ts-rs = { version = "11", optional = true }

@@ -1,0 +1,32 @@
+{
+  "input_authority": {
+    "mode": "approved_prototype",
+    "artifact_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "authority_record_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "human_approval_decision_id": "decision_replace_me",
+    "selection_rationale": null,
+    "maximum_driver_action": "register_private_revision"
+  },
+  "path": "layers",
+  "rationale": "Replace with the measured reason this route is faithful.",
+  "design_guidelines": {
+    "artistic_direction": "Replace with one confident visual direction.",
+    "concept_twist": "Original concept, or name the abstract familiar premise and its distinct twist.",
+    "structure": "pattern",
+    "body_strategy": "Read clearly at the 4-cell spawn and early 6-7 cells, then grow and turn without hiding the head cue.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Procedural layers only; raster seams and sprite cadence are not applicable."
+  },
+  "common_period_ms": 2400,
+  "fidelity_features": [
+    "Replace with the highest-priority game-scale feature"
+  ],
+  "layer_plan": [
+    "Role-readable contour and body fallback establish the foundation"
+  ],
+  "asset_plan": [],
+  "modifier_plan": [],
+  "animation_plan": [],
+  "required_wrap_axes": [],
+  "risks": []
+}

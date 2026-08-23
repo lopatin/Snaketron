@@ -1,0 +1,78 @@
+{
+  "input_authority": {
+    "mode": "approved_prototype",
+    "artifact_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "authority_record_sha256": "sha256:70f4a6ad484fd87acc56c5d4ff83c0fa25be4491bab243bb6434033b9f4f3d7b",
+    "human_approval_decision_id": "fixture-approval-hybrid",
+    "selection_rationale": null,
+    "maximum_driver_action": "register_private_revision"
+  },
+  "path": "hybrid",
+  "rationale": "The hint changes because cloud material needs drawn frames, while the sharp glint is cheaper and more tunable as a gradient layer.",
+  "design_guidelines": {
+    "artistic_direction": "A painterly deep-space cloud with one precise travelling star glint.",
+    "concept_twist": "The familiar nebula vista becomes a continuous role-aware snake surface rather than a rectangular sky scene.",
+    "structure": "sprite",
+    "body_strategy": "Cloud masses simplify at 4 cells, establish depth by 6-7 cells, and repeat over long turns while the procedural glint and head glow preserve head priority.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Request a production-quality 20 fps translucent sheet with 60 derived rows; x and final-to-zero y joins must be seamless and row zero calm."
+  },
+  "common_period_ms": 3000,
+  "fidelity_features": [
+    "slow painterly cloud morph",
+    "sharp travelling star glint",
+    "visible role-colour foundation"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons preserve team reading",
+    "Nebula sheet is translucent above Body fallback",
+    "Star glint gradient travels independently",
+    "Head glow preserves direction"
+  ],
+  "asset_plan": [
+    {
+      "kind": "sheet",
+      "natural_length_cells": 53,
+      "frames": 60,
+      "desired_fps": 20,
+      "texels_per_cell": 16,
+      "raster_overhang_px": 0,
+      "anchor": "whole",
+      "fit": "tile",
+      "tile_phase_origin": "head",
+      "fade": "none",
+      "transverse_edge_policy": "fail_closed_transparent_effect",
+      "prompt": "848x960 grid: 53 body cells by 60 frame rows, translucent art and no gutters or baked contour; x and final-to-zero y seamless, row zero calm, clouds morph in place."
+    }
+  ],
+  "modifier_plan": [
+    {
+      "asset_index": 0,
+      "logical_key": "nebula_motion",
+      "component_key": "B1",
+      "texture_name": "nebula_sheet",
+      "image_layer_name": "Nebula sheet",
+      "fallback_layer_name": "Body fallback",
+      "span_limit_mode": "whole",
+      "span_limit_value": null,
+      "source_mode": "direct_generate",
+      "source_object_sha256": null,
+      "modifier_manifest_sha256": null,
+      "provenance_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "license_id": "owned-original",
+      "authorized_lineage_ids": ["fixture-hybrid"],
+      "required_capabilities": ["image_generator"],
+      "extraction": null,
+      "video": null
+    }
+  ],
+  "animation_plan": [
+    "Play all 60 rows over 3000ms",
+    "Move the glint gradient with tri(time) on the same document clock"
+  ],
+  "required_wrap_axes": ["x", "y"],
+  "risks": [
+    "Opaque generated pixels could bury role cues",
+    "Two motions may compete at game scale"
+  ]
+}

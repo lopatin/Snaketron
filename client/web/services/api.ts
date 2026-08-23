@@ -26,6 +26,7 @@ import type { JobAccepted } from '../types/generated/JobAccepted';
 import type { GenerationJob } from '../types/generated/GenerationJob';
 import type { TextureListResponse } from '../types/generated/TextureListResponse';
 import type {
+  AdminSkinReviewQueueResponse,
   BrowseResponse,
   Equipment,
   PurchaseResult,
@@ -34,6 +35,13 @@ import type {
   SkinSummary,
   Wallet,
 } from '../types/generated';
+import {
+  exactAdminSkinDecision,
+  exactPublicationRequest,
+  exactSkinUpdate,
+  type AdminSkinDecision,
+  type UpdateSkinRequest,
+} from '../utils/skinApiContracts';
 
 /**
  * An equip request.
@@ -624,40 +632,40 @@ class API {
   /** Append a revision, rename, or re-price. */
   async updateSkin(
     skinId: number,
-    request: { name?: string; document?: unknown; priceBux?: number },
+    request: UpdateSkinRequest,
   ): Promise<SkinSummary> {
     return this.request<SkinSummary>(`/api/skins/${skinId}`, {
       method: 'PUT',
-      body: JSON.stringify(request),
+      body: JSON.stringify(exactSkinUpdate(request)),
     });
   }
 
-  /** Ask an admin to look at the current head revision. */
-  async requestSkinPublication(skinId: number): Promise<void> {
+  /** Ask an admin to look at one exact immutable revision. */
+  async requestSkinPublication(skinId: number, revision: number, contentRef: string): Promise<void> {
     await this.request<unknown>(`/api/skins/${skinId}/publish-request`, {
       method: 'POST',
+      body: JSON.stringify(exactPublicationRequest(revision, contentRef)),
     });
   }
 
   /** Everything waiting on a reviewer, oldest first. */
-  async getSkinReviewQueue(): Promise<SkinListResponse> {
-    return this.request<SkinListResponse>('/api/admin/skins');
+  async getSkinReviewQueue(): Promise<AdminSkinReviewQueueResponse> {
+    return this.request<AdminSkinReviewQueueResponse>('/api/admin/skins');
   }
 
   /**
    * Decide a skin.
    *
-   * Publishing names one revision — by default the one review was asked about,
-   * because the creator's head may have moved since they submitted it.
+   * Publish and reject name the exact immutable revision and content hash the
+   * admin reviewed. State-only moderation deliberately accepts neither field.
    */
   async setSkinPublication(
     skinId: number,
-    publication: 'published' | 'unpublished' | 'disabled' | 'private',
-    options: { revision?: number; reason?: string } = {},
+    decision: AdminSkinDecision,
   ): Promise<SkinSummary> {
     return this.request<SkinSummary>(`/api/admin/skins/${skinId}/status`, {
       method: 'PUT',
-      body: JSON.stringify({ publication, ...options }),
+      body: JSON.stringify(exactAdminSkinDecision(decision)),
     });
   }
 }

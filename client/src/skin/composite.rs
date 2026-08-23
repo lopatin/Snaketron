@@ -32,7 +32,7 @@
 use crate::skin::geometry::walk_cells_from_head;
 use crate::skin::layer::{
     Anchor, Binding, ColorSlot, DiscPaint, Fade, Layer, LayerKind, LayerTransform, Region, Source,
-    Span,
+    Span, TilePhaseOrigin,
 };
 use crate::skin::space::{
     ClipShape, RibbonPlan, arc_length, clip_to_body, emit_ribbon, for_each_run,
@@ -333,6 +333,23 @@ impl CompositeSkin {
         (step.rem_euclid(steps)) as usize % self.frames.len()
     }
 
+    /// Continuous presentation clock for image sampling.
+    ///
+    /// Expression parameters intentionally use the small baked ring; sprite
+    /// rows do not. Keeping this clock independent means a 64/120-row sheet
+    /// can address every row without increasing expression storage or aliasing
+    /// it down to the ring's step count.
+    fn texture_time_turns(&self, anim_ms: f64, reduced_motion: bool) -> f64 {
+        if reduced_motion
+            || !anim_ms.is_finite()
+            || !self.period_ms.is_finite()
+            || self.period_ms <= 0.0
+        {
+            return 0.0;
+        }
+        (anim_ms / self.period_ms).rem_euclid(1.0)
+    }
+
     fn swatch<'a>(&self, frame: &'a Frame, identity: &SkinIdentity) -> &'a Swatch {
         let shade = (identity.shade_slot % 2) as usize;
         match identity.role {
@@ -413,15 +430,30 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
         // joint cells to a single run, which makes that reach further still.
         // Structural rather than reviewed: it is invisible on a solid fill and
         // obvious only on the textured skins that came last.
+        let valid_body_span_clip = match (&layer.kind, layer.clip) {
+            (LayerKind::Span { .. }, ClipShape::Silhouette) => true,
+            (
+                LayerKind::Span {
+                    source:
+                        Source::Image {
+                            raster_overhang_px, ..
+                        },
+                    ..
+                },
+                ClipShape::RasterOverhang(clip_px),
+            ) => *raster_overhang_px > 0 && *raster_overhang_px == clip_px,
+            _ => false,
+        };
         if matches!(layer.kind, LayerKind::Span { .. })
             && layer.region == Region::Body
-            && layer.clip != ClipShape::Silhouette
+            && !valid_body_span_clip
         {
             problems.push(LayerStackError {
                 layer: layer.id.to_string(),
                 problem: format!(
-                    "is a body span clipped to {:?}, which reaches outside the \
-                     snake; body spans must clip to the silhouette",
+                    "is a body span clipped to {:?}, which is neither the \
+                     silhouette nor the exact bounded raster margin declared \
+                     by its image source and could therefore paint outside the snake",
                     layer.clip
                 ),
             });
@@ -443,6 +475,7 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
     }
 
     let mut seen_body_or_head = false;
+    let mut seen_signal = false;
     for layer in layers {
         match layer.region {
             Region::Contour if seen_body_or_head => reject(
@@ -452,12 +485,58 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                  layer could paint over the Boost band",
             ),
             Region::Contour => {}
-            _ => seen_body_or_head = true,
+            Region::Signal => seen_signal = true,
+            Region::Body if seen_signal => reject(
+                &mut problems,
+                layer,
+                "authored body layers may not follow the engine-owned \
+                 signal region",
+            ),
+            Region::Head
+                if seen_signal
+                    && !matches!(
+                        layer.kind,
+                        LayerKind::HeadDisc {
+                            paint: DiscPaint::Slot(ColorSlot::HeadCore),
+                            ..
+                        }
+                    ) =>
+            {
+                reject(
+                    &mut problems,
+                    layer,
+                    "only the engine-owned head core may follow the signal region",
+                )
+            }
+            Region::Body | Region::Head => seen_body_or_head = true,
+        }
+
+        if layer.region == Region::Signal
+            && !matches!(
+                layer.kind,
+                LayerKind::Ribbon {
+                    color: ColorSlot::Boost,
+                    ..
+                }
+            )
+        {
+            reject(
+                &mut problems,
+                layer,
+                "the private signal region is reserved for the engine-owned Boost ribbon",
+            );
+        }
+        if layer.region == Region::Signal && !layer.boost_only {
+            reject(
+                &mut problems,
+                layer,
+                "the engine-owned signal ribbon must only paint while Boost is active",
+            );
         }
 
         match &layer.kind {
             LayerKind::Ribbon { extra, .. } => {
-                if layer.region != Region::Contour && *extra != 0.0 {
+                if !matches!(layer.region, Region::Contour | Region::Signal) && *extra != 0.0 {
                     reject(
                         &mut problems,
                         layer,
@@ -520,6 +599,7 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
                     fit:
                         crate::skin::layer::Fit::Tile {
                             cells_per_repeat: Some(cells),
+                            phase_origin: _,
                         },
                     ..
                 } = source
@@ -606,7 +686,9 @@ fn validate_layers(layers: &[Layer], frames: &[Frame]) -> Vec<LayerStackError> {
 
     // The Boost band has to be the outermost thing painted, or a later contour
     // layer buries it and every op-text check still passes.
-    if let Some(first_boost) = layers.iter().position(|layer| layer.boost_only)
+    if let Some(first_boost) = layers
+        .iter()
+        .position(|layer| layer.boost_only && layer.region == Region::Contour)
         && layers[..first_boost]
             .iter()
             .any(|layer| layer.region == Region::Contour && !layer.boost_only)
@@ -844,18 +926,39 @@ impl SnakeSkin for CompositeSkin {
 
     fn metrics(&self, boost_active: bool) -> SkinMetrics {
         SkinMetrics {
-            // Computed from the stack rather than measured, which is exactly
-            // what the regioned frame buys: only contour layers can be
-            // non-zero, so this is a maximum over a known set.
+            // Computed from the stack rather than measured. Fixed-pixel
+            // contour and renderer-signal layers contribute here; scalable
+            // raster bleed aprons are reported separately below.
             overhang_px: self
                 .layers
                 .iter()
                 .filter(|layer| layer.applies(boost_active, 2))
-                .map(Layer::overhang_px)
+                .filter(|layer| matches!(layer.region, Region::Contour | Region::Signal))
+                .map(Layer::fixed_overhang_px)
                 .fold(0.0, f64::max),
+            raster_overhang_px: self
+                .layers
+                .iter()
+                .filter(|layer| layer.applies(boost_active, 2))
+                .filter_map(|layer| match &layer.kind {
+                    LayerKind::Span {
+                        source:
+                            Source::Image {
+                                raster_overhang_px, ..
+                            },
+                        ..
+                    } => Some(*raster_overhang_px),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0),
             head_core_radius_ratio: self.config.head_core_ratio,
             head_core_is_dark: self.config.head_core_is_dark,
         }
+    }
+
+    fn asset_status(&self) -> crate::skin::atlas::AssetStatus {
+        self.atlas.asset_status()
     }
 
     fn paint_alive(
@@ -869,6 +972,7 @@ impl SnakeSkin for CompositeSkin {
         }
 
         let frame = &self.frames[self.frame_index(pose.anim_ms, pose.reduced_motion)];
+        let texture_time_turns = self.texture_time_turns(pose.anim_ms, pose.reduced_motion);
         let swatch = self.swatch(frame, identity);
         let body_len = arc_length(pose.cells);
         let env = binding_env(pose, frame, body_len);
@@ -917,6 +1021,7 @@ impl SnakeSkin for CompositeSkin {
                 pose,
                 layer,
                 frame,
+                texture_time_turns,
                 &env,
                 swatch,
                 allocations[index],
@@ -1025,6 +1130,7 @@ impl CompositeSkin {
         pose: &SnakePose,
         layer: &Layer,
         frame: &Frame,
+        texture_time_turns: f64,
         env: &skin_schema::expr::Env,
         swatch: &Swatch,
         allocation: Option<Allocation>,
@@ -1151,7 +1257,16 @@ impl CompositeSkin {
                 // never disagree about which track is in force.
                 let base_alpha = layer.opacity.get(&frame.params, env, 1.0);
                 self.paint_span(
-                    ctx, pose, env, source, *corner, allocation, swatch, frame, body_len,
+                    ctx,
+                    pose,
+                    env,
+                    source,
+                    *corner,
+                    allocation,
+                    swatch,
+                    frame,
+                    texture_time_turns,
+                    body_len,
                     base_alpha,
                 )
             }
@@ -1170,6 +1285,7 @@ impl CompositeSkin {
         allocation: Allocation,
         swatch: &Swatch,
         frame: &Frame,
+        texture_time_turns: f64,
         _body_len: f64,
         // The layer's own opacity, already set on the context. Sources that
         // modulate alpha multiply into it and restore to it, so a layer that
@@ -1332,6 +1448,8 @@ impl CompositeSkin {
                     fit,
                     fade,
                     drift_cells,
+                    raster_overhang_px,
+                    raster_texels_per_cell,
                 } => {
                     let Some(region) = self.atlas.region(*region) else {
                         ctx.restore();
@@ -1345,20 +1463,33 @@ impl CompositeSkin {
                     // the whole region for still art. This is the only place
                     // the clock touches an image layer, and it moves numbers
                     // rather than op structure.
-                    let (sx, sy, sw, sh) = region.source_rect(frame.time_turns);
+                    let (sx, sy, sw, sh) = region.source_rect(texture_time_turns);
                     let faded = fade.is_some_and(|fade| !fade.is_noop());
+                    let source_overhang = if *raster_overhang_px == 0 {
+                        0.0
+                    } else {
+                        f64::from(*raster_texels_per_cell) * f64::from(*raster_overhang_px)
+                            / f64::from(skin_schema::v2::RASTER_BODY_TEXELS_PER_CELL)
+                    };
+                    let body_sh = (sh - source_overhang * 2.0).max(1e-6);
+                    let visible_overhang =
+                        crate::skin::space::raster_overhang_cells(cell, *raster_overhang_px);
+                    let paint_t = -0.5 - visible_overhang;
+                    let paint_h = 1.0 + visible_overhang * 2.0;
 
                     let failed = match fit {
                         // A texture: as many repeats as this run's slice holds.
-                        crate::skin::layer::Fit::Tile { cells_per_repeat } => {
+                        crate::skin::layer::Fit::Tile {
+                            cells_per_repeat,
+                            phase_origin,
+                        } => {
                             // One repeat covers this many cells of body.
                             // Defaulting to the region's aspect keeps a
                             // texture's proportions when the author has said
                             // nothing; naming it lets one PNG be worn coarse or
                             // fine without being redrawn.
-                            let repeat_cells = cells_per_repeat
-                                .unwrap_or_else(|| sw / sh.max(1e-6))
-                                .max(1e-6);
+                            let repeat_cells =
+                                cells_per_repeat.unwrap_or_else(|| sw / body_sh).max(1e-6);
                             // Repeats are numbered from the span's start in arc
                             // length, so this run picks up exactly where the
                             // previous one left off and a corner is invisible
@@ -1369,16 +1500,20 @@ impl CompositeSkin {
                             // it lands on zero — and that is frame one, so the
                             // very first sample would disagree with every other.
                             let drifts = drift_cells.is_finite() && *drift_cells != 0.0;
-                            let phase = drift_phase(*drift_cells, repeat_cells, frame.time_turns);
+                            let phase = drift_phase(*drift_cells, repeat_cells, texture_time_turns);
                             // Scratch for the two-blit split, so a drifting
                             // pattern allocates nothing per frame.
                             let mut pair;
-                            let first = ((start - allocation.start) / repeat_cells).floor();
-                            let last = ((end - allocation.start) / repeat_cells).ceil();
+                            let phase_edge = match phase_origin {
+                                TilePhaseOrigin::Head => allocation.start,
+                                TilePhaseOrigin::Tail => allocation.end,
+                            };
+                            let first = ((start - phase_edge) / repeat_cells).floor();
+                            let last = ((end - phase_edge) / repeat_cells).ceil();
                             let mut index = first;
                             let mut failed = None;
                             while index < last && failed.is_none() {
-                                let repeat_start = allocation.start + index * repeat_cells;
+                                let repeat_start = phase_edge + index * repeat_cells;
                                 index += 1.0;
                                 let from = repeat_start.max(start);
                                 let to = (repeat_start + repeat_cells).min(end);
@@ -1439,9 +1574,9 @@ impl CompositeSkin {
                                                 ),
                                                 (
                                                     repeat_start + from_u * repeat_cells - run.s0,
-                                                    -0.5,
+                                                    paint_t,
                                                     (to_u - from_u) * repeat_cells,
-                                                    1.0,
+                                                    paint_h,
                                                 ),
                                             )
                                             .err();
@@ -1464,7 +1599,7 @@ impl CompositeSkin {
                             // One cell of body is `sh / tall` source pixels,
                             // in **both** axes — that is what "authored scale"
                             // means and why the picture comes out undistorted.
-                            let source_per_cell = sh / tall;
+                            let source_per_cell = body_sh / tall;
                             fade_pieces(fade.as_ref(), allocation, start, end, &mut pieces);
                             let mut failed = None;
                             for &(a, b, alpha) in &pieces {
@@ -1482,7 +1617,12 @@ impl CompositeSkin {
                                     .draw_image(
                                         image,
                                         (slice_x, sy, clipped_w, sh),
-                                        (a - run.s0, -tall / 2.0, drawn_cells, tall),
+                                        (
+                                            a - run.s0,
+                                            -tall / 2.0 - visible_overhang,
+                                            drawn_cells,
+                                            tall + visible_overhang * 2.0,
+                                        ),
                                     )
                                     .err();
                                 if failed.is_some() {
@@ -1501,7 +1641,7 @@ impl CompositeSkin {
                                 crate::skin::layer::Fit::Stretch => {
                                     sw / (allocation.end - allocation.start).max(1e-6)
                                 }
-                                _ => sh,
+                                _ => body_sh,
                             };
 
                             fade_pieces(fade.as_ref(), allocation, start, end, &mut pieces);
@@ -1527,7 +1667,7 @@ impl CompositeSkin {
                                     .draw_image(
                                         image,
                                         (slice_x, sy, clipped_w, sh),
-                                        (a - run.s0, -0.5, drawn_cells, 1.0),
+                                        (a - run.s0, paint_t, drawn_cells, paint_h),
                                     )
                                     .err();
                                 if failed.is_some() {
@@ -1884,6 +2024,8 @@ mod tests {
                 fit: crate::skin::layer::Fit::Clip,
                 fade: None,
                 drift_cells: 0.0,
+                raster_overhang_px: 0,
+                raster_texels_per_cell: 0,
             },
         );
         layer.kind = LayerKind::Span {
@@ -1893,6 +2035,8 @@ mod tests {
                 fit: crate::skin::layer::Fit::Clip,
                 fade: None,
                 drift_cells: 0.0,
+                raster_overhang_px: 0,
+                raster_texels_per_cell: 0,
             },
             corner: CornerPolicy::Bisector,
         };
@@ -2216,6 +2360,8 @@ mod tests {
                     fit,
                     fade: None,
                     drift_cells: 0.0,
+                    raster_overhang_px: 0,
+                    raster_texels_per_cell: 0,
                 },
                 corner: CornerPolicy::Own,
             },
@@ -2319,6 +2465,13 @@ mod tests {
 
     /// A texture and the body it covers, as `(source, dest)` blits.
     fn textured_skin(cells_per_repeat: Option<f64>) -> CompositeSkin {
+        textured_skin_with_phase(cells_per_repeat, TilePhaseOrigin::Head)
+    }
+
+    fn textured_skin_with_phase(
+        cells_per_repeat: Option<f64>,
+        phase_origin: TilePhaseOrigin,
+    ) -> CompositeSkin {
         CompositeSkin::with_atlas(
             "coat@test",
             "Coat",
@@ -2335,9 +2488,14 @@ mod tests {
                     Span::WHOLE,
                     Source::Image {
                         region: 0,
-                        fit: Fit::Tile { cells_per_repeat },
+                        fit: Fit::Tile {
+                            cells_per_repeat,
+                            phase_origin,
+                        },
                         fade: None,
                         drift_cells: 0.0,
+                        raster_overhang_px: 0,
+                        raster_texels_per_cell: 0,
                     },
                 ),
             ],
@@ -2446,6 +2604,219 @@ mod tests {
         assert_eq!(natural[0].1, 12.0);
     }
 
+    /// Tail-pinned art ends on an exact repeat boundary even as the snake
+    /// grows. Head remains the backward-compatible default.
+    #[test]
+    fn a_tiled_texture_can_pin_its_repeat_phase_to_the_tail() {
+        let body = [(0.0, 0.0), (4.0, 0.0)];
+        let head = blits(
+            &textured_skin_with_phase(Some(3.0), TilePhaseOrigin::Head),
+            &body,
+        );
+        let tail = blits(
+            &textured_skin_with_phase(Some(3.0), TilePhaseOrigin::Tail),
+            &body,
+        );
+
+        assert_eq!(
+            head.iter().map(|(_, width)| *width).collect::<Vec<_>>(),
+            vec![3.0, 2.0]
+        );
+        assert_eq!(head.last().expect("tail fragment").0, (0.0, 2.0 / 3.0));
+        assert_eq!(
+            tail.iter().map(|(_, width)| *width).collect::<Vec<_>>(),
+            vec![2.0, 3.0]
+        );
+        assert_eq!(
+            tail.last().expect("tail repeat").0,
+            (0.0, 1.0),
+            "the repeat touching the tail is complete"
+        );
+    }
+
+    fn raster_overhang_skin() -> CompositeSkin {
+        let mut image = span_layer(
+            "bounded-bleed-coat",
+            Region::Body,
+            Span::WHOLE,
+            Source::Image {
+                region: 0,
+                fit: Fit::Tile {
+                    cells_per_repeat: Some(4.0),
+                    phase_origin: TilePhaseOrigin::Head,
+                },
+                fade: None,
+                drift_cells: 0.0,
+                raster_overhang_px: 4,
+                raster_texels_per_cell: 16,
+            },
+        );
+        image.clip = ClipShape::RasterOverhang(4);
+
+        CompositeSkin::with_atlas(
+            "bounded-bleed@test",
+            "16 by 16 with bleed apron",
+            vec![
+                span_layer(
+                    "fallback",
+                    Region::Body,
+                    Span::WHOLE,
+                    Source::Solid(ColorSlot::Fill),
+                ),
+                image,
+                Layer {
+                    id: "boost-band".into(),
+                    region: Region::Signal,
+                    clip: ClipShape::Silhouette,
+                    kind: LayerKind::Ribbon {
+                        color: ColorSlot::Boost,
+                        extra: 6.0,
+                        joints: true,
+                        tail_cap: false,
+                        fill_before_strokes: false,
+                        refill_before_tail_cap: false,
+                        single_pass: false,
+                    },
+                    transform: LayerTransform::default(),
+                    boost_only: true,
+                    omit_on_single_cell: false,
+                    opacity: Binding::ONE,
+                },
+                Layer {
+                    id: "head-core".into(),
+                    region: Region::Head,
+                    clip: ClipShape::Silhouette,
+                    kind: LayerKind::HeadDisc {
+                        paint: DiscPaint::Slot(ColorSlot::HeadCore),
+                        radius: Binding::Const(0.38),
+                    },
+                    transform: LayerTransform::default(),
+                    boost_only: false,
+                    omit_on_single_cell: false,
+                    opacity: Binding::ONE,
+                },
+            ],
+            vec![frame()],
+            1_000.0,
+            CompositeConfig {
+                boost_color: "#fff200".to_string(),
+                head_core_color: "#333333".to_string(),
+                head_core_ratio: 0.38,
+                head_core_is_dark: true,
+                wave: None,
+            },
+            crate::skin::atlas::Atlas::new(
+                ["images/skins/bounded-bleed.png".to_string()],
+                vec![crate::skin::atlas::AtlasRegion {
+                    image: 0,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 24.0,
+                    frames: None,
+                }],
+            ),
+            None,
+            None,
+        )
+        .expect("bounded raster art plus late system signals is valid")
+    }
+
+    #[test]
+    fn raster_overhang_scales_across_straight_corner_and_short_poses() {
+        let skin = raster_overhang_skin();
+        for cell_size in [5.0, 10.0, 15.0] {
+            assert_eq!(
+                skin.metrics(false).visible_overhang_px(cell_size),
+                cell_size / 4.0
+            );
+            for cells in [
+                vec![(0.0, 0.0), (6.0, 0.0)],
+                vec![(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)],
+                vec![(0.0, 0.0)],
+            ] {
+                let mut recorder = crate::skin::paint::OpRecorder::new();
+                skin.paint_alive(
+                    &mut PaintCtx::recording(&mut recorder),
+                    &SnakePose::still(&cells, cell_size, false),
+                    &SkinIdentity {
+                        role: SnakeRole::Own,
+                        shade_slot: 0,
+                    },
+                )
+                .unwrap();
+                let image_blits = recorder.ops().iter().filter_map(|op| match op {
+                    crate::skin::paint::PaintOp::DrawImage {
+                        dest: (_, t, _, height),
+                        ..
+                    } => Some((*t, *height)),
+                    _ => None,
+                });
+                let mut count = 0;
+                for (t, height) in image_blits {
+                    count += 1;
+                    assert!((t + 0.75).abs() < 1e-9, "{cells:?} at {cell_size}px");
+                    assert!((height - 1.5).abs() < 1e-9, "{cells:?} at {cell_size}px");
+                }
+                assert!(
+                    count > 0,
+                    "short and cornered bodies must still sample their art"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boost_paints_above_raster_art_without_contracting_it() {
+        let skin = raster_overhang_skin();
+        let cells = [(0.0, 0.0), (6.0, 0.0)];
+        let record = |boost_active| {
+            let mut recorder = crate::skin::paint::OpRecorder::new();
+            skin.paint_alive(
+                &mut PaintCtx::recording(&mut recorder),
+                &SnakePose::still(&cells, 15.0, boost_active),
+                &SkinIdentity {
+                    role: SnakeRole::Own,
+                    shade_slot: 0,
+                },
+            )
+            .unwrap();
+            recorder
+        };
+        let resting = record(false);
+        let boosting = record(true);
+        let image_geometry = |recorder: &crate::skin::paint::OpRecorder| {
+            recorder
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    crate::skin::paint::PaintOp::DrawImage { source, dest, .. } => {
+                        Some((*source, *dest))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(image_geometry(&resting), image_geometry(&boosting));
+
+        let image_at = boosting
+            .ops()
+            .iter()
+            .rposition(|op| matches!(op, crate::skin::paint::PaintOp::DrawImage { .. }))
+            .expect("image art");
+        let boost_at = boosting
+            .ops()
+            .iter()
+            .position(|op| matches!(op, crate::skin::paint::PaintOp::SetFill(color) if color == "#fff200"))
+            .expect("system boost signal");
+        let core_at = boosting
+            .ops()
+            .iter()
+            .rposition(|op| matches!(op, crate::skin::paint::PaintOp::SetFill(color) if color == "#333333"))
+            .expect("system head core");
+        assert!(image_at < boost_at && boost_at < core_at);
+    }
+
     /// A coat does not restart at every turn.
     ///
     /// A corner splits a repeat into two blits — the runs are separate
@@ -2494,6 +2865,8 @@ mod tests {
                 fit: Fit::Clip,
                 fade: None,
                 drift_cells: 0.0,
+                raster_overhang_px: 0,
+                raster_texels_per_cell: 0,
             },
         );
         let problems = CompositeSkin::with_atlas(
@@ -2534,6 +2907,8 @@ mod tests {
                 fit: Fit::TILE,
                 fade: None,
                 drift_cells: 0.0,
+                raster_overhang_px: 0,
+                raster_texels_per_cell: 0,
             },
         );
         let problems = CompositeSkin::with_atlas(
@@ -2598,6 +2973,8 @@ mod tests {
                         fit: Fit::TILE,
                         fade: None,
                         drift_cells: 0.0,
+                        raster_overhang_px: 0,
+                        raster_texels_per_cell: 0,
                     },
                 )],
                 vec![frame()],
@@ -2641,9 +3018,12 @@ mod tests {
                     region: 0,
                     fit: Fit::Tile {
                         cells_per_repeat: cells,
+                        phase_origin: TilePhaseOrigin::Head,
                     },
                     fade: None,
                     drift_cells: 0.0,
+                    raster_overhang_px: 0,
+                    raster_texels_per_cell: 0,
                 },
             )
         };
@@ -2696,6 +3076,8 @@ mod tests {
                         fit,
                         fade,
                         drift_cells: drift,
+                        raster_overhang_px: 0,
+                        raster_texels_per_cell: 0,
                     },
                 ),
             ],
@@ -3057,6 +3439,8 @@ mod tests {
                         fit: Fit::Clip,
                         fade: Some(fade),
                         drift_cells: 0.0,
+                        raster_overhang_px: 0,
+                        raster_texels_per_cell: 0,
                     },
                 )],
                 vec![frame()],

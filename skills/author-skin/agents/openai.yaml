@@ -1,0 +1,6 @@
+interface:
+  display_name: "Author Snaketron Skin"
+  short_description: "Build an exact private SkinDoc v2 draft"
+  default_prompt: "Use $author-skin to implement this exact approved prototype or selected draft candidate as a validated private SkinDoc v2 build without publishing it."
+policy:
+  allow_implicit_invocation: true

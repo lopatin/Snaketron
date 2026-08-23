@@ -43,9 +43,49 @@ pub const MAX_LAYERS: usize = 24;
 /// Gradient stops are canvas `addColorStop` calls per run per frame.
 pub const MAX_GRADIENT_STOPS: usize = 8;
 pub const MIN_GRADIENT_STOPS: usize = 2;
-/// Texture references per document. Each is an image fetch and a decoded
-/// bitmap held for the life of the skin.
-pub const MAX_TEXTURE_REFS: usize = 4;
+/// Texture references per document. Independently extracted modifiers need
+/// their own immutable image, so the count permits a four-part base plus four
+/// reusable objects. Aggregate byte ceilings below keep this from multiplying
+/// the old four-image worst case.
+pub const MAX_TEXTURE_REFS: usize = 8;
+pub const MAX_TEXTURE_VARIANTS: usize = 4;
+/// Raster bleed is authored around the sprite subsystem's unchanged 16×16
+/// logical body cell.
+///
+/// A value of four stores four additional paint/alpha texels on each
+/// transverse side. The resulting 24-texel source row is a 16-texel body row
+/// plus two bleed aprons, not a wider game cell. Ladder rungs scale the aprons
+/// with their own `texels_per_cell`; this is not a live CSS-pixel measurement
+/// and never grants unbounded canvas access.
+pub const RASTER_BODY_TEXELS_PER_CELL: u32 = 16;
+pub const MAX_RASTER_OVERHANG_PX: u32 = 4;
+/// Largest decoded edge the browser will accept from a texture descriptor.
+///
+/// This mirrors the forge/server ceiling. A descriptor is part of the skin's
+/// immutable input, so the client checks the allocation *before* it asks the
+/// browser to decode attacker-controlled dimensions.
+pub const MAX_TEXTURE_DIMENSION_PX: u32 = 2_048;
+/// Largest compressed variant the renderer will accept.
+pub const MAX_TEXTURE_VARIANT_BYTES: u32 = 2 * 1_024 * 1_024;
+/// Decoded RGBA memory held for the one selected ladder rung.
+pub const MAX_TEXTURE_DECODED_BYTES: u64 =
+    MAX_TEXTURE_DIMENSION_PX as u64 * MAX_TEXTURE_DIMENSION_PX as u64 * 4;
+/// Total selected-rung decode memory per skin. This preserves the previous
+/// four-reference worst case while allowing more modest independent assets.
+pub const MAX_SKIN_TEXTURE_DECODED_BYTES: u64 = 4 * MAX_TEXTURE_DECODED_BYTES;
+/// Total selected-rung transfer/storage bytes per generated skin, likewise
+/// preserving the old four-reference ceiling.
+pub const MAX_SKIN_TEXTURE_COMPRESSED_BYTES: u64 = 4 * MAX_TEXTURE_VARIANT_BYTES as u64;
+/// The arena currently selects the rung closest to this density once when a
+/// document compiles. Schema cost validation uses the same selection rule.
+pub const PREFERRED_TEXTURE_TEXELS_PER_CELL: u32 = 32;
+/// Sheets may be tall, but this measured ceiling bounds decode memory and the
+/// source-rectangle corpus. It replaces the old product assumption of twenty
+/// rows; the actual reachable count is also limited by the skin period below.
+pub const MAX_SPRITE_FRAME_ROWS: u32 = 120;
+/// A browser cannot present more distinct animation frames than its render
+/// clock. Generation derives rows from this cap and the document period.
+pub const MAX_SPRITE_FRAME_RATE_FPS: f64 = 60.0;
 /// One level of grouping. Depth buys little and costs the panel legibility.
 pub const MAX_GROUP_DEPTH: usize = 1;
 /// A text source's content: one glyph per cell, repeating along the span.
@@ -294,10 +334,26 @@ pub enum FitV2 {
     Tile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cells_per_repeat: Option<f64>,
+        /// Which end of the allocated span owns a repeat boundary.
+        ///
+        /// `head` preserves the original compositor behaviour: the first
+        /// repeat starts at the allocation's head-ward edge. `tail` numbers
+        /// repeats backwards from the tail-ward edge, so variable body length
+        /// cannot leave a partial repeat at the tail.
+        #[serde(default)]
+        phase_origin: TilePhaseOriginV2,
     },
     Cutout {
         cells_tall: f64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TilePhaseOriginV2 {
+    #[default]
+    Head,
+    Tail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -470,6 +526,9 @@ pub struct BuiltinTexture {
     /// What to call it in a menu.
     pub label: &'static str,
     pub kind: TextureKindV2,
+    /// Exact source dimensions decoded by the current client.
+    pub width_px: u32,
+    pub height_px: u32,
 }
 
 pub const BUILTIN_TEXTURES: &[BuiltinTexture] = &[
@@ -477,36 +536,50 @@ pub const BUILTIN_TEXTURES: &[BuiltinTexture] = &[
         id: "stars-and-stripes.v1",
         label: "Stars and stripes",
         kind: TextureKindV2::Sheet,
+        width_px: 320,
+        height_px: 308,
     },
     BuiltinTexture {
         id: "race-livery.v1",
         label: "Race livery",
         kind: TextureKindV2::Sheet,
+        width_px: 1280,
+        height_px: 320,
     },
     BuiltinTexture {
         id: "tiger-live.v1",
         label: "Tiger, moving",
         kind: TextureKindV2::Sheet,
+        width_px: 896,
+        height_px: 320,
     },
     BuiltinTexture {
         id: "zebra-live.v1",
         label: "Zebra, moving",
         kind: TextureKindV2::Sheet,
+        width_px: 576,
+        height_px: 320,
     },
     BuiltinTexture {
         id: "jaguar.v1",
         label: "Jaguar",
         kind: TextureKindV2::Coat,
+        width_px: 832,
+        height_px: 64,
     },
     BuiltinTexture {
         id: "tiger.v1",
         label: "Tiger",
         kind: TextureKindV2::Coat,
+        width_px: 832,
+        height_px: 64,
     },
     BuiltinTexture {
         id: "zebra.v1",
         label: "Zebra",
         kind: TextureKindV2::Coat,
+        width_px: 768,
+        height_px: 64,
     },
 ];
 
@@ -531,6 +604,89 @@ pub struct TextureRefV2 {
     #[serde(rename = "ref")]
     pub content_ref: String,
     pub kind: TextureKindV2,
+    /// Immutable, public rendering metadata resolved by the server before the
+    /// document is registered. Built-in art has the same metadata compiled
+    /// into the client and therefore omits this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<TextureDescriptorV2>,
+}
+
+/// Public rendering metadata for one logical texture.
+///
+/// Deliberately contains no owner, prompt, provider response, or moderation
+/// state. It is safe to travel with a public skin document, and because it is
+/// inside the canonical document bytes the compiler never guesses dimensions
+/// while a mutable manifest request is still in flight.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureDescriptorV2 {
+    pub kind: TextureKindV2,
+    /// Natural length/repeat along the snake. Independent from animation rows:
+    /// X is body space and Y is time, and neither is inferred from the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_columns: Option<u32>,
+    /// One row per animation moment. Present only for sheets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_rows: Option<u32>,
+    /// Visible/transparent bleed apron per transverse side around the fixed
+    /// 16×16 logical body cell. At the 16-texel rung, `4` is stored as a
+    /// 24-texel source row (`4 + 16 + 4`), without changing cell geometry.
+    /// Zero is the legacy one-cell-high layout.
+    ///
+    /// This is intrinsic immutable texture metadata, not permission for a
+    /// layer transform. The renderer clips it to a bounded expanded
+    /// silhouette and reports the same maximum through skin metrics.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub raster_overhang_px: u32,
+    pub variants: Vec<TextureVariantV2>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Source texels available on one side of a ladder rung.
+///
+/// Returns `None` when the bleed apron around the 16×16 body cell cannot be represented exactly at a
+/// rung's density. Refusing fractional source rows keeps frame boundaries
+/// byte-exact and avoids sampling a neighbouring animation moment.
+pub fn raster_overhang_texels(texels_per_cell: u32, raster_overhang_px: u32) -> Option<u32> {
+    let scaled = texels_per_cell.checked_mul(raster_overhang_px)?;
+    scaled
+        .is_multiple_of(RASTER_BODY_TEXELS_PER_CELL)
+        .then_some(scaled / RASTER_BODY_TEXELS_PER_CELL)
+}
+
+/// Total transverse source texels in one coat/sheet row.
+pub fn raster_row_texels(texels_per_cell: u32, raster_overhang_px: u32) -> Option<u32> {
+    let side = raster_overhang_texels(texels_per_cell, raster_overhang_px)?;
+    texels_per_cell.checked_add(side.checked_mul(2)?)
+}
+
+/// One immutable rung of a texture ladder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureVariantV2 {
+    /// Hash of this variant's bytes, not the logical texture/canonical rung.
+    pub content_ref: String,
+    /// Sanitized immutable route. The hash above must occur in this exact path.
+    pub url: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub bytes: u32,
+    pub texels_per_cell: u32,
+}
+
+/// The one immutable ladder rung the current renderer will decode.
+pub fn preferred_texture_variant(descriptor: &TextureDescriptorV2) -> Option<&TextureVariantV2> {
+    descriptor.variants.iter().min_by(|left, right| {
+        left.texels_per_cell
+            .abs_diff(PREFERRED_TEXTURE_TEXELS_PER_CELL)
+            .cmp(
+                &right
+                    .texels_per_cell
+                    .abs_diff(PREFERRED_TEXTURE_TEXELS_PER_CELL),
+            )
+            .then_with(|| right.texels_per_cell.cmp(&left.texels_per_cell))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +726,51 @@ pub struct SkinDocV2 {
 
 fn default_period_ms() -> f64 {
     2_000.0
+}
+
+/// Maximum number of distinct sprite rows a real 60 Hz renderer can visit in
+/// one cycle of this length. `ceil` is intentional: a partial final frame is
+/// still addressable before the loop returns to zero.
+pub fn max_reachable_sprite_rows(period_ms: f64) -> u32 {
+    ((period_ms.max(0.0) / 1_000.0 * MAX_SPRITE_FRAME_RATE_FPS).ceil() as u32)
+        .clamp(1, MAX_SPRITE_FRAME_ROWS)
+}
+
+/// Seam axes the forge must gate for one texture *as this document uses it*.
+/// A sheet always loops its final row back to row zero; X is required only
+/// when at least one image layer repeats the art along the body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeamAxesV2 {
+    pub x: bool,
+    pub y: bool,
+}
+
+pub fn required_seam_axes(doc: &SkinDocV2, texture_name: &str) -> SeamAxesV2 {
+    fn tiled_use(layers: &[LayerV2], texture_name: &str) -> bool {
+        layers.iter().any(|layer| match &layer.body {
+            LayerBodyV2::Group { layers } => tiled_use(layers, texture_name),
+            LayerBodyV2::Span {
+                source:
+                    SourceV2::Image {
+                        texture,
+                        fit: FitV2::Tile { .. },
+                        ..
+                    },
+                ..
+            } => texture == texture_name,
+            _ => false,
+        })
+    }
+
+    let sheet = doc
+        .textures
+        .iter()
+        .find(|texture| texture.name == texture_name)
+        .is_some_and(|texture| texture.kind == TextureKindV2::Sheet);
+    SeamAxesV2 {
+        x: tiled_use(&doc.layers, texture_name),
+        y: sheet,
+    }
 }
 
 /// Convert a v1 document to the v2 form.
@@ -791,7 +992,7 @@ impl EvalSite {
 
     /// `noise` is per-texel wherever it appears, so it is only affordable at
     /// the one site that already runs per cell.
-    fn allows_noise(self) -> bool {
+    pub fn allows_noise(self) -> bool {
         self == EvalSite::Cell
     }
 }
@@ -852,10 +1053,12 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
         ));
     }
     let mut texture_names = std::collections::BTreeSet::new();
+    let mut selected_decoded_bytes = 0u64;
+    let mut selected_compressed_bytes = 0u64;
     for (index, texture) in doc.textures.iter().enumerate() {
-        if !crate::content::is_content_ref(&texture.content_ref)
-            && !is_builtin_texture(&texture.content_ref)
-        {
+        let is_generated = crate::content::is_content_ref(&texture.content_ref);
+        let builtin = builtin_texture(&texture.content_ref);
+        if !is_generated && builtin.is_none() {
             errors.push(SkinDocError::new(
                 format!("textures[{index}].ref"),
                 format!(
@@ -869,12 +1072,77 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
                 ),
             ));
         }
+        if let Some(builtin) = builtin
+            && builtin.kind != texture.kind
+        {
+            errors.push(SkinDocError::new(
+                format!("textures[{index}].kind"),
+                format!(
+                    "declares {:?}, but `{}` is {:?} art",
+                    texture.kind, builtin.id, builtin.kind
+                ),
+            ));
+        }
         if !texture_names.insert(texture.name.as_str()) {
             errors.push(SkinDocError::new(
                 format!("textures[{index}].name"),
                 format!("`{}` is declared twice", texture.name),
             ));
         }
+
+        match (&texture.descriptor, is_generated) {
+            (Some(descriptor), true) => validate_texture_descriptor(
+                texture,
+                descriptor,
+                doc.period_ms,
+                &format!("textures[{index}].descriptor"),
+                &mut errors,
+            ),
+            (Some(_), false) => errors.push(SkinDocError::new(
+                format!("textures[{index}].descriptor"),
+                "first-party art uses the descriptor compiled into this client; remove the remote descriptor",
+            )),
+            (None, true) => errors.push(SkinDocError::new(
+                format!("textures[{index}].descriptor"),
+                "a generated texture must include the immutable public descriptor resolved at save time",
+            )),
+            (None, false) => {}
+        }
+
+        if let Some(art) = builtin {
+            selected_decoded_bytes = selected_decoded_bytes.saturating_add(
+                u64::from(art.width_px)
+                    .saturating_mul(u64::from(art.height_px))
+                    .saturating_mul(4),
+            );
+        } else if is_generated
+            && let Some(descriptor) = &texture.descriptor
+            && let Some(variant) = preferred_texture_variant(descriptor)
+        {
+            selected_decoded_bytes = selected_decoded_bytes.saturating_add(
+                u64::from(variant.width_px)
+                    .saturating_mul(u64::from(variant.height_px))
+                    .saturating_mul(4),
+            );
+            selected_compressed_bytes =
+                selected_compressed_bytes.saturating_add(u64::from(variant.bytes));
+        }
+    }
+    if selected_decoded_bytes > MAX_SKIN_TEXTURE_DECODED_BYTES {
+        errors.push(SkinDocError::new(
+            "textures",
+            format!(
+                "the selected atlas rungs decode to {selected_decoded_bytes} bytes, over the {MAX_SKIN_TEXTURE_DECODED_BYTES}-byte per-skin budget"
+            ),
+        ));
+    }
+    if selected_compressed_bytes > MAX_SKIN_TEXTURE_COMPRESSED_BYTES {
+        errors.push(SkinDocError::new(
+            "textures",
+            format!(
+                "the selected generated atlas rungs total {selected_compressed_bytes} compressed bytes, over the {MAX_SKIN_TEXTURE_COMPRESSED_BYTES}-byte per-skin budget"
+            ),
+        ));
     }
 
     // The head core: the same authority and the same rules as v1.
@@ -946,6 +1214,7 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
     for (index, layer) in doc.layers.iter().enumerate() {
         validate_layer(doc, layer, &format!("layers[{index}]"), 0, &mut errors);
     }
+    validate_image_fallbacks(&doc.layers, &mut errors);
 
     // What the skin actually paints, once the stack is known to be sound.
     // Structure can only say a colour is legal; this says the composite is
@@ -979,6 +1248,328 @@ pub fn validate_v2(doc: &SkinDocV2) -> Result<(), Vec<SkinDocError>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+struct OrderedLayer<'a> {
+    field: String,
+    body: &'a LayerBodyV2,
+    boost_only: bool,
+    omit_on_single_cell: bool,
+}
+
+fn flatten_for_validation<'a>(
+    layers: &'a [LayerV2],
+    prefix: &str,
+    inherited_boost: bool,
+    inherited_omit: bool,
+    out: &mut Vec<OrderedLayer<'a>>,
+) {
+    for (index, layer) in layers.iter().enumerate() {
+        let field = format!("{prefix}[{index}]");
+        let boost_only = inherited_boost || layer.boost_only;
+        let omit_on_single_cell = inherited_omit || layer.omit_on_single_cell;
+        match &layer.body {
+            LayerBodyV2::Group { layers } => flatten_for_validation(
+                layers,
+                &format!("{field}.layers"),
+                boost_only,
+                omit_on_single_cell,
+                out,
+            ),
+            body => out.push(OrderedLayer {
+                field,
+                body,
+                boost_only,
+                omit_on_single_cell,
+            }),
+        }
+    }
+}
+
+/// Every asynchronous image has a role-readable layer underneath it. A failed
+/// decode is therefore a degradation to an ordinary skin, never a blank span.
+fn validate_image_fallbacks(layers: &[LayerV2], errors: &mut Vec<SkinDocError>) {
+    let mut ordered = Vec::new();
+    flatten_for_validation(layers, "layers", false, false, &mut ordered);
+
+    for (at, image) in ordered.iter().enumerate() {
+        let LayerBodyV2::Span {
+            region,
+            span,
+            source: SourceV2::Image { .. },
+            ..
+        } = image.body
+        else {
+            continue;
+        };
+
+        let applies_whenever_image_does = |candidate: &OrderedLayer<'_>| {
+            (!candidate.boost_only || image.boost_only)
+                && (!candidate.omit_on_single_cell || image.omit_on_single_cell)
+        };
+        let covers = |candidate: &OrderedLayer<'_>| match candidate.body {
+            // A body ribbon is the ordinary base coat and covers every
+            // interior image region; a head ribbon covers the head region.
+            LayerBodyV2::Ribbon {
+                region: fallback_region,
+                ..
+            } => {
+                *fallback_region == RegionV2::Body
+                    || (*fallback_region == RegionV2::Head && *region == RegionV2::Head)
+            }
+            LayerBodyV2::Span {
+                region: fallback_region,
+                span: fallback_span,
+                source: SourceV2::Solid { .. } | SourceV2::Gradient { .. } | SourceV2::Band { .. },
+                ..
+            } => fallback_region == region && fallback_span == span,
+            _ => false,
+        };
+
+        if !ordered[..at]
+            .iter()
+            .any(|candidate| applies_whenever_image_does(candidate) && covers(candidate))
+        {
+            errors.push(SkinDocError::new(
+                format!("{}.source", image.field),
+                "an image needs an earlier solid, gradient, band, or body ribbon covering the same span; that fallback remains visible while pixels decode or if they fail",
+            ));
+        }
+    }
+}
+
+fn validate_texture_descriptor(
+    texture: &TextureRefV2,
+    descriptor: &TextureDescriptorV2,
+    period_ms: f64,
+    field: &str,
+    errors: &mut Vec<SkinDocError>,
+) {
+    if descriptor.kind != texture.kind {
+        errors.push(SkinDocError::new(
+            format!("{field}.kind"),
+            format!(
+                "descriptor says {:?}, but the texture declaration says {:?}",
+                descriptor.kind, texture.kind
+            ),
+        ));
+    }
+
+    if descriptor.raster_overhang_px > MAX_RASTER_OVERHANG_PX {
+        errors.push(SkinDocError::new(
+            format!("{field}.raster_overhang_px"),
+            format!(
+                "is {} authored pixels per side; the bounded 16-texel raster grid permits at most {MAX_RASTER_OVERHANG_PX}",
+                descriptor.raster_overhang_px
+            ),
+        ));
+    }
+
+    if descriptor.body_columns == Some(0) {
+        errors.push(SkinDocError::new(
+            format!("{field}.body_columns"),
+            "must be a positive number of body cells",
+        ));
+    }
+    if matches!(texture.kind, TextureKindV2::Coat | TextureKindV2::Sheet)
+        && descriptor.body_columns.is_none()
+    {
+        errors.push(SkinDocError::new(
+            format!("{field}.body_columns"),
+            "coat and sheet art must declare X independently as body columns",
+        ));
+    }
+
+    match (texture.kind, descriptor.frame_rows) {
+        (TextureKindV2::Sheet, Some(rows)) => {
+            if rows == 0 || rows > MAX_SPRITE_FRAME_ROWS {
+                errors.push(SkinDocError::new(
+                    format!("{field}.frame_rows"),
+                    format!("must be 1 to {MAX_SPRITE_FRAME_ROWS} animation rows"),
+                ));
+            }
+            let reachable = max_reachable_sprite_rows(period_ms);
+            if rows > reachable {
+                errors.push(SkinDocError::new(
+                    format!("{field}.frame_rows"),
+                    format!(
+                        "{rows} rows cannot all be presented in a {period_ms:.0}ms cycle at the measured {MAX_SPRITE_FRAME_RATE_FPS:.0}fps renderer limit; use at most {reachable}"
+                    ),
+                ));
+            }
+        }
+        (TextureKindV2::Sheet, None) => errors.push(SkinDocError::new(
+            format!("{field}.frame_rows"),
+            "a sheet must declare Y independently as animation rows",
+        )),
+        (_, Some(_)) => errors.push(SkinDocError::new(
+            format!("{field}.frame_rows"),
+            "only a sheet has animation rows",
+        )),
+        (_, None) => {}
+    }
+
+    if descriptor.variants.is_empty() || descriptor.variants.len() > MAX_TEXTURE_VARIANTS {
+        errors.push(SkinDocError::new(
+            format!("{field}.variants"),
+            format!("must contain 1 to {MAX_TEXTURE_VARIANTS} immutable ladder rungs"),
+        ));
+    }
+
+    let mut refs = std::collections::BTreeSet::new();
+    let mut rungs = std::collections::BTreeSet::new();
+    for (index, variant) in descriptor.variants.iter().enumerate() {
+        let variant_field = format!("{field}.variants[{index}]");
+        if !crate::content::is_content_ref(&variant.content_ref) {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.content_ref"),
+                "must be the sha256 content reference of this variant's own bytes",
+            ));
+        }
+        if !refs.insert(variant.content_ref.as_str()) {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.content_ref"),
+                "the same variant bytes are declared twice",
+            ));
+        }
+        if !rungs.insert(variant.texels_per_cell) {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.texels_per_cell"),
+                format!(
+                    "the {}-texel rung is declared twice",
+                    variant.texels_per_cell
+                ),
+            ));
+        }
+
+        let expected_url = format!("/api/textures/variants/{}.png", variant.content_ref);
+        if variant.url != expected_url {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.url"),
+                format!(
+                    "must be the sanitized immutable route `{expected_url}`; logical-texture/rung URLs are mutable"
+                ),
+            ));
+        }
+        if variant.width_px == 0
+            || variant.height_px == 0
+            || variant.width_px > MAX_TEXTURE_DIMENSION_PX
+            || variant.height_px > MAX_TEXTURE_DIMENSION_PX
+        {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.width_px"),
+                format!(
+                    "{}x{} is outside the 1..={MAX_TEXTURE_DIMENSION_PX}px decoded edge limit",
+                    variant.width_px, variant.height_px
+                ),
+            ));
+        }
+        let decoded = u64::from(variant.width_px)
+            .saturating_mul(u64::from(variant.height_px))
+            .saturating_mul(4);
+        if decoded > MAX_TEXTURE_DECODED_BYTES {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.width_px"),
+                format!(
+                    "decoded RGBA allocation is {decoded} bytes, over {MAX_TEXTURE_DECODED_BYTES}"
+                ),
+            ));
+        }
+        if variant.bytes == 0 || variant.bytes > MAX_TEXTURE_VARIANT_BYTES {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.bytes"),
+                format!("must be 1 to {MAX_TEXTURE_VARIANT_BYTES} compressed bytes"),
+            ));
+        }
+        if variant.texels_per_cell == 0 {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.texels_per_cell"),
+                "must be a positive sampling density",
+            ));
+            continue;
+        }
+
+        let Some(raster_side) =
+            raster_overhang_texels(variant.texels_per_cell, descriptor.raster_overhang_px)
+        else {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.texels_per_cell"),
+                format!(
+                    "the {}-texel rung cannot represent a {}px-per-side margin from the fixed {RASTER_BODY_TEXELS_PER_CELL}-texel authoring grid without a fractional source row",
+                    variant.texels_per_cell, descriptor.raster_overhang_px
+                ),
+            ));
+            continue;
+        };
+        let row_texels = variant
+            .texels_per_cell
+            .saturating_add(raster_side.saturating_mul(2));
+
+        if let Some(columns) = descriptor.body_columns
+            && variant.width_px != columns.saturating_mul(variant.texels_per_cell)
+        {
+            errors.push(SkinDocError::new(
+                format!("{variant_field}.width_px"),
+                format!(
+                    "{} body columns at {} texels each require {}px, not {}px",
+                    columns,
+                    variant.texels_per_cell,
+                    columns.saturating_mul(variant.texels_per_cell),
+                    variant.width_px
+                ),
+            ));
+        }
+        match texture.kind {
+            TextureKindV2::Sheet => {
+                if let Some(rows) = descriptor.frame_rows
+                    && variant.height_px != rows.saturating_mul(row_texels)
+                {
+                    errors.push(SkinDocError::new(
+                        format!("{variant_field}.height_px"),
+                        format!(
+                            "{rows} stored frame rows at {} body texels plus {raster_side}px bleed apron per side require {}px, not {}px",
+                            variant.texels_per_cell,
+                            rows.saturating_mul(row_texels),
+                            variant.height_px
+                        ),
+                    ));
+                }
+            }
+            TextureKindV2::Coat => {
+                if variant.height_px != row_texels {
+                    errors.push(SkinDocError::new(
+                        format!("{variant_field}.height_px"),
+                        format!(
+                            "a coat rung is one {}-texel body cell plus {raster_side}px bleed apron per side ({row_texels}px stored row)",
+                            variant.texels_per_cell
+                        ),
+                    ));
+                }
+            }
+            TextureKindV2::Overlay => {
+                let body_height = variant.height_px.checked_sub(raster_side.saturating_mul(2));
+                if body_height.is_none_or(|height| {
+                    height == 0 || !height.is_multiple_of(variant.texels_per_cell)
+                }) {
+                    errors.push(SkinDocError::new(
+                        format!("{variant_field}.height_px"),
+                        "after its two bounded bleed aprons, an overlay's height must contain whole authored body cells",
+                    ));
+                }
+            }
+        }
+    }
+
+    if !descriptor
+        .variants
+        .iter()
+        .any(|variant| variant.content_ref == texture.content_ref)
+    {
+        errors.push(SkinDocError::new(
+            format!("{field}.variants"),
+            "must include the canonical variant named by the texture declaration's ref",
+        ));
     }
 }
 
@@ -1421,6 +2012,7 @@ fn validate_source(
             }
             if let FitV2::Tile {
                 cells_per_repeat: Some(cells),
+                phase_origin: _,
             } = fit
                 && !(cells.is_finite() && *cells > 0.0)
             {
@@ -1462,6 +2054,15 @@ fn validate_source(
                 drift_cells,
                 errors,
             );
+            if drift_cells
+                .parse()
+                .is_ok_and(|expr| !expr.inputs().is_empty())
+            {
+                errors.push(SkinDocError::new(
+                    format!("{field}.source.drift_cells"),
+                    "image drift is a constant rate in cells per cycle; expressions are not compiled here yet, so a changing rate is rejected instead of being silently frozen to zero",
+                ));
+            }
         }
         SourceV2::Text {
             content,
@@ -1585,9 +2186,10 @@ fn source_ops(source: &SourceV2, runs: usize, cells: usize) -> usize {
         }
         SourceV2::Image { fit, fade, .. } => {
             let repeats = match fit {
-                FitV2::Tile { cells_per_repeat } => {
-                    (cells as f64 / cells_per_repeat.unwrap_or(1.0).max(0.25)).ceil() as usize + 1
-                }
+                FitV2::Tile {
+                    cells_per_repeat,
+                    phase_origin: _,
+                } => (cells as f64 / cells_per_repeat.unwrap_or(1.0).max(0.25)).ceil() as usize + 1,
                 _ => 1,
             };
             let slices = fade.map_or(1, |fade| {
@@ -1932,6 +2534,7 @@ pub fn templates() -> Vec<Template> {
         name: "flag".to_string(),
         content_ref: format!("{BUILTIN_TEXTURE_PREFIX}stars-and-stripes.v1"),
         kind: TextureKindV2::Sheet,
+        descriptor: None,
     });
     let mut flag = layer(
         "Flag",
@@ -2121,6 +2724,7 @@ mod exhaustiveness {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn small_parts(
         transform: TransformV2,
         span: SpanV2,
@@ -2128,6 +2732,8 @@ mod exhaustiveness {
         fade: FadeV2,
         core: HeadCoreV2,
         texture: TextureRefV2,
+        descriptor: TextureDescriptorV2,
+        variant: TextureVariantV2,
         color: ColorRef,
     ) {
         let TransformV2 {
@@ -2158,7 +2764,23 @@ mod exhaustiveness {
             name: _,
             content_ref: _,
             kind: _,
+            descriptor: _,
         } = texture;
+        let TextureDescriptorV2 {
+            kind: _,
+            body_columns: _,
+            frame_rows: _,
+            raster_overhang_px: _,
+            variants: _,
+        } = descriptor;
+        let TextureVariantV2 {
+            content_ref: _,
+            url: _,
+            width_px: _,
+            height_px: _,
+            bytes: _,
+            texels_per_cell: _,
+        } = variant;
         let ColorRef {
             target: _,
             lighten: _,
@@ -2169,6 +2791,35 @@ mod exhaustiveness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_anchors_use_rusts_exact_externally_tagged_shape() {
+        let cases = [
+            (AnchorV2::Whole, serde_json::json!("whole")),
+            (AnchorV2::Head, serde_json::json!("head")),
+            (AnchorV2::Tail, serde_json::json!("tail")),
+            (
+                AnchorV2::At { at: 1.0 },
+                serde_json::json!({ "at": { "at": 1.0 } }),
+            ),
+            (
+                AnchorV2::Fraction { fraction: 0.5 },
+                serde_json::json!({ "fraction": { "fraction": 0.5 } }),
+            ),
+        ];
+
+        for (anchor, expected) in cases {
+            assert_eq!(serde_json::to_value(anchor).expect("serializes"), expected);
+            assert_eq!(
+                serde_json::from_value::<AnchorV2>(expected).expect("deserializes"),
+                anchor
+            );
+        }
+        assert!(serde_json::from_value::<AnchorV2>(serde_json::json!({ "at": 1.0 })).is_err());
+        assert!(
+            serde_json::from_value::<AnchorV2>(serde_json::json!({ "fraction": 0.5 })).is_err()
+        );
+    }
 
     fn classic_v1() -> SkinDoc {
         serde_json::from_str(include_str!("../skins/classic.skin.json"))
@@ -2522,6 +3173,7 @@ mod tests {
             name: "lava".to_string(),
             content_ref: "not-a-ref".to_string(),
             kind: TextureKindV2::Coat,
+            descriptor: None,
         });
         let errors = validate_v2(&v2).expect_err("a malformed ref must fail");
         assert!(
@@ -2853,6 +3505,328 @@ mod tests {
                 panic!("shipped `{}` stops validating: {errors:?}", v1.id);
             }
         }
+    }
+
+    fn generated_texture(
+        name: &str,
+        kind: TextureKindV2,
+        body_columns: Option<u32>,
+        frame_rows: Option<u32>,
+    ) -> TextureRefV2 {
+        let content_ref = format!("sha256:{}", "a".repeat(64));
+        let texels_per_cell = 16;
+        let width_px = body_columns.unwrap_or(4) * texels_per_cell;
+        let height_px = match kind {
+            TextureKindV2::Sheet => frame_rows.unwrap_or(1) * texels_per_cell,
+            TextureKindV2::Coat => texels_per_cell,
+            TextureKindV2::Overlay => texels_per_cell * 2,
+        };
+        TextureRefV2 {
+            name: name.to_string(),
+            content_ref: content_ref.clone(),
+            kind,
+            descriptor: Some(TextureDescriptorV2 {
+                kind,
+                body_columns,
+                frame_rows,
+                raster_overhang_px: 0,
+                variants: vec![TextureVariantV2 {
+                    url: format!("/api/textures/variants/{content_ref}.png"),
+                    content_ref,
+                    width_px,
+                    height_px,
+                    bytes: 8_192,
+                    texels_per_cell,
+                }],
+            }),
+        }
+    }
+
+    fn image_layer(name: &str, fit: FitV2, drift: &str) -> LayerV2 {
+        LayerV2 {
+            name: format!("{name} pixels"),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Silhouette,
+                span: SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Image {
+                    texture: name.to_string(),
+                    fit,
+                    fade: None,
+                    drift_cells: PropExpr(drift.to_string()),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn generated_texture_descriptors_pin_shape_memory_and_variant_url() {
+        let mut doc = upgrade(&classic_v1());
+        // X and Y are intentionally different: neither may be inferred from
+        // the other. 48 columns by 64 moments is a valid tall sheet.
+        doc.textures.push(generated_texture(
+            "motion",
+            TextureKindV2::Sheet,
+            Some(48),
+            Some(64),
+        ));
+        assert!(validate_v2(&doc).is_ok(), "{:?}", validate_v2(&doc));
+
+        let mut no_descriptor = doc.clone();
+        no_descriptor.textures[0].descriptor = None;
+        let errors = validate_v2(&no_descriptor).expect_err("metadata cannot be guessed");
+        assert!(errors.iter().any(|error| {
+            error.field == "textures[0].descriptor" && error.problem.contains("save time")
+        }));
+
+        let mut mutable_url = doc.clone();
+        mutable_url.textures[0]
+            .descriptor
+            .as_mut()
+            .unwrap()
+            .variants[0]
+            .url = format!(
+            "/api/textures/by-ref/{}/16.png",
+            mutable_url.textures[0].content_ref
+        );
+        let errors = validate_v2(&mutable_url).expect_err("logical/rung route is mutable");
+        assert!(errors.iter().any(|error| {
+            error.field.ends_with("variants[0].url") && error.problem.contains("variant")
+        }));
+
+        let mut wrong_shape = doc.clone();
+        wrong_shape.textures[0]
+            .descriptor
+            .as_mut()
+            .unwrap()
+            .variants[0]
+            .height_px -= 1;
+        let errors = validate_v2(&wrong_shape).expect_err("rows must divide exactly");
+        assert!(errors.iter().any(|error| {
+            error.field.ends_with("variants[0].height_px") && error.problem.contains("frame rows")
+        }));
+    }
+
+    #[test]
+    fn raster_rows_keep_a_16x16_body_cell_inside_scaled_bleed_aprons() {
+        let mut doc = upgrade(&classic_v1());
+        let mut texture = generated_texture("wide", TextureKindV2::Coat, Some(4), None);
+        let descriptor = texture.descriptor.as_mut().unwrap();
+        descriptor.raster_overhang_px = 4;
+        descriptor.variants[0].height_px = 24;
+        doc.textures.push(texture);
+        doc.layers.push(image_layer(
+            "wide",
+            FitV2::Tile {
+                cells_per_repeat: Some(4.0),
+                phase_origin: TilePhaseOriginV2::Tail,
+            },
+            "0",
+        ));
+        assert!(validate_v2(&doc).is_ok(), "{:?}", validate_v2(&doc));
+
+        let mut wrong_row = doc.clone();
+        wrong_row.textures[0].descriptor.as_mut().unwrap().variants[0].height_px = 16;
+        let errors = validate_v2(&wrong_row).expect_err("a 16px row omits both 4px margins");
+        assert!(errors.iter().any(|error| {
+            error.field.ends_with("variants[0].height_px")
+                && error.problem.contains("24px stored row")
+        }));
+
+        let mut unbounded = doc.clone();
+        unbounded.textures[0]
+            .descriptor
+            .as_mut()
+            .unwrap()
+            .raster_overhang_px = 5;
+        let errors = validate_v2(&unbounded).expect_err("paint beyond the 4px strip is forbidden");
+        assert!(errors.iter().any(|error| {
+            error.field.ends_with("raster_overhang_px") && error.problem.contains("at most 4")
+        }));
+    }
+
+    #[test]
+    fn tile_phase_origin_defaults_to_head_for_existing_documents() {
+        let fit: FitV2 = serde_json::from_value(serde_json::json!({
+            "type": "tile",
+            "cells_per_repeat": 3.0
+        }))
+        .expect("the pre-phase tile shape remains readable");
+        assert_eq!(
+            fit,
+            FitV2::Tile {
+                cells_per_repeat: Some(3.0),
+                phase_origin: TilePhaseOriginV2::Head,
+            }
+        );
+    }
+
+    #[test]
+    fn eight_modest_texture_refs_fit_without_raising_the_old_memory_ceiling() {
+        let mut doc = upgrade(&classic_v1());
+        for index in 0..MAX_TEXTURE_REFS {
+            doc.textures.push(generated_texture(
+                &format!("object-{index}"),
+                TextureKindV2::Overlay,
+                None,
+                None,
+            ));
+        }
+        assert!(validate_v2(&doc).is_ok(), "{:?}", validate_v2(&doc));
+
+        doc.textures.push(generated_texture(
+            "one-too-many",
+            TextureKindV2::Overlay,
+            None,
+            None,
+        ));
+        let errors = validate_v2(&doc).expect_err("the count remains bounded");
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.field == "textures" && error.problem.contains("at most 8") })
+        );
+    }
+
+    #[test]
+    fn extra_texture_slots_do_not_multiply_the_previous_decode_budget() {
+        let mut doc = upgrade(&classic_v1());
+        for index in 0..5 {
+            let mut texture = generated_texture(
+                &format!("large-{index}"),
+                TextureKindV2::Overlay,
+                None,
+                None,
+            );
+            let variant = &mut texture.descriptor.as_mut().unwrap().variants[0];
+            variant.width_px = MAX_TEXTURE_DIMENSION_PX;
+            variant.height_px = MAX_TEXTURE_DIMENSION_PX;
+            variant.bytes = MAX_TEXTURE_VARIANT_BYTES;
+            doc.textures.push(texture);
+        }
+        let errors = validate_v2(&doc).expect_err("five maximum allocations exceed the old 4x cap");
+        assert!(errors.iter().any(|error| {
+            error.field == "textures" && error.problem.contains("per-skin budget")
+        }));
+    }
+
+    #[test]
+    fn sheet_rows_are_bounded_by_period_and_measured_render_rate() {
+        let mut doc = upgrade(&classic_v1());
+        doc.period_ms = 120.0;
+        doc.textures.push(generated_texture(
+            "too-fast",
+            TextureKindV2::Sheet,
+            Some(9),
+            Some(9),
+        ));
+        assert_eq!(max_reachable_sprite_rows(doc.period_ms), 8);
+        let errors = validate_v2(&doc).expect_err("ninth row cannot be presented");
+        assert!(errors.iter().any(|error| {
+            error.field == "textures[0].descriptor.frame_rows"
+                && error.problem.contains("use at most 8")
+        }));
+    }
+
+    #[test]
+    fn seam_axes_come_from_every_actual_image_use() {
+        let mut doc = upgrade(&classic_v1());
+        doc.textures.push(generated_texture(
+            "coat",
+            TextureKindV2::Coat,
+            Some(12),
+            None,
+        ));
+        doc.textures.push(generated_texture(
+            "sheet",
+            TextureKindV2::Sheet,
+            Some(48),
+            Some(64),
+        ));
+        doc.layers.push(image_layer("coat", FitV2::Clip, "0"));
+        doc.layers.push(LayerV2 {
+            name: "Nested sheet".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: expr_one(),
+            transform: TransformV2::default(),
+            body: LayerBodyV2::Group {
+                layers: vec![image_layer(
+                    "sheet",
+                    FitV2::Tile {
+                        cells_per_repeat: Some(48.0),
+                        phase_origin: TilePhaseOriginV2::Head,
+                    },
+                    "0",
+                )],
+            },
+        });
+
+        assert_eq!(
+            required_seam_axes(&doc, "coat"),
+            SeamAxesV2 { x: false, y: false }
+        );
+        assert_eq!(
+            required_seam_axes(&doc, "sheet"),
+            SeamAxesV2 { x: true, y: true }
+        );
+    }
+
+    #[test]
+    fn image_drift_is_never_silently_frozen() {
+        let mut doc = upgrade(&classic_v1());
+        doc.textures.push(generated_texture(
+            "coat",
+            TextureKindV2::Coat,
+            Some(12),
+            None,
+        ));
+        doc.layers.push(image_layer(
+            "coat",
+            FitV2::Tile {
+                cells_per_repeat: Some(12.0),
+                phase_origin: TilePhaseOriginV2::Head,
+            },
+            "2 * time",
+        ));
+        let errors = validate_v2(&doc).expect_err("changing drift is unsupported");
+        assert!(errors.iter().any(|error| {
+            error.field.ends_with("source.drift_cells") && error.problem.contains("silently frozen")
+        }));
+
+        if let LayerBodyV2::Span {
+            source: SourceV2::Image { drift_cells, .. },
+            ..
+        } = &mut doc.layers.last_mut().unwrap().body
+        {
+            *drift_cells = PropExpr("2 + 1".to_string());
+        }
+        assert!(validate_v2(&doc).is_ok(), "{:?}", validate_v2(&doc));
+    }
+
+    #[test]
+    fn every_image_has_a_fallback_that_exists_in_all_its_states() {
+        let mut doc = upgrade(&classic_v1());
+        doc.textures.push(generated_texture(
+            "coat",
+            TextureKindV2::Coat,
+            Some(12),
+            None,
+        ));
+        doc.layers.push(image_layer("coat", FitV2::Stretch, "0"));
+        assert!(validate_v2(&doc).is_ok(), "the body ribbon is underneath");
+
+        // A boost-only body does not exist while the always-on image decodes.
+        doc.layers[1].boost_only = true;
+        let errors = validate_v2(&doc).expect_err("fallback disappears outside boost");
+        assert!(errors.iter().any(|error| {
+            error.field.ends_with(".source") && error.problem.contains("fallback")
+        }));
     }
 
     #[test]

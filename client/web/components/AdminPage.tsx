@@ -7,10 +7,23 @@ import {
   isApiError,
 } from '../services/api';
 import type { RuntimeConfig, RuntimeConfigAuditPage, RuntimeConfigRecord } from '../types';
-import type { SkinSummary } from '../types/generated';
+import type { AdminSkinReview } from '../types/generated';
 import { MatchHistoryList } from './MatchHistoryList';
-import { getWasm, initWasm } from '../wasm';
+import { getWasm, initWasm, whenSkinAssetsSettle } from '../wasm';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
+import {
+  DEFAULT_SKIN_PERIOD_MS,
+  adminPublishDisabled,
+  adminPreviewTargetKey,
+  adminRejectActionLabel,
+  advanceSkinTimeline,
+  initialSkinPreviewPlaying,
+  shortContentRef,
+  skinAnimationPeriodMs,
+  skinDocumentUsesImages,
+  skinPreviewAssetError,
+} from '../utils/adminSkinPreview';
+import type { AdminSkinPreviewState, SkinAssetStatus } from '../utils/adminSkinPreview';
 
 type AdminSection = 'overview' | 'history' | 'skins' | 'configuration' | 'audit';
 
@@ -511,13 +524,26 @@ const AdminAudit: React.FC = () => {
  * here — palettes, contrast, the boost band, budgets. What is left is what a
  * machine cannot see: what a texture depicts, what a name says, and whether
  * either is someone else's property. So this view is deliberately about
- * *looking*, and the two decisions it offers are approve and take down.
+ * *looking*, with every decision tied to the immutable bytes on screen.
  */
 const AdminSkins: React.FC = () => {
-  const [skins, setSkins] = useState<SkinSummary[]>([]);
+  const [skins, setSkins] = useState<AdminSkinReview[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [reviewNotes, setReviewNotes] = useState<Record<number, string>>({});
+  const [previewStates, setPreviewStates] = useState<Record<string, AdminSkinPreviewState>>({});
+
+  const recordPreviewState = useCallback((
+    targetKey: string,
+    previewState: AdminSkinPreviewState,
+  ) => {
+    setPreviewStates((current) => (
+      current[targetKey] === previewState
+        ? current
+        : { ...current, [targetKey]: previewState }
+    ));
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -538,19 +564,32 @@ const AdminSkins: React.FC = () => {
 
   const decide = useCallback(
     async (
-      skin: SkinSummary,
+      skin: AdminSkinReview,
       publication: 'published' | 'unpublished' | 'disabled' | 'private',
     ) => {
       setBusyId(skin.skinId);
       setError(null);
       try {
-        await api.setSkinPublication(skin.skinId, publication, {
-          // Approve what was submitted, not whatever the head is now: the
-          // creator may have pushed a revision since asking.
-          revision: publication === 'published'
-            ? skin.pendingRevision ?? undefined
-            : undefined,
-        });
+        const reason = reviewNotes[skin.skinId]?.trim() || undefined;
+        await api.setSkinPublication(
+          skin.skinId,
+          publication === 'published'
+            ? {
+                decision: 'publish',
+                // Publish the bytes on screen, not a creator's moving head.
+                revision: skin.pendingRevision,
+                contentRef: skin.pendingContentRef,
+                reason,
+              }
+            : publication === 'private'
+              ? {
+                  decision: 'reject',
+                  revision: skin.pendingRevision,
+                  contentRef: skin.pendingContentRef,
+                  reason,
+                }
+              : { decision: 'setPublication', publication, reason },
+        );
         await load();
       } catch (nextError) {
         setError(errorMessage(nextError));
@@ -558,7 +597,7 @@ const AdminSkins: React.FC = () => {
         setBusyId(null);
       }
     },
-    [load],
+    [load, reviewNotes],
   );
 
   return (
@@ -590,30 +629,71 @@ const AdminSkins: React.FC = () => {
           {skins.map((skin) => (
             <li key={skin.skinId} data-testid={`admin-skin-${skin.skinId}`}>
               <div className="admin-skin-preview">
-                {skin.contentRef ? (
-                  <AdminSkinPreview contentRef={skin.contentRef} name={skin.name} />
-                ) : (
-                  <span className="admin-skin-preview-missing">No preview</span>
-                )}
+                <AdminSkinPreview
+                  contentRef={skin.pendingContentRef}
+                  name={skin.name}
+                  targetKey={adminPreviewTargetKey(
+                    skin.skinId,
+                    skin.pendingRevision,
+                    skin.pendingContentRef,
+                  )}
+                  onStateChange={recordPreviewState}
+                />
               </div>
               <div className="admin-skin-meta">
                 <strong>{skin.name}</strong>
                 <span>
                   {skin.creatorUsername ?? `user #${skin.creatorUserId}`}
                   {' · '}
-                  revision {skin.pendingRevision ?? skin.headRevision}
-                  {' · '}
                   {skin.publication}
+                </span>
+                <span
+                  className="admin-skin-target"
+                  title={skin.pendingContentRef}
+                  data-testid={`admin-skin-target-${skin.skinId}`}
+                >
+                  Pending revision {skin.pendingRevision}
+                  {' · '}
+                  {shortContentRef(skin.pendingContentRef)}
                 </span>
               </div>
               <div className="admin-skin-actions">
+                <label className="admin-skin-review-note">
+                  <span>Review note</span>
+                  <input
+                    type="text"
+                    value={reviewNotes[skin.skinId] ?? ''}
+                    maxLength={500}
+                    placeholder="Optional audit reason"
+                    onChange={(event) => setReviewNotes((current) => ({
+                      ...current,
+                      [skin.skinId]: event.target.value,
+                    }))}
+                  />
+                </label>
                 <button
                   type="button"
                   className="game-shell-button is-primary"
-                  disabled={busyId === skin.skinId}
+                  disabled={adminPublishDisabled(
+                    busyId === skin.skinId,
+                    previewStates[adminPreviewTargetKey(
+                      skin.skinId,
+                      skin.pendingRevision,
+                      skin.pendingContentRef,
+                    )],
+                  )}
+                  title={
+                    previewStates[adminPreviewTargetKey(
+                      skin.skinId,
+                      skin.pendingRevision,
+                      skin.pendingContentRef,
+                    )] === 'ready'
+                      ? undefined
+                      : 'Publish is available once the exact preview renders successfully.'
+                  }
                   onClick={() => void decide(skin, 'published')}
                 >
-                  Approve
+                  Publish this revision
                 </button>
                 <button
                   type="button"
@@ -621,18 +701,20 @@ const AdminSkins: React.FC = () => {
                   disabled={busyId === skin.skinId}
                   onClick={() => void decide(skin, 'private')}
                 >
-                  Reject
+                  {adminRejectActionLabel(skin.publishedRevision)}
                 </button>
                 {/* Distinct from reject on purpose: this one reaches replays
                     and everyone already wearing it. */}
-                <button
-                  type="button"
-                  className="game-shell-button is-destructive"
-                  disabled={busyId === skin.skinId}
-                  onClick={() => void decide(skin, 'disabled')}
-                >
-                  Take down
-                </button>
+                {skin.publishedRevision !== null ? (
+                  <button
+                    type="button"
+                    className="game-shell-button is-destructive"
+                    disabled={busyId === skin.skinId}
+                    onClick={() => void decide(skin, 'disabled')}
+                  >
+                    Take down published skin
+                  </button>
+                ) : null}
               </div>
             </li>
           ))}
@@ -642,29 +724,53 @@ const AdminSkins: React.FC = () => {
   );
 };
 
-/**
- * One queued skin, painted by the real renderer.
- *
- * A reviewer has to see what players will see, so this fetches and registers
- * the document exactly the way a match does rather than approximating it from
- * the skin's metadata.
- */
 const ADMIN_PREVIEW_CELL = 14;
 const ADMIN_PREVIEW_PAD = 8;
+
+interface AdminSkinPreviewProps {
+  contentRef: string;
+  name: string;
+  targetKey: string;
+  onStateChange: (targetKey: string, state: AdminSkinPreviewState) => void;
+}
+
+const previewFailureMessage = (cause: unknown): string => (
+  cause instanceof Error && cause.message
+    ? cause.message
+    : 'The exact skin document could not be rendered.'
+);
 
 /**
  * One queued skin, painted by the real renderer.
  *
  * A reviewer has to see what players will see, so this fetches and registers
  * the document exactly the way a match does, and frames it the way the browse
- * page does — a long body, cropped to itself. A thumbnail too small to judge
- * would defeat the only part of review a machine could not already do.
+ * page does — a long body, cropped to itself. Motion begins on explicit play
+ * so a 50-item queue does not silently run 50 render loops at once.
  */
-const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
+const AdminSkinPreview: React.FC<AdminSkinPreviewProps> = ({
   contentRef,
   name,
+  targetKey,
+  onStateChange,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const timelineRef = useRef<HTMLInputElement | null>(null);
+  const timelineOutputRef = useRef<HTMLOutputElement | null>(null);
+  const timeMsRef = useRef(0);
+  const [periodMs, setPeriodMs] = useState(DEFAULT_SKIN_PERIOD_MS);
+  const [previewState, setPreviewState] = useState<AdminSkinPreviewState>('loading');
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [loadedDocument, setLoadedDocument] = useState<{
+    contentRef: string;
+    usesImages: boolean;
+  } | null>(null);
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(() => (
+    typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  ));
+  const [playing, setPlaying] = useState(initialSkinPreviewPlaying);
   const [layout, setLayout] = useState({
     canvasWidth: 320,
     canvasHeight: 90,
@@ -674,17 +780,67 @@ const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
     offsetY: 48,
   });
 
+  const updatePreviewState = useCallback((
+    state: AdminSkinPreviewState,
+    message: string | null = null,
+  ) => {
+    setPreviewState(state);
+    setPreviewError(message);
+    onStateChange(targetKey, state);
+  }, [onStateChange, targetKey]);
+
+  const paint = useCallback((timeMs: number) => {
+    const wasm = getWasm();
+    const canvas = canvasRef.current;
+    if (!wasm || !canvas) {
+      throw new Error('The skin renderer is unavailable.');
+    }
+    wasm.renderSkinFixture(
+      canvas,
+      contentRef,
+      'longer_than_head_gradient',
+      'own',
+      ADMIN_PREVIEW_CELL,
+      false,
+      false,
+      timeMs,
+      false,
+    );
+  }, [contentRef]);
+
+  const failPreview = useCallback((cause: unknown) => {
+    setPlaying(false);
+    updatePreviewState('error', previewFailureMessage(cause));
+  }, [updatePreviewState]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return undefined;
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const onChange = (event: MediaQueryListEvent) => {
+      setPrefersReducedMotion(event.matches);
+      if (event.matches) setPlaying(false);
+    };
+    query.addEventListener('change', onChange);
+    return () => query.removeEventListener('change', onChange);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
+    updatePreviewState('loading');
+    setLoadedDocument(null);
+    setPlaying(false);
+    timeMsRef.current = 0;
     void (async () => {
-      await initWasm();
-      await ensureAuthoredSkins({ 0: contentRef });
-      const wasm = getWasm();
-      const canvas = canvasRef.current;
-      if (cancelled || !wasm || !canvas) {
-        return;
-      }
       try {
+        await initWasm();
+        const [document] = await Promise.all([
+          api.getSkinDocument(contentRef),
+          ensureAuthoredSkins({ 0: contentRef }),
+        ]);
+        const wasm = getWasm();
+        if (!wasm?.authoredSkinIsRegistered(contentRef)) {
+          throw new Error('The exact skin document could not be registered.');
+        }
         const bounds = JSON.parse(
           wasm.skinFixtureBounds(
             contentRef,
@@ -693,6 +849,16 @@ const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
             false,
           ),
         ) as { x: number; y: number; width: number; height: number };
+        if (
+          !Number.isFinite(bounds.width)
+          || !Number.isFinite(bounds.height)
+          || bounds.width <= 0
+          || bounds.height <= 0
+        ) {
+          throw new Error('The renderer returned no visible preview bounds.');
+        }
+        if (cancelled) return;
+        setPeriodMs(skinAnimationPeriodMs(document));
         setLayout({
           canvasWidth: Math.ceil(bounds.x + bounds.width + ADMIN_PREVIEW_PAD),
           canvasHeight: Math.ceil(bounds.y + bounds.height + ADMIN_PREVIEW_PAD),
@@ -701,51 +867,165 @@ const AdminSkinPreview: React.FC<{ contentRef: string; name: string }> = ({
           offsetX: Math.round(bounds.x - ADMIN_PREVIEW_PAD),
           offsetY: Math.round(bounds.y - ADMIN_PREVIEW_PAD),
         });
-      } catch {
-        // Keep the fallback framing.
+        setLoadedDocument({
+          contentRef,
+          usesImages: skinDocumentUsesImages(document),
+        });
+      } catch (cause) {
+        if (!cancelled) failPreview(cause);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [contentRef]);
+  }, [contentRef, failPreview, updatePreviewState]);
+
+  const syncTimeline = useCallback((timeMs: number) => {
+    const timeline = timelineRef.current;
+    if (timeline) {
+      timeline.value = String(Math.round(timeMs));
+      timeline.setAttribute('aria-valuetext', `${(timeMs / 1_000).toFixed(2)} seconds`);
+    }
+    if (timelineOutputRef.current) {
+      timelineOutputRef.current.textContent = `${(timeMs / 1_000).toFixed(2)}s`;
+    }
+  }, []);
+
+  // A first paint requests lazy textures. Only the repaint after those assets
+  // settle can prove that the exact submitted pixels, rather than a procedural
+  // fallback, reached this canvas.
+  useEffect(() => {
+    if (loadedDocument?.contentRef !== contentRef) return undefined;
+    let cancelled = false;
+    void (async () => {
+      try {
+        paint(0);
+        await whenSkinAssetsSettle(contentRef);
+        if (cancelled) return;
+        const wasm = getWasm();
+        if (!wasm) throw new Error('The skin renderer is unavailable.');
+        const beforeFinalPaint = JSON.parse(wasm.skinAssetStatus(contentRef)) as SkinAssetStatus;
+        paint(0);
+        const finalStatus = JSON.parse(wasm.skinAssetStatus(contentRef)) as SkinAssetStatus;
+        const assetError = skinPreviewAssetError(
+          finalStatus,
+          loadedDocument.usesImages,
+          beforeFinalPaint.drawCalls,
+        );
+        if (assetError) throw new Error(assetError);
+        if (!cancelled) updatePreviewState('ready');
+      } catch (cause) {
+        if (!cancelled) failPreview(cause);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    contentRef,
+    failPreview,
+    layout.canvasHeight,
+    layout.canvasWidth,
+    loadedDocument,
+    paint,
+    updatePreviewState,
+  ]);
 
   useEffect(() => {
-    const wasm = getWasm();
-    const canvas = canvasRef.current;
-    if (!wasm || !canvas) {
-      return;
-    }
+    timeMsRef.current %= periodMs;
+    syncTimeline(timeMsRef.current);
+  }, [periodMs, syncTimeline]);
+
+  useEffect(() => {
+    if (!playing || previewState !== 'ready') return undefined;
+    let previous: number | null = null;
+    let frame = requestAnimationFrame(function loop(now: number) {
+      if (previous !== null) {
+        timeMsRef.current = advanceSkinTimeline(timeMsRef.current, now - previous, periodMs);
+        syncTimeline(timeMsRef.current);
+        try {
+          paint(timeMsRef.current);
+        } catch (cause) {
+          failPreview(cause);
+          return;
+        }
+      }
+      previous = now;
+      frame = requestAnimationFrame(loop);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [failPreview, paint, periodMs, playing, previewState, syncTimeline]);
+
+  const scrub = useCallback((event: React.FormEvent<HTMLInputElement>) => {
+    const next = Number(event.currentTarget.value);
+    if (!Number.isFinite(next)) return;
+    timeMsRef.current = next;
+    syncTimeline(next);
     try {
-      wasm.renderSkinFixture(
-        canvas,
-        contentRef,
-        'longer_than_head_gradient',
-        'own',
-        ADMIN_PREVIEW_CELL,
-        false,
-        false,
-        640,
-        true,
-      );
-    } catch {
-      // An unpaintable skin is itself review-relevant; the empty tile says so.
+      paint(next);
+    } catch (cause) {
+      failPreview(cause);
     }
-  }, [contentRef, layout.canvasWidth, layout.canvasHeight]);
+  }, [failPreview, paint, syncTimeline]);
 
   return (
-    <div
-      className="admin-skin-crop"
-      style={{ width: layout.cropWidth, height: layout.cropHeight }}
-    >
-      <canvas
-        ref={canvasRef}
-        width={layout.canvasWidth}
-        height={layout.canvasHeight}
-        style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
-        role="img"
-        aria-label={`${name} preview`}
-      />
+    <div className="admin-skin-specimen">
+      <div
+        className="admin-skin-crop"
+        style={{ width: layout.cropWidth, height: layout.cropHeight }}
+      >
+        <canvas
+          ref={canvasRef}
+          width={layout.canvasWidth}
+          height={layout.canvasHeight}
+          style={{ marginLeft: -layout.offsetX, marginTop: -layout.offsetY }}
+          role="img"
+          aria-label={`${name} animated preview`}
+        />
+        {previewState !== 'ready' ? (
+          <span
+            className={`admin-skin-preview-state is-${previewState}`}
+            role={previewState === 'error' ? 'alert' : 'status'}
+          >
+            {previewState === 'error' ? 'Preview unavailable' : 'Loading exact preview…'}
+          </span>
+        ) : null}
+      </div>
+      <div className="admin-skin-motion">
+        <button
+          type="button"
+          className="admin-skin-play"
+          aria-label={playing ? `Pause ${name} animation` : `Play ${name} animation`}
+          aria-pressed={playing}
+          disabled={previewState !== 'ready'}
+          onClick={() => setPlaying((current) => !current)}
+        >
+          {playing ? 'Pause' : 'Play'}
+        </button>
+        <input
+          ref={timelineRef}
+          type="range"
+          min="0"
+          max={Math.max(1, Math.round(periodMs))}
+          step="1"
+          defaultValue="0"
+          aria-label={`${name} animation timeline`}
+          disabled={previewState !== 'ready'}
+          onInput={scrub}
+        />
+        <output ref={timelineOutputRef}>0.00s</output>
+      </div>
+      <span
+        className={`admin-skin-motion-note${prefersReducedMotion ? ' is-reduced' : ''}${previewState === 'error' ? ' is-error' : ''}`}
+      >
+        {previewState === 'error'
+          ? `Preview unavailable · ${previewError ?? 'render failed'}`
+          : prefersReducedMotion
+            ? 'Reduced motion detected · autoplay paused'
+            : previewState === 'loading'
+              ? 'Verifying exact document and assets…'
+              : `${(periodMs / 1_000).toFixed(2)}s loop`}
+      </span>
     </div>
   );
 };

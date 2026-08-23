@@ -9,11 +9,12 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 use crate::completion::{CompletionEffect, CompletionRecordV1, EffectApplyResult};
+use crate::factory_service::FactoryServiceCredential;
 use crate::generation::GenerationJob;
 use crate::season::Season;
 use crate::skin_store::{
     GrantSource, NewRevision, NewSkin, Publication, Skin, SkinGrant, SkinKind, SkinPage,
-    SkinRevision,
+    SkinReviewDecision, SkinRevision,
 };
 use crate::texture::Texture;
 use crate::wallet::{LedgerEntry, LedgerSource, Wallet};
@@ -103,6 +104,49 @@ pub trait Database: Send + Sync {
     ) -> Result<User>;
     async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
+
+    // ---- Durable Skin Factory service credentials -----------------------
+    //
+    // These records contain only a one-way digest of the opaque bearer
+    // secret. Defaults keep narrow test databases source-compatible; any
+    // production implementation must override them or service-token
+    // provisioning and authentication fail closed.
+    async fn create_factory_service_credential(
+        &self,
+        _credential: &FactoryServiceCredential,
+    ) -> Result<()> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
+    async fn get_factory_service_credential(
+        &self,
+        _credential_id: &str,
+    ) -> Result<Option<FactoryServiceCredential>> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
+    /// Atomically activate `replacement` and revoke the old credential.
+    async fn rotate_factory_service_credential(
+        &self,
+        _old_credential_id: &str,
+        _replacement: &FactoryServiceCredential,
+        _actor_user_id: i32,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
+    /// Revoke one credential. Repeating an already-completed revocation is an
+    /// idempotent success; a missing credential is an error.
+    async fn revoke_factory_service_credential(
+        &self,
+        _credential_id: &str,
+        _actor_user_id: i32,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        anyhow::bail!("Factory service credentials are not supported by this database")
+    }
+
     async fn update_user_mmr(&self, user_id: i32, mmr: i32) -> Result<()>;
     async fn update_guest_username(&self, user_id: i32, username: &str) -> Result<()>;
     async fn add_user_xp(&self, user_id: i32, xp_to_add: i32) -> Result<i32>; // Returns new total XP
@@ -131,8 +175,18 @@ pub trait Database: Send + Sync {
     /// Create a skin with its first revision, and grant it to its creator.
     async fn create_skin(&self, draft: NewSkin<'_>) -> Result<Skin>;
 
-    /// Append a revision and make it the head. Returns the updated skin.
-    async fn put_skin_revision(&self, skin_id: i32, revision: NewRevision<'_>) -> Result<Skin>;
+    /// Append a revision and make it the head in one transaction.
+    ///
+    /// `expected_head` is the revision the caller edited. A retry of the exact
+    /// same append converges on the already-written revision; a different
+    /// writer winning first is a typed conflict and never leaves an orphan or
+    /// advances the head to bytes other than the requested content hash.
+    async fn put_skin_revision(
+        &self,
+        skin_id: i32,
+        expected_head: u32,
+        revision: NewRevision<'_>,
+    ) -> Result<Skin>;
 
     /// Rename a skin, or re-price it.
     async fn update_skin_metadata(
@@ -150,7 +204,7 @@ pub trait Database: Send + Sync {
     /// This is the render path: a client holding only a `sha256:` reference out
     /// of a match snapshot needs the document and needs to know whether the
     /// skin it belongs to has been disabled.
-    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Option<(Skin, SkinRevision)>>;
+    async fn resolve_content_ref(&self, content_ref: &str) -> Result<Vec<(Skin, SkinRevision)>>;
 
     /// Published skins, newest first.
     async fn list_published_skins(
@@ -181,12 +235,37 @@ pub trait Database: Send + Sync {
     /// Ask for a revision to be reviewed, or clear the request.
     async fn set_skin_pending_revision(&self, skin_id: i32, revision: Option<u32>) -> Result<()>;
 
+    /// Clear one exact open request without racing a newer request away.
+    ///
+    /// A response-loss retry after the exact request was cleared is success;
+    /// a different pending revision is a typed conflict.
+    async fn clear_skin_pending_revision_exact(
+        &self,
+        skin_id: i32,
+        expected_revision: u32,
+    ) -> Result<()>;
+
     /// Everything waiting on a human, oldest first.
     async fn list_skins_awaiting_review(&self, limit: usize) -> Result<Vec<Skin>>;
 
     /// Mark a revision approved, which is what lets its text render for
     /// anyone but its creator.
     async fn approve_skin_revision(&self, skin_id: i32, revision: u32) -> Result<()>;
+
+    /// Finish one review as one durable decision.
+    ///
+    /// Publish and reject both bind `revision` and `content_ref` to the
+    /// immutable bytes the reviewer saw. Approval/rejection, publication,
+    /// audit, and queue removal are one DynamoDB transaction.
+    async fn decide_skin_review(
+        &self,
+        skin_id: i32,
+        decision: SkinReviewDecision,
+        revision: Option<u32>,
+        content_ref: Option<&str>,
+        actor_user_id: i32,
+        reason: Option<&str>,
+    ) -> Result<()>;
 
     /// Record that a revision has entered a match, the first time it does.
     ///
@@ -271,9 +350,31 @@ pub trait Database: Send + Sync {
 
     async fn get_texture(&self, texture_id: i32) -> Result<Option<Texture>>;
 
+    /// Opt a texture's immutable descriptor into or out of author reuse.
+    async fn set_texture_shareable(&self, texture_id: i32, shareable: bool) -> Result<()>;
+
+    /// Merge a successful exact-ladder re-gate into an existing texture row.
+    async fn update_texture_verification(
+        &self,
+        texture_id: i32,
+        shareable: bool,
+        verified_seam_axes: &[crate::texture::SeamAxis],
+        seams: crate::texture::SeamReport,
+    ) -> Result<()>;
+
     /// Resolve a texture by the hash of its canonical variant — the render
     /// path, which knows the reference and nothing else.
     async fn get_texture_by_ref(&self, content_ref: &str) -> Result<Option<Texture>>;
+
+    /// Resolve an exact immutable descriptor for a saving author.
+    async fn get_texture_for_use(
+        &self,
+        content_ref: &str,
+        descriptor: &skin_schema::v2::TextureDescriptorV2,
+        user_id: i32,
+        is_admin: bool,
+        required_seam_axes: &[crate::texture::SeamAxis],
+    ) -> Result<Option<Texture>>;
 
     async fn list_textures_by_owner(&self, user_id: i32, limit: usize) -> Result<Vec<Texture>>;
 

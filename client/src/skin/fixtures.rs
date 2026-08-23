@@ -134,7 +134,27 @@ pub const PREVIEW_ONLY_POSES: &[Pose] = &[
         name: "straight_19",
         cells: &[(18.0, 3.0), (0.0, 3.0)],
     },
+    Pose {
+        // The image-model geometry guide is rendered through the real painter
+        // at the live arena maximum (15 px/cell), then enlarged for review.
+        // One empty cell on every side keeps the round caps and any legal
+        // in-body antialiasing away from the canvas edge. This is deliberately
+        // preview-only: it is a framing fixture, not another conformance case,
+        // and adding it to POSES would rewrite the append-only golden corpus.
+        name: PROTOTYPE_GEOMETRY_POSE_NAME,
+        cells: &[(16.0, 1.0), (1.0, 1.0)],
+    },
 ];
+
+/// Repository-owned image-model guide pose and its exact framing in cells.
+///
+/// The body occupies x=1..17 and y=1..2 inside an 18x3 canvas. Coordinates
+/// are cell origins, head first; therefore `(16, 1)` is the right-facing head
+/// and `(1, 1)` is the tail. The Manhattan arc is 15 cells, hence 16 occupied
+/// cells after including the head cell.
+pub const PROTOTYPE_GEOMETRY_POSE_NAME: &str = "prototype_straight_16";
+#[cfg(test)]
+pub const PROTOTYPE_GEOMETRY_CANVAS_CELLS: (f64, f64) = (18.0, 3.0);
 
 /// Resolve a pose by name, preview-only bodies included.
 ///
@@ -306,6 +326,76 @@ mod tests {
                 "the Builder asks for `{name}` and nothing answers"
             );
         }
+    }
+
+    #[test]
+    fn prototype_geometry_contract_matches_the_real_preview_pose() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../skin-schema/prototype-geometry-v1.json"
+        ))
+        .expect("prototype geometry contract is valid JSON");
+        let source = &contract["renderer_source"];
+
+        assert_eq!(
+            source["fixture"].as_str(),
+            Some(PROTOTYPE_GEOMETRY_POSE_NAME)
+        );
+        let pose = pose_by_name(PROTOTYPE_GEOMETRY_POSE_NAME)
+            .expect("prototype geometry pose remains resolvable by the real painter");
+        let contract_cells: Vec<(f64, f64)> = source["compressed_cells_head_first"]
+            .as_array()
+            .expect("contract has compressed cells")
+            .iter()
+            .map(|cell| {
+                let pair = cell.as_array().expect("each cell is an x/y pair");
+                (
+                    pair[0].as_f64().expect("x is numeric"),
+                    pair[1].as_f64().expect("y is numeric"),
+                )
+            })
+            .collect();
+        assert_eq!(contract_cells, pose.cells);
+
+        let occupied_cells = pose
+            .cells
+            .windows(2)
+            .map(|pair| (pair[0].0 - pair[1].0).abs() + (pair[0].1 - pair[1].1).abs())
+            .sum::<f64>()
+            + 1.0;
+        assert_eq!(source["body_cells"].as_f64(), Some(occupied_cells));
+        assert_eq!(source["head_direction"].as_str(), Some("right"));
+        assert!(pose.cells[0].0 > pose.cells[1].0, "head must be rightmost");
+        assert_eq!(pose.cells[0].1, pose.cells[1].1, "guide must be straight");
+
+        let canvas = source["canvas_cells"]
+            .as_array()
+            .expect("contract has canvas cell dimensions");
+        assert_eq!(
+            (canvas[0].as_f64().unwrap(), canvas[1].as_f64().unwrap()),
+            PROTOTYPE_GEOMETRY_CANVAS_CELLS
+        );
+        assert_eq!(pose.cells, &[(16.0, 1.0), (1.0, 1.0)]);
+
+        let ordinary = pose_by_name("straight_16").expect("ordinary preview remains present");
+        let translated: Vec<(f64, f64)> =
+            pose.cells.iter().map(|(x, y)| (x - 1.0, y + 2.0)).collect();
+        assert_eq!(
+            translated, ordinary.cells,
+            "padding must not change body geometry"
+        );
+
+        let live_sizes: Vec<f64> = contract["live_cell_sizes_px"]
+            .as_array()
+            .expect("contract has live scales")
+            .iter()
+            .map(|value| value.as_f64().expect("live scale is numeric"))
+            .collect();
+        assert_eq!(live_sizes, CELL_SIZES);
+        assert_eq!(source["native_cell_px"].as_f64(), Some(15.0));
+        assert_eq!(
+            source["native_cell_px"].as_f64(),
+            CELL_SIZES.last().copied()
+        );
     }
 
     /// The shading engine needs a body whose runs are one cell long, and one

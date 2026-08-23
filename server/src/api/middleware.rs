@@ -5,11 +5,16 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
 
 use crate::db::Database;
 use crate::db::models::User;
+use crate::factory_service::{
+    FACTORY_SERVICE_TOKEN_PREFIX, FactoryServiceAuth, factory_service_credential_id,
+    factory_service_route_allowed, verify_factory_service_token_at,
+};
 use crate::matchmaking_pool::MatchmakingPool;
 
 use super::jwt::JwtManager;
@@ -54,6 +59,51 @@ pub struct AuthMiddlewareState {
     pub db: Arc<dyn Database>,
 }
 
+enum FactoryAuthenticationError {
+    Invalid,
+    Unavailable,
+}
+
+async fn authenticate_factory_service(
+    state: &AuthMiddlewareState,
+    token: &str,
+) -> Result<(AuthUser, FactoryServiceAuth), FactoryAuthenticationError> {
+    let credential_id =
+        factory_service_credential_id(token).ok_or(FactoryAuthenticationError::Invalid)?;
+    let credential = state
+        .db
+        .get_factory_service_credential(credential_id)
+        .await
+        .map_err(|_| FactoryAuthenticationError::Unavailable)?
+        .ok_or(FactoryAuthenticationError::Invalid)?;
+    if !verify_factory_service_token_at(&credential, token, Utc::now()) {
+        return Err(FactoryAuthenticationError::Invalid);
+    }
+    let user = state
+        .db
+        .get_user_by_id(credential.user_id)
+        .await
+        .map_err(|_| FactoryAuthenticationError::Unavailable)?
+        .ok_or(FactoryAuthenticationError::Invalid)?;
+    // A service credential is deliberately narrower than the account it is
+    // attached to, and it fails closed if the durable identity ever drifts to
+    // guest, stress-test, or administrator status.
+    if user.is_guest || user.is_stress_test || is_admin_user(&user) {
+        return Err(FactoryAuthenticationError::Invalid);
+    }
+    Ok((
+        AuthUser {
+            user_id: user.id,
+            username: user.username,
+            is_guest: false,
+            is_admin: false,
+        },
+        FactoryServiceAuth {
+            credential_id: credential.credential_id,
+        },
+    ))
+}
+
 pub async fn auth_middleware(
     State(state): State<AuthMiddlewareState>,
     mut request: Request,
@@ -76,7 +126,41 @@ pub async fn auth_middleware(
         }
     };
 
-    // Verify the token
+    if token.starts_with(FACTORY_SERVICE_TOKEN_PREFIX) {
+        let (auth_user, factory_auth) = match authenticate_factory_service(&state, token).await {
+            Ok(auth) => auth,
+            Err(FactoryAuthenticationError::Invalid) => {
+                return Ok((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Invalid or revoked factory service token" })),
+                )
+                    .into_response());
+            }
+            Err(FactoryAuthenticationError::Unavailable) => {
+                return Ok((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Authentication service unavailable" })),
+                )
+                    .into_response());
+            }
+        };
+        if !factory_service_route_allowed(request.method().as_str(), request.uri().path()) {
+            let mut response = (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "Factory service credential is not authorized for this route" })),
+            )
+                .into_response();
+            apply_private_no_store(&mut response);
+            return Ok(response);
+        }
+        request.extensions_mut().insert(auth_user);
+        request.extensions_mut().insert(factory_auth);
+        let mut response = next.run(request).await;
+        apply_private_no_store(&mut response);
+        return Ok(response);
+    }
+
+    // Verify an ordinary interactive JWT.
     match state.jwt_manager.verify_token(token) {
         Ok(claims) => {
             // Parse user_id from claims
@@ -162,7 +246,15 @@ pub async fn optional_auth_middleware(
         .map(str::to_string);
 
     let mut identified = false;
-    if let Some(token) = token
+    if let Some(token) = token.as_deref()
+        && token.starts_with(FACTORY_SERVICE_TOKEN_PREFIX)
+        && factory_service_route_allowed(request.method().as_str(), request.uri().path())
+        && let Ok((auth_user, factory_auth)) = authenticate_factory_service(&state, token).await
+    {
+        request.extensions_mut().insert(auth_user);
+        request.extensions_mut().insert(factory_auth);
+        identified = true;
+    } else if let Some(token) = token
         && let Ok(claims) = state.jwt_manager.verify_token(&token)
         && let Ok(user_id) = claims.sub.parse::<i32>()
         && let Ok(Some(user)) = state.db.get_user_by_id(user_id).await

@@ -78,6 +78,7 @@ pub enum PaintOp {
     MoveTo(f64, f64),
     LineTo(f64, f64),
     Arc(f64, f64, f64, f64, f64),
+    Ellipse(f64, f64, f64, f64, f64, f64, f64),
     Rect(f64, f64, f64, f64),
     ClosePath,
     Clip,
@@ -231,6 +232,9 @@ impl PaintOp {
             PaintOp::Arc(x, y, r, start, end) => {
                 format!("arc({x:?}, {y:?}, {r:?}, {start:?}, {end:?})")
             }
+            PaintOp::Ellipse(x, y, rx, ry, rotation, start, end) => {
+                format!("ellipse({x:?}, {y:?}, {rx:?}, {ry:?}, {rotation:?}, {start:?}, {end:?})")
+            }
             PaintOp::Rect(x, y, w, h) => format!("rect({x:?}, {y:?}, {w:?}, {h:?})"),
             PaintOp::ClosePath => "close_path".to_string(),
             PaintOp::Clip => "clip".to_string(),
@@ -276,6 +280,7 @@ impl PaintOp {
             PaintOp::MoveTo(..) => "move_to",
             PaintOp::LineTo(..) => "line_to",
             PaintOp::Arc(..) => "arc",
+            PaintOp::Ellipse(..) => "ellipse",
             PaintOp::Rect(..) => "rect",
             PaintOp::ClosePath => "close_path",
             PaintOp::Clip => "clip",
@@ -305,6 +310,12 @@ impl PaintOp {
                 Some((*x, *y, x + w, y + h))
             }
             PaintOp::Arc(x, y, r, _, _) => Some((x - r, y - r, x + r, y + r)),
+            PaintOp::Ellipse(x, y, rx, ry, rotation, _, _) => {
+                let (sin, cos) = rotation.sin_cos();
+                let half_w = ((rx * cos).powi(2) + (ry * sin).powi(2)).sqrt();
+                let half_h = ((rx * sin).powi(2) + (ry * cos).powi(2)).sqrt();
+                Some((x - half_w, y - half_h, x + half_w, y + half_h))
+            }
             PaintOp::DrawImage {
                 dest: (x, y, w, h), ..
             } => Some((*x, *y, x + w, y + h)),
@@ -730,6 +741,26 @@ impl<'a> PaintCtx<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn ellipse(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius_x: f64,
+        radius_y: f64,
+        rotation: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> Result<(), JsValue> {
+        if let PaintSink::Web(ctx) = &mut self.sink {
+            ctx.ellipse(x, y, radius_x, radius_y, rotation, start_angle, end_angle)?;
+        }
+        self.record(|| {
+            PaintOp::Ellipse(x, y, radius_x, radius_y, rotation, start_angle, end_angle)
+        });
+        Ok(())
+    }
+
     /// Add a rectangle subpath. Used to build the `cells` clip shape, which is
     /// a union of cell squares rather than the rounded silhouette.
     pub fn rect(&mut self, x: f64, y: f64, width: f64, height: f64) {
@@ -798,6 +829,7 @@ impl<'a> PaintCtx<'a> {
             ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
                 &element, source.0, source.1, source.2, source.3, dest.0, dest.1, dest.2, dest.3,
             )?;
+            crate::skin::atlas::record_draw(image);
         }
         self.record(|| PaintOp::DrawImage {
             image,

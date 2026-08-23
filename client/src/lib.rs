@@ -3,6 +3,18 @@ mod scenario;
 mod skin;
 mod tutorial;
 
+/// Validate a document through the exact compiler used by runtime skin
+/// registration.
+///
+/// The native skin-factory gate calls this boundary before it creates a server
+/// revision. Keeping the entry point here means a document cannot pass the
+/// schema-only CLI and then discover a stricter compositor invariant for the
+/// first time in Chromium.
+#[doc(hidden)]
+pub fn validate_skin_document_for_renderer(document_json: &str) -> Result<(), String> {
+    skin::registry::validate_document_for_renderer(document_json)
+}
+
 use common::{
     Direction, GameCommand, GameCommandMessage, GameEngine, GameEvent, GameEventMessage, GameState,
 };

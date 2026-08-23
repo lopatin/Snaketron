@@ -1,0 +1,46 @@
+[
+  {
+    "kind": "generate_asset",
+    "arguments": {
+      "schema_version": 2,
+      "request_id": "fixture_shell_coat",
+      "asset_index": 0,
+      "texture_name": "shell_coat",
+      "capability_role": "image_generator",
+      "operation": "generate",
+      "kind": "coat",
+      "input_artifacts": [],
+      "modifier": {
+        "logical_key": "shell_body",
+        "component_key": "B1",
+        "provenance_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "license_id": "owned-original",
+        "authorized_lineage_ids": ["fixture-worker-draft"]
+      },
+      "prompt": "1856x64 opaque x-seamless coat with irregular shell facets and no background.",
+      "width_px": 1856,
+      "height_px": 64,
+      "grid": {
+        "body_columns": 29,
+        "frame_rows": 1,
+        "texels_per_cell": 64,
+        "raster_overhang_px": 0,
+        "row_texels": 64
+      },
+      "required_wrap_axes": ["x"],
+      "tile_phase_origin": "head",
+      "transparency": "opaque",
+      "row_zero": "not_applicable",
+      "edge_contract": {
+        "transverse_policy": "not_applicable_opaque_fill",
+        "no_frame_or_repeat_gutters": true
+      },
+      "retention": {
+        "retain_inputs": true,
+        "retain_provider_output": true,
+        "retain_forged_output": true
+      },
+      "repair": { "method": "none", "mask_artifact": null }
+    }
+  }
+]

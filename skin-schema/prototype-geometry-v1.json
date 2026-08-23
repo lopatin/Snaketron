@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "id": "prototype-geometry-v1",
+  "guide": "fixtures/prototype-geometry-guide-v1.png",
+  "guide_sha256": "620c98c34f9d4cf0b7366954d48ab964653639d0b5e2a866110093b3de4d19ae",
+  "live_cell_sizes_px": [5, 10, 15],
+  "renderer_source": {
+    "fixture": "prototype_straight_16",
+    "compressed_cells_head_first": [[16, 1], [1, 1]],
+    "role": "own",
+    "native_cell_px": 15,
+    "canvas_cells": [18, 3],
+    "native_canvas": { "width_px": 270, "height_px": 45 },
+    "native_image": "fixtures/prototype-geometry-native-v1.png",
+    "native_sha256": "f7787181df0c3f3addd9f49f9e654f610996adac8d655d7569e6081752aa0999",
+    "skin_document": "fixtures/prototype-geometry-blank.skin.json",
+    "skin_document_sha256": "5deb17e404d1894ce195c5e43ba02e29ed562f88b7be58813a8ea83e75862829",
+    "body_cells": 16,
+    "head_direction": "right",
+    "head_core_ratio": 0.38
+  },
+  "presentation_transform": {
+    "type": "nearest_neighbor_integer_upscale",
+    "scale": 4
+  },
+  "prototype_projection": {
+    "version": "prototype-body-mask-v1",
+    "foreground_detection": {
+      "background_model": "robust_quadratic_border_rgb",
+      "border_fraction": 0.08,
+      "robust_keep_fraction": 0.8,
+      "robust_iterations": 2,
+      "max_border_samples": 8192,
+      "foreground_delta": 18,
+      "foreground_chroma_delta": 10,
+      "neutral_dark_delta": 42,
+      "axis_support_fraction": 0.006,
+      "max_axis_gap_fraction": 0.02,
+      "max_secondary_support_fraction": 0.35,
+      "max_center_offset_fraction": [0.2, 0.2],
+      "min_width_fraction": 0.25,
+      "max_height_fraction": 0.6,
+      "min_aspect_ratio": 2.0,
+      "max_input_pixels": 8388608
+    },
+    "mapping": {
+      "native_body_bbox_px": [15, 15, 255, 30],
+      "native_head_core_bbox_px": [241, 16, 254, 29],
+      "native_head_core_center_px": [247.5, 22.5],
+      "native_head_core_restore_radius_px": 6.75,
+      "source_resample": "center_aligned_bilinear_rgb8"
+    },
+    "output": {
+      "body_clip": "exact_renderer_reference_alpha",
+      "head_core": "exact_renderer_reference_pixels",
+      "background": "exact_guide_canvas_background",
+      "presentation": "contract_nearest_neighbor_integer_upscale",
+      "png": "deterministic_rgb8_filter0_zlib9"
+    }
+  },
+  "guide_canvas": {
+    "width_px": 1080,
+    "height_px": 180,
+    "background": "#666666",
+    "body_mask": "#ffffff",
+    "system_head_core": "#1c1c1c"
+  },
+  "invariants": [
+    "orthographic flat side view",
+    "one continuous one-cell-wide capsule-union silhouette",
+    "rightmost rounded cell is the head",
+    "leftmost endpoint is a rounded tail cap",
+    "centered system-owned head-core disc remains topmost",
+    "all authored body imagery stays inside the round silhouette",
+    "no articulated modules, gaps, perspective, oversized head, or pointed tail"
+  ]
+}

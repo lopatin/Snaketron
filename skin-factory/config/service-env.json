@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "required": [
+    {
+      "name": "GEMINI_API_KEY",
+      "consumer": ["smart_text", "visual_judge", "image_generator"],
+      "secret": true
+    },
+    {
+      "name": "SNAKETRON_FACTORY_SERVICE_TOKEN",
+      "consumer": ["private_skin_registration"],
+      "secret": true
+    }
+  ],
+  "optional": [
+    {
+      "name": "FAL_API_KEY",
+      "consumer": ["draft_animation_transition"],
+      "secret": true
+    },
+    {
+      "name": "FAL_KEY",
+      "consumer": ["draft_animation_transition_alias_import_only"],
+      "secret": true
+    },
+    {
+      "name": "LMSTUDIO_API_KEY",
+      "consumer": ["task_worker"],
+      "secret": true
+    },
+    {
+      "name": "SKIN_FACTORY_OUTBOX_WEBHOOK_URL",
+      "consumer": ["review_notification_outbox"],
+      "secret": false
+    },
+    {
+      "name": "SKIN_FACTORY_OUTBOX_WEBHOOK_TOKEN",
+      "consumer": ["review_notification_outbox"],
+      "secret": true
+    },
+    {
+      "name": "SNAKETRON_FACTORY_OPERATOR_TOKEN",
+      "consumer": ["human_publication_request", "cancellation", "immediate_publication"],
+      "secret": true,
+      "identity": "human_operator_only"
+    },
+    {
+      "name": "SKIN_FACTORY_REVIEW_TOKEN",
+      "consumer": ["human_review_gallery"],
+      "secret": true,
+      "identity": "human_operator_only"
+    },
+    {
+      "name": "SKIN_FACTORY_REVIEW_ACTOR",
+      "consumer": ["human_review_identity"],
+      "secret": false,
+      "identity": "human_operator_only"
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+{
+  "animation": {
+    "expression_clock": "baked_ring",
+    "image_drift": "constant_cells_per_cycle",
+    "reachable_row_formula": "min(max_sprite_frame_rows, ceil(period_ms / 1000 * max_sprite_frame_rate_fps))",
+    "sprite_clock": "continuous_period",
+    "sprite_row_zero_is_resting": true
+  },
+  "expression_constants": [
+    "pi",
+    "tau"
+  ],
+  "expression_functions": [
+    "sin",
+    "cos",
+    "saw",
+    "tri",
+    "pulse",
+    "fract",
+    "floor",
+    "abs",
+    "clamp",
+    "mix",
+    "smoothstep",
+    "step",
+    "min",
+    "max",
+    "noise"
+  ],
+  "expression_functions_by_site": {
+    "bounded": [
+      "sin",
+      "cos",
+      "saw",
+      "tri",
+      "pulse",
+      "fract",
+      "floor",
+      "abs",
+      "clamp",
+      "mix",
+      "smoothstep",
+      "step",
+      "min",
+      "max"
+    ],
+    "cell": [
+      "sin",
+      "cos",
+      "saw",
+      "tri",
+      "pulse",
+      "fract",
+      "floor",
+      "abs",
+      "clamp",
+      "mix",
+      "smoothstep",
+      "step",
+      "min",
+      "max",
+      "noise"
+    ],
+    "palette": [
+      "sin",
+      "cos",
+      "saw",
+      "tri",
+      "pulse",
+      "fract",
+      "floor",
+      "abs",
+      "clamp",
+      "mix",
+      "smoothstep",
+      "step",
+      "min",
+      "max"
+    ],
+    "snake": [
+      "sin",
+      "cos",
+      "saw",
+      "tri",
+      "pulse",
+      "fract",
+      "floor",
+      "abs",
+      "clamp",
+      "mix",
+      "smoothstep",
+      "step",
+      "min",
+      "max"
+    ]
+  },
+  "expression_inputs_by_site": {
+    "bounded": [
+      "time"
+    ],
+    "cell": [
+      "s",
+      "t",
+      "len",
+      "time",
+      "boost",
+      "seed"
+    ],
+    "palette": [
+      "time"
+    ],
+    "snake": [
+      "time",
+      "len",
+      "boost",
+      "seed"
+    ]
+  },
+  "group_flags": {
+    "boost_only": "propagated_to_children",
+    "omit_on_single_cell": "propagated_to_children"
+  },
+  "image_contract": {
+    "descriptor_required_for_generated": true,
+    "fallback_layer_required": true,
+    "max_repair_attempts_per_join": 1,
+    "raster_overhang": {
+      "cross_snake_compositing": "bounded_bleed_may_overlap_occupied_cells_and_follows_normal_snake_draw_order",
+      "logical_body_cell": "16x16_texels",
+      "stored_transverse_row": "scaled_bleed_apron + texels_per_cell + scaled_bleed_apron",
+      "units": "authored_bleed_pixels_per_side_around_unchanged_16x16_body_cell",
+      "visible_clip": "bounded_transverse_expansion_with_unchanged_longitudinal_caps"
+    },
+    "repair_backend": "local_simple_lama",
+    "repair_methods": [
+      "tx_t_inpaint",
+      "roll_and_repair"
+    ],
+    "seam_axes_by_usage": {
+      "sheet": [
+        "y"
+      ],
+      "tile": [
+        "x"
+      ]
+    },
+    "variant_url_template": "/api/textures/variants/{variant_content_ref}.png"
+  },
+  "image_fits": [
+    "clip",
+    "stretch",
+    "tile",
+    "cutout"
+  ],
+  "image_kinds": {
+    "coat": {
+      "body_columns": "required",
+      "frame_rows": "forbidden",
+      "intrinsic_seam_axes": []
+    },
+    "overlay": {
+      "body_columns": "optional",
+      "frame_rows": "forbidden",
+      "intrinsic_seam_axes": []
+    },
+    "sheet": {
+      "body_columns": "required",
+      "frame_rows": "required",
+      "intrinsic_seam_axes": [
+        "y"
+      ]
+    }
+  },
+  "layer_types": [
+    "group",
+    "ribbon",
+    "span",
+    "head_disc",
+    "head_ramp"
+  ],
+  "limits": {
+    "expression_animation_steps": 32,
+    "max_animation_period_ms": 60000.0,
+    "max_flattened_layers": 24,
+    "max_gradient_stops": 8,
+    "max_group_depth": 1,
+    "max_ops_per_snake": 200,
+    "max_raster_overhang_px": 4,
+    "max_skin_texture_compressed_bytes": 8388608,
+    "max_skin_texture_decoded_bytes": 67108864,
+    "max_sprite_frame_rate_fps": 60.0,
+    "max_sprite_frame_rows": 120,
+    "max_text_content_length": 24,
+    "max_texture_decoded_bytes": 16777216,
+    "max_texture_dimension_px": 2048,
+    "max_texture_refs": 8,
+    "max_texture_variant_bytes": 2097152,
+    "max_texture_variants": 4,
+    "min_animation_period_ms": 120.0,
+    "min_gradient_stops": 2,
+    "raster_body_texels_per_cell": 16
+  },
+  "manifest_version": 1,
+  "schema_version": 2,
+  "source_types": [
+    "solid",
+    "gradient",
+    "band",
+    "image",
+    "text"
+  ],
+  "tile_phase_origins": [
+    "head",
+    "tail"
+  ]
+}

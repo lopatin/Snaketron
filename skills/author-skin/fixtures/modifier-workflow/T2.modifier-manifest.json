@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "modifier_id": "modifier:concept-modifier-workflow:sha256:2020202020202020202020202020202020202020202020202020202020202020",
+  "logical_key": "tail_detail",
+  "component_key": "T2",
+  "content_sha256": "sha256:2020202020202020202020202020202020202020202020202020202020202020",
+  "forge_manifest_sha256": "sha256:2323232323232323232323232323232323232323232323232323232323232323",
+  "descriptor_sha256": "sha256:2424242424242424242424242424242424242424242424242424242424242424",
+  "media_type": "image/png",
+  "provenance_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "license_id": "owned-original",
+  "authorized_lineage_ids": ["concept-modifier-workflow"],
+  "source_artifacts": ["sha256:2525252525252525252525252525252525252525252525252525252525252525"],
+  "extraction_report_sha256": "sha256:2626262626262626262626262626262626262626262626262626262626262626",
+  "video_report_sha256": null,
+  "created_by_operation_sha256": "sha256:2727272727272727272727272727272727272727272727272727272727272727",
+  "raster_overhang_px": 4,
+  "verification": {
+    "alpha_matte": "transparent_rgba_verified",
+    "background_contamination": "pass",
+    "edge_fringes": "pass",
+    "outer_frame_edge": "pass_transparent_effect",
+    "frame_gutters": "pass",
+    "immutable_bytes": true
+  }
+}

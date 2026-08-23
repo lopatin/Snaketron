@@ -26,7 +26,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 
 use crate::skin_store::{
-    GrantSource, NewRevision, Publication, Skin, SkinGrant, SkinKind, SkinRevision,
+    GrantSource, NewRevision, Publication, Skin, SkinGrant, SkinKind, SkinNamespace, SkinRevision,
 };
 
 /// Sort keys are zero-padded so lexicographic order is numeric order; six
@@ -55,6 +55,34 @@ pub fn content_ref_index_partition(content_ref: &str) -> String {
     format!("SKINREF#{content_ref}")
 }
 
+pub fn create_idempotency_partition(user_id: i32) -> String {
+    format!("SKIN_CREATE#{user_id}")
+}
+
+pub fn create_idempotency_sort_key(key: &str) -> String {
+    let digest = skin_schema::content::reference_for_bytes(key.as_bytes());
+    format!("IDEMP#{}", digest.trim_start_matches("sha256:"))
+}
+
+pub fn create_idempotency_item(
+    user_id: i32,
+    key: &str,
+    request_hash: &str,
+    skin_id: i32,
+    created_at_ms: i64,
+) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert(
+        "pk".to_string(),
+        string(create_idempotency_partition(user_id)),
+    );
+    item.insert("sk".to_string(), string(create_idempotency_sort_key(key)));
+    item.insert("skinId".to_string(), number(skin_id));
+    item.insert("requestHash".to_string(), string(request_hash));
+    item.insert("createdAtMs".to_string(), number(created_at_ms));
+    item
+}
+
 /// The one partition every open review request sits in.
 ///
 /// A constant partition would normally be a hot-partition mistake, and here it
@@ -66,6 +94,63 @@ pub const REVIEW_QUEUE_PARTITION: &str = "SKIN_REVIEW_QUEUE";
 
 /// The sort key of the marker item that puts a skin in the review queue.
 pub const REVIEW_QUEUE_SORT_KEY: &str = "REVIEWQUEUE";
+
+/// A retry-stable key for one exact moderation decision.
+pub fn review_decision_sort_key(
+    publication: Publication,
+    revision: Option<u32>,
+    content_ref: Option<&str>,
+    actor_user_id: i32,
+    reason: Option<&str>,
+) -> String {
+    let identity = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        publication.as_str(),
+        revision.map_or_else(String::new, |value| value.to_string()),
+        content_ref.unwrap_or_default(),
+        actor_user_id,
+        reason.unwrap_or_default(),
+    );
+    let digest = skin_schema::content::reference_for_bytes(identity.as_bytes());
+    format!("REVIEW#{}", digest.trim_start_matches("sha256:"))
+}
+
+/// The immutable audit row written in the same transaction as publication.
+pub fn review_decision_item(
+    skin_id: i32,
+    publication: Publication,
+    revision: Option<u32>,
+    content_ref: Option<&str>,
+    actor_user_id: i32,
+    reason: Option<&str>,
+    at_ms: i64,
+) -> HashMap<String, AttributeValue> {
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), string(skin_partition(skin_id)));
+    item.insert(
+        "sk".to_string(),
+        string(review_decision_sort_key(
+            publication,
+            revision,
+            content_ref,
+            actor_user_id,
+            reason,
+        )),
+    );
+    item.insert("publication".to_string(), string(publication.as_str()));
+    item.insert("actorUserId".to_string(), number(actor_user_id));
+    item.insert("atMs".to_string(), number(at_ms));
+    if let Some(revision) = revision {
+        item.insert("revision".to_string(), number(revision));
+    }
+    if let Some(content_ref) = content_ref {
+        item.insert("contentRef".to_string(), string(content_ref));
+    }
+    if let Some(reason) = reason {
+        item.insert("reason".to_string(), string(reason));
+    }
+    item
+}
 
 /// The marker item itself.
 pub fn review_queue_item(skin_id: i32, requested_at_ms: i64) -> HashMap<String, AttributeValue> {
@@ -87,6 +172,7 @@ pub fn skin_item(skin: &Skin) -> HashMap<String, AttributeValue> {
     item.insert("sk".to_string(), string("META"));
     item.insert("skinId".to_string(), number(skin.skin_id));
     item.insert("kind".to_string(), string(skin.kind.as_str()));
+    item.insert("namespace".to_string(), string(skin.namespace.as_str()));
     item.insert("creatorUserId".to_string(), number(skin.creator_user_id));
     if let Some(username) = &skin.creator_username {
         item.insert("creatorUsername".to_string(), string(username));
@@ -121,7 +207,7 @@ pub fn skin_item(skin: &Skin) -> HashMap<String, AttributeValue> {
         string(owner_index_partition(skin.creator_user_id)),
     );
     item.insert("gsi2sk".to_string(), string(sortable(skin.created_at_ms)));
-    if skin.publication.is_browsable() {
+    if skin.namespace.is_publishable() && skin.publication.is_browsable() {
         item.insert(
             "gsi1pk".to_string(),
             string(published_index_partition(skin.kind)),
@@ -141,6 +227,13 @@ pub fn skin_from_item(item: &HashMap<String, AttributeValue>) -> Result<Skin> {
         kind: read_string(item, "kind")
             .and_then(|value| SkinKind::parse(&value))
             .ok_or_else(|| anyhow!("skin item has no usable kind"))?,
+        // Rows created before evaluation fixtures existed are production
+        // skins. Unknown new values fail closed into the non-publishable
+        // namespace rather than silently entering the catalogue.
+        namespace: match read_string(item, "namespace") {
+            None => SkinNamespace::Production,
+            Some(value) => SkinNamespace::parse(&value).unwrap_or(SkinNamespace::Evaluation),
+        },
         creator_user_id: read_number(item, "creatorUserId")
             .ok_or_else(|| anyhow!("skin item has no creator"))?,
         creator_username: read_string(item, "creatorUsername"),
@@ -189,29 +282,55 @@ pub fn revision_item(
     }
     item.insert("validatedSchema".to_string(), number(new.validated_schema));
     item.insert("reviewApproved".to_string(), AttributeValue::Bool(false));
+    item.insert(
+        "containsText".to_string(),
+        AttributeValue::Bool(new.contains_text),
+    );
     item.insert("createdAtMs".to_string(), number(created_at_ms));
     item.insert(
         "gsi1pk".to_string(),
         string(content_ref_index_partition(new.content_ref)),
     );
-    item.insert("gsi1sk".to_string(), string(revision_sort_key(revision)));
+    // Several skins may intentionally contain identical canonical document
+    // bytes. Include both identities so the index order is total and stable;
+    // the read path still evaluates every candidate's visibility rather than
+    // treating the first row as the document's moderation state.
+    item.insert(
+        "gsi1sk".to_string(),
+        string(format!(
+            "SKIN#{skin_id:010}#{}",
+            revision_sort_key(revision)
+        )),
+    );
     item
 }
 
 pub fn revision_from_item(item: &HashMap<String, AttributeValue>) -> Result<SkinRevision> {
+    let document = read_string(item, "document").unwrap_or_default();
+    let contains_text = match item.get("containsText") {
+        Some(AttributeValue::Bool(value)) => *value,
+        _ => crate::skin_store::document_contains_authored_text(&document),
+    };
     Ok(SkinRevision {
         skin_id: read_number(item, "skinId").ok_or_else(|| anyhow!("revision has no skin id"))?,
         revision: read_number(item, "revision").ok_or_else(|| anyhow!("revision has no number"))?,
         content_ref: read_string(item, "contentRef")
             .ok_or_else(|| anyhow!("revision has no content reference"))?,
-        document: read_string(item, "document").unwrap_or_default(),
+        document,
         texture_refs: match item.get("textureRefs") {
-            Some(AttributeValue::Ss(refs)) => refs.clone(),
+            Some(AttributeValue::Ss(refs)) => {
+                let mut refs = refs.clone();
+                refs.sort();
+                refs.dedup();
+                refs
+            }
             _ => Vec::new(),
         },
         validated_schema: read_number(item, "validatedSchema").unwrap_or(1),
         exposed_at_ms: read_number::<i64>(item, "exposedAtMs"),
         review_approved: matches!(item.get("reviewApproved"), Some(AttributeValue::Bool(true))),
+        review_rejected: matches!(item.get("reviewRejected"), Some(AttributeValue::Bool(true))),
+        contains_text,
         created_at_ms: read_number(item, "createdAtMs").unwrap_or(0),
     })
 }
@@ -318,4 +437,86 @@ pub type ItemMap = HashMap<String, AttributeValue>;
 
 pub fn ensure_ok<T>(value: Option<T>, what: &str) -> Result<T> {
     value.with_context(|| context_for(what))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_rows_persist_texture_and_text_gates_and_have_total_index_order() {
+        let refs = vec![
+            format!("sha256:{}", "b".repeat(64)),
+            format!("sha256:{}", "a".repeat(64)),
+        ];
+        let document = "{}";
+        let content_ref = skin_schema::content::reference_for_bytes(document.as_bytes());
+        let new = NewRevision {
+            document,
+            content_ref: &content_ref,
+            texture_refs: &refs,
+            validated_schema: 2,
+            contains_text: true,
+        };
+        let item = revision_item(17, 3, &new, 100);
+        let stored = revision_from_item(&item).expect("round trips");
+        let mut expected_refs = refs;
+        expected_refs.sort();
+        assert_eq!(stored.texture_refs, expected_refs);
+        assert!(stored.contains_text);
+        assert!(!stored.review_approved);
+        assert!(!stored.review_rejected);
+        assert_eq!(
+            read_string(&item, "gsi1sk").as_deref(),
+            Some("SKIN#0000000017#REV#000003")
+        );
+
+        let mut legacy = item;
+        legacy.remove("containsText");
+        assert!(
+            revision_from_item(&legacy)
+                .expect("legacy row reads")
+                .contains_text,
+            "an absent gate on malformed legacy bytes must fail closed"
+        );
+    }
+
+    #[test]
+    fn retry_keys_and_review_audits_are_stable_and_payload_bound() {
+        assert_eq!(
+            create_idempotency_sort_key("concept-1"),
+            create_idempotency_sort_key("concept-1")
+        );
+        assert_ne!(
+            create_idempotency_sort_key("concept-1"),
+            create_idempotency_sort_key("concept-2")
+        );
+        let first = review_decision_sort_key(
+            Publication::Published,
+            Some(4),
+            Some("sha256:abc"),
+            9,
+            Some("approved"),
+        );
+        assert_eq!(
+            first,
+            review_decision_sort_key(
+                Publication::Published,
+                Some(4),
+                Some("sha256:abc"),
+                9,
+                Some("approved"),
+            )
+        );
+        assert_ne!(
+            first,
+            review_decision_sort_key(
+                Publication::Published,
+                Some(4),
+                Some("sha256:different"),
+                9,
+                Some("approved"),
+            )
+        );
+    }
 }

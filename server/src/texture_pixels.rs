@@ -87,10 +87,19 @@ fn seam_percentile(image: &RgbaImage, vertical: bool) -> f32 {
     }
 
     let channel_gap = |a: &image::Rgba<u8>, b: &image::Rgba<u8>| -> f64 {
-        (0..3)
-            .map(|c| (f64::from(a[c]) - f64::from(b[c])).abs())
-            .sum::<f64>()
-            / 3.0
+        // Canvas interpolation and compositing operate on premultiplied
+        // colour. Measuring straight RGB would count meaningless colour under
+        // fully transparent pixels, while measuring RGB alone (the previous
+        // implementation) misses the opposite and dangerous case: identical
+        // RGB whose alpha jumps at the loop boundary. Treat premultiplied RGB
+        // and alpha as four equally bounded visual components.
+        let alpha_a = f64::from(a[3]) / 255.0;
+        let alpha_b = f64::from(b[3]) / 255.0;
+        let premultiplied_rgb = (0..3)
+            .map(|c| (f64::from(a[c]) * alpha_a - f64::from(b[c]) * alpha_b).abs())
+            .sum::<f64>();
+        let alpha = (f64::from(a[3]) - f64::from(b[3])).abs();
+        (premultiplied_rgb + alpha) / 4.0
     };
 
     // The join, and every interior step it is being compared against.
@@ -126,6 +135,15 @@ fn seam_percentile(image: &RgbaImage, vertical: bool) -> f32 {
 
     let below = interior.iter().filter(|step| **step < join).count();
     below as f32 / interior.len().max(1) as f32
+}
+
+/// Measure the exact decoded bytes that will be served, without reshaping.
+pub fn seam_report(pixels: &Pixels) -> SeamReport {
+    SeamReport {
+        horizontal_ratio: seam_percentile(&pixels.image, false),
+        vertical_ratio: seam_percentile(&pixels.image, true),
+        repaired: false,
+    }
 }
 
 /// Crop the widest band of the requested aspect from the middle of an image.
@@ -175,8 +193,30 @@ pub fn shape(
     rows: Option<u32>,
     already_shaped: bool,
 ) -> Result<Shaped, TextureError> {
+    shape_with_raster_overhang(pixels, kind, rows, already_shaped, 0)
+}
+
+/// Shape a texture whose source row includes a bounded transverse bleed apron
+/// around the unchanged 16×16 logical body cell.
+pub fn shape_with_raster_overhang(
+    pixels: &Pixels,
+    kind: TextureKind,
+    rows: Option<u32>,
+    already_shaped: bool,
+    raster_overhang_px: u32,
+) -> Result<Shaped, TextureError> {
     let cell = kind.canonical_texels_per_cell();
-    let (target_width, target_height) = canonical_size(kind, rows);
+    if raster_overhang_px > skin_schema::v2::MAX_RASTER_OVERHANG_PX {
+        return Err(TextureError::new(
+            "rasterOverhangPx",
+            format!(
+                "{raster_overhang_px} authored pixels per side exceeds the {}px bound",
+                skin_schema::v2::MAX_RASTER_OVERHANG_PX
+            ),
+        ));
+    }
+    let (target_width, target_height) =
+        canonical_size_with_raster_overhang(kind, rows, raster_overhang_px)?;
 
     let canonical_image = if already_shaped {
         pixels.image.clone()
@@ -242,12 +282,35 @@ pub fn shape(
 
 /// The size a kind's canonical variant is stored at.
 pub fn canonical_size(kind: TextureKind, rows: Option<u32>) -> (u32, u32) {
+    canonical_size_with_raster_overhang(kind, rows, 0)
+        .expect("zero raster overhang is representable at every canonical density")
+}
+
+pub fn canonical_size_with_raster_overhang(
+    kind: TextureKind,
+    rows: Option<u32>,
+    raster_overhang_px: u32,
+) -> Result<(u32, u32), TextureError> {
+    if raster_overhang_px > skin_schema::v2::MAX_RASTER_OVERHANG_PX {
+        return Err(TextureError::new(
+            "rasterOverhangPx",
+            "exceeds the bounded bleed apron around the 16x16 body cell",
+        ));
+    }
+    let row =
+        skin_schema::v2::raster_row_texels(kind.canonical_texels_per_cell(), raster_overhang_px)
+            .ok_or_else(|| {
+                TextureError::new(
+                    "rasterOverhangPx",
+                    "cannot be represented exactly at the canonical texture density",
+                )
+            })?;
     match kind {
         // Twelve cells of body at 64 texels each, one cell tall.
-        TextureKind::Coat => (768, 64),
-        TextureKind::Overlay => (256, 64),
+        TextureKind::Coat => Ok((768, row)),
+        TextureKind::Overlay => Ok((256, row)),
         // A stack of frames, sixteen texels per cell.
-        TextureKind::Sheet => (320, 16 * rows.unwrap_or(20)),
+        TextureKind::Sheet => Ok((320, row * rows.unwrap_or(20))),
     }
 }
 
@@ -311,6 +374,56 @@ mod tests {
         );
     }
 
+    fn alpha_seam(width: u32, height: u32, vertical: bool) -> Pixels {
+        let mut image = RgbaImage::from_pixel(width, height, image::Rgba([80, 140, 220, 0]));
+        if vertical {
+            for x in 0..width {
+                image.put_pixel(x, height - 1, image::Rgba([80, 140, 220, 255]));
+            }
+        } else {
+            for y in 0..height {
+                image.put_pixel(width - 1, y, image::Rgba([80, 140, 220, 255]));
+            }
+        }
+        Pixels { image }
+    }
+
+    #[test]
+    fn an_alpha_discontinuity_fails_the_horizontal_wrap_gate_even_when_rgb_matches() {
+        let report = seam_report(&alpha_seam(32, 4, false));
+        assert!(
+            report.horizontal_ratio > SeamReport::ACCEPTABLE_RATIO,
+            "an opaque last column meeting a transparent first column must be an unusual X join: {report:?}"
+        );
+        assert!(!report.passes_axes(&[crate::texture::SeamAxis::X]));
+    }
+
+    #[test]
+    fn an_alpha_discontinuity_fails_the_vertical_wrap_gate_even_when_rgb_matches() {
+        let report = seam_report(&alpha_seam(4, 32, true));
+        assert!(
+            report.vertical_ratio > SeamReport::ACCEPTABLE_RATIO,
+            "an opaque last row meeting a transparent first row must be an unusual Y join: {report:?}"
+        );
+        assert!(!report.passes_axes(&[crate::texture::SeamAxis::Y]));
+    }
+
+    #[test]
+    fn hidden_rgb_under_full_transparency_does_not_invent_a_visible_seam() {
+        let mut image = RgbaImage::new(8, 8);
+        for (index, pixel) in image.pixels_mut().enumerate() {
+            *pixel = image::Rgba([
+                index as u8,
+                index.wrapping_mul(73) as u8,
+                index.wrapping_mul(151) as u8,
+                0,
+            ]);
+        }
+        let report = seam_report(&Pixels { image });
+        assert_eq!(report.horizontal_ratio, 0.0);
+        assert_eq!(report.vertical_ratio, 0.0);
+    }
+
     /// A ladder is built from the canonical image, so error does not compound.
     #[test]
     fn every_rung_is_the_kind_s_own_ladder() {
@@ -327,6 +440,31 @@ mod tests {
         for rung in &shaped.rungs {
             assert!(!rung.bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn a_16x16_body_with_transverse_bleed_builds_an_exact_scaled_ladder() {
+        let source = Pixels {
+            image: noise(768, 96),
+        };
+        let shaped = shape_with_raster_overhang(&source, TextureKind::Coat, None, true, 4)
+            .expect("the canonical 64-body-texel rung is 96px transverse");
+        assert_eq!(
+            (
+                shaped.canonical.texels_per_cell,
+                shaped.canonical.width_px,
+                shaped.canonical.height_px,
+            ),
+            (64, 768, 96)
+        );
+        assert_eq!(
+            shaped
+                .rungs
+                .iter()
+                .map(|rung| (rung.texels_per_cell, rung.width_px, rung.height_px))
+                .collect::<Vec<_>>(),
+            vec![(32, 384, 48), (16, 192, 24)]
+        );
     }
 
     /// A sheet's rows are moments in an animation; mirroring them would play

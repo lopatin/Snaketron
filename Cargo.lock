@@ -5316,6 +5316,7 @@ dependencies = [
  "skillratings",
  "skin-schema",
  "snaketron-service-api",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

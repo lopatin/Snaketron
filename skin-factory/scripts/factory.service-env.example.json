@@ -1,0 +1,5 @@
+{
+  "FAL_API_KEY": "replace-via-manage-service-credential.py-import-fal",
+  "GEMINI_API_KEY": "replace-with-a-service-scoped-gemini-key",
+  "SNAKETRON_FACTORY_SERVICE_TOKEN": "replace-via-manage-service-credential.py-provision"
+}

@@ -1,0 +1,73 @@
+{
+  "input_authority": {
+    "mode": "approved_prototype",
+    "artifact_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "authority_record_sha256": "sha256:f63ee176d0d965bd46662e2eb1f792c1dee26ba975751d4af35a881c4a000e24",
+    "human_approval_decision_id": "fixture-approval-texture",
+    "selection_rationale": null,
+    "maximum_driver_action": "register_private_revision"
+  },
+  "path": "texture",
+  "rationale": "A static coat retains irregular material detail; role-readable layers remain underneath and around it.",
+  "design_guidelines": {
+    "artistic_direction": "A polished shell mosaic with irregular facets and a clean role-coloured contour.",
+    "concept_twist": "A familiar armored shell surface is stretched into a continuously growing snake mosaic.",
+    "structure": "sprite",
+    "body_strategy": "Large facets reduce to a clear material cue at 4 cells, become legible by 6-7 cells, and x-tile across long turns without covering the head glow.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "Use one production-quality 64-texel-per-cell coat; its x join must remain visually seamless after every served transformation."
+  },
+  "common_period_ms": 2400,
+  "fidelity_features": [
+    "irregular shell facets",
+    "long non-obvious repeat",
+    "clean role contour"
+  ],
+  "layer_plan": [
+    "Outline and Body fallback ribbons remain readable without the atlas",
+    "Shell coat image tiles across the whole body above Body fallback",
+    "Head glow and system core preserve direction"
+  ],
+  "asset_plan": [
+    {
+      "kind": "coat",
+      "natural_length_cells": 29,
+      "frames": 1,
+      "desired_fps": null,
+      "texels_per_cell": 64,
+      "raster_overhang_px": 0,
+      "anchor": "whole",
+      "fit": "tile",
+      "tile_phase_origin": "head",
+      "fade": "none",
+      "transverse_edge_policy": "not_applicable_opaque_fill",
+      "prompt": "1856x64 opaque coat, 29 body cells, x-seamless irregular shell facets several cells wide; no border, vignette, head, tail, text, or background."
+    }
+  ],
+  "modifier_plan": [
+    {
+      "asset_index": 0,
+      "logical_key": "shell_body",
+      "component_key": "B1",
+      "texture_name": "shell_coat",
+      "image_layer_name": "Shell coat",
+      "fallback_layer_name": "Body fallback",
+      "span_limit_mode": "whole",
+      "span_limit_value": null,
+      "source_mode": "direct_generate",
+      "source_object_sha256": null,
+      "modifier_manifest_sha256": null,
+      "provenance_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "license_id": "owned-original",
+      "authorized_lineage_ids": ["fixture-texture"],
+      "required_capabilities": ["image_generator"],
+      "extraction": null,
+      "video": null
+    }
+  ],
+  "animation_plan": [],
+  "required_wrap_axes": ["x"],
+  "risks": [
+    "Facet clusters may expose a short repeat even after the join passes"
+  ]
+}

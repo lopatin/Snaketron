@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "target": "authoring-playbook-v1",
+  "editable_path": "references/playbook.md",
+  "start_marker": "<!-- GEPA_TUNABLE:START target=authoring-playbook-v1 -->",
+  "end_marker": "<!-- GEPA_TUNABLE:END -->",
+  "locked_paths": [
+    "SKILL.md",
+    "agents/openai.yaml",
+    "optimization-boundary.json",
+    "references/contract.md",
+    "references/design-guidelines.md",
+    "references/integration.md",
+    "references/layers-effects.md",
+    "references/modifiers-video.md",
+    "references/prototypes.md",
+    "references/textures-sprites.md",
+    "references/validation.md",
+    "schemas",
+    "scripts",
+    "templates",
+    "fixtures",
+    "tests"
+  ]
+}

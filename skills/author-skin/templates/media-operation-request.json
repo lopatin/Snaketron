@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "request_id": "extract_modifier_replace_me",
+  "operation": "extract_object",
+  "capability_id": "replace_with_exact_advertised_capability_id",
+  "input_artifacts": [
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "logical_key": "head_detail",
+  "component_key": "H",
+  "prompt": "Isolate exactly one component in the reserved empty arena. Remove the background and preserve verified transparent RGBA edge pixels.",
+  "output_kind": "transparent_rgba_object",
+  "journal": {
+    "retain_inputs": true,
+    "retain_provider_output": true,
+    "retain_output": true,
+    "retain_reports": true
+  },
+  "extraction": {
+    "source_arena": "reserved_empty",
+    "visible_object_count": 1,
+    "alpha_contract": "transparent_rgba",
+    "background_removal": "required",
+    "matte_policy": "fail_closed",
+    "crop_after_verification": true,
+    "fail_on_edge_contact": true
+  },
+  "video": null,
+  "reuse": null
+}

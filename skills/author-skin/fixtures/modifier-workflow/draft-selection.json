@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "mode": "draft_submission",
+  "candidate_sha256": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "manifest_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+  "selector_identity": "agent:fixture-selector",
+  "selection_rationale": "Candidate 2 preserves four independently placeable transition, base, and head components at game scale."
+}

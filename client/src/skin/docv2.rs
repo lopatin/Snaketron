@@ -23,7 +23,7 @@ use crate::skin::composite::{
 };
 use crate::skin::layer::{
     Binding, ColorSlot, DiscPaint, Fade, Fit, Layer, LayerKind, LayerTransform, Region, Source,
-    Span, Stop,
+    Span, Stop, TilePhaseOrigin,
 };
 use crate::skin::space::{ClipShape, CornerPolicy};
 use crate::skin::{
@@ -35,7 +35,7 @@ use skin_schema::expr::{Env, Expr, Input};
 use skin_schema::v2::{
     AnchorV2, ClipV2, ColorRef, ColorTarget, CornerV2, DiscPaintName, DiscPaintV2, FitV2,
     GradientAxis, LayerBodyV2, LayerV2, PropExpr, RegionV2, SkinDocV2, SlotName, SourceV2,
-    validate_v2,
+    TilePhaseOriginV2, validate_v2,
 };
 use skin_schema::{ANIMATION_STEPS, ColorPair, SkinDocError, derive_label_ink, shift_lightness};
 use std::sync::Arc;
@@ -151,25 +151,41 @@ fn multiply(left: Expr, right: &Expr) -> Expr {
     Expr::Bin(BinOp::Mul, Box::new(left), Box::new(right.clone()))
 }
 
-/// Flatten groups, multiplying each group's opacity into its children.
-fn flatten<'a>(layers: &'a [LayerV2], inherited: Option<&Expr>, into: &mut Vec<Flat<'a>>) {
+/// Flatten groups, multiplying opacity and propagating conditional visibility
+/// into every child. A group disappears structurally, but none of the meaning
+/// on the group may disappear with it.
+fn flatten<'a>(
+    layers: &'a [LayerV2],
+    inherited: Option<&Expr>,
+    inherited_boost: bool,
+    inherited_omit: bool,
+    into: &mut Vec<Flat<'a>>,
+) {
     for layer in layers {
         let own = parse_or_zero(&layer.opacity);
         let opacity = match inherited {
             Some(outer) => multiply(outer.clone(), &own),
             None => own,
         };
+        let boost_only = inherited_boost || layer.boost_only;
+        let omit_on_single_cell = inherited_omit || layer.omit_on_single_cell;
         match &layer.body {
             LayerBodyV2::Group { layers: children } => {
-                flatten(children, Some(&opacity), into);
+                flatten(
+                    children,
+                    Some(&opacity),
+                    boost_only,
+                    omit_on_single_cell,
+                    into,
+                );
             }
             body => into.push(Flat {
                 name: layer.name.clone(),
                 body,
                 opacity,
                 transform: &layer.transform,
-                boost_only: layer.boost_only,
-                omit_on_single_cell: layer.omit_on_single_cell,
+                boost_only,
+                omit_on_single_cell,
             }),
         }
     }
@@ -216,13 +232,37 @@ fn fit_of(fit: &FitV2) -> Fit {
     match fit {
         FitV2::Clip => Fit::Clip,
         FitV2::Stretch => Fit::Stretch,
-        FitV2::Tile { cells_per_repeat } => Fit::Tile {
+        FitV2::Tile {
+            cells_per_repeat,
+            phase_origin,
+        } => Fit::Tile {
             cells_per_repeat: *cells_per_repeat,
+            phase_origin: match phase_origin {
+                TilePhaseOriginV2::Head => TilePhaseOrigin::Head,
+                TilePhaseOriginV2::Tail => TilePhaseOrigin::Tail,
+            },
         },
         FitV2::Cutout { cells_tall } => Fit::Cutout {
             cells_tall: *cells_tall,
         },
     }
+}
+
+fn raster_overhang_of(doc: &SkinDocV2, texture_name: &str) -> u32 {
+    doc.textures
+        .iter()
+        .find(|texture| texture.name == texture_name)
+        .and_then(|texture| texture.descriptor.as_ref())
+        .map_or(0, |descriptor| descriptor.raster_overhang_px)
+}
+
+fn raster_texels_per_cell_of(doc: &SkinDocV2, texture_name: &str) -> u32 {
+    doc.textures
+        .iter()
+        .find(|texture| texture.name == texture_name)
+        .and_then(|texture| texture.descriptor.as_ref())
+        .and_then(skin_schema::v2::preferred_texture_variant)
+        .map_or(0, |variant| variant.texels_per_cell)
 }
 
 impl LayerSkin {
@@ -231,7 +271,7 @@ impl LayerSkin {
         validate_v2(doc)?;
 
         let mut flat = Vec::new();
-        flatten(&doc.layers, None, &mut flat);
+        flatten(&doc.layers, None, false, false, &mut flat);
 
         // One cycle's worth of steps only when something actually reads the
         // clock. A still document bakes a single frame, which is what keeps a
@@ -244,17 +284,7 @@ impl LayerSkin {
                     .iter()
                     .any(|(_, expr)| parse_or_zero(expr).inputs().contains(Input::Time))
                 || body_reads_clock(layer.body)
-        }) || doc.layers.iter().any(document_color_animates)
-            // A frame sheet animates without any expression saying so: its rows
-            // *are* moments, and the renderer walks them with the frame's own
-            // clock. Judging only by what reads `time` bakes a single frame and
-            // freezes the sheet on row zero — which looks exactly like a still
-            // texture, and is why this was found by watching rather than by
-            // reading.
-            || doc
-                .textures
-                .iter()
-                .any(|texture| matches!(texture.kind, skin_schema::v2::TextureKindV2::Sheet));
+        }) || doc.layers.iter().any(document_color_animates);
         let steps = if animates { ANIMATION_STEPS } else { 1 };
 
         let mut baker = Baker {
@@ -264,13 +294,23 @@ impl LayerSkin {
         let mut palette = Palette::default();
         let mut layers = Vec::with_capacity(flat.len() + 2);
 
-        // The Boost band, outermost and painted only while boosting. Pinned
-        // here rather than authored: an opponent has to be able to see that
-        // you are boosting, so neither its colour, its width, nor its place in
-        // the stack is a style choice.
-        layers.push(Layer {
+        let has_raster_overhang = flat.iter().any(|layer| {
+            matches!(
+                layer.body,
+                LayerBodyV2::Span {
+                    source: SourceV2::Image { texture, .. },
+                    ..
+                } if raster_overhang_of(doc, texture) > 0
+            )
+        });
+        // The Boost band is system-owned. Legacy documents keep its original
+        // first-contour position byte-for-byte. A document with bounded raster
+        // overhang paints the same band in the private Signal region after all
+        // authored pixels, so the art neither covers the telegraph nor pops
+        // inward when Boost toggles.
+        let boost_band = |region| Layer {
             id: "boost-band".into(),
-            region: Region::Contour,
+            region,
             clip: ClipShape::Silhouette,
             kind: LayerKind::Ribbon {
                 color: ColorSlot::Boost,
@@ -285,10 +325,17 @@ impl LayerSkin {
             boost_only: true,
             omit_on_single_cell: false,
             opacity: Binding::ONE,
-        });
+        };
+        if !has_raster_overhang {
+            layers.push(boost_band(Region::Contour));
+        }
 
         for layer in &flat {
             layers.push(compile_layer(layer, &mut baker, &mut palette, doc));
+        }
+
+        if has_raster_overhang {
+            layers.push(boost_band(Region::Signal));
         }
 
         // The head core, topmost. Its position is not authorable either, and
@@ -519,6 +566,13 @@ fn compile_layer(
             LayerBodyV2::HeadDisc { .. } | LayerBodyV2::Group { .. } => Region::Head,
         },
         clip: match flat.body {
+            LayerBodyV2::Span {
+                clip,
+                source: SourceV2::Image { texture, .. },
+                ..
+            } if raster_overhang_of(doc, texture) > 0 => {
+                ClipShape::RasterOverhang(raster_overhang_of(doc, texture))
+            }
             LayerBodyV2::Span { clip, .. } => clip_of(*clip),
             // The glow paints whole cell squares, which *is* the cells clip.
             LayerBodyV2::HeadRamp { .. } => ClipShape::Cells,
@@ -596,12 +650,16 @@ fn compile_source(
                 trail_cells: fade.trail_cells,
                 steps: fade.steps,
             }),
-            // Drift is a rate rather than a paint argument, so it is folded
-            // rather than bound; the renderer advances it from `time_turns`.
-            drift_cells: match bind(drift_cells) {
-                Binding::Const(value) => value,
-                _ => 0.0,
+            // Drift is a rate rather than a paint argument. Validation rejects
+            // any expression that reads an input; evaluate the proven constant
+            // directly so there is no "nonconstant means zero" fallback.
+            drift_cells: {
+                let parsed = drift_cells.parse().expect("validated drift expression");
+                debug_assert!(parsed.inputs().is_empty());
+                parsed.eval(&Env::default())
             },
+            raster_overhang_px: raster_overhang_of(doc, texture),
+            raster_texels_per_cell: raster_texels_per_cell_of(doc, texture),
         },
         SourceV2::Text {
             content,
@@ -721,11 +779,11 @@ struct ResolvedTexture {
 fn builtin_texture(name: &str) -> Option<ResolvedTexture> {
     let (file, width, height, rows) = match name {
         "stars-and-stripes.v1" => ("stars-and-stripes.v1", 320.0, 308.0, Some(14)),
-        "race-livery.v1" => ("race-livery.v1", 320.0, 320.0, Some(20)),
-        "tiger-live.v1" => ("tiger-live.v1", 320.0, 320.0, Some(20)),
-        "zebra-live.v1" => ("zebra-live.v1", 320.0, 320.0, Some(20)),
-        "jaguar.v1" => ("jaguar.v1", 768.0, 64.0, None),
-        "tiger.v1" => ("tiger.v1", 768.0, 64.0, None),
+        "race-livery.v1" => ("race-livery.v1", 1280.0, 320.0, Some(20)),
+        "tiger-live.v1" => ("tiger-live.v1", 896.0, 320.0, Some(20)),
+        "zebra-live.v1" => ("zebra-live.v1", 576.0, 320.0, Some(20)),
+        "jaguar.v1" => ("jaguar.v1", 832.0, 64.0, None),
+        "tiger.v1" => ("tiger.v1", 832.0, 64.0, None),
         "zebra.v1" => ("zebra.v1", 768.0, 64.0, None),
         _ => return None,
     };
@@ -739,6 +797,27 @@ fn builtin_texture(name: &str) -> Option<ResolvedTexture> {
 
 #[cfg(test)]
 mod builtin_asset_tests {
+    fn bytes(name: &str) -> &'static [u8] {
+        match name {
+            "stars-and-stripes.v1" => {
+                include_bytes!("../../web/public/images/skins/stars-and-stripes.v1.png")
+            }
+            "race-livery.v1" => {
+                include_bytes!("../../web/public/images/skins/race-livery.v1.png")
+            }
+            "tiger-live.v1" => {
+                include_bytes!("../../web/public/images/skins/tiger-live.v1.png")
+            }
+            "zebra-live.v1" => {
+                include_bytes!("../../web/public/images/skins/zebra-live.v1.png")
+            }
+            "jaguar.v1" => include_bytes!("../../web/public/images/skins/jaguar.v1.png"),
+            "tiger.v1" => include_bytes!("../../web/public/images/skins/tiger.v1.png"),
+            "zebra.v1" => include_bytes!("../../web/public/images/skins/zebra.v1.png"),
+            _ => panic!("no committed bytes for {name}"),
+        }
+    }
+
     /// Every piece of first-party art is filed under its own id.
     ///
     /// The Builder's texture picker builds a thumbnail URL from the id alone,
@@ -756,6 +835,31 @@ mod builtin_asset_tests {
                 format!("images/skins/{}.png", art.id),
                 "the picker builds this URL from the id and would 404"
             );
+
+            let png = bytes(art.id);
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{} is a PNG", art.id);
+            let dimension = |offset: usize| {
+                u32::from_be_bytes([
+                    png[offset],
+                    png[offset + 1],
+                    png[offset + 2],
+                    png[offset + 3],
+                ])
+            };
+            assert_eq!(
+                (resolved.width as u32, resolved.height as u32),
+                (dimension(16), dimension(20)),
+                "{} source rectangles must use the real PNG dimensions",
+                art.id
+            );
+            if let Some(rows) = resolved.rows {
+                assert_eq!(
+                    resolved.height as usize % rows,
+                    0,
+                    "{} rows must divide its real height exactly",
+                    art.id
+                );
+            }
         }
     }
 }
@@ -770,19 +874,26 @@ fn resolve_texture(texture: &skin_schema::v2::TextureRefV2) -> ResolvedTexture {
         return art;
     }
 
-    let (width, height) = canonical_texture_size(texture.kind);
+    let descriptor = texture
+        .descriptor
+        .as_ref()
+        .expect("generated texture descriptor was validated before compilation");
+    // The arena currently tops out around 15 CSS pixels per cell. Prefer the
+    // 32-texel rung (room for high DPI) and otherwise take the closest real
+    // rung, favouring the sharper one on a tie. The chosen descriptor supplies
+    // every dimension and the immutable URL; no filename or shape is guessed.
+    let variant = skin_schema::v2::preferred_texture_variant(descriptor)
+        .expect("generated descriptor has at least one validated variant");
     ResolvedTexture {
-        url: texture_url(&texture.content_ref),
-        width,
-        height,
-        // A generated sheet's rows are its declared frame count; the canonical
-        // ladder rung keeps the row height square.
-        rows: matches!(texture.kind, skin_schema::v2::TextureKindV2::Sheet).then_some(20),
+        url: descriptor_url(&variant.url),
+        width: f64::from(variant.width_px),
+        height: f64::from(variant.height_px),
+        rows: descriptor.frame_rows.map(|rows| rows as usize),
     }
 }
 
-fn texture_url(content_ref: &str) -> String {
-    format!("{}/api/textures/by-ref/{content_ref}/32.png", api_origin())
+fn descriptor_url(path: &str) -> String {
+    format!("{}{}", api_origin().trim_end_matches('/'), path)
 }
 
 /// Where the API lives, as far as the wasm side is concerned.
@@ -792,6 +903,7 @@ fn texture_url(content_ref: &str) -> String {
 /// the local dev setup, where the page is on :3100 and the API on another
 /// port. The web app already resolves this once and stashes it, so this reads
 /// what it decided rather than deciding again and disagreeing.
+#[cfg(target_arch = "wasm32")]
 fn api_origin() -> String {
     js_sys::Reflect::get(
         &js_sys::global(),
@@ -802,17 +914,12 @@ fn api_origin() -> String {
     .unwrap_or_default()
 }
 
-/// The shape the generation pipeline produces per kind, mirroring
-/// `server::api::textures::canonical_size` at the 32-texel rung.
-fn canonical_texture_size(kind: skin_schema::v2::TextureKindV2) -> (f64, f64) {
-    use skin_schema::v2::TextureKindV2;
-    match kind {
-        // 12 cells of coat.
-        TextureKindV2::Coat => (384.0, 32.0),
-        // 20 frames down, 20 cells across, at the sheet ladder's 8-texel rung.
-        TextureKindV2::Sheet => (160.0, 160.0),
-        TextureKindV2::Overlay => (128.0, 128.0),
-    }
+#[cfg(not(target_arch = "wasm32"))]
+fn api_origin() -> String {
+    // Native conformance records source rectangles without fetching. Keeping
+    // the descriptor's root-relative URL intact makes those tests exercise the
+    // same atlas metadata without touching browser imports.
+    String::new()
 }
 
 /// Resolve one document colour reference for one role at one step.
@@ -1115,7 +1222,7 @@ pub(crate) fn conformance_fixtures() -> Vec<SkinDocV2> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skin::paint::OpRecorder;
+    use crate::skin::paint::{OpRecorder, PaintOp};
     use skin_schema::SkinDoc;
     use skin_schema::v2::upgrade;
 
@@ -1298,20 +1405,32 @@ mod tests {
         );
     }
 
-    /// A sheet's rows are moments, so a document wearing one animates even
-    /// though nothing in it mentions the clock. Baking a single frame freezes
-    /// it on row zero, which is indistinguishable from a still texture — the
-    /// failure mode that hides.
+    /// A sheet's rows use the presentation clock directly, not the 32-step
+    /// expression ring. Sixty-four rows are all reachable while the document
+    /// still bakes one expression frame.
     #[test]
-    fn a_frame_sheet_animates_without_any_expression_saying_so() {
+    fn every_sprite_row_is_reachable_independently_of_the_expression_ring() {
         let mut doc = upgrade(&classic_v1());
+        doc.period_ms = 1_200.0;
+        let content_ref = format!("sha256:{}", "a".repeat(64));
         doc.textures.push(skin_schema::v2::TextureRefV2 {
             name: "flag".to_string(),
-            content_ref: format!(
-                "{}stars-and-stripes.v1",
-                skin_schema::v2::BUILTIN_TEXTURE_PREFIX
-            ),
+            content_ref: content_ref.clone(),
             kind: skin_schema::v2::TextureKindV2::Sheet,
+            descriptor: Some(skin_schema::v2::TextureDescriptorV2 {
+                kind: skin_schema::v2::TextureKindV2::Sheet,
+                body_columns: Some(64),
+                frame_rows: Some(64),
+                raster_overhang_px: 0,
+                variants: vec![skin_schema::v2::TextureVariantV2 {
+                    url: format!("/api/textures/variants/{content_ref}.png"),
+                    content_ref,
+                    width_px: 1_024,
+                    height_px: 1_024,
+                    bytes: 32_768,
+                    texels_per_cell: 16,
+                }],
+            }),
         });
         doc.layers.push(LayerV2 {
             name: "Flag".to_string(),
@@ -1336,8 +1455,55 @@ mod tests {
         let skin = LayerSkin::compile(&doc).expect("compiles");
         assert_eq!(
             skin.engine.frame_count(),
-            ANIMATION_STEPS,
-            "a sheet needs the whole ring to walk its rows"
+            1,
+            "sprite metadata must not enlarge the expression ring"
+        );
+
+        let row_at = |anim_ms: f64, reduced_motion: bool| {
+            let mut recorder = OpRecorder::new();
+            let cells = [(4.0, 3.0), (0.0, 3.0)];
+            skin.paint_alive(
+                &mut PaintCtx::recording(&mut recorder),
+                &SnakePose {
+                    cells: &cells,
+                    cell_size: 15.0,
+                    boost_active: false,
+                    seed: 0.0,
+                    anim_ms,
+                    reduced_motion,
+                    detail_scale: 1.0,
+                },
+                &SkinIdentity {
+                    role: crate::skin::SnakeRole::Own,
+                    shade_slot: 0,
+                },
+            )
+            .expect("recording cannot fail");
+            recorder
+                .ops()
+                .iter()
+                .find_map(|op| match op {
+                    PaintOp::DrawImage {
+                        source: (_, y, _, _),
+                        ..
+                    } => Some(*y),
+                    _ => None,
+                })
+                .expect("the sheet emitted a blit")
+        };
+
+        let reached: Vec<u32> = (0..64)
+            .map(|row| {
+                let y = row_at(row as f64 * doc.period_ms / 64.0, false);
+                (y / 16.0).round() as u32
+            })
+            .collect();
+        assert_eq!(reached, (0..64).collect::<Vec<_>>());
+        assert_eq!(row_at(doc.period_ms, false), 0.0, "loop returns to row 0");
+        assert_eq!(
+            row_at(doc.period_ms * 0.75, true),
+            0.0,
+            "reduced motion pins resting row 0"
         );
     }
 
@@ -1419,6 +1585,52 @@ mod tests {
             .find(|layer| layer.id == "Head cap")
             .expect("present");
         assert_eq!(cap.opacity, Binding::Const(0.5));
+    }
+
+    #[test]
+    fn group_visibility_flags_reach_every_compiled_child() {
+        let mut doc = upgrade(&classic_v1());
+        let decoration = LayerV2 {
+            name: "Grouped decoration".to_string(),
+            boost_only: false,
+            omit_on_single_cell: false,
+            opacity: PropExpr("0.1".to_string()),
+            transform: skin_schema::v2::TransformV2::default(),
+            body: LayerBodyV2::Span {
+                region: RegionV2::Body,
+                clip: ClipV2::Silhouette,
+                span: skin_schema::v2::SpanV2::whole(),
+                corner: CornerV2::Fan,
+                source: SourceV2::Solid {
+                    color: ColorRef::slot(SlotName::Fill),
+                },
+            },
+        };
+        doc.layers.push(LayerV2 {
+            name: "Conditional group".to_string(),
+            boost_only: true,
+            omit_on_single_cell: true,
+            opacity: PropExpr("1".to_string()),
+            transform: skin_schema::v2::TransformV2::default(),
+            body: LayerBodyV2::Group {
+                layers: vec![decoration],
+            },
+        });
+
+        let skin = LayerSkin::compile(&doc).expect("grouped document compiles");
+        let child = skin
+            .layers()
+            .iter()
+            .find(|layer| layer.id == "Grouped decoration")
+            .expect("child survives flattening");
+        assert!(child.boost_only, "group boost_only must propagate");
+        assert!(
+            child.omit_on_single_cell,
+            "group omit_on_single_cell must propagate"
+        );
+        assert!(!child.applies(false, 4), "hidden outside boost");
+        assert!(!child.applies(true, 1), "hidden on a one-cell corpse pose");
+        assert!(child.applies(true, 4), "painted when both gates pass");
     }
 
     /// Derived colours are per role, which is the reason the table lives on
