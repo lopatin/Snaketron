@@ -1,14 +1,11 @@
 import React, {
   useCallback,
   useEffect,
-  useId,
   useLayoutEffect,
   useRef,
   useState,
 } from 'react';
 import { useCrazyGames } from '../contexts/CrazyGamesContext';
-import { useAdsOptional } from '../contexts/AdsContext';
-import { crazyGames } from '../services/crazyGames';
 import type { HighlightClip, Rank } from '../types';
 import {
   canAutoplayHighlight,
@@ -42,65 +39,6 @@ const INTRO_TRAVEL_MS = 560;
 const INTRO_STAR_SCALE = 1.85;
 
 type IntroPhase = 'idle' | 'title' | 'star' | 'travelling' | 'done';
-
-interface SponsorSlotProps {
-  reason: 'absent' | 'incompatible' | 'network';
-}
-
-const SponsorSlot: React.FC<SponsorSlotProps> = ({ reason }) => {
-  const { available, adState } = useCrazyGames();
-  // Ad enablement is server-owned policy, not a build flag: it arrives through
-  // AdsProvider. Outside that provider (the QA harness) policy is unknown, and
-  // a slot that cannot confirm policy must not request inventory.
-  const ads = useAdsOptional();
-  const bannerAllowed = Boolean(ads?.config.enabled && ads.capabilities.banners);
-  const reactId = useId();
-  const containerIdRef = useRef(`potg-sponsor-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`);
-  const attemptedRef = useRef(false);
-  const [bannerLive, setBannerLive] = useState(false);
-  const containerId = containerIdRef.current;
-
-  useEffect(() => {
-    if (!bannerAllowed || !available || adState !== 'idle' || attemptedRef.current) {
-      return undefined;
-    }
-    let active = true;
-    // Completion may request an interstitial in a parent effect from the same
-    // commit. Yield once, then consult the adapter's live snapshot so a stale
-    // context render cannot start a banner underneath that commercial break.
-    const timer = window.setTimeout(() => {
-      if (!active || crazyGames.getSnapshot().adState !== 'idle') return;
-      attemptedRef.current = true;
-      void crazyGames.requestResponsiveBanner(containerId).then((result) => {
-        if (active) setBannerLive(result.status === 'filled');
-      });
-    }, 0);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [adState, available, bannerAllowed, containerId]);
-
-  useEffect(() => () => crazyGames.clearBanner(containerId), [containerId]);
-
-  return (
-    <aside
-      className={`potg-sponsor${bannerLive ? ' has-live-banner' : ' is-house-slot'}`}
-      aria-label="Advertisement"
-      data-testid="potg-sponsor"
-      data-unavailable-reason={reason}
-    >
-      <span className="potg-sponsor__label">Sponsored</span>
-      <div id={containerId} className="potg-sponsor__sdk" />
-      {!bannerLive && (
-        <div className="potg-sponsor__fallback">
-          <strong>Replay booth</strong>
-          <small>Advertisement placement</small>
-        </div>
-      )}
-    </aside>
-  );
-};
 
 interface HighlightReplayProps {
   clip: HighlightClip;
@@ -413,31 +351,24 @@ const PlayOfTheGame: React.FC<PlayOfTheGameProps> = ({
   autoplayAllowed,
   onAutoplayStarted,
 }) => {
-  // Nothing at all while the server is still cutting. A placeholder panel
-  // sitting open under the rating asks the viewer to watch an empty box, and
-  // it spends the slide-in that makes the replay's arrival read as deliberate
-  // — the panel has to be closed for there to be an opening.
-  if (highlight.phase === 'idle' || highlight.phase === 'pending') {
+  // The slot exists only when there is a verified replay to present. Pending,
+  // absent, incompatible, and network-failed highlights leave the results
+  // card at its natural height; ad inventory has its own provider-owned
+  // surfaces and must never be represented by placeholder chrome here.
+  if (highlight.phase !== 'ready') {
     return null;
   }
 
-  // Whichever fill this space gets, it opens inside the same slot, so the
-  // card grows with it instead of jumping to its final height and then
-  // fading something into the gap.
   return (
     <div className="potg-slot" data-testid="potg-slot">
-      {highlight.phase === 'unavailable' ? (
-        <SponsorSlot reason={highlight.reason} />
-      ) : (
-        <HighlightReplay
-          key={`${highlight.clip.game_id}:${highlight.clip.window.start_tick}`}
-          clip={highlight.clip}
-          starRank={starRank}
-          ratingSettled={ratingSettled}
-          autoplayAllowed={autoplayAllowed}
-          onAutoplayStarted={onAutoplayStarted}
-        />
-      )}
+      <HighlightReplay
+        key={`${highlight.clip.game_id}:${highlight.clip.window.start_tick}`}
+        clip={highlight.clip}
+        starRank={starRank}
+        ratingSettled={ratingSettled}
+        autoplayAllowed={autoplayAllowed}
+        onAutoplayStarted={onAutoplayStarted}
+      />
     </div>
   );
 };

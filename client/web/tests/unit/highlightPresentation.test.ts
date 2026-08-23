@@ -4,6 +4,8 @@ import type { HighlightClip } from '../../types/generated/HighlightClip.ts';
 import {
   canAutoplayHighlight,
   formatHighlightReason,
+  HIGHLIGHT_POLL_INTERVAL_MS,
+  HIGHLIGHT_POLL_MAX_ATTEMPTS,
   highlightFocusViewerMs,
   isCompatibleHighlightClip,
 } from '../../utils/highlightPresentation.ts';
@@ -66,6 +68,14 @@ test('highlight compatibility rejects deploy skew and malformed windows', () => 
     ...clip,
     window: { ...clip.window, focus_tick: 191 },
   }), false);
+});
+
+test('highlight polling leaves time for durable replay persistence', () => {
+  const pollWindowMs =
+    (HIGHLIGHT_POLL_MAX_ATTEMPTS - 1) * HIGHLIGHT_POLL_INTERVAL_MS;
+
+  assert.ok(pollWindowMs >= 25_000);
+  assert.ok(pollWindowMs <= 35_000);
 });
 
 test('highlight captions are human and plural-aware', () => {
