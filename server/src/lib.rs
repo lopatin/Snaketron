@@ -53,6 +53,7 @@ pub mod user_cache;
 pub mod wallet;
 pub mod ws_server;
 pub mod xp_persistence;
+pub mod xsolla;
 
 pub mod game_relay {
     tonic::include_proto!("game_relay");

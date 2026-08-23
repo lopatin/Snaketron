@@ -5279,6 +5279,11 @@ mod tests {
             user_id: i32,
             recent_limit: usize
         ) -> crate::wallet::Wallet);
+        unused_database_method!(get_ledger_entry(
+            user_id: i32,
+            source: crate::wallet::LedgerSource,
+            idempotency_key: &str
+        ) -> Option<crate::wallet::LedgerEntry>);
         unused_database_method!(next_texture_id() -> i32);
         unused_database_method!(create_texture(
             texture: &crate::texture::Texture

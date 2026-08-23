@@ -27,6 +27,7 @@ pub async fn run_api_server(addr: &str, db: Arc<dyn Database>, jwt_secret: &str)
         user_cache: None,
         crazygames_verifier: crazygames::configured_verifier_from_env()?,
         texture_store: None,
+        payments: crate::xsolla::Payments::from_env()?.map(Arc::new),
     };
     let auth_middleware_state = AuthMiddlewareState {
         jwt_manager: jwt_manager.clone(),

@@ -32,7 +32,10 @@ const priceLabel = (cents: number): string =>
 const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null }) => {
   const { balanceBux, refresh } = useWallet();
   const [packs, setPacks] = useState<BuxPack[]>([]);
+  const [packsLoaded, setPacksLoaded] = useState(false);
   const [busySku, setBusySku] = useState<string | null>(null);
+  const [awaitingSettlement, setAwaitingSettlement] = useState(false);
+  const [sandbox, setSandbox] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const titleId = useId();
@@ -58,11 +61,13 @@ const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null 
       .then((found) => {
         if (!cancelled) {
           setPacks(found);
+          setPacksLoaded(true);
         }
       })
       .catch(() => {
         if (!cancelled) {
           setError('The shop could not be loaded. Try again in a moment.');
+          setPacksLoaded(true);
         }
       });
     return () => {
@@ -70,20 +75,42 @@ const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null 
     };
   }, []);
 
+  /**
+   * Pick the balance up again when the player comes back.
+   *
+   * Payment happens in another tab and settles through a webhook, so there is
+   * no moment in this component that *is* the purchase completing. Refreshing
+   * whenever this window regains focus is the closest honest approximation:
+   * by the time someone has switched back, the settlement has usually landed.
+   */
+  useEffect(() => {
+    if (!awaitingSettlement) {
+      return undefined;
+    }
+    const onFocus = () => {
+      void refresh();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [awaitingSettlement, refresh]);
+
   const buy = useCallback(
     async (pack: BuxPack) => {
       setBusySku(pack.sku);
       setError(null);
       try {
         const checkout = await api.buxCheckoutToken(pack.sku);
-        // The provider hosts the payment itself; this hands off and comes back
-        // through the settlement webhook, so the balance is refreshed on return
-        // rather than guessed at here.
-        window.open(
-          `https://secure.xsolla.com/paystation4/?token=${encodeURIComponent(checkout.token)}`,
-          '_blank',
-          'noopener,noreferrer',
-        );
+        // The URL comes from the provider with the token, because only the
+        // server knows whether this deployment is pointed at sandbox or
+        // production — and a checkout sent to the wrong one of those is a
+        // dead page rather than a visible error.
+        setSandbox(checkout.sandbox);
+        setAwaitingSettlement(true);
+        window.open(checkout.paymentUrl, '_blank', 'noopener,noreferrer');
         await refresh();
       } catch (cause) {
         setError(
@@ -138,6 +165,17 @@ const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null 
           </p>
         ) : null}
 
+        {packsLoaded && packs.length === 0 ? (
+          // Either this build may not sell (the portal prohibits unapproved
+          // purchases) or the deployment has no merchant account. The player
+          // does not need to know which; they need to know the balance is
+          // still theirs and still spends.
+          <p className="shop-note" data-testid="wallet-unavailable">
+            Snakebux cannot be bought in this version of the game. Any Snakebux you
+            already have still work.
+          </p>
+        ) : null}
+
         <ul className="shop-packs">
           {packs.map((pack) => {
             // Marked, not filtered: seeing the one that just covers it beside
@@ -165,10 +203,18 @@ const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null 
           })}
         </ul>
 
-        <p className="shop-note">
-          Payment is handled by our payment provider. Your balance updates once it
-          settles.
-        </p>
+        {packs.length > 0 ? (
+          <p className="shop-note">
+            Payment is handled by our payment provider. Your balance updates once it
+            settles.
+            {sandbox ? (
+              <strong data-testid="wallet-sandbox">
+                {' '}
+                Test mode: no real money will be charged.
+              </strong>
+            ) : null}
+          </p>
+        ) : null}
       </div>
     </div>
   );

@@ -70,6 +70,19 @@ impl ClientDistribution {
         }
     }
 
+    /// Read a distribution back out of the wire form `as_str` writes.
+    ///
+    /// Used by HTTP surfaces, which — unlike the WebSocket handshake — carry
+    /// the distribution in a header rather than in a typed message.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "web" => Some(Self::Web),
+            "crazygames" => Some(Self::CrazyGames),
+            "itch" => Some(Self::Itch),
+            _ => None,
+        }
+    }
+
     const fn environment(self) -> DistributionEnvironment {
         match self {
             Self::Web => DistributionEnvironment {
