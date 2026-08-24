@@ -133,8 +133,10 @@ await page.waitForTimeout(600);
 await shot('08-after-buying');
 
 // ---------------------------------------------------------------------------
-// 6. The Builder, on a new skin.
+// 6. The Builder, on a new skin. The builder is an admin surface now, so the
+//    session is promoted before entering it.
 // ---------------------------------------------------------------------------
+await setState({ signedIn: true, isAdmin: true });
 await page.goto(`${baseUrl}/skins/builder`, { waitUntil: 'networkidle' });
 await page.waitForSelector('.builder-preview canvas');
 await shot('09-builder-new');

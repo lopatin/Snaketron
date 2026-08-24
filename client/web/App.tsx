@@ -201,8 +201,12 @@ function AppContent() {
             />
           }
         />
+        {/* One route for the catalogue and for a skin's own page: the page is
+            the same either way — the reference only opens a modal over it —
+            and a single route keeps the catalogue mounted across the toggle.
+            The static /skins/builder segments outrank the parameter. */}
         <Route
-          path="/skins"
+          path="/skins/:reference?"
           element={
             <SkinsPage
               onOpenAuth={handleOpenAuth}
@@ -210,16 +214,22 @@ function AppContent() {
             />
           }
         />
+        {/* Skin editing is an operator surface: the catalogue only shows its
+            CTAs to admins, and the builder itself turns everyone else away. */}
         <Route
           path="/skins/builder"
           element={
-            <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+            <AdminRoute>
+              <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+            </AdminRoute>
           }
         />
         <Route
           path="/skins/builder/:skinId"
           element={
-            <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+            <AdminRoute>
+              <SkinBuilder onOpenAuth={handleOpenAuth} onOpenAccount={setAccountModalView} />
+            </AdminRoute>
           }
         />
         <Route path="/profile" element={<Navigate to="/" replace />} />

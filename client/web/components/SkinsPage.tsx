@@ -16,7 +16,7 @@ import GetSkinModal from './GetSkinModal';
 import WalletModal from './WalletModal';
 import SkinToast from './SkinToast';
 import type { CatalogEntry, SkinSummary } from '../types/generated';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   DEFAULT_SKIN_REF,
   readBasePreference,
@@ -441,6 +441,9 @@ const SkinRow: React.FC<SkinRowProps> = ({
 
 const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   const { user, logout } = useAuth();
+  // Skin editing is an operator surface for now: every CTA into the builder
+  // is admin-only, and an admin may edit anyone's skin, not just their own.
+  const isAdmin = Boolean(user?.isAdmin);
   const { applyBalance, balanceBux } = useWallet();
   const [ready, setReady] = useState(false);
   const [snakeSkins, setSnakeSkins] = useState<CatalogEntry[]>([]);
@@ -455,8 +458,14 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   const [registryRevision, setRegistryRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
-  /** The skin whose page is open, if any. */
-  const [viewing, setViewing] = useState<SkinView | null>(null);
+  /**
+   * The reference of the skin whose page is open, straight from the URL.
+   *
+   * The URL rather than component state, so an open skin page is a place: it
+   * survives a reload, the back button closes it, and copying the address bar
+   * hands someone else the same skin.
+   */
+  const { reference: viewingReference } = useParams<{ reference: string }>();
   /** The skin awaiting a spend confirmation. */
   const [getting, setGetting] = useState<SkinSummary | null>(null);
   /** Whether the wallet is open, and what it is being opened *for*. */
@@ -769,11 +778,42 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             : (match.creatorUsername ?? undefined),
         owned: match.owned,
         stats: { ownerCount: match.ownerCount, wearerCount: match.wearerCount },
-        editableSkinId: match.creatorUserId === user?.id ? match.skinId : undefined,
+        editableSkinId: isAdmin ? match.skinId : undefined,
       };
     },
-    [summaryFor, user?.id],
+    [isAdmin, summaryFor, user?.id],
   );
+
+  /**
+   * The skin the URL says is open, resolved against the loaded catalogue.
+   *
+   * Resolved rather than stored: the catalogue is the authority on what the
+   * reference means, and a pasted link arrives before any click has built a
+   * view. A reference the catalogue does not know — a typo, or a skin that
+   * has since vanished — opens nothing rather than an empty dialog.
+   */
+  const viewing = useMemo((): SkinView | null => {
+    if (!viewingReference) {
+      return null;
+    }
+    const entry = snakeSkins.find(
+      (candidate) => candidate.reference === viewingReference,
+    );
+    return entry ? viewOf(entry) : null;
+  }, [snakeSkins, viewOf, viewingReference]);
+
+  const openSkin = useCallback(
+    (reference: string) => {
+      navigate(`/skins/${encodeURIComponent(reference)}`);
+    },
+    [navigate],
+  );
+
+  // Plain navigation rather than history.back(): someone who arrived on a
+  // shared link has no /skins entry behind them to go back to.
+  const closeSkin = useCallback(() => {
+    navigate('/skins');
+  }, [navigate]);
 
   return (
     <div className="home-page skins-page">
@@ -793,17 +833,19 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       <main className="skins-main">
         <div className="skins-intro">
           <h1 className="skins-title">SKINS</h1>
-          <div className="skins-intro-actions">
-            <Link
-              className="game-shell-button is-primary skins-make-own"
-              to="/skins/builder"
-            >
-              <span className="skins-make-own-icon" aria-hidden="true">
-                +
-              </span>
-              Make your own
-            </Link>
-          </div>
+          {isAdmin ? (
+            <div className="skins-intro-actions">
+              <Link
+                className="game-shell-button is-primary skins-make-own"
+                to="/skins/builder"
+              >
+                <span className="skins-make-own-icon" aria-hidden="true">
+                  +
+                </span>
+                Make your own
+              </Link>
+            </div>
+          ) : null}
         </div>
 
         {error ? (
@@ -846,7 +888,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                         const match = summaryFor(entry.reference);
                         return match ? () => startGet(match) : undefined;
                       })()}
-                      onOpen={() => setViewing(viewOf(entry))}
+                      onOpen={() => openSkin(entry.reference)}
                     />
                   ))
                 : null}
@@ -883,17 +925,17 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
           balanceBux={balanceBux ?? 0}
           isEquipped={viewing.reference === equippedSkin}
           busy={busySkin === viewing.editableSkinId}
-          onClose={() => setViewing(null)}
+          onClose={closeSkin}
           onGet={() => {
             const match = summaryFor(viewing.reference);
-            setViewing(null);
+            closeSkin();
             if (match) {
               startGet(match);
             }
           }}
           onEquip={() => {
             void equip('snake', viewing.reference);
-            setViewing(null);
+            closeSkin();
           }}
           onEdit={() => {
             if (viewing.editableSkinId !== undefined) {
@@ -901,7 +943,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             }
           }}
           onTopUp={() => {
-            setViewing(null);
+            closeSkin();
             setWallet({ name: viewing.name, priceBux: viewing.priceBux });
           }}
         />
