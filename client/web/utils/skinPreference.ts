@@ -113,6 +113,43 @@ export const adoptServerEquipment = (equipment: {
 };
 
 /**
+ * What this browser has stored that an empty account should inherit.
+ *
+ * The other half of {@link adoptServerEquipment}, and the reason equipping is
+ * not lost across getting an account. Anyone may pick a skin before they have
+ * one — accounts are created lazily, guests included — and that choice lives
+ * only here until there is somewhere to put it. Without this direction, a
+ * choice made before signing in (or before the guest account that a first
+ * match creates) stays local forever: the picker keeps showing it, while
+ * matchmaking reads an account that never heard about it and dresses the
+ * player in the default.
+ *
+ * Returns what should be sent, or null when the account already has its own
+ * answer. The account always wins where it has one — this fills a blank, it
+ * never overwrites.
+ */
+export const equipmentToAdopt = (equipment: {
+  selectedSkin?: string | null;
+  selectedBase?: string | null;
+}): { selectedSkin?: string; selectedBase?: string } | null => {
+  const request: { selectedSkin?: string; selectedBase?: string } = {};
+
+  const localSkin = readSkinPreference();
+  // The default is what an untouched browser reads, so it carries no intent
+  // and is not worth a write.
+  if (!isPlausibleSkinRef(equipment.selectedSkin) && localSkin !== DEFAULT_SKIN_REF) {
+    request.selectedSkin = localSkin;
+  }
+
+  const localBase = readBasePreference();
+  if (typeof equipment.selectedBase !== 'string' && localBase !== null) {
+    request.selectedBase = `${BASE_REF_PREFIX}${localBase}`;
+  }
+
+  return request.selectedSkin || request.selectedBase ? request : null;
+};
+
+/**
  * The skins this build can render, straight from the Rust catalogue so the
  * list can never drift from what the renderer actually knows.
  * Empty until the WASM module has loaded.

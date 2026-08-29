@@ -84,3 +84,81 @@ test('a spectator sees team 0 as the friendly side', () => {
   assert.equal(getScoreEffectTeamColor(0, null, EMBER), EMBER.friendly_accent);
   assert.equal(getScoreEffectTeamColor(1, null, EMBER), EMBER.enemy_accent);
 });
+
+/**
+ * Equipping has to survive getting an account, because for much of a first
+ * session there is not one: accounts are created lazily, so a choice made
+ * while browsing lives only in local storage until something can write it.
+ */
+const withStoredPreferences = async (
+  stored: Record<string, string>,
+  body: (module: typeof import('../../utils/skinPreference.ts')) => Promise<void> | void,
+) => {
+  const hadWindow = 'window' in globalThis;
+  const previousWindow = (globalThis as any).window;
+  const values = new Map<string, string>(Object.entries(stored));
+  (globalThis as any).window = {
+    localStorage: {
+      get length() { return values.size; },
+      clear: () => values.clear(),
+      getItem: (key: string) => values.get(key) ?? null,
+      key: (index: number) => [...values.keys()][index] ?? null,
+      removeItem: (key: string) => { values.delete(key); },
+      setItem: (key: string, value: string) => { values.set(key, String(value)); },
+    },
+  };
+  try {
+    // Cache-busted so each case reads its own storage stub.
+    await body(await import(`../../utils/skinPreference.ts?adopt=${values.size}-${Math.random()}`));
+  } finally {
+    if (hadWindow) {
+      (globalThis as any).window = previousWindow;
+    } else {
+      delete (globalThis as any).window;
+    }
+  }
+};
+
+test('an empty account inherits the skin chosen before it existed', async () => {
+  await withStoredPreferences(
+    { 'snaketron:skin:v1': 'voltage@1' },
+    ({ equipmentToAdopt }) => {
+      // The exact shape a fresh guest arrives in.
+      assert.deepEqual(equipmentToAdopt({}), { selectedSkin: 'voltage@1' });
+      assert.deepEqual(
+        equipmentToAdopt({ selectedSkin: null, selectedBase: null }),
+        { selectedSkin: 'voltage@1' },
+      );
+    },
+  );
+});
+
+test('an account that already dressed itself is never overwritten', async () => {
+  await withStoredPreferences(
+    { 'snaketron:skin:v1': 'voltage@1', 'snaketron:base:v1': 'base:ember@1' },
+    ({ equipmentToAdopt }) => {
+      // The account is the authority: this fills a blank, it never argues.
+      assert.equal(
+        equipmentToAdopt({ selectedSkin: 'aurora@1', selectedBase: 'base:aurora@1' }),
+        null,
+      );
+      // Each slot is judged on its own.
+      assert.deepEqual(equipmentToAdopt({ selectedSkin: 'aurora@1' }), {
+        selectedBase: 'base:ember@1',
+      });
+    },
+  );
+});
+
+test('an untouched browser has nothing worth saying', async () => {
+  await withStoredPreferences({}, ({ equipmentToAdopt }) => {
+    assert.equal(equipmentToAdopt({}), null);
+  });
+  // The default carries no intent, so it is not worth a write either.
+  await withStoredPreferences(
+    { 'snaketron:skin:v1': DEFAULT_SKIN_REF },
+    ({ equipmentToAdopt }) => {
+      assert.equal(equipmentToAdopt({}), null);
+    },
+  );
+});
