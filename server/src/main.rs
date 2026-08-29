@@ -13,7 +13,14 @@ use std::env;
 use std::sync::Arc;
 use tracing::info;
 
-#[tokio::main]
+// Tokio sizes its worker pool from `available_parallelism()`, which on Fargate
+// reads the cgroup CPU quota with integer division clamped to >= 1. At a 1 vCPU
+// task that yields a single worker, and the partition executors, event-router
+// workers, game ticks, WebSocket I/O and the Valkey/DynamoDB reactor would all
+// serialize on that one thread and blow the 1-second command budget. The task
+// definition's second vCPU existed precisely to supply a second runtime worker,
+// so pin the count here instead of inferring it from the CPU allocation.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // Print the current working directory
     let current_dir = env::current_dir().context("Failed to get current directory")?;
@@ -26,8 +33,11 @@ async fn main() -> Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     // Set up tracing subscriber with log compatibility
+    // Fall back to `info`, not `debug`: an environment that fails to set RUST_LOG
+    // would otherwise emit debug-everything with no alarm to catch the resulting
+    // log-ingestion blowup.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     // Only emit ANSI color codes when stdout is a terminal; log collectors
     // like CloudWatch render them as literal escape sequences.

@@ -1,7 +1,7 @@
 use crate::db::Database;
 use anyhow::Result;
 use std::collections::HashMap;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Persist XP gains for all players in a completed game to the database.
 /// Uses atomic ADD operations in DynamoDB to prevent race conditions.
@@ -16,7 +16,7 @@ pub async fn persist_player_xp(
     player_xp: HashMap<u32, u32>,
 ) -> Result<()> {
     if player_xp.is_empty() {
-        info!("No XP to persist for game {}", game_id);
+        debug!("No XP to persist for game {}", game_id);
         return Ok(());
     }
 
@@ -33,7 +33,7 @@ pub async fn persist_player_xp(
 
         match db.add_user_xp(user_id as i32, xp_gained as i32).await {
             Ok(new_total) => {
-                info!(
+                debug!(
                     "User {} gained {} XP from game {} (new total: {})",
                     user_id, xp_gained, game_id, new_total
                 );
@@ -49,6 +49,6 @@ pub async fn persist_player_xp(
         }
     }
 
-    info!("Finished persisting XP for game {}", game_id);
+    debug!("Finished persisting XP for game {}", game_id);
     Ok(())
 }

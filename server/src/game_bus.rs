@@ -225,7 +225,20 @@ const SUBSCRIBER_CHANNEL_CAPACITY: usize = 2000;
 /// Backoff before rebuilding a failed reader connection.
 const READER_RECONNECT_BACKOFF_MS: u64 = 100;
 const EXECUTOR_GROUP_BATCH: usize = 512;
+/// Idle between empty fenced reads on a partition that still owns live games.
+/// This sits directly on the player command path, and development certification
+/// enforces `command_outcome_max_latency_ms <= 1000` as a per-second maximum, so
+/// the poll gap has to stay a small fraction of that budget.
 const EXECUTOR_GROUP_IDLE: Duration = Duration::from_millis(50);
+/// Idle for a partition with zero live games. Nothing that any player is waiting
+/// on can arrive here: the only command an empty partition can receive is
+/// GameCreated, and matchmaking already spent seconds producing it, so absorbing
+/// up to 500 ms once is invisible. Idle partitions dominate the fleet, and each
+/// fenced read is an EVALSHA costing roughly seven times a plain GET in
+/// ElastiCache ECPU, so gating on activity — rather than raising the interval
+/// unconditionally and spending a quarter of the certified latency budget doing
+/// nothing — is what makes the poll affordable.
+const EXECUTOR_GROUP_IDLE_EMPTY: Duration = Duration::from_millis(500);
 const FENCED_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 // Group-aware cleanup is best effort. Approximate trimming may retain complete
 // stream macro-nodes, while LIMIT bounds one maintenance pass so cleanup
@@ -2808,6 +2821,21 @@ impl ExecutorCommandConsumer {
     }
 
     pub async fn read_new_blocking(&mut self) -> Result<Vec<CommandDelivery>> {
+        self.read_new_blocking_activity_gated(true).await
+    }
+
+    /// `has_live_games` selects the idle cadence between empty fenced reads; see
+    /// `EXECUTOR_GROUP_IDLE`. `read_new_blocking` claims activity because that is
+    /// the latency-safe answer for a caller that cannot observe the partition.
+    pub async fn read_new_blocking_activity_gated(
+        &mut self,
+        has_live_games: bool,
+    ) -> Result<Vec<CommandDelivery>> {
+        let idle = if has_live_games {
+            EXECUTOR_GROUP_IDLE
+        } else {
+            EXECUTOR_GROUP_IDLE_EMPTY
+        };
         loop {
             let deliveries = self.read_new_fenced().await?;
             if !deliveries.is_empty() {
@@ -2816,14 +2844,14 @@ impl ExecutorCommandConsumer {
             tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => return Ok(Vec::new()),
-                _ = tokio::time::sleep(EXECUTOR_GROUP_IDLE) => {}
+                _ = tokio::time::sleep(idle) => {}
             }
         }
     }
 
     /// Atomically validates the exact acquisition token and assigns new group
     /// entries. XREADGROUP cannot block inside Lua, so the public blocking-style
-    /// reader uses a short local idle between empty fenced reads.
+    /// reader uses an activity-gated local idle between empty fenced reads.
     async fn read_new_fenced(&mut self) -> Result<Vec<CommandDelivery>> {
         let operation = async {
             let script = redis::Script::new(

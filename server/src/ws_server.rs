@@ -4114,7 +4114,7 @@ async fn subscribe_to_game_events(
     game_bus: Arc<GameBus>,
     cluster_namespace: ClusterNamespace,
 ) {
-    info!(
+    debug!(
         "Subscribing to game {} events for user {}",
         game_id, user_id
     );
@@ -4811,7 +4811,7 @@ async fn subscribe_to_lobby_match_notifications(
             }
         };
 
-        info!(lobby_code, channel, "Subscribed to lobby match hints");
+        debug!(lobby_code, channel, "Subscribed to lobby match hints");
         if !reconcile_lobby_match(
             &lobby_code,
             user_id,
@@ -4891,7 +4891,7 @@ async fn subscribe_to_game_chat(
     pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
-    info!("Subscribing to game {} chat", game_id);
+    debug!("Subscribing to game {} chat", game_id);
 
     let channel = RedisKeys::game_chat_channel(game_id);
     let mut manager = (*pubsub_manager).clone();
@@ -4936,7 +4936,7 @@ async fn subscribe_to_game_chat(
         }
     }
 
-    info!("Stopped subscribing to game {} chat", game_id);
+    debug!("Stopped subscribing to game {} chat", game_id);
     Ok(())
 }
 
@@ -4945,7 +4945,7 @@ async fn subscribe_to_lobby_chat(
     pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
-    info!("Subscribing to lobby '{}' chat", lobby_code);
+    debug!("Subscribing to lobby '{}' chat", lobby_code);
 
     let channel = RedisKeys::lobby_chat_channel(&lobby_code);
     let mut manager = (*pubsub_manager).clone();
@@ -4990,7 +4990,7 @@ async fn subscribe_to_lobby_chat(
         }
     }
 
-    info!("Stopped subscribing to lobby '{}' chat", lobby_code);
+    debug!("Stopped subscribing to lobby '{}' chat", lobby_code);
     Ok(())
 }
 
@@ -7056,7 +7056,7 @@ async fn subscribe_to_user_count_updates(
         .await
         .context("Failed to subscribe to user_count_updates channel")?;
 
-    info!("Subscribed to user count updates");
+    debug!("Subscribed to user count updates");
 
     loop {
         let region_counts: HashMap<String, u32> = match receiver.recv().await {
@@ -7104,7 +7104,7 @@ async fn subscribe_to_lobby_updates(
     pubsub_manager: Arc<PubSubManager>,
     ws_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
-    info!("Subscribing to lobby '{}' updates", lobby_code);
+    debug!("Subscribing to lobby '{}' updates", lobby_code);
 
     let channel = RedisKeys::lobby_updates_channel();
     let mut manager = (*pubsub_manager).clone();
@@ -7195,12 +7195,12 @@ async fn subscribe_to_lobby_updates(
         }
     }
 
-    info!("Stopped subscribing to lobby '{}' updates", lobby_code);
+    debug!("Stopped subscribing to lobby '{}' updates", lobby_code);
     Ok(())
 }
 
 pub async fn discover_peers(db: &Arc<dyn Database>, region: &str) -> Result<Vec<(u64, String)>> {
-    info!("Discovering peers in region: {}", region);
+    debug!("Discovering peers in region: {}", region);
 
     // Query to find all servers in the specified region
     let servers = db

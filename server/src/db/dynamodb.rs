@@ -2202,8 +2202,48 @@ impl DynamoDatabase {
         Ok(format!("{hash:032x}"))
     }
 
+    /// Fingerprints completion *identity*, deliberately excluding the two
+    /// interchangeable representations of the same replay payload.
+    ///
+    /// `materialize_completion_replay_journal` swaps `recording_journal` for a
+    /// hydrated `recording`, and the executor performs that swap only for the
+    /// `PersistGame` effect. Every effect nevertheless writes the one shared
+    /// revision anchor, so hashing either field made two effects of a single
+    /// revision disagree: whichever ran first anchored its hash, the other
+    /// failed the anchor condition, and the record retried forever against an
+    /// immutable barrier it could never satisfy.
+    ///
+    /// The replay payload is still fenced -- `recording_journal` carries a
+    /// sha256 digest that `materialize_completion_replay_journal` verifies, and
+    /// each effect marker keeps its own `completion_effect_hash`. This anchor
+    /// answers only "is this the same completion revision".
     fn completion_record_hash(completion: &CompletionRecordV1) -> Result<String> {
-        Self::canonical_fingerprint(completion)
+        #[derive(Serialize)]
+        struct CompletionIdentityView<'a> {
+            schema_version: u16,
+            game_id: u32,
+            partition_id: u32,
+            revision: &'a uuid::Uuid,
+            ended_at_ms: i64,
+            server_id: u64,
+            season: &'a Option<Season>,
+            play_of_the_game: &'a Option<common::HighlightClip>,
+            final_state: &'a common::GameState,
+            effects: &'a [CompletionEffect],
+        }
+
+        Self::canonical_fingerprint(&CompletionIdentityView {
+            schema_version: completion.schema_version,
+            game_id: completion.game_id,
+            partition_id: completion.partition_id,
+            revision: &completion.revision,
+            ended_at_ms: completion.ended_at_ms,
+            server_id: completion.server_id,
+            season: &completion.season,
+            play_of_the_game: &completion.play_of_the_game,
+            final_state: &completion.final_state,
+            effects: &completion.effects,
+        })
     }
 
     fn completion_effect_hash(
@@ -8785,6 +8825,67 @@ mod tests {
         assert_eq!(
             stored.bytes,
             canonical_json_bytes(completion.recording.as_ref().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn completion_revision_anchor_hash_survives_replay_materialization() {
+        // The executor materializes the replay journal for the PersistGame
+        // effect only, but every effect writes the same revision anchor. If the
+        // anchor hash moved with that swap, the first effect would anchor one
+        // hash and the next would fail the anchor condition forever.
+        // Post-materialization shape, exactly what PersistGame hands to
+        // `apply_completion_effect`: hydrated recording, journal reference
+        // consumed.
+        let materialized_form = completion_with_recording(9_001);
+        let recording = materialized_form.recording.as_ref().unwrap();
+
+        // Pre-materialization shape, exactly what the fenced Valkey commit
+        // holds and what every non-PersistGame effect applies with.
+        let mut journal_form = materialized_form.clone();
+        journal_form.recording_journal = Some(crate::recovery::ReplayJournalReferenceV1 {
+            schema_version: crate::recovery::REPLAY_JOURNAL_REFERENCE_SCHEMA_VERSION,
+            game_id: materialized_form.game_id,
+            journal_cursor: 0,
+            next_sequence: 1,
+            end_tick: Some(recording.end_tick),
+            end_sync_hash: Some(recording.end_sync_hash),
+            recording_sha256: None,
+            recording_bytes: None,
+        });
+        journal_form.recording = None;
+
+        assert_eq!(
+            DynamoDatabase::completion_record_hash(&journal_form).unwrap(),
+            DynamoDatabase::completion_record_hash(&materialized_form).unwrap(),
+            "revision anchor hash must not depend on which replay representation the caller holds"
+        );
+    }
+
+    #[test]
+    fn completion_revision_anchor_hash_still_fences_identity() {
+        let base = completion_with_recording(9_002);
+        let base_hash = DynamoDatabase::completion_record_hash(&base).unwrap();
+
+        let mut other_revision = base.clone();
+        other_revision.revision = uuid::Uuid::new_v4();
+        assert_ne!(
+            base_hash,
+            DynamoDatabase::completion_record_hash(&other_revision).unwrap()
+        );
+
+        let mut other_ended_at = base.clone();
+        other_ended_at.ended_at_ms += 1;
+        assert_ne!(
+            base_hash,
+            DynamoDatabase::completion_record_hash(&other_ended_at).unwrap()
+        );
+
+        let mut other_effects = base.clone();
+        other_effects.effects.clear();
+        assert_ne!(
+            base_hash,
+            DynamoDatabase::completion_record_hash(&other_effects).unwrap()
         );
     }
 

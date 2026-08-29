@@ -15,6 +15,16 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
+/// Version 12 halves executors from fifty to twenty-five partitions (2026-08
+/// cost reduction: the fleet no longer runs wide enough for fifty partitions to
+/// buy parallelism, and every partition costs a stream and a consumer group
+/// whether or not it holds a game). The hazard is exactly version 9's in
+/// reverse -- a fifty-partition and a twenty-five-partition executor disagree
+/// about which task owns a game, so both would claim it. Games left on
+/// partitions 25..=49 by the outgoing fleet are abandoned on purpose; the
+/// version gate is what keeps the two partitionings from co-owning, not
+/// anything that migrates their state.
+///
 /// Version 11 introduces deterministic death causes in events and recovery
 /// state. Mixed executors must not publish incompatible `SnakeDied` shapes.
 ///
@@ -36,7 +46,7 @@ pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
 /// with every player's idle clock reset to tick zero. The version gate refuses
 /// incompatible envelopes and keeps mixed-version executors from co-owning
 /// partitions during a rolling deploy.
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 11;
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 12;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);

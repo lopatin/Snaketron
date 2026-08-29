@@ -31,8 +31,11 @@ const STATE_ACTIVE: u8 = 1;
 const STATE_DRAINING: u8 = 2;
 // Bound the healthy release-to-acquire polling gap well below the one-second
 // command continuity budget. This remains coarse relative to game ticks and
-// adds only five small coordination passes per task per second.
-const CONTROL_TICK: Duration = Duration::from_millis(200);
+// adds only two and a half small coordination passes per task per second. It
+// must also stay strictly under 500 ms so the coordinator lease TTL still
+// covers a full tick plus two bounded coordination operations, which
+// `crash_authority_ttls_preserve_detection_and_fencing_order` asserts.
+const CONTROL_TICK: Duration = Duration::from_millis(400);
 // ECS makes a desired-count change visible one task at a time. Coalesce only
 // membership changes whose incumbent owners can safely continue serving; a
 // crashed, expired, warming, or incompatible owner always bypasses this wait.
