@@ -102,6 +102,18 @@ export interface User {
   isAdmin?: boolean;
   authSource?: 'crazygames' | string;
   avatarUrl?: string | null;
+  /**
+   * What this player is wearing, as the account has it. Mirrors the server's
+   * `UserInfo` (see `types/generated/UserInfo.ts`), which sends both fields
+   * with every authenticated user. Optional here because the guest-creation
+   * response omits them — a brand-new guest is wearing nothing yet.
+   *
+   * This is the authority on the snake skin: it is what match preparation
+   * reads and hands to every other player. Local storage only holds a choice
+   * made before there was an account to write it to.
+   */
+  selectedSkin?: string | null;
+  selectedBase?: string | null;
 }
 
 export type CrazyGamesSessionStatus =
