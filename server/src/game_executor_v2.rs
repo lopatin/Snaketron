@@ -38,7 +38,13 @@ const HANDOFF_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 // from extending old authority indefinitely; expiry remains the fallback.
 const HANDOFF_WATCHDOG_BRIDGE_TIMEOUT: Duration = HANDOFF_BARRIER_TIMEOUT;
 const SNAPSHOT_FANOUT_TIMEOUT: Duration = Duration::from_secs(3);
-const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(150);
+// Renewal cadence for every partition-lease keepalive. The watchdog fails closed
+// at `last_confirmed + (TTL - operation timeout)` — 2.25 s with the 3 s TTL and
+// 750 ms bound — so 500 ms still leaves four attempts inside one budget, which
+// preserves the retry-once-transiently property with margin to spare. The old
+// 150 ms bought eleven further attempts nobody needed and made lease renewal one
+// of the largest standing EVALSHA sources against ElastiCache.
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
 const COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const COMPLETION_MATERIALIZATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_MAPPING_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -2335,7 +2341,12 @@ async fn run_game_executor_v2(
             // and snapshot branches run; dropping it would strand its assigned
             // entries in this consumer's PEL until a partition restart.
             let deliveries = {
-                let read = consumer.read_new_blocking();
+                // A partition holding no actors holds no games, so nothing a
+                // player is waiting on can arrive; back the poll off there
+                // instead of paying a fenced read every 50 ms per idle
+                // partition. See `EXECUTOR_GROUP_IDLE` for why the gate is on
+                // activity rather than a flat larger interval.
+                let read = consumer.read_new_blocking_activity_gated(!actors.is_empty());
                 tokio::pin!(read);
                 loop {
                     tokio::select! {

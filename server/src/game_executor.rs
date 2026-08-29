@@ -8,7 +8,7 @@ use anyhow::Result;
 use common::{ClientCommandIdentityV2, GameCommand, GameCommandMessage, GameState, GameStatus};
 use serde::{Deserialize, Serialize};
 
-pub const PARTITION_COUNT: u32 = 50;
+pub const PARTITION_COUNT: u32 = 25;
 
 // Snapshot-bearing events are message envelopes; boxing would add churn
 // without a win.

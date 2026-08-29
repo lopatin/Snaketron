@@ -162,7 +162,7 @@ pub async fn persist_player_mmr(
 
     let player_count = game_state.players.len();
     if player_count == 0 {
-        info!("No players to update MMR for in game {}", game_id);
+        debug!("No players to update MMR for in game {}", game_id);
         return Ok(());
     }
 
@@ -212,7 +212,7 @@ pub async fn persist_player_mmr(
     )
     .await?;
 
-    info!("Finished persisting MMR for game {}", game_id);
+    debug!("Finished persisting MMR for game {}", game_id);
     Ok(())
 }
 
@@ -539,7 +539,7 @@ async fn apply_mmr_deltas(
 
     for (user_id, delta) in deltas {
         if delta == 0 {
-            info!("User {} MMR unchanged in game {}", user_id, game_id);
+            debug!("User {} MMR unchanged in game {}", user_id, game_id);
             continue;
         }
 
@@ -550,7 +550,7 @@ async fn apply_mmr_deltas(
         {
             Ok(new_total) => {
                 let sign = if delta > 0 { "+" } else { "" };
-                info!(
+                debug!(
                     "User {} {:?} MMR: {}{} (new total: {}) from game {}",
                     user_id, queue_mode, sign, delta, new_total, game_id
                 );
@@ -588,7 +588,7 @@ async fn apply_mmr_deltas(
             .await
         {
             Ok(_) => {
-                info!(
+                debug!(
                     "Updated ranking for user {} in {} {} (season: {})",
                     user_id,
                     match queue_mode {

@@ -114,7 +114,7 @@ impl RegionCache {
         let mut state = self.state.write().await;
         merge_refresh(&mut state, fresh);
 
-        info!(
+        debug!(
             "Region cache refreshed: {} regions found",
             state.regions.len()
         );

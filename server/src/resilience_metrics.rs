@@ -1,6 +1,13 @@
 //! Bounded-cardinality resilience telemetry exported through OpenTelemetry and
 //! mirrored to CloudWatch EMF as an independent AWS-native alarm backstop.
 //!
+//! The EMF mirror is deliberately a subset. CloudWatch bills per unique metric
+//! name and dimension set, so every name published here is a standing monthly
+//! charge for as long as it is emitted, while the OpenTelemetry export carries
+//! the full instrument set at no per-series price. Only what an alarm, the
+//! production release gate, the CDK dashboard, or the development certification
+//! suite reads is mirrored, on a single `Environment` dimension set.
+//!
 //! Correctness must not depend on metrics. Collection therefore uses its own
 //! best-effort loop and never changes liveness or lease state when CloudWatch,
 //! Valkey, or stdout is unavailable.
@@ -636,6 +643,15 @@ pub fn record_redis_request(latency: Duration, failed: bool) {
     crate::otel_metrics::record_redis_request(latency_ms, failed);
 }
 
+/// One emission interval's counter deltas.
+///
+/// Every counter is drained even though only the alarm-backing few are
+/// mirrored to CloudWatch. The uniform `swap(0)` is what makes the `*_max`
+/// components window maxima rather than all-time ones, and the full set still
+/// reaches Grafana through the OpenTelemetry counters, which are incremented at
+/// record time rather than from this snapshot. The unread fields are therefore
+/// the price of one uniform drain, not forgotten instrumentation.
+#[allow(dead_code)]
 #[derive(Default)]
 struct CounterSnapshot {
     fenced_write_rejections: u64,
@@ -1110,11 +1126,11 @@ impl PartitionOutageTracker {
 /// Starts a best-effort collector. One deterministic live task reports the
 /// regional gauges while every task reports local health and counters, so
 /// CloudWatch uses `Maximum` for regional gauges and `Sum` for counters. The
-/// active-WebSocket gauge is emitted separately per task so dashboards can
-/// sum per-task `Average` for minute-average fleet concurrency. Summed
-/// per-task `Maximum` is only a conservative upper bound because task peaks
-/// need not occur simultaneously.
-/// Dimensions deliberately exclude partitions, users, and games.
+/// active-WebSocket gauge rides that same document rather than a per-task
+/// dimension set: CloudWatch then sees per-task concurrency aggregated across
+/// the fleet, and fleet totals come from the per-task OpenTelemetry gauge in
+/// Grafana, which is not priced per series. Dimensions deliberately exclude
+/// partitions, users, games, and the task boot id.
 pub fn spawn_resilience_metrics(
     redis: RedisConnection,
     namespace: ClusterNamespace,
@@ -1556,11 +1572,17 @@ fn emf_document(
     region: &str,
     task_boot_id: &str,
     local_ready: bool,
+    active_websockets: u64,
     gauges: RegionalGauges,
     counters: CounterSnapshot,
     now_ms: i64,
 ) -> Value {
     let namespace = emf_namespace(environment);
+    // Every name below is a billed CloudWatch metric stream per region. The
+    // list is exactly the union of what the alarms, the production release
+    // gate, the CDK dashboard, and the development certification suite read.
+    // Everything else the collector gathers is still exported over
+    // OpenTelemetry, so trimming here loses no Grafana series.
     let values = [
         (
             "RegionalCollectionFailures",
@@ -1569,10 +1591,6 @@ fn emf_document(
         ),
         ("ReadyTasks", gauges.ready_tasks, "Count"),
         ("LiveTasks", gauges.live_tasks, "Count"),
-        ("DrainingTasks", gauges.draining_tasks, "Count"),
-        ("MembershipAgeMs", gauges.membership_age_ms, "Milliseconds"),
-        ("AssignmentVersion", gauges.assignment_version, "None"),
-        ("AssignmentAgeMs", gauges.assignment_age_ms, "Milliseconds"),
         ("AssignmentImbalance", gauges.assignment_imbalance, "Count"),
         (
             "ActivePartitionLeases",
@@ -1604,35 +1622,9 @@ fn emf_document(
         ),
         ("CheckpointAgeMs", gauges.checkpoint_age_ms, "Milliseconds"),
         ("CheckpointBytes", gauges.checkpoint_bytes, "Bytes"),
-        ("ActiveGames", gauges.active_games, "Count"),
         (
             "ActiveGameIndexMismatches",
             gauges.active_game_index_mismatches,
-            "Count",
-        ),
-        (
-            "MatchmakingQueueEntries",
-            gauges.matchmaking_queue_entries,
-            "Count",
-        ),
-        (
-            "MatchmakingOldestQueuedLobbyMs",
-            gauges.matchmaking_oldest_queued_lobby_ms,
-            "Milliseconds",
-        ),
-        (
-            "GameCreatedOutboxBacklog",
-            gauges.game_created_outbox_backlog,
-            "Count",
-        ),
-        (
-            "GameCreatedOutboxOldestAgeMs",
-            gauges.game_created_outbox_oldest_age_ms,
-            "Milliseconds",
-        ),
-        (
-            "GameCreatedOutboxAgeIndexCardinalityDelta",
-            gauges.game_created_outbox_age_index_cardinality_delta,
             "Count",
         ),
         (
@@ -1645,262 +1637,10 @@ fn emf_document(
             counters.planned_drain_failures,
             "Count",
         ),
-        ("CommandClaims", counters.command_claims, "Count"),
-        ("CommandAcks", counters.command_acks, "Count"),
-        ("CommandResends", counters.command_resends, "Count"),
-        (
-            "CommandDeduplications",
-            counters.command_deduplications,
-            "Count",
-        ),
-        ("CommandRejections", counters.command_rejections, "Count"),
-        (
-            "BoostPacketCollections",
-            counters.boost_packet_collections,
-            "Count",
-        ),
-        ("BoostPadRespawns", counters.boost_pad_respawns, "Count"),
-        (
-            "BoostActivationAttempts",
-            counters.boost_activation_attempts,
-            "Count",
-        ),
-        (
-            "BoostActivationCommandsScheduled",
-            counters.boost_activation_commands_scheduled,
-            "Count",
-        ),
-        (
-            "BoostActivationCommandRejections",
-            counters.boost_activation_command_rejections,
-            "Count",
-        ),
-        ("BoostActivations", counters.boost_activations, "Count"),
-        ("BoostManualStops", counters.boost_manual_stops, "Count"),
-        ("BoostDepletions", counters.boost_depletions, "Count"),
-        (
-            "ComboFoodCollections",
-            counters.combo_food_collections,
-            "Count",
-        ),
-        ("ComboPointsAwarded", counters.combo_points_awarded, "Count"),
-        ("GameActorAdvances", counters.game_actor_advances, "Count"),
-        (
-            "GameActorBatchQuantaSum",
-            counters.game_actor_batch_quanta_sum,
-            "Count",
-        ),
-        (
-            "GameActorBatchQuantaMax",
-            counters.game_actor_batch_quanta_max,
-            "Count",
-        ),
-        (
-            "GameActorLagMsSum",
-            counters.game_actor_lag_ms_sum,
-            "Milliseconds",
-        ),
-        (
-            "GameActorLagMsMax",
-            counters.game_actor_lag_ms_max,
-            "Milliseconds",
-        ),
-        (
-            "GameActorAdvanceDurationUsSum",
-            counters.game_actor_advance_duration_us_sum,
-            "Microseconds",
-        ),
-        (
-            "GameActorAdvanceDurationUsMax",
-            counters.game_actor_advance_duration_us_max,
-            "Microseconds",
-        ),
         ("CheckpointWrites", counters.checkpoint_writes, "Count"),
         ("CheckpointFailures", counters.checkpoint_failures, "Count"),
-        ("RecoveredGames", counters.recovered_games, "Count"),
-        ("RecoveryReplays", counters.recovery_replays, "Count"),
-        (
-            "MatchClaimConflicts",
-            counters.match_claim_conflicts,
-            "Count",
-        ),
-        (
-            "DuplicateCompletionEffectsPrevented",
-            counters.duplicate_completion_effects_prevented,
-            "Count",
-        ),
-        ("HttpRequests", counters.http_requests, "Count"),
-        ("Http4xxResponses", counters.http_responses_4xx, "Count"),
-        ("Http5xxResponses", counters.http_responses_5xx, "Count"),
-        (
-            "HttpRequestLatencyMsSum",
-            counters.http_request_latency_ms_sum,
-            "Milliseconds",
-        ),
-        (
-            "HttpRequestLatencyMsMax",
-            counters.http_request_latency_ms_max,
-            "Milliseconds",
-        ),
-        ("WebSocketOpens", counters.websocket_opens, "Count"),
-        ("WebSocketCloses", counters.websocket_closes, "Count"),
-        (
-            "WebSocketRejectedUpgrades",
-            counters.websocket_rejected_upgrades,
-            "Count",
-        ),
-        (
-            "WebSocketInboundMessages",
-            counters.websocket_inbound_messages,
-            "Count",
-        ),
-        (
-            "WebSocketInboundBytes",
-            counters.websocket_inbound_bytes,
-            "Bytes",
-        ),
-        (
-            "WebSocketOutboundMessages",
-            counters.websocket_outbound_messages,
-            "Count",
-        ),
-        (
-            "WebSocketOutboundBytes",
-            counters.websocket_outbound_bytes,
-            "Bytes",
-        ),
-        (
-            "WebSocketMalformedMessages",
-            counters.websocket_malformed_messages,
-            "Count",
-        ),
-        (
-            "WebSocketProcessErrors",
-            counters.websocket_process_errors,
-            "Count",
-        ),
-        (
-            "WebSocketSendErrors",
-            counters.websocket_send_errors,
-            "Count",
-        ),
-        (
-            "WebSocketTransportErrors",
-            counters.websocket_transport_errors,
-            "Count",
-        ),
-        (
-            "WebSocketSessionDurationMsSum",
-            counters.websocket_session_duration_ms_sum,
-            "Milliseconds",
-        ),
-        (
-            "WebSocketSessionDurationMsMax",
-            counters.websocket_session_duration_ms_max,
-            "Milliseconds",
-        ),
-        (
-            "WebSocketResyncRequests",
-            counters.websocket_resync_requests,
-            "Count",
-        ),
-        (
-            "WebSocketResyncAccepted",
-            counters.websocket_resync_accepted,
-            "Count",
-        ),
-        (
-            "WebSocketResyncRejected",
-            counters.websocket_resync_rejected,
-            "Count",
-        ),
-        (
-            "MatchmakingAdmissions",
-            counters.matchmaking_admissions,
-            "Count",
-        ),
-        (
-            "MatchmakingAdmissionDeduplications",
-            counters.matchmaking_admission_deduplications,
-            "Count",
-        ),
-        (
-            "MatchmakingAdmissionRejections",
-            counters.matchmaking_admission_rejections,
-            "Count",
-        ),
-        ("MatchmakingCommits", counters.matchmaking_commits, "Count"),
-        (
-            "MatchmakingWaitMsSum",
-            counters.matchmaking_wait_ms_sum,
-            "Milliseconds",
-        ),
-        (
-            "MatchmakingWaitMsMax",
-            counters.matchmaking_wait_ms_max,
-            "Milliseconds",
-        ),
-        (
-            "MatchmakingMatchedPlayers",
-            counters.matchmaking_matched_players,
-            "Count",
-        ),
-        (
-            "MatchmakingMatchedLobbies",
-            counters.matchmaking_matched_lobbies,
-            "Count",
-        ),
-        ("MatchmakingErrors", counters.matchmaking_errors, "Count"),
-        (
-            "MatchmakingIntegrityErrors",
-            counters.matchmaking_integrity_errors,
-            "Count",
-        ),
-        (
-            "GameCreatedOutboxDeliveryErrors",
-            counters.game_created_outbox_delivery_errors,
-            "Count",
-        ),
-        ("GamesCompleted", counters.games_completed, "Count"),
-        (
-            "GameDurationMsSum",
-            counters.game_duration_ms_sum,
-            "Milliseconds",
-        ),
-        (
-            "GameDurationMsMax",
-            counters.game_duration_ms_max,
-            "Milliseconds",
-        ),
-        (
-            "CompletedGamePlayers",
-            counters.completed_game_players,
-            "Count",
-        ),
-        ("PotgRingTruncated", counters.potg_ring_truncated, "Count"),
-        (
-            "RingEvictedSecondsSum",
-            counters.ring_evicted_seconds_sum,
-            "Seconds",
-        ),
-        (
-            "RingEvictedSecondsMax",
-            counters.ring_evicted_seconds_max,
-            "Seconds",
-        ),
-        ("RedisRequests", counters.redis_requests, "Count"),
-        ("RedisErrors", counters.redis_errors, "Count"),
-        (
-            "RedisRequestLatencyMsSum",
-            counters.redis_request_latency_ms_sum,
-            "Milliseconds",
-        ),
-        (
-            "RedisRequestLatencyMsMax",
-            counters.redis_request_latency_ms_max,
-            "Milliseconds",
-        ),
         ("LocalReady", u64::from(local_ready), "Count"),
+        ("ActiveWebSockets", active_websockets, "Count"),
     ];
     let definitions: Vec<Value> = values
         .iter()
@@ -1908,6 +1648,11 @@ fn emf_document(
         .collect();
     let mut document = Map::new();
     document.insert("Environment".into(), json!(environment));
+    // Region and TaskBootId are plain log fields, not dimensions. A field no
+    // dimension set names creates zero metric streams, so per-task forensics
+    // stay available through Logs Insights for free, while a Region-qualified
+    // copy of a series would only duplicate — at full price — data that is
+    // already regional because the document is emitted from within one region.
     document.insert("Region".into(), json!(region));
     document.insert("TaskBootId".into(), json!(task_boot_id));
     for (name, value, _) in values {
@@ -1919,39 +1664,12 @@ fn emf_document(
             "Timestamp": now_ms,
             "CloudWatchMetrics": [{
                 "Namespace": namespace,
-                "Dimensions": [
-                    ["Environment"],
-                    ["Environment", "Region"]
-                ],
+                "Dimensions": [["Environment"]],
                 "Metrics": definitions
             }]
         }),
     );
     Value::Object(document)
-}
-
-fn active_websockets_emf_document(
-    environment: &str,
-    region: &str,
-    task_boot_id: &str,
-    active_websockets: u64,
-    now_ms: i64,
-) -> Value {
-    let namespace = emf_namespace(environment);
-    json!({
-        "Environment": environment,
-        "Region": region,
-        "TaskBootId": task_boot_id,
-        "ActiveWebSockets": active_websockets,
-        "_aws": {
-            "Timestamp": now_ms,
-            "CloudWatchMetrics": [{
-                "Namespace": namespace,
-                "Dimensions": [["Environment", "Region", "TaskBootId"]],
-                "Metrics": [metric("ActiveWebSockets", "Count")]
-            }]
-        }
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2002,18 +1720,9 @@ fn emit_emf(
             region,
             task_boot_id,
             local_ready,
+            active_websockets,
             gauges,
             counters,
-            now_ms,
-        )
-    );
-    println!(
-        "{}",
-        active_websockets_emf_document(
-            environment,
-            region,
-            task_boot_id,
-            active_websockets,
             now_ms,
         )
     );
@@ -2181,69 +1890,135 @@ mod tests {
     }
 
     #[test]
-    fn emf_dimensions_keep_only_websocket_gauge_per_task() {
+    fn emf_publishes_one_document_dimensioned_only_by_environment() {
         let counters = CounterSnapshot {
-            combo_food_collections: 4,
-            combo_points_awarded: 9,
+            checkpoint_writes: 4,
+            checkpoint_failures: 9,
             ..CounterSnapshot::default()
         };
-        let main = emf_document(
+        let document = emf_document(
             "test",
             "us-test-1",
             "boot-id",
             true,
+            7,
             RegionalGauges::default(),
             counters,
             123,
         );
         assert_eq!(
-            main.pointer("/_aws/CloudWatchMetrics/0/Dimensions"),
-            Some(&json!([["Environment"], ["Environment", "Region"]])),
+            document.pointer("/_aws/CloudWatchMetrics/1"),
+            None,
+            "a second metric directive would double the billed streams",
         );
         assert_eq!(
-            main.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
+            document.pointer("/_aws/CloudWatchMetrics/0/Dimensions"),
+            Some(&json!([["Environment"]])),
+        );
+        assert_eq!(
+            document.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
             Some(&json!("Snaketron/OperationalDev")),
         );
-        let main_metrics = main
+        let definitions = document
             .pointer("/_aws/CloudWatchMetrics/0/Metrics")
             .and_then(Value::as_array)
-            .expect("main EMF metric definitions");
-        assert!(main_metrics.len() <= 100);
-        assert!(
-            main_metrics
-                .iter()
-                .all(|definition| definition["Name"] != "ActiveWebSockets")
-        );
-        assert_eq!(main["ComboFoodCollections"], 4);
-        assert_eq!(main["ComboPointsAwarded"], 9);
-        for name in ["ComboFoodCollections", "ComboPointsAwarded"] {
-            assert!(
-                main_metrics.iter().any(|definition| {
-                    definition["Name"] == name && definition["Unit"] == "Count"
-                })
-            );
-        }
+            .expect("EMF metric definitions");
+        assert!(definitions.len() <= 100);
+        assert_eq!(document["CheckpointWrites"], 4);
+        assert_eq!(document["CheckpointFailures"], 9);
 
-        let sockets = active_websockets_emf_document("test", "us-test-1", "boot-id", 7, 123);
-        assert_eq!(
-            sockets.pointer("/_aws/CloudWatchMetrics/0/Dimensions"),
-            Some(&json!([["Environment", "Region", "TaskBootId"]])),
-        );
-        assert_eq!(
-            sockets.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
-            Some(&json!("Snaketron/OperationalDev")),
-        );
-        assert_eq!(sockets["ActiveWebSockets"], 7);
-        assert_eq!(
-            sockets.pointer("/_aws/CloudWatchMetrics/0/Metrics/0/Name"),
-            Some(&json!("ActiveWebSockets")),
-        );
+        // The per-task WebSocket gauge rides this document instead of its own
+        // TaskBootId dimension set, so it is queryable on Environment alone.
+        assert_eq!(document["ActiveWebSockets"], 7);
+        assert!(definitions.iter().any(|definition| {
+            definition["Name"] == "ActiveWebSockets" && definition["Unit"] == "Count"
+        }));
 
-        let production = active_websockets_emf_document("prod", "use1", "boot-id", 1, 123);
+        // Region and TaskBootId remain readable in Logs Insights while naming
+        // no dimension set, which is what keeps them free.
+        assert_eq!(document["Region"], json!("us-test-1"));
+        assert_eq!(document["TaskBootId"], json!("boot-id"));
+
+        let production = emf_document(
+            "prod",
+            "use1",
+            "boot-id",
+            true,
+            1,
+            RegionalGauges::default(),
+            CounterSnapshot::default(),
+            123,
+        );
         assert_eq!(
             production.pointer("/_aws/CloudWatchMetrics/0/Namespace"),
             Some(&json!("Snaketron/Operational")),
         );
+    }
+
+    /// Pins the billed CloudWatch surface. Adding a name costs a metric stream
+    /// per region for as long as it is emitted; removing one silently blinds an
+    /// alarm, the release gate, the CDK dashboard, or the certification suite.
+    /// New instrumentation belongs in OpenTelemetry, which is not billed per
+    /// series.
+    #[test]
+    fn emf_publishes_exactly_the_billed_metric_keep_list() {
+        const EXPECTED: [&str; 21] = [
+            "ActiveGameIndexMismatches",
+            "ActivePartitionLeases",
+            "ActiveWebSockets",
+            "AssignmentImbalance",
+            "CheckpointAgeMs",
+            "CheckpointBytes",
+            "CheckpointFailures",
+            "CheckpointWrites",
+            "FencedWriteRejections",
+            "LiveTasks",
+            "LocalReady",
+            "OldestPendingCommandMs",
+            "PartitionLeaseDeficit",
+            "PartitionOwnerMismatches",
+            "PartitionUnownedMs",
+            "PendingCommands",
+            "PendingCompletions",
+            "PlannedDrainFailures",
+            "QuarantinedCommands",
+            "ReadyTasks",
+            "RegionalCollectionFailures",
+        ];
+
+        let document = emf_document(
+            "test",
+            "us-test-1",
+            "boot-id",
+            true,
+            0,
+            RegionalGauges::default(),
+            CounterSnapshot::default(),
+            123,
+        );
+        let mut published = document
+            .pointer("/_aws/CloudWatchMetrics/0/Metrics")
+            .and_then(Value::as_array)
+            .expect("EMF metric definitions")
+            .iter()
+            .map(|definition| {
+                definition["Name"]
+                    .as_str()
+                    .expect("metric definitions are named")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        published.sort();
+        let named = published.len();
+        published.dedup();
+        assert_eq!(named, published.len(), "duplicate EMF metric definition");
+        assert_eq!(published, EXPECTED);
+
+        // A named metric with no matching field is dropped by CloudWatch, so
+        // the definitions and the document body have to agree.
+        for name in EXPECTED {
+            assert!(document.get(name).is_some(), "{name} has no EMF value");
+        }
     }
 
     #[test]
