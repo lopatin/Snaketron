@@ -305,6 +305,48 @@ fn is_conditional_check_failure<E: ProvideErrorMetadata, R>(error: &SdkError<E, 
     error.code() == Some("ConditionalCheckFailedException")
 }
 
+/// Borrowed projection of a completion's identity, deliberately omitting the
+/// two interchangeable representations of one replay payload.
+///
+/// `materialize_completion_replay_journal` swaps `recording_journal` for a
+/// hydrated `recording`, and the executor performs that swap only for the
+/// `PersistGame` effect. Anything derived from a completion therefore has to be
+/// blind to which of the two forms the caller holds, or two effects of a single
+/// revision disagree and retry forever against a barrier neither can satisfy.
+///
+/// The replay payload is still fenced: `recording_journal` carries a sha256
+/// digest that materialization verifies against the hydrated bytes.
+#[derive(Serialize)]
+struct CompletionIdentityView<'a> {
+    schema_version: u16,
+    game_id: u32,
+    partition_id: u32,
+    revision: &'a uuid::Uuid,
+    ended_at_ms: i64,
+    server_id: u64,
+    season: &'a Option<Season>,
+    play_of_the_game: &'a Option<common::HighlightClip>,
+    final_state: &'a common::GameState,
+    effects: &'a [CompletionEffect],
+}
+
+impl<'a> CompletionIdentityView<'a> {
+    fn of(completion: &'a CompletionRecordV1) -> Self {
+        Self {
+            schema_version: completion.schema_version,
+            game_id: completion.game_id,
+            partition_id: completion.partition_id,
+            revision: &completion.revision,
+            ended_at_ms: completion.ended_at_ms,
+            server_id: completion.server_id,
+            season: &completion.season,
+            play_of_the_game: &completion.play_of_the_game,
+            final_state: &completion.final_state,
+            effects: &completion.effects,
+        }
+    }
+}
+
 impl DynamoDatabase {
     /// Strong reads used to reconcile transactional skin writes.
     ///
@@ -2202,55 +2244,25 @@ impl DynamoDatabase {
         Ok(format!("{hash:032x}"))
     }
 
-    /// Fingerprints completion *identity*, deliberately excluding the two
-    /// interchangeable representations of the same replay payload.
-    ///
-    /// `materialize_completion_replay_journal` swaps `recording_journal` for a
-    /// hydrated `recording`, and the executor performs that swap only for the
-    /// `PersistGame` effect. Every effect nevertheless writes the one shared
-    /// revision anchor, so hashing either field made two effects of a single
-    /// revision disagree: whichever ran first anchored its hash, the other
-    /// failed the anchor condition, and the record retried forever against an
-    /// immutable barrier it could never satisfy.
-    ///
-    /// The replay payload is still fenced -- `recording_journal` carries a
-    /// sha256 digest that `materialize_completion_replay_journal` verifies, and
-    /// each effect marker keeps its own `completion_effect_hash`. This anchor
-    /// answers only "is this the same completion revision".
+    /// Fingerprints completion *identity* for the one shared revision anchor.
     fn completion_record_hash(completion: &CompletionRecordV1) -> Result<String> {
-        #[derive(Serialize)]
-        struct CompletionIdentityView<'a> {
-            schema_version: u16,
-            game_id: u32,
-            partition_id: u32,
-            revision: &'a uuid::Uuid,
-            ended_at_ms: i64,
-            server_id: u64,
-            season: &'a Option<Season>,
-            play_of_the_game: &'a Option<common::HighlightClip>,
-            final_state: &'a common::GameState,
-            effects: &'a [CompletionEffect],
-        }
-
-        Self::canonical_fingerprint(&CompletionIdentityView {
-            schema_version: completion.schema_version,
-            game_id: completion.game_id,
-            partition_id: completion.partition_id,
-            revision: &completion.revision,
-            ended_at_ms: completion.ended_at_ms,
-            server_id: completion.server_id,
-            season: &completion.season,
-            play_of_the_game: &completion.play_of_the_game,
-            final_state: &completion.final_state,
-            effects: &completion.effects,
-        })
+        Self::canonical_fingerprint(&CompletionIdentityView::of(completion))
     }
 
+    /// Fingerprints one effect against its completion's identity.
+    ///
+    /// This must be materialization-invariant for a sharper reason than the
+    /// anchor: `completion_effect_dependency_guard` recomputes *another*
+    /// effect's hash from whichever record form the *current* effect happens to
+    /// hold. `high_score` depends on `game`, and `game` is the single effect
+    /// that materializes, so fingerprinting the whole record made that guard
+    /// compare a journal-form hash against a stored materialized-form hash and
+    /// fail on every attempt, with no error naming the real cause.
     fn completion_effect_hash(
         completion: &CompletionRecordV1,
         effect: &CompletionEffect,
     ) -> Result<String> {
-        Self::canonical_fingerprint(&(completion, effect))
+        Self::canonical_fingerprint(&(CompletionIdentityView::of(completion), effect))
     }
 
     fn completion_revision_anchor(
@@ -8859,6 +8871,51 @@ mod tests {
             DynamoDatabase::completion_record_hash(&journal_form).unwrap(),
             DynamoDatabase::completion_record_hash(&materialized_form).unwrap(),
             "revision anchor hash must not depend on which replay representation the caller holds"
+        );
+    }
+
+    #[test]
+    fn completion_effect_hash_survives_replay_materialization() {
+        // `completion_effect_dependency_guard` recomputes the `game` effect's
+        // hash while applying `high_score`. `game` is the only effect that
+        // materializes, so if the effect hash moved with materialization the
+        // guard compared a journal-form hash against the stored
+        // materialized-form hash and no completion carrying both effects could
+        // ever finish.
+        let materialized_form = completion_with_recording(9_003);
+        let recording = materialized_form.recording.as_ref().unwrap();
+
+        let mut journal_form = materialized_form.clone();
+        journal_form.recording_journal = Some(crate::recovery::ReplayJournalReferenceV1 {
+            schema_version: crate::recovery::REPLAY_JOURNAL_REFERENCE_SCHEMA_VERSION,
+            game_id: materialized_form.game_id,
+            journal_cursor: 0,
+            next_sequence: 1,
+            end_tick: Some(recording.end_tick),
+            end_sync_hash: Some(recording.end_sync_hash),
+            recording_sha256: None,
+            recording_bytes: None,
+        });
+        journal_form.recording = None;
+
+        let effect = materialized_form.effects.first().unwrap();
+        assert_eq!(
+            DynamoDatabase::completion_effect_hash(&journal_form, effect).unwrap(),
+            DynamoDatabase::completion_effect_hash(&materialized_form, effect).unwrap(),
+            "effect hash must not depend on which replay representation the caller holds"
+        );
+    }
+
+    #[test]
+    fn completion_effect_hash_still_separates_distinct_effects() {
+        let completion = completion_with_recording(9_004);
+        let game = CompletionEffect::PersistGame { id: "game".into() };
+        let other = CompletionEffect::PersistGame {
+            id: "high_score".into(),
+        };
+        assert_ne!(
+            DynamoDatabase::completion_effect_hash(&completion, &game).unwrap(),
+            DynamoDatabase::completion_effect_hash(&completion, &other).unwrap()
         );
     }
 
