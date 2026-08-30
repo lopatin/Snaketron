@@ -1,0 +1,420 @@
+{
+  "schema_version": 2,
+  "id": "prism@1",
+  "name": "Prism",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#7ad3e2",
+        "outline": "#1c5f77",
+        "accent": "#9b7cf0"
+      },
+      {
+        "fill": "#b6a5f2",
+        "outline": "#3f3183",
+        "accent": "#52d6e6"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#ef7ab0",
+        "outline": "#7d1f4c",
+        "accent": "#f2bd5a"
+      },
+      {
+        "fill": "#efb851",
+        "outline": "#8a5a12",
+        "accent": "#f2609f"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#7ad3e2",
+        "outline": "#1c5f77",
+        "accent": "#9b7cf0"
+      },
+      {
+        "fill": "#efb851",
+        "outline": "#8a5a12",
+        "accent": "#f2609f"
+      },
+      {
+        "fill": "#c8ccd6",
+        "outline": "#545d6e",
+        "accent": "#9fc4e0"
+      },
+      {
+        "fill": "#d9e88c",
+        "outline": "#6b7326",
+        "accent": "#7fd8b0"
+      }
+    ]
+  },
+  "literals": {
+    "flare": "#f4fbff"
+  },
+  "period_ms": 4600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0b1220"
+  },
+  "layers": [
+    {
+      "name": "Kerf",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Blank",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Dispersion",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.62 + 0.20 * sin(tau * time)"
+            },
+            "alpha": "0.97"
+          },
+          {
+            "offset": "0.13",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.50 + 0.28 * sin(tau * (time + 0.125))"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.27",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.30 + 0.34 * sin(tau * (time + 0.25))"
+            },
+            "alpha": "0.86"
+          },
+          {
+            "offset": "0.41",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.12 + 0.38 * sin(tau * (time + 0.375))"
+            },
+            "alpha": "0.82"
+          },
+          {
+            "offset": "0.55",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.04 + 0.42 * sin(tau * (time + 0.5))"
+            },
+            "alpha": "0.8"
+          },
+          {
+            "offset": "0.69",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.20 + 0.42 * sin(tau * (time + 0.625))"
+            },
+            "alpha": "0.82"
+          },
+          {
+            "offset": "0.84",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.36 + 0.38 * sin(tau * (time + 0.75))"
+            },
+            "alpha": "0.86"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "outline",
+              "lighten": "0.06 + 0.34 * sin(tau * (time + 0.875))"
+            },
+            "alpha": "0.94"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Facet 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.14 + 0.52 * sin(tau * time)"
+        },
+        "period_cells": 4.0,
+        "duty": 0.42,
+        "phase_cells": 0.0,
+        "half_width": "0.1",
+        "t_center": "-0.4"
+      }
+    },
+    {
+      "name": "Facet 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.08 + 0.54 * sin(tau * (time + 0.2))"
+        },
+        "period_cells": 4.0,
+        "duty": 0.42,
+        "phase_cells": 0.5,
+        "half_width": "0.1",
+        "t_center": "-0.2"
+      }
+    },
+    {
+      "name": "Facet 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.42 + 0.48 * sin(tau * (time + 0.4))"
+        },
+        "period_cells": 4.0,
+        "duty": 0.42,
+        "phase_cells": 1.0,
+        "half_width": "0.1",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Facet 4",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.04 + 0.56 * sin(tau * (time + 0.6))"
+        },
+        "period_cells": 4.0,
+        "duty": 0.42,
+        "phase_cells": 1.5,
+        "half_width": "0.1",
+        "t_center": "0.2"
+      }
+    },
+    {
+      "name": "Facet 5",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.12 + 0.52 * sin(tau * (time + 0.8))"
+        },
+        "period_cells": 4.0,
+        "duty": 0.42,
+        "phase_cells": 2.0,
+        "half_width": "0.1",
+        "t_center": "0.4"
+      }
+    },
+    {
+      "name": "Caustic thread",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.78 + 0.20 * sin(tau * (time + 0.5))"
+        },
+        "period_cells": 1.75,
+        "duty": 0.5,
+        "phase_cells": 0.35,
+        "half_width": "0.045",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Refraction sweep",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "saw(2 * time) - 0.14",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.4"
+            },
+            "alpha": "0"
+          },
+          {
+            "offset": "saw(2 * time)",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.50 + 0.34 * sin(tau * (time + 0.25))"
+            },
+            "alpha": "0.42"
+          },
+          {
+            "offset": "saw(2 * time) + 0.14",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.4"
+            },
+            "alpha": "0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Entry flare",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * (0.55 + 0.25 * sin(tau * time))",
+      "color": "#f4fbff",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Boost dispersion",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "opacity": "boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "1 - saw(3 * time) - 0.2",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.3"
+            },
+            "alpha": "0"
+          },
+          {
+            "offset": "1 - saw(3 * time) - 0.07",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.52"
+            },
+            "alpha": "0.6"
+          },
+          {
+            "offset": "1 - saw(3 * time) + 0.07",
+            "color": {
+              "literal": "flare"
+            },
+            "alpha": "0.66"
+          },
+          {
+            "offset": "1 - saw(3 * time) + 0.2",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.3"
+            },
+            "alpha": "0"
+          }
+        ]
+      }
+    }
+  ]
+}

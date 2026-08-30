@@ -1,0 +1,276 @@
+{
+  "schema_version": 2,
+  "id": "breaker@1",
+  "name": "Breaker",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#2ec2d6",
+        "outline": "#137a90",
+        "accent": "#08507e"
+      },
+      {
+        "fill": "#20a4c8",
+        "outline": "#0d6182",
+        "accent": "#06406a"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#ff8a52",
+        "outline": "#b34a1e",
+        "accent": "#a83618"
+      },
+      {
+        "fill": "#f26a4b",
+        "outline": "#a3381c",
+        "accent": "#8f2a12"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#2ec2d6",
+        "outline": "#137a90",
+        "accent": "#08507e"
+      },
+      {
+        "fill": "#ff8a52",
+        "outline": "#b34a1e",
+        "accent": "#a83618"
+      },
+      {
+        "fill": "#a9bcc7",
+        "outline": "#5f7686",
+        "accent": "#46606f"
+      },
+      {
+        "fill": "#f7c33a",
+        "outline": "#a8801f",
+        "accent": "#8a5f12"
+      }
+    ]
+  },
+  "literals": {
+    "foam": "#f2feff",
+    "iris": "#f0a81e"
+  },
+  "period_ms": 2600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0d1a24"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Open water",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Depth",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.6"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.22",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0.78"
+          },
+          {
+            "offset": "0.5",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.06"
+            },
+            "alpha": "0.7"
+          },
+          {
+            "offset": "0.76",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.3"
+            },
+            "alpha": "0.72"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.64"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Undertow",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 1.75,
+        "duty": 0.9,
+        "phase_cells": 0.875,
+        "half_width": "0.19",
+        "t_center": "-0.28",
+        "alpha": "clamp(0.42 + 0.36 * sin(tau * (time + s * 0.21 + 0.5)), 0, 1)"
+      }
+    },
+    {
+      "name": "Whitecaps",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "foam"
+        },
+        "period_cells": 1.75,
+        "duty": 0.9,
+        "phase_cells": 0,
+        "half_width": "0.12",
+        "t_center": "0.35",
+        "alpha": "clamp(0.5 + 0.45 * sin(tau * (time + s * 0.29)), 0, 1)"
+      }
+    },
+    {
+      "name": "Spray",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "1 - saw(time) - 0.1",
+            "color": {
+              "slot": "fill"
+            },
+            "alpha": "0"
+          },
+          {
+            "offset": "1 - saw(time)",
+            "color": {
+              "literal": "foam"
+            },
+            "alpha": "0.3"
+          },
+          {
+            "offset": "1 - saw(time) + 0.1",
+            "color": {
+              "slot": "fill"
+            },
+            "alpha": "0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Shorebreak",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "head",
+        "natural": 2.2,
+        "min": 0.9,
+        "priority": 10
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.78"
+            },
+            "alpha": "1"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.4"
+            },
+            "alpha": "0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Eye",
+      "type": "head_disc",
+      "paint": {
+        "literal": "iris"
+      },
+      "radius_ratio": "0.48"
+    }
+  ]
+}

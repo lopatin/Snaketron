@@ -1,0 +1,332 @@
+{
+  "schema_version": 2,
+  "id": "static@1",
+  "name": "Static",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#0e3050",
+        "outline": "#6a1f9c",
+        "accent": "#3fdcf5"
+      },
+      {
+        "fill": "#0b2944",
+        "outline": "#5d1a8a",
+        "accent": "#35cbe6"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#63402a",
+        "outline": "#a3300f",
+        "accent": "#ff9a30"
+      },
+      {
+        "fill": "#5f3d26",
+        "outline": "#942b0d",
+        "accent": "#ef8c25"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#0e3050",
+        "outline": "#6a1f9c",
+        "accent": "#3fdcf5"
+      },
+      {
+        "fill": "#63402a",
+        "outline": "#a3300f",
+        "accent": "#ff9a30"
+      },
+      {
+        "fill": "#26332f",
+        "outline": "#2f8f3c",
+        "accent": "#7dffa0"
+      },
+      {
+        "fill": "#3a2140",
+        "outline": "#b22a86",
+        "accent": "#ff8ad8"
+      }
+    ]
+  },
+  "literals": {
+    "snow": "#e9f1f6",
+    "snow_grey": "#aebdc7",
+    "dropout": "#05080c"
+  },
+  "period_ms": 1800,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#05070a"
+  },
+  "layers": [
+    {
+      "name": "Bezel",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline",
+        "lighten": "-0.55"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Screen",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Raster falloff",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.45"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.34",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.28"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.72",
+            "color": {
+              "slot": "outline",
+              "lighten": "-0.35"
+            },
+            "alpha": "0.6"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.5"
+            },
+            "alpha": "0.8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Snow, lower field",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "snow"
+        },
+        "period_cells": 3.0,
+        "duty": 0.68,
+        "phase_cells": 0.0,
+        "half_width": "0.16",
+        "t_center": "-0.33",
+        "alpha": "clamp(1.4 * noise(s * 0.93 + time * 7.0, 2.7) - 0.36, 0, 1)"
+      }
+    },
+    {
+      "name": "Snow, middle field",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "snow_grey"
+        },
+        "period_cells": 3.7,
+        "duty": 0.7,
+        "phase_cells": 2.0,
+        "half_width": "0.16",
+        "t_center": "0.0",
+        "alpha": "clamp(1.35 * noise(s * 1.21 + 11.4 - time * 5.5, 8.3) - 0.32, 0, 1)"
+      }
+    },
+    {
+      "name": "Snow, upper field",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "snow",
+          "lighten": "-0.2"
+        },
+        "period_cells": 5.4,
+        "duty": 0.6,
+        "phase_cells": 2.45,
+        "half_width": "0.16",
+        "t_center": "0.33",
+        "alpha": "clamp(1.3 * noise(s * 0.71 + 5.9 + time * 4.0, 15.1) - 0.3, 0, 1)"
+      }
+    },
+    {
+      "name": "Interference bar, dropout",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.45 + 0.4 * sin(tau * time)",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "dropout"
+        },
+        "period_cells": 12.6,
+        "duty": 0.44,
+        "phase_cells": 1.8,
+        "half_width": "0.2",
+        "t_center": "0.28 * sin(tau * (time + 0.12))"
+      }
+    },
+    {
+      "name": "Interference bar, hot",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.34 + 0.3 * sin(tau * (time + 0.55))",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "snow_grey",
+          "lighten": "0.3"
+        },
+        "period_cells": 10.6,
+        "duty": 0.36,
+        "phase_cells": 5.2,
+        "half_width": "0.16",
+        "t_center": "-0.3 * sin(tau * (time + 0.38))"
+      }
+    },
+    {
+      "name": "Chroma tear, leading fringe",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.12"
+        },
+        "period_cells": 6.4,
+        "duty": 0.56,
+        "phase_cells": 0.7,
+        "half_width": "0.055",
+        "t_center": "0.34 * sin(tau * (2 * time + 0.18))"
+      }
+    },
+    {
+      "name": "Chroma tear, trailing fringe",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "0.36"
+        },
+        "period_cells": 10.6,
+        "duty": 0.5,
+        "phase_cells": 3.4,
+        "half_width": "0.05",
+        "t_center": "0.34 * sin(tau * (2 * time + 0.18)) - 0.1"
+      }
+    },
+    {
+      "name": "Flyback",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.66",
+      "color": "#f4fbff",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Beam spot",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.35"
+      },
+      "radius_ratio": "0.4"
+    }
+  ]
+}

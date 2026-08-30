@@ -1,0 +1,406 @@
+{
+  "schema_version": 2,
+  "id": "ripple@1",
+  "name": "Ripple",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#003f4d",
+        "outline": "#001621",
+        "accent": "#38f2ff"
+      },
+      {
+        "fill": "#003847",
+        "outline": "#001219",
+        "accent": "#22ddf2"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#651f06",
+        "outline": "#220900",
+        "accent": "#ffab1f"
+      },
+      {
+        "fill": "#601a02",
+        "outline": "#1e0700",
+        "accent": "#ff9508"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#003f4d",
+        "outline": "#001621",
+        "accent": "#38f2ff"
+      },
+      {
+        "fill": "#651f06",
+        "outline": "#220900",
+        "accent": "#ffab1f"
+      },
+      {
+        "fill": "#17262b",
+        "outline": "#070d10",
+        "accent": "#7dfba6"
+      },
+      {
+        "fill": "#241040",
+        "outline": "#0d0520",
+        "accent": "#c98bff"
+      }
+    ]
+  },
+  "period_ms": 1600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#050d12"
+  },
+  "layers": [
+    {
+      "name": "Bezel",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Glass",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Screen depth",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.62"
+            },
+            "alpha": "0.97"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.86"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.4"
+            },
+            "alpha": "0.72"
+          },
+          {
+            "offset": "0.82",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.04"
+            },
+            "alpha": "0.7"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Zero axis",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.14"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.06",
+        "t_center": "0"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Graticule",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.14"
+        },
+        "period_cells": 3.0,
+        "duty": 0.08,
+        "phase_cells": 1.5,
+        "half_width": "0.42",
+        "t_center": "0"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 0.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * time)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 1.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * (time - 0.142857))"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 2.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * (time - 0.285714))"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 4",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 3.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * (time - 0.428571))"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 5",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 4.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * (time - 0.571429))"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 6",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 5.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * (time - 0.714286))"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Trace 7",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 7.0,
+        "duty": 0.14,
+        "phase_cells": 6.0,
+        "half_width": "0.13",
+        "t_center": "0.35 * sin(tau * (time - 0.857143))"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Sweep",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "saw(time) - 0.1",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0"
+          },
+          {
+            "offset": "saw(time)",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.5"
+            },
+            "alpha": "0.22"
+          },
+          {
+            "offset": "saw(time) + 0.1",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Beam spot",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.8",
+      "color": "#eef7f9",
+      "length_cells": 1.4
+    }
+  ]
+}

@@ -1,0 +1,304 @@
+{
+  "schema_version": 2,
+  "id": "delft@1",
+  "name": "Delft",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#1f4a9c",
+        "outline": "#12305f",
+        "accent": "#7ba3da"
+      },
+      {
+        "fill": "#1a4290",
+        "outline": "#0e2a56",
+        "accent": "#6e97d2"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#9c3018",
+        "outline": "#571507",
+        "accent": "#cf7f5f"
+      },
+      {
+        "fill": "#7a3a50",
+        "outline": "#431c2a",
+        "accent": "#ab7285"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#1f4a9c",
+        "outline": "#12305f",
+        "accent": "#7ba3da"
+      },
+      {
+        "fill": "#9c3018",
+        "outline": "#571507",
+        "accent": "#cf7f5f"
+      },
+      {
+        "fill": "#3a4450",
+        "outline": "#1d232a",
+        "accent": "#93a0ae"
+      },
+      {
+        "fill": "#5c4a16",
+        "outline": "#2e250a",
+        "accent": "#a8914c"
+      }
+    ]
+  },
+  "literals": {
+    "glaze": "#f4f3ef",
+    "chalk": "#fbfaf7"
+  },
+  "labels": {
+    "ink": "#16233c"
+  },
+  "period_ms": 5200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#132241"
+  },
+  "layers": [
+    {
+      "name": "Painted rim",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Tin glaze",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "literal": "glaze"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Glaze pooling",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "literal": "chalk"
+            },
+            "alpha": "0.5"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.86"
+            },
+            "alpha": "0.62"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "literal": "glaze"
+            },
+            "alpha": "0.55"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.74"
+            },
+            "alpha": "0.7"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Brush line, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill"
+        },
+        "period_cells": 4.3,
+        "duty": 0.9,
+        "phase_cells": 0.0,
+        "half_width": "0.05",
+        "t_center": "0.4",
+        "alpha": "clamp(0.55 + 0.42 * noise(s * 1.98, 2.7), 0, 1)"
+      }
+    },
+    {
+      "name": "Brush line, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.12"
+        },
+        "period_cells": 3.7,
+        "duty": 0.88,
+        "phase_cells": 1.1,
+        "half_width": "0.05",
+        "t_center": "-0.4",
+        "alpha": "clamp(0.5 + 0.45 * noise(s * 2.6 + 4.3, 7.1), 0, 1)"
+      }
+    },
+    {
+      "name": "Brush line, centre",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.18"
+        },
+        "period_cells": 5.1,
+        "duty": 0.84,
+        "phase_cells": 2.4,
+        "half_width": "0.058",
+        "t_center": "0.03",
+        "alpha": "clamp(0.44 + 0.4 * noise(s * 1.47 + 9.4, 5.2) + 0.1 * sin(tau * (time + s * 0.06)), 0, 1)"
+      }
+    },
+    {
+      "name": "Motif, crown",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill"
+        },
+        "period_cells": 6.3,
+        "duty": 0.2,
+        "phase_cells": 3.2,
+        "half_width": "0.075",
+        "t_center": "0.24"
+      }
+    },
+    {
+      "name": "Motif, heart",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.14"
+        },
+        "period_cells": 6.3,
+        "duty": 0.3,
+        "phase_cells": 3.58,
+        "half_width": "0.1",
+        "t_center": "0.0",
+        "alpha": "clamp(0.62 + 0.36 * noise(s * 1.23 + 17.6, 3.4), 0, 1)"
+      }
+    },
+    {
+      "name": "Motif, stem",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill"
+        },
+        "period_cells": 6.3,
+        "duty": 0.18,
+        "phase_cells": 3.98,
+        "half_width": "0.07",
+        "t_center": "-0.26"
+      }
+    },
+    {
+      "name": "Rim shading",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.3) * 0.3",
+      "color": "#8d97a4",
+      "length_cells": 1.3
+    },
+    {
+      "name": "Pupil",
+      "type": "head_disc",
+      "paint": {
+        "slot": "fill"
+      },
+      "radius_ratio": "0.4"
+    }
+  ]
+}

@@ -1,0 +1,260 @@
+{
+  "schema_version": 2,
+  "id": "floe@1",
+  "name": "Floe",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#123f8e",
+        "outline": "#08214f",
+        "accent": "#bfe6fa"
+      },
+      {
+        "fill": "#0e3273",
+        "outline": "#061a3e",
+        "accent": "#a5d8f5"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#8e3312",
+        "outline": "#4a1806",
+        "accent": "#fad9bd"
+      },
+      {
+        "fill": "#732a0e",
+        "outline": "#3c1305",
+        "accent": "#f5c9a5"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#123f8e",
+        "outline": "#08214f",
+        "accent": "#bfe6fa"
+      },
+      {
+        "fill": "#8e3312",
+        "outline": "#4a1806",
+        "accent": "#fad9bd"
+      },
+      {
+        "fill": "#39434f",
+        "outline": "#1b222b",
+        "accent": "#cfdce8"
+      },
+      {
+        "fill": "#6f4f0d",
+        "outline": "#46320a",
+        "accent": "#f9dc93"
+      }
+    ]
+  },
+  "literals": {
+    "glint": "#ffffff"
+  },
+  "period_ms": 3400,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#07162e"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Polar water",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Depth",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.36"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "0.38",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.16"
+            },
+            "alpha": "0.62"
+          },
+          {
+            "offset": "0.72",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.1"
+            },
+            "alpha": "0.6"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.32"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Slabs",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.3"
+        },
+        "period_cells": 2.75,
+        "duty": 0.66,
+        "phase_cells": 0.0,
+        "half_width": "0.28",
+        "t_center": "0.2",
+        "alpha": "clamp(0.55 + 0.4 * sin(tau * (time + s * 0.15)), 0, 1) * smoothstep(2.4, 4.2, s)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Slab light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "glint"
+        },
+        "period_cells": 2.75,
+        "duty": 0.5,
+        "phase_cells": 0.1,
+        "half_width": "0.075",
+        "t_center": "0.4",
+        "alpha": "0.75 * smoothstep(2.4, 4.2, s)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Brash",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.12"
+        },
+        "period_cells": 2.2,
+        "duty": 0.34,
+        "phase_cells": 0.9,
+        "half_width": "0.12",
+        "t_center": "-0.3",
+        "alpha": "clamp(0.4 + 0.5 * sin(tau * (time + s * 0.21 + 0.5)), 0, 1) * smoothstep(2.2, 4.2, s)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Low sun",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "1 - saw(time) - 0.14",
+            "color": {
+              "slot": "fill"
+            },
+            "alpha": "0"
+          },
+          {
+            "offset": "1 - saw(time)",
+            "color": {
+              "literal": "glint"
+            },
+            "alpha": "0.21"
+          },
+          {
+            "offset": "1 - saw(time) + 0.14",
+            "color": {
+              "slot": "fill"
+            },
+            "alpha": "0"
+          }
+        ]
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Rime",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.6) * 0.5",
+      "color": "#ffffff",
+      "length_cells": 1.6
+    }
+  ]
+}

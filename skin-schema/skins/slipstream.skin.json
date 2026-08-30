@@ -1,0 +1,281 @@
+{
+  "schema_version": 2,
+  "id": "slipstream@1",
+  "name": "Slipstream",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#0d4a63",
+        "outline": "#04202c",
+        "accent": "#3ee6ff"
+      },
+      {
+        "fill": "#0c435c",
+        "outline": "#031b25",
+        "accent": "#2ad4f5"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#702208",
+        "outline": "#2a0b03",
+        "accent": "#ff7a1f"
+      },
+      {
+        "fill": "#661d07",
+        "outline": "#250903",
+        "accent": "#ff6a12"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#0d4a63",
+        "outline": "#04202c",
+        "accent": "#3ee6ff"
+      },
+      {
+        "fill": "#702208",
+        "outline": "#2a0b03",
+        "accent": "#ff7a1f"
+      },
+      {
+        "fill": "#2f3a44",
+        "outline": "#141a20",
+        "accent": "#b9cbd9"
+      },
+      {
+        "fill": "#3a1442",
+        "outline": "#18081c",
+        "accent": "#d47bff"
+      }
+    ]
+  },
+  "literals": {
+    "flash": "#eafdff"
+  },
+  "period_ms": 1200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#04121b"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Shell",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Draft",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.45"
+            },
+            "alpha": "0.96"
+          },
+          {
+            "offset": "0.24",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.22"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.24"
+            },
+            "alpha": "0.8"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.1"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Rake, lane 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.06"
+        },
+        "period_cells": 4.25,
+        "duty": 0.45,
+        "phase_cells": 3.6,
+        "half_width": "0.115",
+        "t_center": "-0.38",
+        "alpha": "clamp(0.6 + 0.38 * sin(tau * (time - s * 0.19)), 0, 1)"
+      }
+    },
+    {
+      "name": "Rake, lane 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.06"
+        },
+        "period_cells": 4.25,
+        "duty": 0.45,
+        "phase_cells": 3.9,
+        "half_width": "0.115",
+        "t_center": "-0.19",
+        "alpha": "clamp(0.6 + 0.38 * sin(tau * (time - s * 0.19)), 0, 1)"
+      }
+    },
+    {
+      "name": "Rake, lane 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "flash"
+        },
+        "period_cells": 4.25,
+        "duty": 0.45,
+        "phase_cells": 4.2,
+        "half_width": "0.115",
+        "t_center": "0.0",
+        "alpha": "clamp(0.6 + 0.38 * sin(tau * (time - s * 0.19)), 0, 1)"
+      }
+    },
+    {
+      "name": "Rake, lane 4",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.06"
+        },
+        "period_cells": 4.25,
+        "duty": 0.45,
+        "phase_cells": 4.5,
+        "half_width": "0.115",
+        "t_center": "0.19",
+        "alpha": "clamp(0.6 + 0.38 * sin(tau * (time - s * 0.19)), 0, 1)"
+      }
+    },
+    {
+      "name": "Rake, lane 5",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.06"
+        },
+        "period_cells": 4.25,
+        "duty": 0.45,
+        "phase_cells": 4.8,
+        "half_width": "0.115",
+        "t_center": "0.38",
+        "alpha": "clamp(0.6 + 0.38 * sin(tau * (time - s * 0.19)), 0, 1)"
+      }
+    },
+    {
+      "name": "Intake",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.62",
+      "color": "#f0f6fa",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Lamp",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.5"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

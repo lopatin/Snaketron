@@ -1,0 +1,329 @@
+{
+  "schema_version": 2,
+  "id": "peacock@1",
+  "name": "Peacock",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#005863",
+        "outline": "#02272d",
+        "accent": "#2f6fe0"
+      },
+      {
+        "fill": "#005059",
+        "outline": "#021f24",
+        "accent": "#2a66d6"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#712808",
+        "outline": "#2c0f04",
+        "accent": "#d1651f"
+      },
+      {
+        "fill": "#6b2606",
+        "outline": "#280d03",
+        "accent": "#c55c1a"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#005863",
+        "outline": "#02272d",
+        "accent": "#2f6fe0"
+      },
+      {
+        "fill": "#712808",
+        "outline": "#2c0f04",
+        "accent": "#d1651f"
+      },
+      {
+        "fill": "#2c2a5c",
+        "outline": "#111029",
+        "accent": "#8f8ce8"
+      },
+      {
+        "fill": "#4a1c4e",
+        "outline": "#1c081e",
+        "accent": "#e884d8"
+      }
+    ]
+  },
+  "literals": {
+    "gold": "#f2c14e",
+    "pupil": "#0d1230"
+  },
+  "period_ms": 2600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#060f14"
+  },
+  "layers": [
+    {
+      "name": "Quill edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Train",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Iridescence",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.32"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "0.26",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.14"
+            },
+            "alpha": "0.86"
+          },
+          {
+            "offset": "0.56",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.12"
+            },
+            "alpha": "0.6"
+          },
+          {
+            "offset": "0.8",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.06"
+            },
+            "alpha": "0.46"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Barbs, upper vane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.86 + 0.12 * sin(tau * time)",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.26"
+        },
+        "period_cells": 1.45,
+        "duty": 0.86,
+        "phase_cells": 0.0,
+        "half_width": "0.2",
+        "t_center": "0.29"
+      }
+    },
+    {
+      "name": "Barbs, lower vane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.86 + 0.12 * sin(tau * (time + 0.5))",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.14"
+        },
+        "period_cells": 1.62,
+        "duty": 0.86,
+        "phase_cells": 0.51,
+        "half_width": "0.2",
+        "t_center": "-0.29"
+      }
+    },
+    {
+      "name": "Ocellus frame",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.55"
+        },
+        "period_cells": 4.6,
+        "duty": 0.3,
+        "phase_cells": 3.3,
+        "half_width": "0.47",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Ocellus gold",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "gold"
+        },
+        "period_cells": 4.6,
+        "duty": 0.245,
+        "phase_cells": 3.4265,
+        "half_width": "0.38",
+        "t_center": "0.0",
+        "alpha": "clamp(0.78 + 0.2 * sin(tau * (time - s * 0.13)), 0, 1)"
+      }
+    },
+    {
+      "name": "Ocellus iris",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.12"
+        },
+        "period_cells": 4.6,
+        "duty": 0.16,
+        "phase_cells": 3.622,
+        "half_width": "0.25",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Ocellus pupil",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "pupil"
+        },
+        "period_cells": 4.6,
+        "duty": 0.09,
+        "phase_cells": 3.783,
+        "half_width": "0.12",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Crest",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.55",
+      "color": "#fbf1d6",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Crown ocellus, frame",
+      "type": "head_disc",
+      "paint": {
+        "slot": "fill",
+        "lighten": "-0.55"
+      },
+      "radius_ratio": "0.5"
+    },
+    {
+      "name": "Crown ocellus, gold",
+      "type": "head_disc",
+      "paint": {
+        "literal": "gold"
+      },
+      "radius_ratio": "0.44"
+    },
+    {
+      "name": "Crown ocellus, iris",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.12"
+      },
+      "radius_ratio": "0.36"
+    }
+  ]
+}

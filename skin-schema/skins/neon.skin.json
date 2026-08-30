@@ -1,0 +1,428 @@
+{
+  "schema_version": 2,
+  "id": "neon@1",
+  "name": "Neon",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#0b2356",
+        "outline": "#030a1c",
+        "accent": "#57e8ff"
+      },
+      {
+        "fill": "#0d2860",
+        "outline": "#04081f",
+        "accent": "#47dcff"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#580e0c",
+        "outline": "#1c0402",
+        "accent": "#ff7a33"
+      },
+      {
+        "fill": "#601009",
+        "outline": "#200401",
+        "accent": "#ff6a22"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#0b2356",
+        "outline": "#030a1c",
+        "accent": "#57e8ff"
+      },
+      {
+        "fill": "#580e0c",
+        "outline": "#1c0402",
+        "accent": "#ff7a33"
+      },
+      {
+        "fill": "#0c3218",
+        "outline": "#030f07",
+        "accent": "#57d95c"
+      },
+      {
+        "fill": "#2b0b4c",
+        "outline": "#0d0219",
+        "accent": "#d977ff"
+      }
+    ]
+  },
+  "literals": {
+    "electrode": "#05070c",
+    "glint": "#c9d6e2",
+    "seam": "#04060c"
+  },
+  "period_ms": 1600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#04070f"
+  },
+  "layers": [
+    {
+      "name": "Glass rim",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Glass",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Tube glass",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.35"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.26",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.5"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.68"
+            },
+            "alpha": "0.8"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.62"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Halo, outer upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.62"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.132 + 0.008 * sin(tau * time * 3)",
+        "t_center": "0.3 + 0.012 * sin(tau * time * 3)"
+      }
+    },
+    {
+      "name": "Halo, outer lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.62"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.132 + 0.008 * sin(tau * time * 3)",
+        "t_center": "-0.3 - 0.012 * sin(tau * time * 3)"
+      }
+    },
+    {
+      "name": "Halo, mid upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.3"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.098",
+        "t_center": "0.185 + 0.008 * sin(tau * time * 3)"
+      }
+    },
+    {
+      "name": "Halo, mid lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.3"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.098",
+        "t_center": "-0.185 - 0.008 * sin(tau * time * 3)"
+      }
+    },
+    {
+      "name": "Halo, inner upper",
+      "type": "span",
+      "opacity": "0.84 + 0.16 * sin(tau * time * 8)",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.05"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.062",
+        "t_center": "0.098"
+      }
+    },
+    {
+      "name": "Halo, inner lower",
+      "type": "span",
+      "opacity": "0.84 + 0.16 * sin(tau * time * 8)",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.05"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.062",
+        "t_center": "-0.098"
+      }
+    },
+    {
+      "name": "Gas core",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.7"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.05 + 0.008 * sin(tau * time * 3)",
+        "t_center": "0",
+        "alpha": "clamp(0.7 + 0.2 * noise(3.0 + 1.1 * sin(tau * time), 5.0 + 1.1 * cos(tau * time)) + 0.09 * sin(tau * time * 8), 0, 1)"
+      }
+    },
+    {
+      "name": "Glass highlight",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "glint"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.03",
+        "t_center": "0.455"
+      }
+    },
+    {
+      "name": "Glass seams",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "seam"
+        },
+        "period_cells": 4.3,
+        "duty": 0.09,
+        "phase_cells": 1.15,
+        "half_width": "0.45",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Electrode collars",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "electrode"
+        },
+        "period_cells": 6.7,
+        "duty": 0.15,
+        "phase_cells": 2.4,
+        "half_width": "0.42",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Collar glint",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "glint"
+        },
+        "period_cells": 6.7,
+        "duty": 0.035,
+        "phase_cells": 2.44,
+        "half_width": "0.4",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Lit end",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.72",
+      "color": "#f2fbff",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Terminal",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.55"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

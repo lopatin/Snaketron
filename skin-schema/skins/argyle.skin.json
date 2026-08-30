@@ -1,0 +1,312 @@
+{
+  "schema_version": 2,
+  "id": "argyle@1",
+  "name": "Argyle",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#a0a4db",
+        "outline": "#2f3050",
+        "accent": "#4d5080"
+      },
+      {
+        "fill": "#8e91c7",
+        "outline": "#282944",
+        "accent": "#43466f"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#eab789",
+        "outline": "#5c3a20",
+        "accent": "#8a5b34"
+      },
+      {
+        "fill": "#d9a276",
+        "outline": "#4e3019",
+        "accent": "#7a4e2b"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#a0a4db",
+        "outline": "#2f3050",
+        "accent": "#4d5080"
+      },
+      {
+        "fill": "#eab789",
+        "outline": "#5c3a20",
+        "accent": "#8a5b34"
+      },
+      {
+        "fill": "#b9c3a6",
+        "outline": "#3a422e",
+        "accent": "#5b6644"
+      },
+      {
+        "fill": "#e0b2b6",
+        "outline": "#4c2d31",
+        "accent": "#7a4c51"
+      }
+    ]
+  },
+  "period_ms": 5200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#1c1a26"
+  },
+  "layers": [
+    {
+      "name": "Selvedge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Heather ground",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Knit, low selvedge",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.56"
+        },
+        "period_cells": 2.0,
+        "duty": 0.1667,
+        "phase_cells": 1.8333,
+        "half_width": "0.0833",
+        "t_center": "-0.4167"
+      }
+    },
+    {
+      "name": "Knit, low",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.56"
+        },
+        "period_cells": 2.0,
+        "duty": 0.5,
+        "phase_cells": 1.5,
+        "half_width": "0.0833",
+        "t_center": "-0.2500"
+      }
+    },
+    {
+      "name": "Knit, low centre",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.56"
+        },
+        "period_cells": 2.0,
+        "duty": 0.8333,
+        "phase_cells": 1.1667,
+        "half_width": "0.0833",
+        "t_center": "-0.0833"
+      }
+    },
+    {
+      "name": "Knit, high centre",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.56"
+        },
+        "period_cells": 2.0,
+        "duty": 0.8333,
+        "phase_cells": 1.1667,
+        "half_width": "0.0833",
+        "t_center": "0.0833"
+      }
+    },
+    {
+      "name": "Knit, high",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.56"
+        },
+        "period_cells": 2.0,
+        "duty": 0.5,
+        "phase_cells": 1.5,
+        "half_width": "0.0833",
+        "t_center": "0.2500"
+      }
+    },
+    {
+      "name": "Knit, high selvedge",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.56"
+        },
+        "period_cells": 2.0,
+        "duty": 0.1667,
+        "phase_cells": 1.8333,
+        "half_width": "0.0833",
+        "t_center": "0.4167"
+      }
+    },
+    {
+      "name": "Overstitch, low",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 6.0,
+        "duty": 0.1333,
+        "phase_cells": 5.02,
+        "half_width": "0.055 + 0.012 * sin(tau * time)",
+        "t_center": "-0.29 + 0.014 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Overstitch, centre",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 6.0,
+        "duty": 0.1333,
+        "phase_cells": 5.6,
+        "half_width": "0.055 + 0.012 * sin(tau * time)",
+        "t_center": "0.014 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Overstitch, high",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 6.0,
+        "duty": 0.1333,
+        "phase_cells": 0.18,
+        "half_width": "0.055 + 0.012 * sin(tau * time)",
+        "t_center": "0.29 + 0.014 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Cuff light",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.42",
+      "color": "#fdf8ec",
+      "length_cells": 1.4
+    }
+  ]
+}

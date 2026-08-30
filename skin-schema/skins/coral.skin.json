@@ -1,0 +1,279 @@
+{
+  "schema_version": 2,
+  "id": "coral@1",
+  "name": "Coral",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#007e78",
+        "outline": "#1a0a3d",
+        "accent": "#a35cff"
+      },
+      {
+        "fill": "#05757f",
+        "outline": "#150a33",
+        "accent": "#8f47f5"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#de1a4e",
+        "outline": "#3d0a02",
+        "accent": "#ff8f1c"
+      },
+      {
+        "fill": "#cd1a4a",
+        "outline": "#360902",
+        "accent": "#f5720a"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#007e78",
+        "outline": "#1a0a3d",
+        "accent": "#a35cff"
+      },
+      {
+        "fill": "#de1a4e",
+        "outline": "#3d0a02",
+        "accent": "#ff8f1c"
+      },
+      {
+        "fill": "#3b6209",
+        "outline": "#1c2606",
+        "accent": "#aecb2c"
+      },
+      {
+        "fill": "#7f1794",
+        "outline": "#2c0537",
+        "accent": "#ff5ce0"
+      }
+    ]
+  },
+  "literals": {
+    "polyp": "#fff3d0"
+  },
+  "period_ms": 4200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#08181c"
+  },
+  "layers": [
+    {
+      "name": "Reef rim",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Living rock",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Lagoon depth",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.12"
+            },
+            "alpha": "0.96"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.1"
+            },
+            "alpha": "0.5"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.6"
+            },
+            "alpha": "0.72"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Understory shadow",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.68"
+        },
+        "period_cells": 21.0,
+        "duty": 0.95,
+        "phase_cells": 0.4,
+        "half_width": "0.055",
+        "t_center": "-0.44"
+      }
+    },
+    {
+      "name": "Branch mass",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.48"
+        },
+        "period_cells": 3.4,
+        "duty": 0.44,
+        "phase_cells": 1.9,
+        "half_width": "0.16 + 0.018 * sin(tau * time)",
+        "t_center": "-0.22",
+        "alpha": "clamp(0.52 + 0.44 * noise(s * 1.45 + 7.9, 9.4), 0, 1)"
+      }
+    },
+    {
+      "name": "Encrusting algae",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.34"
+        },
+        "period_cells": 3.2,
+        "duty": 0.44,
+        "phase_cells": 0.0,
+        "half_width": "0.2 + 0.02 * sin(tau * (time + 0.37))",
+        "t_center": "0.235",
+        "alpha": "clamp(0.4 + 0.5 * noise(s * 0.78 + 1.3, 4.2), 0, 1)"
+      }
+    },
+    {
+      "name": "Coral tips",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 4.9,
+        "duty": 0.44,
+        "phase_cells": 0.7,
+        "half_width": "0.105 + 0.014 * sin(tau * (time + 0.68))",
+        "t_center": "0.3",
+        "alpha": "clamp(0.5 + 0.45 * noise(s * 2.6 + 3.1, 2.35), 0, 1)"
+      }
+    },
+    {
+      "name": "Polyps",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "polyp"
+        },
+        "period_cells": 2.9,
+        "duty": 0.3,
+        "phase_cells": 1.35,
+        "half_width": "0.085 + 0.012 * sin(tau * (time + 0.15))",
+        "t_center": "-0.02",
+        "alpha": "clamp(0.52 + 0.4 * noise(s * 3.9 + 21.4, 1.15) + 0.14 * sin(tau * (time + s * 0.11)), 0, 1)"
+      }
+    },
+    {
+      "name": "Polyp crown",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.6",
+      "color": "#fff1d6",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Oral disc",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.3"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

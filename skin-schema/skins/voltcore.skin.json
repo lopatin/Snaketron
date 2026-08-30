@@ -1,0 +1,431 @@
+{
+  "schema_version": 2,
+  "id": "voltcore@1",
+  "name": "Voltcore",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#2f3f76",
+        "outline": "#0e1430",
+        "accent": "#4fd8ff"
+      },
+      {
+        "fill": "#26346a",
+        "outline": "#0a1028",
+        "accent": "#3ac2f0"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#4a1218",
+        "outline": "#1b0709",
+        "accent": "#ff6a3c"
+      },
+      {
+        "fill": "#3d0f16",
+        "outline": "#160608",
+        "accent": "#ff5028"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#2f3f76",
+        "outline": "#0e1430",
+        "accent": "#4fd8ff"
+      },
+      {
+        "fill": "#4a1218",
+        "outline": "#1b0709",
+        "accent": "#ff6a3c"
+      },
+      {
+        "fill": "#343b45",
+        "outline": "#12161c",
+        "accent": "#a8c6d8"
+      },
+      {
+        "fill": "#3c3113",
+        "outline": "#171105",
+        "accent": "#ffc23a"
+      }
+    ]
+  },
+  "period_ms": 1800,
+  "head_core": {
+    "ratio": 0.32,
+    "color": "#080b14"
+  },
+  "layers": [
+    {
+      "name": "Casing",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Chassis",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Anodised shell",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.32"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.12"
+            },
+            "alpha": "0.8"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.26"
+            },
+            "alpha": "0.62"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.94"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Plate ribs",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "0.14"
+        },
+        "period_cells": 4.2,
+        "duty": 0.16,
+        "phase_cells": 2.1,
+        "half_width": "0.46",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Machined shoulder",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.45"
+        },
+        "period_cells": 7.0,
+        "duty": 0.93,
+        "phase_cells": 0.0,
+        "half_width": "0.055",
+        "t_center": "0.4"
+      }
+    },
+    {
+      "name": "Core seam",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.28 + 0.12 * sin(tau * time) + 0.5 * boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 5.25,
+        "duty": 0.9,
+        "phase_cells": 0.0,
+        "half_width": "0.085",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Core filament",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.4 + 0.1 * sin(tau * (time + 0.5)) + 0.5 * boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.72"
+        },
+        "period_cells": 5.25,
+        "duty": 0.84,
+        "phase_cells": 0.1,
+        "half_width": "0.026",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Intake vent",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * (0.34 + 0.52 * boost)",
+      "color": "#e6f1ff",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Arc, upper outer",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.55"
+        },
+        "period_cells": 5.25,
+        "duty": 0.3,
+        "phase_cells": 1.2,
+        "half_width": "0.075",
+        "t_center": "0.4"
+      }
+    },
+    {
+      "name": "Arc, upper inner",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.75"
+        },
+        "period_cells": 5.25,
+        "duty": 0.32,
+        "phase_cells": 0.6,
+        "half_width": "0.08",
+        "t_center": "0.2"
+      }
+    },
+    {
+      "name": "Arc, spine",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.95"
+        },
+        "period_cells": 5.25,
+        "duty": 0.34,
+        "phase_cells": 0.0,
+        "half_width": "0.085",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Arc, lower inner",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.75"
+        },
+        "period_cells": 5.25,
+        "duty": 0.32,
+        "phase_cells": 0.6,
+        "half_width": "0.08",
+        "t_center": "-0.2"
+      }
+    },
+    {
+      "name": "Arc, lower outer",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.55"
+        },
+        "period_cells": 5.25,
+        "duty": 0.3,
+        "phase_cells": 1.2,
+        "half_width": "0.075",
+        "t_center": "-0.4"
+      }
+    },
+    {
+      "name": "Exhaust bloom",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "boost_only": true,
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0.42",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.3"
+            },
+            "alpha": "0.45"
+          },
+          {
+            "offset": "0.84",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.6"
+            },
+            "alpha": "0.8"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.88"
+            },
+            "alpha": "1"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Reactor eye",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.55"
+      },
+      "radius_ratio": "0.48"
+    }
+  ]
+}

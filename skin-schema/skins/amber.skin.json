@@ -1,0 +1,408 @@
+{
+  "schema_version": 2,
+  "id": "amber@1",
+  "name": "Amber",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#00695a",
+        "outline": "#012620",
+        "accent": "#6ad9c0"
+      },
+      {
+        "fill": "#005f52",
+        "outline": "#011f1a",
+        "accent": "#5ecfb6"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#96550a",
+        "outline": "#2e1901",
+        "accent": "#ffcf72"
+      },
+      {
+        "fill": "#8b4f08",
+        "outline": "#271501",
+        "accent": "#f6c05e"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#00695a",
+        "outline": "#012620",
+        "accent": "#6ad9c0"
+      },
+      {
+        "fill": "#96550a",
+        "outline": "#2e1901",
+        "accent": "#ffcf72"
+      },
+      {
+        "fill": "#453a2a",
+        "outline": "#1a1610",
+        "accent": "#e0cda6"
+      },
+      {
+        "fill": "#2b3663",
+        "outline": "#101538",
+        "accent": "#93b6ff"
+      }
+    ]
+  },
+  "literals": {
+    "inclusion": "#1c1105",
+    "bubble": "#efe0bc"
+  },
+  "period_ms": 5200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#140c02"
+  },
+  "layers": [
+    {
+      "name": "Rind",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Bead",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Depth",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.05"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "0.15",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.22"
+            },
+            "alpha": "0.96"
+          },
+          {
+            "offset": "0.32",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.1"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.48",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.24"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.1"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "0.78",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.12"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.96"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Rim shadow, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.66",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.45"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.11",
+        "t_center": "0.37"
+      }
+    },
+    {
+      "name": "Specular",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.5",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.62"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.085 + 0.015 * sin(tau * time)",
+        "t_center": "0.19 + 0.03 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Flow line, deep",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.46"
+        },
+        "period_cells": 12.7,
+        "duty": 0.94,
+        "phase_cells": 1.1,
+        "half_width": "0.17",
+        "t_center": "0.02 + 0.06 * sin(tau * (time + 0.15))",
+        "alpha": "clamp(0.5 + 0.14 * sin(tau * (time - s * 0.03)), 0, 1)"
+      }
+    },
+    {
+      "name": "Flow line, honey",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.44",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.14"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.18",
+        "t_center": "-0.06 + 0.04 * sin(tau * (time + 0.35))"
+      }
+    },
+    {
+      "name": "Bounce light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.46",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.5"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.105",
+        "t_center": "-0.21 + 0.05 * sin(tau * (time + 0.6))"
+      }
+    },
+    {
+      "name": "Rim shadow, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.56",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.34"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.1",
+        "t_center": "-0.38"
+      }
+    },
+    {
+      "name": "Inclusions, coarse",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "inclusion"
+        },
+        "period_cells": 7.4,
+        "duty": 0.05,
+        "phase_cells": 2.05,
+        "half_width": "0.16",
+        "t_center": "0.08",
+        "alpha": "clamp(0.15 + 0.9 * noise(s * 0.57 + 4.3, 2.9), 0, 1)"
+      }
+    },
+    {
+      "name": "Inclusions, fine",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.7",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "inclusion"
+        },
+        "period_cells": 11.7,
+        "duty": 0.04,
+        "phase_cells": 5.3,
+        "half_width": "0.18",
+        "t_center": "-0.15"
+      }
+    },
+    {
+      "name": "Trapped bubble",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.58",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bubble"
+        },
+        "period_cells": 13.0,
+        "duty": 0.03,
+        "phase_cells": 3.95,
+        "half_width": "0.15",
+        "t_center": "0.05"
+      }
+    },
+    {
+      "name": "Inner light",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.66",
+      "color": "#fbeed6",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Glint",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.28"
+      },
+      "radius_ratio": "0.4"
+    }
+  ]
+}

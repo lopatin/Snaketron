@@ -1,0 +1,399 @@
+{
+  "schema_version": 2,
+  "id": "loom@1",
+  "name": "Loom",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#1b2a66",
+        "outline": "#070c1c",
+        "accent": "#17a89e"
+      },
+      {
+        "fill": "#17265c",
+        "outline": "#060a18",
+        "accent": "#13998f"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#7a2a10",
+        "outline": "#260c05",
+        "accent": "#e0a026"
+      },
+      {
+        "fill": "#6d2410",
+        "outline": "#200a04",
+        "accent": "#d1941f"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#1b2a66",
+        "outline": "#070c1c",
+        "accent": "#17a89e"
+      },
+      {
+        "fill": "#7a2a10",
+        "outline": "#260c05",
+        "accent": "#e0a026"
+      },
+      {
+        "fill": "#33383c",
+        "outline": "#14181b",
+        "accent": "#7f9aa3"
+      },
+      {
+        "fill": "#4a1b45",
+        "outline": "#1c0a1a",
+        "accent": "#c2557e"
+      }
+    ]
+  },
+  "literals": {
+    "cream": "#ecdcbb",
+    "linen": "#d3c49f",
+    "chalk": "#f7ecd2"
+  },
+  "period_ms": 3600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0c1018"
+  },
+  "layers": [
+    {
+      "name": "Selvedge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Cloth",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Ground dye",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.55"
+            },
+            "alpha": "0.96"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.5"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.2"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.62"
+            },
+            "alpha": "0.96"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Block, broad",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.08"
+        },
+        "period_cells": 6.8,
+        "duty": 0.34,
+        "phase_cells": 0.0,
+        "half_width": "0.47",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Block, middle",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 6.8,
+        "duty": 0.28,
+        "phase_cells": 2.55,
+        "half_width": "0.47",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Block, short",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "cream"
+        },
+        "period_cells": 6.8,
+        "duty": 0.18,
+        "phase_cells": 4.65,
+        "half_width": "0.47",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Shuttle pass",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 9.4,
+        "duty": 0.075,
+        "phase_cells": 1.35,
+        "half_width": "0.47",
+        "t_center": "0.0",
+        "alpha": "clamp(0.55 + 0.4 * sin(tau * (time - s * 0.17)), 0, 1)"
+      }
+    },
+    {
+      "name": "Warp thread 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "linen"
+        },
+        "period_cells": 10.5,
+        "duty": 0.93,
+        "phase_cells": 0.0,
+        "half_width": "0.04",
+        "t_center": "-0.42"
+      }
+    },
+    {
+      "name": "Warp thread 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.62"
+        },
+        "period_cells": 12.7,
+        "duty": 0.94,
+        "phase_cells": 1.7,
+        "half_width": "0.04",
+        "t_center": "-0.25"
+      }
+    },
+    {
+      "name": "Warp thread 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "linen"
+        },
+        "period_cells": 10.5,
+        "duty": 0.93,
+        "phase_cells": 3.4,
+        "half_width": "0.04",
+        "t_center": "-0.09"
+      }
+    },
+    {
+      "name": "Warp thread 4",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.62"
+        },
+        "period_cells": 12.7,
+        "duty": 0.94,
+        "phase_cells": 5.9,
+        "half_width": "0.04",
+        "t_center": "0.09"
+      }
+    },
+    {
+      "name": "Warp thread 5",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "linen"
+        },
+        "period_cells": 10.5,
+        "duty": 0.93,
+        "phase_cells": 7.2,
+        "half_width": "0.04",
+        "t_center": "0.25"
+      }
+    },
+    {
+      "name": "Warp thread 6",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.62"
+        },
+        "period_cells": 12.7,
+        "duty": 0.94,
+        "phase_cells": 9.8,
+        "half_width": "0.04",
+        "t_center": "0.42"
+      }
+    },
+    {
+      "name": "Loom light",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.5",
+      "color": "#fbf3de",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Bobbin",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.35"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

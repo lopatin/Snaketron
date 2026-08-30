@@ -1,0 +1,400 @@
+{
+  "schema_version": 2,
+  "id": "circuit@1",
+  "name": "Circuit",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#124f47",
+        "outline": "#05221e",
+        "accent": "#3ef0c2"
+      },
+      {
+        "fill": "#0f4c45",
+        "outline": "#041e1b",
+        "accent": "#34e4bb"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#3d1806",
+        "outline": "#190702",
+        "accent": "#ff9138"
+      },
+      {
+        "fill": "#401a07",
+        "outline": "#1b0803",
+        "accent": "#f5842c"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#124f47",
+        "outline": "#05221e",
+        "accent": "#3ef0c2"
+      },
+      {
+        "fill": "#3d1806",
+        "outline": "#190702",
+        "accent": "#ff9138"
+      },
+      {
+        "fill": "#2c3640",
+        "outline": "#111820",
+        "accent": "#b9c6d2"
+      },
+      {
+        "fill": "#35204c",
+        "outline": "#160c22",
+        "accent": "#c58cff"
+      }
+    ]
+  },
+  "literals": {
+    "solder": "#d7cdb4",
+    "package": "#16150e"
+  },
+  "period_ms": 2600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#06110f"
+  },
+  "layers": [
+    {
+      "name": "Board edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Substrate",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Laminate sheen",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.28",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.2"
+            },
+            "alpha": "0.88"
+          },
+          {
+            "offset": "0.64",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.2"
+            },
+            "alpha": "0.72"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Trace, upper rail",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.02"
+        },
+        "period_cells": 9.4,
+        "duty": 0.93,
+        "phase_cells": 0.7,
+        "half_width": "0.064",
+        "t_center": "0.35"
+      }
+    },
+    {
+      "name": "Trace, upper branch",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.18"
+        },
+        "period_cells": 6.7,
+        "duty": 0.9,
+        "phase_cells": 2.15,
+        "half_width": "0.058",
+        "t_center": "0.15"
+      }
+    },
+    {
+      "name": "Trace, signal line",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.06"
+        },
+        "period_cells": 11.3,
+        "duty": 0.94,
+        "phase_cells": 1.35,
+        "half_width": "0.066",
+        "t_center": "-0.11",
+        "alpha": "clamp(0.62 + 0.34 * sin(tau * (time - s * 0.14)), 0, 1)"
+      }
+    },
+    {
+      "name": "Trace, lower rail",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.26"
+        },
+        "period_cells": 7.9,
+        "duty": 0.92,
+        "phase_cells": 3.4,
+        "half_width": "0.058",
+        "t_center": "-0.34"
+      }
+    },
+    {
+      "name": "Cross link, long",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.2"
+        },
+        "period_cells": 5.3,
+        "duty": 0.035,
+        "phase_cells": 1.1,
+        "half_width": "0.3",
+        "t_center": "0.02"
+      }
+    },
+    {
+      "name": "Cross link, short",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.06"
+        },
+        "period_cells": 8.3,
+        "duty": 0.028,
+        "phase_cells": 4.6,
+        "half_width": "0.22",
+        "t_center": "-0.08"
+      }
+    },
+    {
+      "name": "Component, package",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "package"
+        },
+        "period_cells": 14.5,
+        "duty": 0.13,
+        "phase_cells": 6.2,
+        "half_width": "0.3",
+        "t_center": "-0.02"
+      }
+    },
+    {
+      "name": "Component, chip resistor",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "package"
+        },
+        "period_cells": 17.3,
+        "duty": 0.085,
+        "phase_cells": 2.9,
+        "half_width": "0.155",
+        "t_center": "0.21"
+      }
+    },
+    {
+      "name": "Solder pads, upper lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "solder"
+        },
+        "period_cells": 9.7,
+        "duty": 0.045,
+        "phase_cells": 5.05,
+        "half_width": "0.2",
+        "t_center": "0.3"
+      }
+    },
+    {
+      "name": "Solder pads, lower lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "solder"
+        },
+        "period_cells": 13.1,
+        "duty": 0.036,
+        "phase_cells": 8.4,
+        "half_width": "0.2",
+        "t_center": "-0.29"
+      }
+    },
+    {
+      "name": "Edge connector",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.6",
+      "color": "#eef3ea",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Indicator",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.42"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

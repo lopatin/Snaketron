@@ -1,0 +1,402 @@
+{
+  "schema_version": 2,
+  "id": "chrome@1",
+  "name": "Chrome",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#17395c",
+        "outline": "#07182a",
+        "accent": "#a9cdf0"
+      },
+      {
+        "fill": "#1a3f66",
+        "outline": "#081b2f",
+        "accent": "#b8d8f7"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#74421a",
+        "outline": "#2e1908",
+        "accent": "#f5c184"
+      },
+      {
+        "fill": "#663a11",
+        "outline": "#281405",
+        "accent": "#e8b370"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#17395c",
+        "outline": "#07182a",
+        "accent": "#a9cdf0"
+      },
+      {
+        "fill": "#74421a",
+        "outline": "#2e1908",
+        "accent": "#f5c184"
+      },
+      {
+        "fill": "#2b3138",
+        "outline": "#101317",
+        "accent": "#c2ccd6"
+      },
+      {
+        "fill": "#3d2b46",
+        "outline": "#180f1c",
+        "accent": "#d9b6ea"
+      }
+    ]
+  },
+  "literals": {
+    "specular": "#ffffff",
+    "gleam": "#f4f8fc"
+  },
+  "period_ms": 5200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#050d18"
+  },
+  "layers": [
+    {
+      "name": "Rim",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Barrel",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Environment",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.3"
+            },
+            "alpha": "0.85"
+          },
+          {
+            "offset": "0.32",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.18"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.34"
+            },
+            "alpha": "0.82"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.5"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Reflection, ground rim",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.38"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.0585",
+        "t_center": "-0.4415"
+      }
+    },
+    {
+      "name": "Reflection, ground",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.62"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.093",
+        "t_center": "-0.29"
+      }
+    },
+    {
+      "name": "Reflection, foreshore",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.44"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.057",
+        "t_center": "-0.14"
+      }
+    },
+    {
+      "name": "Reflection, sky",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.66"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.0975",
+        "t_center": "0.2075"
+      }
+    },
+    {
+      "name": "Crown rolloff",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.26"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.0725",
+        "t_center": "0.3775"
+      }
+    },
+    {
+      "name": "Crown edge",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.3"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.025",
+        "t_center": "0.475"
+      }
+    },
+    {
+      "name": "Sheen, ground",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "gleam"
+        },
+        "period_cells": 9.7,
+        "duty": 0.95,
+        "phase_cells": 4.1,
+        "half_width": "0.078",
+        "t_center": "-0.29",
+        "alpha": "clamp(0.24 + 0.16 * sin(tau * (time - s * 0.052 + 0.4)), 0, 1)"
+      }
+    },
+    {
+      "name": "Sheen, sky",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "gleam"
+        },
+        "period_cells": 6.8,
+        "duty": 0.95,
+        "phase_cells": 1.3,
+        "half_width": "0.058",
+        "t_center": "0.2075",
+        "alpha": "clamp(0.54 + 0.24 * sin(tau * (time - s * 0.085)), 0, 1)"
+      }
+    },
+    {
+      "name": "Horizon shadow",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.8"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.058",
+        "t_center": "-0.025 + 0.075 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Specular",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "specular"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.038 + 0.008 * sin(tau * (time + 0.25))",
+        "t_center": "0.072 + 0.075 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Polish",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.72",
+      "color": "#eef5fb",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Bezel",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.35"
+      },
+      "radius_ratio": "0.42"
+    }
+  ]
+}

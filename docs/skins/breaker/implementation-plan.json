@@ -1,0 +1,57 @@
+{
+  "input_authority": {
+    "mode": "draft_submission",
+    "artifact_sha256": "sha256:1e603bf15740ba172459c7dd184193c6e0d5dca004db82f7614f786f18a7ae1e",
+    "authority_record_sha256": "sha256:6d50b52c10feb539ef938ea7265585c8b6949834a5abc7a5ce5718c66a737b42",
+    "human_approval_decision_id": null,
+    "selection_rationale": "The single reference image the user supplied in an interactive session, read as design direction only. See docs/skins/breaker/authoring-record.json: this is not a factory attempt, the reference was not produced by prototype-body-mask-v1, and no host advertised generation, upload, registration or review.",
+    "maximum_driver_action": "request_admin_review"
+  },
+  "path": "layers",
+  "rationale": "The reference is painterly water, which normally routes to a texture. It does not here, for two reasons. First, no image_generator, extraction or video capability is advertised in this session, so any raster route is platform_gap before it starts. Second, and more decisively, the features that survive a 5-15px cell are not painterly: the turtles, the fish and the caustic net are sub-cell and vanish, while what still reads is a lit crest edge, a shadowed undertow, a pale-flats-to-deep-hollow ramp, a breaking foam crest at the head and a gold eye. Every one of those is a formula. Two near-continuous lanes, two gradients and a head disc reproduce them at 178 of the 200-op budget with no atlas to load and therefore no fallback that can ever be seen.",
+  "design_guidelines": {
+    "artistic_direction": "Breaker: a tropical sea rolled onto the snake — pale flats at the tail, a deep hollow behind the head, a lit crest rippling along the top edge, a shadowed undertow below, and the breaking foam crest with a gold eye at the head.",
+    "concept_twist": "Familiar premise: the surf-and-sea-life illustration. Twist: the snake is not swimming in the wave, it is the wave — the swell travels forward along its own body and breaks at its head, where the eye is the barrel's lit hollow.",
+    "structure": "pattern",
+    "body_strategy": "Four-cell spawn: head field plus eye fill half the snake, one swell and one foam dash behind. 6-7 cells: a second pair, deep middle appears. Long: full ramp, lanes tile. One cell: both lanes omit. Turns: snake-space, silhouette-clipped, corner fan; head field priority 10 so a tail run never allocates over the eye.",
+    "head_zone": "light_field_dark_core",
+    "asset_strategy": "No raster. Every layer is procedural, so there is no seam to gate, no sheet cadence to derive, and no image layer that could need a fallback. required_wrap_axes is empty for the same reason."
+  },
+  "common_period_ms": 2600,
+  "fidelity_features": [
+    "Gold eye at the head: dark system core ringed by an authored amber head_disc on a pale foam field",
+    "Lit crest: a near-continuous foam lane on the upper edge whose brightness ripples along the body",
+    "Undertow: a wider accent lane on the lower edge, rippling on a different length and in antiphase",
+    "Depth ramp: pale flats at the tail, open water through the middle, a deep accent hollow behind the head",
+    "Spray: a foam gleam running up the body toward the head once per cycle"
+  ],
+  "layer_plan": [
+    "1 Outline — contour ribbon, outline slot, extra_px 2. The only source of overhang; the engine's Boost band sits outside it.",
+    "2 Open water — body ribbon, fill slot, tail_cap true. The role-readable base coat everything else composites onto.",
+    "3 Depth — whole-body gradient, along_body (offset 0 is the head, verified against the renderer with a two-stop probe). 5 stops: fill+0.60 a0.90 at the head, accent a0.78 at 0.22, fill-0.06 a0.70 at 0.50, fill+0.30 a0.72 at 0.76, fill+0.64 a0.95 at the tail. Owns the depth ramp.",
+    "4 Undertow — whole-body band, accent slot, period 1.75 cells, duty 0.90, phase 0.875, half_width 0.19, t_center -0.28, animated alpha. Duty 0.90 is what makes it a lane rather than a row of dashes: each repeat is its own rectangle, so the per-repeat alpha reads as one edge whose tone undulates. Lane bound: both fields are constant, so max_frame(abs(t_center)) + max_frame(abs(half_width)) = 0.28 + 0.19 = 0.47 <= 0.5 at every baked frame.",
+    "5 Whitecaps — whole-body band, foam literal, period 1.75 cells, duty 0.90, phase 0, half_width 0.12, t_center 0.35, animated alpha. Same lane construction, thinner and higher. Lane bound: 0.35 + 0.12 = 0.47 <= 0.5, both fields constant.",
+    "6 Spray — whole-body gradient, 3 stops travelling on `1 - saw(time)`, foam literal at alpha 0.30 between two transparent fill stops. Travels headward because offset 0 is the head. Owns the gleam.",
+    "7 Shorebreak — head-anchored span, natural 2.2 cells, min 0.9, priority 10; a 2-stop gradient from fill+0.78 at alpha 1 to fill+0.40 at alpha 0, so the breaking crest dissolves into the body instead of ending on a line. Owns the light head field.",
+    "8 Eye — head_disc, iris literal, radius_ratio 0.48 (the renderer rejects anything over 0.5). Under the system head core at ratio 0.30, leaving a 0.18-cell amber annulus around the dark pupil.",
+    "No image layer exists, so no fallback pairing is required; the validator's image-fallback rule is vacuous for this document."
+  ],
+  "asset_plan": [],
+  "modifier_plan": [],
+  "animation_plan": [
+    "One document clock, period_ms 2600, shared by all three animated properties. Nothing else animates: layer order, source kinds, regions, clips, span geometry, band period/duty/phase, both bands' t_center and half_width, stop count and structural flags are all static.",
+    "Whitecaps alpha = clamp(0.5 + 0.45 * sin(tau * (time + s * 0.29)), 0, 1) at the cell site. It never reaches zero, which is what keeps the crest a lit edge instead of a blinking dash. Its length along the body is 3.45 cells against a 1.75-cell repeat — deliberately incommensurate, because an s-frequency equal to the repeat gives every rectangle the same alpha and the lane goes flat. (That was the first draft's actual bug: s * 0.33 against a 3.0-cell period.)",
+    "Undertow alpha = clamp(0.42 + 0.36 * sin(tau * (time + s * 0.21 + 0.5)), 0, 1). A 4.76-cell length and a half-cycle offset, so the two lanes beat against each other rather than marching in step.",
+    "Both alphas complete exactly one cycle in time per period and travel headward: phase is constant along time + k*s, so a fixed phase moves toward decreasing s. The 32-step ring records the full travel at every probed s (0, 2, 12).",
+    "Band lane bounds across the complete pinned ring: neither band's t_center or half_width reads the clock, so max_frame(abs(t_center)) + max_frame(abs(half_width)) is 0.28 + 0.19 = 0.47 for Undertow and 0.35 + 0.12 = 0.47 for Whitecaps, at every one of the 32 baked frames.",
+    "Spray stop offsets travel on 1 - saw(time), one cycle per period; offsets are clamped to 0..1 at evaluation, so the gleam leaves at the head rather than escaping the span.",
+    "Reduced motion and step zero: sin(0) = 0 and saw(0) = 0, so the resting frame is the crest at alpha 0.50, the undertow at 0.42 (its half-cycle offset puts it mid-range too) and the gleam parked at the tail. A complete, calm, fully legible pose — which is what the roster card and every reduced-motion viewer see."
+  ],
+  "required_wrap_axes": [],
+  "risks": [
+    "The reference's identity partly lives in sub-cell detail (two turtles, a fish, the caustic net). Those are deliberately dropped, not approximated; at 5-15px per cell any attempt at them would be noise. If the sea life matters, that is a texture route and needs an advertised image_generator.",
+    "The reference reads deep blue at the head and pale at the tail. This keeps the pale tail and the deep hollow but makes the head-most 2.2 cells pale foam, because the sampler measures head-core contrast at s = 0.6 — outside a head_disc's reach — and a genuinely deep-navy head field cannot clear the 2:1 floor against a dark core. It is also faithful: the reference's own breaking-wave foam sits immediately behind the eye.",
+    "The iris is a document literal, so the eye is the same amber in every role. On free_for_all[3], the game's gold snake, the ring nearly disappears into the body; it was darkened from #ffc63a to #f0a81e to keep a value difference against the pale-gold head field, and it now reads, but it is the weakest role. The dark system head core is still fully legible there, so the head remains findable either way.",
+    "Both lanes are near-continuous (duty 0.90) rather than dashed, which is what makes them read as water. That costs repeats: at 1.75 cells each band is 47 ops, and the document sits at 178 of 200. Shortening either period further, or restoring the rolling sheen that was cut for these, will not fit."
+  ]
+}

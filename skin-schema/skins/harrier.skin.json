@@ -1,0 +1,383 @@
+{
+  "schema_version": 2,
+  "id": "harrier@1",
+  "name": "Harrier",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#2f424a",
+        "outline": "#16222a",
+        "accent": "#93aab4"
+      },
+      {
+        "fill": "#27363d",
+        "outline": "#111b21",
+        "accent": "#839aa5"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#c4a06a",
+        "outline": "#6b4c26",
+        "accent": "#dfb877"
+      },
+      {
+        "fill": "#bd9560",
+        "outline": "#5d3f1e",
+        "accent": "#d8ae6b"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#2f424a",
+        "outline": "#16222a",
+        "accent": "#93aab4"
+      },
+      {
+        "fill": "#c4a06a",
+        "outline": "#6b4c26",
+        "accent": "#dfb877"
+      },
+      {
+        "fill": "#373d43",
+        "outline": "#191d21",
+        "accent": "#a6adb5"
+      },
+      {
+        "fill": "#d3c07a",
+        "outline": "#7a6a2c",
+        "accent": "#efe3b0"
+      }
+    ]
+  },
+  "literals": {
+    "bone": "#f2efe6",
+    "tar": "#14161a"
+  },
+  "period_ms": 3400,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0c1116"
+  },
+  "layers": [
+    {
+      "name": "Airframe",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Hull paint",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Weathering",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.2"
+            },
+            "alpha": "0.55"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.04"
+            },
+            "alpha": "0.32"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0.58"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.32"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Invasion stripe, port 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 4.25,
+        "half_width": "0.071428",
+        "t_center": "-0.428571"
+      }
+    },
+    {
+      "name": "Invasion stripe, port 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 3.9,
+        "half_width": "0.071428",
+        "t_center": "-0.285714"
+      }
+    },
+    {
+      "name": "Invasion stripe, port 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 3.55,
+        "half_width": "0.071428",
+        "t_center": "-0.142857"
+      }
+    },
+    {
+      "name": "Invasion stripe, keel",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 3.2,
+        "half_width": "0.071428",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Invasion stripe, starboard 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 3.55,
+        "half_width": "0.071428",
+        "t_center": "0.142857"
+      }
+    },
+    {
+      "name": "Invasion stripe, starboard 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 3.9,
+        "half_width": "0.071428",
+        "t_center": "0.285714"
+      }
+    },
+    {
+      "name": "Invasion stripe, starboard 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 4.2,
+        "duty": 0.48,
+        "phase_cells": 4.25,
+        "half_width": "0.071428",
+        "t_center": "0.428571"
+      }
+    },
+    {
+      "name": "Counter chevron, port",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "tar"
+        },
+        "period_cells": 5.6,
+        "duty": 0.3,
+        "phase_cells": 3.6,
+        "half_width": "0.1",
+        "t_center": "-0.2"
+      }
+    },
+    {
+      "name": "Counter chevron, keel",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "tar"
+        },
+        "period_cells": 5.6,
+        "duty": 0.3,
+        "phase_cells": 3.1,
+        "half_width": "0.1",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Counter chevron, starboard",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "tar"
+        },
+        "period_cells": 5.6,
+        "duty": 0.3,
+        "phase_cells": 3.6,
+        "half_width": "0.1",
+        "t_center": "0.2"
+      }
+    },
+    {
+      "name": "Nose flash",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * (0.42 + 0.12 * sin(tau * time))",
+      "color": "#f2efe6",
+      "length_cells": 1.4
+    }
+  ]
+}

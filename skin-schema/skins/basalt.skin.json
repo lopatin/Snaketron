@@ -1,0 +1,270 @@
+{
+  "schema_version": 2,
+  "id": "basalt@1",
+  "name": "Basalt",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#33436a",
+        "outline": "#151d2e",
+        "accent": "#232f4a"
+      },
+      {
+        "fill": "#2c3a5d",
+        "outline": "#121927",
+        "accent": "#1e2840"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#7d5533",
+        "outline": "#33210f",
+        "accent": "#4b3320"
+      },
+      {
+        "fill": "#714c2d",
+        "outline": "#2c1c0d",
+        "accent": "#432d1b"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#33436a",
+        "outline": "#151d2e",
+        "accent": "#232f4a"
+      },
+      {
+        "fill": "#7d5533",
+        "outline": "#33210f",
+        "accent": "#4b3320"
+      },
+      {
+        "fill": "#3f4f47",
+        "outline": "#181f1c",
+        "accent": "#2a352f"
+      },
+      {
+        "fill": "#4b4059",
+        "outline": "#1e1a24",
+        "accent": "#332c3d"
+      }
+    ]
+  },
+  "literals": {
+    "lichen": "#78854c"
+  },
+  "period_ms": 5200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#101319"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Quarried stone",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Mortar bed",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.42"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.28"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.14"
+            },
+            "alpha": "0.82"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.52"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Course, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.52"
+        },
+        "period_cells": 2.1,
+        "duty": 0.86,
+        "phase_cells": 0.0,
+        "half_width": "0.145",
+        "t_center": "0.315",
+        "alpha": "clamp(0.66 + 0.30 * noise(s * 0.61, 3.7) - 0.07 * sin(tau * (time + s * 0.05)), 0, 1)"
+      }
+    },
+    {
+      "name": "Course, middle",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.38"
+        },
+        "period_cells": 2.45,
+        "duty": 0.82,
+        "phase_cells": 1.05,
+        "half_width": "0.145",
+        "t_center": "0.0",
+        "alpha": "clamp(0.64 + 0.32 * noise(s * 0.53, 11.2) - 0.06 * sin(tau * (time + s * 0.05 + 0.12)), 0, 1)"
+      }
+    },
+    {
+      "name": "Course, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.25"
+        },
+        "period_cells": 1.95,
+        "duty": 0.85,
+        "phase_cells": 0.35,
+        "half_width": "0.145",
+        "t_center": "-0.315",
+        "alpha": "clamp(0.62 + 0.34 * noise(s * 0.67, 19.4) - 0.05 * sin(tau * (time + s * 0.05 + 0.24)), 0, 1)"
+      }
+    },
+    {
+      "name": "Joint, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "lichen"
+        },
+        "period_cells": 21.0,
+        "duty": 0.92,
+        "phase_cells": 0.6,
+        "half_width": "0.03",
+        "t_center": "0.1575"
+      }
+    },
+    {
+      "name": "Joint, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "lichen",
+          "lighten": "-0.3"
+        },
+        "period_cells": 21.0,
+        "duty": 0.9,
+        "phase_cells": 2.4,
+        "half_width": "0.027",
+        "t_center": "-0.1575"
+      }
+    },
+    {
+      "name": "Weathered crown",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * (0.42 + 0.26 * boost)",
+      "color": "#e9ecef",
+      "length_cells": 1.4
+    }
+  ]
+}

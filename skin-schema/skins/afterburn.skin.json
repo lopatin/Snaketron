@@ -1,0 +1,243 @@
+{
+  "schema_version": 2,
+  "id": "afterburn@1",
+  "name": "Afterburn",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#4a2fc8",
+        "outline": "#241566",
+        "accent": "#ff2e9a"
+      },
+      {
+        "fill": "#3a22a8",
+        "outline": "#1a1050",
+        "accent": "#ff4fb0"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#c4234f",
+        "outline": "#6e0f2a",
+        "accent": "#ff8a2e"
+      },
+      {
+        "fill": "#a81a45",
+        "outline": "#5c0c22",
+        "accent": "#ff7020"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#4a2fc8",
+        "outline": "#241566",
+        "accent": "#ff2e9a"
+      },
+      {
+        "fill": "#c4234f",
+        "outline": "#6e0f2a",
+        "accent": "#ff8a2e"
+      },
+      {
+        "fill": "#464a60",
+        "outline": "#22242f",
+        "accent": "#cfd6e8"
+      },
+      {
+        "fill": "#8a6115",
+        "outline": "#402c08",
+        "accent": "#ffd873"
+      }
+    ]
+  },
+  "literals": {
+    "sunfire": "#fff3b0",
+    "glowline": "#ff5ec4"
+  },
+  "period_ms": 3000,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#140f2e"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Night",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Dusk",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.02"
+            },
+            "alpha": "0.88"
+          },
+          {
+            "offset": "0.32",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.16"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0.6"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.5"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Lattice, low",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 3.0,
+        "duty": 0.36,
+        "phase_cells": 0.45,
+        "half_width": "0.2",
+        "t_center": "-0.27",
+        "alpha": "clamp((0.45 + 0.6 * smoothstep(2, 11, s)) * (0.5 + 0.5 * sin(tau * (time + s * 0.23))), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Lattice, high",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "glowline"
+        },
+        "period_cells": 3.0,
+        "duty": 0.3,
+        "phase_cells": 1.7,
+        "half_width": "0.16",
+        "t_center": "0.29",
+        "alpha": "clamp((0.45 + 0.65 * smoothstep(2.5, 12, s)) * (0.45 + 0.65 * sin(tau * (time + s * 0.19 + 0.5))), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Horizon",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "sunfire"
+        },
+        "period_cells": 5.0,
+        "duty": 0.9,
+        "phase_cells": 0.0,
+        "half_width": "0.055",
+        "t_center": "0.0",
+        "alpha": "clamp(0.45 + 0.5 * smoothstep(2, 12, s), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Suns",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "sunfire"
+        },
+        "period_cells": 5.0,
+        "duty": 0.16,
+        "phase_cells": 4.6,
+        "half_width": "0.33",
+        "t_center": "-0.06",
+        "alpha": "clamp(smoothstep(2.6, 4.4, s) * (0.62 + 0.36 * sin(tau * (time + s * 0.09))), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Burner",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.62",
+      "color": "#fff3b0",
+      "length_cells": 1.4
+    }
+  ]
+}
