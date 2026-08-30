@@ -7300,6 +7300,15 @@ a.home-social-icon:hover {
   bottom: calc(100% + 8px);
   z-index: 90;
   display: grid;
+  /* `minmax(0, 1fr)` rather than the implicit `auto`, which is what a grid
+     column defaults to. An `auto` track may never be smaller than its widest
+     child's min-content, and a definite `width` on the container does not
+     override that — so the moment the link row wanted more than the 288px
+     content box (a longer URL, or just the Copy button growing to "Copied")
+     the single column outgrew the panel and every stretched row spilled
+     through the right padding and past the border. A `1fr` track is capped by
+     the container, so the link ellipsizes as its own rule already intends. */
+  grid-template-columns: minmax(0, 1fr);
   /* Wide enough that the longest network name fits its column without
      truncating — four equal columns is what makes the row scannable. */
   width: 320px;
@@ -7369,8 +7378,27 @@ a.home-social-icon:hover {
   font-weight: 800;
   letter-spacing: 0.6px;
   text-transform: uppercase;
+  white-space: nowrap;
   cursor: pointer;
   transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+/* Copy, Copied and Try again are three different widths, and a button that
+   resizes under the cursor it was just clicked with reads as a glitch — it
+   also drags the link beside it to a new length mid-read. Stacking the
+   longest label in the same grid cell as the live one holds the button at one
+   width without hard-coding a number that a font change would invalidate. */
+.share-game-copy-label {
+  display: grid;
+  justify-items: center;
+}
+
+.share-game-copy-label > * {
+  grid-area: 1 / 1;
+}
+
+.share-game-copy-sizer {
+  visibility: hidden;
 }
 
 .share-game-native {
@@ -7385,7 +7413,11 @@ a.home-social-icon:hover {
 
 .share-game-targets {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* Four across wherever the panel is its full width, which is what makes the
+     row scannable. Where it is not — a narrow card on a phone — the tiles
+     wrap onto a second line rather than squeezing "WhatsApp" past its own
+     border, since the whole point of a tile is that its name is readable. */
+  grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
   gap: 6px;
 }
 
@@ -7495,11 +7527,29 @@ a.home-social-icon:hover {
 }
 
 .game-result-actions {
+  /* Positioned for the same reason the results card's footer is: the share
+     panel hangs off the whole row, not off the button. */
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   margin-top: 24px;
+}
+
+/* The trigger sits at the card's left edge here — it is the only control in
+   the row while a match is still being played — so the base rule's `right: 0`
+   hung a 320px panel off to the left of it and straight off the side of a
+   phone, where nothing can scroll it back. Anchoring to the row resolves both
+   the offset and the width against the card. */
+.game-result-actions .share-game {
+  position: static;
+}
+
+.game-result-actions .share-game-popover {
+  right: auto;
+  left: 0;
+  width: min(320px, 100%);
 }
 
 .game-result-cta {

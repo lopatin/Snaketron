@@ -365,15 +365,15 @@ Each contested element, ruled and locked. Re-litigating any of these requires am
 ### 8.1 Wire and state
 
 - `GameState` gains `#[serde(default)] skins: HashMap<u32 /* user_id */, String /* SkinRef */>` beside `usernames`, documented in `fingerprint.rs`'s excluded list. `sync_hash` is untouched; the chaos suite (`server/tests/sync_equivalence_test.rs`) stays green by construction. Old snapshots, replays, and traces deserialize to an empty map and render all-classic; `trace_rca` and debug-desync are unaffected.
-- The client sends its selected `SkinRef` at join. The **server** validates it against its catalog allowlist at `add_player` time and writes the map — no client can inject arbitrary strings into other clients' renderers. Invalid refs are replaced with `classic@1`, not rejected.
+- The **server** reads the player's equipped `SkinRef` off their account at match prep, validates it against its catalog allowlist, and writes the map — the client never sends one, so no client can inject arbitrary strings into other clients' renderers. Invalid refs are replaced with `classic@1`, not rejected. (Shipped as `matchmaking.rs::apply_player_skin`; an earlier draft of this section had the client send the ref at join, which was never built.)
 - Cosmetics never ride on `Snake` or any hashed field.
 - The wire shape change bumps the WS/GAMEPLAY version-gate constants; per the documented merge hazard, any concurrent branch bumping the same constants must be merged by hand past both sides.
 
 ### 8.2 Persistence
 
-- Logged-in users: a `selectedSkin` attribute on the DynamoDB user item, surfaced through the auth `UserInfo` response (regenerate ts-gen types).
-- Guests: a versioned localStorage key (`snaketron:skin:v1`) via `gameStorage`, added to `CRAZY_GAMES_PREFERENCE_KEYS` for roaming — exactly the boost-input-mode pattern.
-- **v1 selection is decided, and it is dev/QA-only:** the `/qa/skins` route (section 9) writes the versioned localStorage key, and the join path reads it — exercising the full client→server→cosmetic-map channel end to end. No player-facing selection UI ships in v1; that is phase 1 of section 11. Catalog entries are compiled-in (`ClassicSkin` plus AI-authored `SkinDoc`s embedded in the bundle).
+- `selectedSkin` and `selectedBase` attributes on the DynamoDB user item, surfaced through the auth `UserInfo` response and through the CrazyGames exchange response (regenerate ts-gen types). This is the **only** store, for guests and registered players alike: accounts are created lazily but every player who reaches a match has one, and it is the record match prep reads. There is deliberately no browser-local copy — one existed briefly and did exactly what a second copy of an authoritative value does, leaving the picker claiming one skin while every opponent saw another.
+- Equipping therefore needs an account. A signed-out visitor may browse and press Equip; the page holds that intent only until the sign-in prompt resolves, and drops it otherwise.
+- The `/qa/skins` route (section 9) is a renderer contact sheet: its selector picks which skin the sheet previews and equips nothing. Catalog entries are compiled-in (`ClassicSkin` plus AI-authored `SkinDoc`s embedded in the bundle).
 
 ### 8.3 Per-frame resolution
 

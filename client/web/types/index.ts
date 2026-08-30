@@ -68,6 +68,7 @@ export type {
 
 // Typed WebSocket protocol surface derived from the generated WSMessage union.
 import type { OutboundMessage, WSMessageTag, TypedMessage } from './protocol';
+import type { Equipment } from './generated';
 import type {
   Challenge,
   ChallengeInbox,
@@ -106,11 +107,12 @@ export interface User {
    * What this player is wearing, as the account has it. Mirrors the server's
    * `UserInfo` (see `types/generated/UserInfo.ts`), which sends both fields
    * with every authenticated user. Optional here because the guest-creation
-   * response omits them — a brand-new guest is wearing nothing yet.
+   * response omits them — a brand-new guest is wearing nothing yet, and an
+   * absent slot means the default look rather than an explicit clear.
    *
-   * This is the authority on the snake skin: it is what match preparation
-   * reads and hands to every other player. Local storage only holds a choice
-   * made before there was an account to write it to.
+   * This is the *only* record of what is equipped. It is what match
+   * preparation reads and hands to every other player, so the picker and the
+   * arena read it too rather than keeping a copy that could disagree.
    */
   selectedSkin?: string | null;
   selectedBase?: string | null;
@@ -131,6 +133,11 @@ export interface AuthContextType {
   createGuest: (nickname: string) => Promise<{ user: User; token: string }>;
   ensurePlayableSession: (nickname?: string) => Promise<{ user: User; token: string }>;
   updateGuestNickname: (nickname: string) => void;
+  /**
+   * Record what the server now says this account is wearing, so the picker
+   * and the arena see an equip without a second store or a refetch.
+   */
+  applyEquipment: (equipment: Equipment) => void;
   logout: () => void;
   getToken: () => string | null;
   crazyGamesSessionStatus: CrazyGamesSessionStatus;

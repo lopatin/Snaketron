@@ -1,11 +1,13 @@
 import type { CrazyGamesPreferences } from './api.ts';
 import { gameStorage } from './gameStorage.ts';
 
+// Equipment is deliberately absent: it lives on the account record, which
+// roams with the player already and is what the server reads at match prep.
+// A browser-local copy could only ever disagree with it.
 export const CRAZY_GAMES_PREFERENCE_KEYS = new Set([
   'snaketron:tutorial-seen:v1',
   'lastLobbyPreferences',
   'snaketron:boost-input-mode:v1',
-  'snaketron:skin:v1',
 ]);
 const CRAZY_GAMES_PREFERENCE_OWNER_KEY = 'snaketron:crazygames:preferences-owner';
 const MAX_TUTORIAL_KEYS = 128;
