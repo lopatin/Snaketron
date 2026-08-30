@@ -811,7 +811,14 @@ button.game-scoreboard-brand {
   height: 100%;
 }
 
+/* Row 1, always. `is-right` below asks for column 3, and the live band is a
+   single column — so a slot emitted before the roster drives grid
+   auto-placement's cursor past a column the roster then asks to go back to,
+   which opens a second implicit row and pushes the snakes down out of a band
+   whose height is fixed. Pinning the row makes the band's single-row layout
+   independent of child order. */
 .game-roster-action-slot {
+  grid-row: 1;
   display: flex;
   min-width: 0;
   align-items: center;
@@ -3080,6 +3087,9 @@ button.game-scoreboard-brand {
 }
 
 .game-over-actions {
+  /* Positioned so the share popover can hang off the whole row rather than off
+     the button — see the rule below for why that is what keeps it on screen. */
+  position: relative;
   display: flex;
   min-height: 70px;
   align-items: center;
@@ -3087,6 +3097,28 @@ button.game-scoreboard-brand {
   padding: 14px 22px;
   border-top: 1px solid #d8dbe0;
   background: #fafafa;
+}
+
+/* The card is a scroll container — `max-height` plus `overflow: auto`, so its
+   buttons stay reachable on a short viewport — and that clips anything
+   absolutely positioned inside it. Anchored to the Share button, the 320px
+   popover starts about 95px left of the card's edge, and left overflow in a
+   scroll container cannot be scrolled back to: that strip is simply gone.
+   Anchoring to the footer instead resolves the panel's offsets and its
+   percentage width against the full card width, so it cannot outgrow the box
+   that clips it. */
+.game-over-actions .share-game {
+  position: static;
+}
+
+.game-over-actions .share-game-popover {
+  right: auto;
+  bottom: calc(100% + 8px);
+  left: 22px;
+  /* Keeps the base rule's 320px where the card has room — preflight makes that
+     an outer width — and otherwise shrinks to hold the same 22px inset on the
+     right as `left` gives on the left. */
+  width: min(320px, calc(100% - 44px));
 }
 
 .game-over-actions .game-shell-button {
@@ -7380,14 +7412,6 @@ a.home-social-icon:hover {
   outline-offset: 2px;
 }
 
-/* The in-match share sits in the roster rail; when the match is still live
-   there are no other actions there, so the slot only holds this. */
-.game-roster-share-slot {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-}
-
 /* Public match page ---------------------------------------------------------
    The landing surface for a shared link. Most people arriving here have never
    played, so it is a single centered card and one call to action. */
@@ -7619,8 +7643,7 @@ a.home-social-icon:hover {
 
 
 /* Share adopting the shell button: the icon has to come down to the 9px type
-   it now sits beside, and the icon-only form in the HUD rail needs a square
-   footprint rather than the label padding. */
+   it now sits beside. */
 .game-shell-button .share-game-icon {
   width: 12px;
   height: 12px;
@@ -7630,11 +7653,6 @@ a.home-social-icon:hover {
    icon straight into the word. */
 .game-shell-button:has(.share-game-icon) {
   gap: 7px;
-}
-
-.game-shell-button.is-share-icon {
-  width: 32px;
-  padding: 0;
 }
 
 .skins-row {

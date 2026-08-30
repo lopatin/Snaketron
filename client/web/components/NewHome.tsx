@@ -1,13 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import type { AccountModalView } from './AccountModal';
-import { HomeHeader } from './HomeHeader';
+import { SocialHeader } from './SocialHeader';
 import { GameStartForm } from './GameStartForm';
 import { SocialFooter } from './SocialFooter';
 import { LobbyChat } from './LobbyChat';
 import { RegionSelector } from './RegionSelector';
-import { InviteFriendsModal } from './InviteFriendsModal';
-import JoinGameModal from './JoinGameModal';
 import { ConnectionStatusRack } from './ConnectionStatusRack';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
@@ -17,8 +15,6 @@ import { isConnectionReady } from '../utils/connectionBanner';
 import { readHomeNotice, type HomeNotice } from '../utils/homeNotice';
 import { LobbyGameMode } from '../types';
 
-const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
-
 interface NewHomeProps {
   onOpenAuth: () => void;
   onOpenAccount: (view: AccountModalView) => void;
@@ -27,7 +23,7 @@ interface NewHomeProps {
 export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user, ensurePlayableSession, logout } = useAuth();
+  const { user, ensurePlayableSession } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -37,9 +33,7 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     currentRegionUrl,
     currentLobby,
     isLobbyLeader,
-    lobbyMembers,
     createLobby,
-    leaveLobby,
     lobbyChatMessages,
     sendChatMessage,
     lobbyPreferences,
@@ -47,9 +41,6 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
   } = useWebSocket();
   const { currentGameId, isQueued, queueForMatch, queueForMatchMulti } = useGameWebSocket();
   const [isLoading, setIsLoading] = useState(false);
-  const [showInviteModal, setShowInviteModal] = useState(false);
-  const [showJoinModal, setShowJoinModal] = useState(false);
-  const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [homeNotice, setHomeNotice] = useState<HomeNotice | null>(null);
 
@@ -185,44 +176,6 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
     sendChatMessage('lobby', message);
   };
 
-  const handleInvite = async () => {
-    if (isCreatingInvite) {
-      return;
-    }
-
-    setIsCreatingInvite(true);
-    try {
-      try {
-        await ensurePlayableSession(generateGuestNickname());
-      } catch (error) {
-        console.error('Player session creation failed for lobby invite:', error);
-        return;
-      }
-
-      await waitForSessionReady();
-
-      if (!currentLobby) {
-        await createLobby();
-        console.log('Lobby created successfully');
-      }
-
-      setShowInviteModal(true);
-    } catch (error) {
-      console.error('Failed to create lobby:', error);
-    } finally {
-      setIsCreatingInvite(false);
-    }
-  };
-
-  const handleLeaveLobby = async () => {
-    try {
-      await leaveLobby();
-      console.log('Left lobby successfully');
-    } catch (error) {
-      console.error('Failed to leave lobby:', error);
-    }
-  };
-
   const isReady = isConnectionReady({
     isConnected,
     isSessionAuthenticated,
@@ -232,18 +185,10 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
   return (
     <>
       <div className="home-page">
-        <HomeHeader
+        <SocialHeader
           activePage="play"
-          currentUser={user}
-          lobbyMembers={lobbyMembers}
-          hasLobby={Boolean(currentLobby)}
-          isInviteDisabled={isCreatingInvite}
-          onInvite={handleInvite}
-          onJoinGame={() => setShowJoinModal(true)}
-          onLeaveLobby={handleLeaveLobby}
-          onAuthClick={onOpenAuth}
+          onOpenAuth={onOpenAuth}
           onOpenAccount={onOpenAccount}
-          onLogout={logout}
         />
 
         <ConnectionStatusRack
@@ -293,20 +238,6 @@ export const NewHome: React.FC<NewHomeProps> = ({ onOpenAuth, onOpenAccount }) =
           initialExpanded={true}
         />
       </div>
-
-      {/* Invite Friends Modal */}
-      <InviteFriendsModal
-        isOpen={showInviteModal}
-        onClose={() => setShowInviteModal(false)}
-        lobbyCode={currentLobby?.code || null}
-        region={currentLobby?.region || null}
-      />
-
-      {/* Join Game Modal */}
-      <JoinGameModal
-        isOpen={showJoinModal}
-        onClose={() => setShowJoinModal(false)}
-      />
     </>
   );
 };

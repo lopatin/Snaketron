@@ -1,12 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import type { AccountModalView } from './AccountModal';
-import { HomeHeader } from './HomeHeader';
+import { SocialHeader } from './SocialHeader';
 import { SocialFooter } from './SocialFooter';
 import { LobbyChat } from './LobbyChat';
 import { RegionSelector } from './RegionSelector';
-import { InviteFriendsModal } from './InviteFriendsModal';
-import JoinGameModal from './JoinGameModal';
 import { ConnectionStatusRack } from './ConnectionStatusRack';
 import { useAuth } from '../contexts/AuthContext';
 import { useWebSocket } from '../contexts/WebSocketContext';
@@ -18,8 +16,6 @@ import RankIcon from './RankIcon';
 import SoloTrophyIcon from './SoloTrophyIcon';
 import { api } from '../services/api';
 import { useGameWebSocket } from '../hooks/useGameWebSocket';
-
-const generateGuestNickname = () => `Guest${Math.floor(1000 + Math.random() * 9000)}`;
 
 const DEFAULT_LEADERBOARD_REGION = 'global';
 const DEFAULT_LEADERBOARD_MODE: LobbyGameMode = 'duel';
@@ -622,7 +618,7 @@ interface LeaderboardProps {
 export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAccount }) => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const {
     connectToRegion,
     isConnected,
@@ -630,15 +626,9 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
     onMessage,
     currentRegionUrl,
     currentLobby,
-    lobbyMembers,
-    createLobby,
-    leaveLobby,
     lobbyChatMessages,
     sendChatMessage,
   } = useWebSocket();
-  const [showInviteModal, setShowInviteModal] = useState(false);
-  const [showJoinModal, setShowJoinModal] = useState(false);
-  const [isCreatingInvite, setIsCreatingInvite] = useState(false);
   const [seasons, setSeasons] = useState<number[]>([]);
   // Latched on the first answer from /api/seasons, success or failure. A
   // failure still resolves the selection: `null` means "current season", which
@@ -840,35 +830,6 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
     sendChatMessage('lobby', message);
   };
 
-  const handleInvite = async () => {
-    if (isCreatingInvite) {
-      return;
-    }
-
-    setIsCreatingInvite(true);
-    try {
-      if (!currentLobby) {
-        await createLobby();
-        console.log('Lobby created successfully');
-      }
-
-      setShowInviteModal(true);
-    } catch (error) {
-      console.error('Failed to create lobby:', error);
-    } finally {
-      setIsCreatingInvite(false);
-    }
-  };
-
-  const handleLeaveLobby = async () => {
-    try {
-      await leaveLobby();
-      console.log('Left lobby successfully');
-    } catch (error) {
-      console.error('Failed to leave lobby:', error);
-    }
-  };
-
   const isReady = isConnectionReady({
     isConnected,
     isSessionAuthenticated,
@@ -878,18 +839,10 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
   return (
     <>
       <div className="home-page leaderboard-page">
-        <HomeHeader
+        <SocialHeader
           activePage="leaderboards"
-          currentUser={user}
-          lobbyMembers={lobbyMembers}
-          hasLobby={Boolean(currentLobby)}
-          isInviteDisabled={isCreatingInvite}
-          onInvite={handleInvite}
-          onJoinGame={() => setShowJoinModal(true)}
-          onLeaveLobby={handleLeaveLobby}
-          onAuthClick={onOpenAuth}
+          onOpenAuth={onOpenAuth}
           onOpenAccount={onOpenAccount}
-          onLogout={logout}
         />
 
         <ConnectionStatusRack
@@ -936,19 +889,6 @@ export const Leaderboard: React.FC<LeaderboardProps> = ({ onOpenAuth, onOpenAcco
           initialExpanded={true}
         />
       </div>
-
-      {/* Invite Friends Modal */}
-      <InviteFriendsModal
-        isOpen={showInviteModal}
-        onClose={() => setShowInviteModal(false)}
-        lobbyCode={currentLobby?.code || null}
-      />
-
-      {/* Join Game Modal */}
-      <JoinGameModal
-        isOpen={showJoinModal}
-        onClose={() => setShowJoinModal(false)}
-      />
     </>
   );
 };

@@ -299,7 +299,29 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="w-full max-w-md mx-auto">
+    <form
+      onSubmit={handleSubmit}
+      className="w-full max-w-md mx-auto"
+      onKeyDown={(event) => {
+        // The nickname field is not the only implicit-submit path: Chromium
+        // also submits on Enter from the sr-only Competitive checkbox. A match
+        // starts from the Start Game button, so every keyboard route into
+        // submission is closed here.
+        //
+        // Controls that handle Enter themselves are exempt, because for them
+        // it is activation rather than an implicit submit: the Start Game
+        // button, the mode chips, the sign-in button, and — the reason this
+        // tests for anchors too — the ticker's Leaderboards link, which is a
+        // react-router <Link> and so renders an <a href> inside this form.
+        if (
+          event.key === 'Enter'
+          && event.target instanceof HTMLElement
+          && !event.target.closest('a[href], button')
+        ) {
+          event.preventDefault();
+        }
+      }}
+    >
       {/* Logo */}
       <div className="home-brand-lockup">
         <img src="SnaketronLogo.png" alt="Snaketron" className="h-8 w-auto opacity-80" />
@@ -322,6 +344,27 @@ export const GameStartForm: React.FC<GameStartFormProps> = ({
             type="text"
             value={nickname}
             onChange={(e) => setNickname(e.target.value)}
+            onKeyDown={(e) => {
+              // Return in a text field is an implicit form submission, which
+              // the browser performs by clicking the default button — here,
+              // Start Game. A phone keyboard's "go" key takes that same path,
+              // so a player finishing their nickname was queueing a match by
+              // accident. Starting a match is a deliberate act; return only
+              // puts the keyboard away. The isComposing guard leaves IME
+              // confirmation alone for anyone typing a nickname in CJK.
+              if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                // Only on touch, where the point of return is to put the
+                // keyboard away. On desktop there is no keyboard to dismiss,
+                // and blurring would drop focus to <body>, so the next Tab
+                // would restart from the top of the page instead of moving on
+                // to the mode chips.
+                if (inputSurface === 'touch') {
+                  e.currentTarget.blur();
+                }
+              }
+            }}
+            enterKeyHint="done"
             placeholder="Nickname"
             className={`w-full bg-white px-4 py-3 text-base border-2 rounded-lg transition-colors ${
               locksNickname

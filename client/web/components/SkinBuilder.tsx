@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import type { AccountModalView } from './AccountModal';
-import { HomeHeader } from './HomeHeader';
+import { SocialHeader } from './SocialHeader';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
 import { getWasm, initWasm } from '../wasm';
@@ -745,7 +745,7 @@ const ExpressionField: React.FC<ExpressionFieldProps> = ({ field, kind, value, o
 };
 
 const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) => {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const navigate = useNavigate();
   const { skinId } = useParams<{ skinId: string }>();
 
@@ -1099,24 +1099,27 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
   }, [skin]);
 
   const chrome = (
-    <HomeHeader
+    <SocialHeader
       activePage="skins"
-      currentUser={user}
-      lobbyMembers={[]}
-      hasLobby={false}
-      onInvite={() => {}}
-      onJoinGame={() => {}}
-      onLeaveLobby={() => {}}
-      onAuthClick={onOpenAuth}
+      onOpenAuth={onOpenAuth}
       onOpenAccount={onOpenAccount}
-      onLogout={logout}
     />
   );
+
+  // Both return paths below are rooted in this same provider on purpose. A
+  // differing root element type makes React tear down the whole page when
+  // `document` flips, and the header in that subtree owns UI state now: pick a
+  // template while an invite is being minted and the dialog never opens. The
+  // lobby itself is safe either way — it lives in WebSocketProvider, above the
+  // router — so this costs at most a repeated click, but the remount buys
+  // nothing to be worth even that.
+  const textureContext = { catalogue: schema?.builtinTextures ?? [], choose: chooseTexture };
 
   // A new skin picks a starting point first. An empty stack is not a skin, and
   // the first thing an author should see is something that already paints.
   if (!document) {
     return (
+      <TextureContext.Provider value={textureContext}>
       <div className="home-page builder-page">
         {chrome}
         <main className="builder-main">
@@ -1152,6 +1155,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
           ) : null}
         </main>
       </div>
+      </TextureContext.Provider>
     );
   }
 
@@ -1159,9 +1163,7 @@ const SkinBuilder: React.FC<SkinBuilderProps> = ({ onOpenAuth, onOpenAccount }) 
   const overBudget = cost ? cost.ops > cost.maxOps : false;
 
   return (
-    <TextureContext.Provider
-      value={{ catalogue: schema?.builtinTextures ?? [], choose: chooseTexture }}
-    >
+    <TextureContext.Provider value={textureContext}>
     <div className="home-page builder-page">
       {chrome}
 
