@@ -304,10 +304,27 @@ fn stored_form(inner: &str, kind: SkinKind) -> String {
 /// Returns the catalogue's own string rather than the caller's bytes, so what
 /// lands in the database is always a reference this build compiled and never
 /// merely one that compared equal to it.
+///
+/// The base slot accepts two catalogues, and which one a reference came from
+/// decides what equipping it does: a base skin dresses the endzone your whole
+/// team defends and every opponent sees it, while a snake reference in this
+/// slot names that skin's colour theme and dresses only your own screen. See
+/// `skin_catalog::BASE_REF_PREFIX`.
 fn catalogue_reference(inner: &str, kind: SkinKind) -> Option<String> {
-    skin_catalog::CATALOG
-        .iter()
-        .find(|entry| entry.reference == inner)
+    let base_skin = matches!(kind, SkinKind::Base)
+        .then(|| {
+            skin_catalog::BASE_SKINS
+                .iter()
+                .find(|entry| entry.reference == inner)
+        })
+        .flatten();
+
+    base_skin
+        .or_else(|| {
+            skin_catalog::CATALOG
+                .iter()
+                .find(|entry| entry.reference == inner)
+        })
         .map(|entry| stored_form(entry.reference, kind))
 }
 
@@ -2007,6 +2024,31 @@ mod tests {
         assert!(
             builtin_slot(bare.selected_base.as_ref(), SkinKind::Base).is_err(),
             "a bare snake reference is not a base"
+        );
+    }
+
+    /// Both base namespaces are equippable, and both round-trip through the
+    /// `base:` prefix. What separates them is what equipping *does*, which is
+    /// resolved at match preparation rather than here.
+    #[test]
+    fn the_base_slot_accepts_a_base_skin_as_well_as_a_snake_theme() {
+        let picture = equip(r#"{"selectedBase":"base:invaders@1"}"#);
+        assert_eq!(
+            builtin_slot(picture.selected_base.as_ref(), SkinKind::Base).unwrap(),
+            Some(Some("base:invaders@1".to_string()))
+        );
+
+        let theme = equip(r#"{"selectedBase":"base:aurora@1"}"#);
+        assert_eq!(
+            builtin_slot(theme.selected_base.as_ref(), SkinKind::Base).unwrap(),
+            Some(Some("base:aurora@1".to_string()))
+        );
+
+        // A base skin id is not a snake skin, so it is refused in that slot.
+        let wrong_slot = equip(r#"{"selectedSkin":"invaders@1"}"#);
+        assert!(
+            builtin_slot(wrong_slot.selected_skin.as_ref(), SkinKind::Snake).is_err(),
+            "a base skin must not be equippable as a snake skin"
         );
     }
 

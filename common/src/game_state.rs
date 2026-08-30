@@ -1325,6 +1325,30 @@ pub struct GameState {
     /// every state written before skins existed — render as the classic look.
     #[serde(default)]
     pub skins: HashMap<u32, String>,
+    /// Which base skin dresses each team's endzone, by team.
+    ///
+    /// Keyed by team rather than by player because an endzone belongs to a
+    /// team, and a 2v2 has two players who may each have equipped a different
+    /// base. The server resolves one per team at match creation
+    /// (`server::matchmaking::resolve_team_base`) and it never changes
+    /// afterwards, so a mid-match joiner reads the same answer everyone else
+    /// already has.
+    ///
+    /// Cosmetic, and out of the sync fingerprint for exactly the reason
+    /// `skins` is: how a base is painted must never be able to make two
+    /// clients disagree about the game. An absent entry — as in every state
+    /// written before base skins existed — means that endzone is painted the
+    /// way it always was, from the viewer's own skin theme.
+    ///
+    /// Deliberately not a protocol bump. The field defaults, `GameState` does
+    /// not deny unknown fields, and no client has to understand it for the
+    /// match to work — an older one simply paints the endzone the old way. A
+    /// hard cutover would disconnect every player mid-match and invalidate
+    /// every stored highlight clip (`GAMEPLAY_REPLAY_VERSION` gates playback
+    /// on an exact match) to deliver a cosmetic.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-gen", ts(type = "Record<number, string>"))]
+    pub team_bases: HashMap<TeamId, String>,
     // Spectators by user_id (do not have snakes/players)
     #[serde(serialize_with = "sorted_hash_set::serialize")]
     pub spectators: HashSet<u32>,
@@ -1574,6 +1598,7 @@ impl GameState {
             event_sequence: 0,
             usernames: HashMap::new(),
             skins: HashMap::new(),
+            team_bases: HashMap::new(),
             spectators: HashSet::new(),
             scores: HashMap::new(),
             food_pickups: HashMap::new(),
@@ -2802,6 +2827,28 @@ impl GameState {
                 self.skins.remove(&user_id);
             }
         }
+    }
+
+    /// Record which base skin dresses one team's endzone.
+    ///
+    /// Like [`Self::set_player_skin`] this trusts its caller to have checked
+    /// the id: an id no client recognises paints the endzone the way it always
+    /// was, which is a cosmetic outcome and not a reason to fail anything.
+    /// `None` clears the choice.
+    pub fn set_team_base(&mut self, team_id: TeamId, base_ref: Option<String>) {
+        match base_ref {
+            Some(base_ref) => {
+                self.team_bases.insert(team_id, base_ref);
+            }
+            None => {
+                self.team_bases.remove(&team_id);
+            }
+        }
+    }
+
+    /// The base skin dressing one team's endzone, if it has one.
+    pub fn team_base(&self, team_id: TeamId) -> Option<&str> {
+        self.team_bases.get(&team_id).map(String::as_str)
     }
 
     /// Arm the pre-match readiness gate. Called once at match creation, before
@@ -8719,5 +8766,64 @@ mod tests {
             p99 < std::time::Duration::from_millis(25),
             "isolated four-snake engine p99 {p99:?} exceeded half the 50 ms quantum"
         );
+    }
+}
+
+#[cfg(test)]
+mod team_base_wire_tests {
+    use super::*;
+
+    /// The wire shape of `team_bases`, pinned.
+    ///
+    /// `TeamId` is a newtype over `u8`, and serde only accepts a map key that
+    /// serializes as a string — a newtype delegates to its inner type, and an
+    /// integer key is stringified. That is not obvious from the type, and the
+    /// client's generated `Record<number, string>` is only correct if it holds,
+    /// so it is asserted against real JSON rather than assumed.
+    #[test]
+    fn team_bases_round_trip_through_json_with_numeric_keys() {
+        let mut state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        state.set_team_base(TeamId(0), Some("invaders@1".to_string()));
+        state.set_team_base(TeamId(1), Some("dragon@1".to_string()));
+
+        let json = serde_json::to_value(&state).expect("state serializes");
+        assert_eq!(
+            json["team_bases"],
+            serde_json::json!({ "0": "invaders@1", "1": "dragon@1" }),
+            "team keys must be stringified integers, which is what Record<number, string> means"
+        );
+
+        let restored: GameState = serde_json::from_value(json).expect("state deserializes");
+        assert_eq!(restored.team_base(TeamId(0)), Some("invaders@1"));
+        assert_eq!(restored.team_base(TeamId(1)), Some("dragon@1"));
+    }
+
+    /// Every state written before base skins existed, and every state from a
+    /// build that does not know about them, has to load.
+    #[test]
+    fn a_state_without_the_field_deserializes_to_no_bases() {
+        let state = GameState::new(
+            60,
+            40,
+            GameType::TeamMatch { per_team: 2 },
+            QueueMode::Quickmatch,
+            Some(7),
+            0,
+        );
+        let mut json = serde_json::to_value(&state).expect("state serializes");
+        json.as_object_mut()
+            .expect("a state is an object")
+            .remove("team_bases");
+
+        let restored: GameState = serde_json::from_value(json).expect("older states must load");
+        assert!(restored.team_bases.is_empty());
+        assert_eq!(restored.team_base(TeamId(0)), None);
     }
 }

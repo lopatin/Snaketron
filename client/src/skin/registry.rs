@@ -457,6 +457,58 @@ mod tests {
         );
     }
 
+    /// The same rule for the other slot. A base skin the server allows but
+    /// this build cannot draw is worse than a snake skin in the same state: a
+    /// base travels to *every* client, so one build out of step paints an
+    /// endzone that everyone else can see and it cannot.
+    #[test]
+    fn the_client_base_catalogue_matches_the_servers() {
+        let client: Vec<&str> = crate::skin::base_skin::BASE_SKINS
+            .iter()
+            .map(|skin| skin.id)
+            .collect();
+        // Mirrors `BASE_SKINS` in `server/src/skin_catalog.rs`, which cannot be
+        // imported here.
+        let server = [
+            "invaders@1",
+            "lightcycle@1",
+            "python@1",
+            "dragon@1",
+            "sharkbite@1",
+            "aquarium@1",
+            "surf@1",
+            "fairway@1",
+            "destroyer@1",
+            "blockcraft@1",
+            "anime@1",
+            "kittens@1",
+            "bears@1",
+            "barbershop@1",
+            "wizardry@1",
+            "harvest@1",
+            "yuletide@1",
+        ];
+        assert_eq!(
+            client, server,
+            "the client draws {client:?} but the server allows {server:?}"
+        );
+    }
+
+    /// The two slots name disjoint sets of ids, so a stored `base:<id>` is
+    /// never ambiguous. The server asserts the same thing about its own two
+    /// lists; this is the half that keeps the *renderer* honest.
+    #[test]
+    fn no_base_skin_id_is_also_a_snake_skin_id() {
+        let registry = SkinRegistry::new();
+        for base in &crate::skin::base_skin::BASE_SKINS {
+            assert!(
+                !registry.is_known(base.id),
+                "{} is both a base skin and a snake skin",
+                base.id
+            );
+        }
+    }
+
     #[test]
     fn every_registered_skin_has_a_distinct_id() {
         let mut seen = std::collections::HashSet::new();

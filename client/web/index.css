@@ -7052,6 +7052,63 @@ a.home-social-icon:hover {
   }
 }
 
+/* The heading and its home/away switch share a line: the switch is a property
+   of the column it labels, and putting it anywhere else makes it look like a
+   page-wide control. `baseline` rather than `center` so the switch sits on the
+   heading's own line rather than floating beside a much shorter box. */
+.skins-column-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.skins-column-header .skins-column-heading {
+  margin-bottom: 0;
+}
+
+/* Two halves of one control, so it reads as a switch rather than as two
+   buttons that happen to be adjacent. */
+.skins-facing {
+  display: inline-flex;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid #e1e3e7;
+  border-radius: 999px;
+  background: #fff;
+}
+
+.skins-facing-option {
+  border: 0;
+  margin: 0;
+  padding: 3px 11px;
+  background: transparent;
+  color: rgb(63 63 65 / 55%);
+  cursor: pointer;
+  font: inherit;
+  font-size: 9.5px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  line-height: 1.7;
+  text-transform: uppercase;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.skins-facing-option:hover {
+  color: var(--game-graphite);
+}
+
+.skins-facing-option.is-on {
+  background: var(--game-graphite);
+  color: #fff;
+}
+
+.skins-facing-option:focus-visible {
+  outline: 2px solid var(--game-graphite);
+  outline-offset: -2px;
+}
+
 .skins-column-heading {
   margin: 0 0 4px;
   color: var(--game-graphite);
@@ -7751,9 +7808,9 @@ a.home-social-icon:hover {
   display: block;
 }
 
+/* One end of an arena, not two. The column's switch decides which. */
 .skins-base-preview {
-  display: flex;
-  gap: 5px;
+  display: block;
 }
 
 .skins-base-preview canvas {
@@ -8741,9 +8798,9 @@ a.home-social-icon:hover {
   background: #fef2f2;
 }
 
-/* A base row is two preview rectangles plus a name plus an action, which does
-   not fit across a 21rem rail. Stack the art over the meta rather than letting
-   the name wrap to one letter per line. */
+/* A base row is a picture plus a name plus an action, which does not fit
+   across a 21rem rail. Stack the art over the meta rather than letting the
+   name wrap to one letter per line. */
 .skins-column-bases .skins-row {
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
@@ -9361,6 +9418,36 @@ a.home-social-icon:hover {
   font-weight: 900;
   letter-spacing: 0.1em;
   text-transform: uppercase;
+}
+
+/* A base has two shots rather than four, and they are pictures rather than
+   long thin snakes — so they go side by side with the caption underneath,
+   which is the arrangement that lets the pair actually be compared. */
+.skin-shots.is-base {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.skin-shot.is-base {
+  flex: 1 1 240px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 7px;
+}
+
+.skin-shot.is-base canvas {
+  width: 100%;
+  height: auto;
+  border: 1px solid #e1e3e7;
+  border-radius: 5px;
+}
+
+.skin-blurb {
+  margin: 12px 0 0;
+  color: rgb(63 63 65 / 62%);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .skin-stats {

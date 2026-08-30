@@ -48,7 +48,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
   onLogout,
 }) => {
   const { isCrazyGamesBuild, userAccountAvailable } = useCrazyGames();
-  const { balanceBux } = useWallet();
+  const { balanceBux, buxAvailable } = useWallet();
   const [walletOpen, setWalletOpen] = useState(false);
   const fullscreen = useFullscreen();
   const inputSurface = useInputSurface();
@@ -214,7 +214,7 @@ export const HomeHeader: React.FC<HomeHeaderProps> = ({
           {/* Inside the account cluster rather than beside it: the header is a
               two-child flexbox with `space-between`, so a third top-level child
               would silently re-third the layout and move both existing groups. */}
-          {shouldShowBuxChip(Boolean(currentUser), balanceBux) && (
+          {shouldShowBuxChip(Boolean(currentUser), balanceBux, buxAvailable) && (
             <button
               type="button"
               className="home-bux-chip"

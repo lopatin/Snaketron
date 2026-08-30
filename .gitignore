@@ -49,3 +49,7 @@ client/design/tools/__pycache__/neural_tile.*.pyc
 client/design/tools/__pycache__/diffuse_tile.*.pyc
 client/design/tools/__pycache__/sprite_sheet.*.pyc
 client/design/tools/__pycache__/tileify.*.pyc
+
+# Raw model output for the base-skin pictures. Regenerable and expensive, but
+# not source: only the healed tiles under client/web/public/images/bases ship.
+client/design/tools/.cache/

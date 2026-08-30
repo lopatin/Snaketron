@@ -84,6 +84,53 @@ export const equippedBaseRef = (equipment: EquippedRefs | null | undefined): str
 export const toBaseSlotValue = (snakeRef: string): string => `${BASE_REF_PREFIX}${snakeRef}`;
 
 /**
+ * The base skins this build can draw, straight from the Rust registry.
+ *
+ * Base skins and the older per-snake base *themes* share one stored form
+ * (`base:<id>`) but are two different things: a base skin is a picture that
+ * dresses your team's endzone for everybody in the match, while a theme tints
+ * the arena you personally are looking at. Only the second is arena dressing
+ * for the viewer, so the arena has to be able to tell them apart — and asking
+ * the renderer is the only way to do that without mirroring a list of ids into
+ * TypeScript for the two to drift apart on.
+ *
+ * Empty until the WASM module has loaded, which reads as "not a base skin" and
+ * is the safe way round: the worst case is one frame of the viewer's own snake
+ * theme under a picture that is about to cover it anyway.
+ */
+let baseSkinCatalog: SkinCatalogEntry[] | null = null;
+
+export const readBaseSkinCatalog = (): SkinCatalogEntry[] => {
+  // Memoised, and only once it has actually answered. The list is compiled
+  // into the build and cannot change within a session, while the callers are
+  // on React render paths that run per frame — so re-crossing the wasm
+  // boundary and re-parsing JSON for it would be pure waste. Caching the empty
+  // pre-load answer, on the other hand, would be a bug that never recovers.
+  if (baseSkinCatalog) {
+    return baseSkinCatalog;
+  }
+  const wasm = getWasm();
+  if (!wasm) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(wasm.baseSkinCatalog()) as SkinCatalogEntry[];
+    if (parsed.length > 0) {
+      baseSkinCatalog = parsed;
+    }
+    return parsed;
+  } catch (error) {
+    console.warn('Failed to read the base skin catalog:', error);
+    return [];
+  }
+};
+
+/** Whether a bare reference names a base skin rather than a snake skin's theme. */
+export const isBaseSkinRef = (reference: string | null | undefined): boolean =>
+  typeof reference === 'string' &&
+  readBaseSkinCatalog().some((entry) => entry.id === reference);
+
+/**
  * The skins this build can render, straight from the Rust catalogue so the
  * list can never drift from what the renderer actually knows.
  * Empty until the WASM module has loaded.

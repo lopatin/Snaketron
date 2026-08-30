@@ -35,7 +35,31 @@ is_stress_test: boolean, properties: GameProperties, players: { [key in number]?
  * be able to make two clients disagree about the game. Absent entries — and
  * every state written before skins existed — render as the classic look.
  */
-skins: { [key in number]?: string }, spectators: Array<number>, scores: { [key in number]?: number },
+skins: { [key in number]?: string },
+/**
+ * Which base skin dresses each team's endzone, by team.
+ *
+ * Keyed by team rather than by player because an endzone belongs to a
+ * team, and a 2v2 has two players who may each have equipped a different
+ * base. The server resolves one per team at match creation
+ * (`server::matchmaking::resolve_team_base`) and it never changes
+ * afterwards, so a mid-match joiner reads the same answer everyone else
+ * already has.
+ *
+ * Cosmetic, and out of the sync fingerprint for exactly the reason
+ * `skins` is: how a base is painted must never be able to make two
+ * clients disagree about the game. An absent entry — as in every state
+ * written before base skins existed — means that endzone is painted the
+ * way it always was, from the viewer's own skin theme.
+ *
+ * Deliberately not a protocol bump. The field defaults, `GameState` does
+ * not deny unknown fields, and no client has to understand it for the
+ * match to work — an older one simply paints the endzone the old way. A
+ * hard cutover would disconnect every player mid-match and invalidate
+ * every stored highlight clip (`GAMEPLAY_REPLAY_VERSION` gates playback
+ * on an exact match) to deliver a cosmetic.
+ */
+team_bases: Record<number, string>, spectators: Array<number>, scores: { [key in number]?: number },
 /**
  * Cumulative successful pellet pickups by snake. Unlike `scores`, this is
  * unweighted by combo value and is therefore the progression/XP basis.

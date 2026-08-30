@@ -28,8 +28,8 @@ repeatCells: number | null,
  */
 rows: number | null,
 /**
- * Transverse raster margin per side on the fixed 16-body-texel authoring
- * grid. Zero is the legacy one-cell row; four is `4 + 16 + 4`.
+ * Transverse bleed apron per side around the unchanged 16×16 logical
+ * body cell. At the 16-texel rung, four is stored as `4 + 16 + 4`.
  */
 rasterOverhangPx: number, seams: SeamReport,
 /**

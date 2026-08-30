@@ -63,12 +63,15 @@ pub struct User {
     /// as an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_skin: Option<String>,
-    /// The team base this player has chosen, if any.
+    /// The base this player has chosen, if any.
     ///
-    /// Base dressing is viewer-attributed: it themes the arena the owner is
-    /// looking at and never reaches another player's screen, so unlike
-    /// `selected_skin` this one is read by the client and never published into
-    /// game state.
+    /// Stored prefixed, and the prefix covers two different things — see
+    /// `skin_catalog::BASE_REF_PREFIX`. A `base:<snake ref>` is a colour theme
+    /// and is still viewer-attributed: it dresses the arena the owner is
+    /// looking at and never reaches another player's screen. A
+    /// `base:<base skin id>` is a picture, belongs to the team whose endzone
+    /// it paints, and *is* published — match preparation reads it here and may
+    /// put it in `GameState.team_bases`, where every player sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_base: Option<String>,
 }

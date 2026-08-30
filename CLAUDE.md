@@ -53,6 +53,9 @@ SnakeTron is a multiplayer Snake game built with a Rust backend and WebAssembly 
 
 ## Project Structure
 - The _old directory can be fully ignored for all purposes
+- Images under `client/web/public/images/` are build output, not source. The
+  base-skin endzone pictures come from `client/design/tools/build_base_textures.py`
+  and the snake coats from `build_coat_textures.py`; never hand-edit a PNG there.
 
 ## Debugging State Sync
 - Read DEBUGGING.md before touching anything related to game-state synchronization, event delivery, or client prediction. It documents the sync primitives (state fingerprints, TickHash heartbeats, stream_seq transport sequencing, flight-recorder traces) and the trace-to-local-repro workflow.

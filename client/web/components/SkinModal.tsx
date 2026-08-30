@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
-import { getWasm } from '../wasm';
+import { getWasm, whenSkinAssetsSettle } from '../wasm';
 import { formatBux } from '../utils/walletChip';
 import SnakeBuxIcon from './SnakeBuxIcon';
 
@@ -11,6 +11,13 @@ import SnakeBuxIcon from './SnakeBuxIcon';
  * the enemy, whether the shine travels — and that is most of what someone
  * decides on. So the row opens this: the same renderer, several poses, several
  * roles, moving.
+ *
+ * A base skin is a different subject with the same question behind it. There
+ * are no poses and nothing turns; what there is instead is a *pair* — the kit
+ * your end of the arena wears and the kit the other end wears — and a list
+ * that shows one of them at a time cannot show how they compare. So a base
+ * opens the same dialog with both ends side by side and at a size worth
+ * looking at.
  */
 
 const DEMO_CELL = 13;
@@ -36,6 +43,77 @@ const SHOTS: Shot[] = [
   { pose: 'wide_u_turn', role: 'own', label: 'Turning' },
   { pose: 'zigzag', role: 'own', label: 'Zig-zag' },
 ];
+
+/**
+ * One end of an arena, at the size a decision is made at.
+ *
+ * Both ends are always drawn, whatever the list behind this dialog is
+ * currently showing: the toggle out there is for scanning a column, and the
+ * reason to open a base is to see the two together.
+ */
+const BaseShot: React.FC<{ skinRef: string; own: boolean }> = ({ skinRef, own }) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return undefined;
+    }
+    const paint = () => {
+      const wasm = getWasm();
+      if (!wasm) {
+        return;
+      }
+      try {
+        wasm.renderSkinBase(canvas, skinRef, own);
+      } catch {
+        // Leave the last good frame up.
+      }
+    };
+    // The first paint is what requests the picture; the loop is what shows it.
+    // See the same note on the list's `BasePreview`.
+    paint();
+    // Repaint until the picture is actually there. One extra paint after
+    // `whenSkinAssetsSettle` is not enough: that promise also resolves on its
+    // own five-second deadline, and seventeen base pictures requested at once
+    // on a slow connection will blow through it — leaving every preview stuck
+    // on the flat tint for the rest of the session, because a still surface
+    // never looks again.
+    let stale = false;
+    void (async () => {
+      for (let round = 0; round < 6 && !stale; round += 1) {
+        await whenSkinAssetsSettle();
+        if (stale) {
+          return;
+        }
+        paint();
+        const wasm = getWasm();
+        if (wasm && !wasm.skinAssetsPending()) {
+          return;
+        }
+      }
+    })();
+    return () => {
+      stale = true;
+    };
+  }, [skinRef, own]);
+
+  return (
+    <figure className="skin-shot is-base">
+      {/* Barely wider than one panel, unlike the list's two: this is where
+          somebody decides, so the illustration should be seen whole rather
+          than sampled. */}
+      <canvas
+        ref={canvasRef}
+        width={240}
+        height={190}
+        role="img"
+        aria-label={`${own ? 'Your end' : "The opponent's end"} preview`}
+      />
+      <figcaption>{own ? 'Your end' : "The opponent's end"}</figcaption>
+    </figure>
+  );
+};
 
 /** One canvas, cropped to its own pose and always moving. */
 const DemoShot: React.FC<{ skinRef: string; shot: Shot; revision: number }> = ({
@@ -136,6 +214,12 @@ const DemoShot: React.FC<{ skinRef: string; shot: Shot; revision: number }> = ({
 export interface SkinView {
   reference: string;
   name: string;
+  /**
+   * Which slot this dresses. A base has no poses and no roles, so the dialog
+   * shows its two ends instead of four snake shots — and the equip button
+   * writes to the other slot.
+   */
+  kind?: 'snake' | 'base';
   priceBux: number;
   /** The document reference to paint, which is not the skin's own reference. */
   previewRef?: string;
@@ -158,7 +242,12 @@ interface SkinModalProps {
   onGet: () => void;
   onEquip: () => void;
   onEdit: () => void;
-  onTopUp: () => void;
+  /**
+   * Open the wallet. Absent when there is no way to buy Snakebux in this
+   * build, in which case the shortfall is simply stated and not offered a fix
+   * that does not exist.
+   */
+  onTopUp?: () => void;
 }
 
 const plural = (count: number, one: string, many: string): string =>
@@ -213,7 +302,12 @@ const SkinModal: React.FC<SkinModalProps> = ({
         </button>
       );
     }
-    if (skin.priceBux > 0 && !affordable) {
+    // A shortfall offers the wallet — but only when there is a wallet to open.
+    // With no way to buy Snakebux this falls through to the Get button below,
+    // which is the honest call to action: it prompts a signed-out visitor to
+    // sign in, and tells a signed-in one exactly what they are short. Returning
+    // nothing here left a priced skin's dialog with no button at all.
+    if (skin.priceBux > 0 && !affordable && onTopUp) {
       return (
         <button
           type="button"
@@ -267,16 +361,31 @@ const SkinModal: React.FC<SkinModalProps> = ({
           <span aria-hidden="true">×</span>
         </button>
 
-        <div className="skin-shots">
-          {SHOTS.map((shot) => (
-            <DemoShot
-              key={`${shot.pose}-${shot.role}`}
-              skinRef={paintRef}
-              shot={shot}
-              revision={registryRevision}
-            />
-          ))}
+        <div className={`skin-shots${skin.kind === 'base' ? ' is-base' : ''}`}>
+          {skin.kind === 'base' ? (
+            <>
+              <BaseShot skinRef={paintRef} own />
+              <BaseShot skinRef={paintRef} own={false} />
+            </>
+          ) : (
+            SHOTS.map((shot) => (
+              <DemoShot
+                key={`${shot.pose}-${shot.role}`}
+                skinRef={paintRef}
+                shot={shot}
+                revision={registryRevision}
+              />
+            ))
+          )}
         </div>
+
+        {skin.kind === 'base' ? (
+          <p className="skin-blurb" data-testid="skin-modal-base-blurb">
+            Dresses your team&rsquo;s end of the arena in team games, and everyone
+            in the match sees it. If both of you have one equipped, the lobby
+            leader&rsquo;s is the one that plays.
+          </p>
+        ) : null}
 
         <dl className="skin-stats">
           {skin.stats ? (
@@ -296,6 +405,12 @@ const SkinModal: React.FC<SkinModalProps> = ({
               <dd>Ships with the game</dd>
             </div>
           )}
+          {skin.kind === 'base' ? (
+            <div>
+              <dt>Who sees it</dt>
+              <dd>Everyone in the match</dd>
+            </div>
+          ) : null}
           <div>
             <dt>Price</dt>
             <dd className="skin-stat-price">

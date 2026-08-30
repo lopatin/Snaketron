@@ -21,7 +21,12 @@ interface GetSkinModalProps {
   busy: boolean;
   error: string | null;
   onConfirm: () => void;
-  onTopUp: () => void;
+  /**
+   * Open the wallet. Absent when there is no way to buy Snakebux in this
+   * build; the shortfall is then stated without offering a fix that is not
+   * available.
+   */
+  onTopUp?: () => void;
   onClose: () => void;
 }
 
@@ -119,7 +124,7 @@ const GetSkinModal: React.FC<GetSkinModalProps> = ({
             >
               {busy ? 'Getting…' : 'Confirm'}
             </button>
-          ) : (
+          ) : onTopUp ? (
             <button
               type="button"
               className="game-shell-button is-primary"
@@ -129,7 +134,7 @@ const GetSkinModal: React.FC<GetSkinModalProps> = ({
               <SnakeBuxIcon size={16} />
               Get more Snakebux
             </button>
-          )}
+          ) : null}
         </div>
       </div>
     </div>

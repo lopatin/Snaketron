@@ -46,7 +46,23 @@ pub const MEMBERSHIP_SCHEMA_VERSION: u16 = 2;
 /// with every player's idle clock reset to tick zero. The version gate refuses
 /// incompatible envelopes and keeps mixed-version executors from co-owning
 /// partitions during a rolling deploy.
-pub const EXECUTOR_PROTOCOL_VERSION: u16 = 12;
+///
+/// Version 13 is `GameState.team_bases`, and it is the same serde-invisible
+/// hazard as version 8's: the field defaults, so an executor built before it
+/// existed deserializes a checkpoint containing one, drops it silently, and
+/// writes the state back without it. The match then loses both teams' base
+/// skins mid-game, and so does its stored replay. Nothing desyncs — the field
+/// is cosmetic and out of the fingerprint — but a cosmetic that vanishes
+/// halfway through a rolling deploy is a bug report nobody can reproduce
+/// afterwards.
+///
+/// Deliberately *not* accompanied by a `WS_PROTOCOL_VERSION` bump. This one
+/// partitions executors, which is exactly the scope of the problem; the socket
+/// version is a hard cutover that would disconnect every player mid-match, and
+/// `GAMEPLAY_REPLAY_VERSION` gates highlight playback on an exact match and
+/// would invalidate every clip already stored. An older *client* handles the
+/// new field correctly by ignoring it.
+pub const EXECUTOR_PROTOCOL_VERSION: u16 = 13;
 // Three missed one-second heartbeats prove task loss with enough margin for
 // assignment and executor bootstrap inside the five-second crash-output gate.
 pub const DEFAULT_MEMBERSHIP_TTL: Duration = Duration::from_secs(3);
