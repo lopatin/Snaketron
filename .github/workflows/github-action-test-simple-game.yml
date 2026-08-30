@@ -364,13 +364,29 @@ jobs:
       # is worth catching here rather than in a silently dead release.
       #
       # This bundle is never deployed and never runs, so it reports nothing.
+      #
+      # The assertion below is the one that matters most: a build succeeding
+      # proves only that webpack ran. The production client shipped for a full
+      # release cycle with both keys compiled to the empty string, and every
+      # build was green throughout. Only checking that the key reached the
+      # artifact distinguishes "built" from "would actually report".
       - name: Build the production web bundle
-        run: npm run build:prod
         working-directory: client/web
         env:
           GAME_ANALYTICS_GAME_KEY: ${{ vars.GAME_ANALYTICS_GAME_KEY }}
           GAME_ANALYTICS_SECRET_KEY: ${{ secrets.GAME_ANALYTICS_SECRET_KEY }}
-          GAME_ANALYTICS_BUILD: ci-${{ github.sha }}
+          # GameAnalytics caps the build label at 32 characters and silently
+          # keeps its default past that, so a full 40-character SHA cannot be
+          # used here.
+          GAME_ANALYTICS_REQUIRED: 'true'
+        run: |
+          set -euo pipefail
+          GAME_ANALYTICS_BUILD="ci-${GITHUB_SHA::12}" npm run build:prod
+          if ! grep -rlq "$GAME_ANALYTICS_GAME_KEY" dist/; then
+            echo "::error::The game key never reached the bundle - this build would report nothing"
+            exit 1
+          fi
+          echo "✅ Game key is compiled into the production bundle"
 
       # The switch that takes analytics back out of a reviewed release package
       # has no other test: it only shows up in the shape of a built artifact.
