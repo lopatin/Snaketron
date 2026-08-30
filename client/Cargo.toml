@@ -20,3 +20,10 @@ wasm-logger = "0.2"
 [dependencies.web-sys]
 version = "0.3.77"
 features = ['CanvasGradient', 'CanvasRenderingContext2d', 'Document', 'Element', 'HtmlCanvasElement', 'HtmlImageElement', 'Performance', 'TextMetrics', 'Window', 'console']
+
+# Decoding PNGs is a *test* concern only: `base_skin`'s side-honesty check
+# measures the committed endzone pictures natively, and nothing in the wasm
+# bundle ever decodes an image itself — the browser does that. Keeping this out
+# of `[dependencies]` keeps it out of everyone's download.
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

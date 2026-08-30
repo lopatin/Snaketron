@@ -1,9 +1,135 @@
 use crate::skin::{
-    PaintCtx, SkinColors, SkinIdentity, SnakePose, SnakeSkin, paint_alive_with_occlusion,
-    skin_registry,
+    PaintCtx, SkinColors, SkinIdentity, SnakePose, SnakeSkin,
+    base_skin::{BaseSide, resolve_base_skin},
+    paint_alive_with_occlusion, skin_registry,
 };
-use common::{BoostPad, GameState, Position};
+use common::{BoostPad, GameState, Position, TeamId};
 use wasm_bindgen::prelude::*;
+
+/// One endzone rectangle: `(x, y, width, height)` in canvas pixels.
+type ZoneRect = (f64, f64, f64, f64);
+
+/// Where the two endzones are on screen, and how big one tile of base art is.
+///
+/// `team0`/`team1` are the *teams*, not screen sides. Which side of the screen
+/// a team lands on is rotation's business, and `BaseSides::left_*`/`right_*`
+/// follow the same convention: "left" means team 0 in unrotated arena space,
+/// wherever the rotation has since put it.
+#[derive(Clone, Copy)]
+struct TeamZoneLayout {
+    team0: ZoneRect,
+    team1: ZoneRect,
+    /// True when a zone is taller than it is wide, so two teammates' names
+    /// stack instead of sitting side by side.
+    split_vertical: bool,
+}
+
+/// Place both endzones for the current rotation.
+///
+/// Extracted so the tint, the base picture, and the lettering all read the same
+/// rectangles. They used to be derived twice from two separate `match`es on the
+/// rotation, which is exactly the sort of duplication that puts a picture and
+/// the names on it half a zone apart.
+fn team_zone_rects(
+    rotation: i32,
+    width: f64,
+    height: f64,
+    cell_size: f64,
+    end_zone_depth: f64,
+) -> TeamZoneLayout {
+    let depth = end_zone_depth * cell_size;
+    let across = width * cell_size;
+    let down = height * cell_size;
+    let (team0, team1, split_vertical) = match rotation {
+        // team 0 on top, team 1 below.
+        90 => (
+            (0.0, 0.0, across, depth),
+            (0.0, down - depth, across, depth),
+            false,
+        ),
+        // team 0 on the right, team 1 on the left.
+        180 => (
+            (across - depth, 0.0, depth, down),
+            (0.0, 0.0, depth, down),
+            true,
+        ),
+        // team 0 below, team 1 on top.
+        270 => (
+            (0.0, down - depth, across, depth),
+            (0.0, 0.0, across, depth),
+            false,
+        ),
+        // 0 degrees or default: team 0 on the left, team 1 on the right.
+        _ => (
+            (0.0, 0.0, depth, down),
+            (across - depth, 0.0, depth, down),
+            true,
+        ),
+    };
+    TeamZoneLayout {
+        team0,
+        team1,
+        split_vertical,
+    }
+}
+
+/// Paint a base skin's picture across one endzone.
+///
+/// One picture, spanning the whole zone — not repeated. An endzone is a long
+/// thin strip, so the banner is laid along its **long** axis and cover-fitted
+/// across its depth, which means turning the picture a quarter turn when the
+/// strip runs down the screen rather than across it. That is the same thing
+/// that happens to paint on a real pitch when the camera moves: the arena's own
+/// rotation carries the art with it, while the players' names stay upright
+/// because text is the one thing that has to be read rather than seen.
+///
+/// A banner is wider than the strip's depth, so cover-fitting crops its top and
+/// bottom. The generator composes for that — see `build_base_textures.py`.
+fn paint_base_banner(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    rect: ZoneRect,
+    image: &web_sys::HtmlImageElement,
+) -> Result<(), JsValue> {
+    let (x, y, zone_width, zone_height) = rect;
+    let (source_width, source_height) = (
+        f64::from(image.natural_width()),
+        f64::from(image.natural_height()),
+    );
+    if zone_width <= 0.0 || zone_height <= 0.0 || source_width <= 0.0 || source_height <= 0.0 {
+        return Ok(());
+    }
+
+    ctx.save();
+    ctx.begin_path();
+    ctx.rect(x, y, zone_width, zone_height);
+    ctx.clip();
+
+    // Measured in the *banner's* frame: its width runs along the zone's length
+    // whichever way that happens to point on screen.
+    let upright = zone_width >= zone_height;
+    let (along, across) = if upright {
+        (zone_width, zone_height)
+    } else {
+        (zone_height, zone_width)
+    };
+    let scale = (along / source_width).max(across / source_height);
+    let (drawn_width, drawn_height) = (source_width * scale, source_height * scale);
+
+    ctx.translate(x + zone_width / 2.0, y + zone_height / 2.0)?;
+    if !upright {
+        ctx.rotate(std::f64::consts::FRAC_PI_2)?;
+    }
+    ctx.draw_image_with_html_image_element_and_dw_and_dh(
+        image,
+        -drawn_width / 2.0,
+        -drawn_height / 2.0,
+        drawn_width,
+        drawn_height,
+    )?;
+
+    ctx.restore();
+    Ok(())
+}
 
 /// Transform coordinates based on rotation angle
 pub(crate) fn transform_coords(
@@ -1139,21 +1265,27 @@ pub fn authored_skin_is_registered(content_ref: &str) -> bool {
     crate::skin::registry::authored_skin_is_registered(content_ref)
 }
 
-/// Paint one skin's base dressing as a standalone rectangle.
+/// Paint one base as a standalone rectangle.
 ///
 /// The Skins page needs to show what a base looks like without running a match,
-/// and the honest way to do that is to resolve the theme through the same
-/// `base_theme()` the arena reads. Drawing it from TypeScript instead would
-/// mean mirroring six hex values into the client, which is exactly the coupling
-/// `specs/skins-prd.md` removed.
+/// and the honest way to do that is to resolve it through the same code the
+/// arena reads. Drawing it from TypeScript instead would mean mirroring six hex
+/// values into the client, which is exactly the coupling `specs/skins-prd.md`
+/// removed.
 ///
-/// `own` picks which half of the theme is being shown: a player's own end of
-/// the arena, or the opponent's. Which side of a real arena that lands on stays
-/// the renderer's decision — this is a swatch of the theme, not a map.
+/// `reference` names either kind of base (see `skin_catalog::BASE_REF_PREFIX`):
+/// a base skin, which paints its picture, or a snake skin, which paints that
+/// skin's colour theme. Both end up on the same three layers — tint, then
+/// picture if there is one, then the goal wall and the lettering — so the
+/// preview shows what the arena will.
+///
+/// `own` picks which end is being shown: a player's own, or the opponent's.
+/// Which side of a real arena that lands on stays the renderer's decision —
+/// this is a swatch, not a map.
 #[wasm_bindgen(js_name = renderSkinBase)]
 pub fn render_skin_base(
     canvas: &web_sys::HtmlCanvasElement,
-    skin_ref: &str,
+    reference: &str,
     own: bool,
 ) -> Result<(), JsValue> {
     let ctx = canvas
@@ -1163,10 +1295,19 @@ pub fn render_skin_base(
 
     let width = canvas.width() as f64;
     let height = canvas.height() as f64;
-    let theme = skin_registry()
-        .resolve(Some(skin_ref))
-        .base_theme()
-        .unwrap_or(crate::skin::classic::CLASSIC_BASE_THEME);
+    let base_skin = resolve_base_skin(Some(reference));
+    let side = if own { BaseSide::Home } else { BaseSide::Away };
+    // A base skin has no colour theme of its own, so the layer under its
+    // picture is classic — which is also what a real arena shows a viewer who
+    // has one equipped, because equipping a picture leaves the theme to the
+    // snake skin and this preview has no snake skin to ask.
+    let theme = match base_skin {
+        Some(_) => crate::skin::classic::CLASSIC_BASE_THEME,
+        None => skin_registry()
+            .resolve(Some(reference))
+            .base_theme()
+            .unwrap_or(crate::skin::classic::CLASSIC_BASE_THEME),
+    };
     let (zone, wall, text) = if own {
         (
             theme.friendly_zone,
@@ -1187,22 +1328,70 @@ pub fn render_skin_base(
     ctx.set_fill_style_str(zone);
     ctx.fill_rect(0.0, 0.0, width, height);
 
-    let wall_thickness = (width * 0.12).max(3.0);
-    ctx.set_fill_style_str(wall);
-    ctx.fill_rect(0.0, 0.0, wall_thickness, height);
+    // The picture, cover-fitted exactly as the arena does it.
+    let mut lettering = (text, zone);
+    if let Some(base_skin) = base_skin
+        && let Some(image) = base_skin.image(side)
+    {
+        paint_base_banner(&ctx, (0.0, 0.0, width, height), &image)?;
+        crate::skin::atlas::record_draw(base_skin.handle(side));
+        lettering = (base_skin.text, base_skin.text_halo());
+    }
 
-    let glyph_size = (height * 0.34).max(8.0);
-    ctx.set_fill_style_str(text);
+    // No goal wall. In the arena it is the band between the endzone and the
+    // field and it carries the friend/foe read; on a swatch there is no field
+    // for it to be a boundary with, so it was only ever a pale bar down the
+    // left of every row — covering a twelfth of the art on the rows that have
+    // art, and reading as a stray UI element on the one that does not.
+    let _ = wall;
+
+    // Sized against the *width* as well as the height. A swatch is far closer
+    // to square than the 4:1 endzone it stands for, so a label scaled only to
+    // its height ends up covering the picture it exists to show — which is the
+    // one thing the dialog is for.
+    let glyph_size = (height * 0.30).min(width * 0.20).max(8.0);
+    let label = if own { "HOME" } else { "AWAY" };
+    let (text_x, text_y) = (width / 2.0, height / 2.0);
     ctx.set_font(&format!("italic 900 {glyph_size}px sans-serif"));
     ctx.set_text_align("center");
     ctx.set_text_baseline("middle");
-    ctx.fill_text(
-        if own { "HOME" } else { "AWAY" },
-        wall_thickness + (width - wall_thickness) / 2.0,
-        height / 2.0,
-    )?;
+    // Outlined only over a picture. The colour path is unchanged so its
+    // committed appearance stays exactly what it was.
+    if base_skin.is_some() {
+        // Round joins, for the reason `draw_label_with_size` records: a thick
+        // mitred outline on a letterform grows spikes out of every sharp corner.
+        ctx.set_line_join("round");
+        ctx.set_line_cap("round");
+        ctx.set_line_width(glyph_size * 0.28);
+        ctx.set_stroke_style_str(lettering.1);
+        ctx.stroke_text(label, text_x, text_y)?;
+    }
+    ctx.set_fill_style_str(lettering.0);
+    ctx.fill_text(label, text_x, text_y)?;
 
     Ok(())
+}
+
+/// Every base skin this build can draw, as JSON, for the picker.
+///
+/// The picker needs to tell the two kinds of base apart — one is a picture the
+/// whole match sees, the other is a colour theme only its owner sees — and the
+/// browse API returns both under the same `kind`. Reading the answer out of the
+/// renderer rather than mirroring a list into TypeScript is the same rule
+/// `skinCatalog` follows, for the same reason.
+#[wasm_bindgen(js_name = baseSkinCatalog)]
+pub fn base_skin_catalog() -> Result<String, JsValue> {
+    let entries: Vec<serde_json::Value> = crate::skin::base_skin::BASE_SKINS
+        .iter()
+        .map(|skin| {
+            serde_json::json!({
+                "id": skin.id,
+                "name": skin.name,
+                "text": skin.text,
+            })
+        })
+        .collect();
+    serde_json::to_string(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// The colours a skin reports for one named fixture role.
@@ -1873,75 +2062,63 @@ pub fn render_game_state(
 
     // Draw team zones if present
     let team_zone_config_data = arena.team_zone_config.as_ref();
-    if let Some(team_zone_config) = team_zone_config_data {
-        let end_zone_depth = team_zone_config.end_zone_depth as f64;
+    // One rect per team, in the current rotation. Computed once and used by
+    // every endzone pass — the tint, the picture, and the lettering — so the
+    // three can never disagree about where an endzone is.
+    let team_zone_layout = team_zone_config_data.map(|config| {
+        team_zone_rects(
+            rotation_int,
+            width,
+            height,
+            cell_size,
+            config.end_zone_depth as f64,
+        )
+    });
 
-        // Determine zone background colors based on local player's team
-        let (left_color, right_color) = (base_sides.left_zone, base_sides.right_zone);
+    // What each team's endzone is painted with. Attributed to the team that
+    // owns the endzone rather than to the viewer, so this is one of only two
+    // places a cosmetic another player chose reaches your screen — the other
+    // being their snake.
+    //
+    // Which *side* each is shown from stays the renderer's decision, exactly
+    // as it is for the colours underneath: a base skin is handed a resolved
+    // `BaseSide` and paints its home kit or its away kit accordingly. It never
+    // gets to say which end is friendly.
+    let team_base_skins: [Option<(&crate::skin::base_skin::BaseSkin, BaseSide)>; 2] = [0u8, 1u8]
+        .map(|team| {
+            resolve_base_skin(state.team_base(TeamId(team)))
+                .map(|skin| (skin, BaseSide::for_team(team, local_player_team)))
+        });
 
-        // In the original orientation, zones are on left and right
-        // We need to transform these based on rotation
-        match rotation_int {
-            90 => {
-                // 90° CW: left zone becomes top, right zone becomes bottom
-                // Top zone
-                ctx.set_fill_style_str(left_color);
-                ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
+    // Which endzones actually have a picture on them this frame, so the grid
+    // dots can stay off the art. Only true once the pixels have decoded — an
+    // endzone still showing its tint keeps its dots, as it always has.
+    let mut endzone_is_painted = [false; 2];
 
-                // Bottom zone
-                ctx.set_fill_style_str(right_color);
-                ctx.fill_rect(
-                    0.0,
-                    (height - end_zone_depth) * cell_size,
-                    width * cell_size,
-                    end_zone_depth * cell_size,
-                );
-            }
-            180 => {
-                // 180°: left zone becomes right, right zone becomes left
-                // Right zone (was left)
-                ctx.set_fill_style_str(left_color);
-                ctx.fill_rect(
-                    (width - end_zone_depth) * cell_size,
-                    0.0,
-                    end_zone_depth * cell_size,
-                    height * cell_size,
-                );
+    if let Some(layout) = team_zone_layout {
+        for (team, rect) in [layout.team0, layout.team1].into_iter().enumerate() {
+            let (x, y, zone_width, zone_height) = rect;
 
-                // Left zone (was right)
-                ctx.set_fill_style_str(right_color);
-                ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
-            }
-            270 => {
-                // 270° CW: left zone becomes bottom, right zone becomes top
-                // Bottom zone (was left)
-                ctx.set_fill_style_str(left_color);
-                ctx.fill_rect(
-                    0.0,
-                    (height - end_zone_depth) * cell_size,
-                    width * cell_size,
-                    end_zone_depth * cell_size,
-                );
+            // The tint is always painted, base skin or not. It is what a
+            // picture that has not decoded — or never will — leaves showing,
+            // which is the endzone exactly as it looked before base skins
+            // existed.
+            ctx.set_fill_style_str(if team == 0 {
+                base_sides.left_zone
+            } else {
+                base_sides.right_zone
+            });
+            ctx.fill_rect(x, y, zone_width, zone_height);
 
-                // Top zone (was right)
-                ctx.set_fill_style_str(right_color);
-                ctx.fill_rect(0.0, 0.0, width * cell_size, end_zone_depth * cell_size);
-            }
-            _ => {
-                // 0° or default: normal orientation
-                // Left zone
-                ctx.set_fill_style_str(left_color);
-                ctx.fill_rect(0.0, 0.0, end_zone_depth * cell_size, height * cell_size);
-
-                // Right zone
-                ctx.set_fill_style_str(right_color);
-                ctx.fill_rect(
-                    (width - end_zone_depth) * cell_size,
-                    0.0,
-                    end_zone_depth * cell_size,
-                    height * cell_size,
-                );
-            }
+            let Some((base_skin, side)) = team_base_skins[team] else {
+                continue;
+            };
+            let Some(image) = base_skin.image(side) else {
+                continue;
+            };
+            paint_base_banner(&ctx, rect, &image)?;
+            crate::skin::atlas::record_draw(base_skin.handle(side));
+            endzone_is_painted[team] = true;
         }
     }
 
@@ -1951,6 +2128,20 @@ pub fn render_game_state(
     // Cooling pads are deliberately absent from this mask as well as the art.
     let active_boost_pad_bounds =
         transformed_active_pad_bounds(&arena.boost_pads, game_width, game_height, rotation_int);
+
+    // Grid dots stop at a painted endzone. Over a flat tint they read as the
+    // arena's own texture; over a picture they read as dirt on it, and there
+    // are about two thousand of them. An endzone still showing its tint keeps
+    // them, so nothing changes for a match without base skins.
+    let painted_endzones: Vec<(f64, f64, f64, f64)> = team_zone_layout
+        .map(|layout| {
+            [(0usize, layout.team0), (1usize, layout.team1)]
+                .into_iter()
+                .filter(|(team, _)| endzone_is_painted[*team])
+                .map(|(_, rect)| rect)
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Draw dots at grid intersections (like the background pattern)
     ctx.set_fill_style_str("rgba(0, 0, 0, 0.3)"); // Same as background dots
@@ -1970,6 +2161,12 @@ pub fn render_game_state(
                 continue;
             }
 
+            if painted_endzones.iter().any(|(zx, zy, zw, zh)| {
+                dot_x >= *zx && dot_x <= zx + zw && dot_y >= *zy && dot_y <= zy + zh
+            }) {
+                continue;
+            }
+
             // Skip dots that are on the exact edges
             if dot_x >= width * cell_size || dot_y >= height * cell_size {
                 continue;
@@ -1984,9 +2181,7 @@ pub fn render_game_state(
 
     // Draw endzone text after dots but before walls and snakes
     // This ensures text is visible over dots but under snakes
-    if let Some(team_zone_config) = team_zone_config_data {
-        let end_zone_depth = team_zone_config.end_zone_depth as f64;
-
+    if team_zone_config_data.is_some() {
         // Build team labels from player usernames; show both teammates side by side
         let mut team_names: [Vec<String>; 2] = [Vec::new(), Vec::new()];
         for (user_id, player) in &state.players {
@@ -2007,13 +2202,27 @@ pub fn render_game_state(
             names.sort();
         }
 
-        // Background and text colors based on perspective
-        let (left_bg_color, right_bg_color, left_text_color, right_text_color) = (
-            base_sides.left_zone,
-            base_sides.right_zone,
-            base_sides.left_text,
-            base_sides.right_text,
-        );
+        // How each team's names are written.
+        //
+        // A base skin owns its own lettering colour, because the whole point of
+        // one is that the endzone no longer looks like the theme underneath it:
+        // a name in the theme's colour over somebody's picture is a name nobody
+        // can read. The outline is derived from that colour rather than
+        // authored beside it — see `BaseSkin::text_halo`.
+        //
+        // Only a *decoded* picture takes the colours over. Until then the
+        // theme is what is actually on screen, so the theme's colours are the
+        // readable ones, and the pair switches together rather than leaving a
+        // base skin's lettering stranded on a pale tint.
+        let lettering = |team: usize| -> (&str, &str) {
+            match team_base_skins[team].filter(|(skin, side)| skin.is_ready(*side)) {
+                Some((skin, _)) => (skin.text, skin.text_halo()),
+                None if team == 0 => (base_sides.left_text, base_sides.left_zone),
+                None => (base_sides.right_text, base_sides.right_zone),
+            }
+        };
+        let (left_text_color, left_bg_color) = lettering(0);
+        let (right_text_color, right_bg_color) = lettering(1);
 
         // Local/opponent fallback labels, resolved from the state's username map
         // (previously threaded in as scalar arguments from JS).
@@ -2082,6 +2291,19 @@ pub fn render_game_state(
          -> Result<(), JsValue> {
             let size = font_size.min(compute_font_size(text, box_w, box_h));
             ctx.set_font(&format!("900 {}px Impact, 'Arial Black', sans-serif", size));
+            // Round joins, and this is not a nicety. The outline is a third of
+            // the glyph height, and at that width a mitred corner on a
+            // letterform shoots a spike out along the bisector — the apex of an
+            // A or the vertices of a W throw black darts several letters long.
+            // They were always being drawn; they only became visible when the
+            // outline stopped being the same near-white as the zone behind it.
+            //
+            // Set every time rather than once: the canvas keeps this globally
+            // and other painters leave it on `bevel` (the NOS canister) or
+            // `round` (the crash mark), so whichever ran last would otherwise
+            // decide how the names look this frame.
+            ctx.set_line_join("round");
+            ctx.set_line_cap("round");
             ctx.set_line_width(size * 0.35);
             ctx.set_stroke_style_str(bg_color);
             ctx.stroke_text(text, center_x, center_y)?;
@@ -2158,52 +2380,15 @@ pub fn render_game_state(
             Ok(())
         };
 
-        // Compute the rectangles for each team zone in the current orientation
-        let (team0_rect, team1_rect, split_vertical) = match rotation_int {
-            90 => (
-                // team0 = top, team1 = bottom
-                (0.0, 0.0, width * cell_size, end_zone_depth * cell_size),
-                (
-                    0.0,
-                    (height - end_zone_depth) * cell_size,
-                    width * cell_size,
-                    end_zone_depth * cell_size,
-                ),
-                false,
-            ),
-            180 => (
-                // team0 = right, team1 = left
-                (
-                    (width - end_zone_depth) * cell_size,
-                    0.0,
-                    end_zone_depth * cell_size,
-                    height * cell_size,
-                ),
-                (0.0, 0.0, end_zone_depth * cell_size, height * cell_size),
-                true,
-            ),
-            270 => (
-                // team0 = bottom, team1 = top
-                (
-                    0.0,
-                    (height - end_zone_depth) * cell_size,
-                    width * cell_size,
-                    end_zone_depth * cell_size,
-                ),
-                (0.0, 0.0, width * cell_size, end_zone_depth * cell_size),
-                false,
-            ),
-            _ => (
-                // team0 = left, team1 = right
-                (0.0, 0.0, end_zone_depth * cell_size, height * cell_size),
-                (
-                    (width - end_zone_depth) * cell_size,
-                    0.0,
-                    end_zone_depth * cell_size,
-                    height * cell_size,
-                ),
-                true,
-            ),
+        // The same rectangles the tint and the picture used, so a name is
+        // always centred on the endzone it belongs to.
+        let (team0_rect, team1_rect, split_vertical) = match team_zone_layout {
+            Some(layout) => (layout.team0, layout.team1, layout.split_vertical),
+            // Unreachable: this block and the layout are both gated on the
+            // same `team_zone_config`. Written as a fallback rather than an
+            // unwrap because a cosmetic pass must never be able to panic a
+            // frame.
+            None => return Ok(()),
         };
 
         // Draw labels for each team zone (supports up to two names per team)

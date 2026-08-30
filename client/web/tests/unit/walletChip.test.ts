@@ -27,15 +27,32 @@ test('a balance is read as a number whatever the wire calls it', () => {
 });
 
 test('the chip appears only for a signed-in player whose balance arrived', () => {
-  assert.equal(shouldShowBuxChip(true, 500), true);
-  assert.equal(shouldShowBuxChip(true, 0), true, 'nothing is a balance too');
+  assert.equal(shouldShowBuxChip(true, 500, true), true);
+  assert.equal(shouldShowBuxChip(true, 0, true), true, 'nothing is a balance too');
 
-  assert.equal(shouldShowBuxChip(false, 500), false, 'signed out has no wallet');
+  assert.equal(shouldShowBuxChip(false, 500, true), false, 'signed out has no wallet');
   assert.equal(
-    shouldShowBuxChip(true, null),
+    shouldShowBuxChip(true, null, true),
     false,
     'a failed fetch must not paint a hopeful zero — zero is a real balance',
   );
+});
+
+test('a build that cannot sell Snakebux does not mention Snakebux', () => {
+  assert.equal(
+    shouldShowBuxChip(true, 500, false),
+    false,
+    'a balance nobody can add to is an invitation to a shop that is not open',
+  );
+  assert.equal(
+    shouldShowBuxChip(true, 500, null),
+    false,
+    'unknown is not yes: no chip until the shop has actually answered',
+  );
+
+  // …and the moment Xsolla is connected the shop stops being empty, so the
+  // same balance appears with no other change anywhere.
+  assert.equal(shouldShowBuxChip(true, 500, true), true);
 });
 
 test('a balance is grouped, because the header has no room to spare', () => {

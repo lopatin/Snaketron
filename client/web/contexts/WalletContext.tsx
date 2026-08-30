@@ -24,6 +24,23 @@ import { useAuth } from './AuthContext';
 interface WalletContextValue {
   /** `null` while unknown — signed out, still loading, or the fetch failed. */
   balanceBux: number | null;
+  /**
+   * Whether Snakebux exist as far as this player is concerned.
+   *
+   * `null` while unknown, and that is a third state rather than a slow `false`:
+   * rendering "no Snakebux here" for the moment before the answer arrives, and
+   * then popping a balance into the header, is worse than showing nothing and
+   * then showing the truth.
+   *
+   * The signal is the shop being empty. `GET /api/wallet/packs` already returns
+   * `[]` for both reasons Snakebux can be unavailable — a deployment with no
+   * merchant account, and a distribution that may not sell — and the client
+   * does not need to know which happened, only that there is no way to get any.
+   *
+   * Wiring it to Xsolla is therefore all it takes to turn the currency on:
+   * the shop stops being empty and every surface guarded on this appears.
+   */
+  buxAvailable: boolean | null;
   refresh: () => Promise<void>;
   /**
    * Record a balance the caller already has, from a response that carried one.
@@ -42,6 +59,7 @@ const WalletContext = createContext<WalletContextValue | null>(null);
 export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user } = useAuth();
   const [balanceBux, setBalanceBux] = useState<number | null>(null);
+  const [buxAvailable, setBuxAvailable] = useState<boolean | null>(null);
   const requestSequence = useRef(0);
 
   const applyBalance = useCallback((balance: number | null) => {
@@ -65,6 +83,7 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     // load for every signed-out visitor.
     if (userId === null) {
       setBalanceBux(null);
+      setBuxAvailable(null);
       return;
     }
 
@@ -93,9 +112,46 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     void refresh();
   }, [refresh]);
 
+  // Asked once per session rather than when the wallet is opened, because the
+  // answer decides whether the *header* shows anything at all — and a header
+  // that has to open a modal to find out what to render has already rendered.
+  useEffect(() => {
+    if (userId === null) {
+      return undefined;
+    }
+    let cancelled = false;
+    const ask = async (): Promise<void> => {
+      // Retried once, because the failure mode is asymmetric. A shop that will
+      // not load is not evidence either way, so the currency stays hidden —
+      // which is right, but it means one dropped request at page load hides a
+      // real balance for the rest of the session with nothing to prompt
+      // another look. One retry costs a request and covers the transient case.
+      for (let attempt = 0; attempt < 2 && !cancelled; attempt += 1) {
+        try {
+          const packs = await api.buxPacks();
+          if (!cancelled) {
+            setBuxAvailable(packs.length > 0);
+          }
+          return;
+        } catch {
+          if (attempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 3_000));
+          }
+        }
+      }
+      if (!cancelled) {
+        setBuxAvailable(null);
+      }
+    };
+    void ask();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
   const value = useMemo(
-    () => ({ balanceBux, refresh, applyBalance }),
-    [applyBalance, balanceBux, refresh],
+    () => ({ balanceBux, buxAvailable, refresh, applyBalance }),
+    [applyBalance, balanceBux, buxAvailable, refresh],
   );
 
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;

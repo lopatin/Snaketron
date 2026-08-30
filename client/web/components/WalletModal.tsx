@@ -166,13 +166,13 @@ const WalletModal: React.FC<WalletModalProps> = ({ onClose, shortfallFor = null 
         ) : null}
 
         {packsLoaded && packs.length === 0 ? (
-          // Either this build may not sell (the portal prohibits unapproved
-          // purchases) or the deployment has no merchant account. The player
-          // does not need to know which; they need to know the balance is
-          // still theirs and still spends.
+          // Reachable only as a race: every route into this dialog is gated on
+          // `buxAvailable`, which is exactly "the shop is not empty". If the
+          // shop empties between that answer and this fetch — a merchant
+          // account withdrawn mid-session — say nothing rather than apologise
+          // for a currency the rest of the build has stopped mentioning.
           <p className="shop-note" data-testid="wallet-unavailable">
-            Snakebux cannot be bought in this version of the game. Any Snakebux you
-            already have still work.
+            Nothing is on sale right now. Try again in a moment.
           </p>
         ) : null}
 

@@ -17,10 +17,11 @@
 //! - `recent_crashes`, `recent_goals`, and `last_death_causes`: replicated
 //!   presentation history. Hashing it would turn an expired visual cue into a
 //!   false gameplay divergence; the underlying state transition is hashed.
-//! - `usernames`, `skins`, `spectators`, `game_code`, `host_user_id`,
-//!   `start_ms`: cosmetic or static; not gameplay state. Skins in particular
-//!   must stay out: a player changing how their snake looks can never be
-//!   allowed to make two clients disagree about the game.
+//! - `usernames`, `skins`, `team_bases`, `spectators`, `game_code`,
+//!   `host_user_id`, `start_ms`: cosmetic or static; not gameplay state. The
+//!   two skin maps in particular must stay out: neither how a player's snake
+//!   looks nor what a team's endzone is painted with can be allowed to make
+//!   two clients disagree about the game.
 //! - `readiness` and `simulation_epoch_ms`: the pre-match readiness gate.
 //!   Both resolve before tick 1, so hashing them would compare states across
 //!   the window where a `PlayerReady` event is legitimately still in flight
@@ -374,9 +375,43 @@ mod tests {
         dressed.set_player_skin(7, None);
         assert_eq!(dressed.sync_hash(), baseline);
     }
+
+    /// A team's base skin travels to every client, unlike the viewer-local
+    /// theme it replaces — so it is the newest thing that could desync a match
+    /// by being hashed, and the same rule has to hold for it.
+    #[test]
+    fn a_teams_base_skin_never_changes_the_fingerprint() {
+        let mut plain = test_state();
+        plain
+            .add_player(7, Some("player".to_string()))
+            .expect("a player joins at tick 0");
+        let baseline = plain.sync_hash();
+
+        let mut dressed = plain.clone();
+        dressed.set_team_base(TeamId(0), Some("turf@1".to_string()));
+        dressed.set_team_base(TeamId(1), Some("hazard@1".to_string()));
+        assert_ne!(
+            dressed.team_bases, plain.team_bases,
+            "the choice was recorded"
+        );
+        assert_eq!(
+            dressed.sync_hash(),
+            baseline,
+            "a base skin changed the sync fingerprint"
+        );
+
+        dressed.set_team_base(TeamId(0), Some("from-the-future@99".to_string()));
+        assert_eq!(dressed.sync_hash(), baseline);
+
+        dressed.set_team_base(TeamId(0), None);
+        dressed.set_team_base(TeamId(1), None);
+        assert_eq!(dressed.sync_hash(), baseline);
+        assert!(dressed.team_bases.is_empty());
+    }
+
     use crate::{
         CommandId, Direction, GameCommand, GameCommandMessage, GameState, GameType, Position,
-        QueueMode,
+        QueueMode, TeamId,
     };
 
     fn test_state() -> GameState {

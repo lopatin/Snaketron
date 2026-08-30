@@ -1251,28 +1251,51 @@ async fn create_lobby_matches(
 }
 
 /// Allocate an ID and construct all match data without mutating Valkey.
-/// Record a player's chosen skin on the match, after checking it is real.
+/// What a player has equipped, read from their account exactly once.
 ///
-/// The choice lives on the player's account, so it is read here rather than
-/// trusted from the client. Anything the catalogue does not recognise — an
-/// old id, a skin from a newer build, a hand-edited value — becomes the
-/// classic look. Cosmetics never block a join, and a lookup failure is not
-/// worth failing a match over either: the player simply appears in the
-/// default skin.
-async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_id: u32) {
-    let requested = match db.get_user_by_id(user_id as i32).await {
-        Ok(Some(user)) => user.selected_skin,
-        Ok(None) => None,
+/// Both slots come off the same row, so the two cosmetics cost one lookup
+/// between them rather than one each — this runs per player inside the
+/// matchmaking tick, and a second round trip per player is not free.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PlayerEquipment {
+    selected_skin: Option<String>,
+    selected_base: Option<String>,
+}
+
+/// Read a player's equipment. Never fails: an unreadable account wears the
+/// defaults, because a cosmetic lookup must not be able to fail a match.
+async fn read_player_equipment(db: &dyn Database, user_id: u32) -> PlayerEquipment {
+    match db.get_user_by_id(user_id as i32).await {
+        Ok(Some(user)) => PlayerEquipment {
+            selected_skin: user.selected_skin,
+            selected_base: user.selected_base,
+        },
+        Ok(None) => PlayerEquipment::default(),
         Err(error) => {
             tracing::debug!(
                 user_id,
                 %error,
-                "could not read a player's skin; using the default"
+                "could not read a player's equipment; using the defaults"
             );
-            None
+            PlayerEquipment::default()
         }
-    };
+    }
+}
 
+/// Record a player's chosen skin on the match, after checking it is real.
+///
+/// The choice lives on the player's account, so it is read from there rather
+/// than trusted from the client. Anything the catalogue does not recognise —
+/// an old id, a skin from a newer build, a hand-edited value — becomes the
+/// classic look. Cosmetics never block a join, and a lookup failure is not
+/// worth failing a match over either: the player simply appears in the
+/// default skin.
+async fn apply_player_skin(
+    game_state: &mut GameState,
+    db: &dyn Database,
+    user_id: u32,
+    requested: Option<String>,
+) {
     // A first-class skin is named by id and resolved to the hash of the exact
     // bytes this player is wearing, so what travels into everyone's renderer is
     // a specific revision rather than a name whose meaning could change later.
@@ -1302,6 +1325,44 @@ async fn apply_player_skin(game_state: &mut GameState, db: &dyn Database, user_i
             authored_reference.as_deref(),
         )),
     );
+}
+
+/// One team member's claim on what their team's endzone is painted with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaseClaim {
+    pub user_id: u32,
+    /// Whether this member is the leader of the lobby they arrived in.
+    ///
+    /// Taken from `QueuedLobby::requesting_user_id`, which is the effective
+    /// leader: `QueueForMatch` is leader-gated, and the queue entry is frozen
+    /// at admission and fenced by its exact JSON, so this cannot drift even if
+    /// the live lobby promotes someone else while the queue is being drained.
+    pub is_lobby_leader: bool,
+    /// The base skin this member contributes, if any. Already filtered to
+    /// travelling base skins by `skin_catalog::team_base_skin_ref`.
+    pub base_skin_ref: Option<&'static str>,
+}
+
+/// Which base skin dresses one team's endzone.
+///
+/// A 2v2 has two players who may each have equipped a base skin, and only one
+/// picture fits on one endzone. The tie-break is the lobby leader's, and only
+/// falls past them when they have not equipped one — "the leader gets
+/// preference if their skin is not default" — so a party's base is the party
+/// leader's, and a leader who has picked nothing does not veto their teammate.
+///
+/// Beyond that the order is by ascending user id, which matters more than it
+/// looks: a team is not always a lobby. Four solo queuers make two teams of two
+/// strangers with *two* equally valid leaders, and a three-player party
+/// queueing 2v2 is split across both teams, leaving one side with a leader and
+/// the other without. Ranking by (leader first, then id) has a defined answer
+/// for every one of those shapes and gives the same answer every time.
+///
+/// `None` means nobody on the team brought one, which is the common case and
+/// paints the endzone the way it has always been painted.
+pub(crate) fn resolve_team_base(claims: &mut [BaseClaim]) -> Option<&'static str> {
+    claims.sort_by_key(|claim| (!claim.is_lobby_leader, claim.user_id));
+    claims.iter().find_map(|claim| claim.base_skin_ref)
 }
 
 /// Resolve the final reference placed in the shared match snapshot.
@@ -1467,6 +1528,12 @@ async fn prepare_game_from_lobbies(
         .collect();
 
     if !combination.team_assignments.is_empty() {
+        // What each team's endzone might be painted with, gathered as the
+        // roster is built and resolved once the whole team is known. A team
+        // can be assembled from more than one lobby, so the claims have to be
+        // collected before any of them can be ranked.
+        let mut base_claims: HashMap<common::TeamId, Vec<BaseClaim>> = HashMap::new();
+
         // Add all assigned players to the game
         for assignment in &combination.team_assignments {
             let lobby = combination
@@ -1485,7 +1552,19 @@ async fn prepare_game_from_lobbies(
                         Some(member.username.clone()),
                         Some(assignment.team_id),
                     )?;
-                    apply_player_skin(&mut game_state, db, member.user_id).await;
+                    let equipment = read_player_equipment(db, member.user_id).await;
+                    base_claims
+                        .entry(assignment.team_id)
+                        .or_default()
+                        .push(BaseClaim {
+                            user_id: member.user_id,
+                            is_lobby_leader: member.user_id == lobby.requesting_user_id,
+                            base_skin_ref: crate::skin_catalog::team_base_skin_ref(
+                                equipment.selected_base.as_deref(),
+                            ),
+                        });
+                    apply_player_skin(&mut game_state, db, member.user_id, equipment.selected_skin)
+                        .await;
 
                     all_players.push(QueuedPlayer {
                         user_id: member.user_id,
@@ -1494,6 +1573,14 @@ async fn prepare_game_from_lobbies(
                     });
                 }
             }
+        }
+
+        // Resolved once, here, and never again: lobby leadership migrates on
+        // every read, so "the leader's base" is only well defined at a point in
+        // time. Snapshotting it into the match means a promotion two minutes
+        // later cannot repaint an endzone mid-game.
+        for (team_id, mut claims) in base_claims {
+            game_state.set_team_base(team_id, resolve_team_base(&mut claims).map(str::to_string));
         }
 
         // Register any extras marked as spectators (not part of team assignments)
@@ -1532,7 +1619,11 @@ async fn prepare_game_from_lobbies(
                 }
 
                 game_state.add_player(member.user_id, Some(member.username.clone()))?;
-                apply_player_skin(&mut game_state, db, member.user_id).await;
+                // No teams, so no endzones and nothing for a base skin to
+                // dress; only the snake skin is read here.
+                let equipment = read_player_equipment(db, member.user_id).await;
+                apply_player_skin(&mut game_state, db, member.user_id, equipment.selected_skin)
+                    .await;
 
                 all_players.push(QueuedPlayer {
                     user_id: member.user_id,
@@ -2192,6 +2283,94 @@ mod tests {
             ])
             .await?;
         Ok(())
+    }
+
+    /// The tie-break, over every roster shape a team can actually have.
+    ///
+    /// These are not hypotheticals: a party can be split across both teams, a
+    /// team can be two strangers from two different lobbies, and a duel team is
+    /// one person who is trivially their own leader.
+    mod team_bases {
+        use super::super::{BaseClaim, resolve_team_base};
+
+        fn claim(user_id: u32, leader: bool, base: Option<&'static str>) -> BaseClaim {
+            BaseClaim {
+                user_id,
+                is_lobby_leader: leader,
+                base_skin_ref: base,
+            }
+        }
+
+        #[test]
+        fn the_leader_wins_when_they_have_one() {
+            let mut claims = vec![
+                claim(200, false, Some("dragon@1")),
+                claim(100, true, Some("invaders@1")),
+            ];
+            assert_eq!(resolve_team_base(&mut claims), Some("invaders@1"));
+        }
+
+        /// "…if their skin is not default." A leader wearing nothing does not
+        /// get to leave the endzone bare when their teammate brought art.
+        #[test]
+        fn a_leader_without_one_does_not_veto_their_teammate() {
+            let mut claims = vec![claim(100, true, None), claim(200, false, Some("surf@1"))];
+            assert_eq!(resolve_team_base(&mut claims), Some("surf@1"));
+        }
+
+        #[test]
+        fn nobody_with_one_leaves_the_endzone_as_it_was() {
+            let mut claims = vec![claim(100, true, None), claim(200, false, None)];
+            assert_eq!(resolve_team_base(&mut claims), None);
+            assert_eq!(resolve_team_base(&mut []), None);
+        }
+
+        /// Four solo queuers make two teams of strangers, so a team can hold
+        /// two leaders. Ascending user id decides, which is arbitrary but the
+        /// same arbitrary answer every time.
+        #[test]
+        fn two_lobbies_on_one_team_break_the_tie_by_user_id() {
+            let mut claims = vec![
+                claim(900, true, Some("dragon@1")),
+                claim(100, true, Some("invaders@1")),
+            ];
+            assert_eq!(resolve_team_base(&mut claims), Some("invaders@1"));
+
+            // …and the order the members were pushed in cannot change it.
+            let mut reversed = vec![
+                claim(100, true, Some("invaders@1")),
+                claim(900, true, Some("dragon@1")),
+            ];
+            assert_eq!(resolve_team_base(&mut reversed), Some("invaders@1"));
+        }
+
+        /// A three-player party queueing 2v2 puts one member on a team of
+        /// strangers, so a team can have no leader at all.
+        #[test]
+        fn a_team_with_no_leader_still_has_an_answer() {
+            let mut claims = vec![
+                claim(900, false, Some("dragon@1")),
+                claim(100, false, Some("lightcycle@1")),
+            ];
+            assert_eq!(resolve_team_base(&mut claims), Some("lightcycle@1"));
+        }
+
+        #[test]
+        fn a_duel_team_of_one_wears_their_own() {
+            let mut claims = vec![claim(42, true, Some("invaders@1"))];
+            assert_eq!(resolve_team_base(&mut claims), Some("invaders@1"));
+
+            let mut bare = vec![claim(42, true, None)];
+            assert_eq!(resolve_team_base(&mut bare), None);
+        }
+
+        /// Bots and guests have no account equipment at all. A team of them
+        /// must not be a special case anywhere.
+        #[test]
+        fn a_team_of_players_without_accounts_resolves_to_nothing() {
+            let mut claims = vec![claim(1, true, None), claim(2, false, None)];
+            assert_eq!(resolve_team_base(&mut claims), None);
+        }
     }
 
     #[test]

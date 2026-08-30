@@ -99,10 +99,49 @@ const prefersReducedMotion = (): boolean =>
   typeof window.matchMedia === 'function' &&
   window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+/**
+ * Which end of the arena a row is showing.
+ *
+ * One control for a whole column rather than one per row, because the question
+ * is never "what does *this* skin look like as the enemy" on its own — it is
+ * "how does the wall of them read from the other side". Flipping them together
+ * is the comparison; flipping one is a novelty.
+ */
+type Facing = 'home' | 'away';
+
+const FacingToggle: React.FC<{
+  value: Facing;
+  onChange: (facing: Facing) => void;
+  /** Names the section this controls, for screen readers. */
+  label: string;
+  testId: string;
+}> = ({ value, onChange, label, testId }) => (
+  <div className="skins-facing" role="group" aria-label={label} data-testid={testId}>
+    {(['home', 'away'] as const).map((facing) => (
+      <button
+        key={facing}
+        type="button"
+        className={`skins-facing-option${value === facing ? ' is-on' : ''}`}
+        aria-pressed={value === facing}
+        onClick={() => onChange(facing)}
+        data-testid={`${testId}-${facing}`}
+      >
+        {facing === 'home' ? 'Home' : 'Away'}
+      </button>
+    ))}
+  </div>
+);
+
 interface SnakePreviewProps {
   skinRef: string;
   animate: boolean;
   label: string;
+  /**
+   * Which end this row is showing. A snake has no home and away art of its
+   * own — the renderer resolves it to a friend/foe *role*, which is the same
+   * distinction from the other direction.
+   */
+  facing: Facing;
   /** Changes when the registry gains a document, prompting a repaint. */
   revision?: number;
   /**
@@ -127,6 +166,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({
   skinRef,
   animate,
   label,
+  facing,
   revision = 0,
   field,
 }) => {
@@ -184,7 +224,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({
           canvas,
           skinRef,
           SNAKE_PREVIEW_POSE,
-          'own',
+          facing === 'home' ? 'own' : 'enemy',
           cell,
           false,
           false,
@@ -220,7 +260,7 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({
       frame = requestAnimationFrame(loop);
     });
     return () => cancelAnimationFrame(frame);
-  }, [skinRef, animate, revision, cell, field, layout.canvasWidth, layout.canvasHeight]);
+  }, [skinRef, animate, facing, revision, cell, field, layout.canvasWidth, layout.canvasHeight]);
 
   return (
     <div
@@ -243,44 +283,83 @@ const SnakePreview: React.FC<SnakePreviewProps> = ({
 interface BasePreviewProps {
   skinRef: string;
   label: string;
+  /** Which of the base's two kits to paint. */
+  facing: Facing;
+  /** Bigger, for the modal, where there is room to actually look at the art. */
+  size?: { width: number; height: number };
 }
 
 /**
- * One base theme, as the two halves a player actually sees: their own end of
- * the arena and the opponent's. Painted through the skin's own `base_theme()`
- * so no arena colour is mirrored into TypeScript.
+ * One end of an arena wearing one base.
  *
- * Base dressing carries no animation of its own, so unlike a snake preview
- * there is nothing for hover to start.
+ * One end, not both. A row showing home and away side by side was showing the
+ * same information twice — a base skin's two kits are the same design in two
+ * palettes — in half the width each, which is the worst of both. The column's
+ * own toggle switches all of them together instead, and the modal is where the
+ * pair is compared.
+ *
+ * Painted through the renderer's own `renderSkinBase` so no arena colour and no
+ * base picture is mirrored into TypeScript.
  */
-const BasePreview: React.FC<BasePreviewProps> = ({ skinRef, label }) => {
-  const ownRef = useRef<HTMLCanvasElement | null>(null);
-  const enemyRef = useRef<HTMLCanvasElement | null>(null);
+const BasePreview: React.FC<BasePreviewProps> = ({ skinRef, label, facing, size }) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Two panels wide. The preview is stretched to the rail's full width, so its
+  // aspect decides both how tall the row is and how many panels of the endzone
+  // fit across it — and one base skin is one square panel repeated along the
+  // zone. Three was too many: at rail width each picture came out small enough
+  // that the illustration stopped being legible and the row read as a pattern
+  // again. Two shows the art and still says, honestly, that the endzone is
+  // longer than one of them.
+  const width = size?.width ?? 220;
+  const height = size?.height ?? 110;
 
   useEffect(() => {
-    const wasm = getWasm();
-    if (!wasm) {
-      return;
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return undefined;
     }
-    for (const [canvas, own] of [
-      [ownRef.current, true],
-      [enemyRef.current, false],
-    ] as const) {
-      if (!canvas) {
-        continue;
+    const paint = () => {
+      const wasm = getWasm();
+      if (!wasm) {
+        return;
       }
       try {
-        wasm.renderSkinBase(canvas, skinRef, own);
+        wasm.renderSkinBase(canvas, skinRef, facing === 'home');
       } catch {
         // As with snake previews: leave the last good paint rather than throw.
       }
-    }
-  }, [skinRef]);
+    };
+
+    // A base skin is a picture, and the first paint is what *requests* it.
+    paint();
+    // Repaint until the picture is actually there. One extra paint after
+    // `whenSkinAssetsSettle` is not enough: that promise also resolves on its
+    // own five-second deadline, and seventeen base pictures requested at once
+    // on a slow connection will blow through it — leaving every preview stuck
+    // on the flat tint for the rest of the session, because a still surface
+    // never looks again.
+    let stale = false;
+    void (async () => {
+      for (let round = 0; round < 6 && !stale; round += 1) {
+        await whenSkinAssetsSettle();
+        if (stale) {
+          return;
+        }
+        paint();
+        const wasm = getWasm();
+        if (wasm && !wasm.skinAssetsPending()) {
+          return;
+        }
+      }
+    })();
+    return () => {
+      stale = true;
+    };
+  }, [skinRef, facing, width, height]);
 
   return (
     <div className="skins-base-preview" role="img" aria-label={label}>
-      <canvas ref={ownRef} width={120} height={72} />
-      <canvas ref={enemyRef} width={120} height={72} />
+      <canvas ref={canvasRef} width={width} height={height} />
     </div>
   );
 };
@@ -303,6 +382,8 @@ interface SkinRowProps {
   /** The authored record, when the row is one. Built-ins have none. */
   summary?: SkinSummary;
   slot: Slot;
+  /** Which end of the arena this row is showing, from its column's toggle. */
+  facing: Facing;
   isEquipped: boolean;
   canEquip: boolean;
   isBusy: boolean;
@@ -321,6 +402,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
   byline,
   summary,
   slot,
+  facing,
   isEquipped,
   canEquip,
   isBusy,
@@ -364,6 +446,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
           <SnakePreview
             skinRef={previewRef ?? entry.reference}
             animate={animate}
+            facing={facing}
             revision={registryRevision}
             label={`${entry.name} snake skin`}
             field={isEquipped ? EQUIPPED_FIELD : undefined}
@@ -371,7 +454,8 @@ const SkinRow: React.FC<SkinRowProps> = ({
         ) : (
           <BasePreview
             skinRef={previewRef ?? entry.reference}
-            label={`${entry.name} base skin`}
+            facing={facing}
+            label={`${entry.name} base skin, ${facing === 'home' ? 'home' : 'away'} end`}
           />
         )}
       </div>
@@ -444,7 +528,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   // Skin editing is an operator surface for now: every CTA into the builder
   // is admin-only, and an admin may edit anyone's skin, not just their own.
   const isAdmin = Boolean(user?.isAdmin);
-  const { applyBalance, balanceBux } = useWallet();
+  const { applyBalance, balanceBux, buxAvailable } = useWallet();
   const [ready, setReady] = useState(false);
   const [snakeSkins, setSnakeSkins] = useState<CatalogEntry[]>([]);
   const [baseSkins, setBaseSkins] = useState<CatalogEntry[]>([]);
@@ -457,6 +541,14 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
    * their own pick is worse than briefly showing an unconfirmed one.
    */
   const [inFlight, setInFlight] = useState<{ slot: Slot; reference: string } | null>(null);
+  /**
+   * Which end each column is showing. Two pieces of state rather than one,
+   * because the two columns answer different questions — "what do I look like
+   * to them" and "what does my base look like from over there" — and someone
+   * comparing bases has no reason to have their snakes flip underneath them.
+   */
+  const [snakeFacing, setSnakeFacing] = useState<Facing>('home');
+  const [baseFacing, setBaseFacing] = useState<Facing>('home');
   /**
    * An equip that arrived without an account to write it to.
    *
@@ -621,10 +713,14 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       setInFlight({ slot, reference });
       setBusySlot(slot);
       try {
+        // An empty reference is the "no base skin" row asking to clear the
+        // slot. The equip API's three-valued shape already means it — absent
+        // leaves a slot alone, `null` returns it to the default — so this
+        // needs no second endpoint.
         const equipment = await api.setEquipment(
           slot === 'snake'
             ? { selectedSkin: reference }
-            : { selectedBase: toBaseSlotValue(reference) },
+            : { selectedBase: reference === '' ? null : toBaseSlotValue(reference) },
         );
         // The account is what everything else reads, so the response goes
         // there rather than into any state of this page's own.
@@ -752,13 +848,18 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
         return;
       }
       if ((balanceBux ?? 0) < skin.priceBux) {
-        setWallet({ name: skin.name, priceBux: skin.priceBux });
-        return;
+        // Only worth opening the wallet if there is anything in it to do. With
+        // no way to buy Snakebux, "top up" is a dead end, so the sums are shown
+        // instead and the player is told plainly what they are short.
+        if (buxAvailable) {
+          setWallet({ name: skin.name, priceBux: skin.priceBux });
+          return;
+        }
       }
       setGetError(null);
       setGetting(skin);
     },
-    [acquire, balanceBux, onOpenAuth, user],
+    [acquire, balanceBux, buxAvailable, onOpenAuth, user],
   );
 
 
@@ -778,12 +879,13 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
    * nobody to count, so it says so rather than showing zeroes.
    */
   const viewOf = useCallback(
-    (entry: CatalogEntry): SkinView => {
-      const match = summaryFor(entry.reference);
+    (entry: CatalogEntry, kind: Slot = 'snake'): SkinView => {
+      const match = kind === 'snake' ? summaryFor(entry.reference) : undefined;
       if (!match) {
         return {
           reference: entry.reference,
           name: entry.name,
+          kind,
           priceBux: 0,
           owned: true,
         };
@@ -791,6 +893,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       return {
         reference: match.reference,
         name: match.name,
+        kind,
         priceBux: match.priceBux,
         previewRef: match.contentRef ?? undefined,
         creatorName:
@@ -817,11 +920,17 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
     if (!viewingReference) {
       return null;
     }
-    const entry = snakeSkins.find(
-      (candidate) => candidate.reference === viewingReference,
-    );
-    return entry ? viewOf(entry) : null;
-  }, [snakeSkins, viewOf, viewingReference]);
+    // Snake first, then base. The two id spaces are disjoint by construction
+    // — `the_two_base_namespaces_do_not_overlap` in the server's catalogue
+    // holds that — so the order is only about which lookup is likelier, not
+    // about resolving an ambiguity.
+    const snake = snakeSkins.find((candidate) => candidate.reference === viewingReference);
+    if (snake) {
+      return viewOf(snake, 'snake');
+    }
+    const base = baseSkins.find((candidate) => candidate.reference === viewingReference);
+    return base ? viewOf(base, 'base') : null;
+  }, [baseSkins, snakeSkins, viewOf, viewingReference]);
 
   const openSkin = useCallback(
     (reference: string) => {
@@ -870,9 +979,17 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
 
         <div className="skins-columns">
           <section className="skins-column skins-column-snakes" aria-labelledby="skins-snakes-heading">
-            <h2 id="skins-snakes-heading" className="skins-column-heading">
-              Snake skins
-            </h2>
+            <div className="skins-column-header">
+              <h2 id="skins-snakes-heading" className="skins-column-heading">
+                Snake skins
+              </h2>
+              <FacingToggle
+                value={snakeFacing}
+                onChange={setSnakeFacing}
+                label="Show snake skins as your own or as the enemy"
+                testId="snake-facing"
+              />
+            </div>
             <ul className="skins-list" data-testid="snake-skin-list">
               {ready
                 ? snakeSkins.map((entry) => (
@@ -880,6 +997,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
                       key={entry.reference}
                       entry={entry}
                       slot="snake"
+                      facing={snakeFacing}
                       isEquipped={entry.reference === equippedSkin}
                       canEquip={Boolean(user)}
                       previewRef={
@@ -910,20 +1028,53 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
           </section>
 
           <section className="skins-column skins-column-bases" aria-labelledby="skins-bases-heading">
-            <h2 id="skins-bases-heading" className="skins-column-heading">
-              Base skins
-            </h2>
+            <div className="skins-column-header">
+              <h2 id="skins-bases-heading" className="skins-column-heading">
+                Base skins
+              </h2>
+              <FacingToggle
+                value={baseFacing}
+                onChange={setBaseFacing}
+                label="Show base skins as your end or the opponent's"
+                testId="base-facing"
+              />
+            </div>
             <ul className="skins-list" data-testid="base-skin-list">
+              {/* The way back. Every other row here sets the slot; this one is
+                  the only thing that unsets it, and without it a player who
+                  equips a base can never return to the plain endzone — the
+                  list used to include the nineteen colour themes, one of which
+                  was classic, and narrowing it to base skins quietly took that
+                  exit away. Not a catalogue entry, because "no base skin" is
+                  the absence of one rather than another one. */}
+              {ready ? (
+                <SkinRow
+                  entry={{
+                    reference: '',
+                    name: 'No base skin',
+                    kind: 'base',
+                    priceBux: 0,
+                  }}
+                  slot="base"
+                  facing={baseFacing}
+                  isEquipped={equippedBase === null}
+                  canEquip={Boolean(user)}
+                  isBusy={busySlot === 'base'}
+                  onEquip={() => void equip('base', '')}
+                />
+              ) : null}
               {ready
                 ? baseSkins.map((entry) => (
                     <SkinRow
                       key={entry.reference}
                       entry={entry}
                       slot="base"
+                      facing={baseFacing}
                       isEquipped={entry.reference === equippedBase}
                       canEquip={Boolean(user)}
                       isBusy={busySlot === 'base'}
                       onEquip={(reference) => void equip('base', reference)}
+                      onOpen={() => openSkin(entry.reference)}
                     />
                   ))
                 : null}
@@ -937,7 +1088,10 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
           skin={viewing}
           registryRevision={registryRevision}
           balanceBux={balanceBux ?? 0}
-          isEquipped={viewing.reference === equippedSkin}
+          isEquipped={
+            viewing.reference ===
+            (viewing.kind === 'base' ? equippedBase : equippedSkin)
+          }
           busy={busySkin === viewing.editableSkinId}
           onClose={closeSkin}
           onGet={() => {
@@ -948,7 +1102,7 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             }
           }}
           onEquip={() => {
-            void equip('snake', viewing.reference);
+            void equip(viewing.kind === 'base' ? 'base' : 'snake', viewing.reference);
             closeSkin();
           }}
           onEdit={() => {
@@ -956,10 +1110,14 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
               navigate(`/skins/builder/${viewing.editableSkinId}`);
             }
           }}
-          onTopUp={() => {
-            closeSkin();
-            setWallet({ name: viewing.name, priceBux: viewing.priceBux });
-          }}
+          onTopUp={
+            buxAvailable
+              ? () => {
+                  closeSkin();
+                  setWallet({ name: viewing.name, priceBux: viewing.priceBux });
+                }
+              : undefined
+          }
         />
       ) : null}
 
@@ -973,6 +1131,10 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
             <SnakePreview
               skinRef={getting.contentRef ?? getting.reference}
               animate
+              // Always your own colours here: this is the moment of acquiring
+              // it, and what a buyer wants to see is the skin they will be
+              // wearing, not the one their opponent will see.
+              facing="home"
               revision={registryRevision}
               label={`${getting.name} snake skin`}
             />
@@ -984,10 +1146,14 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
               }
             });
           }}
-          onTopUp={() => {
-            setGetting(null);
-            setWallet({ name: getting.name, priceBux: getting.priceBux });
-          }}
+          onTopUp={
+            buxAvailable
+              ? () => {
+                  setGetting(null);
+                  setWallet({ name: getting.name, priceBux: getting.priceBux });
+                }
+              : undefined
+          }
           onClose={() => setGetting(null)}
         />
       ) : null}

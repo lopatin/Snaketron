@@ -15,6 +15,7 @@
 
 pub mod animal;
 pub mod atlas;
+pub mod base_skin;
 pub mod checker;
 pub mod classic;
 pub mod composite;

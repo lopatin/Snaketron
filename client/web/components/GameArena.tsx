@@ -22,7 +22,7 @@ import IdleKickDialog from './IdleKickDialog';
 import IdleWarningBanner from './IdleWarningBanner';
 import LoadingScreen from './LoadingScreen';
 import TutorialModal from './TutorialModal';
-import { equippedBaseRef, equippedSkinRef } from '../utils/equippedSkin';
+import { equippedBaseRef, equippedSkinRef, isBaseSkinRef } from '../utils/equippedSkin';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import { buildMatchPresentation, simulationStartMs } from '../utils/gamePresentation';
 import { crazyGames } from '../services/crazyGames';
@@ -550,9 +550,16 @@ export default function GameArena() {
     ensureAuthoredSkins(wornSkins);
   }, [wornSkins]);
 
-  // What dresses the arena: the base this account has equipped, or — when it
-  // has equipped none — the base theme carried by the skin this viewer is
-  // wearing.
+  // What supplies the arena's *colours*: the base theme this account has
+  // equipped, or — when it has equipped none — the theme carried by the skin
+  // this viewer is wearing.
+  //
+  // A base *skin* is deliberately not part of that answer. It is a picture, it
+  // belongs to a team rather than to a viewer, and the server publishes it in
+  // `GameState.team_bases` where the renderer reads it for both ends of the
+  // arena. Passing one here would only ask the snake registry for an id it has
+  // never heard of, which resolves to classic and would quietly throw away the
+  // viewer's own snake theme underneath.
   //
   // The server's resolved map is preferred over the account's own value
   // because only the map has been turned into something the renderer can look
@@ -561,10 +568,11 @@ export default function GameArena() {
   // players only — so the account is what is left, and it resolves every
   // catalogue skin correctly.
   const equippedBase = user ? equippedBaseRef(user) : null;
+  const equippedBaseTheme = equippedBase && !isBaseSkinRef(equippedBase) ? equippedBase : null;
   const wornSkin = user ? wornSkins?.[user.id] ?? equippedSkinRef(user) : null;
   useEffect(() => {
-    arenaSkinRef.current = equippedBase ?? wornSkin;
-  }, [equippedBase, wornSkin]);
+    arenaSkinRef.current = equippedBaseTheme ?? wornSkin;
+  }, [equippedBaseTheme, wornSkin]);
 
   const platformGameType = useMemo(() => {
     const gameType = (gameState ?? committedState)?.game_type;

@@ -49,15 +49,25 @@ export const formatBux = (balance: number): string =>
 /**
  * Whether the chip belongs on screen at all.
  *
- * Only for a signed-in player with a balance we actually have. A signed-out
- * visitor has no wallet — `GET /api/wallet` is auth-gated and 401s — and a
- * chip showing a hopeful zero while the request fails would be worse than no
- * chip, because zero is a real balance and looks like one.
+ * Three things have to be true, and they fail for different reasons.
+ *
+ * The player has to be signed in and the balance has to have arrived: a
+ * signed-out visitor has no wallet — `GET /api/wallet` is auth-gated and 401s —
+ * and a chip showing a hopeful zero while the request fails would be worse than
+ * no chip, because zero is a real balance and looks like one.
+ *
+ * And the currency has to exist here at all. A build with no way to buy
+ * Snakebux should not talk about Snakebux — a balance in the corner is a
+ * standing invitation to click it, and what used to be behind that click was an
+ * apology for a shop that is not open. Nothing is a better answer than an
+ * explanation. `buxAvailable` is `null` until known, so this is false during
+ * that window rather than flashing a chip and taking it back.
  */
 export const shouldShowBuxChip = (
   signedIn: boolean,
   balance: number | null,
-): balance is number => signedIn && balance !== null;
+  buxAvailable: boolean | null,
+): balance is number => signedIn && balance !== null && buxAvailable === true;
 
 /**
  * What to tell a buyer, from the outcome the server actually returned.
