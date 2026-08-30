@@ -87,6 +87,10 @@ function resolveShareOrigin(origin: string | null | undefined, isEmbeddedBuild: 
 /**
  * The sentence that accompanies a shared link. Falls back to something
  * truthful when the match has no headline yet (a share pressed mid-game).
+ *
+ * Whatever arrives here is read by the recipient, not the sender: it becomes
+ * the tweet body on X, the WhatsApp message, and — literally — the submission
+ * title on Reddit. Callers owe it a sentence written for a stranger.
  */
 export function buildShareContent(url: string, headline?: string | null): ShareContent {
   const text = headline?.trim() ? headline.trim() : 'Watch this Snaketron match.';

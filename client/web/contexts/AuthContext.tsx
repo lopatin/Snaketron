@@ -17,9 +17,9 @@ import {
   readCrazyGamesPreferences,
 } from '../services/crazyGamesPreferences';
 import { gameStorage, subscribeGameStorage } from '../services/gameStorage';
-import { adoptServerEquipment, equipmentToAdopt } from '../utils/skinPreference';
 import { CrazyGamesAccountException } from '../services/crazyGames';
 import { useCrazyGames } from './CrazyGamesContext';
+import type { Equipment } from '../types/generated';
 import {
   AuthContextType,
   CrazyGamesSessionStatus,
@@ -491,11 +491,6 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       try {
         const currentUser = await api.getCurrentUser();
         setUser(currentUser);
-        // The account is the authority on what this player is wearing: it is
-        // what match preparation reads and hands to every other player. A stale
-        // local choice would leave the picker disagreeing with what opponents
-        // actually see, so the account wins on load.
-        adoptServerEquipment(currentUser);
       } catch (error) {
         console.error('Failed to fetch current user:', error);
         const status = isApiError(error) ? error.response.status : undefined;
@@ -513,35 +508,18 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   }, [isCrazyGamesPrivacyPage, resolveCrazyGamesAccount, setUser]);
 
   /**
-   * Hand a newly-arrived account whatever this browser was already wearing.
+   * Drop the keys an older build kept a second copy of the equipped skin in.
    *
-   * Equipping needs somewhere to write, and for much of a player's first
-   * session there is nowhere: accounts are created lazily, so a visitor
-   * browsing skins has none, and a guest account only exists once they try to
-   * play. The choice waits in local storage until this runs.
-   *
-   * Every route to an account passes through `user` becoming set — signing in,
-   * registering, the guest account a first match creates, and a reload — so
-   * this sits on that transition rather than in any one of them. It also
-   * repairs an account that missed the write before this existed.
+   * The account is now the only store, so these are dead weight — and worse
+   * than dead: a browser that last held one account's choice would otherwise
+   * keep offering it to whoever signs in next. Removing them is a one-way
+   * step, which is the point.
    */
-  const equipmentAdoptedForRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!user || equipmentAdoptedForRef.current === user.id) {
-      return;
+    for (const key of ['snaketron:skin:v1', 'snaketron:base:v1']) {
+      gameStorage.removeItem(key);
     }
-    equipmentAdoptedForRef.current = user.id;
-    const pending = equipmentToAdopt(user);
-    if (!pending) {
-      return;
-    }
-    void api
-      .setEquipment(pending)
-      .then(adoptServerEquipment)
-      // Cosmetics are never worth surfacing an error over; the next account
-      // that resolves tries again.
-      .catch((error) => console.debug('Could not adopt local equipment:', error));
-  }, [user]);
+  }, []);
 
   // Renew the internal session while the platform can still mint a fresh
   // CrazyGames token. Token changes for the same user preserve lobby state.
@@ -744,6 +722,31 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     return createGuestSession(nickname);
   }, [createGuestSession, ensurePlayableSession]);
 
+  /**
+   * Record what the server now says this account is wearing.
+   *
+   * The account record is the only store for equipment, so the copy of it
+   * held here is what the Skins page badges and the arena's dressing both
+   * read. Updating it in place — rather than re-fetching the account — is
+   * what makes an equip visible immediately without any second store to keep
+   * in sync. Modelled on `updateGuestNickname`: nothing downstream keys an
+   * effect on the whole `user` object where a refetch would be triggered.
+   */
+  const applyEquipment = useCallback((equipment: Equipment) => {
+    setUserState((previous) => {
+      if (!previous) {
+        return previous;
+      }
+      const next = {
+        ...previous,
+        selectedSkin: equipment.selectedSkin,
+        selectedBase: equipment.selectedBase,
+      };
+      userRef.current = next;
+      return next;
+    });
+  }, []);
+
   const updateGuestNickname = useCallback((nickname: string) => {
     setUserState((previous) => {
       if (!previous) return previous;
@@ -797,6 +800,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     createGuest,
     ensurePlayableSession,
     updateGuestNickname,
+    applyEquipment,
     logout,
     getToken,
     crazyGamesSessionStatus,

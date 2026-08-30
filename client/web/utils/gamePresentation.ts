@@ -88,6 +88,16 @@ export interface MatchPresentation {
   soloScore: number;
   resultTitle: string;
   resultSummary: string;
+  /**
+   * The same result, written for a stranger.
+   *
+   * `resultSummary` addresses the player reading their own card, so it says
+   * "You". A share carries the sentence away from that reader and hands it to
+   * someone who did not play — where "You finished with 62 points" describes
+   * the recipient, not the sender. This one is the sharer's own voice: first
+   * person when they played, third person when they only watched.
+   */
+  shareSummary: string;
   resultTone: MatchResultTone;
   resultArtwork: MatchResultArtwork;
   /** True while the pre-match readiness gate is still holding the match. */
@@ -354,19 +364,60 @@ export const buildMatchPresentation = (
   const pointsPerMinute = calculatePerMinuteRate(currentPlayer?.score ?? 0, elapsedMs);
   const actionsPerMinute = calculatePerMinuteRate(currentPlayer?.actionCount ?? 0, elapsedMs);
 
+  /**
+   * `12–7` for one named player, their own number first.
+   *
+   * Whose number leads is the whole point: a sentence that names a winner and
+   * then reports the loser's score first is worse than one with no scoreline
+   * at all. So it is always built around the player the sentence is about —
+   * the sharer where they played, the winner where they only watched.
+   */
+  const scorelineFor = (subject: MatchPlayerPresentation | null): string | null => {
+    if (subject === null) {
+      return null;
+    }
+    const ownSide = sides.find((side) => side.teamId === subject.teamId);
+    const otherSide = sides.find((side) => side.teamId !== subject.teamId);
+    if (ownSide && otherSide) {
+      return `${ownSide.score}–${otherSide.score}`;
+    }
+    // A field mode has no sides, so the comparison is against whoever else
+    // scored the most.
+    const best = players
+      .filter((player) => player !== subject)
+      .reduce<number | null>(
+        (highest, player) => (highest === null || player.score > highest ? player.score : highest),
+        null,
+      );
+    return best === null ? null : `${subject.score}–${best}`;
+  };
+  const withScoreline = (sentence: string, subject: MatchPlayerPresentation | null): string => {
+    const scoreline = scorelineFor(subject);
+    return scoreline === null ? `${sentence}.` : `${sentence}, ${scoreline}.`;
+  };
+  const points = (score: number): string => `${score} point${score === 1 ? '' : 's'}`;
+  // The runner of a solo game the viewer is not playing. `name` is safe here
+  // only because `resolveSnakeName` returns "You" exclusively for the local
+  // player, and this branch runs when there is none.
+  const soloRunnerName = players[0]?.name ?? 'A player';
+
   let resultTitle = 'Match complete';
   let resultSummary = 'Final scores are in.';
+  let shareSummary = `Final scores are in from a Snaketron ${mode.label}.`;
   let resultTone: MatchResultTone = 'complete';
   let resultArtwork: MatchResultArtwork = 'neutral';
   if (gameState.completed_by_inactivity === true) {
     if (currentPlayer?.isIdleKicked) {
       resultTitle = 'Removed';
       resultSummary = 'You were removed for inactivity.';
+      shareSummary = `I was removed from a Snaketron ${mode.label} for inactivity.`;
       resultTone = 'defeat';
       resultArtwork = 'ruby-shatter';
     } else if (winningSnakeId === null) {
       resultTitle = 'Match ended';
       resultSummary = 'Every active player was removed for inactivity.';
+      shareSummary =
+        `Every active player was removed from a Snaketron ${mode.label} for inactivity.`;
       resultTone = 'draw';
       resultArtwork = 'topaz-cut';
     } else if (currentPlayer) {
@@ -375,29 +426,60 @@ export const buildMatchPresentation = (
       resultSummary = didWin
         ? 'The other side was removed for inactivity.'
         : 'Inactivity ended the match.';
+      shareSummary = didWin
+        ? `I won a Snaketron ${mode.label} — the other side was removed for inactivity.`
+        : `Inactivity ended my Snaketron ${mode.label}.`;
       resultTone = didWin ? 'victory' : 'complete';
       resultArtwork = didWin ? 'azure-cut' : 'neutral';
     } else {
       resultSummary = 'Inactivity ended the match.';
+      shareSummary = `Inactivity ended a Snaketron ${mode.label}.`;
     }
   } else if (mode.isSolo) {
     resultTitle = 'Run complete';
     resultSummary = `You finished with ${soloScore} point${soloScore === 1 ? '' : 's'}.`;
+    // A solo run has no opponent to compare against, so the score stands alone
+    // — and it is the whole point of sharing one.
+    shareSummary = currentPlayer
+      ? `I scored ${points(soloScore)} in a Snaketron ${mode.label}.`
+      : `${soloRunnerName} scored ${points(soloScore)} in a Snaketron ${mode.label}.`;
     resultArtwork = 'jade-fracture';
   } else if (winningSnakeId === null) {
     resultTitle = 'Draw';
     resultSummary = 'Neither side could pull ahead.';
+    if (!mode.isTeam) {
+      // A field mode has no winner by construction: it runs until every snake
+      // is dead and completes with no winning snake, whatever the scores were
+      // (`common/src/game_state.rs`, the `alive_snakes.is_empty()` branch). So
+      // calling it a draw and then quoting 62–18 would contradict itself. The
+      // score is the honest thing to say about a field finish.
+      shareSummary = currentPlayer
+        ? `I scored ${points(currentPlayer.score)} in a Snaketron ${mode.label}.`
+        : `Final scores are in from a Snaketron ${mode.label}.`;
+    } else {
+      shareSummary = currentPlayer
+        ? withScoreline(`I drew a Snaketron ${mode.label}`, currentPlayer)
+        // Nobody to lead the scoreline with, and a draw is symmetric anyway.
+        : `A Snaketron ${mode.label} ended in a draw.`;
+    }
     resultTone = 'draw';
     resultArtwork = 'topaz-cut';
   } else if (currentPlayer) {
     const didWin = currentPlayer.isWinner;
     resultTitle = didWin ? 'Victory' : 'Defeat';
     resultSummary = didWin ? 'Your side got there first.' : 'The other side got there first.';
+    shareSummary = withScoreline(
+      didWin ? `I won a Snaketron ${mode.label}` : `I lost a Snaketron ${mode.label}`,
+      currentPlayer,
+    );
     resultTone = didWin ? 'victory' : 'defeat';
     resultArtwork = didWin ? 'azure-cut' : 'ruby-shatter';
   } else {
     const winner = players.find((player) => player.isWinner);
     resultSummary = winner ? `${winner.name} took the match.` : 'Final scores are in.';
+    shareSummary = winner
+      ? withScoreline(`${winner.name} won a Snaketron ${mode.label}`, winner)
+      : `Final scores are in from a Snaketron ${mode.label}.`;
   }
 
   return {
@@ -421,6 +503,7 @@ export const buildMatchPresentation = (
     soloScore,
     resultTitle,
     resultSummary,
+    shareSummary,
     resultTone,
     resultArtwork,
     isAwaitingReadiness: gameState.readiness !== null,

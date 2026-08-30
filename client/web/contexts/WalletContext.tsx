@@ -53,26 +53,30 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, []);
 
+  // Keyed on the account's identity, not the object: equipping a skin
+  // replaces `user` in place, and a balance does not change because a snake
+  // changed colour.
+  const userId = user?.id ?? null;
   const refresh = useCallback(async () => {
     // Guarded on the resolved user rather than on a stored token: the token is
     // read synchronously from localStorage while the account it names is
     // confirmed asynchronously, so a revoked session has a token and no user —
     // and `/api/wallet` is auth-gated, so fetching anyway throws on every page
     // load for every signed-out visitor.
-    if (!user) {
+    if (userId === null) {
       setBalanceBux(null);
       return;
     }
 
     const sequence = (requestSequence.current += 1);
-    const requestedFor = user.id;
+    const requestedFor = userId;
     try {
       const wallet = await api.getWallet();
       // Two guards, and they catch different things: the sequence discards a
       // slow response overtaken by a newer one, and the id discards a response
       // that belongs to whoever was signed in when it started. Painting
       // somebody else's balance is a support ticket.
-      if (sequence === requestSequence.current && requestedFor === user.id) {
+      if (sequence === requestSequence.current && requestedFor === userId) {
         setBalanceBux(coerceBalance(wallet.balanceBux));
       }
     } catch {
@@ -83,7 +87,7 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         setBalanceBux(null);
       }
     }
-  }, [user]);
+  }, [userId]);
 
   useEffect(() => {
     void refresh();

@@ -4,10 +4,8 @@ import SkinTuningSidebar from './SkinTuningSidebar';
 import {
   DEFAULT_SKIN_REF,
   readSkinCatalog,
-  readSkinPreference,
-  writeSkinPreference,
   type SkinCatalogEntry,
-} from '../utils/skinPreference';
+} from '../utils/equippedSkin';
 
 /**
  * The skin contact sheet.
@@ -178,7 +176,6 @@ const SkinsQA: React.FC = () => {
         }
         setCatalog(readSkinCatalog());
         setFixtures(JSON.parse(wasm.skinFixtures()) as Fixtures);
-        setSkinRef(readSkinPreference());
         setReady(true);
       })
       .catch((error) => console.error('skins QA failed to load wasm:', error));
@@ -187,9 +184,11 @@ const SkinsQA: React.FC = () => {
     };
   }, []);
 
+  // Which skin this sheet is previewing, and nothing more: it is a renderer
+  // harness, not an equip control. Equipping writes to the account, which is
+  // the only place it is recorded.
   const select = useCallback((next: string) => {
     setSkinRef(next);
-    writeSkinPreference(next);
   }, []);
 
   const sizeOf = useCallback(

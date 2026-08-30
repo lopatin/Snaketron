@@ -70,7 +70,7 @@ The mechanic must not:
 - User-provided code of any kind. The document schema is the permanent user ceiling; the expression DSL's totality is a sandbox boundary and does not relax (`specs/skin-shading-prd.md` section 9.2).
 - Skinning arena gameplay objects (food, NOS canisters, grid) — the boundary rulings of `specs/skins-prd.md` section 7 stand unamended except where section 5.2 below explicitly extends them (base as a separate entity kind).
 - Rating, commenting, or social features on the Skins page.
-- In-game (mid-match) skin switching. Equip changes apply at the next match, exactly as the current once-per-mount read does (`client/web/components/GameArena.tsx:261-263`).
+- In-game (mid-match) skin switching. Equip changes apply at the next match, because the server resolves each player's skin off their account at match prep (`server/src/matchmaking.rs::apply_player_skin`) and publishes it into `GameState.skins`.
 - CrazyGames in-portal purchases. The CG build browses and equips owned skins; purchase surfaces are compile-time absent until portal approval exists (`CRAZYGAMES.md:75`).
 - Automated content moderation beyond provider-side filters, the structural validator, and text normalization. Review is human in v1.
 

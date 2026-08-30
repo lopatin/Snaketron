@@ -68,6 +68,26 @@ const duelState = (): GameState => ({
   simulation_epoch_ms: null,
 });
 
+/**
+ * A free-for-all: no teams, no zones, and — as the engine builds it — no
+ * winning snake once everybody is dead.
+ */
+const ffaState = (): GameState => {
+  const base = duelState();
+  return {
+    ...base,
+    game_type: { FreeForAll: { max_players: 4 } },
+    status: { Complete: { winning_snake_id: null } },
+    arena: {
+      ...base.arena,
+      snakes: base.arena.snakes.map((body) => ({ ...body, team_id: null })),
+      team_zone_config: null,
+    },
+    scores: { 0: 11, 1: 9, 2: 4, 3: 1 },
+    team_scores: {},
+  };
+};
+
 const gatedDuelState = (readyUserIds: number[]): GameState => ({
   ...duelState(),
   tick: 0,
@@ -339,5 +359,136 @@ test('the countdown follows the simulation epoch, never the immutable start_ms',
   assert.equal(
     simulationStartMs({ readiness: null, simulation_epoch_ms: null, start_ms: 4_200 }),
     4_200,
+  );
+});
+
+/**
+ * The results card addresses the player reading it, so it says "You". A share
+ * hands that same sentence to someone who did not play, where "You finished
+ * with 62 points" describes the recipient rather than the sender. The two
+ * audiences need two sentences.
+ */
+test('the share summary speaks as the player who is sharing, not to them', () => {
+  const solo = duelState();
+  solo.game_type = 'Solo';
+  solo.arena.snakes = [snake(0)];
+  solo.players = { 7: { user_id: 7, snake_id: 0 } };
+  solo.scores = { 0: 62 };
+  const run = buildMatchPresentation(solo, 7);
+  assert.equal(run.resultSummary, 'You finished with 62 points.');
+  assert.equal(run.shareSummary, 'I scored 62 points in a Snaketron Solo run.');
+
+  const won = buildMatchPresentation(duelState(), 9);
+  assert.equal(won.resultSummary, 'Your side got there first.');
+  // The viewer's own side leads the scoreline, because they are the one
+  // posting it.
+  assert.equal(won.shareSummary, 'I won a Snaketron Competitive 2v2, 4–2.');
+
+  const lost = buildMatchPresentation(duelState(), 8);
+  assert.equal(lost.resultSummary, 'The other side got there first.');
+  assert.equal(lost.shareSummary, 'I lost a Snaketron Competitive 2v2, 2–4.');
+
+  const drawnState = duelState();
+  drawnState.status = { Complete: { winning_snake_id: null } };
+  const drawn = buildMatchPresentation(drawnState, 7);
+  assert.equal(drawn.resultSummary, 'Neither side could pull ahead.');
+  assert.equal(drawn.shareSummary, 'I drew a Snaketron Competitive 2v2, 4–2.');
+});
+
+test('a share with no local player names whoever played instead of inventing one', () => {
+  // `resolveSnakeName` answers "You" for the local player, so third-person
+  // copy may only use it where there is none — which is exactly here. A team
+  // win names a winner, the same one the results card names.
+  const watched = buildMatchPresentation(duelState());
+  assert.equal(watched.shareSummary, 'Alex won a Snaketron Competitive 2v2, 4–2.');
+
+  const solo = duelState();
+  solo.game_type = 'Solo';
+  solo.arena.snakes = [snake(0)];
+  solo.players = { 7: { user_id: 7, snake_id: 0 } };
+  solo.scores = { 0: 62 };
+  const run = buildMatchPresentation(solo);
+  assert.equal(run.shareSummary, 'Alex scored 62 points in a Snaketron Solo run.');
+});
+
+test('an inactivity finish is shareable without accusing the reader of idling', () => {
+  const opponentRemoved = duelState();
+  opponentRemoved.idle_kicked_user_ids = [8, 10];
+  opponentRemoved.completed_by_inactivity = true;
+  assert.equal(
+    buildMatchPresentation(opponentRemoved, 7).shareSummary,
+    'I won a Snaketron Competitive 2v2 — the other side was removed for inactivity.',
+  );
+
+  const localRemoved = duelState();
+  localRemoved.idle_kicked_user_ids = [7];
+  localRemoved.completed_by_inactivity = true;
+  assert.equal(
+    buildMatchPresentation(localRemoved, 7).shareSummary,
+    'I was removed from a Snaketron Competitive 2v2 for inactivity.',
+  );
+});
+
+test('one point is one point', () => {
+  const solo = duelState();
+  solo.game_type = 'Solo';
+  solo.arena.snakes = [snake(0)];
+  solo.players = { 7: { user_id: 7, snake_id: 0 } };
+  solo.scores = { 0: 1 };
+  assert.equal(
+    buildMatchPresentation(solo, 7).shareSummary,
+    'I scored 1 point in a Snaketron Solo run.',
+  );
+});
+
+test('a share scoreline always leads with the number belonging to whoever it names', () => {
+  // Otherwise the sentence reads as if the winner scored the loser's points.
+  const upset = duelState();
+  upset.status = { Complete: { winning_snake_id: 1 } };
+  upset.team_scores = { 0: 2, 1: 5 };
+  assert.equal(
+    buildMatchPresentation(upset).shareSummary,
+    'Rival won a Snaketron Competitive 2v2, 5–2.',
+  );
+  // The same match seen by a player on the losing side leads with their own.
+  assert.equal(
+    buildMatchPresentation(upset, 7).shareSummary,
+    'I lost a Snaketron Competitive 2v2, 2–5.',
+  );
+});
+
+test('a field mode has no sides, so the scoreline compares against the best rival', () => {
+  const ffa = ffaState();
+  ffa.status = { Complete: { winning_snake_id: 0 } };
+  assert.equal(
+    buildMatchPresentation(ffa, 7).shareSummary,
+    'I won a Snaketron Competitive FFA, 11–9.',
+  );
+  assert.equal(
+    buildMatchPresentation(ffa, 10).shareSummary,
+    'I lost a Snaketron Competitive FFA, 1–11.',
+  );
+});
+
+/**
+ * A field mode runs until every snake is dead and then completes with no
+ * winning snake, whatever the scores were — so its ordinary finish lands in
+ * the same branch a genuine team draw does.
+ */
+test('a field mode that ends with no winner reports the score, not a draw', () => {
+  const ffa = ffaState();
+  const finished = buildMatchPresentation(ffa, 7);
+  // The card still says nobody pulled ahead, which is what the standings show.
+  assert.equal(finished.resultSummary, 'Neither side could pull ahead.');
+  // The share must not call 11–9 a draw.
+  assert.equal(finished.shareSummary, 'I scored 11 points in a Snaketron Competitive FFA.');
+
+  // A real team draw keeps the draw wording, and its scoreline agrees with it.
+  const tied = duelState();
+  tied.status = { Complete: { winning_snake_id: null } };
+  tied.team_scores = { 0: 3, 1: 3 };
+  assert.equal(
+    buildMatchPresentation(tied, 7).shareSummary,
+    'I drew a Snaketron Competitive 2v2, 3–3.',
   );
 });

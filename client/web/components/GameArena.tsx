@@ -22,7 +22,7 @@ import IdleKickDialog from './IdleKickDialog';
 import IdleWarningBanner from './IdleWarningBanner';
 import LoadingScreen from './LoadingScreen';
 import TutorialModal from './TutorialModal';
-import { readSkinPreference } from '../utils/skinPreference';
+import { equippedBaseRef, equippedSkinRef } from '../utils/equippedSkin';
 import { ensureAuthoredSkins } from '../utils/authoredSkins';
 import { buildMatchPresentation, simulationStartMs } from '../utils/gamePresentation';
 import { crazyGames } from '../services/crazyGames';
@@ -265,9 +265,11 @@ export default function GameArena() {
   const visualEpochRef = useRef<number | null>(null);
   const lastVisualJsonRef = useRef<string | null>(null);
   const prefersReducedMotionRef = useRef(false);
-  // The viewer's own skin. It dresses their bases and their snake; it is read
-  // once per mount because changing skins mid-match is not a thing.
-  const selectedSkinRef = useRef<string | null>(readSkinPreference());
+  // The reference whose base theme dresses this viewer's arena. It is only
+  // the arena: every snake in the match, this player's included, is painted
+  // from the server's resolved `skins` map. Filled in below, once there is a
+  // match to read it from.
+  const arenaSkinRef = useRef<string | null>(null);
   const scoreEffectsRef = useRef(createScoreEffectRuntime());
   const platformResultReportedForGameRef = useRef<string | null>(null);
   const platformGameplayObservedForGameRef = useRef<string | null>(null);
@@ -547,6 +549,22 @@ export default function GameArena() {
   useEffect(() => {
     ensureAuthoredSkins(wornSkins);
   }, [wornSkins]);
+
+  // What dresses the arena: the base this account has equipped, or — when it
+  // has equipped none — the base theme carried by the skin this viewer is
+  // wearing.
+  //
+  // The server's resolved map is preferred over the account's own value
+  // because only the map has been turned into something the renderer can look
+  // up: an authored skin is named by its content hash there and by its id on
+  // the account. A spectator is in no such map — `apply_player_skin` runs for
+  // players only — so the account is what is left, and it resolves every
+  // catalogue skin correctly.
+  const equippedBase = user ? equippedBaseRef(user) : null;
+  const wornSkin = user ? wornSkins?.[user.id] ?? equippedSkinRef(user) : null;
+  useEffect(() => {
+    arenaSkinRef.current = equippedBase ?? wornSkin;
+  }, [equippedBase, wornSkin]);
 
   const platformGameType = useMemo(() => {
     const gameType = (gameState ?? committedState)?.game_type;
@@ -1005,7 +1023,7 @@ export default function GameArena() {
           // one, so they stay smooth regardless of tick rate.
           now,
           prefersReducedMotionRef.current,
-          selectedSkinRef.current ?? undefined,
+          arenaSkinRef.current ?? undefined,
           () => {
             drawScoreEffects(context, scoreEffectsRef.current, {
               nowMs: now,

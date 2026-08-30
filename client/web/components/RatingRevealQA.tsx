@@ -176,6 +176,7 @@ const fixturePresentation: MatchPresentation = {
   soloScore: 25,
   resultTitle: 'Victory',
   resultSummary: 'Your side got there first.',
+  shareSummary: 'I won a Snaketron Competitive Duel, 25–19.',
   resultTone: 'victory',
   resultArtwork: 'azure-cut',
   isAwaitingReadiness: false,

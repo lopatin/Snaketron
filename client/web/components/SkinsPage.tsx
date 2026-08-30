@@ -18,12 +18,10 @@ import SkinToast from './SkinToast';
 import type { CatalogEntry, SkinSummary } from '../types/generated';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
-  DEFAULT_SKIN_REF,
-  readBasePreference,
-  readSkinPreference,
-  writeBasePreference,
-  writeSkinPreference,
-} from '../utils/skinPreference';
+  equippedBaseRef,
+  equippedSkinRef,
+  toBaseSlotValue,
+} from '../utils/equippedSkin';
 
 /**
  * The Skins page.
@@ -440,7 +438,9 @@ const SkinRow: React.FC<SkinRowProps> = ({
 };
 
 const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
-  const { user } = useAuth();
+  const { user, applyEquipment } = useAuth();
+  /** Who is signed in, for effects that must not re-run on an equip. */
+  const userId = user?.id ?? null;
   // Skin editing is an operator surface for now: every CTA into the builder
   // is admin-only, and an admin may edit anyone's skin, not just their own.
   const isAdmin = Boolean(user?.isAdmin);
@@ -448,8 +448,25 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
   const [ready, setReady] = useState(false);
   const [snakeSkins, setSnakeSkins] = useState<CatalogEntry[]>([]);
   const [baseSkins, setBaseSkins] = useState<CatalogEntry[]>([]);
-  const [equippedSkin, setEquippedSkin] = useState<string>(DEFAULT_SKIN_REF);
-  const [equippedBase, setEquippedBase] = useState<string | null>(null);
+  /**
+   * The choice being written right now, shown before the server confirms it.
+   *
+   * Not a second store: it exists only while a PUT is in flight and is
+   * dropped the moment the account answers, either way. Equipping is a
+   * cosmetic preference and making the player wait on a round trip to see
+   * their own pick is worse than briefly showing an unconfirmed one.
+   */
+  const [inFlight, setInFlight] = useState<{ slot: Slot; reference: string } | null>(null);
+  /**
+   * An equip that arrived without an account to write it to.
+   *
+   * Held for as long as the page is open so that signing in through the
+   * prompt below finishes the job the player started, and no longer — there
+   * is nowhere else for it to live now that the account is the only store.
+   */
+  const [awaitingAccount, setAwaitingAccount] = useState<{ slot: Slot; reference: string } | null>(
+    null,
+  );
   const [busySlot, setBusySlot] = useState<Slot | null>(null);
   /** Player-authored entries, kept beside the merged list so a row can find
    *  the skin id a purchase needs. */
@@ -501,7 +518,9 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
       api.browseSkins('snake'),
       api.browseSkins('base'),
       api.browseAuthoredSkins('snake').catch(() => empty),
-      user ? api.browseAuthoredSkins('snake', 'mine').catch(() => empty) : Promise.resolve(empty),
+      userId === null
+        ? Promise.resolve(empty)
+        : api.browseAuthoredSkins('snake', 'mine').catch(() => empty),
     ])
       .then(([snakes, bases, published, mine]) => {
         if (cancelled) {
@@ -541,7 +560,10 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
     return () => {
       cancelled = true;
     };
-  }, [user, ownershipRevision]);
+    // Keyed on who is signed in, not on the `user` object: equipping replaces
+    // that object in place, and the catalogue does not change because a skin
+    // was equipped — re-running here would blank the list under the player.
+  }, [userId, ownershipRevision]);
 
   // Painting an authored skin means having its document. This waits for both
   // halves — the list, and the wasm module to register into — because the
@@ -570,67 +592,66 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
     };
   }, [authored, ready]);
 
-  // The account is the authority on what is equipped; local storage is the
-  // echo that makes the page correct before the account resolves, and that
-  // carries a signed-out visitor's choice at all.
-  useEffect(() => {
-    setEquippedSkin(readSkinPreference());
-    setEquippedBase(readBasePreference());
-  }, [user?.id]);
+  /**
+   * What the badges read.
+   *
+   * Straight off the account, which is the only place equipping is recorded —
+   * so what this page claims and what opponents see cannot drift apart. While
+   * the account is still resolving, or when there is none, no row is badged:
+   * nothing is equipped until an account says so, and showing Classic as
+   * equipped to a signed-out visitor would be inventing an answer.
+   */
+  const accountSkin = user ? equippedSkinRef(user) : null;
+  const accountBase = user ? equippedBaseRef(user) : null;
+  const equippedSkin = inFlight?.slot === 'snake' ? inFlight.reference : accountSkin;
+  const equippedBase = inFlight?.slot === 'base' ? inFlight.reference : accountBase;
 
   const equip = useCallback(
     async (slot: Slot, reference: string) => {
       setError(null);
 
-      // Paint the choice immediately. Equipping is a cosmetic preference, and
-      // making the player wait on a round trip to see their own pick is worse
-      // than briefly showing a state the server has not confirmed.
-      const previousSkin = equippedSkin;
-      const previousBase = equippedBase;
-      if (slot === 'snake') {
-        setEquippedSkin(reference);
-        writeSkinPreference(reference);
-      } else {
-        setEquippedBase(reference);
-        writeBasePreference(reference);
-      }
-
       if (!user) {
-        // No account to write to. The local choice stands so the arena paints
-        // it, and the prompt explains why nobody else will see it.
+        // Nowhere to write it yet. Hold the intent so signing in through the
+        // prompt finishes what the player started, rather than dropping it.
+        setAwaitingAccount({ slot, reference });
         onOpenAuth();
         return;
       }
 
+      setInFlight({ slot, reference });
       setBusySlot(slot);
       try {
         const equipment = await api.setEquipment(
           slot === 'snake'
             ? { selectedSkin: reference }
-            : { selectedBase: `base:${reference}` },
+            : { selectedBase: toBaseSlotValue(reference) },
         );
-        setEquippedSkin(equipment.selectedSkin ?? DEFAULT_SKIN_REF);
-        setEquippedBase(
-          equipment.selectedBase?.startsWith('base:')
-            ? equipment.selectedBase.slice('base:'.length)
-            : null,
-        );
+        // The account is what everything else reads, so the response goes
+        // there rather than into any state of this page's own.
+        applyEquipment(equipment);
       } catch (cause) {
-        // Put the previous choice back rather than leaving the page claiming
-        // something the server rejected.
-        setEquippedSkin(previousSkin);
-        setEquippedBase(previousBase);
-        writeSkinPreference(previousSkin);
-        writeBasePreference(previousBase);
         setError(
           isApiError(cause) ? cause.message : 'That skin could not be equipped.',
         );
       } finally {
+        // Either way the account now has the last word: a success wrote it, a
+        // failure left it as it was.
+        setInFlight(null);
         setBusySlot(null);
       }
     },
-    [equippedBase, equippedSkin, onOpenAuth, user],
+    [applyEquipment, onOpenAuth, user],
   );
+
+  // Finish an equip that was waiting for an account to exist.
+  useEffect(() => {
+    if (!user || !awaitingAccount) {
+      return;
+    }
+    const pending = awaitingAccount;
+    setAwaitingAccount(null);
+    void equip(pending.slot, pending.reference);
+  }, [awaitingAccount, equip, user]);
 
   /**
    * Acquire a skin, priced or not.

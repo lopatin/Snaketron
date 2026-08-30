@@ -394,6 +394,16 @@ pub struct CrazyGamesUserInfo {
     pub is_admin: bool,
     pub auth_source: &'static str,
     pub avatar_url: String,
+    /// What this player is wearing, exactly as `UserInfo` carries it.
+    ///
+    /// A portal session never calls `/api/auth/me`, so this exchange is the
+    /// only chance the client gets to learn it. Without these the Skins page
+    /// would show Classic as equipped for the whole session while every
+    /// opponent saw the real skin the server read off the account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_skin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_base: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -594,6 +604,8 @@ pub async fn exchange(
             is_admin: super::middleware::is_admin_user(&account.user),
             auth_source: "crazygames",
             avatar_url: account.profile.avatar_url,
+            selected_skin: account.user.selected_skin.clone(),
+            selected_base: account.user.selected_base.clone(),
         },
         preferences: account.preferences,
     })
@@ -922,6 +934,8 @@ rAxdQqJU63eb3D0Nhs/4EJ72x6BgNXb/sQ1O/0Xv67v8BcQk7aodmvj+LfvTsERu
                 is_admin: false,
                 auth_source: "crazygames",
                 avatar_url: "https://images.crazygames.com/avatar.png".to_string(),
+                selected_skin: Some("aurora@1".to_string()),
+                selected_base: Some("base:aurora@1".to_string()),
             },
             preferences: CrazyGamesPreferences::default(),
         })
@@ -937,5 +951,32 @@ rAxdQqJU63eb3D0Nhs/4EJ72x6BgNXb/sQ1O/0Xv67v8BcQk7aodmvj+LfvTsERu
         );
         assert!(value["user"].get("ranked_mmr").is_none());
         assert_eq!(value["user"]["rankedMmr"], 1_010);
+        // The account is the only place equipment lives, and a portal session
+        // never calls `/api/auth/me`, so this response has to carry it.
+        assert_eq!(value["user"]["selectedSkin"], "aurora@1");
+        assert_eq!(value["user"]["selectedBase"], "base:aurora@1");
+    }
+
+    #[test]
+    fn exchange_response_omits_equipment_the_account_does_not_have() {
+        let value = serde_json::to_value(CrazyGamesUserInfo {
+            id: 7,
+            username: "Exact.Name".to_string(),
+            mmr: 1_000,
+            ranked_mmr: 1_010,
+            casual_mmr: 990,
+            xp: 12,
+            is_guest: false,
+            is_admin: false,
+            auth_source: "crazygames",
+            avatar_url: "https://images.crazygames.com/avatar.png".to_string(),
+            selected_skin: None,
+            selected_base: None,
+        })
+        .expect("serialize user");
+        // Absent rather than null, matching `UserInfo` — the client reads a
+        // missing slot as "wearing the default", never as an explicit clear.
+        assert!(value.get("selectedSkin").is_none());
+        assert!(value.get("selectedBase").is_none());
     }
 }

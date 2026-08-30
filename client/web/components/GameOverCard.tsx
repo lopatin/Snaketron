@@ -461,7 +461,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
           </button>
           <ShareGame
             gameId={shareGameId}
-            headline={presentation.resultSummary}
+            headline={presentation.shareSummary}
             triggerClassName="game-shell-button"
           />
           <div className="game-over-replay-actions">

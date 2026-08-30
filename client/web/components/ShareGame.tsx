@@ -19,7 +19,13 @@ import {
  */
 export interface ShareGameProps {
   gameId: number | string | null | undefined;
-  /** One-line match result, used as the accompanying text. */
+  /**
+   * One-line match result, used as the accompanying text.
+   *
+   * It is read by whoever the link is sent to, so it has to be written for
+   * them: the sharer's own voice, or a neutral third person — never the
+   * second-person copy the results card addresses its own reader in.
+   */
   headline?: string | null;
   /** `compact` is the icon-only form used inside the in-match HUD. */
   variant?: 'default' | 'compact';
@@ -189,8 +195,15 @@ export const ShareGame: React.FC<ShareGameProps> = ({
               data-testid="share-game-copy"
             >
               <LinkIcon className="share-game-icon" />
-              <span>
-                {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Try again' : 'Copy'}
+              <span className="share-game-copy-label">
+                {/* Reserves the width of the longest label so the button does
+                    not resize under the cursor when the state changes. */}
+                <span className="share-game-copy-sizer" aria-hidden="true">
+                  Try again
+                </span>
+                <span>
+                  {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Try again' : 'Copy'}
+                </span>
               </span>
             </button>
           </div>
