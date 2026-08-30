@@ -67,6 +67,38 @@ for (const [name, value, shape, length] of gameAnalyticsKeyShapes) {
   }
 }
 
+// Absent keys are a supported state — that is exactly what keeps developer
+// machines, CI, and forks out of the live game's numbers with no switch to
+// remember. But at runtime it is indistinguishable from a working release that
+// reports nothing, which is how the production client shipped for a full
+// release cycle with analytics silently dead: the deploy workflow never passed
+// the keys and nothing failed. A build that is going to be distributed sets
+// GAME_ANALYTICS_REQUIRED=true and fails here instead of shipping inert.
+if (
+  process.env.GAME_ANALYTICS_REQUIRED === 'true'
+  && !analyticsExcludedFromBuild
+  && !gameAnalyticsGameKey
+) {
+  throw new Error(
+    'GAME_ANALYTICS_REQUIRED=true but GAME_ANALYTICS_GAME_KEY and '
+    + 'GAME_ANALYTICS_SECRET_KEY are unset, so this bundle would never load the '
+    + 'SDK and would report nothing. Set both, or unset GAME_ANALYTICS_REQUIRED '
+    + 'for a build that is not being distributed. See ANALYTICS.md.',
+  );
+}
+
+// The build label is capped at 32 characters by the SDK, which logs and keeps
+// its default beyond that rather than failing — the same silent shape the key
+// checks above exist to prevent. A full commit SHA overruns it.
+const gameAnalyticsBuild = (process.env.GAME_ANALYTICS_BUILD || '').trim();
+if (gameAnalyticsBuild.length > 32) {
+  throw new Error(
+    `GAME_ANALYTICS_BUILD must be at most 32 characters (got ${gameAnalyticsBuild.length}). `
+    + 'GameAnalytics silently ignores a longer label, so every event would be '
+    + 'tagged with the default build instead of this release.',
+  );
+}
+
 module.exports = {
   entry: "./bootstrap.ts",
   output: {
@@ -161,7 +193,7 @@ module.exports = {
       // machine, CI, and any fork — never loads the SDK. See ANALYTICS.md.
       'process.env.GAME_ANALYTICS_GAME_KEY': JSON.stringify(gameAnalyticsGameKey),
       'process.env.GAME_ANALYTICS_SECRET_KEY': JSON.stringify(gameAnalyticsSecretKey),
-      'process.env.GAME_ANALYTICS_BUILD': JSON.stringify(process.env.GAME_ANALYTICS_BUILD || ''),
+      'process.env.GAME_ANALYTICS_BUILD': JSON.stringify(gameAnalyticsBuild),
       'process.env.GAME_ANALYTICS_DISABLE_EMBEDDED': JSON.stringify(
         disableEmbeddedAnalytics ? 'true' : '',
       ),
