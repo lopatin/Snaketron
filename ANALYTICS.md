@@ -21,12 +21,24 @@ further setup.
 
 ## Continuous integration and deployment
 
-The keys are stored on the GitHub repository as:
+The keys must be stored on **both** repositories, because two different
+repositories build a bundle from this checkout:
 
 | Name | Kind | Why |
 | --- | --- | --- |
 | `GAME_ANALYTICS_GAME_KEY` | Repository **variable** | It ships inside the client bundle, so it is a public identifier, not a credential |
 | `GAME_ANALYTICS_SECRET_KEY` | Repository **secret** | Also reaches the bundle, but keeping it out of a public repository's files and out of build logs costs nothing |
+
+| Repository | Builds | Needs the keys because |
+| --- | --- | --- |
+| `lopatin/SnakeTron` | CI only, never deployed | The guard build below has to exercise a real key |
+| `lopatin/snaketron-io` | **The bundle players actually load** | `release-production.yml` → `deploy-client.yml` is the only path to snaketron.io |
+
+Storing them on the game repository alone is the failure this section exists to
+prevent, and it is not hypothetical: the production client shipped for a full
+release cycle with both keys compiled to the empty string, because CI had them
+and the deploying repository did not. Nothing failed — that is the whole
+problem, and it is what `GAME_ANALYTICS_REQUIRED` below now catches.
 
 Neither is a credential in the usual sense: GameAnalytics' HTML5 SDK signs
 payloads in the browser, so anyone can read both out of the served JavaScript.
@@ -50,8 +62,14 @@ client build:**
 env:
   GAME_ANALYTICS_GAME_KEY: ${{ vars.GAME_ANALYTICS_GAME_KEY }}
   GAME_ANALYTICS_SECRET_KEY: ${{ secrets.GAME_ANALYTICS_SECRET_KEY }}
-  GAME_ANALYTICS_BUILD: web-${{ github.ref_name }}
+  GAME_ANALYTICS_BUILD: web-<short sha>   # 32 characters maximum
+  GAME_ANALYTICS_REQUIRED: 'true'         # fail rather than ship inert
 ```
+
+A **reusable** workflow needs one thing more: a repository secret is invisible
+across a `workflow_call` boundary unless it is declared under
+`on.workflow_call.secrets` *and* passed by the caller. Repository variables
+need neither. Missing that declaration looks exactly like a missing key.
 
 **No AWS or ECS configuration is required for the keys.** They are compile-time
 client configuration baked into the bundle, and the server never talks to
@@ -69,6 +87,12 @@ Unset excludes nobody, so production works without it; setting it is what keeps
 the release owner's own play out of the numbers on every device at home,
 including signed-out ones.
 
+**`GAME_ANALYTICS_REQUIRED=true` makes a keyless build fail.** A checkout with
+no keys is a supported state everywhere else — that is what keeps developer
+machines and forks out of the numbers — but for a build that is going to be
+distributed it is indistinguishable at runtime from a working release that
+reports nothing. Both `deploy-client.yml` and `scripts/build-itch.sh` set it.
+
 The game key is exactly 32 alphanumeric characters and the secret exactly 40.
 The SDK refuses to initialize on any other shape — it logs and returns, with no
 failed request to notice — so the build validates both shapes and fails loudly
@@ -81,7 +105,10 @@ rotate it in the dashboard if it is ever abused.
 
 `GAME_ANALYTICS_BUILD` is the version label attached to every event, so a
 regression can be traced to the release that introduced it. It defaults to
-`0.0.0`.
+`0.0.0`, and is capped at **32 characters** by the SDK — which logs and keeps
+its default beyond that rather than failing, so a full 40-character commit SHA
+cannot be used as a label. The build validates the length. Deployments tag
+releases `web-<short sha>`; the itch package uses `itch-<short sha>`.
 
 **A checkout with no keys never loads the SDK.** That is deliberate and is what
 keeps developer machines, CI, and forks out of the live game's numbers with no
@@ -360,7 +387,7 @@ one, and expect to synthesize session annotations for every event.
 
 | File | Role |
 | --- | --- |
-| `server/src/api/analytics.rs` | `GET /api/analytics/consent`; address matching |
+| `server/src/api/analytics_consent.rs` | `GET /api/analytics/consent`; address matching (routed in `server/src/http_server.rs`) |
 | `client/web/components/PrivacyPolicy.tsx` | The player-facing notice, incl. the analytics disclosure |
 | `client/web/services/sessionIdentity.ts` | Reads the user id from the session token, before init |
 | `client/web/services/analytics/config.ts` | Build-time keys and distribution scope |
