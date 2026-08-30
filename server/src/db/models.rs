@@ -34,6 +34,20 @@ pub struct User {
     pub guest_token: Option<String>,
     #[serde(default)]
     pub is_stress_test: bool,
+    /// Whether this account holds administrative authority.
+    ///
+    /// Durable and false by default: an account that has never been granted it
+    /// carries no `isAdmin` attribute at all, and an absent attribute reads as
+    /// false rather than as an error, so every account that predates this flag
+    /// is simply not an administrator. Granting it is an out-of-band operator
+    /// action (`scripts/set-user-admin.sh` in the deployment repository), not
+    /// something any request handler can do.
+    ///
+    /// This is a grant, not the decision. Guests and stress-test accounts are
+    /// refused administrative access whatever this says — ask
+    /// [`crate::api::middleware::is_admin_user`], never this field directly.
+    #[serde(default)]
+    pub is_admin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -68,7 +68,9 @@ Season schedule:
 
 Administration:
 
-- `SNAKETRON_ADMIN_USER_IDS`: Comma-separated durable numeric user IDs allowed to use `/api/admin/*`. Authorization is recalculated from the current database user on every authenticated request; guests and stress-test users are never administrators.
+- Administrative access to `/api/admin/*` comes from either of two independent grants, and is recalculated from the current database user on every authenticated request. Guests and stress-test users are never administrators, whichever grant claims otherwise.
+  - **The durable `isAdmin` flag on the account.** False by default and absent from accounts nobody has granted it. This is how a deployed environment gets an administrator: run `scripts/set-user-admin.sh --user-id <id> --apply` from the deployment repository. It writes the account row directly, so it takes effect on that user's next request with no deploy and no restart.
+  - **`SNAKETRON_ADMIN_USER_IDS`**: comma-separated durable numeric user IDs. Kept for local development and the Skin Factory tooling, which bootstrap an administrator from the environment against a throwaway database where there is no account to have flagged first. Changing it needs a process restart, so it is the wrong tool for a deployed environment.
 - Runtime announcements, provider-neutral pre-match ad policy, and history-retention settings are stored in DynamoDB and managed through `/api/admin/config`. The safe defaults disable every ad distribution with a one-game threshold and 10-minute durable interval, retain snapshots for 30 days, and retain compact summaries for 365 days.
 - Match-history projections are created by the immutable completion pipeline. Existing completed-game rows are not retroactively projected, so a deployment begins recording browseable history with the first completion processed after rollout; backfill requires an explicit migration from retained snapshots.
 

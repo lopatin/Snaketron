@@ -32,13 +32,31 @@ pub const ADMIN_USER_IDS_ENV: &str = "SNAKETRON_ADMIN_USER_IDS";
 
 /// Resolve administrative access exclusively from the database-loaded user.
 ///
-/// Entries in `SNAKETRON_ADMIN_USER_IDS` are comma-separated durable numeric
-/// user IDs. Guests and stress-test users can never be administrators, even if
-/// their ID appears in the list.
+/// There are two independent grants, and either one is enough:
+///
+/// 1. The durable `is_admin` flag on the account itself, granted out of band
+///    with `scripts/set-user-admin.sh` in the deployment repository. This is
+///    the normal way to make somebody an administrator, because it takes
+///    effect on their next request without redeploying anything.
+/// 2. The `SNAKETRON_ADMIN_USER_IDS` process allowlist of comma-separated
+///    durable numeric user IDs. Kept because local development and the Skin
+///    Factory tooling bootstrap an administrator from the environment against
+///    a throwaway database, where there is no account to have flagged first.
+///
+/// Guests and stress-test users can never be administrators, whichever grant
+/// claims otherwise.
 pub fn is_admin_user(user: &User) -> bool {
-    std::env::var(ADMIN_USER_IDS_ENV)
-        .ok()
-        .is_some_and(|value| admin_allowlist_matches(&value, user))
+    admin_granted(user, std::env::var(ADMIN_USER_IDS_ENV).ok().as_deref())
+}
+
+/// The whole rule, with the process environment passed in so that it can be
+/// exercised without mutating global state from a parallel test.
+fn admin_granted(user: &User, allowlist: Option<&str>) -> bool {
+    if user.is_guest || user.is_stress_test {
+        return false;
+    }
+
+    user.is_admin || allowlist.is_some_and(|value| admin_allowlist_matches(value, user))
 }
 
 fn admin_allowlist_matches(value: &str, user: &User) -> bool {
@@ -337,6 +355,7 @@ mod tests {
             is_guest: false,
             guest_token: None,
             is_stress_test: false,
+            is_admin: false,
             auth_provider: None,
             crazygames_user_id: None,
             profile_picture_url: None,
@@ -371,5 +390,71 @@ mod tests {
         guest.is_guest = false;
         guest.is_stress_test = true;
         assert!(!admin_allowlist_matches("7", &guest));
+    }
+
+    /// The durable flag is the deployed grant: it has to work on its own,
+    /// because production sets no `SNAKETRON_ADMIN_USER_IDS` at all.
+    #[test]
+    fn the_durable_flag_grants_admin_without_any_allowlist() {
+        let mut flagged = user(7, "operator");
+        flagged.is_admin = true;
+
+        assert!(admin_granted(&flagged, None));
+        assert!(admin_granted(&flagged, Some("")));
+        assert!(admin_granted(&flagged, Some("11,12")));
+    }
+
+    #[test]
+    fn an_unflagged_account_is_not_an_admin() {
+        assert!(!admin_granted(&user(7, "ordinary"), None));
+        assert!(!admin_granted(&user(7, "ordinary"), Some("11,12")));
+    }
+
+    /// Either grant alone suffices, so the environment path keeps working for
+    /// local development and the Skin Factory tooling that depends on it.
+    #[test]
+    fn the_allowlist_still_grants_admin_to_an_unflagged_account() {
+        assert!(admin_granted(&user(7, "developer"), Some("7")));
+    }
+
+    /// The exclusion is on the decision, not on either grant, so no way of
+    /// setting the flag can make a guest or a load-test puppet an admin.
+    #[test]
+    fn the_durable_flag_cannot_promote_a_guest_or_stress_account() {
+        let mut guest = user(7, "guest");
+        guest.is_admin = true;
+        guest.is_guest = true;
+        assert!(!admin_granted(&guest, None));
+        assert!(!admin_granted(&guest, Some("7")));
+
+        let mut stress = user(7, "loadtest");
+        stress.is_admin = true;
+        stress.is_stress_test = true;
+        assert!(!admin_granted(&stress, None));
+        assert!(!admin_granted(&stress, Some("7")));
+    }
+
+    /// An account written before the flag existed has no `isAdmin` attribute,
+    /// which `get_user_by_id` reads as false. Serde has to agree, or every
+    /// user blob already sitting in the Valkey cache fails to deserialize on
+    /// the first request after deploy.
+    #[test]
+    fn a_user_serialized_without_the_flag_deserializes_as_not_admin() {
+        let mut flagged = user(7, "operator");
+        flagged.is_admin = true;
+        let json = serde_json::to_value(&flagged).expect("user serializes");
+
+        let mut legacy = json.clone();
+        legacy
+            .as_object_mut()
+            .expect("user is a JSON object")
+            .remove("is_admin")
+            .expect("the flag is serialized");
+
+        let restored: User = serde_json::from_value(legacy).expect("legacy blob deserializes");
+        assert!(!restored.is_admin);
+
+        let round_tripped: User = serde_json::from_value(json).expect("current blob deserializes");
+        assert!(round_tripped.is_admin);
     }
 }

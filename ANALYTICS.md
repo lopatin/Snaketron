@@ -155,7 +155,7 @@ signals do that, and **any one of them is enough**:
 | --- | --- | --- |
 | `?analytics=off` | Any browser, anywhere — phone, VPN, someone else's network | Visit the game once with the parameter |
 | Excluded address list | Every browser and device on your network, signed out, with no per-device setup | Set `SNAKETRON_ANALYTICS_EXCLUDED_IPS` on the server |
-| Administrator account | You, wherever you sign in | Already covered by `SNAKETRON_ADMIN_USER_IDS` |
+| Administrator account | You, wherever you sign in | Already covered once your account is an administrator |
 
 An excluded browser never downloads the SDK chunk, never opens a GameAnalytics
 session, and never contacts GameAnalytics at all.
@@ -206,8 +206,10 @@ never been excluded caches `counted` and is unaffected.
 
 ### The administrator account
 
-Any user in `SNAKETRON_ADMIN_USER_IDS` is excluded as soon as `/api/auth/me`
-resolves. Because that can happen after the session has already opened, signing
+Any administrator is excluded as soon as `/api/auth/me` resolves — whether the
+grant is the durable `isAdmin` flag on the account or an entry in
+`SNAKETRON_ADMIN_USER_IDS`. Because that can happen after the session has
+already opened, signing
 in both stops the live SDK and writes the local opt-out, so the *next* load in
 that browser is excluded before the SDK is ever fetched.
 
