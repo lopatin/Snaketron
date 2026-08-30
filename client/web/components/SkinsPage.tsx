@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { AccountModalView } from './AccountModal';
-import { HomeHeader } from './HomeHeader';
+import { SocialHeader } from './SocialHeader';
 import { SocialFooter } from './SocialFooter';
 import { useAuth } from '../contexts/AuthContext';
 import { api, isApiError } from '../services/api';
@@ -440,7 +440,7 @@ const SkinRow: React.FC<SkinRowProps> = ({
 };
 
 const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   // Skin editing is an operator surface for now: every CTA into the builder
   // is admin-only, and an admin may edit anyone's skin, not just their own.
   const isAdmin = Boolean(user?.isAdmin);
@@ -817,17 +817,10 @@ const SkinsPage: React.FC<SkinsPageProps> = ({ onOpenAuth, onOpenAccount }) => {
 
   return (
     <div className="home-page skins-page">
-      <HomeHeader
+      <SocialHeader
         activePage="skins"
-        currentUser={user}
-        lobbyMembers={[]}
-        hasLobby={false}
-        onInvite={() => {}}
-        onJoinGame={() => {}}
-        onLeaveLobby={() => {}}
-        onAuthClick={onOpenAuth}
+        onOpenAuth={onOpenAuth}
         onOpenAccount={onOpenAccount}
-        onLogout={logout}
       />
 
       <main className="skins-main">

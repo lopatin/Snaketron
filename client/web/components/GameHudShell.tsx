@@ -93,7 +93,6 @@ const GameHudShell: React.FC<GameHudShellProps> = ({
       <MatchRosterBand
         presentation={presentation}
         isVisible={isVisible}
-        shareGameId={shareGameId}
         onMenu={onMenu}
         onScoreCard={() => setScoreCardOpen((open) => !open)}
         scoreCardOpen={scoreCardOpen}

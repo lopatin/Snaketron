@@ -1,13 +1,10 @@
 import React from 'react';
 import type { MatchPlayerPresentation, MatchPresentation } from '../utils/gamePresentation';
 import RosterSnakeCanvas from './RosterSnakeCanvas';
-import ShareGame from './ShareGame';
 
 export interface MatchRosterBandProps {
   presentation: MatchPresentation;
   isVisible: boolean;
-  /** Wire game id; a null id simply hides the share control. */
-  shareGameId?: number | null;
   onMenu?: () => void;
   onScoreCard?: () => void;
   scoreCardOpen?: boolean;
@@ -61,7 +58,6 @@ const PlayerLegend: React.FC<{
 const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
   presentation,
   isVisible,
-  shareGameId = null,
   onMenu,
   onScoreCard,
   scoreCardOpen = false,
@@ -69,18 +65,11 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
   const leftSide = presentation.sides[0];
   const rightSide = presentation.sides[1];
   const showActions = presentation.isComplete && Boolean(onMenu || onScoreCard);
-  // Share stays available for the whole match, not just at the end: the link
-  // is permanent and resolves to the result page once the match finishes, so
-  // posting it mid-game is a real thing to do.
-  const share = shareGameId !== null && (
-    <ShareGame
-      gameId={shareGameId}
-      headline={presentation.isComplete ? presentation.resultSummary : null}
-      variant="compact"
-      className="game-roster-share"
-      triggerClassName="game-shell-button is-share-icon"
-    />
-  );
+  // The band carries no share control. It is a 44px row with `overflow: hidden`
+  // and a transform of its own (index.css:613-628, :421-428), so a popover
+  // anchored inside it cannot paint in either direction — and mid-match the
+  // slot also drove the roster onto a second grid row. Sharing lives where the
+  // result does: the score card's footer, and the permanent /g/:id page.
 
   return (
     <section
@@ -89,10 +78,6 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
       aria-hidden={!isVisible}
       data-testid="game-roster-band"
     >
-      {!showActions && share && (
-        <div className="game-roster-action-slot is-right game-roster-share-slot">{share}</div>
-      )}
-
       {showActions && (
         <div className="game-roster-action-slot is-left">
           {onMenu && (
@@ -156,7 +141,6 @@ const MatchRosterBand: React.FC<MatchRosterBandProps> = ({
       {showActions && (
         <div className="game-roster-action-slot is-right">
           <div className="game-roster-actions is-right">
-            {share}
             {onScoreCard && (
               <button
                 type="button"

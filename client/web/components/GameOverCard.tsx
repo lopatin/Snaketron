@@ -249,6 +249,16 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
     ? `${presentation.sides[0]?.score ?? 0}–${presentation.sides[1]?.score ?? 0}`
     : current?.score.toString() ?? presentation.soloScore.toString();
 
+  // Rematch is a group decision — it converges everyone who ticks the box onto
+  // one lobby. A solo run has nobody to converge with, so the box can only ever
+  // report back the one opt-in it just took, which is why it reads as an
+  // orphaned control there. The server does offer it (rematch.rs:92 treats a
+  // lone Solo player as a valid rematch), so this is suppressed here rather
+  // than expected to arrive empty.
+  //
+  // Keyed on the match's shape rather than on roster size, so a duel that
+  // merely emptied out still gets the real control and its waiting copy.
+  const rematchOffer = presentation.isSoloGame ? null : rematch;
 
   return (
     <div
@@ -371,7 +381,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                   {player.name}
                   {player.isWinner && <span className="game-over-winner">Winner</span>}
                   {player.isIdleKicked && <span className="game-over-idle">Idle</span>}
-                  {rematchBadgeFor(rematch, player.userId) === 'rematch' && (
+                  {rematchBadgeFor(rematchOffer, player.userId) === 'rematch' && (
                     <span
                       className="game-over-rematch-pill"
                       data-testid={`rematch-pill-${player.snakeId}`}
@@ -379,7 +389,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
                       Rematch
                     </span>
                   )}
-                  {rematchBadgeFor(rematch, player.userId) === 'left' && (
+                  {rematchBadgeFor(rematchOffer, player.userId) === 'left' && (
                     <span className="game-over-left-pill">Left</span>
                   )}
                 </span>
@@ -397,7 +407,7 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
           ))}
         </div>
 
-        {rematch && onRematchToggle && canRematch(rematch, currentUserId) && (
+        {rematchOffer && onRematchToggle && canRematch(rematchOffer, currentUserId) && (
           <div className="game-over-rematch" data-testid="rematch-toggle">
             {/* Same control as the Competitive checkbox on the home form: a
                 bare label, the native input hidden for semantics, and a drawn
@@ -408,19 +418,19 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
               <div className="relative">
                 <input
                   type="checkbox"
-                  checked={hasOptedIntoRematch(rematch, currentUserId)}
+                  checked={hasOptedIntoRematch(rematchOffer, currentUserId)}
                   onChange={(event) => onRematchToggle(event.target.checked)}
                   className="sr-only"
                   data-testid="rematch-checkbox"
                 />
                 <div
                   className={`w-4 h-4 border-2 rounded transition-all group-hover:border-gray-400 ${
-                    hasOptedIntoRematch(rematch, currentUserId)
+                    hasOptedIntoRematch(rematchOffer, currentUserId)
                       ? 'bg-blue-500 border-blue-500'
                       : 'bg-white border-gray-300'
                   }`}
                 >
-                  {hasOptedIntoRematch(rematch, currentUserId) && (
+                  {hasOptedIntoRematch(rematchOffer, currentUserId) && (
                     <svg
                       className="w-full h-full text-white"
                       fill="none"
@@ -437,9 +447,9 @@ const GameOverCard: React.FC<GameOverCardProps> = ({
             </label>
             {/* Only ever shown when ticking the box cannot actually produce a
                 game; silence there would read as the feature being broken. */}
-            {rematchBlockReason(rematch) && (
+            {rematchBlockReason(rematchOffer) && (
               <span className="game-over-rematch-blocked" role="status">
-                {rematchBlockReason(rematch)}
+                {rematchBlockReason(rematchOffer)}
               </span>
             )}
           </div>
