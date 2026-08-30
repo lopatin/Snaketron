@@ -2692,6 +2692,7 @@ impl DynamoDatabase {
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
+        item.insert("isAdmin".to_string(), Self::av_bool(false));
         item.insert("authProvider".to_string(), Self::av_s("crazygames"));
         item.insert(
             "crazyGamesUserId".to_string(),
@@ -3180,6 +3181,7 @@ impl Database for DynamoDatabase {
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(false));
         item.insert("isStressTest".to_string(), Self::av_bool(false));
+        item.insert("isAdmin".to_string(), Self::av_bool(false));
 
         self.client
             .put_item()
@@ -3202,6 +3204,7 @@ impl Database for DynamoDatabase {
             is_guest: false,
             guest_token: None,
             is_stress_test: false,
+            is_admin: false,
             auth_provider: None,
             crazygames_user_id: None,
             profile_picture_url: None,
@@ -3240,6 +3243,7 @@ impl Database for DynamoDatabase {
         item.insert("createdAt".to_string(), Self::av_s(now.to_rfc3339()));
         item.insert("isGuest".to_string(), Self::av_bool(true));
         item.insert("isStressTest".to_string(), Self::av_bool(is_stress_test));
+        item.insert("isAdmin".to_string(), Self::av_bool(false));
         item.insert("guestToken".to_string(), Self::av_s(guest_token));
 
         self.client
@@ -3268,6 +3272,7 @@ impl Database for DynamoDatabase {
             is_guest: true,
             guest_token: Some(guest_token.to_string()),
             is_stress_test,
+            is_admin: false,
             auth_provider: None,
             crazygames_user_id: None,
             profile_picture_url: None,
@@ -3451,6 +3456,10 @@ impl Database for DynamoDatabase {
                     is_guest: Self::extract_bool(&item, "isGuest").unwrap_or(false),
                     guest_token: Self::extract_string(&item, "guestToken"),
                     is_stress_test: Self::extract_bool(&item, "isStressTest").unwrap_or(false),
+                    // Absent on every account created before the flag existed,
+                    // and on every account nobody has ever granted it. Absence
+                    // is the default, not a fault.
+                    is_admin: Self::extract_bool(&item, "isAdmin").unwrap_or(false),
                     auth_provider: Self::extract_string(&item, "authProvider"),
                     crazygames_user_id: Self::extract_string(&item, "crazyGamesUserId"),
                     profile_picture_url: Self::extract_string(&item, "profilePictureUrl"),
