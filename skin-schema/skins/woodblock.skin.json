@@ -1,0 +1,241 @@
+{
+  "schema_version": 2,
+  "id": "woodblock@1",
+  "name": "Woodblock",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#a3c1e6",
+        "outline": "#1c3566",
+        "accent": "#2449b4"
+      },
+      {
+        "fill": "#98b8de",
+        "outline": "#182c58",
+        "accent": "#1d3fa6"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#f6d79a",
+        "outline": "#6e3210",
+        "accent": "#a1481a"
+      },
+      {
+        "fill": "#f0cd90",
+        "outline": "#5e2a0c",
+        "accent": "#8e3d14"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#a3c1e6",
+        "outline": "#1c3566",
+        "accent": "#2449b4"
+      },
+      {
+        "fill": "#f6d79a",
+        "outline": "#6e3210",
+        "accent": "#a1481a"
+      },
+      {
+        "fill": "#dad7d0",
+        "outline": "#3c3830",
+        "accent": "#57524a"
+      },
+      {
+        "fill": "#f0e0a8",
+        "outline": "#7a5a0e",
+        "accent": "#a8760f"
+      }
+    ]
+  },
+  "literals": {
+    "paperwhite": "#fbf7ef"
+  },
+  "period_ms": 4200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#161310"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Paper",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Wash",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.22"
+            },
+            "alpha": "0.7"
+          },
+          {
+            "offset": "0.35",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0.16"
+          },
+          {
+            "offset": "0.72",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.1"
+            },
+            "alpha": "0.5"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.2"
+            },
+            "alpha": "0.75"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Swell",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 3.5,
+        "duty": 0.55,
+        "phase_cells": 0.0,
+        "half_width": "0.32",
+        "t_center": "-0.16",
+        "alpha": "clamp(0.6 + 0.35 * sin(tau * (time + s * 0.11)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Curl",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.34"
+        },
+        "period_cells": 3.5,
+        "duty": 0.3,
+        "phase_cells": 1.75,
+        "half_width": "0.15",
+        "t_center": "0.3",
+        "alpha": "clamp(0.45 + 0.45 * sin(tau * (time + s * 0.17 + 0.5)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Crest",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "paperwhite"
+        },
+        "period_cells": 3.5,
+        "duty": 0.16,
+        "phase_cells": 1.68,
+        "half_width": "0.09",
+        "t_center": "0.38"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Foam",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "paperwhite"
+        },
+        "period_cells": 1.25,
+        "duty": 0.22,
+        "phase_cells": 0.35,
+        "half_width": "0.1",
+        "t_center": "0.06"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Sky",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 2.0) * 0.42",
+      "color": "#fbf7ef",
+      "length_cells": 2.0
+    }
+  ]
+}

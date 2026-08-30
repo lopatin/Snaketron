@@ -1,0 +1,255 @@
+{
+  "schema_version": 2,
+  "id": "camo@1",
+  "name": "Camo",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#22443d",
+        "outline": "#0a1614",
+        "accent": "#5c6349"
+      },
+      {
+        "fill": "#1c3b35",
+        "outline": "#081210",
+        "accent": "#545b42"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#cdb689",
+        "outline": "#4e3d24",
+        "accent": "#b57c42"
+      },
+      {
+        "fill": "#cbb282",
+        "outline": "#48381f",
+        "accent": "#b0763c"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#22443d",
+        "outline": "#0a1614",
+        "accent": "#5c6349"
+      },
+      {
+        "fill": "#cdb689",
+        "outline": "#4e3d24",
+        "accent": "#b57c42"
+      },
+      {
+        "fill": "#e2e6eb",
+        "outline": "#6a717b",
+        "accent": "#a4acb8"
+      },
+      {
+        "fill": "#3d2456",
+        "outline": "#160d20",
+        "accent": "#6b5c82"
+      }
+    ]
+  },
+  "period_ms": 6200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0f1512"
+  },
+  "layers": [
+    {
+      "name": "Edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Ground cloth",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Patch, crown",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.3"
+        },
+        "period_cells": 11.3,
+        "duty": 0.6,
+        "phase_cells": 0.0,
+        "half_width": "0.2",
+        "t_center": "0.28",
+        "alpha": "clamp(2.4 * noise(s * 0.11 + 2.4, 1.7) - 0.72, 0, 1)"
+      }
+    },
+    {
+      "name": "Patch, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.2"
+        },
+        "period_cells": 8.6,
+        "duty": 0.56,
+        "phase_cells": 3.4,
+        "half_width": "0.23",
+        "t_center": "0.07 + 0.03 * sin(tau * time)",
+        "alpha": "clamp(2.6 * noise(s * 0.155 + 7.1, 5.3) - 0.82, 0, 1)"
+      }
+    },
+    {
+      "name": "Patch, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.38"
+        },
+        "period_cells": 6.7,
+        "duty": 0.54,
+        "phase_cells": 1.9,
+        "half_width": "0.23",
+        "t_center": "-0.15 + 0.03 * sin(tau * (time + 0.73))",
+        "alpha": "clamp(2.3 * noise(s * 0.21 + 4.8, 9.6) - 0.68, 0, 1)"
+      }
+    },
+    {
+      "name": "Patch, belly",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.44"
+        },
+        "period_cells": 5.1,
+        "duty": 0.5,
+        "phase_cells": 4.7,
+        "half_width": "0.2",
+        "t_center": "-0.29",
+        "alpha": "clamp(2.5 * noise(s * 0.27 + 11.3, 13.2) - 0.78, 0, 1)"
+      }
+    },
+    {
+      "name": "Stipple, coarse",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.28"
+        },
+        "period_cells": 3.9,
+        "duty": 0.44,
+        "phase_cells": 2.6,
+        "half_width": "0.3",
+        "t_center": "0.17 + 0.02 * sin(tau * (time + 0.41))",
+        "alpha": "clamp(2.2 * noise(s * 0.29 + 16.4, 17.8) - 0.62, 0, 1)"
+      }
+    },
+    {
+      "name": "Stipple, fine",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.14"
+        },
+        "period_cells": 3.05,
+        "duty": 0.4,
+        "phase_cells": 0.9,
+        "half_width": "0.3",
+        "t_center": "-0.17",
+        "alpha": "clamp(2.35 * noise(s * 0.235 + 21.7, 22.4) - 0.7, 0, 1)"
+      }
+    },
+    {
+      "name": "Crown light",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.46",
+      "color": "#e2dccb",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Sight",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.4"
+      },
+      "radius_ratio": "0.4"
+    }
+  ]
+}

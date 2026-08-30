@@ -1,0 +1,279 @@
+{
+  "schema_version": 2,
+  "id": "marquee@1",
+  "name": "Marquee",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#2b1f66",
+        "outline": "#120b30",
+        "accent": "#8b6cff"
+      },
+      {
+        "fill": "#261b5c",
+        "outline": "#0f0929",
+        "accent": "#7c5df5"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#6e131c",
+        "outline": "#300609",
+        "accent": "#ff5a3c"
+      },
+      {
+        "fill": "#6a121e",
+        "outline": "#2b050a",
+        "accent": "#f5462d"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#2b1f66",
+        "outline": "#120b30",
+        "accent": "#8b6cff"
+      },
+      {
+        "fill": "#6e131c",
+        "outline": "#300609",
+        "accent": "#ff5a3c"
+      },
+      {
+        "fill": "#14313c",
+        "outline": "#071820",
+        "accent": "#4fd6e8"
+      },
+      {
+        "fill": "#3b2a0c",
+        "outline": "#1a1204",
+        "accent": "#ffc247"
+      }
+    ]
+  },
+  "literals": {
+    "bulb": "#ffe3a8",
+    "glass": "#ffe6a3",
+    "letter": "#fff6e2"
+  },
+  "period_ms": 1800,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#140a24"
+  },
+  "layers": [
+    {
+      "name": "Sign edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Sign face",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Board",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.36"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.28"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.18"
+            },
+            "alpha": "0.85"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.46"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Rail, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.7 + 0.3 * boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.1"
+        },
+        "period_cells": 7.0,
+        "duty": 0.96,
+        "phase_cells": 0.0,
+        "half_width": "0.028 + 0.016 * (0.5 + 0.5 * sin(tau * time))",
+        "t_center": "0.385"
+      }
+    },
+    {
+      "name": "Rail, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.7 + 0.3 * boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.1"
+        },
+        "period_cells": 7.0,
+        "duty": 0.96,
+        "phase_cells": 3.5,
+        "half_width": "0.028 + 0.016 * (0.5 + 0.5 * sin(tau * (time + 0.5)))",
+        "t_center": "-0.385"
+      }
+    },
+    {
+      "name": "Bulbs, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.78 + 0.22 * boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bulb",
+          "lighten": "-0.18 + 0.18 * sin(tau * time)"
+        },
+        "period_cells": 1.4,
+        "duty": 0.17,
+        "phase_cells": 0.0,
+        "half_width": "0.085",
+        "t_center": "0.385"
+      }
+    },
+    {
+      "name": "Bulbs, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.78 + 0.22 * boost",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bulb",
+          "lighten": "-0.18 - 0.18 * sin(tau * time)"
+        },
+        "period_cells": 1.4,
+        "duty": 0.17,
+        "phase_cells": 0.7,
+        "half_width": "0.085",
+        "t_center": "-0.385"
+      }
+    },
+    {
+      "name": "Letters",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "text",
+        "content": "EAT - GROW - REPEAT ",
+        "color": {
+          "literal": "letter"
+        },
+        "scale": 0.85
+      }
+    },
+    {
+      "name": "Headlamp",
+      "type": "head_disc",
+      "boost_only": true,
+      "paint": {
+        "literal": "glass"
+      },
+      "radius_ratio": "0.46"
+    },
+    {
+      "name": "House lights",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.68",
+      "color": "#fff3d8",
+      "length_cells": 1.4
+    }
+  ]
+}

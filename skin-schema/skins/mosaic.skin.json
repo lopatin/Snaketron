@@ -1,0 +1,281 @@
+{
+  "schema_version": 2,
+  "id": "mosaic@1",
+  "name": "Mosaic",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#1a4574",
+        "outline": "#081a2e",
+        "accent": "#3f86c4"
+      },
+      {
+        "fill": "#163c66",
+        "outline": "#061527",
+        "accent": "#3778b4"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#7a2130",
+        "outline": "#2c0a11",
+        "accent": "#c0563e"
+      },
+      {
+        "fill": "#6d1b2a",
+        "outline": "#26080e",
+        "accent": "#b34c37"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#1a4574",
+        "outline": "#081a2e",
+        "accent": "#3f86c4"
+      },
+      {
+        "fill": "#7a2130",
+        "outline": "#2c0a11",
+        "accent": "#c0563e"
+      },
+      {
+        "fill": "#1c5148",
+        "outline": "#07201c",
+        "accent": "#3f9c86"
+      },
+      {
+        "fill": "#43265e",
+        "outline": "#170c22",
+        "accent": "#8a5cc0"
+      }
+    ]
+  },
+  "literals": {
+    "gold": "#dfa93f",
+    "gild": "#f7e2ad"
+  },
+  "period_ms": 4600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0b1723"
+  },
+  "layers": [
+    {
+      "name": "Grout edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Setting bed",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Mortar",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.42"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "0.28",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.3"
+            },
+            "alpha": "0.86"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.46"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Tesserae, course 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.12"
+        },
+        "period_cells": 3.05,
+        "duty": 0.66,
+        "phase_cells": 0.0,
+        "half_width": "0.105",
+        "t_center": "0.375",
+        "alpha": "clamp(0.3 + 0.66 * noise(s * 0.53 + 0.4, 3.7) + 0.11 * sin(tau * (time + s * 0.06)), 0, 1)"
+      }
+    },
+    {
+      "name": "Tesserae, course 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.64"
+        },
+        "period_cells": 3.75,
+        "duty": 0.7,
+        "phase_cells": 1.35,
+        "half_width": "0.105",
+        "t_center": "0.125",
+        "alpha": "clamp(0.42 + 0.54 * noise(s * 0.45 + 6.1, 11.9) + 0.07 * sin(tau * (time + s * 0.06 + 0.28)), 0, 1)"
+      }
+    },
+    {
+      "name": "Tesserae, course 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.36"
+        },
+        "period_cells": 3.3,
+        "duty": 0.64,
+        "phase_cells": 0.62,
+        "half_width": "0.105",
+        "t_center": "-0.125",
+        "alpha": "clamp(0.26 + 0.7 * noise(s * 0.51 + 13.3, 19.3) + 0.13 * sin(tau * (time + s * 0.06 + 0.55)), 0, 1)"
+      }
+    },
+    {
+      "name": "Tesserae, course 4",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.47"
+        },
+        "period_cells": 4.3,
+        "duty": 0.62,
+        "phase_cells": 1.9,
+        "half_width": "0.105",
+        "t_center": "-0.375",
+        "alpha": "clamp(0.46 + 0.5 * noise(s * 0.42 + 21.7, 27.1) + 0.06 * sin(tau * (time + s * 0.06 + 0.81)), 0, 1)"
+      }
+    },
+    {
+      "name": "Gold leaf",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "gold",
+          "lighten": "0.16"
+        },
+        "period_cells": 6.6,
+        "duty": 0.32,
+        "phase_cells": 0.62,
+        "half_width": "0.105 - 0.02 * sin(tau * time)",
+        "t_center": "-0.125"
+      }
+    },
+    {
+      "name": "Nimbus",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.5",
+      "color": "#f6ead0",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Gold tessera",
+      "type": "head_disc",
+      "paint": {
+        "literal": "gild"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

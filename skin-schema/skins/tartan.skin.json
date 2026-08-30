@@ -1,0 +1,446 @@
+{
+  "schema_version": 2,
+  "id": "tartan@1",
+  "name": "Tartan",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#106053",
+        "outline": "#23387c",
+        "accent": "#3d6fb8"
+      },
+      {
+        "fill": "#0f5849",
+        "outline": "#213573",
+        "accent": "#3767ac"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#6e1520",
+        "outline": "#1f080a",
+        "accent": "#94301a"
+      },
+      {
+        "fill": "#64121c",
+        "outline": "#1b0708",
+        "accent": "#882c17"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#106053",
+        "outline": "#23387c",
+        "accent": "#3d6fb8"
+      },
+      {
+        "fill": "#6e1520",
+        "outline": "#1f080a",
+        "accent": "#94301a"
+      },
+      {
+        "fill": "#3a3a29",
+        "outline": "#17170f",
+        "accent": "#5c5b3c"
+      },
+      {
+        "fill": "#3f2650",
+        "outline": "#1b0f24",
+        "accent": "#6a447f"
+      }
+    ]
+  },
+  "literals": {
+    "overcheck": "#e8cf72",
+    "guard": "#f0ece0"
+  },
+  "period_ms": 6400,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0a1018"
+  },
+  "layers": [
+    {
+      "name": "Selvedge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Cloth",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Nap",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.22"
+            },
+            "alpha": "0.85"
+          },
+          {
+            "offset": "0.24",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.08"
+            },
+            "alpha": "0.7"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.2"
+            },
+            "alpha": "0.5"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.28"
+            },
+            "alpha": "0.88"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Sett, broad ground bar",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline"
+        },
+        "period_cells": 10.5,
+        "duty": 0.2,
+        "phase_cells": 1.5,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Sett, narrow ground bar",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "-0.08"
+        },
+        "period_cells": 5.25,
+        "duty": 0.07,
+        "phase_cells": 4.45,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Sett, second ground bar",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "0.07"
+        },
+        "period_cells": 10.5,
+        "duty": 0.115,
+        "phase_cells": 5.8,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Sett, azure bar",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.05"
+        },
+        "period_cells": 10.5,
+        "duty": 0.05,
+        "phase_cells": 7.95,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Warp, broad ground stripe",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "0.04"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.1",
+        "t_center": "0.4"
+      }
+    },
+    {
+      "name": "Warp, guard stripe",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "-0.1"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.062",
+        "t_center": "-0.435"
+      }
+    },
+    {
+      "name": "Warp, hairline stripe",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "0.1"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.032",
+        "t_center": "-0.12"
+      }
+    },
+    {
+      "name": "Over-check, weft gold",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "overcheck"
+        },
+        "period_cells": 10.5,
+        "duty": 0.02,
+        "phase_cells": 2.3,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Over-check, weft gold companion",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "overcheck"
+        },
+        "period_cells": 10.5,
+        "duty": 0.013,
+        "phase_cells": 2.92,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Over-check, weft white",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "guard"
+        },
+        "period_cells": 10.5,
+        "duty": 0.017,
+        "phase_cells": 9.0,
+        "half_width": "0.5",
+        "t_center": "0"
+      }
+    },
+    {
+      "name": "Over-check, warp gold",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "overcheck"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.038",
+        "t_center": "0.075 + 0.018 * sin(tau * time)"
+      }
+    },
+    {
+      "name": "Over-check, warp white",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "guard"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.026",
+        "t_center": "-0.265 + 0.016 * sin(tau * (time + 0.35))"
+      }
+    },
+    {
+      "name": "Bonnet light",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.5",
+      "color": "#f4f0e2",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Clan stud",
+      "type": "head_disc",
+      "paint": {
+        "literal": "overcheck"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

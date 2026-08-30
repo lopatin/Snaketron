@@ -96,7 +96,7 @@ await shot('01-browse-signed-out');
 // ---------------------------------------------------------------------------
 // 2. Browsing, signed in: equip becomes possible and one skin is already worn.
 // ---------------------------------------------------------------------------
-await setState({ signedIn: true, selectedSkin: 'tiger-live@1', owned: [1002] });
+await setState({ signedIn: true, selectedSkin: 'pitlane@1', owned: [1002] });
 await page.goto(`${baseUrl}/skins`, { waitUntil: 'networkidle' });
 await page.waitForSelector('[data-testid="snake-skin-list"] li');
 await shot('02-browse-signed-in');

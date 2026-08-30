@@ -1,0 +1,32 @@
+{
+  "record_version": 1,
+  "concept": "breaker",
+  "mode": "draft_submission",
+  "origin": "interactive_session",
+  "origin_note": "The user supplied one reference image directly in an interactive Claude Code session and asked for a skin built from it, plus renders for review. This is not a Snaketron skin-factory attempt: there is no generated candidate set, no prototype manifest, no capability manifest, and no advertised host offering upload, registration, or admin review. The reference is therefore bound here as the retained selection artifact so the implementation plan's input_authority names bytes that actually exist, and the ceiling recorded in the plan is a ceiling, not an action that was taken.",
+  "reference_artifact": {
+    "path": "docs/skins/breaker/reference.png",
+    "sha256": "1e603bf15740ba172459c7dd184193c6e0d5dca004db82f7614f786f18a7ae1e",
+    "width_px": 474,
+    "height_px": 33,
+    "recovered_from": "the session transcript's inline image attachment, written to disk unmodified",
+    "geometry_projection": null,
+    "geometry_projection_note": "The image was NOT produced by prototype-body-mask-v1. It is a user-supplied illustration that happens to share the prototype pose (flat right-facing one-cell capsule, rounded tail, dark head core at the tip). It is treated as design direction, not as a projected prototype authority."
+  },
+  "selection_rationale": "The single reference the user supplied. It is read as design direction rather than as pixels to reproduce: the build is entirely procedural, embeds no bytes from the reference, and keeps only the abstract subject (an ocean swell with a breaking foam crest and an eye at the head).",
+  "safety_ip": {
+    "verdict": "clear",
+    "reasoning": "The subject is ocean water, foam and an eye — a generic natural motif with no protected mark, character, likeness or trade dress. No pixels, vectors or gradients are copied from the reference; every layer is a SkinDoc v2 primitive parameterised by hand."
+  },
+  "actions_taken": [
+    "authored skin-schema/skins/breaker.skin.json",
+    "validated it with `cargo run -p skin-schema --bin validate-skin`",
+    "reviewed it through the real WASM renderer under a local draft handle",
+    "shipped it as a built-in: compiled into the client registry and added to the server's catalogue allowlist, which is how the other in-game skins exist and is why it needs no upload, revision, or admin approval"
+  ],
+  "actions_not_taken": [
+    "no asset generation (no image_generator capability advertised in this session)",
+    "no upload, no texture registration, no private revision, no admin review request",
+    "no publication through the first-class-skins store: a built-in is not a stored skin and never enters that flow"
+  ]
+}

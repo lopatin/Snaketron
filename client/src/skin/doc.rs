@@ -171,7 +171,15 @@ impl ParamSkin {
         Ok(Self { engine })
     }
 
-    /// Compile from JSON.
+    /// Compile from JSON, skipping the version dispatch.
+    ///
+    /// Test-only since the built-in catalogue stopped being one schema
+    /// version: shipped documents now go through
+    /// `registry::compile_document_owned`, which reads `schema_version` rather
+    /// than being told it. What is left here is the v1-specific door the
+    /// conformance suite needs to pin classic's document against the compiled
+    /// classic skin.
+    #[cfg(test)]
     pub fn from_json(json: &str) -> Result<Self, Vec<SkinDocError>> {
         let doc: SkinDoc = serde_json::from_str(json).map_err(|error| {
             vec![SkinDocError {

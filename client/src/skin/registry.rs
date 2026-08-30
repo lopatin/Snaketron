@@ -4,12 +4,10 @@
 //! newer build, a corrupted preference, a hand-edited request — falls back to
 //! the classic look and logs once. Cosmetics must not be able to break a frame.
 
-use crate::skin::animal::AnimalSkin;
 use crate::skin::checker::CheckerSkin;
 use crate::skin::doc::ParamSkin;
 use crate::skin::docv2::LayerSkin;
 use crate::skin::ember::EmberSkin;
-use crate::skin::sprite::SpriteSkin;
 use crate::skin::{ClassicSkin, SnakeSkin};
 use std::sync::OnceLock;
 
@@ -20,27 +18,79 @@ use std::sync::OnceLock;
 /// A document that somehow fails to compile is dropped from the catalogue with
 /// a log rather than taken as a reason to fail startup — a bad cosmetic should
 /// cost you a skin, not the game.
-fn document_skins() -> &'static [ParamSkin] {
-    static SKINS: OnceLock<Vec<ParamSkin>> = OnceLock::new();
+///
+/// Boxed rather than a `Vec<ParamSkin>` because the list is no longer one
+/// schema version. It goes through [`compile_document_owned`], the same
+/// dispatch a player-authored skin and the native pre-register gate use, so a
+/// built-in cannot be accepted here by a path the store would refuse.
+fn document_skins() -> &'static [Box<dyn SnakeSkin>] {
+    static SKINS: OnceLock<Vec<Box<dyn SnakeSkin>>> = OnceLock::new();
     SKINS.get_or_init(|| {
         [
             include_str!("../../../skin-schema/skins/aurora.skin.json"),
             include_str!("../../../skin-schema/skins/tidewave.skin.json"),
             include_str!("../../../skin-schema/skins/voltage.skin.json"),
             include_str!("../../../skin-schema/skins/lantern.skin.json"),
+            include_str!("../../../skin-schema/skins/breaker.skin.json"),
+            include_str!("../../../skin-schema/skins/afterburn.skin.json"),
+            include_str!("../../../skin-schema/skins/cinder.skin.json"),
+            include_str!("../../../skin-schema/skins/floe.skin.json"),
+            include_str!("../../../skin-schema/skins/woodblock.skin.json"),
+            include_str!("../../../skin-schema/skins/bloom.skin.json"),
+            include_str!("../../../skin-schema/skins/slipstream.skin.json"),
+            include_str!("../../../skin-schema/skins/harrier.skin.json"),
+            include_str!("../../../skin-schema/skins/argyle.skin.json"),
+            include_str!("../../../skin-schema/skins/serpentine.skin.json"),
+            include_str!("../../../skin-schema/skins/voltcore.skin.json"),
+            include_str!("../../../skin-schema/skins/marquee.skin.json"),
+            include_str!("../../../skin-schema/skins/basalt.skin.json"),
+            include_str!("../../../skin-schema/skins/ripple.skin.json"),
+            include_str!("../../../skin-schema/skins/moth.skin.json"),
+            include_str!("../../../skin-schema/skins/prism.skin.json"),
+            include_str!("../../../skin-schema/skins/houndstooth.skin.json"),
+            include_str!("../../../skin-schema/skins/circuit.skin.json"),
+            include_str!("../../../skin-schema/skins/pinstripe.skin.json"),
+            include_str!("../../../skin-schema/skins/static.skin.json"),
+            include_str!("../../../skin-schema/skins/mosaic.skin.json"),
+            include_str!("../../../skin-schema/skins/herringbone.skin.json"),
+            include_str!("../../../skin-schema/skins/carbon.skin.json"),
+            include_str!("../../../skin-schema/skins/tartan.skin.json"),
+            include_str!("../../../skin-schema/skins/coral.skin.json"),
+            include_str!("../../../skin-schema/skins/amber.skin.json"),
+            include_str!("../../../skin-schema/skins/geode.skin.json"),
+            include_str!("../../../skin-schema/skins/timber.skin.json"),
+            include_str!("../../../skin-schema/skins/peacock.skin.json"),
+            include_str!("../../../skin-schema/skins/monarch.skin.json"),
+            include_str!("../../../skin-schema/skins/chrome.skin.json"),
+            include_str!("../../../skin-schema/skins/neon.skin.json"),
+            include_str!("../../../skin-schema/skins/camo.skin.json"),
+            include_str!("../../../skin-schema/skins/loom.skin.json"),
+            include_str!("../../../skin-schema/skins/delft.skin.json"),
+            include_str!("../../../skin-schema/skins/rosette.skin.json"),
         ]
         .into_iter()
-        .filter_map(|json| match ParamSkin::from_json(json) {
+        .filter_map(|json| match compile_document_owned(json) {
             Ok(skin) => Some(skin),
-            Err(errors) => {
-                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "skipping an invalid built-in skin document: {errors:?}"
-                )));
+            Err(problem) => {
+                warn_dropped_builtin(&problem);
                 None
             }
         })
         .collect()
     })
+}
+
+/// Report a built-in that would not compile.
+///
+/// The console is the right place in the browser and unavailable everywhere
+/// else, and the native side of this crate — the pre-register gate and the
+/// conformance suite — must still be able to link.
+fn warn_dropped_builtin(problem: &str) {
+    let message = format!("skipping an invalid built-in skin document: {problem}");
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&message));
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{message}");
 }
 
 /// The built-in catalogue.
@@ -51,10 +101,6 @@ pub struct SkinRegistry {
     /// array rather than three fields because that is what it is, and because
     /// adding a fourth board should not mean touching this struct.
     checkers: [CheckerSkin; 3],
-    /// The animal family: one textured implementation, three coats.
-    animals: [AnimalSkin; 6],
-    /// The sprite-sheet family: art whose rows are frames of animation.
-    sheets: [SpriteSkin; 4],
 }
 
 impl Default for SkinRegistry {
@@ -69,18 +115,14 @@ impl SkinRegistry {
             classic: ClassicSkin,
             ember: EmberSkin,
             checkers: crate::skin::checker::FAMILY,
-            animals: crate::skin::animal::FAMILY,
-            sheets: crate::skin::sprite::FAMILY,
         }
     }
 
     /// Every selectable skin, in catalogue order.
     pub fn entries(&self) -> Vec<&dyn SnakeSkin> {
         let mut entries: Vec<&dyn SnakeSkin> = vec![&self.classic, &self.ember];
-        entries.extend(document_skins().iter().map(|skin| skin as &dyn SnakeSkin));
+        entries.extend(document_skins().iter().map(|skin| skin.as_ref()));
         entries.extend(self.checkers.iter().map(|skin| skin as &dyn SnakeSkin));
-        entries.extend(self.animals.iter().map(|skin| skin as &dyn SnakeSkin));
-        entries.extend(self.sheets.iter().map(|skin| skin as &dyn SnakeSkin));
         entries
     }
 
@@ -365,19 +407,45 @@ mod tests {
             "tidewave@1",
             "voltage@1",
             "lantern@1",
+            "breaker@1",
+            "afterburn@1",
+            "cinder@1",
+            "floe@1",
+            "woodblock@1",
+            "bloom@1",
+            "slipstream@1",
+            "harrier@1",
+            "argyle@1",
+            "serpentine@1",
+            "voltcore@1",
+            "marquee@1",
+            "basalt@1",
+            "ripple@1",
+            "moth@1",
+            "prism@1",
+            "houndstooth@1",
+            "circuit@1",
+            "pinstripe@1",
+            "static@1",
+            "mosaic@1",
+            "herringbone@1",
+            "carbon@1",
+            "tartan@1",
+            "coral@1",
+            "amber@1",
+            "geode@1",
+            "timber@1",
+            "peacock@1",
+            "monarch@1",
+            "chrome@1",
+            "neon@1",
+            "camo@1",
+            "loom@1",
+            "delft@1",
+            "rosette@1",
             "gambit@1",
             "harlequin@1",
             "pitlane@1",
-            "zebra@1",
-            "zebra-print@1",
-            "tiger@1",
-            "tiger-print@1",
-            "jaguar@1",
-            "jaguar-print@1",
-            "zebra-live@1",
-            "tiger-live@1",
-            "stars-and-stripes@1",
-            "race-livery@1",
         ];
         let mut sorted_client = client.clone();
         sorted_client.sort_unstable();

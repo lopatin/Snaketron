@@ -1,0 +1,346 @@
+{
+  "schema_version": 2,
+  "id": "houndstooth@1",
+  "name": "Houndstooth",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#f0f2f6",
+        "outline": "#151922",
+        "accent": "#14171d"
+      },
+      {
+        "fill": "#eceef4",
+        "outline": "#11151d",
+        "accent": "#171a21"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#1e1913",
+        "outline": "#0a0805",
+        "accent": "#e6cfa8"
+      },
+      {
+        "fill": "#221c15",
+        "outline": "#0d0a07",
+        "accent": "#dfc79f"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#f0f2f6",
+        "outline": "#151922",
+        "accent": "#14171d"
+      },
+      {
+        "fill": "#1e1913",
+        "outline": "#0a0805",
+        "accent": "#e6cfa8"
+      },
+      {
+        "fill": "#f1eff6",
+        "outline": "#1a1720",
+        "accent": "#201b29"
+      },
+      {
+        "fill": "#10141a",
+        "outline": "#070a0d",
+        "accent": "#c9d1db"
+      }
+    ]
+  },
+  "period_ms": 4200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0b0e12"
+  },
+  "layers": [
+    {
+      "name": "Selvedge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Cloth",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Nap",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.08"
+            },
+            "alpha": "0.45"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.05"
+            },
+            "alpha": "0.35"
+          },
+          {
+            "offset": "0.6",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.26"
+            },
+            "alpha": "clamp(0.5 + 0.14 * sin(tau * time), 0, 1)"
+          },
+          {
+            "offset": "0.82",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.09"
+            },
+            "alpha": "0.55"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.92"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Check, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.04"
+        },
+        "period_cells": 2.8,
+        "duty": 0.42,
+        "phase_cells": 0.0,
+        "half_width": "0.25",
+        "t_center": "0.25"
+      }
+    },
+    {
+      "name": "Check, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.04"
+        },
+        "period_cells": 2.8,
+        "duty": 0.42,
+        "phase_cells": 1.4,
+        "half_width": "0.25",
+        "t_center": "-0.25"
+      }
+    },
+    {
+      "name": "Leg, upper point, root",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.04"
+        },
+        "period_cells": 2.8,
+        "duty": 0.125,
+        "phase_cells": 1.176,
+        "half_width": "0.125",
+        "t_center": "0.375"
+      }
+    },
+    {
+      "name": "Leg, upper point, tip",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.1"
+        },
+        "period_cells": 2.8,
+        "duty": 0.125,
+        "phase_cells": 1.526,
+        "half_width": "0.0625",
+        "t_center": "0.4375"
+      }
+    },
+    {
+      "name": "Leg, upper stub",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 2.8,
+        "duty": 0.125,
+        "phase_cells": 2.45,
+        "half_width": "0.125",
+        "t_center": "0.125"
+      }
+    },
+    {
+      "name": "Leg, lower point, root",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.04"
+        },
+        "period_cells": 2.8,
+        "duty": 0.125,
+        "phase_cells": 1.05,
+        "half_width": "0.125",
+        "t_center": "-0.375"
+      }
+    },
+    {
+      "name": "Leg, lower point, tip",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.1"
+        },
+        "period_cells": 2.8,
+        "duty": 0.125,
+        "phase_cells": 0.7,
+        "half_width": "0.0625",
+        "t_center": "-0.4375"
+      }
+    },
+    {
+      "name": "Leg, lower stub",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 2.8,
+        "duty": 0.125,
+        "phase_cells": 2.576,
+        "half_width": "0.125",
+        "t_center": "-0.125"
+      }
+    },
+    {
+      "name": "Cuff",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.3) * (0.44 + 0.1 * sin(tau * time))",
+      "color": "#f4f2ec",
+      "length_cells": 1.3
+    }
+  ]
+}

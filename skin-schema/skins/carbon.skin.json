@@ -1,0 +1,278 @@
+{
+  "schema_version": 2,
+  "id": "carbon@1",
+  "name": "Carbon",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#2b3745",
+        "outline": "#0e131a",
+        "accent": "#6aa6dc"
+      },
+      {
+        "fill": "#293542",
+        "outline": "#0c1118",
+        "accent": "#5c98cf"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#170f06",
+        "outline": "#070402",
+        "accent": "#d9a558"
+      },
+      {
+        "fill": "#150d04",
+        "outline": "#060301",
+        "accent": "#cf9a4c"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#2b3745",
+        "outline": "#0e131a",
+        "accent": "#6aa6dc"
+      },
+      {
+        "fill": "#170f06",
+        "outline": "#070402",
+        "accent": "#d9a558"
+      },
+      {
+        "fill": "#2f353b",
+        "outline": "#12161a",
+        "accent": "#aebbc6"
+      },
+      {
+        "fill": "#34283a",
+        "outline": "#150f18",
+        "accent": "#c69ad4"
+      }
+    ]
+  },
+  "literals": {
+    "clearcoat": "#e8f0f6"
+  },
+  "period_ms": 2600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#04070b"
+  },
+  "layers": [
+    {
+      "name": "Lacquer edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Matrix",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Resin depth",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.36"
+            },
+            "alpha": "0.96"
+          },
+          {
+            "offset": "0.26",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.16"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.14"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.5"
+            },
+            "alpha": "0.92"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Twill, tow 1",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.4"
+        },
+        "period_cells": 1.05,
+        "duty": 0.54,
+        "phase_cells": 0.0,
+        "half_width": "0.125",
+        "t_center": "-0.375"
+      }
+    },
+    {
+      "name": "Twill, tow 2",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.18"
+        },
+        "period_cells": 1.05,
+        "duty": 0.46,
+        "phase_cells": 0.2625,
+        "half_width": "0.125",
+        "t_center": "-0.125"
+      }
+    },
+    {
+      "name": "Twill, tow 3",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.34"
+        },
+        "period_cells": 1.05,
+        "duty": 0.54,
+        "phase_cells": 0.525,
+        "half_width": "0.125",
+        "t_center": "0.125"
+      }
+    },
+    {
+      "name": "Twill, tow 4",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.13"
+        },
+        "period_cells": 1.05,
+        "duty": 0.46,
+        "phase_cells": 0.7875,
+        "half_width": "0.125",
+        "t_center": "0.375"
+      }
+    },
+    {
+      "name": "Specular",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.08"
+        },
+        "period_cells": 10.5,
+        "duty": 0.8,
+        "phase_cells": 0.4,
+        "half_width": "0.13",
+        "t_center": "0.29 * sin(tau * time)",
+        "alpha": "clamp(0.46 + 0.22 * cos(tau * (time * 2 - s * 0.05)), 0, 1)"
+      }
+    },
+    {
+      "name": "Clearcoat",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.5",
+      "color": "#e8f0f6",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Bezel",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.45"
+      },
+      "radius_ratio": "0.42"
+    }
+  ]
+}

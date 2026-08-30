@@ -1,0 +1,421 @@
+{
+  "schema_version": 2,
+  "id": "rosette@1",
+  "name": "Rosette",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#2352c6",
+        "outline": "#0d8f74",
+        "accent": "#8a3fe0"
+      },
+      {
+        "fill": "#1c46ad",
+        "outline": "#0a7f68",
+        "accent": "#7a34cc"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#c01a2c",
+        "outline": "#b52063",
+        "accent": "#c4830e"
+      },
+      {
+        "fill": "#a41626",
+        "outline": "#9c1a55",
+        "accent": "#a86f0c"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#2352c6",
+        "outline": "#0d8f74",
+        "accent": "#8a3fe0"
+      },
+      {
+        "fill": "#c01a2c",
+        "outline": "#b52063",
+        "accent": "#c4830e"
+      },
+      {
+        "fill": "#35506e",
+        "outline": "#2c7570",
+        "accent": "#6d84bb"
+      },
+      {
+        "fill": "#7a4a10",
+        "outline": "#8a2244",
+        "accent": "#c9901f"
+      }
+    ]
+  },
+  "literals": {
+    "lead": "#080711",
+    "opal": "#e6d4a8",
+    "glow": "#ffc978"
+  },
+  "period_ms": 5600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#07060c"
+  },
+  "layers": [
+    {
+      "name": "Came",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "literal": "lead"
+      },
+      "extra_px": 2.2,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Glass",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Upper row, cobalt light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.07"
+        },
+        "period_cells": 5.25,
+        "duty": 0.5,
+        "phase_cells": 0.0,
+        "half_width": "0.165",
+        "t_center": "0.235"
+      }
+    },
+    {
+      "name": "Upper row, violet light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.04"
+        },
+        "period_cells": 5.25,
+        "duty": 0.5,
+        "phase_cells": 2.625,
+        "half_width": "0.165",
+        "t_center": "0.235"
+      }
+    },
+    {
+      "name": "Lower row, emerald light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline"
+        },
+        "period_cells": 7.875,
+        "duty": 0.3334,
+        "phase_cells": 0.0,
+        "half_width": "0.165",
+        "t_center": "-0.235"
+      }
+    },
+    {
+      "name": "Lower row, deep light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.16"
+        },
+        "period_cells": 7.875,
+        "duty": 0.3334,
+        "phase_cells": 2.625,
+        "half_width": "0.165",
+        "t_center": "-0.235"
+      }
+    },
+    {
+      "name": "Lower row, violet light",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.06"
+        },
+        "period_cells": 7.875,
+        "duty": 0.3334,
+        "phase_cells": 5.25,
+        "half_width": "0.165",
+        "t_center": "-0.235"
+      }
+    },
+    {
+      "name": "Boss, leaded eye",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "outline",
+          "lighten": "-0.42"
+        },
+        "period_cells": 7.875,
+        "duty": 0.16667,
+        "phase_cells": 0.65625,
+        "half_width": "0.115",
+        "t_center": "0.235"
+      }
+    },
+    {
+      "name": "Boss, clear roundel",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "opal"
+        },
+        "period_cells": 10.5,
+        "duty": 0.125,
+        "phase_cells": 3.28125,
+        "half_width": "0.115",
+        "t_center": "-0.235"
+      }
+    },
+    {
+      "name": "Backlight",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.3"
+          },
+          {
+            "offset": "0.26",
+            "color": {
+              "literal": "glow"
+            },
+            "alpha": "0.1"
+          },
+          {
+            "offset": "0.62 + 0.16 * sin(tau * time)",
+            "color": {
+              "literal": "glow"
+            },
+            "alpha": "0.17"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.42"
+            },
+            "alpha": "0.3"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Lead, spine",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "lead"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.07",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Lead, top rail",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "lead"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.06",
+        "t_center": "0.44"
+      }
+    },
+    {
+      "name": "Lead, bottom rail",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "lead"
+        },
+        "period_cells": 21.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.06",
+        "t_center": "-0.44"
+      }
+    },
+    {
+      "name": "Lead, mullions",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "lead"
+        },
+        "period_cells": 2.625,
+        "duty": 0.16,
+        "phase_cells": -0.21,
+        "half_width": "0.5",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Halation",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.36",
+      "color": "#fff2d8",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Boss, crown",
+      "type": "head_disc",
+      "paint": {
+        "slot": "accent",
+        "lighten": "0.34"
+      },
+      "radius_ratio": "0.36"
+    }
+  ]
+}

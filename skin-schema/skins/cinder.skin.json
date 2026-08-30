@@ -1,0 +1,290 @@
+{
+  "schema_version": 2,
+  "id": "cinder@1",
+  "name": "Cinder",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#26406e",
+        "outline": "#0c1220",
+        "accent": "#35d0ff"
+      },
+      {
+        "fill": "#1e3358",
+        "outline": "#080d18",
+        "accent": "#2ab6f0"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#33190e",
+        "outline": "#180c08",
+        "accent": "#ff4a12"
+      },
+      {
+        "fill": "#291308",
+        "outline": "#120806",
+        "accent": "#ff2e08"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#26406e",
+        "outline": "#0c1220",
+        "accent": "#35d0ff"
+      },
+      {
+        "fill": "#33190e",
+        "outline": "#180c08",
+        "accent": "#ff4a12"
+      },
+      {
+        "fill": "#2c2c33",
+        "outline": "#131318",
+        "accent": "#aeb9c8"
+      },
+      {
+        "fill": "#3a2d0c",
+        "outline": "#1b1505",
+        "accent": "#eda008"
+      }
+    ]
+  },
+  "period_ms": 2200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#120a06"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Crust",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Cooling",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.26"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "0.4",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.02"
+            },
+            "alpha": "0.74"
+          },
+          {
+            "offset": "0.72",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.26"
+            },
+            "alpha": "0.6"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Cross cracks",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.3"
+        },
+        "period_cells": 3.0,
+        "duty": 0.15,
+        "phase_cells": 1.5,
+        "half_width": "0.45",
+        "t_center": "0.0",
+        "alpha": "clamp(0.34 + 0.5 * sin(tau * (time + s * 0.37 + 0.25)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Split cracks",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 4.3,
+        "duty": 0.09,
+        "phase_cells": 0.9,
+        "half_width": "0.22",
+        "t_center": "0.12"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Seam, high",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 3.5,
+        "duty": 0.82,
+        "phase_cells": 0.0,
+        "half_width": "0.115",
+        "t_center": "0.33",
+        "alpha": "clamp(0.52 + 0.46 * sin(tau * (time + s * 0.23)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Seam, low",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 3.5,
+        "duty": 0.82,
+        "phase_cells": 1.55,
+        "half_width": "0.12",
+        "t_center": "-0.32",
+        "alpha": "clamp(0.48 + 0.44 * sin(tau * (time + s * 0.19 + 0.5)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Core, high",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.62"
+        },
+        "period_cells": 3.5,
+        "duty": 0.76,
+        "phase_cells": 0.06,
+        "half_width": "0.038",
+        "t_center": "0.33"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Core, low",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.58"
+        },
+        "period_cells": 3.5,
+        "duty": 0.76,
+        "phase_cells": 1.61,
+        "half_width": "0.04",
+        "t_center": "-0.32"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Melt",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.5",
+      "color": "#fff1d2",
+      "length_cells": 1.4
+    }
+  ]
+}

@@ -1,0 +1,376 @@
+{
+  "schema_version": 2,
+  "id": "geode@1",
+  "name": "Geode",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#3d2062",
+        "outline": "#1a0d2b",
+        "accent": "#b47ce8"
+      },
+      {
+        "fill": "#361b57",
+        "outline": "#160a24",
+        "accent": "#a76ee0"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#732e0e",
+        "outline": "#311205",
+        "accent": "#f0913f"
+      },
+      {
+        "fill": "#68290c",
+        "outline": "#2a0f04",
+        "accent": "#e58433"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#3d2062",
+        "outline": "#1a0d2b",
+        "accent": "#b47ce8"
+      },
+      {
+        "fill": "#732e0e",
+        "outline": "#311205",
+        "accent": "#f0913f"
+      },
+      {
+        "fill": "#322e3c",
+        "outline": "#14121a",
+        "accent": "#b9b0c6"
+      },
+      {
+        "fill": "#144330",
+        "outline": "#072016",
+        "accent": "#6fd79a"
+      }
+    ]
+  },
+  "literals": {
+    "quartz": "#f1e9dd",
+    "crystal": "#fffdf6"
+  },
+  "period_ms": 5200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#150b22"
+  },
+  "layers": [
+    {
+      "name": "Matrix",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Stone",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Bedding",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.14"
+            },
+            "alpha": "0.5"
+          },
+          {
+            "offset": "0.28",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.3"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "0.62",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.18"
+            },
+            "alpha": "0.7"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.95"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Chalcedony",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "0.18"
+        },
+        "period_cells": 11.3,
+        "duty": 0.52,
+        "phase_cells": 1.4,
+        "half_width": "0.22 + 0.02 * sin(tau * (time + 0.25))",
+        "t_center": "-0.23 + 0.02 * sin(tau * time)",
+        "alpha": "clamp(0.16 + 0.6 * noise(s * 0.83 + 4.2, 2.7), 0, 1)"
+      }
+    },
+    {
+      "name": "Band, deep",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.42"
+        },
+        "period_cells": 6.3,
+        "duty": 0.27,
+        "phase_cells": 0.0,
+        "half_width": "0.4",
+        "t_center": "-0.1"
+      }
+    },
+    {
+      "name": "Band, deep core",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.4"
+        },
+        "period_cells": 6.3,
+        "duty": 0.155,
+        "phase_cells": 0.42,
+        "half_width": "0.2",
+        "t_center": "0.09"
+      }
+    },
+    {
+      "name": "Band, thin mineral",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.05"
+        },
+        "period_cells": 6.3,
+        "duty": 0.085,
+        "phase_cells": 2.06,
+        "half_width": "0.31",
+        "t_center": "0.19"
+      }
+    },
+    {
+      "name": "Band, thin pale",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.52"
+        },
+        "period_cells": 6.3,
+        "duty": 0.0667,
+        "phase_cells": 2.72,
+        "half_width": "0.27",
+        "t_center": "-0.23",
+        "alpha": "clamp(0.44 + 0.56 * noise(s * 0.61 + 3.4, 7.9), 0, 1)"
+      }
+    },
+    {
+      "name": "Crystal edge, quartz",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "crystal"
+        },
+        "period_cells": 6.3,
+        "duty": 0.05,
+        "phase_cells": 3.15,
+        "half_width": "0.45",
+        "t_center": "0.03"
+      }
+    },
+    {
+      "name": "Band, quartz",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "quartz"
+        },
+        "period_cells": 6.3,
+        "duty": 0.22,
+        "phase_cells": 3.464,
+        "half_width": "0.42",
+        "t_center": "0.08"
+      }
+    },
+    {
+      "name": "Band, quartz seam",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.25"
+        },
+        "period_cells": 6.3,
+        "duty": 0.075,
+        "phase_cells": 3.8,
+        "half_width": "0.13",
+        "t_center": "0.21"
+      }
+    },
+    {
+      "name": "Crystal edges",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "crystal"
+        },
+        "period_cells": 3.15,
+        "duty": 0.1,
+        "phase_cells": 1.7,
+        "half_width": "0.43 + 0.05 * sin(tau * time)",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Crystal centre",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.66",
+      "color": "#f6f0e6",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Druse",
+      "type": "head_disc",
+      "paint": {
+        "literal": "crystal"
+      },
+      "radius_ratio": "0.42"
+    }
+  ]
+}

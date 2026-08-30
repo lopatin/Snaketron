@@ -13,7 +13,6 @@
 //!
 //! See `specs/skins-prd.md` for the boundary rulings this module implements.
 
-pub mod animal;
 pub mod atlas;
 pub mod checker;
 pub mod classic;
@@ -31,7 +30,6 @@ pub mod paint;
 pub mod perf;
 pub mod registry;
 pub mod space;
-pub mod sprite;
 
 #[cfg(test)]
 mod conformance;

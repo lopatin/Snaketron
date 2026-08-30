@@ -1,0 +1,322 @@
+{
+  "schema_version": 2,
+  "id": "moth@1",
+  "name": "Moth",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#7d6da3",
+        "outline": "#2a2140",
+        "accent": "#c6b4dc"
+      },
+      {
+        "fill": "#71619e",
+        "outline": "#221a35",
+        "accent": "#b8a5d2"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#88482c",
+        "outline": "#331a10",
+        "accent": "#e0b28c"
+      },
+      {
+        "fill": "#7f3f22",
+        "outline": "#2b150c",
+        "accent": "#d5a47e"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#7d6da3",
+        "outline": "#2a2140",
+        "accent": "#c6b4dc"
+      },
+      {
+        "fill": "#88482c",
+        "outline": "#331a10",
+        "accent": "#e0b28c"
+      },
+      {
+        "fill": "#5f6474",
+        "outline": "#23262f",
+        "accent": "#c3c8d6"
+      },
+      {
+        "fill": "#6e6a3c",
+        "outline": "#292716",
+        "accent": "#dcd79a"
+      }
+    ]
+  },
+  "literals": {
+    "eyespot": "#d9f45a",
+    "rim": "#1b1226"
+  },
+  "period_ms": 3400,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#150e1e"
+  },
+  "layers": [
+    {
+      "name": "Wing margin",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Wing membrane",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Dusk wash",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.46"
+            },
+            "alpha": "0.96"
+          },
+          {
+            "offset": "0.24",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.58",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.24"
+            },
+            "alpha": "0.78"
+          },
+          {
+            "offset": "0.8",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.04"
+            },
+            "alpha": "0.72"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.42"
+            },
+            "alpha": "0.92"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Inner band, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 5.25,
+        "duty": 0.5,
+        "phase_cells": 3.6,
+        "half_width": "0.135",
+        "t_center": "0.13",
+        "alpha": "clamp(smoothstep(2.2, 4.6, s) * (0.6 + 0.36 * noise(s * 1.7, 3.1)), 0, 1)"
+      }
+    },
+    {
+      "name": "Inner band, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 5.25,
+        "duty": 0.5,
+        "phase_cells": 3.6,
+        "half_width": "0.135",
+        "t_center": "-0.13",
+        "alpha": "clamp(smoothstep(2.2, 4.6, s) * (0.6 + 0.36 * noise(s * 1.7, 3.1)), 0, 1)"
+      }
+    },
+    {
+      "name": "Mid band, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.8 + 0.08 * sin(tau * time)",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.18"
+        },
+        "period_cells": 5.25,
+        "duty": 0.42,
+        "phase_cells": 3.0,
+        "half_width": "0.085",
+        "t_center": "0.325"
+      }
+    },
+    {
+      "name": "Mid band, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.8 + 0.08 * sin(tau * time)",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.18"
+        },
+        "period_cells": 5.25,
+        "duty": 0.42,
+        "phase_cells": 3.0,
+        "half_width": "0.085",
+        "t_center": "-0.325"
+      }
+    },
+    {
+      "name": "Margin freckles, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.66 + 0.08 * sin(tau * (time + 0.5))",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.4"
+        },
+        "period_cells": 2.625,
+        "duty": 0.34,
+        "phase_cells": 2.4,
+        "half_width": "0.045",
+        "t_center": "0.455"
+      }
+    },
+    {
+      "name": "Margin freckles, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "opacity": "0.66 + 0.08 * sin(tau * (time + 0.5))",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "0.4"
+        },
+        "period_cells": 2.625,
+        "duty": 0.34,
+        "phase_cells": 2.4,
+        "half_width": "0.045",
+        "t_center": "-0.455"
+      }
+    },
+    {
+      "name": "Thorax fur",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.62",
+      "color": "#f2ead9",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Eyespot rim",
+      "type": "head_disc",
+      "paint": {
+        "literal": "rim"
+      },
+      "radius_ratio": "0.5"
+    },
+    {
+      "name": "Eyespot iris",
+      "type": "head_disc",
+      "paint": {
+        "literal": "eyespot"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}

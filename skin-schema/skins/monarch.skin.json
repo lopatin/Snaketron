@@ -1,0 +1,378 @@
+{
+  "schema_version": 2,
+  "id": "monarch@1",
+  "name": "Monarch",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#0d5a72",
+        "outline": "#041f2b",
+        "accent": "#9a5fe0"
+      },
+      {
+        "fill": "#0c5168",
+        "outline": "#031a24",
+        "accent": "#8a5bd6"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#b8500c",
+        "outline": "#2e1003",
+        "accent": "#f0821c"
+      },
+      {
+        "fill": "#a8470a",
+        "outline": "#280d02",
+        "accent": "#e8761a"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#0d5a72",
+        "outline": "#041f2b",
+        "accent": "#9a5fe0"
+      },
+      {
+        "fill": "#b8500c",
+        "outline": "#2e1003",
+        "accent": "#f0821c"
+      },
+      {
+        "fill": "#3a4048",
+        "outline": "#171b20",
+        "accent": "#c9d3dd"
+      },
+      {
+        "fill": "#4a2440",
+        "outline": "#1c0c19",
+        "accent": "#e05fa8"
+      }
+    ]
+  },
+  "literals": {
+    "vein": "#120c07",
+    "chalk": "#f6f2e6"
+  },
+  "period_ms": 3600,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0d0904"
+  },
+  "layers": [
+    {
+      "name": "Wing edge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Wing membrane",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Cells",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.4"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.3",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.02"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.52",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.12"
+            },
+            "alpha": "0.94"
+          },
+          {
+            "offset": "0.78",
+            "color": {
+              "slot": "accent",
+              "lighten": "0.06"
+            },
+            "alpha": "0.92"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "accent",
+              "lighten": "-0.34"
+            },
+            "alpha": "0.9"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Vein, primary",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "vein"
+        },
+        "period_cells": 3.3,
+        "duty": 0.12,
+        "phase_cells": 0.0,
+        "half_width": "0.5",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Vein, branch",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "vein"
+        },
+        "period_cells": 4.9,
+        "duty": 0.105,
+        "phase_cells": 1.6,
+        "half_width": "0.5",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Vein, cross",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "vein"
+        },
+        "period_cells": 7.1,
+        "duty": 0.09,
+        "phase_cells": 3.4,
+        "half_width": "0.5",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Margin, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "vein"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.105",
+        "t_center": "0.395"
+      }
+    },
+    {
+      "name": "Margin, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "vein"
+        },
+        "period_cells": 21.0,
+        "duty": 1.0,
+        "phase_cells": 0.0,
+        "half_width": "0.105",
+        "t_center": "-0.395"
+      }
+    },
+    {
+      "name": "Spots, outer upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 3.0,
+        "duty": 0.12,
+        "phase_cells": 0.0,
+        "half_width": "0.037",
+        "t_center": "0.445"
+      }
+    },
+    {
+      "name": "Spots, inner upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 3.0,
+        "duty": 0.12,
+        "phase_cells": 1.5,
+        "half_width": "0.033",
+        "t_center": "0.345"
+      },
+      "opacity": "0.72 + 0.28 * sin(tau * time)"
+    },
+    {
+      "name": "Spots, outer lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 3.0,
+        "duty": 0.12,
+        "phase_cells": 0.0,
+        "half_width": "0.037",
+        "t_center": "-0.445"
+      }
+    },
+    {
+      "name": "Spots, inner lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 3.0,
+        "duty": 0.12,
+        "phase_cells": 1.5,
+        "half_width": "0.033",
+        "t_center": "-0.345"
+      },
+      "opacity": "0.72 + 0.28 * sin(tau * time)"
+    },
+    {
+      "name": "Thorax",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.6",
+      "color": "#f6f2e6",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Eye",
+      "type": "head_disc",
+      "paint": {
+        "literal": "chalk"
+      },
+      "radius_ratio": "0.42"
+    }
+  ]
+}

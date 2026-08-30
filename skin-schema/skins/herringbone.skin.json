@@ -1,0 +1,365 @@
+{
+  "schema_version": 2,
+  "id": "herringbone@1",
+  "name": "Herringbone",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#0e3a3f",
+        "outline": "#04191c",
+        "accent": "#cdd8d2"
+      },
+      {
+        "fill": "#0c343a",
+        "outline": "#031517",
+        "accent": "#c2cec8"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#8a521c",
+        "outline": "#2e1a06",
+        "accent": "#f0dcb2"
+      },
+      {
+        "fill": "#824c1a",
+        "outline": "#291705",
+        "accent": "#e6d1a6"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#0e3a3f",
+        "outline": "#04191c",
+        "accent": "#cdd8d2"
+      },
+      {
+        "fill": "#8a521c",
+        "outline": "#2e1a06",
+        "accent": "#f0dcb2"
+      },
+      {
+        "fill": "#3d4436",
+        "outline": "#171a12",
+        "accent": "#ccd2bc"
+      },
+      {
+        "fill": "#472a4c",
+        "outline": "#1a0e1d",
+        "accent": "#cbb8ce"
+      }
+    ]
+  },
+  "literals": {
+    "bone": "#ece3cd",
+    "chalk": "#f7f2e4",
+    "soot": "#100e0b"
+  },
+  "period_ms": 4200,
+  "head_core": {
+    "ratio": 0.3,
+    "color": "#0a1214"
+  },
+  "layers": [
+    {
+      "name": "Selvedge",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Cloth",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Fulling",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.44"
+            },
+            "alpha": "0.95"
+          },
+          {
+            "offset": "0.27",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.22"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.68",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.3"
+            },
+            "alpha": "clamp(0.74 + 0.1 * sin(tau * time), 0, 1)"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.42"
+            },
+            "alpha": "0.94"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Ground twill, upper",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.55"
+        },
+        "period_cells": 6.3,
+        "duty": 0.44,
+        "phase_cells": 0.0,
+        "half_width": "0.25",
+        "t_center": "0.25"
+      }
+    },
+    {
+      "name": "Ground twill, lower",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "fill",
+          "lighten": "-0.55"
+        },
+        "period_cells": 6.3,
+        "duty": 0.44,
+        "phase_cells": 4.05,
+        "half_width": "0.25",
+        "t_center": "-0.25"
+      }
+    },
+    {
+      "name": "Weft over, seam lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 2.8,
+        "duty": 0.4,
+        "phase_cells": 0.0,
+        "half_width": "0.083333",
+        "t_center": "0.083333"
+      }
+    },
+    {
+      "name": "Weft over, mid lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 2.8,
+        "duty": 0.4,
+        "phase_cells": 0.3,
+        "half_width": "0.083333",
+        "t_center": "0.25"
+      }
+    },
+    {
+      "name": "Weft over, selvedge lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.06"
+        },
+        "period_cells": 2.8,
+        "duty": 0.4,
+        "phase_cells": 0.6,
+        "half_width": "0.083333",
+        "t_center": "0.416667"
+      }
+    },
+    {
+      "name": "Weft under, seam lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "chalk"
+        },
+        "period_cells": 2.8,
+        "duty": 0.4,
+        "phase_cells": 1.4,
+        "half_width": "0.083333",
+        "t_center": "-0.083333"
+      }
+    },
+    {
+      "name": "Weft under, mid lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bone"
+        },
+        "period_cells": 2.8,
+        "duty": 0.4,
+        "phase_cells": 1.7,
+        "half_width": "0.083333",
+        "t_center": "-0.25"
+      }
+    },
+    {
+      "name": "Weft under, selvedge lane",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent",
+          "lighten": "-0.06"
+        },
+        "period_cells": 2.8,
+        "duty": 0.4,
+        "phase_cells": 2.0,
+        "half_width": "0.083333",
+        "t_center": "-0.416667"
+      }
+    },
+    {
+      "name": "Course seam",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "omit_on_single_cell": true,
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "soot"
+        },
+        "period_cells": 63.0,
+        "duty": 0.99,
+        "phase_cells": 0.0,
+        "half_width": "0.07",
+        "t_center": "0.0"
+      }
+    },
+    {
+      "name": "Nap",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * (0.52 + 0.1 * sin(tau * time))",
+      "color": "#f7f2e4",
+      "length_cells": 1.4
+    }
+  ]
+}

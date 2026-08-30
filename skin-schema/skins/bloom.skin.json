@@ -1,0 +1,226 @@
+{
+  "schema_version": 2,
+  "id": "bloom@1",
+  "name": "Bloom",
+  "palette": {
+    "friendly": [
+      {
+        "fill": "#1a2a8c",
+        "outline": "#0b1145",
+        "accent": "#35e6ff"
+      },
+      {
+        "fill": "#141f70",
+        "outline": "#080c33",
+        "accent": "#2ac8f0"
+      }
+    ],
+    "enemy": [
+      {
+        "fill": "#7a1246",
+        "outline": "#3d0722",
+        "accent": "#ff9a4a"
+      },
+      {
+        "fill": "#630d38",
+        "outline": "#310518",
+        "accent": "#ff7a2e"
+      }
+    ],
+    "free_for_all": [
+      {
+        "fill": "#1a2a8c",
+        "outline": "#0b1145",
+        "accent": "#35e6ff"
+      },
+      {
+        "fill": "#7a1246",
+        "outline": "#3d0722",
+        "accent": "#ff9a4a"
+      },
+      {
+        "fill": "#30394b",
+        "outline": "#161b26",
+        "accent": "#c0cee0"
+      },
+      {
+        "fill": "#5a420a",
+        "outline": "#2a1e04",
+        "accent": "#ffcb4f"
+      }
+    ]
+  },
+  "literals": {
+    "bell": "#ff5ad8",
+    "spark": "#eafcff"
+  },
+  "period_ms": 3600,
+  "head_core": {
+    "ratio": 0.28,
+    "color": "#0a0a28"
+  },
+  "layers": [
+    {
+      "name": "Outline",
+      "type": "ribbon",
+      "region": "contour",
+      "color": {
+        "slot": "outline"
+      },
+      "extra_px": 2.0,
+      "joints": true,
+      "tail_cap": false
+    },
+    {
+      "name": "Void",
+      "type": "ribbon",
+      "region": "body",
+      "color": {
+        "slot": "fill"
+      },
+      "extra_px": 0.0,
+      "joints": true,
+      "tail_cap": true
+    },
+    {
+      "name": "Nebula",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "gradient",
+        "axis": "along_body",
+        "stops": [
+          {
+            "offset": "0",
+            "color": {
+              "slot": "fill",
+              "lighten": "-0.05"
+            },
+            "alpha": "0.9"
+          },
+          {
+            "offset": "0.34",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.1"
+            },
+            "alpha": "0.82"
+          },
+          {
+            "offset": "0.66",
+            "color": {
+              "slot": "accent"
+            },
+            "alpha": "0.62"
+          },
+          {
+            "offset": "1",
+            "color": {
+              "slot": "fill",
+              "lighten": "0.18"
+            },
+            "alpha": "0.85"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Current",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "slot": "accent"
+        },
+        "period_cells": 2.5,
+        "duty": 0.9,
+        "phase_cells": 0.0,
+        "half_width": "0.19",
+        "t_center": "-0.3",
+        "alpha": "clamp(0.4 + 0.5 * sin(tau * (time + s * 0.23)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Bells",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "bell"
+        },
+        "period_cells": 3.0,
+        "duty": 0.38,
+        "phase_cells": 1.2,
+        "half_width": "0.23",
+        "t_center": "0.26",
+        "alpha": "clamp(0.52 + 0.45 * sin(tau * (time + s * 0.27 + 0.5)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Sparks",
+      "type": "span",
+      "region": "body",
+      "clip": "silhouette",
+      "span": {
+        "from": "whole",
+        "min": 0,
+        "priority": 0
+      },
+      "corner": "fan",
+      "source": {
+        "type": "band",
+        "color": {
+          "literal": "spark"
+        },
+        "period_cells": 1.75,
+        "duty": 0.22,
+        "phase_cells": 0.4,
+        "half_width": "0.10",
+        "t_center": "0.02",
+        "alpha": "clamp(0.35 + 0.55 * sin(tau * (time + s * 0.43)), 0, 1)"
+      },
+      "omit_on_single_cell": true
+    },
+    {
+      "name": "Halo",
+      "type": "head_ramp",
+      "omit_on_single_cell": true,
+      "opacity": "(1 - s / 1.4) * 0.5",
+      "color": "#eafcff",
+      "length_cells": 1.4
+    },
+    {
+      "name": "Bell, head",
+      "type": "head_disc",
+      "paint": {
+        "literal": "bell"
+      },
+      "radius_ratio": "0.44"
+    }
+  ]
+}
