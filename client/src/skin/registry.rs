@@ -4,12 +4,10 @@
 //! newer build, a corrupted preference, a hand-edited request — falls back to
 //! the classic look and logs once. Cosmetics must not be able to break a frame.
 
-use crate::skin::animal::AnimalSkin;
 use crate::skin::checker::CheckerSkin;
 use crate::skin::doc::ParamSkin;
 use crate::skin::docv2::LayerSkin;
 use crate::skin::ember::EmberSkin;
-use crate::skin::sprite::SpriteSkin;
 use crate::skin::{ClassicSkin, SnakeSkin};
 use std::sync::OnceLock;
 
@@ -51,10 +49,6 @@ pub struct SkinRegistry {
     /// array rather than three fields because that is what it is, and because
     /// adding a fourth board should not mean touching this struct.
     checkers: [CheckerSkin; 3],
-    /// The animal family: one textured implementation, three coats.
-    animals: [AnimalSkin; 6],
-    /// The sprite-sheet family: art whose rows are frames of animation.
-    sheets: [SpriteSkin; 4],
 }
 
 impl Default for SkinRegistry {
@@ -69,8 +63,6 @@ impl SkinRegistry {
             classic: ClassicSkin,
             ember: EmberSkin,
             checkers: crate::skin::checker::FAMILY,
-            animals: crate::skin::animal::FAMILY,
-            sheets: crate::skin::sprite::FAMILY,
         }
     }
 
@@ -79,8 +71,6 @@ impl SkinRegistry {
         let mut entries: Vec<&dyn SnakeSkin> = vec![&self.classic, &self.ember];
         entries.extend(document_skins().iter().map(|skin| skin as &dyn SnakeSkin));
         entries.extend(self.checkers.iter().map(|skin| skin as &dyn SnakeSkin));
-        entries.extend(self.animals.iter().map(|skin| skin as &dyn SnakeSkin));
-        entries.extend(self.sheets.iter().map(|skin| skin as &dyn SnakeSkin));
         entries
     }
 
@@ -368,16 +358,6 @@ mod tests {
             "gambit@1",
             "harlequin@1",
             "pitlane@1",
-            "zebra@1",
-            "zebra-print@1",
-            "tiger@1",
-            "tiger-print@1",
-            "jaguar@1",
-            "jaguar-print@1",
-            "zebra-live@1",
-            "tiger-live@1",
-            "stars-and-stripes@1",
-            "race-livery@1",
         ];
         let mut sorted_client = client.clone();
         sorted_client.sort_unstable();

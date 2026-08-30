@@ -60,16 +60,6 @@ pub const CATALOG: &[CatalogEntry] = &[
     entry("gambit@1", "Gambit"),
     entry("harlequin@1", "Harlequin"),
     entry("pitlane@1", "Pitlane"),
-    entry("zebra@1", "Zebra"),
-    entry("zebra-print@1", "Zebra Print"),
-    entry("tiger@1", "Tiger"),
-    entry("tiger-print@1", "Tiger Print"),
-    entry("jaguar@1", "Jaguar"),
-    entry("jaguar-print@1", "Jaguar Print"),
-    entry("zebra-live@1", "Living Zebra"),
-    entry("tiger-live@1", "Living Tiger"),
-    entry("stars-and-stripes@1", "Stars and Stripes"),
-    entry("race-livery@1", "Race Livery"),
 ];
 
 /// Every snake skin also supplies base dressing, so the base picker offers the
